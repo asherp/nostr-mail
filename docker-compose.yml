@@ -1,0 +1,27 @@
+version: '2.4'
+
+services:
+  notebook:
+    image: nostr-mail
+    ports:
+      - "8888:8888"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      TZ: ${TZ:-America/New_York}
+      DASH_DEBUG: "${DASH_DEBUG}"
+    volumes:
+      - type: bind
+        source: .
+        target: /nostr-mail
+    container_name: nostr-notebook
+    command:
+      - jupyter
+      - notebook
+      - .
+      - --port=8888
+      - --no-browser
+      - --ip=0.0.0.0
+      - --allow-root
+    working_dir: /nostr-mail

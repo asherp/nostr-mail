@@ -1,0 +1,13 @@
+nostr
+git+https://github.com/predsci/psidash.git@hydra_1.2.0
+dash-bootstrap-components
+plotly
+dash
+hydra-core==1.2.0
+redmail==0.5.0
+gunicorn
+
+# docs requirements
+mkdocs
+markdown-include
+pygments

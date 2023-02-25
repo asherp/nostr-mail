@@ -153,22 +153,203 @@ hello is nip05 compliant, so we should be able to a get request to his server to
 import requests
 ```
 
+### Nip05 validation
+
 ```python
-result = requests.get('https://safier.com/.well-known/nostr.json?name=xenofun')
+from json import JSONDecodeError
+
+def validate_nip05(hex_name):
+    meta = get_events(hex_name, 'meta')
+    nip05 = meta[0].get('nip05')
+    if nip05 is None:
+        return False
+    # construct get request
+    if '@' in nip05:
+        username, tld = nip05.split('@')
+    else:
+        return False
+    
+    url = f'https://{tld}/.well-known/nostr.json?name={username}'
+    result = requests.get(url)
+    try:
+        nip05_data = json.loads(result.content.decode('utf-8'))
+    except JSONDecodeError:
+        raise NameError('Cannot decode nip05 json')
+    if 'names' in nip05_data:
+        names = nip05_data['names']
+        # reverse lookup
+        pubs = {pub_key: name for name, pub_key in names.items()}
+        if hex_name in pubs:
+            return pubs[hex_name]
+        else:
+            raise NameError(f'{hex_name} not among registered pub keys: {pubs}')
+    else:
+        raise NameError('nip05 data does not contain names')
+    
+    return result
 ```
 
 ```python
-json.loads(result.content.decode('utf-8'))
-```
-
-The above response holds several other names, so this acts as a p2p registry!
-
-```python
-hodl_hex = '1afe0c74e3d7784eba93a5e3fa554a6eeb01928d12739ae8ba4832786808e36d'
+JSONDecodeError?
 ```
 
 ```python
-pd.DataFrame(get_events(hodl_hex, 'meta'))
+validate_nip05(node_hello_hex) # returns the name of this user according to their .com
+```
+
+```python
+validate_nip05(hodl_hex)
+```
+
+Hello Jessica's nip05 contains several other names, so this acts as a p2p registry!
+
+```python
+hrh_hex = 'ae4efa502bf1cb7dd63343ae4bc7bd0a599c5251c686c9ebd3b5f0d4f841a939'
+```
+
+```python
+try:
+    validate_nip05(hrh_hex) # this one doesn't validate
+except NameError as m:
+    print(m)
+```
+
+## Shared secret
+
+
+First we'll create two key pairs, one for the sender and one for the receiver
+
+```python
+from nostr.key import PrivateKey
+
+priv_key1 = PrivateKey()
+pub_key1 = priv_key1.public_key
+print(f"Private key: {priv_key1.bech32()}")
+print(f"Public key: {pub_key1.bech32()}")
+```
+
+```python
+priv_key2 = PrivateKey()
+pub_key2 = priv_key2.public_key
+print(f"Private key: {priv_key1.bech32()}")
+print(f"Public key: {pub_key1.bech32()}")
+```
+
+```python
+assert priv_key1.compute_shared_secret(pub_key2.hex()) == priv_key2.compute_shared_secret(pub_key1.hex())
+
+print('shared secret validated!')
+```
+
+## Encryption
+
+
+We use [Fernet encryption](https://cryptography.io/en/latest/fernet/#fernet-symmetric-encryption) available from the cryptography package. Fernet encryption is a form of symmetric encryption, meaning the same key may be used to encrypt and decrypt a message.
+
+```python
+from cryptography.fernet import Fernet, InvalidToken
+import base64
+
+def get_fernet(key_str):
+    if isinstance(key_str, str):
+        fernet_key = base64.urlsafe_b64encode(bytes(key_str.ljust(32).encode()))
+    else:
+        fernet_key = base64.urlsafe_b64encode(key_str)
+    return Fernet(fernet_key)
+
+
+def encrypt(message, key):
+    f = get_fernet(key)
+    token = f.encrypt(message.encode())
+
+    encrypted_msg = token.decode('ascii')
+
+    return encrypted_msg
+
+def decrypt(message, key):
+    f = get_fernet(key)
+    decrypted_msg = f.decrypt(message.encode()).decode('ascii')
+
+    return decrypted_msg
+```
+
+```python
+decrypt(encrypt('hello world', 'yowzah'), 'yowzah')
+```
+
+## Mock email flow
+
+```python
+sender_priv = PrivateKey()
+sender_pub = sender_priv.public_key.hex()
+
+email_msg = """
+    Well, hello there!
+
+    This is a decrypted message!
+"""
+
+receiver_priv = PrivateKey()
+receiver_pub = receiver_priv.public_key.hex()
+
+sender_secret = sender_priv.compute_shared_secret(receiver_pub)
+sender_secret # will match receiver secret
+```
+
+```python
+encrypted_email = encrypt(email_msg, sender_secret)
+encrypted_email
+```
+
+```python
+receiver_secret = receiver_priv.compute_shared_secret(sender_pub)
+
+# this works because the receiver_secret matches the sender_secret (hence, shared secret)
+decrypted_email = decrypt(encrypted_email, receiver_secret)
+print(decrypted_email)
+```
+
+## TOTP
+
+We may use a different key for each message by concatonating the shared secret with a time stamp and hashing the result. This is known as a [time-based on-time password](https://en.wikipedia.org/wiki/Time-based_one-time_password) (TOTP) and is familiar to anyone who has used [google authenticator](https://googleauthenticator.net/). The time used would be the time the email was sent. The epoch needs to be large enough for the mail servers to route the message.
+
+It might also help to use the latest block hash as the time stamp.
+
+This approach may provide some additional security benefit, such as mitigating replay attacks or preventing emails from being sent from the future.
+
+```python
+from cryptography.hazmat.primitives import hashes
+```
+
+```python
+def sha256(message):
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(message.encode())
+    digest.update(b"123")
+    return digest.finalize()
+```
+
+```python
+def hash_concat(key, value):
+    """concatonates a message with a value and returns the hash"""
+    key_str = base64.urlsafe_b64encode(key).decode('ascii')
+    return sha256(key_str + str(value))
+```
+
+Using the most recent bitcoin block
+
+```python
+latest_block_hash = '000000000000000000065a582c53ef20e5ae37b74844b31bfcbd82f4c515fdb2'
+```
+
+```python
+epoch_value = latest_block_hash
+assert sender_secret == receiver_secret
+
+print(decrypt(encrypt(email_msg,
+                      hash_concat(sender_secret, epoch_value)),
+              hash_concat(receiver_secret, epoch_value)) # 
+    )
 ```
 
 ```python

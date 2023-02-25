@@ -14,6 +14,12 @@ This application can use any email server for delivery.
 
 
 
+### Requirements
+
+* secp256k1 https://pypi.org/project/secp256k1/
+* nostr https://pypi.org/project/nostr/
+
+
 ### secp256k1
 
 This library is maintained by rustyrussell https://github.com/rustyrussell/secp256k1-py 
@@ -79,10 +85,23 @@ from nostr.relay_manager import RelayManager
 from nostr.message_type import ClientMessageType
 ```
 
+## Text events
+From [NIP-01](https://github.com/nostr-protocol/nips/blob/master/01.md) there are three kinds of events
+
+* 0: set_metadata: the content is set to a stringified JSON object {name: <username>, about: <string>, picture: <url, string>} describing the user who created the event. A relay may delete past set_metadata events once it gets a new one for the same pubkey.
+* 1: text_note: the content is set to the plaintext content of a note (anything the user wants to say). Markdown links ([]() stuff) are not plaintext.
+* 2: recommend_server: the content is set to the URL (e.g., wss://somerelay.com) of a relay the event creator wants to recommend to its followers.
+
 ```python
-def get_events(author_hex):
+def get_events(author_hex, kind='text'):
     events = []
-    filters = Filters([Filter(authors=[author_hex], kinds=[EventKind.TEXT_NOTE])])
+    if kind == 'text':
+        kinds = [EventKind.TEXT_NOTE]
+    elif kind == 'meta':
+        kinds = [EventKind.SET_METADATA]
+    else:
+        raise NotImplementedError(f'{kind} events not supported')
+    filters = Filters([Filter(authors=[author_hex], kinds=kinds)])
     subscription_id = "some random str"
     request = [ClientMessageType.REQUEST, subscription_id]
     request.extend(filters.to_json_array())
@@ -100,22 +119,56 @@ def get_events(author_hex):
 
     while relay_manager.message_pool.has_events():
         event_msg = relay_manager.message_pool.get_event()
-        events.append(event_msg.event.content)
+        if kind == 'meta':
+            content = json.loads(event_msg.event.content)
+        else:
+            content = event_msg.event.content
+        events.append(content)
 
     relay_manager.close_connections()
     return events
 ```
 
 ```python
-get_events(node_hello_hex)
+text_hello = get_events(node_hello_hex, 'text')
+text_hello
 ```
+
+```python
+meta_hello = get_events(node_hello_hex, 'meta')
+meta_hello
+```
+
+```python
+import pandas as pd
+```
+
+```python
+pd.DataFrame(meta_hello)
+```
+
+hello is nip05 compliant, so we should be able to a get request to his server to verify his pub key
+
+```python
+import requests
+```
+
+```python
+result = requests.get('https://safier.com/.well-known/nostr.json?name=xenofun')
+```
+
+```python
+json.loads(result.content.decode('utf-8'))
+```
+
+The above response holds several other names, so this acts as a p2p registry!
 
 ```python
 hodl_hex = '1afe0c74e3d7784eba93a5e3fa554a6eeb01928d12739ae8ba4832786808e36d'
 ```
 
 ```python
-get_events(hodl_hex)
+pd.DataFrame(get_events(hodl_hex, 'meta'))
 ```
 
 ```python

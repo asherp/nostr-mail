@@ -6,6 +6,7 @@ dash
 hydra-core==1.2.0
 redmail==0.5.0
 gunicorn
+pandas
 
 # docs requirements
 mkdocs

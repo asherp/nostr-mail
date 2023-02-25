@@ -1,3 +1,4 @@
+* nip05 p2p registry
 
 # 2023-02-25 10:54:24.729659: clock-in
 

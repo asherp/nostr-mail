@@ -25,3 +25,24 @@ services:
       - --ip=0.0.0.0
       - --allow-root
     working_dir: /nostr-mail
+  email:
+    image: nostr-mail
+    ports:
+      - "8050:8050"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      TZ: ${TZ:-America/New_York}
+      DASH_DEBUG: "${DASH_DEBUG}"
+    volumes:
+      - type: bind
+        source: .
+        target: /nostrmail
+    container_name: nostr-mail
+    command:
+      - python
+      - -u
+      - dashboard.py
+    working_dir: /nostrmail/nostrmail
+

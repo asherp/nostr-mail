@@ -9,15 +9,15 @@ RUN pip3 install --no-binary :all: secp256k1
 
 RUN conda install jupyter jupytext
 
-COPY requirements.txt /rigly/requirements.txt
+COPY requirements.txt /nostrmail/requirements.txt
 
-RUN pip install -r /rigly/requirements.txt
+RUN pip install -r /nostrmail/requirements.txt
 
-# ADD . /nostr-mail
+ADD . /nostrmail
 
-# WORKDIR /nostr-mail
+WORKDIR /nostrmail
 
-# # RUN pip install -e .
+RUN pip install -e .
 
 # # CMD ["nostr-mail"]
 

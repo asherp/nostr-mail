@@ -1,3 +1,4 @@
+* installable package, basic email gui
 
 # 2023-02-26 20:41:38.192299: clock-in
 

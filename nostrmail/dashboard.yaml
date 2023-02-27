@@ -1,0 +1,253 @@
+
+import:
+  dcc: dash.dcc
+  html: dash.html
+  dbc: dash_bootstrap_components
+  daq: dash_daq
+
+external_stylesheets:
+  - https://codepen.io/chriddyp/pen/bWLwgP.css
+  - https://www.w3schools.com/w3css/4/w3.css
+  - https://cdn.jsdelivr.net/npm/bootswatch@5.1.3/dist/slate/bootstrap.min.css
+  - https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css
+
+external_scripts:
+  - https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.4/MathJax.js?config=TeX-MML-AM_CHTML
+
+app:
+  dash.Dash:
+    external_stylesheets: ${external_stylesheets}
+    external_scripts: ${external_scripts}
+    title: nostrmail
+    suppress_callback_exceptions: False
+
+app.run_server:
+  host: '0.0.0.0'
+  port: 8050
+  # ssl_context: adhoc
+  # ssl_context:
+  #   - cert.pem
+  #   - key.pem
+  extra_files:
+    - dashboard.yaml
+    - dashboard.py
+    - callbacks.py
+  debug: True # ${oc.env:DASH_DEBUG}
+
+
+
+header:
+  html.Div:
+    children:
+    - dbc.NavbarSimple:
+        children:
+          # - dbc.NavItem:
+          #     children:
+          #       dbc.NavLink:
+          #         id: logout-link
+          #         children: Logout
+          #         href: '/'
+        brand: NostrMail
+        brand_href: https://github.com/asherp
+        color: primary
+        dark: True
+    - html.Br:
+    - html.H2: Main page
+    - dcc.Markdown:
+        id: markdown-content
+        children: Welcome to nostr-mail!
+        dangerously_allow_html: True
+        dedent: False
+
+
+email_header:
+  dbc.Card:
+    body: True
+    children:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+            - dbc.Label: "From:"
+        - dbc.Col:
+            width: 3
+            children:
+            - dbc.FormFloating:
+                children:
+                - dbc.Input:
+                    type: email
+                    id: email-from
+                    placeholder: someone@tld.com
+                    value: ''
+                    required: True
+                - dbc.Label: Email
+        - dbc.Col:
+            width: 3
+            children:
+            - dbc.FormFloating:
+                children:
+                - dbc.Input:
+                    type: password
+                    id: email-password
+                    placeholder:
+                    value: ''
+                    required: True
+                - dbc.Label: Password
+        - dbc.Col:
+            width:
+              size: 2
+            children:
+            - dbc.Switch:
+                id: email-type
+                value: False # False for test email
+        - dbc.Col:
+            width:
+              size: 2
+              offset: 1
+            children:
+            - dbc.Button:
+                id: send-email
+                children: Send
+                color: success
+                n_clicks: 0
+                className: me-1
+            - dbc.Modal:
+                id: send-popup
+                is_open: False
+                children:
+                  - dbc.ModalHeader:
+                      children:
+                        - dbc.ModalTitle: Header
+                  - dbc.ModalBody:
+                      id: email-status
+                  - dbc.ModalFooter:
+                      children:
+                        - dbc.Button:
+                            children: close
+                            id: close-send
+                            className: ms-auto
+                            n_clicks: 0
+    - html.Br:       
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+            - dbc.Label: "To:"
+        - dbc.Col:
+            width: 6
+            children:
+            - dbc.FormFloating:
+                children:
+                - dbc.Input:
+                    type: email
+                    id: customer-email-address-send
+                    placeholder: customer.email@tld.com
+                    required: True
+                - dbc.Label: "Receiving address"
+        - dbc.Col:
+            width:
+              size: 3
+            children:
+            # - html.Div:
+            #     id: email-status
+            - dbc.Tooltip:
+                id: send-email-tooltip
+                target: send-email
+    - html.Br:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+            - dbc.Label: "Cc:"
+        - dbc.Col:
+            width: 6
+            children:
+            - dbc.FormFloating:
+                children:
+                - dbc.Input:
+                    type: email
+                    id: cc-email-address-send
+                    placeholder: someone@tld.com
+                    value: ''
+                - dbc.Label: Carbon Copy
+    - html.Br:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+            - dbc.Label: "Bcc:"
+        - dbc.Col:
+            width: 6
+            children:
+            - dbc.FormFloating:
+                children:
+                - dbc.Input:
+                    type: email
+                    id: bcc-email-address-send
+                    placeholder: someone@tld.com
+                    value: ''
+                - dbc.Label: Blind Carbon Copy
+
+email_subject:
+  dbc.Card:
+    body: True
+    children:
+    - html.Br:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+            - dbc.Label: "Subject:"
+        - dbc.Col:
+            width: 6
+            children:
+            - dbc.FormFloating:
+                children:
+                - dbc.Input:
+                    type: text
+                    id: customer-email-subject-send
+                    placeholder: subject text
+                    required: True
+                - dbc.Label: Subject text
+
+email_body:
+  dbc.Card:
+    body: True
+    children:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+            - dbc.Label: "Body:"
+        - dbc.Col:
+            width: 10
+            children:
+            - dbc.Textarea:
+                id: email-body-send
+                disabled: False
+                rows: 10
+                size: md
+                style:
+                  height: 600
+                spellCheck: True
+layout:
+  dbc.Container:
+    children:
+    - html.Br:
+    - ${header}
+    - ${email_header}
+    - html.Br:
+    - ${email_subject}
+    - html.Br:
+    - ${email_body}
+
+
+
+
+

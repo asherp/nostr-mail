@@ -1,3 +1,6 @@
+* adding credentials, settings
+* sidebar example https://dash-bootstrap-components.opensource.faculty.ai/examples/simple-sidebar/
+* configuring smtp https://red-mail.readthedocs.io/en/stable/tutorials/client.html#config-smtp
 
 # 2023-03-01 19:12:17.414119: clock-in
 

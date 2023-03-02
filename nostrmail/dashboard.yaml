@@ -41,12 +41,12 @@ header:
     children:
     - dbc.NavbarSimple:
         children:
-          # - dbc.NavItem:
-          #     children:
-          #       dbc.NavLink:
-          #         id: logout-link
-          #         children: Logout
-          #         href: '/'
+          - dbc.NavItem:
+              children:
+                # dbc.NavLink:
+                #   id: settings-button
+                #   children: Settings
+                #   href: '/'
         brand: NostrMail
         brand_href: https://github.com/asherp
         color: primary
@@ -81,19 +81,8 @@ email_header:
                     placeholder: someone@tld.com
                     value: ''
                     required: True
+                    disabled: True
                 - dbc.Label: Email
-        - dbc.Col:
-            width: 3
-            children:
-            - dbc.FormFloating:
-                children:
-                - dbc.Input:
-                    type: password
-                    id: email-password
-                    placeholder:
-                    value: ''
-                    required: True
-                - dbc.Label: Password
         - dbc.Col:
             width:
               size: 2
@@ -155,6 +144,7 @@ email_header:
             - dbc.Tooltip:
                 id: send-email-tooltip
                 target: send-email
+                children: Sends an encrypted nostr email
     - html.Br:
     - dbc.Row:
         children:
@@ -236,18 +226,128 @@ email_body:
                 style:
                   height: 600
                 spellCheck: True
+
+
+
+settings:
+  - html.Br:
+  - dbc.Card:
+      body: True
+      children:
+      - dbc.Form:
+          children:
+          - dbc.Row:
+              className: mb-3
+              children:
+              - dbc.Label: Credentials
+              - dbc.Col:
+                  width: 4
+                  children:
+                  - dbc.FormFloating:
+                      children:
+                      - dbc.Input:
+                          type: email
+                          id: user-email
+                          placeholder: Enter email
+                      - dbc.Label:
+                          children: Email
+              - dbc.Col:
+                  width: 4
+                  children:
+                  - dbc.FormFloating:
+                      children:
+                      - dbc.Input:
+                          type: password
+                          id: user-password
+                          placeholder: Enter Password
+                      - dbc.Label:
+                          children: Password
+                          html_for: user-password
+          - dbc.Row:
+              className: mb-3
+              children:
+              - dbc.Label: SMTP
+              - dbc.Col:
+                  width: 4
+                  children:
+                  - dbc.FormFloating:
+                      children:
+                      - dbc.Input:
+                          type: text
+                          id: smtp-host
+                          placeholder: smtp.example.com
+                      - dbc.Label:
+                          children: Host
+                          html_for: smtp-host
+              - dbc.Col:
+                  width: 4
+                  children:
+                  - dbc.FormFloating:
+                      children:
+                      - dbc.Input:
+                          type: number
+                          id: smtp-port
+                          value: 2525
+                      - dbc.Label:
+                          children: Port
+                          html_for: smtp-port
+
+
 layout:
   dbc.Container:
     children:
     - html.Br:
     - ${header}
-    - ${email_header}
-    - html.Br:
-    - ${email_subject}
-    - html.Br:
-    - ${email_body}
+    - dbc.Tabs:
+        id: page
+        active_tab: compose
+        children:
+        - dbc.Tab:
+            tab_id: contacts
+            label: Contacts
+            children: Contacts
+        - dbc.Tab:
+            tab_id: inbox
+            label: Inbox
+            children: Inbox content
+        - dbc.Tab:
+            tab_id: settings
+            label: Settings
+            children: ${settings}
+        - dbc.Tab:
+            tab_id: compose
+            label: Compose
+            children:
+            - html.Br:
+            - ${email_header}
+            - html.Br:
+            - ${email_subject}
+            - html.Br:
+            - ${email_body}
+    - html.Div:
+        id: debug-email
 
 
+callbacks:
+  update_email_from:
+    input:
+      - id: user-email
+        attr: value
+    output:
+      - id: email-from
+        attr: value
+    callback: callbacks.pass_through
 
-
+  email_send:
+    input:
+      - id: user-email
+        attr: value
+      - id: user-password
+        attr: value
+      - id: send-email
+        attr: n_clicks
+    output:
+      - id: debug-email
+        attr: children
+    callback: callbacks.send_mail
 

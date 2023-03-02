@@ -1,3 +1,6 @@
+
+# 2023-03-01 19:12:17.414119: clock-in
+
 # 2023-02-27 18:30:14.616845: clock-out
 
 * reading email in python https://www.thepythoncode.com/article/reading-emails-in-python

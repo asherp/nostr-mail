@@ -1,3 +1,6 @@
+
+# 2023-03-05 19:13:13.083170: clock-in
+
 # 2023-03-01 20:53:56.066092: clock-out
 
 * adding credentials, settings

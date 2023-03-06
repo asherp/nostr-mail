@@ -11,6 +11,7 @@ services:
     environment:
       TZ: ${TZ:-America/New_York}
       DASH_DEBUG: "${DASH_DEBUG}"
+      NOSTR_PRIV_KEY: ${NOSTR_PRIV_KEY}
     volumes:
       - type: bind
         source: .

@@ -28,6 +28,8 @@ Check that we can import
 
 ### priv/pub key generation
 
+Use this to set your private key as an environment variable. Store it in your local .env so the container can pick it up on load.
+
 ```python
 from nostr.key import PrivateKey
 
@@ -35,6 +37,25 @@ private_key = PrivateKey()
 public_key = private_key.public_key
 print(f"Private key: {private_key.bech32()}")
 print(f"Public key: {public_key.bech32()}")
+```
+
+<!-- #region -->
+Copy and the above private key into `.env` at the root of this repo.
+
+```sh
+NOSTR_PRIV_KEY=<priv key here>
+```
+<!-- #endregion -->
+
+```python
+import os
+```
+
+```python
+try:
+    priv_key = os.environ['NOSTR_PRIV_KEY']
+except KeyError:
+    raise KeyError('Please set environment variable NOSTR_PRIV_KEY')
 ```
 
 ```python
@@ -264,6 +285,85 @@ print(decrypt(encrypt(email_msg,
                       hash_concat(sender_secret, epoch_value)),
               hash_concat(receiver_secret, epoch_value)) # 
     )
+```
+
+## Direct Message
+
+Test delivery of the email subject via dm
+
+```python
+import os
+```
+
+```python
+try:
+    priv_key_str = os.environ['NOSTR_PRIV_KEY']
+except KeyError:
+    raise KeyError('Please set environment variable NOSTR_PRIV_KEY')
+```
+
+```python
+from nostr.key import PrivateKey
+```
+
+Confirm that we can create a valid priv key from the one provided
+
+```python
+priv_key = PrivateKey.from_nsec(priv_key_str)
+assert priv_key.bech32() == priv_key_str
+```
+
+```python
+pub_key = priv_key.public_key
+pub_key_hex = pub_key.hex()
+pub_key_hex
+```
+
+### Try connecting to Damus
+
+```python
+import json 
+import ssl
+import time
+from nostr.event import Event
+from nostr.relay_manager import RelayManager
+from nostr.message_type import ClientMessageType
+from nostr.key import PrivateKey
+
+relay_manager = RelayManager()
+relay_manager.add_relay("wss://nostr-pub.wellorder.net")
+relay_manager.add_relay("wss://relay.damus.io")
+relay_manager.open_connections({"cert_reqs": ssl.CERT_NONE}) # NOTE: This disables ssl certificate verification
+time.sleep(1.25) # allow the connections to open
+```
+
+```python
+event = Event(pub_key_hex, "Hello there")
+```
+
+```python
+priv_key.sign_event(event)
+```
+
+```python
+assert event.verify() # checks signature on event
+```
+
+```python
+relay_manager.publish_event(event)
+time.sleep(1) # allow the messages to send
+
+relay_manager.close_connections()
+```
+
+### fetch event for your pub key
+
+```python
+from nostrmail.utils import get_events
+```
+
+```python
+get_events(pub_key_hex)
 ```
 
 ```python

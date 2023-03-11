@@ -432,6 +432,16 @@ pk = mine_vanity_key('rigly')
 %autoreload 2
 ```
 
+## Address book
+
+```python
+from omegaconf import OmegaConf
+```
+
+```python
+OmegaConf.load('address_book.yaml')
+```
+
 ```python
 
 ```

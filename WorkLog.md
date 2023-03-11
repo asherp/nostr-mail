@@ -1,3 +1,4 @@
+* switch from Fernet to nostr encryption scheme
 
 # 2023-03-11 13:28:19.085627: clock-in
 

@@ -12,6 +12,7 @@ from nostr.filter import Filter, Filters
 from nostr.event import Event, EventKind
 from nostr.relay_manager import RelayManager
 from nostr.message_type import ClientMessageType
+import requests
 
 def get_events(author_hex, kind='text'):
     events = []

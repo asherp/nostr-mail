@@ -121,25 +121,25 @@ import requests
 ### Nip05 validation
 
 ```python
-from json import JSONDecodeError
+from nostrmail.utils import validate_nip05
 ```
 
 ```python
-JSONDecodeError?
+from json import JSONDecodeError
 ```
 
 ```python
 validate_nip05(node_hello_hex) # returns the name of this user according to their .com
 ```
 
-```python
-validate_nip05(hodl_hex)
-```
-
 Hello Jessica's nip05 contains several other names, so this acts as a p2p registry!
 
 ```python
 hrh_hex = 'ae4efa502bf1cb7dd63343ae4bc7bd0a599c5251c686c9ebd3b5f0d4f841a939'
+```
+
+```python
+bytes(b"\x02")
 ```
 
 ```python
@@ -179,17 +179,53 @@ print('shared secret validated!')
 ## Encryption
 
 
-We use [Fernet encryption](https://cryptography.io/en/latest/fernet/#fernet-symmetric-encryption) available from the cryptography package. Fernet encryption is a form of symmetric encryption, meaning the same key may be used to encrypt and decrypt a message.
+nostr-python already uses AES 256 (?) encryption. More on the encryption scheme can be found here https://github.com/jeffthibault/python-nostr/blob/37cb66ba2d3968b2d75cc8ad71c3550415ca47fe/nostr/key.py#L69
+
+<!-- #region -->
+```python
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import secrets
+iv = secrets.token_bytes(16)
+cipher = Cipher(algorithms.AES(self.compute_shared_secret(public_key_hex)), modes.CBC(iv))
+```
+<!-- #endregion -->
+
+```python
+help(priv_key1.encrypt_message)
+```
+
+```python
+help(priv_key2.decrypt_message)
+```
+
+```python
+clear_message = 'hello there'
+
+encrypted_msg = priv_key1.encrypt_message(clear_message, pub_key2.hex())
+encrypted_msg
+```
+
+```python
+assert priv_key2.decrypt_message(encrypted_msg, pub_key1.hex()) == clear_message
+```
+
+This approach uses the key pairs alone. There is no timing information included.
+
+
+## Fernet encryption
+
+
+We could also use [Fernet encryption](https://cryptography.io/en/latest/fernet/#fernet-symmetric-encryption) available from the cryptography package. Fernet encryption is a form of symmetric encryption, meaning the same key may be used to encrypt and decrypt a message.
 
 ```python
 from cryptography.fernet import Fernet, InvalidToken
 import base64
 
-def get_fernet(key_str):
-    if isinstance(key_str, str):
-        fernet_key = base64.urlsafe_b64encode(bytes(key_str.ljust(32).encode()))
+def get_fernet(key):
+    if isinstance(key, str):
+        fernet_key = base64.urlsafe_b64encode(bytes(key.ljust(32).encode()))
     else:
-        fernet_key = base64.urlsafe_b64encode(key_str)
+        fernet_key = base64.urlsafe_b64encode(key)
     return Fernet(fernet_key)
 
 
@@ -231,6 +267,21 @@ sender_secret = sender_priv.compute_shared_secret(receiver_pub)
 sender_secret # will match receiver secret
 ```
 
+<!-- #region -->
+`python-nostr/key.py`
+```python
+def compute_shared_secret(self, public_key_hex: str) -> bytes:
+        pk = secp256k1.PublicKey(bytes.fromhex("02" + public_key_hex), True)
+        return pk.ecdh(self.raw_secret, hashfn=copy_x)
+```
+
+The shared secret is the result of applying Eliptic Curve Diffe Hellman, so it should return a point on the elliptic curve (which is just another public key)
+<!-- #endregion -->
+
+```python
+sender_secret # can turn into hex encoded str
+```
+
 ```python
 encrypted_email = encrypt(email_msg, sender_secret)
 encrypted_email
@@ -246,7 +297,7 @@ print(decrypted_email)
 
 ## TOTP
 
-We may use a different key for each message by concatonating the shared secret with a time stamp and hashing the result. This is known as a [time-based on-time password](https://en.wikipedia.org/wiki/Time-based_one-time_password) (TOTP) and is familiar to anyone who has used [google authenticator](https://googleauthenticator.net/). The time used would be the time the email was sent. The epoch needs to be large enough for the mail servers to route the message.
+We may use a different key for each message by concatonating the shared secret with a time stamp and hashing the result. This is known as a [time-based on-time password](https://en.wikipedia.org/wiki/Time-based_one-time_password) (TOTP) and should already be familiar to anyone who has used [google authenticator](https://googleauthenticator.net/). The time used would be the time the email was sent. The epoch needs to be large enough for the mail servers to route the message.
 
 It might also help to use the latest block hash as the time stamp.
 
@@ -266,7 +317,9 @@ def sha256(message):
 
 ```python
 def hash_concat(key, value):
-    """concatonates a message with a value and returns the hash"""
+    """concatonates a message with a value and returns the hash
+    key - a binary
+    """
     key_str = base64.urlsafe_b64encode(key).decode('ascii')
     return sha256(key_str + str(value))
 ```
@@ -282,7 +335,7 @@ epoch_value = latest_block_hash
 assert sender_secret == receiver_secret
 
 print(decrypt(encrypt(email_msg,
-                      hash_concat(sender_secret, epoch_value)),
+                      hash_concat(sender_secret, latest_block_hash)),
               hash_concat(receiver_secret, epoch_value)) # 
     )
 ```
@@ -364,6 +417,19 @@ from nostrmail.utils import get_events
 
 ```python
 get_events(pub_key_hex)
+```
+
+```python
+from nostr.key import mine_vanity_key
+```
+
+```python
+pk = mine_vanity_key('rigly')
+```
+
+```python
+%load_ext autoreload
+%autoreload 2
 ```
 
 ```python

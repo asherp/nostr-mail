@@ -427,19 +427,48 @@ from nostr.key import mine_vanity_key
 pk = mine_vanity_key('rigly')
 ```
 
-```python
-%load_ext autoreload
-%autoreload 2
-```
-
 ## Address book
 
 ```python
 from omegaconf import OmegaConf
+import pandas as pd
+import dash_bootstrap_components as dbc
 ```
 
 ```python
-OmegaConf.load('address_book.yaml')
+from nostrmail.utils import load_contacts
+```
+
+```python
+
+load_contacts()
+```
+
+```python
+def update_contacts_table(url):
+    contacts = load_contacts()
+    table = dbc.Table.from_dataframe(contacts, index=True)
+    return table.children
+```
+
+## load user profile
+
+```python
+from nostr.relay_manager import RelayManager
+
+```
+
+```python
+help(RelayManager.close_connections)
+```
+
+```python
+help(RelayManager.open_connections)
+```
+
+```python
+%load_ext autoreload
+%autoreload 2
 ```
 
 ```python

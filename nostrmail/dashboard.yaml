@@ -293,19 +293,90 @@ settings:
                           html_for: smtp-port
 
 
+contacts:
+  dbc.Card:
+    body: True
+    children:
+    - dcc.Store:
+        id: contacts
+    - dcc.Store:
+        id: contact-profile
+    - dbc.Row:
+        children:
+          - dbc.Col:
+              width:
+                size: 2
+                offset: 1
+              children:
+              - dcc.Dropdown:
+                  id: contacts-select
+                  clearable: False
+          - dbc.Col:
+              width: 5
+              children:
+              - dbc.Card:
+                  children:
+                  - dbc.CardImg:
+                      top: True
+                      id: contact-image
+                      src:
+                  - dbc.CardBody:
+                      children:
+                      - html.H4:
+                          children: Card title
+                          className: card-title
+                          id: contact-profile-title
+                      - html.P:
+                          id: contact-profile-about
+                          children: Some example profile text
+                          className: card-text
+
+        # dbc.CardImg(src="/static/images/placeholder286x180.png", top=True),
+        # dbc.CardBody(
+        #     [
+        #         html.H4("Card title", className="card-title"),
+        #         html.P(
+        #             "Some quick example text to build on the card title and "
+        #             "make up the bulk of the card's content.",
+        #             className="card-text",
+        #         ),
+        #         dbc.Button("Go somewhere", color="primary"),
+        #     ]
+        # ),
+
+    - html.Br:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width:
+              size: 10
+              offset: 1
+            children:
+            - dbc.Table:
+                id: contacts-table
+                striped: True
+                bordered: True
+                hover: True
+                color: dark
+    - html.Div:
+        id: selected-contact
+
 layout:
   dbc.Container:
     children:
+    - dcc.Location:
+        id: url
     - html.Br:
     - ${header}
     - dbc.Tabs:
         id: page
-        active_tab: compose
+        active_tab: contacts
         children:
         - dbc.Tab:
             tab_id: contacts
             label: Contacts
-            children: Contacts
+            children:
+              - ${contacts}
         - dbc.Tab:
             tab_id: inbox
             label: Inbox
@@ -329,6 +400,69 @@ layout:
 
 
 callbacks:
+  update_contacts_store:
+    input:
+      - id: url
+        attr: pathname
+    output:
+      - id: contacts
+        attr: data
+    callback: callbacks.update_contacts
+
+  update_contacts_options:
+    input:
+      - id: contacts
+        attr: data
+    output:
+      - id: contacts-select
+        attr: options
+    callback: callbacks.update_contacts_options
+
+  update_contact_profile:
+    input:
+      - id: contacts-select
+        attr: value
+    state:
+      - id: contacts
+        attr: data
+    output:
+      - id: contact-profile
+        attr: data
+    callback: callbacks.update_contact_profile
+
+  render_contact_profile:
+    input:
+      - id: contact-profile
+        attr: data
+    output:
+      - id: contact-image
+        attr: src
+      - id: contact-profile-title
+        attr: children
+      - id: contact-profile-about
+        attr: children
+    callback: callbacks.render_contact_profile
+
+  update_contacts_table:
+    input:
+      - id: contacts
+        attr: data
+    output:
+      - id: contacts-table
+        attr: children
+    callback: callbacks.update_contacts_table
+
+
+  update_selected_contact:
+    input:
+      - id: contacts-table
+        attr: hover
+    output:
+      - id: selected-contact
+        attr: children
+    callback: callbacks.pass_through
+
+
   update_email_from:
     input:
       - id: user-email

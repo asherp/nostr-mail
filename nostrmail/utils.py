@@ -13,8 +13,21 @@ from nostr.event import Event, EventKind
 from nostr.relay_manager import RelayManager
 from nostr.message_type import ClientMessageType
 import requests
+from omegaconf import OmegaConf
+import pandas as pd
+import os
 
-def get_events(author_hex, kind='text'):
+nostr_contacts = os.environ['NOSTR_CONTACTS']
+
+relays = OmegaConf.load(nostr_contacts).relays
+
+
+def get_events(author_hex, kind='text', relays=relays):
+    relay_manager = RelayManager()
+
+    for relay in relays:
+        relay_manager.add_relay(relay)
+
     events = []
     if kind == 'text':
         kinds = [EventKind.TEXT_NOTE]
@@ -27,9 +40,7 @@ def get_events(author_hex, kind='text'):
     request = [ClientMessageType.REQUEST, subscription_id]
     request.extend(filters.to_json_array())
 
-    relay_manager = RelayManager()
-    relay_manager.add_relay("wss://nostr-pub.wellorder.net")
-    relay_manager.add_relay("wss://relay.damus.io")
+
     relay_manager.add_subscription(subscription_id, filters)
     relay_manager.open_connections({"cert_reqs": ssl.CERT_NONE}) # NOTE: This disables ssl certificate verification
     time.sleep(1.25) # allow the connections to open
@@ -48,6 +59,7 @@ def get_events(author_hex, kind='text'):
 
     relay_manager.close_connections()
     return events
+
 
 def validate_nip05(hex_name):
     meta = get_events(hex_name, 'meta')
@@ -78,3 +90,9 @@ def validate_nip05(hex_name):
         raise NameError('nip05 data does not contain names')
     
     return result
+
+
+def load_contacts(contacts_file=nostr_contacts):
+    cfg = OmegaConf.load(contacts_file)
+    return OmegaConf.to_container(cfg.contacts)
+

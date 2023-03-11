@@ -1,3 +1,4 @@
+* rendering contacts profile
 
 # 2023-03-11 15:37:57.782640: clock-in
 

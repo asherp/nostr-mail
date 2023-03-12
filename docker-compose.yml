@@ -13,6 +13,8 @@ services:
       DASH_DEBUG: "${DASH_DEBUG}"
       NOSTR_PRIV_KEY: ${NOSTR_PRIV_KEY}
       NOSTR_CONTACTS: "${NOSTR_CONTACTS}"
+      PRIV_KEY_ALICE: "${PRIV_KEY_ALICE}"
+      PRIV_KEY_BOB: "${PRIV_KEY_BOB}"
     volumes:
       - type: bind
         source: .

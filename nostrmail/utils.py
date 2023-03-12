@@ -22,7 +22,7 @@ nostr_contacts = os.environ['NOSTR_CONTACTS']
 relays = OmegaConf.load(nostr_contacts).relays
 
 
-def get_events(author_hex, kind='text', relays=relays):
+def get_events(author_hex, kind='text', relays=relays, returns='content'):
     relay_manager = RelayManager()
 
     for relay in relays:
@@ -51,10 +51,15 @@ def get_events(author_hex, kind='text', relays=relays):
 
     while relay_manager.message_pool.has_events():
         event_msg = relay_manager.message_pool.get_event()
-        if kind == 'meta':
-            content = json.loads(event_msg.event.content)
+        if returns == 'content':
+            if kind == 'meta':
+                content = json.loads(event_msg.event.content)
+            else:
+                content = event_msg.event.content
+        elif returns == 'event':
+            content = event_msg.event
         else:
-            content = event_msg.event.content
+            raise NotImplementedError(f"{returns} returns option not supported, options are 'event' or 'content'")
         events.append(content)
 
     relay_manager.close_connections()

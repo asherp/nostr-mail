@@ -14,7 +14,9 @@ services:
       NOSTR_PRIV_KEY: ${NOSTR_PRIV_KEY}
       NOSTR_CONTACTS: "${NOSTR_CONTACTS}"
       PRIV_KEY_ALICE: "${PRIV_KEY_ALICE}"
+      EMAIL_ALICE: "${EMAIL_ALICE}"
       PRIV_KEY_BOB: "${PRIV_KEY_BOB}"
+      EMAIL_BOB: "${EMAIL_BOB}"
     volumes:
       - type: bind
         source: .

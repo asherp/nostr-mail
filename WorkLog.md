@@ -1,3 +1,4 @@
+* publish alice and bob profiles
 
 # 2023-03-11 22:08:11.340599: clock-in
 

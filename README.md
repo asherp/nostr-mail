@@ -355,13 +355,10 @@ except KeyError:
     raise KeyError('Please set environment variable NOSTR_PRIV_KEY')
 ```
 
-```python
-from nostr.key import PrivateKey
-```
-
 Confirm that we can create a valid priv key from the one provided
 
 ```python
+from nostr.key import PrivateKey
 priv_key = PrivateKey.from_nsec(priv_key_str)
 assert priv_key.bech32() == priv_key_str
 ```
@@ -370,6 +367,10 @@ assert priv_key.bech32() == priv_key_str
 pub_key = priv_key.public_key
 pub_key_hex = pub_key.hex()
 pub_key_hex
+```
+
+```python
+pub_key.bech32()
 ```
 
 ### Try connecting to Damus
@@ -440,7 +441,6 @@ from nostrmail.utils import load_contacts
 ```
 
 ```python
-
 load_contacts()
 ```
 
@@ -451,19 +451,128 @@ def update_contacts_table(url):
     return table.children
 ```
 
-## load user profile
+## create user profile
 
 ```python
+try:
+    priv_key_str = os.environ['NOSTR_PRIV_KEY']
+except KeyError:
+    raise KeyError('Please set environment variable NOSTR_PRIV_KEY')
+```
+
+```python
+priv_key = PrivateKey.from_nsec(priv_key_str)
+assert priv_key.bech32() == priv_key_str
+```
+
+## Generate Alice profile
+
+```python
+import os
+```
+
+```python
+from nostr.event import EventKind
+from nostr.key import PrivateKey
+from nostr.event import Event
 from nostr.relay_manager import RelayManager
+import json
+import ssl
 
+alice_priv_key_str = os.environ['PRIV_KEY_ALICE']
+alice_email = os.environ['EMAIL_ALICE']
+alice_priv_key = PrivateKey.from_nsec(alice_priv_key_str)
+assert alice_priv_key.bech32() == alice_priv_key_str
 ```
 
 ```python
-help(RelayManager.close_connections)
+import time
 ```
 
 ```python
-help(RelayManager.open_connections)
+from nostrmail.utils import relays
+```
+
+```python
+def publish_profile(priv_key, profile_dict):
+    relay_manager = RelayManager()
+
+    for relay in relays:
+        relay_manager.add_relay(relay)
+    relay_manager.open_connections({"cert_reqs": ssl.CERT_NONE}) # NOTE: This disables ssl certificate verification
+    print('waiting 1.5 sec to open')
+    time.sleep(1.5)
+    
+    event_profile = Event(priv_key.public_key.hex(),
+                          json.dumps(profile_dict),
+                          kind=EventKind.SET_METADATA)
+    priv_key.sign_event(event_profile)
+    
+    # check signature
+    assert event_profile.verify()
+    relay_manager.publish_event(event_profile)
+    print('waiting 1 sec to send')
+    time.sleep(1) # allow the messages to send
+
+    relay_manager.close_connections()
+    return event_profile.signature
+```
+
+```python
+alice_profile = dict(display_name='Alice',
+              name='alice',
+              about='my name is Alice..',
+              email=alice_email)
+```
+
+```python
+sig = publish_profile(alice_priv_key, alice_profile)
+```
+
+```python
+sig
+```
+
+Verify that profile was published
+
+```python
+from nostrmail.utils import get_events
+```
+
+```python
+alice_profile_remote = get_events(alice_priv_key.public_key.hex(), 'meta')[0]
+```
+
+```python
+assert alice_profile_remote['email'] == alice_email
+```
+
+### Publish Bob's profile
+
+```python
+bob_priv_key_str = os.environ['PRIV_KEY_BOB']
+bob_email = os.environ['EMAIL_BOB']
+bob_priv_key = PrivateKey.from_nsec(bob_priv_key_str)
+assert bob_priv_key.bech32() == bob_priv_key_str
+```
+
+```python
+bob_profile = dict(display_name='Bob',
+              name=bob_email,
+              about="I am the one they call Bob",
+              email='apembroke+bob@gmail.com')
+```
+
+```python
+sig = publish_profile(bob_priv_key, bob_profile)
+```
+
+```python
+bob_profile_remote = get_events(bob_priv_key.public_key.hex(), 'meta')[0]
+```
+
+```python
+assert bob_profile_remote['email'] == bob_email
 ```
 
 ```python

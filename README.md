@@ -547,6 +547,10 @@ alice_profile_remote = get_events(alice_priv_key.public_key.hex(), 'meta')[0]
 assert alice_profile_remote['email'] == alice_email
 ```
 
+```python
+alice_profile_remote
+```
+
 ### Publish Bob's profile
 
 ```python
@@ -575,11 +579,47 @@ bob_profile_remote = get_events(bob_priv_key.public_key.hex(), 'meta')[0]
 assert bob_profile_remote['email'] == bob_email
 ```
 
+## search email by subject
+
 ```python
-%load_ext autoreload
-%autoreload 2
+import imaplib
+import email
 ```
 
 ```python
+import os
+```
 
+```python
+os.environ
+```
+
+```python
+# Set up connection to IMAP server
+mail = imaplib.IMAP4_SSL('imap.gmail.com')
+mail.login('username', 'password')
+mail.select('inbox')
+
+# Search for emails matching a specific subject
+result, data = mail.search(None, 'SUBJECT "Your Subject"')
+
+# Process the list of message IDs returned by the search
+for num in data[0].split():
+    # Fetch the email message by ID
+    result, data = mail.fetch(num, '(RFC822)')
+    raw_email = data[0][1]
+    # Convert raw email data into a Python email object
+    email_message = email.message_from_bytes(raw_email)
+    # Extract the email subject and print it
+    subject = email_message['Subject']
+    print(f"Email subject: {subject}")
+
+# Close the mailbox and logout from the IMAP server
+mail.close()
+mail.logout()
+```
+
+```python
+%load_ext autoreload
+%autoreload 2
 ```

@@ -17,6 +17,9 @@ services:
       EMAIL_ALICE: "${EMAIL_ALICE}"
       PRIV_KEY_BOB: "${PRIV_KEY_BOB}"
       EMAIL_BOB: "${EMAIL_BOB}"
+      EMAIL_USERNAME: "${EMAIL_USERNAME}"
+      EMAIL_PASSWORD: "${EMAIL_PASSWORD}"
+      EMAIL_IMAP: "${EMAIL_IMAP}"
     volumes:
       - type: bind
         source: .

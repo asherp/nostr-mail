@@ -490,37 +490,13 @@ import time
 ```
 
 ```python
-from nostrmail.utils import relays
-```
-
-```python
-def publish_profile(priv_key, profile_dict):
-    relay_manager = RelayManager()
-
-    for relay in relays:
-        relay_manager.add_relay(relay)
-    relay_manager.open_connections({"cert_reqs": ssl.CERT_NONE}) # NOTE: This disables ssl certificate verification
-    print('waiting 1.5 sec to open')
-    time.sleep(1.5)
-    
-    event_profile = Event(priv_key.public_key.hex(),
-                          json.dumps(profile_dict),
-                          kind=EventKind.SET_METADATA)
-    priv_key.sign_event(event_profile)
-    
-    # check signature
-    assert event_profile.verify()
-    relay_manager.publish_event(event_profile)
-    print('waiting 1 sec to send')
-    time.sleep(1) # allow the messages to send
-
-    relay_manager.close_connections()
-    return event_profile.signature
+from nostrmail.utils import relays, publish_profile
 ```
 
 ```python
 alice_profile = dict(display_name='Alice',
               name='alice',
+              picture='https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTV-0rZbgnQcRbDqbk0hHPLHPyHpqLJ8xkriA&usqp=CAU',
               about='my name is Alice..',
               email=alice_email)
 ```
@@ -561,10 +537,15 @@ assert bob_priv_key.bech32() == bob_priv_key_str
 ```
 
 ```python
+bob_priv_key.public_key.hex()
+```
+
+```python
 bob_profile = dict(display_name='Bob',
-              name=bob_email,
+              name='bob',
+              picture='https://cdnb.artstation.com/p/assets/images/images/030/065/923/large/in-house-media-bobgundisplay.jpg?1599501909',
               about="I am the one they call Bob",
-              email='apembroke+bob@gmail.com')
+              email=bob_email)
 ```
 
 ```python
@@ -579,6 +560,14 @@ bob_profile_remote = get_events(bob_priv_key.public_key.hex(), 'meta')[0]
 assert bob_profile_remote['email'] == bob_email
 ```
 
+```python
+bob_profile_remote
+```
+
+```python
+bob_priv_key.public_key.hex()
+```
+
 ## search email by subject
 
 ```python
@@ -591,17 +580,28 @@ import os
 ```
 
 ```python
-os.environ
+email_imap = os.environ['EMAIL_IMAP']
+```
+
+```python
+email_username = os.environ['EMAIL_USERNAME']
+```
+
+```python
+email_password = os.environ['EMAIL_PASSWORD']
 ```
 
 ```python
 # Set up connection to IMAP server
-mail = imaplib.IMAP4_SSL('imap.gmail.com')
-mail.login('username', 'password')
-mail.select('inbox')
+mail = imaplib.IMAP4_SSL(email_imap)
+mail.login(email_username, email_password)
+```
+
+```python
+mail.select('Inbox')
 
 # Search for emails matching a specific subject
-result, data = mail.search(None, 'SUBJECT "Your Subject"')
+result, data = mail.search(None, 'SUBJECT "Football"')
 
 # Process the list of message IDs returned by the search
 for num in data[0].split():
@@ -613,7 +613,13 @@ for num in data[0].split():
     # Extract the email subject and print it
     subject = email_message['Subject']
     print(f"Email subject: {subject}")
+```
 
+```python
+email_message['Subject']
+```
+
+```python
 # Close the mailbox and logout from the IMAP server
 mail.close()
 mail.logout()
@@ -622,4 +628,8 @@ mail.logout()
 ```python
 %load_ext autoreload
 %autoreload 2
+```
+
+```python
+
 ```

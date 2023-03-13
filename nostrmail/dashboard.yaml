@@ -29,10 +29,11 @@ app.run_server:
   #   - cert.pem
   #   - key.pem
   extra_files:
-    - dashboard.yaml
-    - dashboard.py
-    - callbacks.py
+    # - dashboard.yaml
+    # - dashboard.py
+    # - callbacks.py
   debug: True # ${oc.env:DASH_DEBUG}
+  dev_tools_hot_reload: False
 
 
 

@@ -101,3 +101,26 @@ def load_contacts(contacts_file=nostr_contacts):
     cfg = OmegaConf.load(contacts_file)
     return OmegaConf.to_container(cfg.contacts)
 
+
+def publish_profile(priv_key, profile_dict):
+    relay_manager = RelayManager()
+
+    for relay in relays:
+        relay_manager.add_relay(relay)
+    relay_manager.open_connections({"cert_reqs": ssl.CERT_NONE}) # NOTE: This disables ssl certificate verification
+    print('waiting 1.5 sec to open')
+    time.sleep(1.5)
+    
+    event_profile = Event(priv_key.public_key.hex(),
+                          json.dumps(profile_dict),
+                          kind=EventKind.SET_METADATA)
+    priv_key.sign_event(event_profile)
+    
+    # check signature
+    assert event_profile.verify()
+    relay_manager.publish_event(event_profile)
+    print('waiting 1 sec to send')
+    time.sleep(1) # allow the messages to send
+
+    relay_manager.close_connections()
+    return event_profile.signature

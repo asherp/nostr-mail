@@ -1,3 +1,4 @@
+* fetching email, profile pics
 
 # 2023-03-12 21:28:32.683363: clock-in
 

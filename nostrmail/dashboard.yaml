@@ -33,7 +33,7 @@ app.run_server:
     # - dashboard.py
     # - callbacks.py
   debug: True # ${oc.env:DASH_DEBUG}
-  dev_tools_hot_reload: False
+  dev_tools_hot_reload: True
 
 
 
@@ -55,7 +55,7 @@ header:
     - html.Br:
     - html.H2: Main page
     - dcc.Markdown:
-        id: markdown-content
+        id: welcome-msg
         children: Welcome to nostr-mail!
         dangerously_allow_html: True
         dedent: False
@@ -401,6 +401,15 @@ layout:
 
 
 callbacks:
+  update_username:
+    input:
+      - id: url
+        attr: pathname
+    output:
+      - id: welcome-msg
+        attr: children
+    callback: callbacks.get_username
+
   update_contacts_store:
     input:
       - id: url

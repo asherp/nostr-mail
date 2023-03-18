@@ -1,8 +1,10 @@
-from utils import load_contacts, get_events
+from utils import load_contacts, get_events, load_user_profile
 import dash_bootstrap_components as dbc
 import pandas as pd
 from dash.exceptions import PreventUpdate
 import json
+import os
+from nostr.key import PrivateKey
 
 def update_contacts(url):
     contacts = load_contacts()
@@ -49,4 +51,13 @@ def pass_through(*args):
 
 def send_mail(*args):
     return 'debug info'
+
+
+def get_username(url):
+    priv_key_nsec = os.environ['NOSTR_PRIV_KEY']
+    pub_key_hex = PrivateKey.from_nsec(priv_key_nsec).public_key.hex()
+    profile = load_user_profile(pub_key_hex)
+    name = profile['name']
+    return f"### Welcome, {name}!"
+
 

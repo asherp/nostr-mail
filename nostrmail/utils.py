@@ -4,6 +4,7 @@ import json
 import ssl
 import time
 from nostr.relay_manager import RelayManager
+from nostr.key import PrivateKey
 
 import json
 import ssl
@@ -124,3 +125,10 @@ def publish_profile(priv_key, profile_dict):
 
     relay_manager.close_connections()
     return event_profile.signature
+
+
+def load_user_profile(pub_key_hex):
+    profile_events = get_events(pub_key_hex, 'meta')
+    if len(profile_events) > 0:
+        return profile_events[0]
+

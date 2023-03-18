@@ -29,9 +29,9 @@ app.run_server:
   #   - cert.pem
   #   - key.pem
   extra_files:
-    # - dashboard.yaml
+    - dashboard.yaml
     # - dashboard.py
-    # - callbacks.py
+    - callbacks.py
   debug: True # ${oc.env:DASH_DEBUG}
   dev_tools_hot_reload: True
 
@@ -240,9 +240,38 @@ settings:
           - dbc.Row:
               className: mb-3
               children:
-              - dbc.Label: Credentials
+              - dbc.Label: Nostr Credentials
+              - dbc.Col:
+                  width:
+                    size: 4
+                  children:
+                  - dbc.FormFloating:
+                      children:
+                      - dbc.Input:
+                          type: password
+                          id: nostr-priv-key
+                          placeholder: Enter priv key
+                      - dbc.Label:
+                          children: Nostr Private Key
               - dbc.Col:
                   width: 4
+                  children:
+                  - dbc.FormFloating:
+                      children:
+                      - dbc.Input:
+                          type: text
+                          id: nostr-pub-key
+                          placeholder: Nostr Pub Key
+                          disabled: True
+                      - dbc.Label:
+                          children: Nostr Public Key
+          - dbc.Row:
+              className: mb-3
+              children:
+              - dbc.Label: Email Credentials
+              - dbc.Col:
+                  width:
+                    size: 4
                   children:
                   - dbc.FormFloating:
                       children:
@@ -269,7 +298,8 @@ settings:
               children:
               - dbc.Label: SMTP
               - dbc.Col:
-                  width: 4
+                  width:
+                    size: 4
                   children:
                   - dbc.FormFloating:
                       children:
@@ -293,6 +323,40 @@ settings:
                           children: Port
                           html_for: smtp-port
 
+
+profile:
+  dbc.Card:
+    body: True
+    children:
+    - dcc.Store:
+        id: profile-data
+    - html.Div:
+        id: profile-render
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 5
+            children:
+            - dbc.Card:
+                children:
+                - dbc.CardImg:
+                    top: True
+                    id: user-image
+                    src:
+                - dbc.CardBody:
+                    children:
+                    - html.H4:
+                        children: Card title
+                        className: card-title
+                        id: user-profile-title
+                    - html.P:
+                        id: user-profile-about
+                        children: Some example profile text
+                        className: card-text
+                    - dbc.Input:
+                        id: user-profile-email
+                        type: email
+                        disabled: True
 
 contacts:
   dbc.Card:
@@ -331,19 +395,11 @@ contacts:
                           id: contact-profile-about
                           children: Some example profile text
                           className: card-text
+                      - dbc.Input:
+                          id: contact-profile-email
+                          type: email
+                          disabled: True
 
-        # dbc.CardImg(src="/static/images/placeholder286x180.png", top=True),
-        # dbc.CardBody(
-        #     [
-        #         html.H4("Card title", className="card-title"),
-        #         html.P(
-        #             "Some quick example text to build on the card title and "
-        #             "make up the bulk of the card's content.",
-        #             className="card-text",
-        #         ),
-        #         dbc.Button("Go somewhere", color="primary"),
-        #     ]
-        # ),
 
     - html.Br:
     - dbc.Row:
@@ -374,6 +430,14 @@ layout:
         active_tab: contacts
         children:
         - dbc.Tab:
+            tab_id: settings
+            label: Settings
+            children: ${settings}
+        - dbc.Tab:
+            tab_id: profile
+            label: Profile
+            children: ${profile}
+        - dbc.Tab:
             tab_id: contacts
             label: Contacts
             children:
@@ -382,10 +446,6 @@ layout:
             tab_id: inbox
             label: Inbox
             children: Inbox content
-        - dbc.Tab:
-            tab_id: settings
-            label: Settings
-            children: ${settings}
         - dbc.Tab:
             tab_id: compose
             label: Compose
@@ -401,15 +461,59 @@ layout:
 
 
 callbacks:
-  update_username:
+  #### User-specific callbacks
+  update_priv_key:
     input:
       - id: url
         attr: pathname
+    output:
+      - id: nostr-priv-key
+        attr: value
+    callback: callbacks.get_nostr_priv_key
+
+  update_pub_key:
+    input:
+      - id: nostr-priv-key
+        attr: value
+    output:
+      - id: nostr-pub-key
+        attr: value
+    callback: callbacks.get_nostr_pub_key
+
+  get_user_profile:
+    input:
+      - id: nostr-pub-key
+        attr: value
+    output:
+      - id: profile-data
+        attr: data
+    callback: utils.load_user_profile
+
+  update_username:
+    input:
+      - id: profile-data
+        attr: data
     output:
       - id: welcome-msg
         attr: children
     callback: callbacks.get_username
 
+  render_user_profile:
+    input:
+      - id: profile-data
+        attr: data
+    output:
+      - id: user-image
+        attr: src
+      - id: user-profile-title
+        attr: children
+      - id: user-profile-about
+        attr: children
+      - id: user-profile-email
+        attr: value
+    callback: callbacks.render_contact_profile
+
+  ### Contacts #########
   update_contacts_store:
     input:
       - id: url
@@ -451,6 +555,8 @@ callbacks:
         attr: children
       - id: contact-profile-about
         attr: children
+      - id: contact-profile-email
+        attr: value
     callback: callbacks.render_contact_profile
 
   update_contacts_table:
@@ -471,6 +577,21 @@ callbacks:
       - id: selected-contact
         attr: children
     callback: callbacks.pass_through
+
+  update_user_email:
+    input:
+      - id: url
+        attr: pathname
+    output:
+      - id: user-email
+        attr: value
+      - id: user-password
+        attr: value
+      - id: smtp-host
+        attr: value
+      - id: smtp-port
+        attr: value
+    callback: callbacks.get_email_credentials
 
 
   update_email_from:

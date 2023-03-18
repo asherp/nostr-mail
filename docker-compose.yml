@@ -17,9 +17,10 @@ services:
       EMAIL_ALICE: ${EMAIL_ALICE}
       PRIV_KEY_BOB: ${PRIV_KEY_BOB}
       EMAIL_BOB: ${EMAIL_BOB}
-      EMAIL_USERNAME: ${EMAIL_USERNAME}
+      EMAIL: ${EMAIL}
       EMAIL_PASSWORD: ${EMAIL_PASSWORD}
       EMAIL_IMAP: ${EMAIL_IMAP}
+      EMAIL_IMAP_PORT: ${EMAIL_IMAP_PORT}
     volumes:
       - type: bind
         source: .
@@ -67,6 +68,10 @@ services:
       DASH_DEBUG: ${DASH_DEBUG}
       NOSTR_CONTACTS: ${NOSTR_CONTACTS}
       NOSTR_PRIV_KEY: ${PRIV_KEY_ALICE}
+      EMAIL: ${EMAIL_ALICE}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD_ALICE}
+      EMAIL_IMAP: ${EMAIL_IMAP}
+      EMAIL_IMAP_PORT: ${EMAIL_IMAP_PORT}
     volumes:
       - type: bind
         source: .
@@ -89,6 +94,10 @@ services:
       DASH_DEBUG: ${DASH_DEBUG}
       NOSTR_CONTACTS: ${NOSTR_CONTACTS}
       NOSTR_PRIV_KEY: ${PRIV_KEY_BOB}
+      EMAIL: ${EMAIL_BOB}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD_BOB}
+      EMAIL_IMAP: ${EMAIL_IMAP}
+      EMAIL_IMAP_PORT: ${EMAIL_IMAP_PORT}
     volumes:
       - type: bind
         source: .

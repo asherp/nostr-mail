@@ -36,7 +36,7 @@ def render_contact_profile(profile):
     if profile is None:
         raise PreventUpdate
     try:
-        return profile['picture'], profile['display_name'], profile['about']
+        return profile['picture'], profile['display_name'], profile['about'], profile.get('email')
     except:
         print('problem rendering profile', profile)
         raise
@@ -53,11 +53,35 @@ def send_mail(*args):
     return 'debug info'
 
 
-def get_username(url):
-    priv_key_nsec = os.environ['NOSTR_PRIV_KEY']
-    pub_key_hex = PrivateKey.from_nsec(priv_key_nsec).public_key.hex()
-    profile = load_user_profile(pub_key_hex)
-    name = profile['name']
+def get_username(profile):
+    name = profile.get('display_name')
     return f"### Welcome, {name}!"
+
+
+def get_nostr_priv_key(url):
+    """if nostr credentials set by environment variable, use them"""
+    priv_key_nsec = os.environ.get('NOSTR_PRIV_KEY')
+    if priv_key_nsec is not None:
+        return priv_key_nsec
+    raise PreventUpdate
+
+def get_nostr_pub_key(priv_key_nsec):
+    if priv_key_nsec is None:
+        raise PreventUpdate
+    pub_key_hex = PrivateKey.from_nsec(priv_key_nsec).public_key.hex()
+    return pub_key_hex
+
+def get_email_credentials(url):
+    """if credentials are set by environment variables, use them"""
+    email_address = os.environ.get('EMAIL')
+    email_password = os.environ.get('EMAIL_PASSWORD')
+    email_imap = os.environ.get('EMAIL_IMAP')
+    email_imap_port = os.environ.get('EMAIL_IMAP_PORT')
+    credentials = (email_address, email_password, email_imap, email_imap_port)
+    if None in credentials:
+        raise IOError('one of credentials missing')
+    print('found credentials')
+    return email_address, email_password, email_imap, email_imap_port
+
 
 

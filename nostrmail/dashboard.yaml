@@ -126,16 +126,27 @@ email_header:
             children:
             - dbc.Label: "To:"
         - dbc.Col:
-            width: 6
+            width: 5
             children:
             - dbc.FormFloating:
                 children:
                 - dbc.Input:
                     type: email
-                    id: customer-email-address-send
+                    id: receiver-address
                     placeholder: customer.email@tld.com
                     required: True
                 - dbc.Label: "Receiving address"
+        - dbc.Col:
+            width: 3
+            children:
+              - dcc.Dropdown:
+                  id: receiver-select
+                  clearable: True
+                  placeholder: Select Nostr contact..
+        - dbc.Col:
+            width: 3
+            children:
+
         - dbc.Col:
             width:
               size: 3
@@ -154,15 +165,16 @@ email_header:
             children:
             - dbc.Label: "Cc:"
         - dbc.Col:
-            width: 6
+            width: 5
             children:
             - dbc.FormFloating:
                 children:
                 - dbc.Input:
                     type: email
-                    id: cc-email-address-send
+                    id: cc
                     placeholder: someone@tld.com
                     value: ''
+                    disabled: True # Not yet implemented
                 - dbc.Label: Carbon Copy
     - html.Br:
     - dbc.Row:
@@ -172,15 +184,16 @@ email_header:
             children:
             - dbc.Label: "Bcc:"
         - dbc.Col:
-            width: 6
+            width: 5
             children:
             - dbc.FormFloating:
                 children:
                 - dbc.Input:
                     type: email
-                    id: bcc-email-address-send
+                    id: bcc
                     placeholder: someone@tld.com
                     value: ''
+                    disabled: True # Not yet implemented
                 - dbc.Label: Blind Carbon Copy
 
 email_subject:
@@ -195,16 +208,40 @@ email_subject:
             children:
             - dbc.Label: "Subject:"
         - dbc.Col:
-            width: 6
+            width: 5
             children:
             - dbc.FormFloating:
                 children:
                 - dbc.Input:
                     type: text
-                    id: customer-email-subject-send
+                    id: subject
                     placeholder: subject text
                     required: True
                 - dbc.Label: Subject text
+        - dbc.Col:
+            width: 5
+            children:
+            - dbc.FormFloating:
+                children:
+                - dbc.Input:
+                    type: text
+                    id: subject-encrypted
+                    placeholder: subject Encrypted
+                    disabled: True
+                - dbc.Label: Subject Encrypted
+    - html.Br:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+              dbc.Label: "hash:"
+        - dbc.Col:
+            width: 5
+            children:
+            - dbc.Input:
+                id: subject-hash
+                disabled: True
 
 email_body:
   dbc.Card:
@@ -220,15 +257,42 @@ email_body:
             width: 10
             children:
             - dbc.Textarea:
-                id: email-body-send
+                id: body
                 disabled: False
                 rows: 10
                 size: md
                 style:
                   height: 600
                 spellCheck: True
-
-
+    - html.Br:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+              dbc.Label: "hash:"
+        - dbc.Col:
+            width: 5
+            children:
+            - dbc.Input:
+                id: body-hash
+                disabled: True
+    - html.Br:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+            - dbc.Label: "Body (Encrypted):"
+        - dbc.Col:
+            width: 10
+            children:
+            - dbc.Textarea:
+                id: body-encrypted
+                disabled: True
+                rows: 10
+                size: md
+                spellCheck: False
 
 settings:
   - html.Br:
@@ -427,7 +491,7 @@ layout:
     - ${header}
     - dbc.Tabs:
         id: page
-        active_tab: contacts
+        active_tab: compose
         children:
         - dbc.Tab:
             tab_id: settings
@@ -578,6 +642,7 @@ callbacks:
         attr: children
     callback: callbacks.pass_through
 
+  #### compose ######
   update_user_email:
     input:
       - id: url
@@ -593,7 +658,6 @@ callbacks:
         attr: value
     callback: callbacks.get_email_credentials
 
-
   update_email_from:
     input:
       - id: user-email
@@ -602,6 +666,68 @@ callbacks:
       - id: email-from
         attr: value
     callback: callbacks.pass_through
+
+  update_receiver_options:
+    input:
+      - id: contacts
+        attr: data
+    output:
+      - id: receiver-select
+        attr: options
+    callback: callbacks.update_contacts_options
+
+  update_receiver:
+    input:
+      - id: receiver-select
+        attr: value
+    output:
+      - id: receiver-address
+        attr: value
+    callback: callbacks.update_receiver_address
+
+  update_subject_hash:
+    input:
+      - id: subject
+        attr: value
+    output:
+      - id: subject-hash
+        attr: value
+    callback: utils.sha256
+
+  update_subject_encrypted:
+    input:
+      - id: nostr-priv-key
+        attr: value
+      - id: receiver-select
+        attr: value
+      - id: subject
+        attr: value
+    output:
+      - id: subject-encrypted
+        attr: value
+    callback: callbacks.encrypt_message
+
+  update_body_hash:
+    input:
+      - id: body
+        attr: value
+    output:
+      - id: body-hash
+        attr: value
+    callback: utils.sha256
+
+  update_body_encrypted:
+    input:
+      - id: nostr-priv-key
+        attr: value
+      - id: receiver-select
+        attr: value
+      - id: subject
+        attr: value
+    output:
+      - id: body-encrypted
+        attr: value
+    callback: callbacks.encrypt_message
 
   email_send:
     input:

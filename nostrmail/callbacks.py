@@ -11,6 +11,11 @@ def update_contacts(url):
     return contacts
 
 def update_contacts_options(contacts):
+    """Provide username selection where value is pubkey
+
+    Note: there may be duplicate usernames, so we'll
+    need to make sure usernames are unique among contacts
+    """
     options = []
     for contact in contacts:
         username = contact['username']
@@ -29,8 +34,8 @@ def update_contact_profile(pubkey, contacts):
 
     for contact in contacts:
         if contact['pubkey'] == pubkey:
-            profile = get_events(pubkey, 'meta')[0]
-            return profile
+            # profile = get_events(pubkey, 'meta')[0]
+            return load_user_profile(pubkey)
 
 def render_contact_profile(profile):
     if profile is None:
@@ -82,6 +87,21 @@ def get_email_credentials(url):
         raise IOError('one of credentials missing')
     print('found credentials')
     return email_address, email_password, email_imap, email_imap_port
+
+
+def update_receiver_address(pub_key_hex):
+    if pub_key_hex is not None:
+        profile = load_user_profile(pub_key_hex)
+        return profile.get('email')
+    raise PreventUpdate
+
+def encrypt_message(priv_key_nsec, pub_key_hex, message):
+    """encrypt message using shared secret"""
+    if None not in (priv_key_nsec, pub_key_hex, message):
+        priv_key = PrivateKey.from_nsec(priv_key_nsec)
+        return priv_key.encrypt_message(message, pub_key_hex)
+    raise PreventUpdate
+
 
 
 

@@ -12,6 +12,7 @@ RUN conda install jupyter jupytext
 COPY requirements.txt /nostrmail/requirements.txt
 
 RUN pip install -r /nostrmail/requirements.txt
+ENV PYTHONUNBUFFERED 1
 
 ADD . /nostrmail
 

@@ -17,6 +17,11 @@ import requests
 from omegaconf import OmegaConf
 import pandas as pd
 import os
+from diskcache import FanoutCache
+from cryptography.hazmat.primitives import hashes
+import base64
+
+cache = FanoutCache('cache', size_limit=1e6) # 1Mb
 
 nostr_contacts = os.environ['NOSTR_CONTACTS']
 
@@ -126,9 +131,18 @@ def publish_profile(priv_key, profile_dict):
     relay_manager.close_connections()
     return event_profile.signature
 
-
+@cache.memoize(tag='profiles') #Todo add temporal caching/refresh button
 def load_user_profile(pub_key_hex):
+    print(f'fetching profile {pub_key_hex}')
     profile_events = get_events(pub_key_hex, 'meta')
     if len(profile_events) > 0:
         return profile_events[0]
+
+def sha256(message):
+    if message is None:
+        return ''
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(message.encode())
+    digest.update(b"123")
+    return base64.urlsafe_b64encode(digest.finalize()).decode('ascii')
 

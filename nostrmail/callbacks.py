@@ -5,6 +5,20 @@ from dash.exceptions import PreventUpdate
 import json
 import os
 from nostr.key import PrivateKey
+import dash
+
+from redmail import EmailSender
+from smtplib import SMTP
+
+def get_triggered(ctx=None):
+    if ctx is None:
+        # fall back to global if callback_context is not available
+        ctx = dash.callback_context
+    if not ctx.triggered:
+        button_id = 'No clicks yet'
+    else:
+        button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    return button_id
 
 def update_contacts(url):
     contacts = load_contacts()
@@ -18,8 +32,8 @@ def update_contacts_options(contacts):
     """
     options = []
     for contact in contacts:
-        username = contact['username']
         pubkey = contact['pubkey']
+        username = f"{contact['username']} {pubkey}"
         options.append(dict(label=username, value=pubkey))
     return options
 
@@ -54,8 +68,73 @@ def toggle_collapse(n, is_open):
 def pass_through(*args):
     return args
 
-def send_mail(*args):
-    return 'debug info'
+    #   - id: send-email
+    #     attr: n_clicks
+    # state:
+    #   - id: user-email
+    #     attr: value
+    #   - id: user-password
+    #     attr: value
+    #   - id: receiver-address
+    #     attr: value
+    #   - id: subject-encrypted
+    #     attr: value
+    #   - id: body-encrypted
+    #     attr: value
+
+def send_mail(
+        n_clicks,
+        user_email,
+        user_password,
+        receiver_address,
+        subject_encrypted,
+        body_encrypted,
+        smtp_host,
+        smtp_port):
+    """Send encrypted email"""
+    if n_clicks is None:
+        raise PreventUpdate
+    # We only want to display the "Message sent!" when we actually send a message
+    # clear the send status if the send button was not clicked
+    button_id = get_triggered()
+
+    if button_id != 'send-email':
+        return button_id
+
+    # prevent send on page load
+    if n_clicks == 0:
+        raise PreventUpdate
+
+    try:
+
+        if 'gmail' in user_email:
+            from redmail import gmail
+
+            gmail.username = user_email # Your Gmail address
+            gmail.password = user_password # app password
+            gmail.send(
+                    subject=subject_encrypted,
+                    receivers=[receiver_address],
+                    text=body_encrypted,
+                    )
+
+        else:
+            email = EmailSender(
+                host=smtp_host,
+                port=smtp_port,
+                cls_smtp=SMTP,
+                use_starttls=True,
+                )
+            email.send(
+                subject=subject_encrypted,
+                sender=user_email,
+                receivers=[receiver_address],
+                text=body_encrypted,
+                )
+    except Exception as m:
+        return str(m)
+
+    return f'Email sent to {receiver_address}!'
 
 
 def get_username(profile):
@@ -78,15 +157,20 @@ def get_nostr_pub_key(priv_key_nsec):
 
 def get_email_credentials(url):
     """if credentials are set by environment variables, use them"""
-    email_address = os.environ.get('EMAIL')
-    email_password = os.environ.get('EMAIL_PASSWORD')
-    email_imap = os.environ.get('EMAIL_IMAP')
-    email_imap_port = os.environ.get('EMAIL_IMAP_PORT')
-    credentials = (email_address, email_password, email_imap, email_imap_port)
-    if None in credentials:
-        raise IOError('one of credentials missing')
+    credentials = dict(
+        EMAIL=os.environ.get('EMAIL'),
+        EMAIL_PASSWORD=os.environ.get('EMAIL_PASSWORD'),
+        IMAP_HOST = os.environ.get('IMAP_HOST'),
+        IMAP_PORT = os.environ.get('IMAP_PORT'),
+        SMTP_HOST = os.environ.get('SMTP_HOST'),
+        SMTP_PORT = os.environ.get('SMTP_PORT'),
+        )
+    if None in credentials.values():
+        for k,v in credentials.items():
+            if v is None:
+                raise IOError(f'env variable {k} missing')
     print('found credentials')
-    return email_address, email_password, email_imap, email_imap_port
+    return tuple(credentials.values())
 
 
 def update_receiver_address(pub_key_hex):
@@ -100,6 +184,13 @@ def encrypt_message(priv_key_nsec, pub_key_hex, message):
     if None not in (priv_key_nsec, pub_key_hex, message):
         priv_key = PrivateKey.from_nsec(priv_key_nsec)
         return priv_key.encrypt_message(message, pub_key_hex)
+    raise PreventUpdate
+
+def decrypt_message(priv_key_nsec, pub_key_hex, encrypted_message):
+    """encrypt message using shared secret"""
+    if None not in (priv_key_nsec, pub_key_hex, encrypted_message):
+        priv_key = PrivateKey.from_nsec(priv_key_nsec)
+        return priv_key.decrypt_message(encrypted_message, pub_key_hex)
     raise PreventUpdate
 
 

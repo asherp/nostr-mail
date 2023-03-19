@@ -19,8 +19,10 @@ services:
       EMAIL_BOB: ${EMAIL_BOB}
       EMAIL: ${EMAIL}
       EMAIL_PASSWORD: ${EMAIL_PASSWORD}
-      EMAIL_IMAP: ${EMAIL_IMAP}
-      EMAIL_IMAP_PORT: ${EMAIL_IMAP_PORT}
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
     volumes:
       - type: bind
         source: .
@@ -46,10 +48,17 @@ services:
       TZ: ${TZ:-America/New_York}
       DASH_DEBUG: ${DASH_DEBUG}
       NOSTR_CONTACTS: ${NOSTR_CONTACTS}
-    volumes:
-      - type: bind
-        source: .
-        target: /nostrmail
+      NOSTR_PRIV_KEY: ${NOSTR_PRIV_KEY}
+      EMAIL: ${EMAIL}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD}
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+    # volumes:
+    #   - type: bind
+    #     source: .
+    #     target: /nostrmail
     container_name: nostr-mail
     command:
       - python
@@ -70,8 +79,10 @@ services:
       NOSTR_PRIV_KEY: ${PRIV_KEY_ALICE}
       EMAIL: ${EMAIL_ALICE}
       EMAIL_PASSWORD: ${EMAIL_PASSWORD_ALICE}
-      EMAIL_IMAP: ${EMAIL_IMAP}
-      EMAIL_IMAP_PORT: ${EMAIL_IMAP_PORT}
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
     volumes:
       - type: bind
         source: .
@@ -96,8 +107,10 @@ services:
       NOSTR_PRIV_KEY: ${PRIV_KEY_BOB}
       EMAIL: ${EMAIL_BOB}
       EMAIL_PASSWORD: ${EMAIL_PASSWORD_BOB}
-      EMAIL_IMAP: ${EMAIL_IMAP}
-      EMAIL_IMAP_PORT: ${EMAIL_IMAP_PORT}
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
     volumes:
       - type: bind
         source: .

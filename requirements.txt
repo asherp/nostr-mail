@@ -1,4 +1,4 @@
-nostr
+nostr==0.0.2
 git+https://github.com/predsci/psidash.git@hydra_1.2.0
 dash-bootstrap-components
 plotly

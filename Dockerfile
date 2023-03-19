@@ -12,6 +12,8 @@ RUN conda install jupyter jupytext
 COPY requirements.txt /nostrmail/requirements.txt
 
 RUN pip install -r /nostrmail/requirements.txt
+# RUN pip install git+https://github.com/jeffthibault/python-nostr.git@37cb66ba2d3968b2d75cc8ad71c3550415ca47fe
+
 ENV PYTHONUNBUFFERED 1
 
 ADD . /nostrmail

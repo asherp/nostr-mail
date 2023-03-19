@@ -96,12 +96,6 @@ email_header:
               size: 2
               offset: 1
             children:
-            - dbc.Button:
-                id: send-email
-                children: Send
-                color: success
-                n_clicks: 0
-                className: me-1
             - dbc.Modal:
                 id: send-popup
                 is_open: False
@@ -128,25 +122,22 @@ email_header:
         - dbc.Col:
             width: 5
             children:
+            - dcc.Dropdown:
+                id: receiver-select
+                clearable: True
+                placeholder: Select Nostr contact..
+            - html.Br:
             - dbc.FormFloating:
                 children:
                 - dbc.Input:
                     type: email
                     id: receiver-address
                     placeholder: customer.email@tld.com
-                    required: True
+                    disabled: True
                 - dbc.Label: "Receiving address"
         - dbc.Col:
             width: 3
             children:
-              - dcc.Dropdown:
-                  id: receiver-select
-                  clearable: True
-                  placeholder: Select Nostr contact..
-        - dbc.Col:
-            width: 3
-            children:
-
         - dbc.Col:
             width:
               size: 3
@@ -158,43 +149,43 @@ email_header:
                 target: send-email
                 children: Sends an encrypted nostr email
     - html.Br:
-    - dbc.Row:
-        children:
-        - dbc.Col:
-            width: 1
-            children:
-            - dbc.Label: "Cc:"
-        - dbc.Col:
-            width: 5
-            children:
-            - dbc.FormFloating:
-                children:
-                - dbc.Input:
-                    type: email
-                    id: cc
-                    placeholder: someone@tld.com
-                    value: ''
-                    disabled: True # Not yet implemented
-                - dbc.Label: Carbon Copy
-    - html.Br:
-    - dbc.Row:
-        children:
-        - dbc.Col:
-            width: 1
-            children:
-            - dbc.Label: "Bcc:"
-        - dbc.Col:
-            width: 5
-            children:
-            - dbc.FormFloating:
-                children:
-                - dbc.Input:
-                    type: email
-                    id: bcc
-                    placeholder: someone@tld.com
-                    value: ''
-                    disabled: True # Not yet implemented
-                - dbc.Label: Blind Carbon Copy
+    # - dbc.Row:
+    #     children:
+    #     - dbc.Col:
+    #         width: 1
+    #         children:
+    #         - dbc.Label: "Cc:"
+    #     - dbc.Col:
+    #         width: 5
+    #         children:
+    #         - dbc.FormFloating:
+    #             children:
+    #             - dbc.Input:
+    #                 type: email
+    #                 id: cc
+    #                 placeholder: someone@tld.com
+    #                 value: ''
+    #                 disabled: True # Not yet implemented
+    #             - dbc.Label: Carbon Copy
+    # - html.Br:
+    # - dbc.Row:
+    #     children:
+    #     - dbc.Col:
+    #         width: 1
+    #         children:
+    #         - dbc.Label: "Bcc:"
+    #     - dbc.Col:
+    #         width: 5
+    #         children:
+    #         - dbc.FormFloating:
+    #             children:
+    #             - dbc.Input:
+    #                 type: email
+    #                 id: bcc
+    #                 placeholder: someone@tld.com
+    #                 value: ''
+    #                 disabled: True # Not yet implemented
+    #             - dbc.Label: Blind Carbon Copy
 
 email_subject:
   dbc.Card:
@@ -242,6 +233,17 @@ email_subject:
             - dbc.Input:
                 id: subject-hash
                 disabled: True
+        - dbc.Col:
+            width: 5
+            children:
+            - dbc.FormFloating:
+                children:
+                - dbc.Input:
+                    type: text
+                    id: subject-decrypted
+                    placeholder: subject Decrypted
+                    disabled: True
+                - dbc.Label: Subject Decrypted
 
 email_body:
   dbc.Card:
@@ -277,6 +279,22 @@ email_body:
             - dbc.Input:
                 id: body-hash
                 disabled: True
+        - dbc.Col:
+            width:
+              size: 2
+              offset: 2
+            children:
+            - html.Div:
+                id: debug-email
+        - dbc.Col:
+            width: 2
+            children:
+            - dbc.Button:
+                id: send-email
+                children: Send
+                color: success
+                n_clicks: 0
+                className: me-1
     - html.Br:
     - dbc.Row:
         children:
@@ -289,6 +307,22 @@ email_body:
             children:
             - dbc.Textarea:
                 id: body-encrypted
+                disabled: True
+                rows: 10
+                size: md
+                spellCheck: False
+    - html.Br:
+    - dbc.Row:
+        children:
+        - dbc.Col:
+            width: 1
+            children:
+            - dbc.Label: "Body (Decrypted):"
+        - dbc.Col:
+            width: 10
+            children:
+            - dbc.Textarea:
+                id: body-decrypted
                 disabled: True
                 rows: 10
                 size: md
@@ -360,7 +394,36 @@ settings:
           - dbc.Row:
               className: mb-3
               children:
-              - dbc.Label: SMTP
+              - dbc.Label: IMAP - for receiving emails
+              - dbc.Col:
+                  width:
+                    size: 4
+                  children:
+                  - dbc.FormFloating:
+                      children:
+                      - dbc.Input:
+                          type: text
+                          id: imap-host
+                          placeholder: imap.example.com
+                      - dbc.Label:
+                          children: Host
+                          html_for: imap-host
+              - dbc.Col:
+                  width: 4
+                  children:
+                  - dbc.FormFloating:
+                      children:
+                      - dbc.Input:
+                          type: number
+                          id: imap-port
+                          value: 2525
+                      - dbc.Label:
+                          children: Port
+                          html_for: imap-port
+          - dbc.Row:
+              className: mb-3
+              children:
+              - dbc.Label: SMTP - for sending emails
               - dbc.Col:
                   width:
                     size: 4
@@ -382,64 +445,20 @@ settings:
                       - dbc.Input:
                           type: number
                           id: smtp-port
-                          value: 2525
+                          value: 587
                       - dbc.Label:
                           children: Port
                           html_for: smtp-port
 
-
 profile:
-  dbc.Card:
-    body: True
-    children:
-    - dcc.Store:
-        id: profile-data
-    - html.Div:
-        id: profile-render
-    - dbc.Row:
-        children:
-        - dbc.Col:
-            width: 5
-            children:
-            - dbc.Card:
-                children:
-                - dbc.CardImg:
-                    top: True
-                    id: user-image
-                    src:
-                - dbc.CardBody:
-                    children:
-                    - html.H4:
-                        children: Card title
-                        className: card-title
-                        id: user-profile-title
-                    - html.P:
-                        id: user-profile-about
-                        children: Some example profile text
-                        className: card-text
-                    - dbc.Input:
-                        id: user-profile-email
-                        type: email
-                        disabled: True
-
-contacts:
-  dbc.Card:
-    body: True
-    children:
-    - dcc.Store:
-        id: contacts
-    - dcc.Store:
-        id: contact-profile
-    - dbc.Row:
-        children:
-          - dbc.Col:
-              width:
-                size: 2
-                offset: 1
-              children:
-              - dcc.Dropdown:
-                  id: contacts-select
-                  clearable: False
+  - html.Br:
+  - dbc.Card:
+      body: True
+      children:
+      - dcc.Store:
+          id: profile-data
+      - dbc.Row:
+          children:
           - dbc.Col:
               width: 5
               children:
@@ -447,40 +466,76 @@ contacts:
                   children:
                   - dbc.CardImg:
                       top: True
-                      id: contact-image
+                      id: user-image
                       src:
                   - dbc.CardBody:
                       children:
                       - html.H4:
                           children: Card title
                           className: card-title
-                          id: contact-profile-title
+                          id: user-profile-title
                       - html.P:
-                          id: contact-profile-about
+                          id: user-profile-about
                           children: Some example profile text
                           className: card-text
                       - dbc.Input:
-                          id: contact-profile-email
+                          id: user-profile-email
                           type: email
                           disabled: True
 
+contacts:
+  - html.Br:
+  - dbc.Card:
+      body: True
+      children:
+      - dcc.Store:
+          id: contacts
+      - dcc.Store:
+          id: contact-profile
+      - html.Br:
+      - dbc.Row:
+          children:
+            - dbc.Col:
+                width: 6
+                children:
+                - dcc.Dropdown:
+                    id: contacts-select
+                    clearable: False
+                - html.Br:
+                - dbc.Table:
+                    id: contacts-table
+                    striped: True
+                    bordered: True
+                    hover: True
+                    color: dark
+            - dbc.Col:
+                width:
+                  size: 4
+                  offset: 2
+                children:
+                - dbc.Card:
+                    children:
+                    - dbc.CardImg:
+                        top: True
+                        id: contact-image
+                        src:
+                    - dbc.CardBody:
+                        children:
+                        - html.H4:
+                            children: Card title
+                            className: card-title
+                            id: contact-profile-title
+                        - html.P:
+                            id: contact-profile-about
+                            children: Some example profile text
+                            className: card-text
+                        - dbc.Input:
+                            id: contact-profile-email
+                            type: email
+                            disabled: True
 
-    - html.Br:
-    - dbc.Row:
-        children:
-        - dbc.Col:
-            width:
-              size: 10
-              offset: 1
-            children:
-            - dbc.Table:
-                id: contacts-table
-                striped: True
-                bordered: True
-                hover: True
-                color: dark
-    - html.Div:
-        id: selected-contact
+      - html.Div:
+          id: selected-contact
 
 layout:
   dbc.Container:
@@ -491,7 +546,7 @@ layout:
     - ${header}
     - dbc.Tabs:
         id: page
-        active_tab: compose
+        active_tab: settings
         children:
         - dbc.Tab:
             tab_id: settings
@@ -504,8 +559,7 @@ layout:
         - dbc.Tab:
             tab_id: contacts
             label: Contacts
-            children:
-              - ${contacts}
+            children: ${contacts}
         - dbc.Tab:
             tab_id: inbox
             label: Inbox
@@ -520,9 +574,8 @@ layout:
             - ${email_subject}
             - html.Br:
             - ${email_body}
-    - html.Div:
-        id: debug-email
-
+    - html.Br:
+    - html.Br:
 
 callbacks:
   #### User-specific callbacks
@@ -632,16 +685,6 @@ callbacks:
         attr: children
     callback: callbacks.update_contacts_table
 
-
-  update_selected_contact:
-    input:
-      - id: contacts-table
-        attr: hover
-    output:
-      - id: selected-contact
-        attr: children
-    callback: callbacks.pass_through
-
   #### compose ######
   update_user_email:
     input:
@@ -651,6 +694,10 @@ callbacks:
       - id: user-email
         attr: value
       - id: user-password
+        attr: value
+      - id: imap-host
+        attr: value
+      - id: imap-port
         attr: value
       - id: smtp-host
         attr: value
@@ -707,6 +754,19 @@ callbacks:
         attr: value
     callback: callbacks.encrypt_message
 
+  update_subject_decrypted:
+    input:
+      - id: nostr-priv-key
+        attr: value
+      - id: receiver-select
+        attr: value
+      - id: subject-encrypted
+        attr: value
+    output:
+      - id: subject-decrypted
+        attr: value
+    callback: callbacks.decrypt_message
+
   update_body_hash:
     input:
       - id: body
@@ -722,21 +782,44 @@ callbacks:
         attr: value
       - id: receiver-select
         attr: value
-      - id: subject
+      - id: body
         attr: value
     output:
       - id: body-encrypted
         attr: value
     callback: callbacks.encrypt_message
 
+  update_body_decrypted:
+    input:
+      - id: nostr-priv-key
+        attr: value
+      - id: receiver-select
+        attr: value
+      - id: body-encrypted
+        attr: value
+    output:
+      - id: body-decrypted
+        attr: value
+    callback: callbacks.decrypt_message
+
   email_send:
     input:
+      - id: send-email
+        attr: n_clicks
       - id: user-email
         attr: value
       - id: user-password
         attr: value
-      - id: send-email
-        attr: n_clicks
+      - id: receiver-address
+        attr: value
+      - id: subject-encrypted
+        attr: value
+      - id: body-encrypted
+        attr: value
+      - id: smtp-host
+        attr: value
+      - id: smtp-port
+        attr: value
     output:
       - id: debug-email
         attr: children

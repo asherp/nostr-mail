@@ -28,7 +28,7 @@ nostr_contacts = os.environ['NOSTR_CONTACTS']
 relays = OmegaConf.load(nostr_contacts).relays
 
 
-def get_events(author_hex, kind='text', relays=relays, returns='content'):
+def get_events(pub_key_hex, kind='text', relays=relays, returns='content'):
     relay_manager = RelayManager()
 
     for relay in relays:
@@ -37,11 +37,16 @@ def get_events(author_hex, kind='text', relays=relays, returns='content'):
     events = []
     if kind == 'text':
         kinds = [EventKind.TEXT_NOTE]
+        filter_ = Filter(authors=[pub_key_hex], kinds=kinds)
     elif kind == 'meta':
         kinds = [EventKind.SET_METADATA]
+        filter_ = Filter(authors=[pub_key_hex], kinds=kinds)
+    elif kind == 'dm':
+        kinds = [EventKind.ENCRYPTED_DIRECT_MESSAGE]
+        filter_ = Filter(pubkey_refs=[pub_key_hex], kinds=kinds)
     else:
         raise NotImplementedError(f'{kind} events not supported')
-    filters = Filters([Filter(authors=[author_hex], kinds=kinds)])
+    filters = Filters([filter_])
     subscription_id = "some random str"
     request = [ClientMessageType.REQUEST, subscription_id]
     request.extend(filters.to_json_array())
@@ -71,6 +76,62 @@ def get_events(author_hex, kind='text', relays=relays, returns='content'):
     relay_manager.close_connections()
     return events
 
+def publish_direct_message(priv_key, receiver_pub_key_hex, clear_text, event_id=None):
+    dm_encrypted = priv_key.encrypt_message(clear_text, receiver_pub_key_hex)
+    dm_encrypted
+
+    relay_manager = RelayManager()
+
+    for relay in relays:
+        relay_manager.add_relay(relay)
+    relay_manager.open_connections({"cert_reqs": ssl.CERT_NONE}) # NOTE: This disables ssl certificate verification
+    print('waiting 1 sec to open')
+    time.sleep(1)
+    
+    if event_id is None:
+        tags=[['p', receiver_pub_key_hex]]
+    else:
+        tags=[['p', receiver_pub_key_hex], ['e', event_id]]
+
+
+    dm_event = Event(priv_key.public_key.hex(),
+                 dm_encrypted,
+                 kind=EventKind.ENCRYPTED_DIRECT_MESSAGE,
+                 tags=tags,
+                )
+    priv_key.sign_event(dm_event)
+
+    assert dm_event.verify()
+
+    relay_manager.publish_event(dm_event)
+    print('waiting 1 sec to send')
+    time.sleep(1) # allow the messages to send
+
+    relay_manager.close_connections()
+    return dm_event.signature
+
+def get_dms(pub_key_hex):
+    """Get all dms for this pub key
+    Returns list of dict objects storing metadata for each dm
+    Note: if a dm signature does not pass, the event is markded with valid=False
+    """
+    dms = []
+    dm_events = get_events(pub_key_hex, kind='dm', returns='event')
+    for e in dm_events:
+        # check signature first
+        if not e.verify():
+            dm = dict(valid=False, event_id=e.id)
+        else:
+            dm = dict(
+                valid=True,
+                time=pd.Timestamp(e.created_at, unit='s'),
+                event_id=e.id,
+                author=e.public_key,
+                content=e.content,
+                **dict(e.tags))
+            assert dm['p'] == pub_key_hex # recipient matches
+        dms.append(dm)
+    return dms
 
 def validate_nip05(hex_name):
     meta = get_events(hex_name, 'meta')

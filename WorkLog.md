@@ -1,3 +1,4 @@
+* setting up dms
 
 # 2023-03-19 21:10:30.939365: clock-in
 

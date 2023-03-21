@@ -38,15 +38,19 @@ def get_events(pub_key_hex, kind='text', relays=relays, returns='content'):
     if kind == 'text':
         kinds = [EventKind.TEXT_NOTE]
         filter_ = Filter(authors=[pub_key_hex], kinds=kinds)
+        filters = Filters([filter_])
     elif kind == 'meta':
         kinds = [EventKind.SET_METADATA]
         filter_ = Filter(authors=[pub_key_hex], kinds=kinds)
+        filters = Filters([filter_])
     elif kind == 'dm':
         kinds = [EventKind.ENCRYPTED_DIRECT_MESSAGE]
-        filter_ = Filter(pubkey_refs=[pub_key_hex], kinds=kinds)
+        filter_to_pub_key = Filter(pubkey_refs=[pub_key_hex], kinds=kinds)
+        filter_from_pub_key = Filter(authors=[pub_key_hex], kinds=kinds)
+        filters = Filters([filter_to_pub_key, filter_from_pub_key])
     else:
         raise NotImplementedError(f'{kind} events not supported')
-    filters = Filters([filter_])
+    
     subscription_id = "some random str"
     request = [ClientMessageType.REQUEST, subscription_id]
     request.extend(filters.to_json_array())
@@ -129,7 +133,12 @@ def get_dms(pub_key_hex):
                 author=e.public_key,
                 content=e.content,
                 **dict(e.tags))
-            assert dm['p'] == pub_key_hex # recipient matches
+            if dm['p'] == pub_key_hex:
+                pass
+            elif dm['author'] == pub_key_hex:
+                pass
+            else:
+                raise AssertionError('pub key not associated with dm')
         dms.append(dm)
     return dms
 

@@ -206,10 +206,25 @@ def update_inbox(priv_key_nsec):
           backgroundRepeat="no-repeat",
           backgroundRosition="center center",
           backgroundSize="cover",)
-    for author, _ in dms.groupby('author'):
+    for author, convos in dms.groupby('author'):
         profile = load_user_profile(author)
-        style.update(backgroundImage=f"url({profile['picture']})")
-        dms_render.append(html.Div(style=style))
+        style_ = style.copy()
+        style_.update(backgroundImage=f"url({profile['picture']})")
+        convos.set_index('time', inplace=True)
+        convos.sort_index(ascending=False, inplace=True)
+        convos_list = []
+        for _, conv in convos.iterrows():
+            convos_list.append(
+                dbc.ListGroup([
+                        dbc.ListGroupItem(conv['content'], n_clicks=0, action=True),
+                        dbc.ListGroupItem(str(_))],
+                    horizontal=True)
+                )
+
+        dms_render.append(dbc.Row([
+            dbc.Col(html.Div(style=style_.copy()), width=1),
+            dbc.Col(convos_list),
+            ]))
 
     return dms_render
 

@@ -1,5 +1,6 @@
-from utils import load_contacts, get_events, load_user_profile
+from utils import load_contacts, get_events, load_user_profile, get_dms
 import dash_bootstrap_components as dbc
+from dash import html
 import pandas as pd
 from dash.exceptions import PreventUpdate
 import json
@@ -193,6 +194,23 @@ def decrypt_message(priv_key_nsec, pub_key_hex, encrypted_message):
         return priv_key.decrypt_message(encrypted_message, pub_key_hex)
     raise PreventUpdate
 
+def update_inbox(priv_key_nsec):
+    priv_key = PrivateKey.from_nsec(priv_key_nsec)
+    dms = pd.DataFrame(get_dms(priv_key.public_key.hex()))
+    dms_render = []
+    style = dict(
+          display="inline-block",
+          width="50px",
+          height="50px",
+          borderRadius="50%",
+          backgroundRepeat="no-repeat",
+          backgroundRosition="center center",
+          backgroundSize="cover",)
+    for author, _ in dms.groupby('author'):
+        profile = load_user_profile(author)
+        style.update(backgroundImage=f"url({profile['picture']})")
+        dms_render.append(html.Div(style=style))
 
+    return dms_render
 
 

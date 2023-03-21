@@ -536,6 +536,15 @@ contacts:
       - html.Div:
           id: selected-contact
 
+inbox:
+  - html.Br:
+  - dbc.Card:
+      body: True
+      children:
+      - dbc.ListGroup:
+          id: dms
+
+
 layout:
   dbc.Container:
     children:
@@ -545,7 +554,7 @@ layout:
     - ${header}
     - dbc.Tabs:
         id: page
-        active_tab: settings
+        active_tab: inbox
         children:
         - dbc.Tab:
             tab_id: settings
@@ -562,7 +571,7 @@ layout:
         - dbc.Tab:
             tab_id: inbox
             label: Inbox
-            children: Inbox content
+            children: ${inbox}
         - dbc.Tab:
             tab_id: compose
             label: Compose
@@ -823,4 +832,14 @@ callbacks:
       - id: debug-email
         attr: children
     callback: callbacks.send_mail
+
+  update_inbox:
+    input:
+      - id: nostr-priv-key
+        attr: value
+    output:
+      - id: dms
+        attr: children
+    callback: callbacks.update_inbox
+
 

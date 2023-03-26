@@ -538,12 +538,21 @@ contacts:
 
 inbox:
   - html.Br:
+  - dbc.Row:
+      children:
+      - dbc.Col:
+          width:
+            offset: 11
+            size: 1
+          children:
+          - dbc.Switch:
+              id: decrypt-inbox
+              value: True
   - dbc.Card:
       body: True
       children:
       - dbc.ListGroup:
           id: dms
-
 
 layout:
   dbc.Container:
@@ -836,6 +845,8 @@ callbacks:
   update_inbox:
     input:
       - id: nostr-priv-key
+        attr: value
+      - id: decrypt-inbox
         attr: value
     output:
       - id: dms

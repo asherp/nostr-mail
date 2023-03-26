@@ -1,4 +1,4 @@
-from utils import load_contacts, get_events, load_user_profile, get_dms
+from utils import load_contacts, get_events, load_user_profile, get_dms, get_convs
 import dash_bootstrap_components as dbc
 from dash import html
 import pandas as pd
@@ -194,9 +194,13 @@ def decrypt_message(priv_key_nsec, pub_key_hex, encrypted_message):
         return priv_key.decrypt_message(encrypted_message, pub_key_hex)
     raise PreventUpdate
 
-def update_inbox(priv_key_nsec):
+
+def update_inbox(priv_key_nsec, decrypt=False):
     priv_key = PrivateKey.from_nsec(priv_key_nsec)
-    dms = pd.DataFrame(get_dms(priv_key.public_key.hex()))
+    pub_key = priv_key.public_key.hex()
+    dms = pd.DataFrame(get_dms(pub_key))
+    dms['conv'] = get_convs(dms)
+
     dms_render = []
     style = dict(
           display="inline-block",
@@ -206,25 +210,43 @@ def update_inbox(priv_key_nsec):
           backgroundRepeat="no-repeat",
           backgroundRosition="center center",
           backgroundSize="cover",)
-    for author, convos in dms.groupby('author'):
-        profile = load_user_profile(author)
-        style_ = style.copy()
-        style_.update(backgroundImage=f"url({profile['picture']})")
-        convos.set_index('time', inplace=True)
-        convos.sort_index(ascending=False, inplace=True)
-        convos_list = []
-        for _, conv in convos.iterrows():
-            convos_list.append(
-                dbc.ListGroup([
-                        dbc.ListGroupItem(conv['content'], n_clicks=0, action=True),
-                        dbc.ListGroupItem(str(_))],
-                    horizontal=True)
-                )
 
-        dms_render.append(dbc.Row([
-            dbc.Col(html.Div(style=style_.copy()), width=1),
-            dbc.Col(convos_list),
-            ]))
+    for conv_id, conv in dms.groupby('conv'):
+        print(f'conv id: {conv_id}')
+        conv.set_index('time', inplace=True)
+        conv.sort_index(ascending=True, inplace=True)
+        msg_list = []
+        for _, msg in conv.iterrows():
+            print(f' msg id: {_}')
+            profile = load_user_profile(msg.author)
+            style_ = style.copy()
+            style_.update(backgroundImage=f"url({profile['picture']})")
+            content = msg['content']
+            if msg.author == pub_key:
+                if decrypt:
+                    content = priv_key.decrypt_message(content, msg['p'])
+                msg_list.append(
+                    dbc.ListGroup([
+                            dbc.ListGroupItem(html.Div(style=style.copy())),
+                            dbc.ListGroupItem(content, n_clicks=0, action=True),
+                            dbc.ListGroupItem(str(_)),
+                            dbc.ListGroupItem(html.Div(style=style_.copy())),],
+                        horizontal=True)
+                    )
+            else:
+                if decrypt:
+                    content = priv_key.decrypt_message(content, msg.author)
+                msg_list.append(
+                    dbc.ListGroup([
+                            dbc.ListGroupItem(html.Div(style=style_.copy())),
+                            dbc.ListGroupItem(content, n_clicks=0, action=True),
+                            dbc.ListGroupItem(str(_)),
+                            dbc.ListGroupItem(html.Div(style=style.copy())),
+                            ],
+                        horizontal=True)
+                    )
+        print('appending messages')
+        dms_render.append(dbc.Row(dbc.Col(msg_list)))
 
     return dms_render
 

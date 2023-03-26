@@ -1,3 +1,4 @@
+* rendering avatars in inbox
 
 # 2023-03-26 15:17:45.151187: clock-in
 

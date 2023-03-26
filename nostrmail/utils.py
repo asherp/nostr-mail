@@ -142,6 +142,17 @@ def get_dms(pub_key_hex):
         dms.append(dm)
     return dms
 
+def get_convs(dms):
+    """assign conversation tuples to each dm
+    
+    dms - pd.DataFrame of dms
+    
+    """
+    convs = []
+    for _, e in dms.iterrows():
+        convs.append(tuple(sorted((e.author, e.p))))
+    return convs
+
 def validate_nip05(hex_name):
     meta = get_events(hex_name, 'meta')
     nip05 = meta[0].get('nip05')

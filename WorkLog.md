@@ -1,3 +1,4 @@
+* example env file
 # 2023-04-08 13:44:35.437850: clock-out
 
 * got email working with dms

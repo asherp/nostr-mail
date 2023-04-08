@@ -316,6 +316,15 @@ def sha256(message):
 ```
 
 ```python
+import base64
+base64.urlsafe_b64encode(sha256('hey')).decode('ascii')
+```
+
+```python
+sha256('hey')
+```
+
+```python
 def hash_concat(key, value):
     """concatonates a message with a value and returns the hash
     key - a binary
@@ -338,39 +347,6 @@ print(decrypt(encrypt(email_msg,
                       hash_concat(sender_secret, latest_block_hash)),
               hash_concat(receiver_secret, epoch_value)) # 
     )
-```
-
-## Direct Message
-
-Test delivery of the email subject via dm
-
-```python
-import os
-```
-
-```python
-try:
-    priv_key_str = os.environ['NOSTR_PRIV_KEY']
-except KeyError:
-    raise KeyError('Please set environment variable NOSTR_PRIV_KEY')
-```
-
-Confirm that we can create a valid priv key from the one provided
-
-```python
-from nostr.key import PrivateKey
-priv_key = PrivateKey.from_nsec(priv_key_str)
-assert priv_key.bech32() == priv_key_str
-```
-
-```python
-pub_key = priv_key.public_key
-pub_key_hex = pub_key.hex()
-pub_key_hex
-```
-
-```python
-pub_key.bech32()
 ```
 
 ### Try connecting to Damus
@@ -424,10 +400,6 @@ get_events(pub_key_hex)
 from nostr.key import mine_vanity_key
 ```
 
-```python
-pk = mine_vanity_key('rigly')
-```
-
 ## Address book
 
 ```python
@@ -463,6 +435,16 @@ except KeyError:
 ```python
 priv_key = PrivateKey.from_nsec(priv_key_str)
 assert priv_key.bech32() == priv_key_str
+```
+
+```python
+from nostrmail.utils import get_events, load_current_user
+from nostr.key import PrivateKey
+import os
+```
+
+```python
+
 ```
 
 ## Generate Alice profile
@@ -568,6 +550,145 @@ bob_profile_remote
 bob_priv_key.public_key.hex()
 ```
 
+## Direct Message
+
+Test delivery of the email subject via dm. The standard is defined in https://github.com/nostr-protocol/nips/blob/master/04.md
+
+* text is encrypted with `base64-encoded, aes-256-cbc` using the x-coordinate if the shared point between sender/receiver
+* content includes an initialization vector `"content": "<encrypted_text>?iv=<initialization_vector>"`
+* `tags` MUST contain an entry identifying the receiver of the message in the form `["p", "<pubkey, as a hex string>"]`.
+* `tags` MAY contain an entry identifying the previous message in a conversation or a message we are explicitly replying to, in the form `["e", "<event_id>"]`.
+
+```python
+from nostr.key import PrivateKey
+import os
+alice_priv_key_str = os.environ['PRIV_KEY_ALICE']
+alice_email = os.environ['EMAIL_ADDRESS_ALICE']
+alice_priv_key = PrivateKey.from_nsec(alice_priv_key_str)
+assert alice_priv_key.bech32() == alice_priv_key_str
+
+bob_priv_key_str = os.environ['PRIV_KEY_BOB']
+bob_email = os.environ['EMAIL_ADDRESS_BOB']
+bob_priv_key = PrivateKey.from_nsec(bob_priv_key_str)
+assert bob_priv_key.bech32() == bob_priv_key_str
+```
+
+Confirm that we can create a valid priv key from the one provided
+
+```python
+from nostrmail.utils import relays, publish_direct_message
+```
+
+```python
+# publish_direct_message(alice_priv_key, bob_priv_key.public_key.hex(), "hi ho bob!")
+```
+
+```python
+from nostrmail.utils import get_events
+```
+
+```python
+txt_events = get_events(bob_priv_key.public_key.hex(), kind='dm', returns='event')
+```
+
+```python
+for e in txt_events:
+    print(e.content, e.tags)
+```
+
+```python
+bob_priv_key.public_key.hex()
+```
+
+```python
+bob_priv_key.decrypt_message(e.content, alice_priv_key.public_key.hex())
+```
+
+```python
+# publish_direct_message(bob_priv_key, alice_priv_key.public_key.hex(), 'hullo, hullo!', e.id)
+```
+
+```python
+from nostrmail.utils import get_dms, get_convs
+```
+
+```python
+import pandas as pd
+```
+
+```python
+alice_dms = get_dms(alice_priv_key.public_key.hex())
+```
+
+```python
+alice_priv_key.public_key.hex()
+```
+
+```python
+dms = pd.DataFrame(alice_dms)
+dms['conv'] = get_convs(dms)
+```
+
+```python
+dms
+```
+
+```python
+pd.DataFrame(alice_dms).set_index('time').sort_index(ascending=False)
+```
+
+```python
+bob_dms = get_dms(bob_priv_key.public_key.hex())
+```
+
+```python
+bob_dms_df = pd.DataFrame(bob_dms)
+```
+
+```python
+bob_dms_df['convs'] = get_convs(bob_dms_df)
+```
+
+```python
+bob_dms_df
+```
+
+```python
+bob_dms
+```
+
+```python
+def get_encryption_iv(msg):
+    """extract the iv from an ecnrypted blob"""
+    return msg.split('?iv=')[-1].strip('==')
+```
+
+```python
+for id_, _ in pd.DataFrame(bob_dms).iterrows():
+    print(get_encryption_iv(_.content), alice_priv_key.decrypt_message(_.content, bob_priv_key.public_key.hex()))
+```
+
+```python
+alice_priv_key.decrypt_message(_.content, bob_priv_key.public_key.hex())
+```
+
+```python
+# from nostr.event import EncryptedDirectMessage # this isn't available as of nostr==0.0.2
+
+# dm = EncryptedDirectMessage(
+#   recipient_pubkey=recipient_pubkey,
+#   cleartext_content="Secret message!"
+# )
+# private_key.sign_event(dm)
+# relay_manager.publish_event(dm)
+```
+
+### Contacts
+
+There's a nip for contacts!
+https://github.com/nostr-protocol/nips/blob/master/02.md e.g. frank.david.erin 
+
+
 ## search email by subject
 
 ```python
@@ -580,11 +701,11 @@ import os
 ```
 
 ```python
-email_imap = os.environ['EMAIL_IMAP']
+email_imap = os.environ['IMAP_HOST']
 ```
 
 ```python
-email_username = os.environ['EMAIL_USERNAME']
+email_username = os.environ['EMAIL_ADDRESS']
 ```
 
 ```python
@@ -594,35 +715,89 @@ email_password = os.environ['EMAIL_PASSWORD']
 ```python
 # Set up connection to IMAP server
 mail = imaplib.IMAP4_SSL(email_imap)
+```
+
+```python
+if not email_is_logged_in(mail):
+    print('logging in')
+    mail.login(email_username, email_password)
+```
+
+```python
 mail.login(email_username, email_password)
 ```
 
 ```python
-mail.select('Inbox')
-
-# Search for emails matching a specific subject
-result, data = mail.search(None, 'SUBJECT "Football"')
-
-# Process the list of message IDs returned by the search
-for num in data[0].split():
-    # Fetch the email message by ID
-    result, data = mail.fetch(num, '(RFC822)')
-    raw_email = data[0][1]
-    # Convert raw email data into a Python email object
-    email_message = email.message_from_bytes(raw_email)
-    # Extract the email subject and print it
-    subject = email_message['Subject']
-    print(f"Email subject: {subject}")
+email_is_logged_in(mail)
 ```
 
 ```python
-email_message['Subject']
+if not email_is_logged_in(mail):
+    print('logging in')
+    mail.login(email_username, email_password)
+```
+
+```python
+from dash import html
+```
+
+```python
+mail.select('Inbox')
+```
+
+```python
+# email_body = find_email_by_subject(mail, 'bVpH/kND9hb1p83A0saXYw')
+email_body = find_email_by_subject(mail, 'r2e7cDJR6dqDgShm6w')
+
+email_body
+```
+
+```python
+type(email_body)
+```
+
+```python
+check_if_email_logged_in(mail)
+```
+
+```python
+from dash import dcc
+```
+
+```python
+dcc.Markdown?
+```
+
+```python
+print(alice_priv_key.decrypt_message(email_body, bob_priv_key.public_key.hex()))
+```
+
+```python
+imaplib.IMAP4_SSL?
 ```
 
 ```python
 # Close the mailbox and logout from the IMAP server
 mail.close()
 mail.logout()
+```
+
+```python
+assert not email_is_logged_in(mail)
+```
+
+## Filters
+
+```python
+from nostr.filter import Filter, Filters
+```
+
+```python
+Filters?
+```
+
+```python
+Filter?
 ```
 
 ```python

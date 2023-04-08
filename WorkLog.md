@@ -1,3 +1,5 @@
+# 2023-04-08 13:44:35.437850: clock-out
+
 * got email working with dms
 
 # 2023-04-08 10:45:50.749441: clock-in

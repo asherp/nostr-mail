@@ -33,7 +33,7 @@ app.run_server:
     # - dashboard.py
     - callbacks.py
   debug: True # ${oc.env:DASH_DEBUG}
-  dev_tools_hot_reload: True
+  dev_tools_hot_reload: False
 
 
 
@@ -229,9 +229,12 @@ email_subject:
         - dbc.Col:
             width: 5
             children:
-            - dbc.Input:
-                id: subject-hash
-                disabled: True
+            - dbc.FormFloating:
+                children:
+                - dbc.Input:
+                    id: subject-hash
+                    disabled: True
+                - dbc.Label: subject hash
         - dbc.Col:
             width: 5
             children:
@@ -827,6 +830,10 @@ callbacks:
         attr: value
       - id: user-password
         attr: value
+      - id: nostr-priv-key
+        attr: value
+      - id: receiver-select
+        attr: value
       - id: receiver-address
         attr: value
       - id: subject-encrypted
@@ -847,6 +854,14 @@ callbacks:
       - id: nostr-priv-key
         attr: value
       - id: decrypt-inbox
+        attr: value
+      - id: user-email
+        attr: value
+      - id: user-password
+        attr: value
+      - id: imap-host
+        attr: value
+      - id: imap-port
         attr: value
     output:
       - id: dms

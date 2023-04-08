@@ -1,3 +1,4 @@
+* got email working with dms
 
 # 2023-04-08 10:45:50.749441: clock-in
 

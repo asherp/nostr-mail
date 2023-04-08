@@ -1,6 +1,8 @@
 from utils import load_contacts, get_events, load_user_profile, get_dms, get_convs
+from utils import publish_direct_message, email_is_logged_in, find_email_by_subject, get_encryption_iv
 import dash_bootstrap_components as dbc
-from dash import html
+
+from dash import html, dcc
 import pandas as pd
 from dash.exceptions import PreventUpdate
 import json
@@ -8,6 +10,7 @@ import os
 from nostr.key import PrivateKey
 import dash
 
+import imaplib
 from redmail import EmailSender
 from smtplib import SMTP
 
@@ -87,6 +90,8 @@ def send_mail(
         n_clicks,
         user_email,
         user_password,
+        user_priv_key,
+        receiver_pub_key,
         receiver_address,
         subject_encrypted,
         body_encrypted,
@@ -107,7 +112,11 @@ def send_mail(
         raise PreventUpdate
 
     try:
+        # publish the dm to nostr 
+        priv_key = PrivateKey.from_nsec(user_priv_key)
+        publish_direct_message(priv_key, receiver_pub_key, dm_encrypted=subject_encrypted)
 
+        # use the same dm as the email subject
         if 'gmail' in user_email:
             from redmail import gmail
 
@@ -159,7 +168,7 @@ def get_nostr_pub_key(priv_key_nsec):
 def get_email_credentials(url):
     """if credentials are set by environment variables, use them"""
     credentials = dict(
-        EMAIL=os.environ.get('EMAIL'),
+        EMAIL=os.environ.get('EMAIL_ADDRESS'),
         EMAIL_PASSWORD=os.environ.get('EMAIL_PASSWORD'),
         IMAP_HOST = os.environ.get('IMAP_HOST'),
         IMAP_PORT = os.environ.get('IMAP_PORT'),
@@ -195,7 +204,22 @@ def decrypt_message(priv_key_nsec, pub_key_hex, encrypted_message):
     raise PreventUpdate
 
 
-def update_inbox(priv_key_nsec, decrypt=False):
+def update_inbox(
+        priv_key_nsec,
+        decrypt,
+        user_email,
+        user_password,
+        imap_host,
+        imap_port):
+
+
+    # # Set up connection to IMAP server
+    mail = imaplib.IMAP4_SSL(host=imap_host)
+    # if not email_is_logged_in(mail):
+    print('logging in')
+    mail.login(user_email, user_password)
+    mail.select('Inbox')
+
     priv_key = PrivateKey.from_nsec(priv_key_nsec)
     pub_key = priv_key.public_key.hex()
     dms = pd.DataFrame(get_dms(pub_key))
@@ -209,22 +233,39 @@ def update_inbox(priv_key_nsec, decrypt=False):
           borderRadius="50%",
           backgroundRepeat="no-repeat",
           backgroundRosition="center center",
-          backgroundSize="cover",)
+          backgroundSize="cover")
 
     for conv_id, conv in dms.groupby('conv'):
-        print(f'conv id: {conv_id}')
+        # print(f'conv id: {conv_id}')
         conv.set_index('time', inplace=True)
         conv.sort_index(ascending=True, inplace=True)
         msg_list = []
         for _, msg in conv.iterrows():
-            print(f' msg id: {_}')
+            # print(f' msg id: {_}')
             profile = load_user_profile(msg.author)
             style_ = style.copy()
             style_.update(backgroundImage=f"url({profile['picture']})")
             content = msg['content']
-            if msg.author == pub_key:
-                if decrypt:
+            msg_iv = get_encryption_iv(content)
+            email_body = find_email_by_subject(mail, msg_iv)
+
+            if decrypt:
+                if msg.author == pub_key: # sent from the user
                     content = priv_key.decrypt_message(content, msg['p'])
+                    if email_body is not None:
+                        email_body = priv_key.decrypt_message(email_body, msg['p'])
+                else: # sent to the user
+                    content = priv_key.decrypt_message(content, msg.author)
+                    if email_body is not None:
+                        email_body = priv_key.decrypt_message(email_body, msg.author)
+            if email_body is not None:
+                content = html.Details([
+                    html.Summary(content),
+                    html.Hr(),
+                    dcc.Markdown(email_body.replace('\n', '<br>'),
+                        dangerously_allow_html=True),])
+
+            if msg.author == pub_key: # sent from the user
                 msg_list.append(
                     dbc.ListGroup([
                             dbc.ListGroupItem(html.Div(style=style.copy())),
@@ -233,9 +274,7 @@ def update_inbox(priv_key_nsec, decrypt=False):
                             dbc.ListGroupItem(html.Div(style=style_.copy())),],
                         horizontal=True)
                     )
-            else:
-                if decrypt:
-                    content = priv_key.decrypt_message(content, msg.author)
+            else: # sent to the user
                 msg_list.append(
                     dbc.ListGroup([
                             dbc.ListGroupItem(html.Div(style=style_.copy())),
@@ -244,9 +283,19 @@ def update_inbox(priv_key_nsec, decrypt=False):
                             dbc.ListGroupItem(html.Div(style=style.copy())),
                             ],
                         horizontal=True)
-                    )
-        print('appending messages')
+                    )   
+
+        # print('appending messages')
         dms_render.append(dbc.Row(dbc.Col(msg_list)))
+
+    # Close the mailbox and logout from the IMAP server
+    if email_is_logged_in(mail):
+        print('logging out')
+        try:
+            mail.close()
+            mail.logout()
+        except:
+            pass
 
     return dms_render
 

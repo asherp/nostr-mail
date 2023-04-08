@@ -20,6 +20,7 @@ import os
 from diskcache import FanoutCache
 from cryptography.hazmat.primitives import hashes
 import base64
+import email
 
 cache = FanoutCache('cache', size_limit=1e6) # 1Mb
 
@@ -80,9 +81,21 @@ def get_events(pub_key_hex, kind='text', relays=relays, returns='content'):
     relay_manager.close_connections()
     return events
 
-def publish_direct_message(priv_key, receiver_pub_key_hex, clear_text, event_id=None):
-    dm_encrypted = priv_key.encrypt_message(clear_text, receiver_pub_key_hex)
-    dm_encrypted
+def publish_direct_message(priv_key, receiver_pub_key_hex, clear_text=None, dm_encrypted=None, event_id=None):
+    """publish a direct message sent from priv_key to receiver_pub_key_hex
+
+    clear_text will be encrypted using a shared secret between sender and receiver
+    dm_encrypted is optional - if supplied, clear_text is ignored. if not supplied, clear_text is required
+    """
+
+    if dm_encrypted is None:
+        if clear_text is None:
+            raise IOError('Must provide clear_text if dm is not precomputed')
+        else:
+            dm_encrypted = priv_key.encrypt_message(clear_text, receiver_pub_key_hex)
+    else:
+        # assumes the dm was precomputed and receiver can decrypt it
+        pass
 
     relay_manager = RelayManager()
 
@@ -227,3 +240,41 @@ def sha256(message):
     digest.update(b"123")
     return base64.urlsafe_b64encode(digest.finalize()).decode('ascii')
 
+def email_is_logged_in(mail):
+    try:
+        return 'OK' in mail.noop()
+    except:
+        return False
+
+def get_encryption_iv(msg):
+    """extract the iv from an ecnrypted blob"""
+    return msg.split('?iv=')[-1].strip('==')
+
+def find_email_by_subject(mail, subject):
+    # Search for emails matching a specific subject
+    result, data = mail.search(None, f'SUBJECT "{subject}"')
+    
+    # Process the list of message IDs returned by the search
+    for num in data[0].split():
+        # Fetch the email message by ID
+        result, data = mail.fetch(num, '(RFC822)')
+        raw_email = data[0][1]
+        # Convert raw email data into a Python email object
+        email_message = email.message_from_bytes(raw_email)
+        # Extract the email subject and print it
+        subject = email_message['Subject'].strip()
+#         print(f"Email subject: {subject}")
+    
+        # Extract the email body and print it
+        if email_message.is_multipart():
+#             print('found multipart')
+            for part in email_message.walk():
+                content_type = part.get_content_type()
+                if content_type == 'text/plain':
+                    email_body = part.get_payload(decode=True).decode()
+                    break
+        else:
+#             print('normal email')
+            email_body = email_message.get_payload(decode=True).decode()
+#         print(f"Email body: {email_body}")
+        return email_body.strip()

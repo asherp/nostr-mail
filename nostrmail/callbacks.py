@@ -300,3 +300,13 @@ def update_inbox(
     return dms_render
 
 
+def edit_user_profile(profile):
+    """render the current profile to editable fields"""
+    children = []
+    for k, v in profile.items():
+        children.append(dbc.Row(
+            dbc.Col(k),
+            dbc.Col(dbc.Input(id=f'profile-edit-{k}', value=v)),
+            ))
+    return children
+

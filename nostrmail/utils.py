@@ -225,7 +225,7 @@ def publish_profile(priv_key, profile_dict):
     relay_manager.close_connections()
     return event_profile.signature
 
-@cache.memoize(tag='profiles') #Todo add temporal caching/refresh button
+# @cache.memoize(tag='profiles') #Todo add temporal caching/refresh button
 def load_user_profile(pub_key_hex):
     print(f'fetching profile {pub_key_hex}')
     profile_events = get_events(pub_key_hex, 'meta')

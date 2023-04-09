@@ -33,7 +33,7 @@ app.run_server:
     # - dashboard.py
     - callbacks.py
   debug: True # ${oc.env:DASH_DEBUG}
-  dev_tools_hot_reload: False
+  dev_tools_hot_reload: ${oc.env:DEV_TOOLS_HOT_RELOAD}
 
 
 
@@ -462,6 +462,11 @@ profile:
       - dbc.Row:
           children:
           - dbc.Col:
+              width: 7
+              children:
+              - dbc.Card:
+                  id: profile-edit
+          - dbc.Col:
               width: 5
               children:
               - dbc.Card:
@@ -634,6 +639,15 @@ callbacks:
       - id: welcome-msg
         attr: children
     callback: callbacks.get_username
+
+  edit_user_profile:
+    input:
+      - id: profile-data
+        attr: data
+    output:
+      - id: profile-edit
+        attr: children
+    callback: callbacks.edit_user_profile
 
   render_user_profile:
     input:

@@ -1,3 +1,4 @@
+* hot reload by env, edit user profile
 
 # 2023-04-09 10:11:08.859105: clock-in
 

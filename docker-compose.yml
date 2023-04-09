@@ -37,6 +37,23 @@ services:
       - --ip=0.0.0.0
       - --allow-root
     working_dir: /nostrmail
+  docs:
+    image: nostr-mail
+    ports:
+      - "8000:8000"
+    build:
+      context: .
+      dockerfile: rigly.Dockerfile
+    volumes:
+      - type: bind
+        source: .
+        target: /nostrmail
+    container_name: nostr-mail-docs
+    command:
+      - mkdocs
+      - serve
+      - -a
+      - 0.0.0.0:8000
   nostrmail:
     image: nostr-mail
     ports:

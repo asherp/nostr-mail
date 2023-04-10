@@ -33,7 +33,7 @@ app.run_server:
     # - dashboard.py
     - callbacks.py
   debug: True # ${oc.env:DASH_DEBUG}
-  dev_tools_hot_reload: ${oc.env:DEV_TOOLS_HOT_RELOAD}
+  dev_tools_hot_reload: False # ${oc.env:DEV_TOOLS_HOT_RELOAD}
 
 
 
@@ -459,13 +459,33 @@ profile:
       children:
       - dcc.Store:
           id: profile-data
+      - dcc.Markdown: |
+          # User profile
+
+          You may edit these fields and update your profile if your email changes
+
       - dbc.Row:
           children:
           - dbc.Col:
               width: 7
               children:
               - dbc.Card:
-                  id: profile-edit
+                  body: True
+                  children:
+                  - html.Div:
+                      id: profile-edit
+                  - dbc.Row:
+                      children:
+                      - dbc.Col:
+                          width: 3
+                          children:
+                          - dbc.Button:
+                              id: profile-update
+                              children: Update Profile
+                              color: success
+                              n_clicks: 0
+                              className: me-1
+                  
           - dbc.Col:
               width: 5
               children:
@@ -489,7 +509,8 @@ profile:
                           id: user-profile-email
                           type: email
                           disabled: True
-
+      - html.Div:
+          id: profile-edit-debug
 contacts:
   - html.Br:
   - dbc.Card:
@@ -571,7 +592,7 @@ layout:
     - ${header}
     - dbc.Tabs:
         id: page
-        active_tab: inbox
+        active_tab: profile
         children:
         - dbc.Tab:
             tab_id: settings
@@ -881,5 +902,25 @@ callbacks:
       - id: dms
         attr: children
     callback: callbacks.update_inbox
+
+  update_user_profile:
+    input:
+      - id: profile-update
+        attr: n_clicks
+    state:
+      - id: nostr-priv-key
+        attr: value
+      - id:
+          form_type: user_profile_keys
+          form_key: ALL
+        attr: children
+      - id:
+          form_type: user_profile_values
+          form_key: ALL
+        attr: value
+    output:
+      - id: profile-edit-debug
+        attr: children
+    callback: callbacks.update_user_profile
 
 

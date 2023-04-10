@@ -225,12 +225,15 @@ def publish_profile(priv_key, profile_dict):
     relay_manager.close_connections()
     return event_profile.signature
 
-# @cache.memoize(tag='profiles') #Todo add temporal caching/refresh button
-def load_user_profile(pub_key_hex):
+@cache.memoize(tag='profiles') #Todo add temporal caching/refresh button
+def load_user_profile(pub_key_hex, cache_val=0):
     print(f'fetching profile {pub_key_hex}')
     profile_events = get_events(pub_key_hex, 'meta')
     if len(profile_events) > 0:
-        return profile_events[0]
+        profile = profile_events[0]
+        if 'email' not in profile:
+            profile['email'] = None
+        return profile
 
 def sha256(message):
     if message is None:
@@ -278,3 +281,29 @@ def find_email_by_subject(mail, subject):
             email_body = email_message.get_payload(decode=True).decode()
 #         print(f"Email body: {email_body}")
         return email_body.strip()
+
+
+@cache.memoize(typed=True, tag='block_height')
+def get_block_hash(block_height):
+    result = requests.get(f'https://blockstream.info/api/block-height/{block_height}').content.decode('utf-8')
+    return result
+
+
+@cache.memoize(typed=True, tag='blocks')
+def get_block_info(block_height=None, block_hash=None):
+    if block_hash is None:
+        if block_height is not None:
+            block_hash = get_block_hash(block_height)
+        else:
+            raise IOError('block_height or block_hash required')
+    if 'Block not found' in block_hash:
+        # this needs to raise an error to prevent cache from storing it
+        raise ValueError('Block not found')
+    print(f'getting block {block_hash}')
+    result = requests.get(f'https://blockstream.info/api/block/{block_hash}')
+    return result.json()
+
+def get_latest_block_hash():
+    block_hash = requests.get('https://blockstream.info/api/blocks/tip/hash').content.decode('utf-8')
+    return block_hash
+

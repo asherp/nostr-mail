@@ -1,5 +1,6 @@
 from utils import load_contacts, get_events, load_user_profile, get_dms, get_convs
 from utils import publish_direct_message, email_is_logged_in, find_email_by_subject, get_encryption_iv
+from utils import publish_profile
 import dash_bootstrap_components as dbc
 
 from dash import html, dcc
@@ -148,6 +149,8 @@ def send_mail(
 
 
 def get_username(profile):
+    if profile is None:
+        raise PreventUpdate
     name = profile.get('display_name')
     return f"### Welcome, {name}!"
 
@@ -302,11 +305,48 @@ def update_inbox(
 
 def edit_user_profile(profile):
     """render the current profile to editable fields"""
+    if profile is None:
+        raise PreventUpdate
+            # - dbc.FormFloating:
+            #     children:
+            #     - dbc.Input:
+            #         type: text
+            #         id: subject-encrypted
+            #         placeholder: subject Encrypted
+            #         disabled: True
+            #     - dbc.Label: Subject Encrypted
+
+
     children = []
+
     for k, v in profile.items():
         children.append(dbc.Row(
-            dbc.Col(k),
-            dbc.Col(dbc.Input(id=f'profile-edit-{k}', value=v)),
-            ))
+            children=[
+                dbc.FormFloating(
+                    children=[
+                        dbc.Input(
+                            # allow pattern matching to extract these later
+                            id=dict(form_type='user_profile_values', form_key=k),
+                            value=v),
+                        dbc.Label(
+                            id=dict(form_type='user_profile_keys', form_key=k),
+                            children=k),
+                        html.Br(),
+                    ])
+            ]))
     return children
+
+def update_user_profile(n_clicks, priv_key_nsec, profile_keys, profile_values):
+    if n_clicks == 0:
+        raise PreventUpdate
+
+
+    profile = {}
+    for k, v in zip(profile_keys, profile_values):
+        profile[k] = v
+
+    priv_key = PrivateKey.from_nsec(priv_key_nsec)
+    sig = publish_profile(priv_key, profile)
+
+    return sig
 

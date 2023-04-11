@@ -1,3 +1,9 @@
+
+# 2023-04-10 22:05:43.542150: clock-in
+
+
+* to sanize emails, check out amonia with nh3 python binding https://nh3.readthedocs.io/en/latest/
+
 # 2023-04-09 23:51:00.895163: clock-out
 
 * update profile button

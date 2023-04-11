@@ -459,6 +459,12 @@ profile:
       children:
       - dcc.Store:
           id: profile-data
+          data:
+            display_name: ''
+            name: ''
+            picture: ''
+            about: ''
+            email: ''
       - dcc.Markdown: |
           # User profile
 

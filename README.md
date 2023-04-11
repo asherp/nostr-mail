@@ -11,7 +11,15 @@ Both sender and receiver derive a shared secret known only to them, which is use
 
 This application can use any email server for delivery.
 
+## Usage
 
+Navigate to the base of this directory, then:
+
+```sh
+docker compose up nostrmail
+```
+
+Navigate to [http://localhost:8050](http://localhost:8050)
 
 
 ### Requirements
@@ -803,6 +811,31 @@ Filter?
 ```python
 %load_ext autoreload
 %autoreload 2
+```
+
+## Block height caching
+
+We'll use block height to cache profile data.
+
+
+```python
+from nostrmail.utils import get_block_hash, get_block_info, get_latest_block_hash
+```
+
+```python
+block_hash = get_latest_block_hash()
+```
+
+```python
+block_hash
+```
+
+```python
+latest_block = get_block_info(block_hash=block_hash)
+```
+
+```python
+latest_block['height']
 ```
 
 ```python

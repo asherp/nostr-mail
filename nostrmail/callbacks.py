@@ -60,7 +60,10 @@ def render_contact_profile(profile):
     if profile is None:
         raise PreventUpdate
     try:
-        return profile['picture'], profile['display_name'], profile['about'], profile.get('email')
+        return (profile.get('picture', ''),
+            profile.get('display_name', 'N/A'),
+            profile.get('about', 'N/A'),
+            profile.get('email', 'N/A'))
     except:
         print('problem rendering profile', profile)
         raise
@@ -171,7 +174,7 @@ def get_nostr_pub_key(priv_key_nsec):
 def get_email_credentials(url):
     """if credentials are set by environment variables, use them"""
     credentials = dict(
-        EMAIL=os.environ.get('EMAIL_ADDRESS'),
+        EMAIL_ADDRESS=os.environ.get('EMAIL_ADDRESS'),
         EMAIL_PASSWORD=os.environ.get('EMAIL_PASSWORD'),
         IMAP_HOST = os.environ.get('IMAP_HOST'),
         IMAP_PORT = os.environ.get('IMAP_PORT'),
@@ -307,17 +310,11 @@ def edit_user_profile(profile):
     """render the current profile to editable fields"""
     if profile is None:
         raise PreventUpdate
-            # - dbc.FormFloating:
-            #     children:
-            #     - dbc.Input:
-            #         type: text
-            #         id: subject-encrypted
-            #         placeholder: subject Encrypted
-            #         disabled: True
-            #     - dbc.Label: Subject Encrypted
-
 
     children = []
+    for _ in ['display_name', 'name', 'picture', 'about', 'email']:
+        if _ not in profile:
+            profile[_] = None
 
     for k, v in profile.items():
         children.append(dbc.Row(

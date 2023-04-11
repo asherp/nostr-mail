@@ -72,11 +72,11 @@ services:
       IMAP_PORT: ${IMAP_PORT}
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
-      DEV_TOOLS_HOT_RELOAD: ${DEV_TOOLS_HOT_RELOAD}
-    # volumes:
-    #   - type: bind
-    #     source: .
-    #     target: /nostrmail
+      DEV_TOOLS_HOT_RELOAD: False
+    volumes:
+      - type: bind
+        source: .
+        target: /nostrmail
     container_name: nostr-mail
     command:
       - python

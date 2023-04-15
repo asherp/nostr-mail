@@ -43,10 +43,13 @@ header:
     - dbc.NavbarSimple:
         children:
         - dbc.NavItem:
+            id: refresh-button-status
+        - dbc.NavItem:
             children:
             - dbc.Button:
                 id: refresh-button
-                children: ''
+                n_clicks: 0
+                children: refresh
         brand: NostrMail
         brand_href: https://github.com/asherp
         color: primary
@@ -632,12 +635,10 @@ callbacks:
   refresh_cache:
     # provides a new timestamp whenever the user clicks. Use the output in a cache
     input:
-      - id: url
-        attr: pathname
       - id: refresh-button
         attr: n_clicks
     output:
-      - id: refresh-button
+      - id: refresh-button-status
         attr: children
     callback: callbacks.refresh_cache
 
@@ -664,8 +665,6 @@ callbacks:
     input:
       - id: nostr-pub-key
         attr: value
-      - id: refresh-button
-        attr: children
     output:
       - id: profile-data
         attr: data
@@ -693,6 +692,8 @@ callbacks:
     input:
       - id: profile-data
         attr: data
+      - id: profile-edit-debug
+        attr: children
     output:
       - id: user-image
         attr: src
@@ -727,8 +728,6 @@ callbacks:
     input:
       - id: contacts-select
         attr: value
-      - id: refresh-button
-        attr: children
     state:
       - id: contacts
         attr: data
@@ -803,8 +802,6 @@ callbacks:
     input:
       - id: receiver-select
         attr: value
-      - id: refresh-button
-        attr: children
     output:
       - id: receiver-address
         attr: value
@@ -921,8 +918,6 @@ callbacks:
         attr: value
       - id: imap-port
         attr: value
-      - id: refresh-button
-        attr: children
     output:
       - id: dms
         attr: children

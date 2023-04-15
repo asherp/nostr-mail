@@ -23,6 +23,7 @@ services:
       IMAP_PORT: ${IMAP_PORT}
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
+      NOSTRMAIL_CACHE: /nostrmail/cache
     volumes:
       - type: bind
         source: .
@@ -73,6 +74,7 @@ services:
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
       DEV_TOOLS_HOT_RELOAD: False
+      NOSTRMAIL_CACHE: /nostrmail/cache
     volumes:
       - type: bind
         source: .
@@ -102,6 +104,7 @@ services:
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
       DEV_TOOLS_HOT_RELOAD: ${DEV_TOOLS_HOT_RELOAD}
+      NOSTRMAIL_CACHE: /nostrmail/cache
     volumes:
       - type: bind
         source: .
@@ -131,6 +134,7 @@ services:
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
       DEV_TOOLS_HOT_RELOAD: ${DEV_TOOLS_HOT_RELOAD}
+      NOSTRMAIL_CACHE: /nostrmail/cache
     volumes:
       - type: bind
         source: .

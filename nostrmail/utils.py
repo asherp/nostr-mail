@@ -22,7 +22,8 @@ from cryptography.hazmat.primitives import hashes
 import base64
 import email
 
-cache = FanoutCache('cache', size_limit=1e6) # 1Mb
+cache_dir = os.environ.get('NOSTRMAIL_CACHE', 'cache')
+cache = FanoutCache(cache_dir, size_limit=1e6) # 1Mb
 
 nostr_contacts = os.environ['NOSTR_CONTACTS']
 

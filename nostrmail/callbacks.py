@@ -17,8 +17,12 @@ from smtplib import SMTP
 
 
 
-def refresh_cache(url, n_clicks):
-    return pd.Timestamp.utcnow().strftime('%Y-%m-%d %X')
+def refresh_cache(n_clicks):
+    if n_clicks > 0:
+        cache.clear()
+        return f"cache cleared {pd.Timestamp.utcnow().strftime('%Y-%m-%d %X')}"
+    else:
+        raise PreventUpdate
 
 
 def get_triggered(ctx=None):
@@ -32,7 +36,7 @@ def get_triggered(ctx=None):
     return button_id
 
 @cache.memoize(tag='profiles') #Todo add temporal caching/refresh button
-def load_user_profile(pub_key_hex, tstr_cache):
+def load_user_profile(pub_key_hex):
     print(f'fetching profile {pub_key_hex}')
     profile_events = get_events(pub_key_hex, 'meta')
     if len(profile_events) > 0:
@@ -61,16 +65,16 @@ def update_contacts_table(contacts):
     table = dbc.Table.from_dataframe(df, index=True)
     return table.children
 
-def update_contact_profile(pubkey, contacts, tstr_cache):
+def update_contact_profile(pubkey, contacts):
     if contacts is None:
         raise PreventUpdate
 
     for contact in contacts:
         if contact['pubkey'] == pubkey:
             # profile = get_events(pubkey, 'meta')[0]
-            return load_user_profile(pubkey, tstr_cache)
+            return load_user_profile(pubkey)
 
-def render_contact_profile(profile):
+def render_contact_profile(profile, *args):
     if profile is None:
         raise PreventUpdate
     try:
@@ -203,9 +207,9 @@ def get_email_credentials(url):
     return tuple(credentials.values())
 
 
-def update_receiver_address(pub_key_hex, tstr_cache):
+def update_receiver_address(pub_key_hex):
     if pub_key_hex is not None:
-        profile = load_user_profile(pub_key_hex, tstr_cache)
+        profile = load_user_profile(pub_key_hex)
         return profile.get('email')
     raise PreventUpdate
 
@@ -224,18 +228,35 @@ def decrypt_message(priv_key_nsec, pub_key_hex, encrypted_message):
     raise PreventUpdate
 
 
+    # input:
+    #   - id: nostr-priv-key
+    #     attr: value
+    #   - id: decrypt-inbox
+    #     attr: value
+    #   - id: user-email
+    #     attr: value
+    #   - id: user-password
+    #     attr: value
+    #   - id: imap-host
+    #     attr: value
+    #   - id: imap-port
+    #     attr: value
+    #   - id: refresh-button
+    #     attr: children
+
 def update_inbox(
         priv_key_nsec,
         decrypt,
         user_email,
         user_password,
         imap_host,
-        imap_port,
-        tstr_cache):
+        imap_port):
 
-
-    # # Set up connection to IMAP server
-    mail = imaplib.IMAP4_SSL(host=imap_host)
+    # Set up connection to IMAP server
+    try:
+        mail = imaplib.IMAP4_SSL(host=imap_host)
+    except:
+        raise IOError(f'cannot open mail with host {imap_host}')
     # if not email_is_logged_in(mail):
     print('logging in')
     mail.login(user_email, user_password)
@@ -263,9 +284,12 @@ def update_inbox(
         msg_list = []
         for _, msg in conv.iterrows():
             # print(f' msg id: {_}')
-            profile = load_user_profile(msg.author, tstr_cache)
+            profile = load_user_profile(msg.author)
             style_ = style.copy()
-            style_.update(backgroundImage=f"url({profile['picture']})")
+            try:
+                style_.update(backgroundImage=f"url({profile['picture']})")
+            except:
+                raise IOError(f'could not extract picture from {profile} author: {msg.author}')
             content = msg['content']
             msg_iv = get_encryption_iv(content)
             email_body = find_email_by_subject(mail, msg_iv)
@@ -324,7 +348,7 @@ def update_inbox(
 def edit_user_profile(profile):
     """render the current profile to editable fields"""
     if profile is None:
-        raise PreventUpdate
+        profile = {}
 
     children = []
     for _ in ['display_name', 'name', 'picture', 'about', 'email']:

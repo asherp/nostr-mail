@@ -1,4 +1,4 @@
-from utils import load_contacts, get_events, load_user_profile, get_dms, get_convs
+from utils import load_contacts, get_events, get_dms, get_convs, cache
 from utils import publish_direct_message, email_is_logged_in, find_email_by_subject, get_encryption_iv
 from utils import publish_profile
 import dash_bootstrap_components as dbc
@@ -15,6 +15,12 @@ import imaplib
 from redmail import EmailSender
 from smtplib import SMTP
 
+
+
+def refresh_cache(url, n_clicks):
+    return pd.Timestamp.utcnow().strftime('%Y-%m-%d %X')
+
+
 def get_triggered(ctx=None):
     if ctx is None:
         # fall back to global if callback_context is not available
@@ -24,6 +30,14 @@ def get_triggered(ctx=None):
     else:
         button_id = ctx.triggered[0]['prop_id'].split('.')[0]
     return button_id
+
+@cache.memoize(tag='profiles') #Todo add temporal caching/refresh button
+def load_user_profile(pub_key_hex, tstr_cache):
+    print(f'fetching profile {pub_key_hex}')
+    profile_events = get_events(pub_key_hex, 'meta')
+    if len(profile_events) > 0:
+        profile = profile_events[0]
+        return profile
 
 def update_contacts(url):
     contacts = load_contacts()
@@ -47,14 +61,14 @@ def update_contacts_table(contacts):
     table = dbc.Table.from_dataframe(df, index=True)
     return table.children
 
-def update_contact_profile(pubkey, contacts):
+def update_contact_profile(pubkey, contacts, tstr_cache):
     if contacts is None:
         raise PreventUpdate
 
     for contact in contacts:
         if contact['pubkey'] == pubkey:
             # profile = get_events(pubkey, 'meta')[0]
-            return load_user_profile(pubkey)
+            return load_user_profile(pubkey, tstr_cache)
 
 def render_contact_profile(profile):
     if profile is None:
@@ -189,9 +203,9 @@ def get_email_credentials(url):
     return tuple(credentials.values())
 
 
-def update_receiver_address(pub_key_hex):
+def update_receiver_address(pub_key_hex, tstr_cache):
     if pub_key_hex is not None:
-        profile = load_user_profile(pub_key_hex)
+        profile = load_user_profile(pub_key_hex, tstr_cache)
         return profile.get('email')
     raise PreventUpdate
 
@@ -216,7 +230,8 @@ def update_inbox(
         user_email,
         user_password,
         imap_host,
-        imap_port):
+        imap_port,
+        tstr_cache):
 
 
     # # Set up connection to IMAP server
@@ -248,7 +263,7 @@ def update_inbox(
         msg_list = []
         for _, msg in conv.iterrows():
             # print(f' msg id: {_}')
-            profile = load_user_profile(msg.author)
+            profile = load_user_profile(msg.author, tstr_cache)
             style_ = style.copy()
             style_.update(backgroundImage=f"url({profile['picture']})")
             content = msg['content']

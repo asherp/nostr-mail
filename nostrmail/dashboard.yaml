@@ -692,8 +692,6 @@ callbacks:
     input:
       - id: profile-data
         attr: data
-      - id: profile-edit-debug
-        attr: children
     output:
       - id: user-image
         attr: src
@@ -703,13 +701,13 @@ callbacks:
         attr: children
       - id: user-profile-email
         attr: value
-    callback: callbacks.render_contact_profile
+    callback: callbacks.render_profile
 
   ### Contacts #########
   update_contacts_store:
     input:
-      - id: url
-        attr: pathname
+      - id: page
+        attr: active_tab
     output:
       - id: contacts
         attr: data
@@ -749,7 +747,7 @@ callbacks:
         attr: children
       - id: contact-profile-email
         attr: value
-    callback: callbacks.render_contact_profile
+    callback: callbacks.render_profile
 
   update_contacts_table:
     input:
@@ -906,6 +904,9 @@ callbacks:
 
   update_inbox:
     input:
+      - id: page
+        attr: active_tab
+    state:
       - id: nostr-priv-key
         attr: value
       - id: decrypt-inbox

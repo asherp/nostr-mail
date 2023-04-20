@@ -1,6 +1,6 @@
-from utils import load_contacts, get_events, get_dms, get_convs, cache
-from utils import publish_direct_message, email_is_logged_in, find_email_by_subject, get_encryption_iv
-from utils import publish_profile
+from nostrmail.utils import load_contacts, get_events, get_dms, get_convs, cache
+from nostrmail.utils import publish_direct_message, email_is_logged_in, find_email_by_subject, get_encryption_iv
+from nostrmail.utils import publish_profile
 import dash_bootstrap_components as dbc
 
 from dash import html, dcc
@@ -43,7 +43,9 @@ def load_user_profile(pub_key_hex):
         profile = profile_events[0]
         return profile
 
-def update_contacts(url):
+def update_contacts(active_tab):
+    if active_tab != 'contacts':
+        raise PreventUpdate
     contacts = load_contacts()
     return contacts
 
@@ -74,7 +76,7 @@ def update_contact_profile(pubkey, contacts):
             # profile = get_events(pubkey, 'meta')[0]
             return load_user_profile(pubkey)
 
-def render_contact_profile(profile, *args):
+def render_profile(profile):
     if profile is None:
         raise PreventUpdate
     try:
@@ -93,20 +95,6 @@ def toggle_collapse(n, is_open):
 
 def pass_through(*args):
     return args
-
-    #   - id: send-email
-    #     attr: n_clicks
-    # state:
-    #   - id: user-email
-    #     attr: value
-    #   - id: user-password
-    #     attr: value
-    #   - id: receiver-address
-    #     attr: value
-    #   - id: subject-encrypted
-    #     attr: value
-    #   - id: body-encrypted
-    #     attr: value
 
 def send_mail(
         n_clicks,
@@ -245,13 +233,15 @@ def decrypt_message(priv_key_nsec, pub_key_hex, encrypted_message):
     #     attr: children
 
 def update_inbox(
+        active_tab,
         priv_key_nsec,
         decrypt,
         user_email,
         user_password,
         imap_host,
         imap_port):
-
+    if active_tab != 'inbox':
+        raise PreventUpdate
     # Set up connection to IMAP server
     try:
         mail = imaplib.IMAP4_SSL(host=imap_host)

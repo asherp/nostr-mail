@@ -603,7 +603,7 @@ layout:
     - ${header}
     - dbc.Tabs:
         id: page
-        active_tab: profile
+        active_tab: contacts
         children:
         - dbc.Tab:
             tab_id: settings

@@ -1,3 +1,4 @@
+* handle imap connection error
 
 # 2023-04-23 14:53:12.076305: clock-in
 

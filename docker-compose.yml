@@ -64,7 +64,7 @@ services:
       dockerfile: Dockerfile
     environment:
       TZ: ${TZ:-America/New_York}
-      DASH_DEBUG: ${DASH_DEBUG}
+      DASH_DEBUG: False
       NOSTR_CONTACTS: ${NOSTR_CONTACTS}
       NOSTR_PRIV_KEY: ${NOSTR_PRIV_KEY}
       EMAIL_ADDRESS: ${EMAIL_ADDRESS}

@@ -255,7 +255,7 @@ def update_inbox(
     try:
         mail = imaplib.IMAP4_SSL(host=imap_host)
     except:
-        raise IOError(f'cannot open mail with host {imap_host}')
+        return html.Div(children=f'Cannot connect to imap host: {imap_host}')
     # if not email_is_logged_in(mail):
     print('logging in')
     mail.login(user_email, user_password)

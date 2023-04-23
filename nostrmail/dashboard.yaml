@@ -461,6 +461,7 @@ profile:
       children:
       - dcc.Store:
           id: profile-data
+          storage_type: session
           data:
             display_name: ''
             name: ''
@@ -526,8 +527,10 @@ contacts:
       children:
       - dcc.Store:
           id: contacts
+          storage_type: session
       - dcc.Store:
           id: contact-profile
+          storage_type: session
       - html.Br:
       - dbc.Row:
           children:
@@ -706,8 +709,11 @@ callbacks:
   ### Contacts #########
   update_contacts_store:
     input:
-      - id: page
-        attr: active_tab
+      - id: refresh-button
+        attr: n_clicks
+    state:
+      - id: contacts
+        attr: data
     output:
       - id: contacts
         attr: data
@@ -715,6 +721,9 @@ callbacks:
 
   update_contacts_options:
     input:
+      - id: contacts
+        attr: modified_timestamp
+    state:
       - id: contacts
         attr: data
     output:
@@ -751,6 +760,9 @@ callbacks:
 
   update_contacts_table:
     input:
+      - id: contacts
+        attr: modified_timestamp
+    state:
       - id: contacts
         attr: data
     output:
@@ -789,6 +801,9 @@ callbacks:
 
   update_receiver_options:
     input:
+      - id: contacts
+        attr: modified_timestamp
+    state:
       - id: contacts
         attr: data
     output:

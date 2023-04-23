@@ -43,18 +43,25 @@ def load_user_profile(pub_key_hex):
         profile = profile_events[0]
         return profile
 
-def update_contacts(active_tab):
-    if active_tab != 'contacts':
+
+def update_contacts(refresh_clicks, contacts):
+    if refresh_clicks is None:
+        # prevent the None callbacks is important with the store component.
+        # you don't want to update the store for nothing.
         raise PreventUpdate
-    contacts = load_contacts()
+
+    if contacts is None:
+        contacts = load_contacts()
     return contacts
 
-def update_contacts_options(contacts):
+def update_contacts_options(ts, contacts):
     """Provide username selection where value is pubkey
 
     Note: there may be duplicate usernames, so we'll
     need to make sure usernames are unique among contacts
     """
+    if None in (ts, contacts):
+        raise PreventUpdate  
     options = []
     for contact in contacts:
         pubkey = contact['pubkey']
@@ -62,7 +69,9 @@ def update_contacts_options(contacts):
         options.append(dict(label=username, value=pubkey))
     return options
 
-def update_contacts_table(contacts):
+def update_contacts_table(ts, contacts):
+    if None in (ts, contacts):
+        raise PreventUpdate  
     df = pd.DataFrame(contacts).set_index('pubkey')
     table = dbc.Table.from_dataframe(df, index=True)
     return table.children

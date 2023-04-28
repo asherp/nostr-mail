@@ -1,4 +1,13 @@
+* packaging, discussion with Tadge
+* Tadgh Drija on cc'ing: use a single encryption key and encrypt it to everyone's pub keys and include the whole decryption package in the message. This could be a json blob storing the following
 
+```yaml
+scheme: aes256
+receiver keys:
+- pub_key: encrypted decryption key
+- ...
+```
+	
 # 2023-04-28 17:55:10.766292: clock-in
 
 # 2023-04-28 12:05:40.850929: clock-out

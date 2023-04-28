@@ -3,12 +3,21 @@ site_name: NostrMail
 nav:
 - Home: README.md
 - NIP: NIP.md
+- Techstack: Techstack.md
+- Related Work: related_work.md
 - WorkLog: WorkLog.md
 
-theme: readthedocs
+extra_files:
+  - README.md
+
+theme: material
 plugins:
   - search
 markdown_extensions:
+  - attr_list
+  - pymdownx.emoji:
+      emoji_index: !!python/name:materialx.emoji.twemoji
+      emoji_generator: !!python/name:materialx.emoji.to_svg
   - admonition
   - tables
   - toc:

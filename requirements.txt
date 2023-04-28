@@ -13,3 +13,4 @@ diskcache
 mkdocs
 markdown-include
 pygments
+mkdocs-material

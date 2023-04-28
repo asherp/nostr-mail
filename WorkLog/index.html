@@ -1,0 +1,537 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.2.3, mkdocs-material-7.3.6">
+    
+    
+      
+        <title>WorkLog - NostrMail</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.a57b2b03.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.3f5d1f46.min.css">
+        
+      
+    
+    
+    
+      
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,400i,700%7CRoboto+Mono&display=fallback">
+        <style>:root{--md-text-font-family:"Roboto";--md-code-font-family:"Roboto Mono"}</style>
+      
+    
+    
+    
+    
+      
+
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="" data-md-color-primary="none" data-md-color-accent="none">
+  
+    
+    <script>function __prefix(e){return new URL("..",location).pathname+"."+e}function __get(e,t=localStorage){return JSON.parse(t.getItem(__prefix(e)))}</script>
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#2023-04-28-120540850929-clock-out" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="NostrMail" class="md-header__button md-logo" aria-label="NostrMail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54z"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            NostrMail
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              WorkLog
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5z"/></svg>
+      </label>
+      
+<div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="NostrMail" class="md-nav__button md-logo" aria-label="NostrMail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54z"/></svg>
+
+    </a>
+    NostrMail
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Home
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../NIP/" class="md-nav__link">
+        NIP
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Techstack/" class="md-nav__link">
+        Techstack
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../related_work/" class="md-nav__link">
+        Related Work
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" data-md-toggle="toc" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        WorkLog
+      </a>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          <div class="md-content" data-md-component="content">
+            <article class="md-content__inner md-typeset">
+              
+                
+                
+                <h1 id="2023-04-28-120540850929-clock-out">2023-04-28 12:05:40.850929: clock-out<a class="headerlink" href="#2023-04-28-120540850929-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>docs</li>
+</ul>
+<h1 id="2023-04-28-102811651768-clock-in">2023-04-28 10:28:11.651768: clock-in<a class="headerlink" href="#2023-04-28-102811651768-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-04-23-150829738699-clock-out">2023-04-23 15:08:29.738699: clock-out<a class="headerlink" href="#2023-04-23-150829738699-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>handle imap connection error</li>
+</ul>
+<h1 id="2023-04-23-145312076305-clock-in">2023-04-23 14:53:12.076305: clock-in<a class="headerlink" href="#2023-04-23-145312076305-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-04-23-101754445850-clock-out">2023-04-23 10:17:54.445850: clock-out<a class="headerlink" href="#2023-04-23-101754445850-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>caching improvements
+looking at session storage</li>
+</ul>
+<h1 id="2023-04-23-091940385017-clock-in">2023-04-23 09:19:40.385017: clock-in<a class="headerlink" href="#2023-04-23-091940385017-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-04-19-234327964016-clock-out">2023-04-19 23:43:27.964016: clock-out<a class="headerlink" href="#2023-04-19-234327964016-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>improved loading times to avoid timeout</li>
+</ul>
+<h1 id="2023-04-19-230312254233-clock-in">2023-04-19 23:03:12.254233: clock-in<a class="headerlink" href="#2023-04-19-230312254233-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-04-15-105738662251-clock-out">2023-04-15 10:57:38.662251: clock-out<a class="headerlink" href="#2023-04-15-105738662251-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>refreshing user profile</li>
+</ul>
+<h1 id="2023-04-15-095933579529-clock-in">2023-04-15 09:59:33.579529: clock-in<a class="headerlink" href="#2023-04-15-095933579529-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-04-15-094901574530-clock-out">2023-04-15 09:49:01.574530: clock-out<a class="headerlink" href="#2023-04-15-094901574530-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>cache reset button</li>
+</ul>
+<h1 id="2023-04-15-091532803650-clock-in">2023-04-15 09:15:32.803650: clock-in<a class="headerlink" href="#2023-04-15-091532803650-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-04-10-224809284772-clock-out">2023-04-10 22:48:09.284772: clock-out<a class="headerlink" href="#2023-04-10-224809284772-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>testing user container</li>
+</ul>
+<h1 id="2023-04-10-220543542150-clock-in">2023-04-10 22:05:43.542150: clock-in<a class="headerlink" href="#2023-04-10-220543542150-clock-in" title="Permanent link">&para;</a></h1>
+<ul>
+<li>to sanize emails, check out amonia with nh3 python binding https://nh3.readthedocs.io/en/latest/</li>
+</ul>
+<h1 id="2023-04-09-235100895163-clock-out">2023-04-09 23:51:00.895163: clock-out<a class="headerlink" href="#2023-04-09-235100895163-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>update profile button</li>
+</ul>
+<h1 id="2023-04-09-220851287745-clock-in">2023-04-09 22:08:51.287745: clock-in<a class="headerlink" href="#2023-04-09-220851287745-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-04-09-102557371034-clock-out">2023-04-09 10:25:57.371034: clock-out<a class="headerlink" href="#2023-04-09-102557371034-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>hot reload by env, edit user profile</li>
+</ul>
+<h1 id="2023-04-09-101108859105-clock-in">2023-04-09 10:11:08.859105: clock-in<a class="headerlink" href="#2023-04-09-101108859105-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-04-08-191840274196-clock-out">2023-04-08 19:18:40.274196: clock-out<a class="headerlink" href="#2023-04-08-191840274196-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>documentation</li>
+</ul>
+<h1 id="2023-04-08-181251398424-clock-in">2023-04-08 18:12:51.398424: clock-in<a class="headerlink" href="#2023-04-08-181251398424-clock-in" title="Permanent link">&para;</a></h1>
+<ul>
+<li>example env file</li>
+</ul>
+<h1 id="2023-04-08-134435437850-clock-out">2023-04-08 13:44:35.437850: clock-out<a class="headerlink" href="#2023-04-08-134435437850-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>got email working with dms</li>
+</ul>
+<h1 id="2023-04-08-104550749441-clock-in">2023-04-08 10:45:50.749441: clock-in<a class="headerlink" href="#2023-04-08-104550749441-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-26-161400530769-clock-out">2023-03-26 16:14:00.530769: clock-out<a class="headerlink" href="#2023-03-26-161400530769-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>rendering avatars in inbox</li>
+</ul>
+<h1 id="2023-03-26-151745151187-clock-in">2023-03-26 15:17:45.151187: clock-in<a class="headerlink" href="#2023-03-26-151745151187-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-21-141928772712-clock-out">2023-03-21 14:19:28.772712: clock-out<a class="headerlink" href="#2023-03-21-141928772712-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>conversations</li>
+</ul>
+<h1 id="2023-03-21-130606735484-clock-in">2023-03-21 13:06:06.735484: clock-in<a class="headerlink" href="#2023-03-21-130606735484-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-20-190945883040-clock-out-t-10m">2023-03-20 19:09:45.883040: clock-out: T-10m<a class="headerlink" href="#2023-03-20-190945883040-clock-out-t-10m" title="Permanent link">&para;</a></h1>
+<ul>
+<li>update inbox, avatars</li>
+</ul>
+<h1 id="2023-03-20-181156948100-clock-in">2023-03-20 18:11:56.948100: clock-in<a class="headerlink" href="#2023-03-20-181156948100-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-20-110501507585-clock-out">2023-03-20 11:05:01.507585: clock-out<a class="headerlink" href="#2023-03-20-110501507585-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>fetching dms</li>
+</ul>
+<h1 id="2023-03-20-101438822856-clock-in">2023-03-20 10:14:38.822856: clock-in<a class="headerlink" href="#2023-03-20-101438822856-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-19-234545312979-clock-out">2023-03-19 23:45:45.312979: clock-out<a class="headerlink" href="#2023-03-19-234545312979-clock-out" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-19-223839007652-clock-in">2023-03-19 22:38:39.007652: clock-in<a class="headerlink" href="#2023-03-19-223839007652-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-19-213820532966-clock-out">2023-03-19 21:38:20.532966: clock-out<a class="headerlink" href="#2023-03-19-213820532966-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>setting up dms</li>
+</ul>
+<h1 id="2023-03-19-211030939365-clock-in">2023-03-19 21:10:30.939365: clock-in<a class="headerlink" href="#2023-03-19-211030939365-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-19-020402230490-clock-out">2023-03-19 02:04:02.230490: clock-out<a class="headerlink" href="#2023-03-19-020402230490-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>email send</li>
+</ul>
+<h1 id="2023-03-18-233936131727-clock-in">2023-03-18 23:39:36.131727: clock-in<a class="headerlink" href="#2023-03-18-233936131727-clock-in" title="Permanent link">&para;</a></h1>
+<ul>
+<li>ignoring env</li>
+</ul>
+<h1 id="2023-03-18-220731239372-clock-out">2023-03-18 22:07:31.239372: clock-out<a class="headerlink" href="#2023-03-18-220731239372-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>encrypting subject and body to receiver</li>
+</ul>
+<h1 id="2023-03-18-202313413597-clock-in">2023-03-18 20:23:13.413597: clock-in<a class="headerlink" href="#2023-03-18-202313413597-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-18-185629590170-clock-out">2023-03-18 18:56:29.590170: clock-out<a class="headerlink" href="#2023-03-18-185629590170-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>render user profile, credentials</li>
+</ul>
+<h1 id="2023-03-18-174322541161-clock-in">2023-03-18 17:43:22.541161: clock-in<a class="headerlink" href="#2023-03-18-174322541161-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-17-222616589981-clock-out-t-30m">2023-03-17 22:26:16.589981: clock-out: T-30m<a class="headerlink" href="#2023-03-17-222616589981-clock-out-t-30m" title="Permanent link">&para;</a></h1>
+<ul>
+<li>alice, bob services</li>
+</ul>
+<h1 id="2023-03-17-210816620064-clock-in">2023-03-17 21:08:16.620064: clock-in<a class="headerlink" href="#2023-03-17-210816620064-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-12-221603525915-clock-out">2023-03-12 22:16:03.525915: clock-out<a class="headerlink" href="#2023-03-12-221603525915-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>fetching email, profile pics</li>
+</ul>
+<h1 id="2023-03-12-212832683363-clock-in">2023-03-12 21:28:32.683363: clock-in<a class="headerlink" href="#2023-03-12-212832683363-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-12-190752308489-clock-out">2023-03-12 19:07:52.308489: clock-out<a class="headerlink" href="#2023-03-12-190752308489-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>imap receiver</li>
+</ul>
+<h1 id="2023-03-12-185217463282-clock-in">2023-03-12 18:52:17.463282: clock-in<a class="headerlink" href="#2023-03-12-185217463282-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-11-223758222838-clock-out">2023-03-11 22:37:58.222838: clock-out<a class="headerlink" href="#2023-03-11-223758222838-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>publish alice and bob profiles</li>
+</ul>
+<h1 id="2023-03-11-220811340599-clock-in">2023-03-11 22:08:11.340599: clock-in<a class="headerlink" href="#2023-03-11-220811340599-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-11-204025042590-clock-out">2023-03-11 20:40:25.042590: clock-out<a class="headerlink" href="#2023-03-11-204025042590-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>alice and bob keys</li>
+</ul>
+<h1 id="2023-03-11-194755859711-clock-in">2023-03-11 19:47:55.859711: clock-in<a class="headerlink" href="#2023-03-11-194755859711-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-11-175930794963-clock-out">2023-03-11 17:59:30.794963: clock-out<a class="headerlink" href="#2023-03-11-175930794963-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>rendering contacts profile</li>
+</ul>
+<h1 id="2023-03-11-153757782640-clock-in">2023-03-11 15:37:57.782640: clock-in<a class="headerlink" href="#2023-03-11-153757782640-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-11-144505108228-clock-out">2023-03-11 14:45:05.108228: clock-out<a class="headerlink" href="#2023-03-11-144505108228-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>switch from Fernet to nostr encryption scheme</li>
+</ul>
+<h1 id="2023-03-11-132819085627-clock-in">2023-03-11 13:28:19.085627: clock-in<a class="headerlink" href="#2023-03-11-132819085627-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-05-200743617401-clock-out">2023-03-05 20:07:43.617401: clock-out<a class="headerlink" href="#2023-03-05-200743617401-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>setting up container priv keys</li>
+</ul>
+<h1 id="2023-03-05-191313083170-clock-in">2023-03-05 19:13:13.083170: clock-in<a class="headerlink" href="#2023-03-05-191313083170-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-03-01-205356066092-clock-out">2023-03-01 20:53:56.066092: clock-out<a class="headerlink" href="#2023-03-01-205356066092-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>adding credentials, settings</li>
+<li>sidebar example https://dash-bootstrap-components.opensource.faculty.ai/examples/simple-sidebar/</li>
+<li>configuring smtp https://red-mail.readthedocs.io/en/stable/tutorials/client.html#config-smtp</li>
+</ul>
+<h1 id="2023-03-01-191217414119-clock-in">2023-03-01 19:12:17.414119: clock-in<a class="headerlink" href="#2023-03-01-191217414119-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-02-27-183014616845-clock-out">2023-02-27 18:30:14.616845: clock-out<a class="headerlink" href="#2023-02-27-183014616845-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>reading email in python https://www.thepythoncode.com/article/reading-emails-in-python</li>
+</ul>
+<h1 id="2023-02-27-182434923804-clock-in">2023-02-27 18:24:34.923804: clock-in<a class="headerlink" href="#2023-02-27-182434923804-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-02-26-215620776792-clock-out">2023-02-26 21:56:20.776792: clock-out<a class="headerlink" href="#2023-02-26-215620776792-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>installable package, basic email gui</li>
+</ul>
+<h1 id="2023-02-26-204138192299-clock-in">2023-02-26 20:41:38.192299: clock-in<a class="headerlink" href="#2023-02-26-204138192299-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-02-25-132956840093-clock-out">2023-02-25 13:29:56.840093: clock-out<a class="headerlink" href="#2023-02-25-132956840093-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>working symmetric TOTP encryption</li>
+</ul>
+<h1 id="2023-02-25-115502107526-clock-in">2023-02-25 11:55:02.107526: clock-in<a class="headerlink" href="#2023-02-25-115502107526-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-02-25-113127280425-clock-out">2023-02-25 11:31:27.280425: clock-out<a class="headerlink" href="#2023-02-25-113127280425-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>nip05 p2p registry</li>
+</ul>
+<h1 id="2023-02-25-105424729659-clock-in">2023-02-25 10:54:24.729659: clock-in<a class="headerlink" href="#2023-02-25-105424729659-clock-in" title="Permanent link">&para;</a></h1>
+<h1 id="2023-02-16-162837548094-clock-out">2023-02-16 16:28:37.548094: clock-out<a class="headerlink" href="#2023-02-16-162837548094-clock-out" title="Permanent link">&para;</a></h1>
+<ul>
+<li>set up dependencies, trying nostr queries</li>
+</ul>
+<h1 id="2023-02-16-143504909245-clock-in">2023-02-16 14:35:04.909245: clock-in<a class="headerlink" href="#2023-02-16-143504909245-clock-in" title="Permanent link">&para;</a></h1>
+                
+              
+              
+                
+
+
+              
+            </article>
+          </div>
+        </div>
+        
+      </main>
+      
+        
+<footer class="md-footer">
+  
+    <nav class="md-footer__inner md-grid" aria-label="Footer">
+      
+        
+        <a href="../related_work/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Related Work" rel="prev">
+          <div class="md-footer__button md-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12z"/></svg>
+          </div>
+          <div class="md-footer__title">
+            <div class="md-ellipsis">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              Related Work
+            </div>
+          </div>
+        </a>
+      
+      
+    </nav>
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-footer-copyright">
+        
+        
+          Made with
+          <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+            Material for MkDocs
+          </a>
+        
+        
+      </div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    <script id="__config" type="application/json">{"base": "..", "features": [], "translations": {"clipboard.copy": "Copy to clipboard", "clipboard.copied": "Copied to clipboard", "search.config.lang": "en", "search.config.pipeline": "trimmer, stopWordFilter", "search.config.separator": "[\\s\\-]+", "search.placeholder": "Search", "search.result.placeholder": "Type to start searching", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.term.missing": "Missing", "select.version.title": "Select version"}, "search": "../assets/javascripts/workers/search.fcfe8b6d.min.js", "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.b1047164.min.js"></script>
+      
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+      
+    
+  </body>
+</html>

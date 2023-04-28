@@ -1,0 +1,614 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.2.3, mkdocs-material-7.3.6">
+    
+    
+      
+        <title>NIP - NostrMail</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.a57b2b03.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.3f5d1f46.min.css">
+        
+      
+    
+    
+    
+      
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,400i,700%7CRoboto+Mono&display=fallback">
+        <style>:root{--md-text-font-family:"Roboto";--md-code-font-family:"Roboto Mono"}</style>
+      
+    
+    
+    
+    
+      
+
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="" data-md-color-primary="none" data-md-color-accent="none">
+  
+    
+    <script>function __prefix(e){return new URL("..",location).pathname+"."+e}function __get(e,t=localStorage){return JSON.parse(t.getItem(__prefix(e)))}</script>
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#nip-" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="NostrMail" class="md-header__button md-logo" aria-label="NostrMail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54z"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            NostrMail
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              NIP
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5z"/></svg>
+      </label>
+      
+<div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="NostrMail" class="md-nav__button md-logo" aria-label="NostrMail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54z"/></svg>
+
+    </a>
+    NostrMail
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Home
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" data-md-toggle="toc" type="checkbox" id="__toc">
+      
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          NIP
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        NIP
+      </a>
+      
+        
+
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#nip-" class="md-nav__link">
+    NIP-??
+  </a>
+  
+    <nav class="md-nav" aria-label="NIP-??">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#motivation" class="md-nav__link">
+    Motivation
+  </a>
+  
+    <nav class="md-nav" aria-label="Motivation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#long-form-messaging" class="md-nav__link">
+    Long form messaging
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#archival-storage" class="md-nav__link">
+    Archival storage
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#email-authenticationidentification" class="md-nav__link">
+    Email authentication/identification
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#email-privacy" class="md-nav__link">
+    Email privacy
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#key-rotation" class="md-nav__link">
+    Key rotation
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#email-signaling" class="md-nav__link">
+    Email signaling
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dm-replication" class="md-nav__link">
+    DM replication
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Techstack/" class="md-nav__link">
+        Techstack
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../related_work/" class="md-nav__link">
+        Related Work
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../WorkLog/" class="md-nav__link">
+        WorkLog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#nip-" class="md-nav__link">
+    NIP-??
+  </a>
+  
+    <nav class="md-nav" aria-label="NIP-??">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#motivation" class="md-nav__link">
+    Motivation
+  </a>
+  
+    <nav class="md-nav" aria-label="Motivation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#long-form-messaging" class="md-nav__link">
+    Long form messaging
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#archival-storage" class="md-nav__link">
+    Archival storage
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#email-authenticationidentification" class="md-nav__link">
+    Email authentication/identification
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#email-privacy" class="md-nav__link">
+    Email privacy
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#key-rotation" class="md-nav__link">
+    Key rotation
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#email-signaling" class="md-nav__link">
+    Email signaling
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dm-replication" class="md-nav__link">
+    DM replication
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          <div class="md-content" data-md-component="content">
+            <article class="md-content__inner md-typeset">
+              
+                
+                
+                  <h1>NIP</h1>
+                
+                <h2 id="nip-">NIP-??<a class="headerlink" href="#nip-" title="Permanent link">&para;</a></h2>
+<p>This NIP defines the basic requirements that should be implemented by anyone wanting to support email alongside nostr.</p>
+<h3 id="motivation">Motivation<a class="headerlink" href="#motivation" title="Permanent link">&para;</a></h3>
+<p>Email integration enables several features for nostr users that relays alone cannot.</p>
+<h4 id="long-form-messaging">Long form messaging<a class="headerlink" href="#long-form-messaging" title="Permanent link">&para;</a></h4>
+<p>Nostr messages are intended to mimic the short form messaging of social media. It is largely up to the relay to determine the length of messages, but attachments and formatting are not supported (other NIPs that address this?). Email provides a means of communicating much larger messages, which are more suitable in personal or business contxts (with the added bonus of privacy offered by nostr's encryption).</p>
+<h4 id="archival-storage">Archival storage<a class="headerlink" href="#archival-storage" title="Permanent link">&para;</a></h4>
+<p>Nostr relays are not required to store DMs permanently. With nostr-mail DMs are replicated (in encrypted form) as the subject of an associated email. Thus, email provides a free back up for any DMs sent or received in this manner, in addition to any longer form content or files intended for long term storage.</p>
+<h4 id="email-authenticationidentification">Email authentication/identification<a class="headerlink" href="#email-authenticationidentification" title="Permanent link">&para;</a></h4>
+<p>While the <a href="https://github.com/nostr-protocol/nips/blob/master/05.md">NIP-05</a> standard allows nostr profiles to be associated with a user who controls their own domain, this is not the case for vast majority of users. Nostr-mail provides a more accessible way to associate one's identity with a public key. The setup process will be familiar to anyone who uses a desktop email client: simply allow the email server to accept SMTP connections and provide email credentials to the nostr-mail client.</p>
+<h4 id="email-privacy">Email privacy<a class="headerlink" href="#email-privacy" title="Permanent link">&para;</a></h4>
+<p>While Email PGP has been availble in various forms since 1991. Despite decades of attempts to educate the public, it has not seen wide adoption. Since all Nostr users have key pairs by default, we can leap frog the education propblems associated with traditional PGP. <a href="https://github.com/nostr-protocol/nips/blob/master/04.md">NIP-04</a> provides a mechanism for encrypting DMs, and we apply the scheme to encrypt/decrypt emails as well as link them to specific Nostr DMs.</p>
+<h4 id="key-rotation">Key rotation<a class="headerlink" href="#key-rotation" title="Permanent link">&para;</a></h4>
+<p>In the event that a user loses access to their private key, Email provides an out-of-band means of communicating a new one. A more formal key rotation mechanism that utilizes email is outside the scope of this NIP, but we hope to address it further in the future!</p>
+<h3 id="email-signaling">Email signaling<a class="headerlink" href="#email-signaling" title="Permanent link">&para;</a></h3>
+<p><code>final</code> <code>optional</code> <code>author:asherp</code> <code>author:asherp</code></p>
+<p>A special <code>email</code> field in the user's profile is all that is required to signal that the user <strong>accepts</strong> encrypted email.</p>
+<p>Here is example python code that accomplishes this, using <a href="https://github.com/jeffthibault/python-nostr">python-nostr</a></p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostr.relay_manager</span> <span class="kn">import</span> <span class="n">RelayManager</span>
+<span class="kn">from</span> <span class="nn">nostr.key</span> <span class="kn">import</span> <span class="n">PrivateKey</span>
+<span class="kn">from</span> <span class="nn">nostr.filter</span> <span class="kn">import</span> <span class="n">Filter</span><span class="p">,</span> <span class="n">Filters</span>
+<span class="kn">from</span> <span class="nn">nostr.event</span> <span class="kn">import</span> <span class="n">Event</span><span class="p">,</span> <span class="n">EventKind</span>
+<span class="kn">import</span> <span class="nn">time</span>
+
+<span class="k">def</span> <span class="nf">publish_profile</span><span class="p">(</span><span class="n">priv_key</span><span class="p">,</span> <span class="n">profile_dict</span><span class="p">):</span>
+    <span class="n">relay_manager</span> <span class="o">=</span> <span class="n">RelayManager</span><span class="p">()</span>
+
+    <span class="k">for</span> <span class="n">relay</span> <span class="ow">in</span> <span class="n">relays</span><span class="p">:</span>
+        <span class="n">relay_manager</span><span class="o">.</span><span class="n">add_relay</span><span class="p">(</span><span class="n">relay</span><span class="p">)</span>
+    <span class="n">relay_manager</span><span class="o">.</span><span class="n">open_connections</span><span class="p">({</span><span class="s2">&quot;cert_reqs&quot;</span><span class="p">:</span> <span class="n">ssl</span><span class="o">.</span><span class="n">CERT_NONE</span><span class="p">})</span> <span class="c1"># NOTE: This disables ssl certificate verification</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s1">&#39;waiting 1.5 sec to open&#39;</span><span class="p">)</span>
+    <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">1.5</span><span class="p">)</span>
+
+    <span class="n">event_profile</span> <span class="o">=</span> <span class="n">Event</span><span class="p">(</span><span class="n">priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
+                          <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">profile_dict</span><span class="p">),</span>
+                          <span class="n">kind</span><span class="o">=</span><span class="n">EventKind</span><span class="o">.</span><span class="n">SET_METADATA</span><span class="p">)</span>
+    <span class="n">priv_key</span><span class="o">.</span><span class="n">sign_event</span><span class="p">(</span><span class="n">event_profile</span><span class="p">)</span>
+
+    <span class="c1"># check signature</span>
+    <span class="k">assert</span> <span class="n">event_profile</span><span class="o">.</span><span class="n">verify</span><span class="p">()</span>
+    <span class="n">relay_manager</span><span class="o">.</span><span class="n">publish_event</span><span class="p">(</span><span class="n">event_profile</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s1">&#39;waiting 1 sec to send&#39;</span><span class="p">)</span>
+    <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># allow the messages to send</span>
+
+    <span class="n">relay_manager</span><span class="o">.</span><span class="n">close_connections</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">event_profile</span><span class="o">.</span><span class="n">signature</span>
+
+<span class="n">alice_profile</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">display_name</span><span class="o">=</span><span class="s1">&#39;Alice&#39;</span><span class="p">,</span>
+              <span class="n">name</span><span class="o">=</span><span class="s1">&#39;alice&#39;</span><span class="p">,</span>
+              <span class="n">picture</span><span class="o">=</span><span class="s1">&#39;https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTV-0rZbgnQcRbDqbk0hHPLHPyHpqLJ8xkriA&amp;usqp=CAU&#39;</span><span class="p">,</span>
+              <span class="n">about</span><span class="o">=</span><span class="s1">&#39;my name is Alice..&#39;</span><span class="p">,</span>
+              <span class="n">email</span><span class="o">=</span><span class="s1">&#39;alice@tld.com&#39;</span><span class="p">)</span>
+</code></pre></div>
+
+<h3 id="dm-replication">DM replication<a class="headerlink" href="#dm-replication" title="Permanent link">&para;</a></h3>
+<p>When an email is sent from a nostr-mail client, two things <strong>must</strong> occur:</p>
+<ol>
+<li>a DM with the encrypted subject of the email should be broadcast to the user's nostr relays</li>
+<li>the body of the email <strong>must</strong> be encrypted with the same shared secret.</li>
+<li>an email with the encrypted subject and body (using the same shared secret) <strong>must</strong> be sent via the user's SMTP server</li>
+</ol>
+<p>It is crucial that the email subject matches the encrypted DM exactly. This allows the receiver to verify that the email came from the same author as the DM - specifically, the author who's private key signed the DM event. Second, it allows the receiver to find the encrypted message on their mail server using the subject. Specifically, the <code>iv</code> string used in the encryption will be unique to that message.</p>
+                
+              
+              
+                
+
+
+              
+            </article>
+          </div>
+        </div>
+        
+      </main>
+      
+        
+<footer class="md-footer">
+  
+    <nav class="md-footer__inner md-grid" aria-label="Footer">
+      
+        
+        <a href=".." class="md-footer__link md-footer__link--prev" aria-label="Previous: Home" rel="prev">
+          <div class="md-footer__button md-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12z"/></svg>
+          </div>
+          <div class="md-footer__title">
+            <div class="md-ellipsis">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              Home
+            </div>
+          </div>
+        </a>
+      
+      
+        
+        <a href="../Techstack/" class="md-footer__link md-footer__link--next" aria-label="Next: Techstack" rel="next">
+          <div class="md-footer__title">
+            <div class="md-ellipsis">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              Techstack
+            </div>
+          </div>
+          <div class="md-footer__button md-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11H4z"/></svg>
+          </div>
+        </a>
+      
+    </nav>
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-footer-copyright">
+        
+        
+          Made with
+          <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+            Material for MkDocs
+          </a>
+        
+        
+      </div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    <script id="__config" type="application/json">{"base": "..", "features": [], "translations": {"clipboard.copy": "Copy to clipboard", "clipboard.copied": "Copied to clipboard", "search.config.lang": "en", "search.config.pipeline": "trimmer, stopWordFilter", "search.config.separator": "[\\s\\-]+", "search.placeholder": "Search", "search.result.placeholder": "Type to start searching", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.term.missing": "Missing", "select.version.title": "Select version"}, "search": "../assets/javascripts/workers/search.fcfe8b6d.min.js", "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.b1047164.min.js"></script>
+      
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+      
+    
+  </body>
+</html>

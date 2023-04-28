@@ -1,0 +1,1300 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.2.3, mkdocs-material-7.3.6">
+    
+    
+      
+        <title>Techstack - NostrMail</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.a57b2b03.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.3f5d1f46.min.css">
+        
+      
+    
+    
+    
+      
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,400i,700%7CRoboto+Mono&display=fallback">
+        <style>:root{--md-text-font-family:"Roboto";--md-code-font-family:"Roboto Mono"}</style>
+      
+    
+    
+    
+    
+      
+
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="" data-md-color-primary="none" data-md-color-accent="none">
+  
+    
+    <script>function __prefix(e){return new URL("..",location).pathname+"."+e}function __get(e,t=localStorage){return JSON.parse(t.getItem(__prefix(e)))}</script>
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#dependencies" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="NostrMail" class="md-header__button md-logo" aria-label="NostrMail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54z"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            NostrMail
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Techstack
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5z"/></svg>
+      </label>
+      
+<div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" aria-label="Clear" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="NostrMail" class="md-nav__button md-logo" aria-label="NostrMail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54z"/></svg>
+
+    </a>
+    NostrMail
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        Home
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../NIP/" class="md-nav__link">
+        NIP
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" data-md-toggle="toc" type="checkbox" id="__toc">
+      
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          Techstack
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        Techstack
+      </a>
+      
+        
+
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#dependencies" class="md-nav__link">
+    Dependencies
+  </a>
+  
+    <nav class="md-nav" aria-label="Dependencies">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#nostr" class="md-nav__link">
+    nostr
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#secp256k1" class="md-nav__link">
+    secp256k1
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#workflow" class="md-nav__link">
+    Workflow
+  </a>
+  
+    <nav class="md-nav" aria-label="Workflow">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#privpub-key-generation" class="md-nav__link">
+    priv/pub key generation
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#connecting-to-proxies" class="md-nav__link">
+    Connecting to proxies
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#text-events" class="md-nav__link">
+    Text events
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#shared-secret" class="md-nav__link">
+    Shared secret
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#encryption" class="md-nav__link">
+    Encryption
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#mock-email-flow" class="md-nav__link">
+    Mock email flow
+  </a>
+  
+    <nav class="md-nav" aria-label="Mock email flow">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#try-connecting-to-damus" class="md-nav__link">
+    Try connecting to Damus
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fetch-event-for-your-pub-key" class="md-nav__link">
+    fetch event for your pub key
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#address-book" class="md-nav__link">
+    Address book
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#create-user-profile" class="md-nav__link">
+    create user profile
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#generate-alice-profile" class="md-nav__link">
+    Generate Alice profile
+  </a>
+  
+    <nav class="md-nav" aria-label="Generate Alice profile">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#publish-bobs-profile" class="md-nav__link">
+    Publish Bob's profile
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#direct-message" class="md-nav__link">
+    Direct Message
+  </a>
+  
+    <nav class="md-nav" aria-label="Direct Message">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#contacts" class="md-nav__link">
+    Contacts
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#search-email-by-subject" class="md-nav__link">
+    search email by subject
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#filters" class="md-nav__link">
+    Filters
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-height-caching" class="md-nav__link">
+    Block height caching
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../related_work/" class="md-nav__link">
+        Related Work
+      </a>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../WorkLog/" class="md-nav__link">
+        WorkLog
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#dependencies" class="md-nav__link">
+    Dependencies
+  </a>
+  
+    <nav class="md-nav" aria-label="Dependencies">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#nostr" class="md-nav__link">
+    nostr
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#secp256k1" class="md-nav__link">
+    secp256k1
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#workflow" class="md-nav__link">
+    Workflow
+  </a>
+  
+    <nav class="md-nav" aria-label="Workflow">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#privpub-key-generation" class="md-nav__link">
+    priv/pub key generation
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#connecting-to-proxies" class="md-nav__link">
+    Connecting to proxies
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#text-events" class="md-nav__link">
+    Text events
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#shared-secret" class="md-nav__link">
+    Shared secret
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#encryption" class="md-nav__link">
+    Encryption
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#mock-email-flow" class="md-nav__link">
+    Mock email flow
+  </a>
+  
+    <nav class="md-nav" aria-label="Mock email flow">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#try-connecting-to-damus" class="md-nav__link">
+    Try connecting to Damus
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fetch-event-for-your-pub-key" class="md-nav__link">
+    fetch event for your pub key
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#address-book" class="md-nav__link">
+    Address book
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#create-user-profile" class="md-nav__link">
+    create user profile
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#generate-alice-profile" class="md-nav__link">
+    Generate Alice profile
+  </a>
+  
+    <nav class="md-nav" aria-label="Generate Alice profile">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#publish-bobs-profile" class="md-nav__link">
+    Publish Bob's profile
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#direct-message" class="md-nav__link">
+    Direct Message
+  </a>
+  
+    <nav class="md-nav" aria-label="Direct Message">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#contacts" class="md-nav__link">
+    Contacts
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#search-email-by-subject" class="md-nav__link">
+    search email by subject
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#filters" class="md-nav__link">
+    Filters
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#block-height-caching" class="md-nav__link">
+    Block height caching
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          <div class="md-content" data-md-component="content">
+            <article class="md-content__inner md-typeset">
+              
+                
+                
+                  <h1>Techstack</h1>
+                
+                <p>Here we walk through the building blocks of NostrMail. In addition to explaining how our implementation works, this should serve to illustrate how a similar strategy could be used for other platforms.</p>
+<h2 id="dependencies">Dependencies<a class="headerlink" href="#dependencies" title="Permanent link">&para;</a></h2>
+<h3 id="nostr">nostr<a class="headerlink" href="#nostr" title="Permanent link">&para;</a></h3>
+<p>NostrMail builds on the <code>python-nostr==0.0.2</code>, which <a href="https://github.com/jeffthibault/python-nostr">may be found here</a>. </p>
+<h3 id="secp256k1">secp256k1<a class="headerlink" href="#secp256k1" title="Permanent link">&para;</a></h3>
+<p>This library handles the PGP side of NostrMail and is a dependency of <code>python-nostr</code>. It is maintained by rustyrussell and <a href="https://github.com/rustyrussell/secp256k1-py">may be found here</a>.</p>
+<h2 id="workflow">Workflow<a class="headerlink" href="#workflow" title="Permanent link">&para;</a></h2>
+<h3 id="privpub-key-generation">priv/pub key generation<a class="headerlink" href="#privpub-key-generation" title="Permanent link">&para;</a></h3>
+<p>If you don't already have a nostr private key, use this to generate one. </p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostr.key</span> <span class="kn">import</span> <span class="n">PrivateKey</span>
+
+<span class="n">private_key</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="p">()</span>
+<span class="n">public_key</span> <span class="o">=</span> <span class="n">private_key</span><span class="o">.</span><span class="n">public_key</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Private key: </span><span class="si">{</span><span class="n">private_key</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Public key: </span><span class="si">{</span><span class="n">public_key</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<!-- #region -->
+<p>Copy and the above private key into <code>.env</code> at the root of this repo.</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">NOSTR_PRIV_KEY</span><span class="o">=</span>&lt;priv key here&gt;
+</code></pre></div>
+
+<!-- #endregion -->
+
+<p>When you run the <code>nostrmail</code> container, this key will be used as the default private key if the environment variable is set.</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span> <span class="nn">os</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">try</span><span class="p">:</span>
+    <span class="n">priv_key</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;NOSTR_PRIV_KEY&#39;</span><span class="p">]</span>
+<span class="k">except</span> <span class="ne">KeyError</span><span class="p">:</span>
+    <span class="k">raise</span> <span class="ne">KeyError</span><span class="p">(</span><span class="s1">&#39;Please set environment variable NOSTR_PRIV_KEY&#39;</span><span class="p">)</span>
+</code></pre></div>
+
+<h3 id="connecting-to-proxies">Connecting to proxies<a class="headerlink" href="#connecting-to-proxies" title="Permanent link">&para;</a></h3>
+<p>The following code is borrowed from the <code>python-nostr==0.0.2</code> docs. No attempt has been made to optimize relay connections on our part. There are <a href="https://github.com/jeffthibault/python-nostr/issues/91">open issues</a> on <code>python-nostr</code> that address this. </p>
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">ssl</span>
+<span class="kn">import</span> <span class="nn">time</span>
+<span class="kn">from</span> <span class="nn">nostr.relay_manager</span> <span class="kn">import</span> <span class="n">RelayManager</span>
+
+<span class="n">relay_manager</span> <span class="o">=</span> <span class="n">RelayManager</span><span class="p">()</span>
+<span class="n">relay_manager</span><span class="o">.</span><span class="n">add_relay</span><span class="p">(</span><span class="s2">&quot;wss://nostr-pub.wellorder.net&quot;</span><span class="p">)</span>
+<span class="n">relay_manager</span><span class="o">.</span><span class="n">add_relay</span><span class="p">(</span><span class="s2">&quot;wss://relay.damus.io&quot;</span><span class="p">)</span>
+<span class="n">relay_manager</span><span class="o">.</span><span class="n">add_relay</span><span class="p">(</span><span class="s2">&quot;wss://relay.oldcity-bitcoiners.info&quot;</span><span class="p">)</span>
+<span class="n">relay_manager</span><span class="o">.</span><span class="n">open_connections</span><span class="p">({</span><span class="s2">&quot;cert_reqs&quot;</span><span class="p">:</span> <span class="n">ssl</span><span class="o">.</span><span class="n">CERT_NONE</span><span class="p">})</span> <span class="c1"># NOTE: This disables ssl certificate verification</span>
+<span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">1.25</span><span class="p">)</span> <span class="c1"># allow the connections to open</span>
+
+<span class="k">while</span> <span class="n">relay_manager</span><span class="o">.</span><span class="n">message_pool</span><span class="o">.</span><span class="n">has_notices</span><span class="p">():</span>
+    <span class="n">notice_msg</span> <span class="o">=</span> <span class="n">relay_manager</span><span class="o">.</span><span class="n">message_pool</span><span class="o">.</span><span class="n">get_notice</span><span class="p">()</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">notice_msg</span><span class="o">.</span><span class="n">content</span><span class="p">)</span>
+
+<span class="n">relay_manager</span><span class="o">.</span><span class="n">close_connections</span><span class="p">()</span>
+</code></pre></div>
+
+<h3 id="text-events">Text events<a class="headerlink" href="#text-events" title="Permanent link">&para;</a></h3>
+<p>From <a href="https://github.com/nostr-protocol/nips/blob/master/01.md">NIP-01</a> there are three kinds of events</p>
+<ul>
+<li>0: set_metadata: the content is set to a stringified JSON object {name: <username>, about: <string>, picture: <url, string>} describing the user who created the event. A relay may delete past set_metadata events once it gets a new one for the same pubkey.</li>
+<li>1: text_note: the content is set to the plaintext content of a note (anything the user wants to say). Markdown links (<a href=""></a> stuff) are not plaintext.</li>
+<li>2: recommend_server: the content is set to the URL (e.g., wss://somerelay.com) of a relay the event creator wants to recommend to its followers.</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">get_events</span>
+</code></pre></div>
+
+<p>Let's view HelloJessica's nostr events.</p>
+<div class="codehilite"><pre><span></span><code><span class="n">node_hello</span> <span class="o">=</span> <span class="s1">&#39;npub1k9tkawv6ga6ptz3jl30pjzh68hk5mgvl28al5zc6r0myy849wvaq38a70g&#39;</span>
+<span class="n">node_hello_hex</span> <span class="o">=</span> <span class="s1">&#39;b1576eb99a4774158a32fc5e190afa3ded4da19f51fbfa0b1a1bf6421ea5733a&#39;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">text_hello</span> <span class="o">=</span> <span class="n">get_events</span><span class="p">(</span><span class="n">node_hello_hex</span><span class="p">,</span> <span class="s1">&#39;text&#39;</span><span class="p">)</span>
+<span class="n">text_hello</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">meta_hello</span> <span class="o">=</span> <span class="n">get_events</span><span class="p">(</span><span class="n">node_hello_hex</span><span class="p">,</span> <span class="s1">&#39;meta&#39;</span><span class="p">)</span>
+<span class="n">meta_hello</span>
+</code></pre></div>
+
+<h2 id="shared-secret">Shared secret<a class="headerlink" href="#shared-secret" title="Permanent link">&para;</a></h2>
+<p>First we'll create two key pairs, one for the sender and one for the receiver</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostr.key</span> <span class="kn">import</span> <span class="n">PrivateKey</span>
+
+<span class="n">priv_key1</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="p">()</span>
+<span class="n">pub_key1</span> <span class="o">=</span> <span class="n">priv_key1</span><span class="o">.</span><span class="n">public_key</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Private key: </span><span class="si">{</span><span class="n">priv_key1</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Public key: </span><span class="si">{</span><span class="n">pub_key1</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">priv_key2</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="p">()</span>
+<span class="n">pub_key2</span> <span class="o">=</span> <span class="n">priv_key2</span><span class="o">.</span><span class="n">public_key</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Private key: </span><span class="si">{</span><span class="n">priv_key1</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Public key: </span><span class="si">{</span><span class="n">pub_key1</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">assert</span> <span class="n">priv_key1</span><span class="o">.</span><span class="n">compute_shared_secret</span><span class="p">(</span><span class="n">pub_key2</span><span class="o">.</span><span class="n">hex</span><span class="p">())</span> <span class="o">==</span> <span class="n">priv_key2</span><span class="o">.</span><span class="n">compute_shared_secret</span><span class="p">(</span><span class="n">pub_key1</span><span class="o">.</span><span class="n">hex</span><span class="p">())</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s1">&#39;shared secret validated!&#39;</span><span class="p">)</span>
+</code></pre></div>
+
+<h2 id="encryption">Encryption<a class="headerlink" href="#encryption" title="Permanent link">&para;</a></h2>
+<p>nostr-python already uses AES 256 (?) encryption. More on the encryption scheme can be found here https://github.com/jeffthibault/python-nostr/blob/37cb66ba2d3968b2d75cc8ad71c3550415ca47fe/nostr/key.py#L69</p>
+<!-- #region -->
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">cryptography.hazmat.primitives.ciphers</span> <span class="kn">import</span> <span class="n">Cipher</span><span class="p">,</span> <span class="n">algorithms</span><span class="p">,</span> <span class="n">modes</span>
+<span class="kn">import</span> <span class="nn">secrets</span>
+<span class="n">iv</span> <span class="o">=</span> <span class="n">secrets</span><span class="o">.</span><span class="n">token_bytes</span><span class="p">(</span><span class="mi">16</span><span class="p">)</span>
+<span class="n">cipher</span> <span class="o">=</span> <span class="n">Cipher</span><span class="p">(</span><span class="n">algorithms</span><span class="o">.</span><span class="n">AES</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">compute_shared_secret</span><span class="p">(</span><span class="n">public_key_hex</span><span class="p">)),</span> <span class="n">modes</span><span class="o">.</span><span class="n">CBC</span><span class="p">(</span><span class="n">iv</span><span class="p">))</span>
+</code></pre></div>
+
+<!-- #endregion -->
+
+<div class="codehilite"><pre><span></span><code><span class="n">help</span><span class="p">(</span><span class="n">priv_key1</span><span class="o">.</span><span class="n">encrypt_message</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">help</span><span class="p">(</span><span class="n">priv_key2</span><span class="o">.</span><span class="n">decrypt_message</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">clear_message</span> <span class="o">=</span> <span class="s1">&#39;hello there&#39;</span>
+
+<span class="n">encrypted_msg</span> <span class="o">=</span> <span class="n">priv_key1</span><span class="o">.</span><span class="n">encrypt_message</span><span class="p">(</span><span class="n">clear_message</span><span class="p">,</span> <span class="n">pub_key2</span><span class="o">.</span><span class="n">hex</span><span class="p">())</span>
+<span class="n">encrypted_msg</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">assert</span> <span class="n">priv_key2</span><span class="o">.</span><span class="n">decrypt_message</span><span class="p">(</span><span class="n">encrypted_msg</span><span class="p">,</span> <span class="n">pub_key1</span><span class="o">.</span><span class="n">hex</span><span class="p">())</span> <span class="o">==</span> <span class="n">clear_message</span>
+</code></pre></div>
+
+<p>This approach uses the key pairs alone. There is no timing information included.</p>
+<h2 id="mock-email-flow">Mock email flow<a class="headerlink" href="#mock-email-flow" title="Permanent link">&para;</a></h2>
+<div class="codehilite"><pre><span></span><code><span class="n">sender_priv</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="p">()</span>
+<span class="n">sender_pub</span> <span class="o">=</span> <span class="n">sender_priv</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
+
+<span class="n">email_msg</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">    Well, hello there!</span>
+
+<span class="s2">    This is a decrypted message!</span>
+<span class="s2">&quot;&quot;&quot;</span>
+
+<span class="n">receiver_priv</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="p">()</span>
+<span class="n">receiver_pub</span> <span class="o">=</span> <span class="n">receiver_priv</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
+
+<span class="n">sender_secret</span> <span class="o">=</span> <span class="n">sender_priv</span><span class="o">.</span><span class="n">compute_shared_secret</span><span class="p">(</span><span class="n">receiver_pub</span><span class="p">)</span>
+<span class="n">sender_secret</span> <span class="c1"># will match receiver secret</span>
+</code></pre></div>
+
+<!-- #region -->
+<p><code>python-nostr/key.py</code></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span> <span class="nf">compute_shared_secret</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">public_key_hex</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+        <span class="n">pk</span> <span class="o">=</span> <span class="n">secp256k1</span><span class="o">.</span><span class="n">PublicKey</span><span class="p">(</span><span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="s2">&quot;02&quot;</span> <span class="o">+</span> <span class="n">public_key_hex</span><span class="p">),</span> <span class="kc">True</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">pk</span><span class="o">.</span><span class="n">ecdh</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">raw_secret</span><span class="p">,</span> <span class="n">hashfn</span><span class="o">=</span><span class="n">copy_x</span><span class="p">)</span>
+</code></pre></div>
+
+<p>The shared secret is the result of applying Eliptic Curve Diffe Hellman, so it should return a point on the elliptic curve (which is just another public key)</p>
+<!-- #endregion -->
+
+<div class="codehilite"><pre><span></span><code><span class="n">sender_secret</span> <span class="c1"># can turn into hex encoded str</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">encrypted_email</span> <span class="o">=</span> <span class="n">encrypt</span><span class="p">(</span><span class="n">email_msg</span><span class="p">,</span> <span class="n">sender_secret</span><span class="p">)</span>
+<span class="n">encrypted_email</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">receiver_secret</span> <span class="o">=</span> <span class="n">receiver_priv</span><span class="o">.</span><span class="n">compute_shared_secret</span><span class="p">(</span><span class="n">sender_pub</span><span class="p">)</span>
+
+<span class="c1"># this works because the receiver_secret matches the sender_secret (hence, shared secret)</span>
+<span class="n">decrypted_email</span> <span class="o">=</span> <span class="n">decrypt</span><span class="p">(</span><span class="n">encrypted_email</span><span class="p">,</span> <span class="n">receiver_secret</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">decrypted_email</span><span class="p">)</span>
+</code></pre></div>
+
+<h3 id="try-connecting-to-damus">Try connecting to Damus<a class="headerlink" href="#try-connecting-to-damus" title="Permanent link">&para;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span> <span class="nn">json</span> 
+<span class="kn">import</span> <span class="nn">ssl</span>
+<span class="kn">import</span> <span class="nn">time</span>
+<span class="kn">from</span> <span class="nn">nostr.event</span> <span class="kn">import</span> <span class="n">Event</span>
+<span class="kn">from</span> <span class="nn">nostr.relay_manager</span> <span class="kn">import</span> <span class="n">RelayManager</span>
+<span class="kn">from</span> <span class="nn">nostr.message_type</span> <span class="kn">import</span> <span class="n">ClientMessageType</span>
+<span class="kn">from</span> <span class="nn">nostr.key</span> <span class="kn">import</span> <span class="n">PrivateKey</span>
+
+<span class="n">relay_manager</span> <span class="o">=</span> <span class="n">RelayManager</span><span class="p">()</span>
+<span class="n">relay_manager</span><span class="o">.</span><span class="n">add_relay</span><span class="p">(</span><span class="s2">&quot;wss://nostr-pub.wellorder.net&quot;</span><span class="p">)</span>
+<span class="n">relay_manager</span><span class="o">.</span><span class="n">add_relay</span><span class="p">(</span><span class="s2">&quot;wss://relay.damus.io&quot;</span><span class="p">)</span>
+<span class="n">relay_manager</span><span class="o">.</span><span class="n">open_connections</span><span class="p">({</span><span class="s2">&quot;cert_reqs&quot;</span><span class="p">:</span> <span class="n">ssl</span><span class="o">.</span><span class="n">CERT_NONE</span><span class="p">})</span> <span class="c1"># NOTE: This disables ssl certificate verification</span>
+<span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">1.25</span><span class="p">)</span> <span class="c1"># allow the connections to open</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">event</span> <span class="o">=</span> <span class="n">Event</span><span class="p">(</span><span class="n">pub_key_hex</span><span class="p">,</span> <span class="s2">&quot;Hello there&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">priv_key</span><span class="o">.</span><span class="n">sign_event</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">assert</span> <span class="n">event</span><span class="o">.</span><span class="n">verify</span><span class="p">()</span> <span class="c1"># checks signature on event</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">relay_manager</span><span class="o">.</span><span class="n">publish_event</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
+<span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># allow the messages to send</span>
+
+<span class="n">relay_manager</span><span class="o">.</span><span class="n">close_connections</span><span class="p">()</span>
+</code></pre></div>
+
+<h3 id="fetch-event-for-your-pub-key">fetch event for your pub key<a class="headerlink" href="#fetch-event-for-your-pub-key" title="Permanent link">&para;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">get_events</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">get_events</span><span class="p">(</span><span class="n">pub_key_hex</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostr.key</span> <span class="kn">import</span> <span class="n">mine_vanity_key</span>
+</code></pre></div>
+
+<h2 id="address-book">Address book<a class="headerlink" href="#address-book" title="Permanent link">&para;</a></h2>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">omegaconf</span> <span class="kn">import</span> <span class="n">OmegaConf</span>
+<span class="kn">import</span> <span class="nn">pandas</span> <span class="k">as</span> <span class="nn">pd</span>
+<span class="kn">import</span> <span class="nn">dash_bootstrap_components</span> <span class="k">as</span> <span class="nn">dbc</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">load_contacts</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">load_contacts</span><span class="p">()</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">def</span> <span class="nf">update_contacts_table</span><span class="p">(</span><span class="n">url</span><span class="p">):</span>
+    <span class="n">contacts</span> <span class="o">=</span> <span class="n">load_contacts</span><span class="p">()</span>
+    <span class="n">table</span> <span class="o">=</span> <span class="n">dbc</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_dataframe</span><span class="p">(</span><span class="n">contacts</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">table</span><span class="o">.</span><span class="n">children</span>
+</code></pre></div>
+
+<h2 id="create-user-profile">create user profile<a class="headerlink" href="#create-user-profile" title="Permanent link">&para;</a></h2>
+<div class="codehilite"><pre><span></span><code><span class="k">try</span><span class="p">:</span>
+    <span class="n">priv_key_str</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;NOSTR_PRIV_KEY&#39;</span><span class="p">]</span>
+<span class="k">except</span> <span class="ne">KeyError</span><span class="p">:</span>
+    <span class="k">raise</span> <span class="ne">KeyError</span><span class="p">(</span><span class="s1">&#39;Please set environment variable NOSTR_PRIV_KEY&#39;</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">priv_key</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="o">.</span><span class="n">from_nsec</span><span class="p">(</span><span class="n">priv_key_str</span><span class="p">)</span>
+<span class="k">assert</span> <span class="n">priv_key</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span> <span class="o">==</span> <span class="n">priv_key_str</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">get_events</span><span class="p">,</span> <span class="n">load_current_user</span>
+<span class="kn">from</span> <span class="nn">nostr.key</span> <span class="kn">import</span> <span class="n">PrivateKey</span>
+<span class="kn">import</span> <span class="nn">os</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>
+</code></pre></div>
+
+<h2 id="generate-alice-profile">Generate Alice profile<a class="headerlink" href="#generate-alice-profile" title="Permanent link">&para;</a></h2>
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span> <span class="nn">os</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostr.event</span> <span class="kn">import</span> <span class="n">EventKind</span>
+<span class="kn">from</span> <span class="nn">nostr.key</span> <span class="kn">import</span> <span class="n">PrivateKey</span>
+<span class="kn">from</span> <span class="nn">nostr.event</span> <span class="kn">import</span> <span class="n">Event</span>
+<span class="kn">from</span> <span class="nn">nostr.relay_manager</span> <span class="kn">import</span> <span class="n">RelayManager</span>
+<span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">ssl</span>
+
+<span class="n">alice_priv_key_str</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;PRIV_KEY_ALICE&#39;</span><span class="p">]</span>
+<span class="n">alice_email</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;EMAIL_ALICE&#39;</span><span class="p">]</span>
+<span class="n">alice_priv_key</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="o">.</span><span class="n">from_nsec</span><span class="p">(</span><span class="n">alice_priv_key_str</span><span class="p">)</span>
+<span class="k">assert</span> <span class="n">alice_priv_key</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span> <span class="o">==</span> <span class="n">alice_priv_key_str</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span> <span class="nn">time</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">relays</span><span class="p">,</span> <span class="n">publish_profile</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">alice_profile</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">display_name</span><span class="o">=</span><span class="s1">&#39;Alice&#39;</span><span class="p">,</span>
+              <span class="n">name</span><span class="o">=</span><span class="s1">&#39;alice&#39;</span><span class="p">,</span>
+              <span class="n">picture</span><span class="o">=</span><span class="s1">&#39;https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTV-0rZbgnQcRbDqbk0hHPLHPyHpqLJ8xkriA&amp;usqp=CAU&#39;</span><span class="p">,</span>
+              <span class="n">about</span><span class="o">=</span><span class="s1">&#39;my name is Alice..&#39;</span><span class="p">,</span>
+              <span class="n">email</span><span class="o">=</span><span class="n">alice_email</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">sig</span> <span class="o">=</span> <span class="n">publish_profile</span><span class="p">(</span><span class="n">alice_priv_key</span><span class="p">,</span> <span class="n">alice_profile</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">sig</span>
+</code></pre></div>
+
+<p>Verify that profile was published</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">get_events</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">alice_profile_remote</span> <span class="o">=</span> <span class="n">get_events</span><span class="p">(</span><span class="n">alice_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span> <span class="s1">&#39;meta&#39;</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">assert</span> <span class="n">alice_profile_remote</span><span class="p">[</span><span class="s1">&#39;email&#39;</span><span class="p">]</span> <span class="o">==</span> <span class="n">alice_email</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">alice_profile_remote</span>
+</code></pre></div>
+
+<h3 id="publish-bobs-profile">Publish Bob's profile<a class="headerlink" href="#publish-bobs-profile" title="Permanent link">&para;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="n">bob_priv_key_str</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;PRIV_KEY_BOB&#39;</span><span class="p">]</span>
+<span class="n">bob_email</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;EMAIL_BOB&#39;</span><span class="p">]</span>
+<span class="n">bob_priv_key</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="o">.</span><span class="n">from_nsec</span><span class="p">(</span><span class="n">bob_priv_key_str</span><span class="p">)</span>
+<span class="k">assert</span> <span class="n">bob_priv_key</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span> <span class="o">==</span> <span class="n">bob_priv_key_str</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_profile</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">display_name</span><span class="o">=</span><span class="s1">&#39;Bob&#39;</span><span class="p">,</span>
+              <span class="n">name</span><span class="o">=</span><span class="s1">&#39;bob&#39;</span><span class="p">,</span>
+              <span class="n">picture</span><span class="o">=</span><span class="s1">&#39;https://cdnb.artstation.com/p/assets/images/images/030/065/923/large/in-house-media-bobgundisplay.jpg?1599501909&#39;</span><span class="p">,</span>
+              <span class="n">about</span><span class="o">=</span><span class="s2">&quot;I am the one they call Bob&quot;</span><span class="p">,</span>
+              <span class="n">email</span><span class="o">=</span><span class="n">bob_email</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">sig</span> <span class="o">=</span> <span class="n">publish_profile</span><span class="p">(</span><span class="n">bob_priv_key</span><span class="p">,</span> <span class="n">bob_profile</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_profile_remote</span> <span class="o">=</span> <span class="n">get_events</span><span class="p">(</span><span class="n">bob_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span> <span class="s1">&#39;meta&#39;</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">assert</span> <span class="n">bob_profile_remote</span><span class="p">[</span><span class="s1">&#39;email&#39;</span><span class="p">]</span> <span class="o">==</span> <span class="n">bob_email</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_profile_remote</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
+</code></pre></div>
+
+<h2 id="direct-message">Direct Message<a class="headerlink" href="#direct-message" title="Permanent link">&para;</a></h2>
+<p>Test delivery of the email subject via dm. The standard is defined in https://github.com/nostr-protocol/nips/blob/master/04.md</p>
+<ul>
+<li>text is encrypted with <code>base64-encoded, aes-256-cbc</code> using the x-coordinate if the shared point between sender/receiver</li>
+<li>content includes an initialization vector <code>"content": "&lt;encrypted_text&gt;?iv=&lt;initialization_vector&gt;"</code></li>
+<li><code>tags</code> MUST contain an entry identifying the receiver of the message in the form <code>["p", "&lt;pubkey, as a hex string&gt;"]</code>.</li>
+<li><code>tags</code> MAY contain an entry identifying the previous message in a conversation or a message we are explicitly replying to, in the form <code>["e", "&lt;event_id&gt;"]</code>.</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostr.key</span> <span class="kn">import</span> <span class="n">PrivateKey</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="n">alice_priv_key_str</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;PRIV_KEY_ALICE&#39;</span><span class="p">]</span>
+<span class="n">alice_email</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;EMAIL_ADDRESS_ALICE&#39;</span><span class="p">]</span>
+<span class="n">alice_priv_key</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="o">.</span><span class="n">from_nsec</span><span class="p">(</span><span class="n">alice_priv_key_str</span><span class="p">)</span>
+<span class="k">assert</span> <span class="n">alice_priv_key</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span> <span class="o">==</span> <span class="n">alice_priv_key_str</span>
+
+<span class="n">bob_priv_key_str</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;PRIV_KEY_BOB&#39;</span><span class="p">]</span>
+<span class="n">bob_email</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;EMAIL_ADDRESS_BOB&#39;</span><span class="p">]</span>
+<span class="n">bob_priv_key</span> <span class="o">=</span> <span class="n">PrivateKey</span><span class="o">.</span><span class="n">from_nsec</span><span class="p">(</span><span class="n">bob_priv_key_str</span><span class="p">)</span>
+<span class="k">assert</span> <span class="n">bob_priv_key</span><span class="o">.</span><span class="n">bech32</span><span class="p">()</span> <span class="o">==</span> <span class="n">bob_priv_key_str</span>
+</code></pre></div>
+
+<p>Confirm that we can create a valid priv key from the one provided</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">relays</span><span class="p">,</span> <span class="n">publish_direct_message</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># publish_direct_message(alice_priv_key, bob_priv_key.public_key.hex(), &quot;hi ho bob!&quot;)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">get_events</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">txt_events</span> <span class="o">=</span> <span class="n">get_events</span><span class="p">(</span><span class="n">bob_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span> <span class="n">kind</span><span class="o">=</span><span class="s1">&#39;dm&#39;</span><span class="p">,</span> <span class="n">returns</span><span class="o">=</span><span class="s1">&#39;event&#39;</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">txt_events</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">e</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">e</span><span class="o">.</span><span class="n">tags</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_priv_key</span><span class="o">.</span><span class="n">decrypt_message</span><span class="p">(</span><span class="n">e</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">alice_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">())</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># publish_direct_message(bob_priv_key, alice_priv_key.public_key.hex(), &#39;hullo, hullo!&#39;, e.id)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">get_dms</span><span class="p">,</span> <span class="n">get_convs</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span> <span class="nn">pandas</span> <span class="k">as</span> <span class="nn">pd</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">alice_dms</span> <span class="o">=</span> <span class="n">get_dms</span><span class="p">(</span><span class="n">alice_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">())</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">alice_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">dms</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">(</span><span class="n">alice_dms</span><span class="p">)</span>
+<span class="n">dms</span><span class="p">[</span><span class="s1">&#39;conv&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">get_convs</span><span class="p">(</span><span class="n">dms</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">dms</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">(</span><span class="n">alice_dms</span><span class="p">)</span><span class="o">.</span><span class="n">set_index</span><span class="p">(</span><span class="s1">&#39;time&#39;</span><span class="p">)</span><span class="o">.</span><span class="n">sort_index</span><span class="p">(</span><span class="n">ascending</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_dms</span> <span class="o">=</span> <span class="n">get_dms</span><span class="p">(</span><span class="n">bob_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">())</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_dms_df</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">(</span><span class="n">bob_dms</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_dms_df</span><span class="p">[</span><span class="s1">&#39;convs&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">get_convs</span><span class="p">(</span><span class="n">bob_dms_df</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_dms_df</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">bob_dms</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">def</span> <span class="nf">get_encryption_iv</span><span class="p">(</span><span class="n">msg</span><span class="p">):</span>
+    <span class="sd">&quot;&quot;&quot;extract the iv from an ecnrypted blob&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">msg</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s1">&#39;?iv=&#39;</span><span class="p">)[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">strip</span><span class="p">(</span><span class="s1">&#39;==&#39;</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">id_</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">(</span><span class="n">bob_dms</span><span class="p">)</span><span class="o">.</span><span class="n">iterrows</span><span class="p">():</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">get_encryption_iv</span><span class="p">(</span><span class="n">_</span><span class="o">.</span><span class="n">content</span><span class="p">),</span> <span class="n">alice_priv_key</span><span class="o">.</span><span class="n">decrypt_message</span><span class="p">(</span><span class="n">_</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">bob_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">()))</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">alice_priv_key</span><span class="o">.</span><span class="n">decrypt_message</span><span class="p">(</span><span class="n">_</span><span class="o">.</span><span class="n">content</span><span class="p">,</span> <span class="n">bob_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">())</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># from nostr.event import EncryptedDirectMessage # this isn&#39;t available as of nostr==0.0.2</span>
+
+<span class="c1"># dm = EncryptedDirectMessage(</span>
+<span class="c1">#   recipient_pubkey=recipient_pubkey,</span>
+<span class="c1">#   cleartext_content=&quot;Secret message!&quot;</span>
+<span class="c1"># )</span>
+<span class="c1"># private_key.sign_event(dm)</span>
+<span class="c1"># relay_manager.publish_event(dm)</span>
+</code></pre></div>
+
+<h3 id="contacts">Contacts<a class="headerlink" href="#contacts" title="Permanent link">&para;</a></h3>
+<p>There's a nip for contacts!
+https://github.com/nostr-protocol/nips/blob/master/02.md e.g. frank.david.erin </p>
+<h2 id="search-email-by-subject">search email by subject<a class="headerlink" href="#search-email-by-subject" title="Permanent link">&para;</a></h2>
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span> <span class="nn">imaplib</span>
+<span class="kn">import</span> <span class="nn">email</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span> <span class="nn">os</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">email_imap</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;IMAP_HOST&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">email_username</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;EMAIL_ADDRESS&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">email_password</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">&#39;EMAIL_PASSWORD&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># Set up connection to IMAP server</span>
+<span class="n">mail</span> <span class="o">=</span> <span class="n">imaplib</span><span class="o">.</span><span class="n">IMAP4_SSL</span><span class="p">(</span><span class="n">email_imap</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="ow">not</span> <span class="n">email_is_logged_in</span><span class="p">(</span><span class="n">mail</span><span class="p">):</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s1">&#39;logging in&#39;</span><span class="p">)</span>
+    <span class="n">mail</span><span class="o">.</span><span class="n">login</span><span class="p">(</span><span class="n">email_username</span><span class="p">,</span> <span class="n">email_password</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">mail</span><span class="o">.</span><span class="n">login</span><span class="p">(</span><span class="n">email_username</span><span class="p">,</span> <span class="n">email_password</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">email_is_logged_in</span><span class="p">(</span><span class="n">mail</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="ow">not</span> <span class="n">email_is_logged_in</span><span class="p">(</span><span class="n">mail</span><span class="p">):</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s1">&#39;logging in&#39;</span><span class="p">)</span>
+    <span class="n">mail</span><span class="o">.</span><span class="n">login</span><span class="p">(</span><span class="n">email_username</span><span class="p">,</span> <span class="n">email_password</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">dash</span> <span class="kn">import</span> <span class="n">html</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">mail</span><span class="o">.</span><span class="n">select</span><span class="p">(</span><span class="s1">&#39;Inbox&#39;</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># email_body = find_email_by_subject(mail, &#39;bVpH/kND9hb1p83A0saXYw&#39;)</span>
+<span class="n">email_body</span> <span class="o">=</span> <span class="n">find_email_by_subject</span><span class="p">(</span><span class="n">mail</span><span class="p">,</span> <span class="s1">&#39;r2e7cDJR6dqDgShm6w&#39;</span><span class="p">)</span>
+
+<span class="n">email_body</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="nb">type</span><span class="p">(</span><span class="n">email_body</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">check_if_email_logged_in</span><span class="p">(</span><span class="n">mail</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">dash</span> <span class="kn">import</span> <span class="n">dcc</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">dcc</span><span class="o">.</span><span class="n">Markdown</span><span class="err">?</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="n">alice_priv_key</span><span class="o">.</span><span class="n">decrypt_message</span><span class="p">(</span><span class="n">email_body</span><span class="p">,</span> <span class="n">bob_priv_key</span><span class="o">.</span><span class="n">public_key</span><span class="o">.</span><span class="n">hex</span><span class="p">()))</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">imaplib</span><span class="o">.</span><span class="n">IMAP4_SSL</span><span class="err">?</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="c1"># Close the mailbox and logout from the IMAP server</span>
+<span class="n">mail</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+<span class="n">mail</span><span class="o">.</span><span class="n">logout</span><span class="p">()</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">assert</span> <span class="ow">not</span> <span class="n">email_is_logged_in</span><span class="p">(</span><span class="n">mail</span><span class="p">)</span>
+</code></pre></div>
+
+<h2 id="filters">Filters<a class="headerlink" href="#filters" title="Permanent link">&para;</a></h2>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostr.filter</span> <span class="kn">import</span> <span class="n">Filter</span><span class="p">,</span> <span class="n">Filters</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">Filters</span><span class="err">?</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">Filter</span><span class="err">?</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="o">%</span><span class="n">load_ext</span> <span class="n">autoreload</span>
+<span class="o">%</span><span class="n">autoreload</span> <span class="mi">2</span>
+</code></pre></div>
+
+<h2 id="block-height-caching">Block height caching<a class="headerlink" href="#block-height-caching" title="Permanent link">&para;</a></h2>
+<p>We'll use block height to cache profile data.</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span> <span class="nn">nostrmail.utils</span> <span class="kn">import</span> <span class="n">get_block_hash</span><span class="p">,</span> <span class="n">get_block_info</span><span class="p">,</span> <span class="n">get_latest_block_hash</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">block_hash</span> <span class="o">=</span> <span class="n">get_latest_block_hash</span><span class="p">()</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">block_hash</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">latest_block</span> <span class="o">=</span> <span class="n">get_block_info</span><span class="p">(</span><span class="n">block_hash</span><span class="o">=</span><span class="n">block_hash</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="n">latest_block</span><span class="p">[</span><span class="s1">&#39;height&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>
+</code></pre></div>
+                
+              
+              
+                
+
+
+              
+            </article>
+          </div>
+        </div>
+        
+      </main>
+      
+        
+<footer class="md-footer">
+  
+    <nav class="md-footer__inner md-grid" aria-label="Footer">
+      
+        
+        <a href="../NIP/" class="md-footer__link md-footer__link--prev" aria-label="Previous: NIP" rel="prev">
+          <div class="md-footer__button md-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12z"/></svg>
+          </div>
+          <div class="md-footer__title">
+            <div class="md-ellipsis">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              NIP
+            </div>
+          </div>
+        </a>
+      
+      
+        
+        <a href="../related_work/" class="md-footer__link md-footer__link--next" aria-label="Next: Related Work" rel="next">
+          <div class="md-footer__title">
+            <div class="md-ellipsis">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              Related Work
+            </div>
+          </div>
+          <div class="md-footer__button md-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11H4z"/></svg>
+          </div>
+        </a>
+      
+    </nav>
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-footer-copyright">
+        
+        
+          Made with
+          <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+            Material for MkDocs
+          </a>
+        
+        
+      </div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    <script id="__config" type="application/json">{"base": "..", "features": [], "translations": {"clipboard.copy": "Copy to clipboard", "clipboard.copied": "Copied to clipboard", "search.config.lang": "en", "search.config.pipeline": "trimmer, stopWordFilter", "search.config.separator": "[\\s\\-]+", "search.placeholder": "Search", "search.result.placeholder": "Type to start searching", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.term.missing": "Missing", "select.version.title": "Select version"}, "search": "../assets/javascripts/workers/search.fcfe8b6d.min.js", "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.b1047164.min.js"></script>
+      
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+      
+    
+  </body>
+</html>

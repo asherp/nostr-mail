@@ -1,3 +1,5 @@
+# 2023-04-28 18:01:30.320739: clock-out
+
 * packaging, discussion with Tadge
 * Tadgh Drija on cc'ing: use a single encryption key and encrypt it to everyone's pub keys and include the whole decryption package in the message. This could be a json blob storing the following
 

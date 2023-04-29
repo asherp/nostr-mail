@@ -22,5 +22,5 @@ WORKDIR /nostrmail
 
 RUN pip install -e .
 
-# # CMD ["nostr-mail"]
+CMD ["python", "nostrmail/dashboard.py"]
 

@@ -2,7 +2,7 @@ version: '2.4'
 
 services:
   notebook:
-    image: nostr-mail
+    image: ${NOSTR_MAIL_IMAGE_TAG}
     ports:
       - "8888:8888"
     build:
@@ -39,7 +39,7 @@ services:
       - --allow-root
     working_dir: /nostrmail
   docs:
-    image: nostr-mail
+    image: ${NOSTR_MAIL_IMAGE_TAG}
     ports:
       - "8000:8000"
     build:
@@ -56,7 +56,7 @@ services:
       - -a
       - 0.0.0.0:8000
   nostrmail:
-    image: nostr-mail
+    image: ${NOSTR_MAIL_IMAGE_TAG}
     ports:
       - "8050:8050"
     build:
@@ -86,7 +86,7 @@ services:
       - dashboard.py
     working_dir: /nostrmail/nostrmail
   alice:
-    image: nostr-mail
+    image: ${NOSTR_MAIL_IMAGE_TAG}
     ports:
       - "8051:8050"
     build:
@@ -116,7 +116,7 @@ services:
       - dashboard.py
     working_dir: /nostrmail/nostrmail
   bob:
-    image: nostr-mail
+    image: ${NOSTR_MAIL_IMAGE_TAG}
     ports:
       - "8052:8050"
     build:

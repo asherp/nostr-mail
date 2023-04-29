@@ -183,7 +183,11 @@ def get_nostr_priv_key(url):
 def get_nostr_pub_key(priv_key_nsec):
     if priv_key_nsec is None:
         raise PreventUpdate
-    pub_key_hex = PrivateKey.from_nsec(priv_key_nsec).public_key.hex()
+    try:
+        pub_key_hex = PrivateKey.from_nsec(priv_key_nsec).public_key.hex()
+    except:
+        print(f'strange priv key ----> {priv_key_nsec} <----')
+        raise IOError(f'something wrong with priv key {priv_key_nsec}')
     return pub_key_hex
 
 def get_email_credentials(url):

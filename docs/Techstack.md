@@ -1,4 +1,4 @@
-Here we walk through the building blocks of NostrMail. In addition to explaining how our implementation works, this should serve to illustrate how a similar strategy could be used for other platforms.
+Let's we walk through the building blocks of NostrMail. In addition to explaining how our implementation works, this should serve to illustrate how a similar strategy could be used for other platforms.
 
 
 

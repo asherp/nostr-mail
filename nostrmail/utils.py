@@ -22,14 +22,19 @@ from cryptography.hazmat.primitives import hashes
 import base64
 import email
 
-cache_dir = os.environ.get('NOSTRMAIL_CACHE')
+cache_dir = os.environ.get('NOSTRMAIL_CACHE', 'cache')
 
 print(f'cache_dir: {cache_dir}')
 cache = FanoutCache(cache_dir, size_limit=1e6) # 1Mb
 
-nostr_contacts = os.environ['NOSTR_CONTACTS']
+nostr_contacts = os.environ.get('NOSTR_CONTACTS')
 
-relays = OmegaConf.load(nostr_contacts).relays
+if nostr_contacts is not None:
+    relays = OmegaConf.load(nostr_contacts).relays
+else:
+    relays = [
+        "wss://nostr-pub.wellorder.net",
+        "wss://relay.damus.io"]
 
 
 def get_events(pub_key_hex, kind='text', relays=relays, returns='content'):

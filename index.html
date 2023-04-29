@@ -47,13 +47,17 @@
   
     
     
+      
     
     
     
-    <body dir="ltr" data-md-color-scheme="" data-md-color-primary="none" data-md-color-accent="none">
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="" data-md-color-accent="">
   
     
     <script>function __prefix(e){return new URL(".",location).pathname+"."+e}function __get(e,t=localStorage){return JSON.parse(t.getItem(__prefix(e)))}</script>
+    
+      <script>var palette=__get("__palette");if(null!==palette&&"object"==typeof palette.color)for(var key in palette.color)document.body.setAttribute("data-md-color-"+key,palette.color[key])</script>
     
     <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
     <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
@@ -99,6 +103,28 @@
         </div>
       </div>
     </div>
+    
+      <form class="md-header__option" data-md-component="palette">
+        
+          
+          
+          <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="" data-md-color-accent=""  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+          
+            <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_2" hidden>
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12 20 8.69z"/></svg>
+            </label>
+          
+        
+          
+          
+          <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="" data-md-color-accent=""  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_2">
+          
+            <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12c0-2.42-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12 20 8.69z"/></svg>
+            </label>
+          
+        
+      </form>
     
     
     
@@ -231,16 +257,44 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#obligatory-warning" class="md-nav__link">
+    Obligatory warning
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#usage" class="md-nav__link">
     Usage
   </a>
   
-    <nav class="md-nav" aria-label="Usage">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration" class="md-nav__link">
+    Configuration
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#requirements" class="md-nav__link">
-    Requirements
+  <a href="#environment-variables" class="md-nav__link">
+    Environment variables
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#address-bookrelays" class="md-nav__link">
+    Address book/relays
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#email" class="md-nav__link">
+    Email
   </a>
   
 </li>
@@ -364,16 +418,44 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#obligatory-warning" class="md-nav__link">
+    Obligatory warning
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#usage" class="md-nav__link">
     Usage
   </a>
   
-    <nav class="md-nav" aria-label="Usage">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#configuration" class="md-nav__link">
+    Configuration
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#requirements" class="md-nav__link">
-    Requirements
+  <a href="#environment-variables" class="md-nav__link">
+    Environment variables
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#address-bookrelays" class="md-nav__link">
+    Address book/relays
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#email" class="md-nav__link">
+    Email
   </a>
   
 </li>
@@ -405,7 +487,7 @@
 <p>Both sender and receiver derive a shared secret known only to them, which is used to protect their communications.</p>
 <p>This application can use any email server for delivery.</p>
 <h3 id="why-have-you-done-this">Why have you done this?<a class="headerlink" href="#why-have-you-done-this" title="Permanent link">&para;</a></h3>
-<p>NostrMail aims to improve privacy for the average pleb by bridging the gap between nostr and email. The two protocols serve different purposes, but they also solve each other's problems.</p>
+<p>NostrMail aims to improve privacy for the average pleb by bridging the gap between nostr and email. The two protocols serve different purposes, but they also solve each other's problems. For example, PGP does exist for email but it has not seen mainstream adoption because it relies on an existing key registry.</p>
 <table>
 <thead>
 <tr>
@@ -417,7 +499,7 @@
 </thead>
 <tbody>
 <tr>
-<td>Social</td>
+<td>Social Key Registry</td>
 <td><span class="twemoji"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m10 17-5-5 1.41-1.42L10 14.17l7.59-7.59L19 8m0-5H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/></svg></span></td>
 <td><span class="twemoji"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 3H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2m0 2v14H5V5h14z"/></svg></span></td>
 <td><span class="twemoji"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m10 17-5-5 1.41-1.42L10 14.17l7.59-7.59L19 8m0-5H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/></svg></span></td>
@@ -425,7 +507,7 @@
 <tr>
 <td>PGP</td>
 <td><span class="twemoji"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m10 17-5-5 1.41-1.42L10 14.17l7.59-7.59L19 8m0-5H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/></svg></span></td>
-<td><span class="twemoji"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 3H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2m0 2v14H5V5h14z"/></svg></span></td>
+<td><span class="twemoji"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m10 17-5-5 1.41-1.42L10 14.17l7.59-7.59L19 8m0-5H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/></svg></span></td>
 <td><span class="twemoji"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m10 17-5-5 1.41-1.42L10 14.17l7.59-7.59L19 8m0-5H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/></svg></span></td>
 </tr>
 <tr>
@@ -448,17 +530,108 @@
 </tr>
 </tbody>
 </table>
+<h2 id="obligatory-warning">Obligatory warning<a class="headerlink" href="#obligatory-warning" title="Permanent link">&para;</a></h2>
+<p>Nostrmail uses NIP-04, which has many <a href="https://github.com/nostr-protocol/nips/issues/107">issues pointed out here</a>. While not perfect, it's better than cleartext emails. </p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
-<p>Navigate to the base of this directory, then:</p>
+<p>You'll need <a href="https://docs.docker.com/desktop/">docker</a>.</p>
+<p>Clone and navigate to the base of the repo directory, then:</p>
 <div class="codehilite"><pre><span></span><code>docker compose up nostrmail
 </code></pre></div>
 
 <p>Navigate to <a href="http://localhost:8050">http://localhost:8050</a></p>
-<h3 id="requirements">Requirements<a class="headerlink" href="#requirements" title="Permanent link">&para;</a></h3>
-<ul>
-<li>secp256k1 https://pypi.org/project/secp256k1/</li>
-<li>nostr https://pypi.org/project/nostr/</li>
-</ul>
+<p>Here are all the services you can run with <code>docker compose up &lt;service name&gt;</code></p>
+<table>
+<thead>
+<tr>
+<th>service</th>
+<th>purpose</th>
+<th>port</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>nostrmail</td>
+<td>main dashboard site</td>
+<td>8050</td>
+</tr>
+<tr>
+<td>alice</td>
+<td>"Alice" dashboard for testing</td>
+<td>8051</td>
+</tr>
+<tr>
+<td>bob</td>
+<td>"Bob" dashboard for testing</td>
+<td>8052</td>
+</tr>
+<tr>
+<td>docs</td>
+<td>documentation site</td>
+<td>8000</td>
+</tr>
+<tr>
+<td>notebook</td>
+<td>jupyter notebook for prototyping</td>
+<td>8888</td>
+</tr>
+</tbody>
+</table>
+<h2 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&para;</a></h2>
+<h3 id="environment-variables">Environment variables<a class="headerlink" href="#environment-variables" title="Permanent link">&para;</a></h3>
+<p>Create a <code>.env</code> file and place it in the base of this repo to set the defaults for the above containers.</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">NOSTR_PRIV_KEY</span><span class="o">=</span>&lt;your priv key&gt;
+<span class="nv">EMAIL_ADDRESS</span><span class="o">=</span>&lt;your public email address&gt;
+<span class="nv">EMAIL_PASSWORD</span><span class="o">=</span>&lt;email password&gt;
+
+<span class="c1"># email server, assuming gmail</span>
+<span class="nv">IMAP_HOST</span><span class="o">=</span>imap.gmail.com
+<span class="nv">IMAP_PORT</span><span class="o">=</span><span class="m">2525</span>
+<span class="nv">SMTP_HOST</span><span class="o">=</span>smtp.gmail.com
+<span class="nv">SMTP_PORT</span><span class="o">=</span><span class="m">587</span>
+
+<span class="c1"># this is where we find pub keys for now (should use NIP-02)</span>
+<span class="nv">NOSTR_CONTACTS</span><span class="o">=</span>/nostrmail/address_book.yaml
+
+<span class="c1"># the below configuration is for test purposes only</span>
+<span class="nv">PRIV_KEY_ALICE</span><span class="o">=</span>&lt;priv key <span class="k">for</span> alice&gt;
+<span class="nv">EMAIL_ADDRESS_ALICE</span><span class="o">=</span>yourname+alice@gmail.com
+<span class="nv">EMAIL_PASSWORD_ALICE</span><span class="o">=</span>&lt;same email password as above&gt;
+
+<span class="nv">PRIV_KEY_BOB</span><span class="o">=</span>&lt;priv key <span class="k">for</span> bob&gt;
+<span class="nv">EMAIL_ADDRESS_BOB</span><span class="o">=</span>yourname+bob@gmail.com
+<span class="nv">EMAIL_PASSWORD_BOB</span><span class="o">=</span>&lt;same password as above&gt;
+
+<span class="nv">NOSTR_MAIL_IMAGE_TAG</span><span class="o">=</span>&lt;dockerhub_username&gt;/nostr-mail
+</code></pre></div>
+
+<h3 id="address-bookrelays">Address book/relays<a class="headerlink" href="#address-bookrelays" title="Permanent link">&para;</a></h3>
+<p>Create a file in the local directory called <code>address_book.yaml</code> to specify private contacts.
+Here's an example.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">contacts</span><span class="p">:</span>
+  <span class="p p-Indicator">-</span> <span class="nt">username</span><span class="p">:</span> <span class="l l-Scalar l-Scalar-Plain">alice</span>
+    <span class="nt">pubkey</span><span class="p">:</span> <span class="l l-Scalar l-Scalar-Plain">12697aa72d2269aa632319d000b0548235d1d385dc16260ca77f704e802b5483</span>
+  <span class="p p-Indicator">-</span> <span class="nt">username</span><span class="p">:</span> <span class="l l-Scalar l-Scalar-Plain">bob</span>
+    <span class="nt">pubkey</span><span class="p">:</span> <span class="l l-Scalar l-Scalar-Plain">8619149c5549fa9970c042da77d9d018c7213e83aa49b89c234da9c298ecb941</span>
+  <span class="p p-Indicator">-</span> <span class="nt">username</span><span class="p">:</span> <span class="l l-Scalar l-Scalar-Plain">asher</span>
+    <span class="nt">pubkey</span><span class="p">:</span> <span class="l l-Scalar l-Scalar-Plain">86fb0bd1f7edcb17b39e897488f51f1d22ac6bd93aae491fc7cd45c9fb0d4ad8</span>
+<span class="nt">relays</span><span class="p">:</span>
+  <span class="p p-Indicator">-</span> <span class="l l-Scalar l-Scalar-Plain">wss://nostr-pub.wellorder.net</span>
+  <span class="p p-Indicator">-</span> <span class="l l-Scalar l-Scalar-Plain">wss://relay.damus.io</span>
+</code></pre></div>
+
+<h3 id="email">Email<a class="headerlink" href="#email" title="Permanent link">&para;</a></h3>
+<p>Configure your email account to allow sending and receiving emails. Here are instructions for gmail.</p>
+<ol>
+<li>Generate an app password (required if using 2-factor auth) See https://support.google.com/accounts/answer/185833?hl=en </li>
+<li>Set <code>EMAIL_PASSWORD</code> in your <code>.env</code> file as explained above.</li>
+<li>Open gmail settings to enable IMAP<ol>
+<li>In the top right, click Settings Settings and then See all  settings.</li>
+<li>Click the Forwarding and POP/IMAP tab.</li>
+<li>In the "IMAP access" section, select Enable IMAP.</li>
+<li>Click Save Changes.</li>
+</ol>
+</li>
+</ol>
                 
               
               

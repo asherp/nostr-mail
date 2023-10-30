@@ -145,4 +145,15 @@ services:
       - -u
       - dashboard.py
     working_dir: /nostrmail/nostrmail
+  app:
+    build: 
+      context: app
+      dockerfile: Dockerfile
+    environment:
+      - DISPLAY=${HOST_DISPLAY}
+      - LIBGL_ALWAYS_SOFTWARE=1
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    command: python main.py
+
 

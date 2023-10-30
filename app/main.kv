@@ -1,0 +1,46 @@
+BoxLayout:
+    orientation: 'horizontal'
+
+    MDNavigationDrawer:
+        id: nav_drawer
+        BoxLayout:
+            orientation: 'vertical'
+            spacing: '8dp'
+            padding: '8dp'
+
+            ScrollView:
+                MDList:
+                    OneLineListItem:
+                        text: 'Profile'
+                        on_release: app.show_screen('profile_screen')
+                    OneLineListItem:
+                        text: 'Contacts'
+                        on_release: app.show_screen('contacts_screen')
+                    OneLineListItem:
+                        text: 'Compose'
+                        on_release: app.show_screen('compose_screen')
+                    OneLineListItem:
+                        text: 'Inbox'
+                        on_release: app.show_screen('inbox_screen')
+                    OneLineListItem:
+                        text: 'Settings'
+                        on_release: app.show_screen('settings_screen')
+
+    ScreenManager:
+        id: screen_manager
+
+        ProfileScreen:
+            name: 'profile_screen'
+
+        ContactsScreen:
+            name: 'contacts_screen'
+
+        ComposeScreen:
+            name: 'compose_screen'
+
+        InboxScreen:
+            name: 'inbox_screen'
+
+        SettingsScreen:
+            name: 'settings_screen'
+

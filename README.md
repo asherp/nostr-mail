@@ -23,9 +23,9 @@ NostrMail aims to improve privacy for the average pleb by bridging the gap betwe
 | Archival Storage   | :material-checkbox-blank-outline:   | :material-checkbox-marked:        | :material-checkbox-marked: |
 | Ubiquitous         | :material-checkbox-blank-outline:   | :material-checkbox-marked:        | :material-checkbox-marked: |
 
-## Obligatory warning
+### Obligatory warning
 
-Nostrmail uses NIP-04, which has many [issues pointed out here](https://github.com/nostr-protocol/nips/issues/107). While not perfect, it's better than cleartext emails. 
+Nostrmail uses NIP-04, which has many [issues pointed out here](https://github.com/nostr-protocol/nips/issues/107). While not perfect, it's better than cleartext. Use at your own risk.
 
 ## Usage
 

@@ -1,3 +1,4 @@
+* nostr dependencies
 
 # 2023-10-31 14:37:20.178561: clock-in
 

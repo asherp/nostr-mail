@@ -1,3 +1,4 @@
 kivy
 kivymd
 keyring
+git+https://github.com/davestgermain/aionostr.git#egg=aionostr

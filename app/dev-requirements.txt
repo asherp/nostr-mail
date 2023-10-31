@@ -1,0 +1,6 @@
+jupyter
+notebook==6.4.*
+jupytext
+pandas
+numpy
+

@@ -27,6 +27,21 @@ NostrMail aims to improve privacy for the average pleb by bridging the gap betwe
 
 Nostrmail uses NIP-04, which has many [issues pointed out here](https://github.com/nostr-protocol/nips/issues/107). While not perfect, it's better than cleartext. Use at your own risk.
 
+## App
+
+### Desktop
+
+Use conda/miniconda to install dependencies
+
+```sh
+conda create -n nostrmail python=3.9
+conda activate nostrmail
+pip install -r app/requirements.txt
+```
+
+
+
+
 ## Usage
 
 You'll need [docker](https://docs.docker.com/desktop/).
@@ -49,7 +64,8 @@ Here are all the services you can run with `docker compose up <service name>`
 | docs    | documentation site | 8000 |
 | notebook | jupyter notebook for prototyping | 8888 |
 
-## Configuration
+
+## Docker Configuration
 
 ### Environment variables
 

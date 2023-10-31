@@ -1,3 +1,4 @@
+* nav, compose, inbox, settings layout
 
 # 2023-10-30 18:00:46.852777: clock-in
 

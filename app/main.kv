@@ -1,46 +1,223 @@
-BoxLayout:
-    orientation: 'horizontal'
+<DrawerClickableItem@MDNavigationDrawerItem>
+    focus_color: "#e7e4c0"
+    text_color: "#4a4939"
+    icon_color: "#4a4939"
+    ripple_color: "#c5bdd2"
+    selected_color: "#0c6c4d"
 
-    MDNavigationDrawer:
-        id: nav_drawer
-        BoxLayout:
-            orientation: 'vertical'
-            spacing: '8dp'
-            padding: '8dp'
 
-            ScrollView:
-                MDList:
-                    OneLineListItem:
-                        text: 'Profile'
-                        on_release: app.show_screen('profile_screen')
-                    OneLineListItem:
-                        text: 'Contacts'
-                        on_release: app.show_screen('contacts_screen')
-                    OneLineListItem:
-                        text: 'Compose'
-                        on_release: app.show_screen('compose_screen')
-                    OneLineListItem:
-                        text: 'Inbox'
-                        on_release: app.show_screen('inbox_screen')
-                    OneLineListItem:
-                        text: 'Settings'
-                        on_release: app.show_screen('settings_screen')
+<DrawerLabelItem@MDNavigationDrawerItem>
+    text_color: "#4a4939"
+    icon_color: "#4a4939"
+    focus_behavior: False
+    selected_color: "#4a4939"
+    _no_ripple_effect: True
 
-    ScreenManager:
-        id: screen_manager
 
-        ProfileScreen:
-            name: 'profile_screen'
+<SettingsScreen>:
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: "16dp"
 
-        ContactsScreen:
-            name: 'contacts_screen'
+        MDTopAppBar:
+            title: "Settings"
+            elevation: 4
+            pos_hint: {"top": 1}
+            md_bg_color: "#e7e4c0"
+            specific_text_color: "#4a4939"
+            left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
+            
+        ScrollView:
+            MDList:
+                MDTextField:
+                    hint_text: "Enter priv key"
+                    helper_text: "Nostr Private Key"
+                    helper_text_mode: "on_focus"
+                MDTextField:
+                    hint_text: "Nostr Pub Key"
+                    disabled: True
+                    helper_text: "Nostr Public Key"
+                    helper_text_mode: "on_focus"
+                MDTextField:
+                    hint_text: "Enter email"
+                    helper_text: "Email"
+                    helper_text_mode: "on_focus"
+                MDTextField:
+                    hint_text: "Enter Password"
+                    password: True  # hides the text
+                    helper_text: "Password"
+                    helper_text_mode: "on_focus"
+                MDTextField:
+                    hint_text: "imap.example.com"
+                    helper_text: "IMAP Host"
+                    helper_text_mode: "on_focus"
+                MDTextField:
+                    hint_text: "2525"
+                    input_filter: 'int'  # allows only integer input
+                    helper_text: "IMAP Port"
+                    helper_text_mode: "on_focus"
+                MDTextField:
+                    hint_text: "smtp.example.com"
+                    helper_text: "SMTP Host"
+                    helper_text_mode: "on_focus"
+                MDTextField:
+                    hint_text: "587"
+                    input_filter: 'int'  # allows only integer input
+                    helper_text: "SMTP Port"
+                    helper_text_mode: "on_focus"
 
-        ComposeScreen:
-            name: 'compose_screen'
 
-        InboxScreen:
-            name: 'inbox_screen'
 
-        SettingsScreen:
-            name: 'settings_screen'
 
+MDScreen:
+
+    MDNavigationLayout:
+
+        MDScreenManager:
+            id: screen_manager
+
+            MDScreen:
+                name: 'main_screen'
+
+                MDTopAppBar:
+                    title: "Navigation Drawer"
+                    elevation: 4
+                    pos_hint: {"top": 1}
+                    md_bg_color: "#e7e4c0"
+                    specific_text_color: "#4a4939"
+                    left_action_items: [["menu", lambda x: nav_drawer.set_state("open")]]
+
+            SettingsScreen:
+                name: 'settings_screen'  # name of the new settings screen
+
+
+            MDScreen:
+                name: 'inbox_screen'  # name of the new screen
+
+                MDBoxLayout:
+                    orientation: 'vertical'
+
+                    MDTopAppBar:
+                        title: "Inbox"
+                        elevation: 4
+                        pos_hint: {"top": 1}
+                        md_bg_color: "#e7e4c0"
+                        specific_text_color: "#4a4939"
+                        left_action_items: [["menu", lambda x: nav_drawer.set_state("open")]]
+
+                    ScrollView:
+                        MDList:
+                            id: message_list
+                            OneLineAvatarListItem:
+                                text: "Message 1"
+                                ImageLeftWidget:
+                                    source: app.avatars[0] if app.avatars else "default_avatar.png"  # now it's a file path
+
+
+
+            MDScreen:
+                name: 'compose_screen'
+
+                MDBoxLayout:
+                    orientation: 'vertical'
+                    padding: "16dp"
+
+                    MDTopAppBar:
+                        title: "Compose"
+                        elevation: 4
+                        pos_hint: {"top": 1}
+                        md_bg_color: "#e7e4c0"
+                        specific_text_color: "#4a4939"
+                        left_action_items: [["menu", lambda x: nav_drawer.set_state("open")]]
+
+                    BoxLayout:
+                        size_hint_y: None
+                        height: self.minimum_height
+                        orientation: 'vertical'
+                        padding: "16dp", "8dp", "16dp", "0dp"
+
+                        MDTextField:
+                            hint_text: 'Recipient'
+                            multiline: False
+
+                        MDTextField:
+                            hint_text: 'Subject'
+                            multiline: False
+
+                    BoxLayout:
+                        size_hint_y: 1
+                        padding: "16dp", "8dp", "16dp", "0dp"
+
+                        MDTextField:
+                            hint_text: 'Message'
+                            multiline: True
+                            size_hint_y: 1
+
+                    BoxLayout:
+                        size_hint_y: None
+                        height: '48dp'
+                        padding: "16dp", "8dp", "16dp", "16dp"
+
+                        MDRaisedButton:
+                            text: 'Send'
+                            size_hint: None, None
+                            size: '64dp', '48dp'
+                            pos_hint: {'right': 1}
+
+
+
+        MDNavigationDrawer:
+            id: nav_drawer
+            radius: (0, 16, 16, 0)
+
+            MDNavigationDrawerMenu:
+
+                MDNavigationDrawerHeader:
+                    title: "Header title"
+                    title_color: "#4a4939"
+                    text: "Header text"
+                    spacing: "4dp"
+                    padding: "12dp", 0, 0, "56dp"
+
+                MDNavigationDrawerLabel:
+                    text: "Mail"
+
+                DrawerClickableItem:
+                    icon: "gmail"
+                    right_text: "+99"
+                    text_right_color: "#4a4939"
+                    text: "Inbox"
+                    on_release:
+                        app.root.ids.screen_manager.current = 'inbox_screen'  # switch to the inbox screen
+                        nav_drawer.set_state("close")
+
+                DrawerClickableItem:
+                    icon: "send"
+                    text: "Outbox"
+
+                DrawerClickableItem:
+                    icon: "pencil"
+                    text: "Compose"
+                    on_release:
+                        app.root.ids.screen_manager.current = 'compose_screen'
+                        nav_drawer.set_state("close")
+
+                DrawerClickableItem:
+                    icon: "cog"
+                    text: "Settings"
+                    on_release:
+                        app.root.ids.screen_manager.current = 'settings_screen'
+                        nav_drawer.set_state("close")
+
+                MDNavigationDrawerDivider:
+
+                MDNavigationDrawerLabel:
+                    text: "Labels"
+
+                DrawerLabelItem:
+                    icon: "information-outline"
+                    text: "Label"
+
+                DrawerLabelItem:
+                    icon: "information-outline"
+                    text: "Label"

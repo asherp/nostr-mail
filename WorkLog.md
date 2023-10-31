@@ -1,3 +1,5 @@
+# 2023-10-31 08:43:57.102223: clock-out
+
 * key storage
 * nostr private key storage https://www.reddit.com/r/nostr/comments/10thhgh/managing_nostr_private_key/
 

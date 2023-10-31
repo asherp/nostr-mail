@@ -1,3 +1,5 @@
+* key storage
+* nostr private key storage https://www.reddit.com/r/nostr/comments/10thhgh/managing_nostr_private_key/
 
 # 2023-10-31 07:52:33.894620: clock-in: T-4m 
 

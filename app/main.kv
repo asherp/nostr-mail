@@ -26,7 +26,7 @@
             md_bg_color: "#e7e4c0"
             specific_text_color: "#4a4939"
             left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
-            
+
         ScrollView:
             MDList:
                 MDTextField:
@@ -67,6 +67,56 @@
                     helper_text_mode: "on_focus"
 
 
+<ProfileScreen>:
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: "16dp"
+
+        MDTopAppBar:
+            title: "Profile"
+            elevation: 4
+            pos_hint: {"top": 1}
+            md_bg_color: "#e7e4c0"
+            specific_text_color: "#4a4939"
+            left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
+
+        ScrollView:
+            MDList:
+                MDTextField:
+                    hint_text: "Display Name"
+                    text: ''
+                MDTextField:
+                    hint_text: "Name"
+                    text: ''
+                MDTextField:
+                    hint_text: "Picture URL"
+                    text: ''
+                MDTextField:
+                    hint_text: "About"
+                    text: ''
+                MDTextField:
+                    hint_text: "Email"
+                    text: ''
+
+
+<ContactsScreen>:
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: "16dp"
+
+        MDTopAppBar:
+            title: "Contacts"
+            elevation: 4
+            pos_hint: {"top": 1}
+            md_bg_color: "#e7e4c0"
+            specific_text_color: "#4a4939"
+            left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
+
+        ScrollView:
+            MDList:
+                id: contacts_list
+                # You could populate this list dynamically in your app
+
 
 
 MDScreen:
@@ -89,6 +139,18 @@ MDScreen:
 
             SettingsScreen:
                 name: 'settings_screen'  # name of the new settings screen
+
+            MDScreen:
+                name: 'profile_screen'  # name of the new profile screen
+                BoxLayout:
+                    orientation: 'vertical'
+                    ProfileScreen:
+
+            MDScreen:
+                name: 'contacts_screen'  # name of the new contacts screen
+                BoxLayout:
+                    orientation: 'vertical'
+                    ContactsScreen:
 
 
             MDScreen:
@@ -173,14 +235,28 @@ MDScreen:
             MDNavigationDrawerMenu:
 
                 MDNavigationDrawerHeader:
-                    title: "Header title"
+                    title: "NostrMail"
                     title_color: "#4a4939"
-                    text: "Header text"
+                    text: "Email and other stuff"
                     spacing: "4dp"
                     padding: "12dp", 0, 0, "56dp"
 
                 MDNavigationDrawerLabel:
                     text: "Mail"
+
+                DrawerClickableItem:
+                    icon: "account-circle-outline"
+                    text: "Profile"
+                    on_release:
+                        app.root.ids.screen_manager.current = 'profile_screen'
+                        nav_drawer.set_state("close")
+
+                DrawerClickableItem:
+                    icon: "account-multiple-outline"
+                    text: "Contacts"
+                    on_release:
+                        app.root.ids.screen_manager.current = 'contacts_screen'
+                        nav_drawer.set_state("close")
 
                 DrawerClickableItem:
                     icon: "gmail"

@@ -7,8 +7,12 @@ from kivymd.app import MDApp
 from kivymd.uix.screen import MDScreen
 from kivymd.uix.list import OneLineAvatarListItem, ImageLeftWidget
 import tempfile
+import keyring
 
+# get a password
+password = keyring.get_password("nostrmail", "priv_key")
 
+Logger.info('password for nostrmail loaded')
 
 class ComposeScreen(MDScreen):
     pass
@@ -17,6 +21,11 @@ class ComposeScreen(MDScreen):
 class SettingsScreen(MDScreen):
     pass
 
+class ProfileScreen(MDScreen):
+    pass
+
+class ContactsScreen(MDScreen):
+    pass
 
 class Main(MDApp):
     avatars = ListProperty([])

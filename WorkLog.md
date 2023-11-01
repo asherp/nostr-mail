@@ -1,3 +1,6 @@
+
+# 2023-11-01 18:58:43.427874: clock-in
+
 # 2023-11-01 16:33:49.770381: clock-out
 
 * save, load nostr priv, pub key

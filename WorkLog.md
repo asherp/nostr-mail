@@ -1,3 +1,5 @@
+* save, load nostr priv, pub key
+* aionostr docs https://github.com/davestgermain/aionostr/blob/master/docs/usage.rst
 
 # 2023-11-01 15:02:03.890320: clock-in
 

@@ -30,15 +30,20 @@
         ScrollView:
             MDList:
                 MDTextField:
-                    hint_text: "Enter priv key"
+                    id: priv_key_input
+                    hint_text: "Enter priv key (nsec format)"
                     password: True
                     helper_text: "Nostr Private Key"
                     helper_text_mode: "on_focus"
+
                 MDTextField:
+                    id: pub_key_output
                     hint_text: "Nostr Pub Key"
-                    disabled: True
+                    readonly: True
                     helper_text: "Nostr Public Key"
                     helper_text_mode: "on_focus"
+                    helper_text_color: app.theme_cls.error_color if root.error else app.theme_cls.secondary_text_color
+                    theme_text_color: "Primary"
                 MDTextField:
                     hint_text: "Enter email"
                     helper_text: "Email"
@@ -67,6 +72,9 @@
                     helper_text: "SMTP Port"
                     helper_text_mode: "on_focus"
 
+        MDRaisedButton:
+            text: "Save"
+            on_release: root.save_priv_key()
 
 <ProfileScreen>:
     MDBoxLayout:
@@ -140,6 +148,7 @@ MDScreen:
 
             SettingsScreen:
                 name: 'settings_screen'  # name of the new settings screen
+                id: settings_screen
 
             MDScreen:
                 name: 'profile_screen'  # name of the new profile screen
@@ -286,15 +295,15 @@ MDScreen:
                         app.root.ids.screen_manager.current = 'settings_screen'
                         nav_drawer.set_state("close")
 
-                MDNavigationDrawerDivider:
+                # MDNavigationDrawerDivider:
 
-                MDNavigationDrawerLabel:
-                    text: "Labels"
+                # MDNavigationDrawerLabel:
+                #     text: "Labels"
 
-                DrawerLabelItem:
-                    icon: "information-outline"
-                    text: "Label"
+                # DrawerLabelItem:
+                #     icon: "information-outline"
+                #     text: "Label"
 
-                DrawerLabelItem:
-                    icon: "information-outline"
-                    text: "Label"
+                # DrawerLabelItem:
+                #     icon: "information-outline"
+                #     text: "Label"

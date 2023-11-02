@@ -1,3 +1,4 @@
+* looking at aoinostr api
 
 # 2023-11-02 15:35:58.694842: clock-in: T-4m 
 

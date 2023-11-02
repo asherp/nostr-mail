@@ -1,3 +1,6 @@
+
+# 2023-11-02 15:35:58.694842: clock-in: T-4m 
+
 # 2023-11-01 19:52:24.403884: clock-out
 
 * save, load email credentials

@@ -1,3 +1,4 @@
+* save, load email credentials
 
 # 2023-11-01 18:58:43.427874: clock-in
 

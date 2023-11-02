@@ -10,32 +10,59 @@ import tempfile
 import keyring
 from util import get_nostr_pub_key
 
+KEYRING_GROUP = 'nostrmail'
+
 class SettingsScreen(MDScreen):
     error = BooleanProperty(False)
 
+    def save_settings(self):
+        self.save_priv_key()
+        self.save_email_credentials()
+
+
     def save_priv_key(self):
-        priv_key = self.ids.priv_key_input.text
+        priv_key = self.ids.priv_key.text
         try:
             pub_key = get_nostr_pub_key(priv_key)
-            self.update_pub_key_output(pub_key)
+            self.update_pub_key(pub_key)
 
-            priv_key_stored = keyring.get_password('nostrmail', 'priv_key')
+            priv_key_stored = keyring.get_password(KEYRING_GROUP, 'priv_key')
             if priv_key != priv_key_stored:
-                keyring.set_password('nostrmail', 'priv_key', priv_key)
+                keyring.set_password(KEYRING_GROUP, 'priv_key', priv_key)
                 Logger.info('priv key stored')
-                self.ids.priv_key_input.helper_text = 'Nostr Priv Key (changed)'
+                self.ids.priv_key.helper_text = 'Nostr Priv Key (changed)'
             else:
                 Logger.info('priv key unchanged')
-                self.ids.priv_key_input.helper_text = 'Nostr Priv Key'
+                self.ids.priv_key.helper_text = 'Nostr Priv Key'
 
         except Exception as e:
-            self.ids.pub_key_output.text = ''
-            self.ids.pub_key_output.helper_text = "Failed to generate public key." + str(e)
+            self.ids.pub_key.text = ''
+            self.ids.pub_key.helper_text = "Failed to generate public key." + str(e)
             self.error = True
 
-    def update_pub_key_output(self, pub_key):
-        self.ids.pub_key_output.text = pub_key
-        self.ids.pub_key_output.helper_text = "Nostr Public Key"
+
+    def save_email_credentials(self):
+        self.save_credential('email_address', self.ids.email_address.text)
+        self.save_credential('email_password', self.ids.email_password.text)
+        self.save_credential('imap_host', self.ids.imap_host.text)
+        self.save_credential('imap_port', self.ids.imap_port.text)
+        self.save_credential('smtp_host', self.ids.smtp_port.text)
+        self.save_credential('smtp_port', self.ids.smtp_port.text)
+
+
+    def save_credential(self, credential_type, credential_value):
+        stored_credential = keyring.get_password(KEYRING_GROUP, credential_type)
+        if credential_value != stored_credential:
+            keyring.set_password(KEYRING_GROUP, credential_type, credential_value)
+            Logger.info(f'{credential_type} updated.')
+        else:
+            Logger.info(f'{credential_type} unchanged.')
+
+
+
+    def update_pub_key(self, pub_key):
+        self.ids.pub_key.text = pub_key
+        self.ids.pub_key.helper_text = "Nostr Public Key"
 
 
 
@@ -56,13 +83,32 @@ class Main(MDApp):
 
     def on_start(self):
         self.load_priv_key()
+        self.load_credentials()
 
     def load_priv_key(self):
-        priv_key = keyring.get_password('nostrmail', 'priv_key')
+        priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
         settings_screen = self.root.ids.settings_screen
-        settings_screen.ids.priv_key_input.text = priv_key
-        settings_screen.save_priv_key()
-        Logger.info('password for nostrmail loaded')
+        if priv_key is not None:
+            settings_screen.ids.priv_key.text = priv_key
+            settings_screen.save_priv_key()
+            Logger.info('priv_key for nostrmail loaded')
+        else:
+            Logger.info('priv_key for nostrmail not found')
+
+
+    def load_credentials(self):
+        self.load_credential('email_address', 'email_address')
+        self.load_credential('email_password', 'email_password')
+
+    def load_credential(self, credential_type, text_field_id):
+        credential_value = keyring.get_password(KEYRING_GROUP, credential_type)
+        settings_screen = self.root.ids.settings_screen
+        if credential_value is not None:
+            getattr(settings_screen.ids, text_field_id).text = credential_value
+            Logger.info(f'{credential_type} for nostrmail loaded')
+        else:
+            Logger.info(f'{credential_type} for nostrmail not found')
+
 
 
     def build(self):

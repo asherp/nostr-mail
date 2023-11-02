@@ -30,14 +30,13 @@
         ScrollView:
             MDList:
                 MDTextField:
-                    id: priv_key_input
+                    id: priv_key
                     hint_text: "Enter priv key (nsec format)"
                     password: True
                     helper_text: "Nostr Private Key"
                     helper_text_mode: "on_focus"
-
                 MDTextField:
-                    id: pub_key_output
+                    id: pub_key
                     hint_text: "Nostr Pub Key"
                     readonly: True
                     helper_text: "Nostr Public Key"
@@ -45,28 +44,34 @@
                     helper_text_color: app.theme_cls.error_color if root.error else app.theme_cls.secondary_text_color
                     theme_text_color: "Primary"
                 MDTextField:
+                    id: email_address
                     hint_text: "Enter email"
                     helper_text: "Email"
                     helper_text_mode: "on_focus"
                 MDTextField:
+                    id: email_password
                     hint_text: "Enter Password"
                     password: True  # hides the text
                     helper_text: "Password"
                     helper_text_mode: "on_focus"
                 MDTextField:
+                    id: imap_host
                     hint_text: "imap.example.com"
                     helper_text: "IMAP Host"
                     helper_text_mode: "on_focus"
                 MDTextField:
+                    id: imap_port
                     hint_text: "2525"
                     input_filter: 'int'  # allows only integer input
                     helper_text: "IMAP Port"
                     helper_text_mode: "on_focus"
                 MDTextField:
+                    id: smtp_host
                     hint_text: "smtp.example.com"
                     helper_text: "SMTP Host"
                     helper_text_mode: "on_focus"
                 MDTextField:
+                    id: smtp_port
                     hint_text: "587"
                     input_filter: 'int'  # allows only integer input
                     helper_text: "SMTP Port"
@@ -74,7 +79,7 @@
 
         MDRaisedButton:
             text: "Save"
-            on_release: root.save_priv_key()
+            on_release: root.save_settings()
 
 <ProfileScreen>:
     MDBoxLayout:

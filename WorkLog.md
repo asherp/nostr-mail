@@ -1,3 +1,6 @@
+
+# 2023-11-03 18:01:35.470392: clock-in
+
 # 2023-11-02 16:24:28.645786: clock-out
 
 * looking at aoinostr api

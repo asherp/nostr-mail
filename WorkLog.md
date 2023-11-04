@@ -1,3 +1,6 @@
+
+# 2023-11-04 15:14:07.577390: clock-in
+
 # 2023-11-03 19:47:54.771049: clock-out: T-20m 
 
 * testing profile loading into db

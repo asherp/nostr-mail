@@ -42,12 +42,17 @@ class SettingsScreen(MDScreen):
 
 
     def save_email_credentials(self):
-        self.save_credential('email_address', self.ids.email_address.text)
-        self.save_credential('email_password', self.ids.email_password.text)
-        self.save_credential('imap_host', self.ids.imap_host.text)
-        self.save_credential('imap_port', self.ids.imap_port.text)
-        self.save_credential('smtp_host', self.ids.smtp_port.text)
-        self.save_credential('smtp_port', self.ids.smtp_port.text)
+        credential_names = [
+            'email_address',
+            'email_password',
+            'imap_host',
+            'imap_port',
+            'smtp_host',
+            'smtp_port']
+
+        # Use a for loop to save the credentials
+        for name in credential_names:
+            self.save_credential(name, self.ids[name].text)
 
 
     def save_credential(self, credential_type, credential_value):

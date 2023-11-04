@@ -1,5 +1,3 @@
-from nostr.key import PrivateKey
-
 import json
 import ssl
 import time

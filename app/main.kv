@@ -14,6 +14,33 @@
     _no_ripple_effect: True
 
 
+<RelayScreen>:
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: "16dp"
+
+        MDTopAppBar:
+            title: "Relays"
+            elevation: 4
+            pos_hint: {"top": 1}
+            md_bg_color: "#e7e4c0"
+            specific_text_color: "#4a4939"
+            left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
+        ScrollView:
+            MDList:
+                id: relay_list
+                # This will be populated with the list of relays
+
+        MDFloatingActionButton:
+            icon: "plus"
+            pos_hint: {'right': 0.95, 'bottom': 0.05}
+            on_release: root.add_relay()
+
+        MDRaisedButton:
+            text: 'Load Default Relays'
+            on_release: root.load_default_relays()
+
+
 <SettingsScreen>:
     MDBoxLayout:
         orientation: 'vertical'
@@ -76,7 +103,6 @@
                     input_filter: 'int'  # allows only integer input
                     helper_text: "SMTP Port"
                     helper_text_mode: "on_focus"
-
         MDRaisedButton:
             text: "Save"
             on_release: root.save_settings()
@@ -97,20 +123,20 @@
         ScrollView:
             MDList:
                 MDTextField:
+                    id: display_name
                     hint_text: "Display Name"
-                    text: ''
                 MDTextField:
+                    id: name
                     hint_text: "Name"
-                    text: ''
                 MDTextField:
+                    id: picture_url
                     hint_text: "Picture URL"
-                    text: ''
                 MDTextField:
+                    id: about
                     hint_text: "About"
-                    text: ''
                 MDTextField:
+                    id: email
                     hint_text: "Email"
-                    text: ''
 
 
 <ContactsScreen>:
@@ -151,15 +177,17 @@ MDScreen:
                     specific_text_color: "#4a4939"
                     left_action_items: [["menu", lambda x: nav_drawer.set_state("open")]]
 
+            RelayScreen:
+                name: 'relay_screen'
+                id: relay_screen
+
             SettingsScreen:
-                name: 'settings_screen'  # name of the new settings screen
+                name: 'settings_screen'
                 id: settings_screen
 
-            MDScreen:
-                name: 'profile_screen'  # name of the new profile screen
-                BoxLayout:
-                    orientation: 'vertical'
-                    ProfileScreen:
+            ProfileScreen:  # Now directly inside the ScreenManager
+                name: 'profile_screen'
+                id: profile_screen
 
             MDScreen:
                 name: 'contacts_screen'  # name of the new contacts screen
@@ -241,8 +269,6 @@ MDScreen:
                             size: '64dp', '48dp'
                             pos_hint: {'right': 1}
 
-
-
         MDNavigationDrawer:
             id: nav_drawer
             radius: (0, 16, 16, 0)
@@ -300,15 +326,11 @@ MDScreen:
                         app.root.ids.screen_manager.current = 'settings_screen'
                         nav_drawer.set_state("close")
 
-                # MDNavigationDrawerDivider:
 
-                # MDNavigationDrawerLabel:
-                #     text: "Labels"
+                DrawerClickableItem:
+                    icon: "satellite-uplink"
+                    text: "Relays"
+                    on_release:
+                        app.root.ids.screen_manager.current = 'relay_screen'
+                        nav_drawer.set_state("close")
 
-                # DrawerLabelItem:
-                #     icon: "information-outline"
-                #     text: "Label"
-
-                # DrawerLabelItem:
-                #     icon: "information-outline"
-                #     text: "Label"

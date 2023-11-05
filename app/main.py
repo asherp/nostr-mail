@@ -1,16 +1,164 @@
 from threading import Thread
+from sqlitedict import SqliteDict
 from kivy.network.urlrequest import UrlRequest
 from kivy.properties import ListProperty, BooleanProperty
 from kivy.logger import Logger
 from kivy.core.image import Image as CoreImage
 from kivymd.app import MDApp
 from kivymd.uix.screen import MDScreen
-from kivymd.uix.list import OneLineAvatarListItem, ImageLeftWidget
+from kivymd.uix.dialog import MDDialog
+from kivymd.uix.list import OneLineAvatarListItem, ImageLeftWidget, OneLineListItem
+from kivymd.uix.textfield import MDTextField
+from kivymd.uix.button import MDFlatButton
+
 import tempfile
 import keyring
 from util import get_nostr_pub_key
+from aionostr.util import NIP19_PREFIXES, from_nip19, to_nip19
 
 KEYRING_GROUP = 'nostrmail'
+DEFAULT_RELAYS = [
+    "wss://nostr-pub.wellorder.net",
+    "wss://relay.damus.io",
+    'wss://brb.io',
+    'wss://nostr.mom']
+
+class EditableListItem(OneLineListItem):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.on_release = self.open_edit_dialog  # Sets the on_release to the dialog opener
+
+    def open_edit_dialog(self):
+        app = MDApp.get_running_app()
+        relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
+        relay_screen.open_edit_dialog(self.text)
+
+class RelayScreen(MDScreen):
+    relays = ListProperty()
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.load_relays_from_db()
+
+    def save_relays_to_db(self):
+        with SqliteDict('nostrmail.sqlite', autocommit=True) as db:
+            # Convert the ListProperty to a plain list before saving.
+            db['relays'] = list(self.relays)
+            Logger.info("Relays saved to database.")
+
+    def load_relays_from_db(self):
+        with SqliteDict('nostrmail.sqlite') as db:
+            # Directly assign the list to self.relays
+            self.relays = db.get('relays', DEFAULT_RELAYS)
+            Logger.info("Relays loaded from database.")
+
+    def load_default_relays(self):
+        '''Load default relays if they are not already present.'''
+        for default_relay in DEFAULT_RELAYS:
+            if default_relay not in self.relays:
+                self.relays.append(default_relay)
+        self.on_pre_enter()  # Refresh the list
+        self.save_relays_to_db()  # Save the updated list to the database
+
+    def is_valid_relay_url(self, url):
+        return url.startswith("wss://") and not url.endswith('.')
+
+    def show_error_dialog(self, error_message):
+        '''Show an error dialog with the given message.'''
+        self.dialog = MDDialog(
+            title="Error",
+            text=error_message,
+            buttons=[MDFlatButton(text="OK", on_release=self.close_dialog)],
+        )
+        self.dialog.open()
+
+    def on_pre_enter(self, *args):
+        self.ids.relay_list.clear_widgets()
+        for relay in self.relays:
+            self.ids.relay_list.add_widget(EditableListItem(text=relay))
+
+
+    def open_edit_dialog(self, relay_url):
+        '''Open a dialog to edit the selected relay URL.'''
+        self.dialog = MDDialog(
+            title="Edit Relay URL",
+            type="custom",
+            content_cls=MDTextField(text=relay_url),
+            buttons=[
+                MDFlatButton(
+                    text="CANCEL",
+                    on_release=self.close_dialog
+                ),
+                MDFlatButton(
+                    text="DELETE",
+                    on_release=lambda *_: self.delete_relay_url(relay_url)
+                ),
+                MDFlatButton(
+                    text="SAVE",
+                    on_release=lambda *_: (
+                        self.save_relay_url(relay_url, self.dialog.content_cls.text),
+                        self.close_dialog()
+                    )
+                ),
+            ],
+        )
+        self.dialog.open()
+
+    def delete_relay_url(self, relay_url):
+        '''Delete the selected relay URL.'''
+        if relay_url in self.relays:
+            self.relays.remove(relay_url)
+            self.on_pre_enter()  # Refresh the list
+            self.save_relays_to_db()  # Save the updated list to the database
+        self.close_dialog()
+
+    def add_relay(self):
+        '''Open a dialog to add a new relay URL.'''
+        self.dialog = MDDialog(
+            title="Add Relay URL",
+            type="custom",
+            content_cls=MDTextField(hint_text="wss://new.example.com"),
+            buttons=[
+                MDFlatButton(
+                    text="CANCEL",
+                    on_release=self.close_dialog
+                ),
+                MDFlatButton(
+                    text="SAVE",
+                    on_release=lambda *_: self.save_new_relay_url(self.dialog.content_cls.text)
+                ),
+            ],
+        )
+        self.dialog.open()
+
+    def save_new_relay_url(self, new_url):
+        '''Save the new relay URL.'''
+        if self.is_valid_relay_url(new_url):
+            self.relays.append(new_url)
+            self.on_pre_enter()  # Refresh the list
+            self.save_relays_to_db()  # Save the updated list to the database
+        else:
+            self.show_error_dialog("The relay URL must start with wss://")
+        self.close_dialog()  # Moved to here
+
+    def save_relay_url(self, old_url, new_url):
+        '''Save the edited relay URL.'''
+        if self.is_valid_relay_url(new_url):
+            if old_url in self.relays:
+                index = self.relays.index(old_url)
+                self.relays[index] = new_url
+                self.on_pre_enter()  # Refresh the list
+                self.save_relays_to_db()  # Save the updated list to the database
+        else:
+            self.show_error_dialog("The relay URL must start with wss://")
+        self.close_dialog()
+
+
+    def close_dialog(self, *args):
+        '''Close the edit dialog.'''
+        self.dialog.dismiss()
+
+
 
 class SettingsScreen(MDScreen):
     error = BooleanProperty(False)
@@ -78,7 +226,35 @@ class ComposeScreen(MDScreen):
 
 
 class ProfileScreen(MDScreen):
-    pass
+    def load_profile_data(self):
+        # first fetch our hex key base on private key
+        priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
+        pub_key_hex = get_nostr_pub_key(priv_key)
+        raise NotImplementedError('not finished yet')
+        profile_query = to_nip19(ntype='nprofile', payload=pub_key_hex, relays=relays)
+        Logger.info(profile_query)
+        
+
+    def on_enter(self, *args):
+        Logger.info('PROFILE SCREEN ENTERED')
+        # Load profile data from your data source here
+        profile_data = self.load_profile_data()
+        self.populate_profile(profile_data)
+
+    def populate_profile(self, profile_data):
+        # Parse the JSON string in the 'content' key of the profile data
+        content = json.loads(profile_data['content'])
+
+        self.ids.display_name.text = content.get('display_name', '')
+        self.ids.name.text = content.get('name', '')
+        self.ids.picture_url.text = content.get('picture', '')
+        self.ids.about.text = content.get('about', '')
+        self.ids.email.text = content.get('email', '')
+
+        # You might also want to store the id and pubkey somewhere or use it in some way
+        # For example:
+        self.profile_id = profile_data.get('id', '')
+        self.public_key = profile_data.get('pubkey', '')
 
 class ContactsScreen(MDScreen):
     pass
@@ -89,6 +265,8 @@ class Main(MDApp):
     def on_start(self):
         self.load_priv_key()
         self.load_credentials()
+        self.root.ids.relay_screen.load_relays_from_db()
+
 
     def load_priv_key(self):
         priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')

@@ -7,6 +7,9 @@ from kivy.core.image import Image as CoreImage
 from kivymd.app import MDApp
 from kivymd.uix.screen import MDScreen
 from kivymd.uix.dialog import MDDialog
+from kivymd.uix.boxlayout import MDBoxLayout  # Make sure to import MDBoxLayout
+from kivymd.uix.label import MDLabel
+from kivy.uix.boxlayout import BoxLayout
 from kivymd.uix.list import OneLineAvatarListItem, ImageLeftWidget, OneLineListItem
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.button import MDFlatButton
@@ -31,6 +34,7 @@ class EditableListItem(OneLineListItem):
     def open_edit_dialog(self):
         app = MDApp.get_running_app()
         relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
+        Logger.info(f'editing current relay url: {self.text}')
         relay_screen.open_edit_dialog(self.text)
 
 class RelayScreen(MDScreen):
@@ -38,7 +42,9 @@ class RelayScreen(MDScreen):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        Logger.info("Initializing RelayScreen")
         self.load_relays_from_db()
+
 
     def save_relays_to_db(self):
         with SqliteDict('nostrmail.sqlite', autocommit=True) as db:
@@ -63,14 +69,6 @@ class RelayScreen(MDScreen):
     def is_valid_relay_url(self, url):
         return url.startswith("wss://") and not url.endswith('.')
 
-    def show_error_dialog(self, error_message):
-        '''Show an error dialog with the given message.'''
-        self.dialog = MDDialog(
-            title="Error",
-            text=error_message,
-            buttons=[MDFlatButton(text="OK", on_release=self.close_dialog)],
-        )
-        self.dialog.open()
 
     def on_pre_enter(self, *args):
         self.ids.relay_list.clear_widgets()
@@ -78,12 +76,23 @@ class RelayScreen(MDScreen):
             self.ids.relay_list.add_widget(EditableListItem(text=relay))
 
 
+    def on_save_button_release(self, relay_url):
+        if self.current_content_cls is not None:
+            self.save_relay_url(relay_url, self.current_content_cls.text)
+        else:
+            Logger.error('current_content_cls is None')
+        self.dialog.dismiss()
+
+
     def open_edit_dialog(self, relay_url):
         '''Open a dialog to edit the selected relay URL.'''
+        self.current_content_cls = MDTextField(text=relay_url)
+        self.error_label = MDLabel(text='', color=(1, 0, 0, 1))  # Red color for error messages
+        self.dialog_box = MDBoxLayout(orientation='vertical', children=[self.current_content_cls, self.error_label])
         self.dialog = MDDialog(
-            title="Edit Relay URL",
+            # title="Edit Relay URL",
             type="custom",
-            content_cls=MDTextField(text=relay_url),
+            content_cls=self.dialog_box,
             buttons=[
                 MDFlatButton(
                     text="CANCEL",
@@ -95,14 +104,12 @@ class RelayScreen(MDScreen):
                 ),
                 MDFlatButton(
                     text="SAVE",
-                    on_release=lambda *_: (
-                        self.save_relay_url(relay_url, self.dialog.content_cls.text),
-                        self.close_dialog()
-                    )
+                    on_release=lambda *_: self.on_save_button_release(relay_url)
                 ),
             ],
         )
         self.dialog.open()
+
 
     def delete_relay_url(self, relay_url):
         '''Delete the selected relay URL.'''
@@ -138,8 +145,8 @@ class RelayScreen(MDScreen):
             self.on_pre_enter()  # Refresh the list
             self.save_relays_to_db()  # Save the updated list to the database
         else:
-            self.show_error_dialog("The relay URL must start with wss://")
-        self.close_dialog()  # Moved to here
+            self.error_label.text = "The relay URL must start with wss://"
+        self.close_dialog()
 
     def save_relay_url(self, old_url, new_url):
         '''Save the edited relay URL.'''
@@ -150,13 +157,15 @@ class RelayScreen(MDScreen):
                 self.on_pre_enter()  # Refresh the list
                 self.save_relays_to_db()  # Save the updated list to the database
         else:
-            self.show_error_dialog("The relay URL must start with wss://")
-        self.close_dialog()
-
+            self.error_label.text = "The relay URL must start with wss://"
 
     def close_dialog(self, *args):
         '''Close the edit dialog.'''
-        self.dialog.dismiss()
+        Logger.info(f'Closing dialog: {self.dialog}')
+        if self.dialog is not None:
+            self.dialog.dismiss()
+        else:
+            Logger.error('No dialog to close')
 
 
 

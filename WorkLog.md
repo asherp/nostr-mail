@@ -1,3 +1,4 @@
+* refactor, load profile, async
 
 # 2023-11-06 07:28:11.225384: clock-in
 

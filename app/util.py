@@ -6,7 +6,10 @@ KEYRING_GROUP = 'nostrmail'
 DATABASE_PATH = 'nostrmail.sqlite'
 DEFAULT_RELAYS = [
     "wss://nostr-pub.wellorder.net",
-    "wss://relay.damus.io"]
+    "wss://relay.damus.io",
+    'wss://brb.io',
+    'wss://nostr.mom']
+
 
 def get_nostr_pub_key(priv_key_nsec):
     """given priv key in nsec format, returns pub key in hex format"""

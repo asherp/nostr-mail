@@ -10,6 +10,7 @@ import aionostr
 import asyncio
 from sqlitedict import SqliteDict
 from util import DEFAULT_RELAYS, DATABASE_PATH, KEYRING_GROUP
+from aionostr.relay import RelayPool
 
 
 
@@ -34,12 +35,13 @@ class ProfileScreen(MDScreen):
         # Now you have access to the relays list
         relays = relay_screen.relays
 
-        profile_query = to_nip19(ntype='nprofile', payload=pub_key_hex, relays=relays)
-        Logger.info(f'profile_query: {profile_query}')
-        profile_events = await aionostr.get_anything(profile_query)
-        profile_event = profile_events[0]
-        profile_dict = profile_event.to_json_object()
-        return profile_dict
+        for relay in relays:
+            profile_query = to_nip19(ntype='nprofile', payload=pub_key_hex, relays=[relay])
+            Logger.info(f'profile_query: {profile_query}')
+            profile_events = await aionostr.get_anything(profile_query)
+            profile_event = profile_events[0]
+            profile_dict = profile_event.to_json_object()
+            return profile_dict
 
 
     def populate_profile(self, profile_data):
@@ -58,33 +60,93 @@ class ProfileScreen(MDScreen):
         self.public_key = profile_data.get('pubkey', '')
 
 
-async def load_profile_data():
+    async def save_profile_to_relays(self):
+        # Collect the data from the input fields
+        content = {
+            "display_name": self.ids.display_name.text,
+            "name": self.ids.name.text,
+            "picture": self.ids.picture_url.text,
+            "about": self.ids.about.text,
+            "email": self.ids.email.text
+        }
+        
+        # Convert the dictionary to a JSON string
+        content_json = json.dumps(content)
+
+        ### or use aionostr.add_event??
+        # event_id = await add_event(
+        #     relays,
+        #     event=event,
+        #     pubkey=pubkey,
+        #     private_key=private_key,
+        #     created_at=int(created),
+        #     kind=kind,
+        #     content=content,
+        #     tags=tags,
+        #     direct_message=dm,
+        # )
+        # click.echo(event_id)
+        # click.echo(to_nip19('nevent', event_id, relays))
+
+        # Create the profile event
+        profile_event = {
+            # ... [populate the event dictionary with appropriate keys and values]
+        }
+        
+        # Fetch the relays from the RelayScreen
+        app = MDApp.get_running_app()
+        relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
+        relays = relay_screen.relays
+        
+        # Create a relay pool
+        relay_pool = RelayPool(relays=relays)
+
+        # Start the relay pool
+        await relay_pool.start()
+
+        # Post the event to the relay pool
+        try:
+            await relay_pool.publish(profile_event)
+            Logger.info(f"Profile event published to relays.")
+        except Exception as e:
+            Logger.error(f"Failed to publish profile event: {e}")
+        finally:
+            # Stop the relay pool once done
+            await relay_pool.stop()
+
+
+
+async def load_profile_data(self):
     # Retrieve the private key from the keyring
     priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
     if not priv_key:
-        raise ValueError("Private key not found in keyring.")
+        Logger.error("Private key not found in keyring.")
+        return None  # Fail gracefully without throwing an exception
     
     pub_key_hex = get_nostr_pub_key(priv_key)
+    app = MDApp.get_running_app()
+    relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
 
-    # Load relays from the database
-    with SqliteDict(DATABASE_PATH) as db:
-        relays = db.get('relays', DEFAULT_RELAYS)
-    
-    Logger.info(f"Relays loaded from database: {relays}")
+    # Now you have access to the relays list
+    relays = relay_screen.relays
 
-    # Construct the profile query
-    profile_query = to_nip19(ntype='nprofile', payload=pub_key_hex, relays=relays)
-    Logger.info(f'Profile Query: {profile_query}')
+    for relay in relays:
+        try:
+            profile_query = to_nip19(ntype='nprofile', payload=pub_key_hex, relays=[relay])
+            Logger.info(f'Trying profile query on relay: {relay}')
+            profile_events = await aionostr.get_anything(profile_query)
+            if profile_events:
+                profile_event = profile_events[0]
+                profile_dict = profile_event.to_json_object()
+                return profile_dict
+            else:
+                Logger.warn(f"No profile events found on relay: {relay}")
+        except Exception as e:
+            Logger.error(f"Error querying relay {relay}: {e}")
 
-    # Execute the query to fetch the profile
-    profile_events = await aionostr.get_anything(profile_query)
-    if profile_events:
-        profile_event = profile_events[0]
-        profile_dict = profile_event.to_json_object()
-        return profile_dict
-    else:
-        Logger.info("No profile events found.")
-        return None
+    Logger.error("All relays failed to load profile data.")
+    return None
+
 
 
 if __name__ == "__main__":

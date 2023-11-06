@@ -36,13 +36,13 @@ class RelayScreen(MDScreen):
 
 
     def save_relays_to_db(self):
-        with SqliteDict(DATABASE_PATH, autocommit=True) as db:
+        with SqliteDict(DATABASE_PATH, tablename='relays', autocommit=True) as db:
             # Convert the ListProperty to a plain list before saving.
             db['relays'] = list(self.relays)
             Logger.info("Relays saved to database.")
 
     def load_relays_from_db(self):
-        with SqliteDict(DATABASE_PATH) as db:
+        with SqliteDict(DATABASE_PATH, tablename='relays') as db:
             # Directly assign the list to self.relays
             self.relays = db.get('relays', DEFAULT_RELAYS)
             Logger.info("Relays loaded from database.")

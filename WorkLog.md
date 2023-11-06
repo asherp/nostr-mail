@@ -1,3 +1,5 @@
+# 2023-11-06 14:02:32.612313: clock-out
+
 * setting up profile save
 
 # 2023-11-06 13:33:18.272176: clock-in
@@ -21,8 +23,7 @@
 # 2023-11-04 18:11:42.384464: clock-in: T-10m 
 
 # 2023-11-04 16:17:29.788581: clock-out: T-15m 
-
-* profile loading
+* profile loading. look at using  `aionostr.relay.RelayPool`
 
 # 2023-11-04 15:14:07.577390: clock-in
 

@@ -1,0 +1,28 @@
+
+
+<RelayScreen>:
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: "16dp"
+
+        MDTopAppBar:
+            title: "Relays"
+            elevation: 4
+            pos_hint: {"top": 1}
+            md_bg_color: "#e7e4c0"
+            specific_text_color: "#4a4939"
+            left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
+        ScrollView:
+            MDList:
+                id: relay_list
+                # This will be populated with the list of relays
+
+        MDFloatingActionButton:
+            icon: "plus"
+            pos_hint: {'right': 0.95, 'bottom': 0.05}
+            on_release: root.add_relay()
+
+        MDRaisedButton:
+            text: 'Load Default Relays'
+            on_release: root.load_default_relays()
+

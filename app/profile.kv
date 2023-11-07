@@ -1,0 +1,55 @@
+<ProfileScreen>:
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: "16dp"
+
+        MDTopAppBar:
+            title: "Profile"
+            elevation: 4
+            pos_hint: {"top": 1}
+            md_bg_color: "#e7e4c0"
+            specific_text_color: "#4a4939"
+            left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
+
+        # Spacer widget to create space above the image
+        Widget:
+            size_hint_y: None
+            height: "28dp"  # Adjust the height to create more or less space
+
+        # Adjust the top positioning of the MDCard so it does not cast a shadow on the nav bar
+        MDCard:
+            size_hint: None, None
+            size: "200dp", "200dp"
+            pos_hint: {'center_x': 0.5, 'top': 0.9}  # Lower the 'top' value to move the card down
+            elevation: 2  # You can reduce this value if the shadow is still too prominent
+            AsyncImage:
+                id: profile_picture
+                source: root.ids.picture_url.text
+                allow_stretch: True
+                keep_ratio: True
+                size_hint: None, None
+                size: "200dp", "200dp"
+                pos_hint: {'center_x': 0.5, 'center_y': 0.5}
+
+        ScrollView:
+            MDList:
+                MDTextField:
+                    id: picture_url
+                    hint_text: "Picture URL"
+                    on_text: profile_picture.source = self.text  # Update the image source when text changes
+
+                MDTextField:
+                    id: display_name
+                    hint_text: "Display Name"
+
+                MDTextField:
+                    id: name
+                    hint_text: "Name"
+
+                MDTextField:
+                    id: about
+                    hint_text: "About"
+
+                MDTextField:
+                    id: email
+                    hint_text: "Email"

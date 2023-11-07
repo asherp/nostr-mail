@@ -1,0 +1,46 @@
+<ComposeScreen>:
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: "16dp"
+
+        MDTopAppBar:
+            title: "Compose"
+            elevation: 4
+            pos_hint: {"top": 1}
+            md_bg_color: "#e7e4c0"
+            specific_text_color: "#4a4939"
+            left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
+
+        BoxLayout:
+            size_hint_y: None
+            height: self.minimum_height
+            orientation: 'vertical'
+            padding: "16dp", "8dp", "16dp", "0dp"
+
+            MDTextField:
+                hint_text: 'Recipient'
+                multiline: False
+
+            MDTextField:
+                hint_text: 'Subject'
+                multiline: False
+
+        BoxLayout:
+            size_hint_y: 1
+            padding: "16dp", "8dp", "16dp", "0dp"
+
+            MDTextField:
+                hint_text: 'Message'
+                multiline: True
+                size_hint_y: 1
+
+        BoxLayout:
+            size_hint_y: None
+            height: '48dp'
+            padding: "16dp", "8dp", "16dp", "16dp"
+
+            MDRaisedButton:
+                text: 'Send'
+                size_hint: None, None
+                size: '64dp', '48dp'
+                pos_hint: {'right': 1}

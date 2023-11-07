@@ -23,7 +23,9 @@ class ProfileScreen(MDScreen):
     async def async_populate_profile(self):
         app = MDApp.get_running_app()
         relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
+
         profile_data = await load_profile_data(relays=relay_screen.relays)
+
         self.populate_profile(profile_data)
 
 
@@ -144,9 +146,14 @@ async def load_profile_data(relays, pub_key_hex=None):
 
     # Initialize the Manager with the list of relays
     manager = Manager(relays=relays)
-    
-    # Start the manager (connect all relays)
+
+    # Start the manager (attempt to connect all relays)
     await manager.connect()
+
+    # Check if connected to any relays
+    if not any(relay.connected for relay in manager.relays):
+        Logger.error("Failed to connect to any relays.")
+        return None
 
     # Construct the profile query using EventKind for metadata
     filter_ = {"authors": [pub_key_hex], "kinds": [EventKind.SET_METADATA]}
@@ -163,7 +170,7 @@ async def load_profile_data(relays, pub_key_hex=None):
             return profile_dict
 
     except Exception as e:
-        logging.error(f"Error querying for profile: {e}")
+        Logger.error(f"Error querying for profile: {e}")
 
     finally:
         # Ensure to unsubscribe before closing to clean up properly
@@ -171,7 +178,7 @@ async def load_profile_data(relays, pub_key_hex=None):
         # Disconnect all relays
         await manager.close()
 
-    logging.warn("No profile events found.")
+    Logger.warn("No profile events found.")
     return None
 
 

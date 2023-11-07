@@ -14,8 +14,13 @@ from contacts import ContactsScreen
 import asyncio
 from kivy.clock import Clock
 from util import KEYRING_GROUP
+from kivy.lang import Builder
 
-
+Builder.load_file('relay.kv')
+Builder.load_file('profile.kv')
+Builder.load_file('settings.kv')
+Builder.load_file('contacts.kv')
+Builder.load_file('compose.kv')
 
 class Main(MDApp):
 
@@ -27,7 +32,7 @@ class Main(MDApp):
         # Access the profile screen using the screen manager
         profile_screen = self.root.ids.screen_manager.get_screen('profile_screen')
         # Schedule the async_populate_profile coroutine to be executed.
-        asyncio.create_task(profile_screen.async_populate_profile())
+        # asyncio.create_task(profile_screen.async_populate_profile())
 
 
 if __name__ == "__main__":

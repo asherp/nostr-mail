@@ -1,0 +1,18 @@
+
+<ContactsScreen>:
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: "16dp"
+
+        MDTopAppBar:
+            title: "Contacts"
+            elevation: 4
+            pos_hint: {"top": 1}
+            md_bg_color: "#e7e4c0"
+            specific_text_color: "#4a4939"
+            left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
+
+        ScrollView:
+            MDList:
+                id: contacts_list
+                # You could populate this list dynamically in your app

@@ -31,7 +31,8 @@ class Main(MDApp):
 
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(Main().async_run())
-    loop.close()
+    try:
+        asyncio.run(Main().async_run())
+    except KeyboardInterrupt:
+        print("Program exited by user.")
 

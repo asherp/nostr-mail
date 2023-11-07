@@ -10,8 +10,8 @@ import aionostr
 import asyncio
 from sqlitedict import SqliteDict
 from util import DEFAULT_RELAYS, DATABASE_PATH, KEYRING_GROUP
-from aionostr.relay import RelayPool
-
+from aionostr.relay import Manager
+from aionostr.event import EventKind
 
 
 class ProfileScreen(MDScreen):
@@ -21,27 +21,10 @@ class ProfileScreen(MDScreen):
         asyncio.ensure_future(self.async_populate_profile())
 
     async def async_populate_profile(self):
-        profile_data = await self.load_profile_data()
-        self.populate_profile(profile_data)
-
-
-    async def load_profile_data(self):
-        # first fetch our hex key base on private key
-        priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
-        pub_key_hex = get_nostr_pub_key(priv_key)
         app = MDApp.get_running_app()
         relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
-        
-        # Now you have access to the relays list
-        relays = relay_screen.relays
-
-        for relay in relays:
-            profile_query = to_nip19(ntype='nprofile', payload=pub_key_hex, relays=[relay])
-            Logger.info(f'profile_query: {profile_query}')
-            profile_events = await aionostr.get_anything(profile_query)
-            profile_event = profile_events[0]
-            profile_dict = profile_event.to_json_object()
-            return profile_dict
+        profile_data = await load_profile_data(relays=relay_screen.relays)
+        self.populate_profile(profile_data)
 
 
     def populate_profile(self, profile_data):
@@ -99,7 +82,7 @@ class ProfileScreen(MDScreen):
         relays = relay_screen.relays
         
         # Create a relay pool
-        relay_pool = RelayPool(relays=relays)
+        relay_pool = Manager(relays=relays)
 
         # Start the relay pool
         await relay_pool.start()
@@ -116,42 +99,90 @@ class ProfileScreen(MDScreen):
 
 
 
-async def load_profile_data(self):
-    # Retrieve the private key from the keyring
+# async def load_profile_data(self):
+#     # Retrieve the private key from the keyring
+#     priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
+#     if not priv_key:
+#         Logger.error("Private key not found in keyring.")
+#         return None  # Fail gracefully without throwing an exception
+    
+#     pub_key_hex = get_nostr_pub_key(priv_key)
+#     app = MDApp.get_running_app()
+#     relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
+
+#     # Now you have access to the relays list
+#     relays = relay_screen.relays
+
+#     for relay in relays:
+#         try:
+#             profile_query = to_nip19(ntype='nprofile', payload=pub_key_hex, relays=[relay])
+#             Logger.info(f'Trying profile query on relay: {relay}')
+#             profile_events = await aionostr.get_anything(profile_query)
+#             if profile_events:
+#                 profile_event = profile_events[0]
+#                 profile_dict = profile_event.to_json_object()
+#                 return profile_dict
+#             else:
+#                 Logger.warn(f"No profile events found on relay: {relay}")
+#         except Exception as e:
+#             Logger.error(f"Error querying relay {relay}: {e}")
+
+#     Logger.error("All relays failed to load profile data.")
+#     return None
+
+def load_user_pub_key():
     priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
     if not priv_key:
         Logger.error("Private key not found in keyring.")
-        return None  # Fail gracefully without throwing an exception
-    
+        raise IOError("Expected private key in keyring")
     pub_key_hex = get_nostr_pub_key(priv_key)
-    app = MDApp.get_running_app()
-    relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
+    return pub_key_hex
 
-    # Now you have access to the relays list
-    relays = relay_screen.relays
+async def load_profile_data(relays, pub_key_hex=None):
+    if pub_key_hex is None:
+        pub_key_hex = load_user_pub_key()
 
-    for relay in relays:
-        try:
-            profile_query = to_nip19(ntype='nprofile', payload=pub_key_hex, relays=[relay])
-            Logger.info(f'Trying profile query on relay: {relay}')
-            profile_events = await aionostr.get_anything(profile_query)
-            if profile_events:
-                profile_event = profile_events[0]
-                profile_dict = profile_event.to_json_object()
-                return profile_dict
-            else:
-                Logger.warn(f"No profile events found on relay: {relay}")
-        except Exception as e:
-            Logger.error(f"Error querying relay {relay}: {e}")
+    # Initialize the Manager with the list of relays
+    manager = Manager(relays=relays)
+    
+    # Start the manager (connect all relays)
+    await manager.connect()
 
-    Logger.error("All relays failed to load profile data.")
+    # Construct the profile query using EventKind for metadata
+    filter_ = {"authors": [pub_key_hex], "kinds": [EventKind.SET_METADATA]}
+    subscription_id = "some_random_str"  # Generate a unique ID for the subscription
+
+    try:
+        # Use the manager to subscribe to the relays with the filter
+        queue = await manager.subscribe(subscription_id, filter_)
+
+        # Use the manager to get profile events
+        event = await queue.get()
+        if event:
+            profile_dict = event.to_json_object()
+            return profile_dict
+
+    except Exception as e:
+        logging.error(f"Error querying for profile: {e}")
+
+    finally:
+        # Ensure to unsubscribe before closing to clean up properly
+        await manager.unsubscribe(subscription_id)
+        # Disconnect all relays
+        await manager.close()
+
+    logging.warn("No profile events found.")
     return None
+
 
 
 
 if __name__ == "__main__":
     # Run the async function in the asyncio event loop
-    profile_data = asyncio.run(load_profile_data())
+    try:
+        profile_data = asyncio.run(load_profile_data(relays=DEFAULT_RELAYS))
+    except KeyboardInterrupt:
+        print("Program exited by user.")
 
     # Once you have profile_data, you can print or manipulate it as needed
     if profile_data:

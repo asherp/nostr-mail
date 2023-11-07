@@ -14,12 +14,12 @@
         ScrollView:
             MDList:
 
-                # Adjust the top positioning of the MDCard so it does not cast a shadow on the nav bar
+                # Adjust the top positioning of the MDCard
                 MDCard:
                     size_hint: None, None
                     size: "200dp", "200dp"
                     pos_hint: {'center_x': 0.5}
-                    elevation: 2  # You can reduce this value if the shadow is still too prominent
+                    elevation: 2
                     AsyncImage:
                         id: profile_picture
                         source: root.ids.picture_url.text
@@ -32,7 +32,7 @@
                 MDTextField:
                     id: picture_url
                     hint_text: "Picture URL"
-                    on_text: app.root.ids.profile_screen.ids.profile_picture.source = self.text  # Update the image source when text changes
+                    on_text: app.root.ids.profile_screen.ids.profile_picture.source = self.text
 
                 MDTextField:
                     id: display_name
@@ -50,12 +50,18 @@
                     id: email
                     hint_text: "Email"
 
-
                 OneLineIconListItem:
                     text: "Save Profile"
-                    on_release: root.save_profile()  # Call the save_profile method in ProfileScreen
+                    on_release: root.save_profile()
 
                     IconLeftWidget:
                         icon: 'content-save'
 
-
+                # Status message label
+                MDLabel:
+                    id: status_message
+                    text: ""
+                    size_hint_y: None
+                    height: self.texture_size[1]
+                    pos_hint: {'center_x': 0.5}
+                    halign: 'center'

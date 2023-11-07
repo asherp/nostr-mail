@@ -1,3 +1,12 @@
+* confirming save
+* replaceable event discussion (for mailing list):
+	- use list of moderators
+	- subscribers are in list of [(hash, encrypted asymmetric key)]
+	- mods are in list of [(mod pub key)]
+	- subscription list are published by mods independently
+	- subscribers follow the mods
+* any mod can update the subscriber list
+* other mods republish each other's changes
 
 # 2023-11-07 13:28:39.328472: clock-in
 

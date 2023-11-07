@@ -15,6 +15,18 @@ import asyncio
 from kivy.clock import Clock
 from util import KEYRING_GROUP
 from kivy.lang import Builder
+import os
+from kivy.config import Config
+
+# Set the directory where you want to store the log files
+log_directory = os.path.join(os.path.dirname(__file__), 'logs')
+if not os.path.exists(log_directory):
+    os.makedirs(log_directory)
+
+# Configure the Kivy logger
+Config.set('kivy', 'log_dir', log_directory)
+Config.set('kivy', 'log_name', 'kivy_%y-%m-%d_%_.txt')
+
 
 Builder.load_file('relay.kv')
 Builder.load_file('profile.kv')
@@ -26,13 +38,6 @@ class Main(MDApp):
 
     def build(self):
         self.theme_cls.theme_style = "Dark"
-        Clock.schedule_once(self.schedule_async_data)
-
-    def schedule_async_data(self, *args):
-        # Access the profile screen using the screen manager
-        profile_screen = self.root.ids.screen_manager.get_screen('profile_screen')
-        # Schedule the async_populate_profile coroutine to be executed.
-        # asyncio.create_task(profile_screen.async_populate_profile())
 
 
 if __name__ == "__main__":

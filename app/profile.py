@@ -13,10 +13,9 @@ from util import DEFAULT_RELAYS, DATABASE_PATH, KEYRING_GROUP
 from aionostr.relay import Manager
 from aionostr.event import EventKind
 from aionostr.event import Event
-import secrets
-from datetime import datetime
-from util import load_profile_data
-
+from util import get_current_unix_timestamp, get_priv_key_hex
+from util import load_profile_data, get_screen, save_profile_to_relays
+from kivy.clock import Clock
 
 
 class ProfileScreen(MDScreen):
@@ -26,8 +25,7 @@ class ProfileScreen(MDScreen):
         asyncio.ensure_future(self.async_populate_profile())
 
     async def async_populate_profile(self):
-        app = MDApp.get_running_app()
-        relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
+        relay_screen = get_screen('relay_screen')
 
         profile_data = await load_profile_data(relays=relay_screen.relays)
 
@@ -49,14 +47,9 @@ class ProfileScreen(MDScreen):
         self.profile_id = profile_data.get('id', '')
         self.public_key = profile_data.get('pubkey', '')
 
+
     def save_profile(self):
-        # This method will be called by the UI
-        Logger.info('Saving profile data...')
-        asyncio.ensure_future(self.save_profile_to_relays())
-
-
-    async def save_profile_to_relays(self):
-        # Collect the data from the input fields
+        # Extract the profile data from the UI elements
         content = {
             "display_name": self.ids.display_name.text,
             "name": self.ids.name.text,
@@ -64,56 +57,32 @@ class ProfileScreen(MDScreen):
             "about": self.ids.about.text,
             "email": self.ids.email.text
         }
-        
-        # Convert the dictionary to a JSON string
-        content_json = json.dumps(content)
-        
-        # Fetch the user's private key
-        private_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
-        if not private_key:
-            Logger.error("Private key not found in keyring.")
-            return
-        
-        # Create the profile event using the Event class
-        profile_event = Event(
-            pubkey=self.public_key,
-            created_at=get_current_unix_timestamp(),  # or simply use `int(time.time())`
-            kind=EventKind.SET_METADATA,  # Replace with the correct kind number for a profile event
-            tags=[],  # Add any tags if necessary, for example, [['p', 'profile']]
-            content=content_json
-        )
 
-        # Sign the event with the user's private key
-        profile_event.sign(private_key)
+        # Log the initiation of profile save
+        Logger.info('ProfileScreen: Starting to save profile data...')
 
-        # Fetch the relays from the RelayScreen
-        app = MDApp.get_running_app()
-        relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
-        relays = relay_screen.relays
-        
-        # Create a relay pool
-        relay_pool = app.root.ids.relay_manager  # Assuming you have a relay manager in your app root
-        
-        # Start the relay pool
-        await relay_pool.start()
-
-        # Post the event to the relay pool
-        try:
-            response = await relay_pool.add_event(profile_event, check_response=True)
-            # Check if the response is successful
-            if response and response[1] == profile_event.id:  # assuming successful response returns the event ID
-                Logger.info(f"Profile event published to relays with event id {profile_event.id}.")
+        async def schedule_and_check():
+            success = await save_profile_to_relays(content)
+            if success:
+                Clock.schedule_once(lambda dt: self.on_success())
             else:
-                Logger.error(f"Failed to publish profile event. Response: {response}")
-        except Exception as e:
-            Logger.error(f"Failed to publish profile event: {e}")
-        finally:
-            # Stop the relay pool once done
-            await relay_pool.stop()
+                Clock.schedule_once(lambda dt: self.on_failure())
 
 
+        # Start the asynchronous operation
+        asyncio.ensure_future(schedule_and_check())
 
+    def on_success(self):
+        # Update the status message on the UI
+        self.ids.status_message.text = "Profile saved successfully!"
+        # Log the success message
+        Logger.info('ProfileScreen: on_success triggered.')
 
+    def on_failure(self):
+        # Update the status message on the UI
+        self.ids.status_message.text = "Failed to save profile."
+        # Log the failure message
+        Logger.error('ProfileScreen: on_failure triggered.')
 
 
 if __name__ == "__main__":

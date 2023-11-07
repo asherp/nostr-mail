@@ -11,32 +11,28 @@
             specific_text_color: "#4a4939"
             left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
 
-        # Spacer widget to create space above the image
-        Widget:
-            size_hint_y: None
-            height: "28dp"  # Adjust the height to create more or less space
-
-        # Adjust the top positioning of the MDCard so it does not cast a shadow on the nav bar
-        MDCard:
-            size_hint: None, None
-            size: "200dp", "200dp"
-            pos_hint: {'center_x': 0.5, 'top': 0.9}  # Lower the 'top' value to move the card down
-            elevation: 2  # You can reduce this value if the shadow is still too prominent
-            AsyncImage:
-                id: profile_picture
-                source: root.ids.picture_url.text
-                allow_stretch: True
-                keep_ratio: True
-                size_hint: None, None
-                size: "200dp", "200dp"
-                pos_hint: {'center_x': 0.5, 'center_y': 0.5}
-
         ScrollView:
             MDList:
+
+                # Adjust the top positioning of the MDCard so it does not cast a shadow on the nav bar
+                MDCard:
+                    size_hint: None, None
+                    size: "200dp", "200dp"
+                    pos_hint: {'center_x': 0.5}
+                    elevation: 2  # You can reduce this value if the shadow is still too prominent
+                    AsyncImage:
+                        id: profile_picture
+                        source: root.ids.picture_url.text
+                        allow_stretch: True
+                        keep_ratio: True
+                        size_hint: None, None
+                        size: "200dp", "200dp"
+                        pos_hint: {'center_x': 0.5, 'center_y': 0.5}
+
                 MDTextField:
                     id: picture_url
                     hint_text: "Picture URL"
-                    on_text: profile_picture.source = self.text  # Update the image source when text changes
+                    on_text: app.root.ids.profile_screen.ids.profile_picture.source = self.text  # Update the image source when text changes
 
                 MDTextField:
                     id: display_name
@@ -53,3 +49,13 @@
                 MDTextField:
                     id: email
                     hint_text: "Email"
+
+
+                OneLineIconListItem:
+                    text: "Save Profile"
+                    on_release: root.save_profile()  # Call the save_profile method in ProfileScreen
+
+                    IconLeftWidget:
+                        icon: 'content-save'
+
+

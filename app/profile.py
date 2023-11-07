@@ -12,6 +12,11 @@ from sqlitedict import SqliteDict
 from util import DEFAULT_RELAYS, DATABASE_PATH, KEYRING_GROUP
 from aionostr.relay import Manager
 from aionostr.event import EventKind
+from aionostr.event import Event
+import secrets
+from datetime import datetime
+from util import load_profile_data
+
 
 
 class ProfileScreen(MDScreen):
@@ -44,6 +49,11 @@ class ProfileScreen(MDScreen):
         self.profile_id = profile_data.get('id', '')
         self.public_key = profile_data.get('pubkey', '')
 
+    def save_profile(self):
+        # This method will be called by the UI
+        Logger.info('Saving profile data...')
+        asyncio.ensure_future(self.save_profile_to_relays())
+
 
     async def save_profile_to_relays(self):
         # Collect the data from the input fields
@@ -57,42 +67,44 @@ class ProfileScreen(MDScreen):
         
         # Convert the dictionary to a JSON string
         content_json = json.dumps(content)
-
-        ### or use aionostr.add_event??
-        # event_id = await add_event(
-        #     relays,
-        #     event=event,
-        #     pubkey=pubkey,
-        #     private_key=private_key,
-        #     created_at=int(created),
-        #     kind=kind,
-        #     content=content,
-        #     tags=tags,
-        #     direct_message=dm,
-        # )
-        # click.echo(event_id)
-        # click.echo(to_nip19('nevent', event_id, relays))
-
-        # Create the profile event
-        profile_event = {
-            # ... [populate the event dictionary with appropriate keys and values]
-        }
         
+        # Fetch the user's private key
+        private_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
+        if not private_key:
+            Logger.error("Private key not found in keyring.")
+            return
+        
+        # Create the profile event using the Event class
+        profile_event = Event(
+            pubkey=self.public_key,
+            created_at=get_current_unix_timestamp(),  # or simply use `int(time.time())`
+            kind=EventKind.SET_METADATA,  # Replace with the correct kind number for a profile event
+            tags=[],  # Add any tags if necessary, for example, [['p', 'profile']]
+            content=content_json
+        )
+
+        # Sign the event with the user's private key
+        profile_event.sign(private_key)
+
         # Fetch the relays from the RelayScreen
         app = MDApp.get_running_app()
         relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
         relays = relay_screen.relays
         
         # Create a relay pool
-        relay_pool = Manager(relays=relays)
-
+        relay_pool = app.root.ids.relay_manager  # Assuming you have a relay manager in your app root
+        
         # Start the relay pool
         await relay_pool.start()
 
         # Post the event to the relay pool
         try:
-            await relay_pool.publish(profile_event)
-            Logger.info(f"Profile event published to relays.")
+            response = await relay_pool.add_event(profile_event, check_response=True)
+            # Check if the response is successful
+            if response and response[1] == profile_event.id:  # assuming successful response returns the event ID
+                Logger.info(f"Profile event published to relays with event id {profile_event.id}.")
+            else:
+                Logger.error(f"Failed to publish profile event. Response: {response}")
         except Exception as e:
             Logger.error(f"Failed to publish profile event: {e}")
         finally:
@@ -100,86 +112,6 @@ class ProfileScreen(MDScreen):
             await relay_pool.stop()
 
 
-
-# async def load_profile_data(self):
-#     # Retrieve the private key from the keyring
-#     priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
-#     if not priv_key:
-#         Logger.error("Private key not found in keyring.")
-#         return None  # Fail gracefully without throwing an exception
-    
-#     pub_key_hex = get_nostr_pub_key(priv_key)
-#     app = MDApp.get_running_app()
-#     relay_screen = app.root.ids.screen_manager.get_screen('relay_screen')
-
-#     # Now you have access to the relays list
-#     relays = relay_screen.relays
-
-#     for relay in relays:
-#         try:
-#             profile_query = to_nip19(ntype='nprofile', payload=pub_key_hex, relays=[relay])
-#             Logger.info(f'Trying profile query on relay: {relay}')
-#             profile_events = await aionostr.get_anything(profile_query)
-#             if profile_events:
-#                 profile_event = profile_events[0]
-#                 profile_dict = profile_event.to_json_object()
-#                 return profile_dict
-#             else:
-#                 Logger.warn(f"No profile events found on relay: {relay}")
-#         except Exception as e:
-#             Logger.error(f"Error querying relay {relay}: {e}")
-
-#     Logger.error("All relays failed to load profile data.")
-#     return None
-
-def load_user_pub_key():
-    priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
-    if not priv_key:
-        Logger.error("Private key not found in keyring.")
-        raise IOError("Expected private key in keyring")
-    pub_key_hex = get_nostr_pub_key(priv_key)
-    return pub_key_hex
-
-async def load_profile_data(relays, pub_key_hex=None):
-    if pub_key_hex is None:
-        pub_key_hex = load_user_pub_key()
-
-    # Initialize the Manager with the list of relays
-    manager = Manager(relays=relays)
-
-    # Start the manager (attempt to connect all relays)
-    await manager.connect()
-
-    # Check if connected to any relays
-    if not any(relay.connected for relay in manager.relays):
-        Logger.error("Failed to connect to any relays.")
-        return None
-
-    # Construct the profile query using EventKind for metadata
-    filter_ = {"authors": [pub_key_hex], "kinds": [EventKind.SET_METADATA]}
-    subscription_id = "some_random_str"  # Generate a unique ID for the subscription
-
-    try:
-        # Use the manager to subscribe to the relays with the filter
-        queue = await manager.subscribe(subscription_id, filter_)
-
-        # Use the manager to get profile events
-        event = await queue.get()
-        if event:
-            profile_dict = event.to_json_object()
-            return profile_dict
-
-    except Exception as e:
-        Logger.error(f"Error querying for profile: {e}")
-
-    finally:
-        # Ensure to unsubscribe before closing to clean up properly
-        await manager.unsubscribe(subscription_id)
-        # Disconnect all relays
-        await manager.close()
-
-    Logger.warn("No profile events found.")
-    return None
 
 
 

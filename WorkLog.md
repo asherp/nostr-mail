@@ -1,3 +1,4 @@
+* saving profile
 * refactor layout, fail gracefully when offline
 
 # 2023-11-07 08:29:58.746735: clock-in

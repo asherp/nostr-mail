@@ -1,5 +1,5 @@
 from kivy.properties import ListProperty
-from kivy.logger import Logger
+
 from kivymd.app import MDApp
 from kivymd.uix.screen import MDScreen
 from kivymd.uix.dialog import MDDialog
@@ -11,8 +11,12 @@ from kivymd.uix.label import MDLabel
 
 import keyring
 from sqlitedict import SqliteDict
-
+from util import Logger
 from util import get_nostr_pub_key, DEFAULT_RELAYS, DATABASE_PATH
+from kivy.lang import Builder
+from aionostr.relay import Manager
+
+Builder.load_file('relays.kv')
 
 
 class EditableListItem(OneLineListItem):
@@ -26,14 +30,24 @@ class EditableListItem(OneLineListItem):
         Logger.info(f'editing current relay url: {self.text}')
         relay_screen.open_edit_dialog(self.text)
 
+
 class RelayScreen(MDScreen):
     relays = ListProperty()
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.relay_manager = None
         Logger.info("Initializing RelayScreen")
         self.load_relays_from_db()
 
+
+    def load_relays_from_db(self):
+        with SqliteDict(DATABASE_PATH, tablename='relays') as db:
+            # Directly assign the list to self.relays
+            self.relays = db.get('relays', DEFAULT_RELAYS)
+            # Initialize the NostrRelayManager with the loaded relays
+            self.relay_manager = Manager(self.relays)
+            Logger.info("Relays loaded from database and relay manager initialized.")
 
     def save_relays_to_db(self):
         with SqliteDict(DATABASE_PATH, tablename='relays', autocommit=True) as db:
@@ -41,11 +55,7 @@ class RelayScreen(MDScreen):
             db['relays'] = list(self.relays)
             Logger.info("Relays saved to database.")
 
-    def load_relays_from_db(self):
-        with SqliteDict(DATABASE_PATH, tablename='relays') as db:
-            # Directly assign the list to self.relays
-            self.relays = db.get('relays', DEFAULT_RELAYS)
-            Logger.info("Relays loaded from database.")
+
 
     def load_default_relays(self):
         '''Load default relays if they are not already present.'''

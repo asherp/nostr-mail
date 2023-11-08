@@ -1,6 +1,5 @@
 from threading import Thread
 from kivy.properties import ListProperty
-from kivy.logger import Logger
 from kivymd.app import MDApp
 import tempfile
 import keyring
@@ -10,40 +9,38 @@ from relays import RelayScreen
 from settings import SettingsScreen
 from compose import ComposeScreen
 from profile import ProfileScreen
+from conversations import ConversationsScreen
 from contacts import ContactsScreen
 import asyncio
 from kivy.clock import Clock
-from util import KEYRING_GROUP
-from kivy.lang import Builder
+
+from util import KEYRING_GROUP, Logger, NostrRelayManager
 import os
-from kivy.config import Config
-
-# Set the directory where you want to store the log files
-log_directory = os.path.join(os.path.dirname(__file__), 'logs')
-if not os.path.exists(log_directory):
-    os.makedirs(log_directory)
-
-# Configure the Kivy logger
-Config.set('kivy', 'log_dir', log_directory)
-Config.set('kivy', 'log_name', 'kivy_%y-%m-%d_%_.txt')
 
 
-Builder.load_file('relay.kv')
-Builder.load_file('profile.kv')
-Builder.load_file('settings.kv')
-Builder.load_file('contacts.kv')
-Builder.load_file('compose.kv')
-Builder.load_file('conversations.kv')
 
 class Main(MDApp):
 
     def build(self):
         self.theme_cls.theme_style = "Dark"
+        self.relay_manager = NostrRelayManager.get_instance()
+        # This line schedules the connect method to run as soon as the event loop starts.
+        Clock.schedule_once(lambda dt: asyncio.create_task(self.connect_to_relays()))
 
+    async def connect_to_relays(self):
+        # Ensure that the relay_manager has been initialized
+        if self.relay_manager.relay_manager:
+            # Attempt to connect to each relay
+            await asyncio.gather(*(relay.connect() for relay in self.relay_manager.relay_manager.relays))
+            # Check if all relays are connected
+            self.relay_manager.connected = all(relay.connected for relay in self.relay_manager.relay_manager.relays)
+        else:
+            Logger.error("Relay manager not initialized.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(Main().async_run())
     except KeyboardInterrupt:
         print("Program exited by user.")
+
 

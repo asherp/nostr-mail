@@ -4,7 +4,9 @@ from kivymd.uix.screen import MDScreen
 
 import keyring
 from util import get_nostr_pub_key, KEYRING_GROUP
+from kivy.lang import Builder
 
+Builder.load_file('settings.kv')
 
 Logger.info(f'Using keyring backend: {keyring.get_keyring()}')
 

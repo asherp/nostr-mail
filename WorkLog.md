@@ -1,10 +1,13 @@
+* refactor, single relay manager
+* sub 30m
+* nip 44 - new encryption method
+nostr dev mailing list?
 
 # 2023-11-08 09:49:26.726445: clock-in
 
 # 2023-11-08 09:17:24.479631: clock-out
 
 * loading dms
-
 
 # 2023-11-08 08:27:21.298092: clock-in
 

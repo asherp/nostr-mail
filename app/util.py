@@ -230,14 +230,12 @@ def get_screen(screen_name):
     return screen
 
 
-async def load_dms(relays, pub_key_hex=None):
+async def load_dms(relay_manager_instance, pub_key_hex=None):
     if pub_key_hex is None:
         pub_key_hex = load_user_pub_key()
     Logger.debug(f"Public Key Hex: {pub_key_hex}")
 
-    manager = Manager(relays=relays)
-    Logger.debug("Manager created, connecting to relays...")
-    await manager.connect()
+    manager = relay_manager_instance.relay_manager
 
     if not any(relay.connected for relay in manager.relays):
         Logger.error("Failed to connect to any relays.")
@@ -253,7 +251,7 @@ async def load_dms(relays, pub_key_hex=None):
         Logger.debug("Subscribed to DMs.")
 
         # List to hold all DM events
-        dms = []
+        dm_events = []
         # Set a timeout for DM fetching to avoid infinite waiting
         end_time = asyncio.get_event_loop().time() + 10.0  # 10 seconds from now
         Logger.debug(f"Starting to fetch DMs with a timeout of 10 seconds.")
@@ -263,17 +261,14 @@ async def load_dms(relays, pub_key_hex=None):
             try:
                 # Wait for a DM with a 1-second timeout
                 event = await asyncio.wait_for(queue.get(), timeout=1.0)
-                if event:
-                    dm = event.to_json_object()
-                    dms.append(dm)
-                    Logger.debug(f"Received DM: {dm}")
+                dm_events.append(event)
             except asyncio.TimeoutError:
                 Logger.debug("Timeout occurred while waiting for DMs.")
                 break
 
-        if dms:
-            Logger.info(f"Total DMs fetched: {len(dms)}")
-            return dms
+        if dm_events:
+            Logger.info(f"Total DMs fetched: {len(dm_events)}")
+            return dm_events
         else:
             Logger.warn("No DM events found after fetching.")
             return None
@@ -284,11 +279,12 @@ async def load_dms(relays, pub_key_hex=None):
         Logger.error(traceback.format_exc())
 
     finally:
-        Logger.debug("Unsubscribing and closing connection.")
+        Logger.debug("Unsubscribing from DMs.")
         await manager.unsubscribe(subscription_id)
-        await manager.close()
+        # No need to close the manager if it's shared and will be used later on.
 
     Logger.warn("No DM events found at the end of the function.")
     return None
+
 
 

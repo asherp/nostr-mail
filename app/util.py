@@ -9,6 +9,7 @@ import datetime
 from kivymd.app import MDApp
 import json
 import re
+import secrets
 
 
 KEYRING_GROUP = 'nostrmail'
@@ -46,7 +47,7 @@ async def load_profile_data(relays, pub_key_hex=None):
 
     # Construct the profile query using EventKind for metadata
     filter_ = {"authors": [pub_key_hex], "kinds": [EventKind.SET_METADATA]}
-    subscription_id = "some_random_str"  # Generate a unique ID for the subscription
+    subscription_id = secrets.token_hex(4)  # Generate a unique ID for the subscription
 
     try:
         # Use the manager to subscribe to the relays with the filter
@@ -191,4 +192,77 @@ def get_screen(screen_name):
     screen = app.root.ids.screen_manager.get_screen(screen_name)
     return screen
 
+
+async def load_dms(relays, pub_key_hex=None):
+    if pub_key_hex is None:
+        pub_key_hex = load_user_pub_key()
+
+    # Initialize the Manager with the list of relays
+    manager = Manager(relays=relays)
+
+    # Start the manager (attempt to connect all relays)
+    await manager.connect()
+
+    # Check if connected to any relays
+    if not any(relay.connected for relay in manager.relays):
+        Logger.error("Failed to connect to any relays.")
+        return None
+
+    # Construct the profile query using EventKind for metadata
+    filter_ = {"authors": [pub_key_hex], "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
+    subscription_id = secrets.token_hex(4)  # Generate a unique ID for the subscription
+
+    try:
+        # Use the manager to subscribe to the relays with the filter
+        queue = await manager.subscribe(subscription_id, filter_)
+
+        event = await queue.get()
+        return event.to_json_object()
+
+        # # Need to return all events instead
+        # events = await queue.join()
+        
+        # events_json = [event.to_json_object() for event in events]
+        # return events_json
+
+    except Exception as e:
+        Logger.error(f"Error querying for profile: {e}")
+
+    finally:
+        # Ensure to unsubscribe before closing to clean up properly
+        await manager.unsubscribe(subscription_id)
+        # Disconnect all relays
+        await manager.close()
+
+    return None
+
+# def get_dms(pub_key_hex):
+#     """Get all dms for this pub key
+#     EventKind.ENCRYPTED_DIRECT_MESSAGE
+
+#     Returns list of dict objects storing metadata for each dm
+#     Note: if a dm signature does not pass, the event is markded with valid=False
+#     """
+#     dms = []
+#     dm_events = get_events(pub_key_hex, kind='dm', returns='event')
+#     for e in dm_events:
+#         # check signature first
+#         if not e.verify():
+#             dm = dict(valid=False, event_id=e.id)
+#         else:
+#             dm = dict(
+#                 valid=True,
+#                 time=pd.Timestamp(e.created_at, unit='s'),
+#                 event_id=e.id,
+#                 author=e.public_key,
+#                 content=e.content,
+#                 **dict(e.tags))
+#             if dm['p'] == pub_key_hex:
+#                 pass
+#             elif dm['author'] == pub_key_hex:
+#                 pass
+#             else:
+#                 raise AssertionError('pub key not associated with dm')
+#         dms.append(dm)
+#     return dms
 

@@ -1,9 +1,11 @@
+* loading dms
+
 
 # 2023-11-08 08:27:21.298092: clock-in
 
 # 2023-11-07 16:58:54.524724: clock-out
 
-* confirming save
+* issue: confirming save - this isn't working
 * replaceable event discussion (for mailing list):
 	- use list of moderators
 	- subscribers are in list of [(hash, encrypted asymmetric key)]

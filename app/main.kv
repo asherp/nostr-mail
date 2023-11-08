@@ -52,22 +52,8 @@ MDScreen:
                     ContactsScreen:
 
             MDScreen:
-                name: 'inbox_screen'  # name of the new screen
-
-                MDBoxLayout:
-                    orientation: 'vertical'
-
-                    MDTopAppBar:
-                        title: "Inbox"
-                        elevation: 4
-                        pos_hint: {"top": 1}
-                        md_bg_color: "#e7e4c0"
-                        specific_text_color: "#4a4939"
-                        left_action_items: [["menu", lambda x: nav_drawer.set_state("open")]]
-
-                    ScrollView:
-                        MDList:
-                            id: message_list
+                name: 'conversations_screen'  # name of the new screen
+                id: conversations_screen
 
             ComposeScreen:
                 name: 'compose_screen'
@@ -106,11 +92,11 @@ MDScreen:
 
                 DrawerClickableItem:
                     icon: "gmail"
-                    right_text: "+99"
+                    right_text: "+?"
                     text_right_color: "#4a4939"
-                    text: "Inbox"
+                    text: "Conversations"
                     on_release:
-                        app.root.ids.screen_manager.current = 'inbox_screen'  # switch to the inbox screen
+                        app.root.ids.screen_manager.current = 'conversations_screen'  # switch to the inbox screen
                         nav_drawer.set_state("close")
 
                 DrawerClickableItem:

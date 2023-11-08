@@ -33,6 +33,7 @@ Builder.load_file('profile.kv')
 Builder.load_file('settings.kv')
 Builder.load_file('contacts.kv')
 Builder.load_file('compose.kv')
+Builder.load_file('conversations.kv')
 
 class Main(MDApp):
 

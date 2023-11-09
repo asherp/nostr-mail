@@ -1,3 +1,6 @@
+
+# 2023-11-09 10:42:57.738861: clock-in
+
 # 2023-11-09 09:53:22.846869: clock-out
 
 * splitting sent/received dms

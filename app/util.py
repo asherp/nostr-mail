@@ -233,6 +233,30 @@ def get_encryption_iv(msg):
     """extract the iv from an ecnrypted blob"""
     return msg.split('?iv=')[-1].strip('==')
 
+async def subscribe_and_fetch(manager, subscription_id, event_filter):
+    Logger.debug(f"Subscription ID: {subscription_id}")
+    Logger.debug(f"Filter: {event_filter}")
+
+    queue = await manager.subscribe(subscription_id, event_filter)
+    Logger.debug("Subscribed to DMs.")
+
+    dm_events = []
+    end_time = asyncio.get_event_loop().time() + 10.0  # 10 seconds from now
+    Logger.debug("Starting to fetch DMs with a timeout of 10 seconds.")
+
+    unique_ids = set()
+    while asyncio.get_event_loop().time() < end_time:
+        try:
+            event = await asyncio.wait_for(queue.get(), timeout=1.0)
+            if event.verify() and event.id not in unique_ids:
+                dm_events.append(event.to_json_object())
+                unique_ids.add(event.id)
+        except asyncio.TimeoutError:
+            Logger.debug("Timeout occurred while waiting for DMs.")
+            break
+
+    return dm_events
+
 async def load_dms(relay_manager_instance, pub_key_hex=None):
     if pub_key_hex is None:
         pub_key_hex = load_user_pub_key()
@@ -245,56 +269,31 @@ async def load_dms(relay_manager_instance, pub_key_hex=None):
         return None
 
     filter_1 = {
-        "authors": [pub_key_hex], # from user's pub key
+        "authors": [pub_key_hex],
         "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
     filter_2 = {
-        'pubkey_refs': [pub_key_hex], # to user's pub key
+        'pubkey_refs': [pub_key_hex],
         "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
 
-    subscription_id = secrets.token_hex(4)
-    Logger.debug(f"Subscription ID: {subscription_id}")
-    Logger.debug(f"Filter: {filter_1}")
-    Logger.debug(f"Filter: {filter_2}")
+    subscription_id_1 = secrets.token_hex(4)
+    subscription_id_2 = secrets.token_hex(4)
 
-    try:
-        queue = await manager.subscribe(subscription_id, filter_2)
-        Logger.debug("Subscribed to DMs.")
+    results = await asyncio.gather(
+        subscribe_and_fetch(manager, subscription_id_1, filter_1),
+        # subscribe_and_fetch(manager, subscription_id_2, filter_2)
+    )
 
-        # List to hold all DM events
-        dm_events = []
-        # Set a timeout for DM fetching to avoid infinite waiting
-        end_time = asyncio.get_event_loop().time() + 10.0  # 10 seconds from now
-        Logger.debug(f"Starting to fetch DMs with a timeout of 10 seconds.")
+    # Flatten list of results into one list and return
+    dm_events = [event for sublist in results for event in sublist]
+    
+    if dm_events:
+        Logger.info(f"Total DMs fetched: {len(dm_events)}")
+        return dm_events
+    else:
+        Logger.warn("No DM events found after fetching.")
+        return None
 
-        # Fetch all available DMs until timeout
-        while asyncio.get_event_loop().time() < end_time:
-            try:
-                # Wait for a DM with a 1-second timeout
-                event = await asyncio.wait_for(queue.get(), timeout=1.0)
-                dm_events.append(event)
-            except asyncio.TimeoutError:
-                Logger.debug("Timeout occurred while waiting for DMs.")
-                break
 
-        if dm_events:
-            Logger.info(f"Total DMs fetched: {len(dm_events)}")
-            return dm_events
-        else:
-            Logger.warn("No DM events found after fetching.")
-            return None
-
-    except Exception as e:
-        Logger.error(f"Error querying for DMs: {e}")
-        import traceback
-        Logger.error(traceback.format_exc())
-
-    finally:
-        Logger.debug("Unsubscribing from DMs.")
-        await manager.unsubscribe(subscription_id)
-        # No need to close the manager if it's shared and will be used later on.
-
-    Logger.warn("No DM events found at the end of the function.")
-    return None
 
 
 

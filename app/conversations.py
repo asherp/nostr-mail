@@ -9,7 +9,7 @@ from kivymd.uix.list import OneLineListItem
 from aionostr.util import PrivateKey, PublicKey
 from kivy.clock import mainthread
 import keyring
-from util import load_user_pub_key, get_nostr_pub_key
+from util import load_user_pub_key, get_nostr_pub_key, NostrRelayManager
 import json
 
 
@@ -52,25 +52,21 @@ class ConversationsScreen(MDScreen):
         for e in dm_events:
             if e is None:
                 continue
-            if not e.verify():
-                dm = dict(valid=False, event_id=e.id)
             else:
                 dm = dict(
                     valid=True,
-                    created_at=e.created_at,
-                    event_id=e.id,
-                    author=e.pubkey,
-                    content=e.content,
-                    **dict(e.tags))
-                # if dm['p'] == pub_key_hex:
-                #     # from sender to user
-                #     pass
-                # elif dm['author'] == pub_key_hex:
-                #     # from user to sender
-                #     pass
-                # else:
-                #     raise AssertionError('pub key not associated with dm')
+                    created_at=e['created_at'],
+                    event_id=e['id'],
+                    author=e['pubkey'],
+                    content=e['content'],
+                    **dict(e['tags']))
+            try:
                 decrypted = priv_key.decrypt_message(dm['content'], dm['p'])
+            except Exception as e:
+                try:
+                    decrypted = priv_key.decrypt_message(dm['content'], dm['author'])
+                except Exception as e:
+                    decrypted = json.dumps(dm, indent=4)
                 dm['decrypted'] = decrypted
             dms.append(dm)
 
@@ -99,56 +95,25 @@ class ConversationsScreen(MDScreen):
 
 async def test_load_dms():
     Logger.setLevel('DEBUG')
-    from aionostr.key import PrivateKey
-    from util import NostrRelayManager, load_dms
 
     priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
     if not priv_key_nsec:
         Logger.error("Private key not found in keyring.")
         return
+
     priv_key = PrivateKey.from_nsec(priv_key_nsec)
     pub_key_hex = priv_key.public_key.hex()
 
     relay_manager = NostrRelayManager()
     await relay_manager.connect()
-    dm_events = await load_dms(relay_manager)
 
-    if dm_events is None:
-        Logger.debug('could not load dms')
-        return
-
-    dms = []
-    for e in dm_events:
-        if e is None:
-            continue
-        if not e.verify():
-            continue
-
-        dm = dict(
-            valid=True,
-            created_at=e.created_at,
-            event_id=e.id,
-            author=e.pubkey,
-            content=e.content,
-            **dict(e.tags))
-        try:
-            if e.pubkey == pub_key_hex: # sent from user
-                Logger.debug('sent from user?')
-                decrypted = priv_key.decrypt_message(dm['content'], dm['p'])
-            else: # sent to user
-                pub_key_from_hex = PublicKey(bytes.fromhex("02" + e.pubkey), True).hex()
-                Logger.debug('sent to user')
-                decrypted = priv_key.decrypt_message(dm['content'], pub_key_from_hex)
-        except:
-            raise ValueError(f'cannot decrypt {json.dumps(e.to_message(), indent=4)}')
-        dm['decrypted'] = decrypted
-        dms.append(dm)
-
+    dms = await load_dms(relay_manager)
+    
     for dm in dms:
-        print(dm['created_at'])
+        Logger.info(dm['created_at'])
         for k,v in dm.items():
             if k != 'created_at':
-                print(f'\t{k}:{v}')
+                Logger.info(f'\t{k}:{v}')
 
 if __name__ == '__main__':
     try:

@@ -1,3 +1,4 @@
+* splitting sent/received dms
 
 # 2023-11-09 07:28:48.666838: clock-in
 

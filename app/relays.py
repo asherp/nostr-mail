@@ -14,6 +14,8 @@ from sqlitedict import SqliteDict
 from util import Logger
 from util import get_nostr_pub_key, DEFAULT_RELAYS, DATABASE_PATH
 from kivy.lang import Builder
+from kivy.properties import ObjectProperty
+
 # from aionostr.relay import Manager
 
 Builder.load_file('relays.kv')
@@ -32,22 +34,15 @@ class EditableListItem(OneLineListItem):
 
 
 class RelayScreen(MDScreen):
+    relay_manager = ObjectProperty(None)
+
     relays = ListProperty()
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # self.relay_manager = None
+        self.relay_manager = None
         Logger.info("Initializing RelayScreen")
-        # self.load_relays_from_db()
 
-
-    # def load_relays_from_db(self):
-    #     with SqliteDict(DATABASE_PATH, tablename='relays') as db:
-    #         # Directly assign the list to self.relays
-    #         self.relays = db.get('relays', DEFAULT_RELAYS)
-    #         # Initialize the NostrRelayManager with the loaded relays
-    #         self.relay_manager = Manager(self.relays)
-    #         Logger.info("Relays loaded from database and relay manager initialized.")
 
     def save_relays_to_db(self):
         with SqliteDict(DATABASE_PATH, tablename='relays', autocommit=True) as db:
@@ -61,6 +56,7 @@ class RelayScreen(MDScreen):
         for default_relay in DEFAULT_RELAYS:
             if default_relay not in self.relays:
                 self.relays.append(default_relay)
+                self.relay_manager.relay_manager.add_relay(default_relay)
         self.on_pre_enter()  # Refresh the list
         self.save_relays_to_db()  # Save the updated list to the database
 
@@ -69,6 +65,11 @@ class RelayScreen(MDScreen):
 
 
     def on_pre_enter(self, *args):
+        if not self.relay_manager:
+            self.relay_manager = MDApp.get_running_app().relay_manager
+
+        self.relays = list(self.relay_manager.relay_manager.relays.keys())
+        
         self.ids.relay_list.clear_widgets()
         for relay in self.relays:
             self.ids.relay_list.add_widget(EditableListItem(text=relay))
@@ -118,6 +119,7 @@ class RelayScreen(MDScreen):
         '''Delete the selected relay URL.'''
         if relay_url in self.relays:
             self.relays.remove(relay_url)
+            self.relay_manager.relay_manager.remove_relay(relay_url)
             self.on_pre_enter()  # Refresh the list
             self.save_relays_to_db()  # Save the updated list to the database
         self.close_dialog()

@@ -5,7 +5,7 @@ import keyring
 # from aionostr.relay import Manager
 # from aionostr.event import EventKind
 # from aionostr.event import Event
-from nostr.relay_manager import RelayManager as NostrLibRelayManager
+from nostr.relay_manager import RelayManager
 from sqlitedict import SqliteDict
 import asyncio
 import datetime
@@ -58,12 +58,13 @@ class NostrRelayManager:
 
     def init_manager(self):
         relays = self.load_relays_from_db()
-        self.relay_manager = NostrLibRelayManager()
+        self.relay_manager = RelayManager()
+        Logger.info('connecting relays')
         for relay_url in relays:
+            Logger.info(f'adding relay: {relay_url}')
             self.relay_manager.add_relay(relay_url)
         Logger.info(f'relays connected: ')
-        for k,v in self.relay_manager.relays.items():
-            Logger.info(f' {k}: {v.connected}')
+
 
     def load_relays_from_db(self):
         with SqliteDict(DATABASE_PATH, tablename='relays') as db:

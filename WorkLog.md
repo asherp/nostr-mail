@@ -1,3 +1,4 @@
+* fixed relays with synchronous
 
 # 2023-11-09 13:31:57.636021: clock-in
 

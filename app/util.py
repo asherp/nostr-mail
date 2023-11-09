@@ -2,10 +2,11 @@ from nostr.key import PrivateKey, PublicKey
 from kivy.logger import Logger
 import sqlite3
 import keyring
-# from aionostr.relay import Manager
-# from aionostr.event import EventKind
-# from aionostr.event import Event
+from nostr.filter import Filter, Filters
+from nostr.event import Event, EventKind
+from nostr.message_type import ClientMessageType
 from nostr.relay_manager import RelayManager
+from websocket import WebSocketConnectionClosedException
 from sqlitedict import SqliteDict
 import asyncio
 import datetime
@@ -13,7 +14,9 @@ from kivymd.app import MDApp
 import json
 import re
 import secrets
+import ssl
 import os
+import time
 from kivy.config import Config
 from sqlitedict import SqliteDict
 import asyncio
@@ -63,13 +66,121 @@ class NostrRelayManager:
         for relay_url in relays:
             Logger.info(f'adding relay: {relay_url}')
             self.relay_manager.add_relay(relay_url)
-        Logger.info(f'relays connected: ')
+        Logger.info(f'relays connected: {self.relay_manager.relays}')
 
 
     def load_relays_from_db(self):
         with SqliteDict(DATABASE_PATH, tablename='relays') as db:
             relays = db.get('relays', DEFAULT_RELAYS)
         return relays
+
+    def get_events(self, pub_key_hex, kind='text', returns='content'):
+        """fetch events of any kind for pub_key_hex"""
+        relay_manager = self.relay_manager
+
+        if kind == 'text':
+            kinds = [EventKind.TEXT_NOTE]
+            filter_ = Filter(authors=[pub_key_hex], kinds=kinds)
+            filters = Filters([filter_])
+        elif kind == 'meta':
+            kinds = [EventKind.SET_METADATA]
+            filter_ = Filter(authors=[pub_key_hex], kinds=kinds)
+            filters = Filters([filter_])
+        elif kind == 'dm':
+            kinds = [EventKind.ENCRYPTED_DIRECT_MESSAGE]
+            filter_to_pub_key = Filter(pubkey_refs=[pub_key_hex], kinds=kinds)
+            filter_from_pub_key = Filter(authors=[pub_key_hex], kinds=kinds)
+            filters = Filters([filter_to_pub_key, filter_from_pub_key])
+        else:
+            raise NotImplementedError(f'{kind} events not supported')
+        
+        subscription_id = secrets.token_hex(4)
+        request = [ClientMessageType.REQUEST, subscription_id]
+        request.extend(filters.to_json_array())
+
+
+        relay_manager.add_subscription(subscription_id, filters)
+
+        message = json.dumps(request)
+
+        try:
+            relay_manager.publish_message(message)
+        except WebSocketConnectionClosedException:
+            Logger.warning('connection was closed, reopening..')
+            relay_manager.open_connections()
+            time.sleep(1.5)
+            relay_manager.publish_message(message)
+
+        time.sleep(1) # allow the messages to send
+        Logger.info(f'message should have sent {kind}')
+        Logger.info(f'found events {relay_manager.message_pool.has_events()}')
+
+        events = []
+        while relay_manager.message_pool.has_events():
+            event_msg = relay_manager.message_pool.get_event()
+            Logger.info(f'found event {event_msg}')
+            if returns == 'content':
+                if kind == 'meta':
+                    content = json.loads(event_msg.event.content)
+                else:
+                    content = event_msg.event.content
+            elif returns == 'event':
+                content = event_msg.event
+            else:
+                raise NotImplementedError(f"{returns} returns option not supported, options are 'event' or 'content'")
+            events.append(content)
+        try:
+            relay_manager.close_subscription(subscription_id)
+        except KeyError:
+            Logger.warning(f'subscription id {subscription_id} not found in relay manager:')
+            for relay in relay_manager.relays.values():
+                Logger.info(relay.subscriptions)
+
+        return events
+
+    def load_profile_data(self, pub_key_hex=None):
+        # Access the Manager instance with the relays from the relay_manager attribute
+        if pub_key_hex is None:
+            pub_key_hex = load_user_pub_key()
+
+        profile_events = self.get_events(pub_key_hex, 'meta')
+
+        Logger.info(f'profile events: {profile_events}')
+        if len(profile_events) > 0:
+            profile = profile_events[0]
+            return profile
+        else:
+            Logger.warning(f'no profile events found for {pub_key_hex}')
+
+    def publish_profile(self, profile_dict):
+        relay_manager = self.relay_manager
+
+        priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
+        if not priv_key_nsec:
+            Logger.error("Private key not found in keyring.")
+            raise IOError("Expected private key in keyring")
+        priv_key = PrivateKey.from_nsec(priv_key_nsec)
+
+        event_profile = Event(priv_key.public_key.hex(),
+                              json.dumps(profile_dict),
+                              kind=EventKind.SET_METADATA)
+        priv_key.sign_event(event_profile)
+        
+        # check signature
+        assert event_profile.verify()
+
+        try:
+            relay_manager.publish_message(event_profile.to_message())
+        except WebSocketConnectionClosedException:
+            Logger.warning('connection was closed, reopening..')
+            relay_manager.open_connections()
+            time.sleep(1.5)
+            relay_manager.publish_message(event_profile)
+
+        print('waiting 1 sec to send')
+        time.sleep(1) # allow the messages to send
+
+        return event_profile.signature
 
 
 
@@ -80,45 +191,6 @@ def load_user_pub_key():
         raise IOError("Expected private key in keyring")
     pub_key_hex = get_nostr_pub_key(priv_key)
     return pub_key_hex
-
-
-
-async def load_profile_data(relay_manager_instance, pub_key_hex=None):
-    # Access the Manager instance with the relays from the relay_manager attribute
-    manager = relay_manager_instance.relay_manager
-
-    if not any(relay.connected for relay in manager.relays):
-        Logger.error("Failed to connect to any relays.")
-        return None
-
-    if pub_key_hex is None:
-        pub_key_hex = load_user_pub_key()
-
-    # Construct the profile query using EventKind for metadata
-    filter_ = {"authors": [pub_key_hex], "kinds": [EventKind.SET_METADATA]}
-    subscription_id = secrets.token_hex(4)  # Generate a unique ID for the subscription
-
-    try:
-        # Use the manager instance to subscribe to the relays with the filter
-        queue = await manager.subscribe(subscription_id, filter_)
-
-        # Use the manager instance to get profile events
-        event = await queue.get()
-        if event:
-            profile_dict = event.to_json_object()
-            return profile_dict
-
-    except Exception as e:
-        Logger.error(f"Error querying for profile: {e}")
-
-    finally:
-        # Ensure to unsubscribe before closing to clean up properly
-        await manager.unsubscribe(subscription_id)
-        # No need to disconnect if using a shared manager, unless it's the end of its lifecycle
-
-    Logger.warn("No profile events found.")
-    return None
-
 
 
 def parse_responses(response):
@@ -145,7 +217,7 @@ def parse_responses(response):
     return success_count
 
 
-async def save_profile_to_relays(content, relay_manager):
+def save_profile_to_relays(content, relay_manager):
     # Convert the dictionary to a JSON string
     content_json = json.dumps(content)
     
@@ -171,7 +243,7 @@ async def save_profile_to_relays(content, relay_manager):
 
     # Use the connected relay_manager to add the event
     try:
-        response = await relay_manager.add_event(profile_event, check_response=True)
+        response = relay_manager.publish_event(profile_event, check_response=True)
         Logger.debug(f'Raw response from relay_manager.add_event: {response}')
         success_count = parse_responses(response)
         Logger.debug(f'Parsed response count: {success_count}')
@@ -234,65 +306,67 @@ def get_encryption_iv(msg):
     """extract the iv from an ecnrypted blob"""
     return msg.split('?iv=')[-1].strip('==')
 
-async def subscribe_and_fetch(manager, subscription_id, event_filter):
-    Logger.debug(f"Subscription ID: {subscription_id}")
-    Logger.debug(f"Filter: {event_filter}")
 
-    queue = await manager.subscribe(subscription_id, event_filter)
-    Logger.debug("Subscribed to DMs.")
 
-    dm_events = []
-    end_time = asyncio.get_event_loop().time() + 10.0  # 10 seconds from now
-    Logger.debug("Starting to fetch DMs with a timeout of 10 seconds.")
+# async def subscribe_and_fetch(manager, subscription_id, event_filter):
+#     Logger.debug(f"Subscription ID: {subscription_id}")
+#     Logger.debug(f"Filter: {event_filter}")
 
-    unique_ids = set()
-    while asyncio.get_event_loop().time() < end_time:
-        try:
-            event = await asyncio.wait_for(queue.get(), timeout=1.0)
-            if event.verify() and event.id not in unique_ids:
-                dm_events.append(event.to_json_object())
-                unique_ids.add(event.id)
-        except asyncio.TimeoutError:
-            Logger.debug("Timeout occurred while waiting for DMs.")
-            break
+#     queue = await manager.subscribe(subscription_id, event_filter)
+#     Logger.debug("Subscribed to DMs.")
 
-    return dm_events
+#     dm_events = []
+#     end_time = asyncio.get_event_loop().time() + 10.0  # 10 seconds from now
+#     Logger.debug("Starting to fetch DMs with a timeout of 10 seconds.")
 
-async def load_dms(relay_manager_instance, pub_key_hex=None):
-    if pub_key_hex is None:
-        pub_key_hex = load_user_pub_key()
-    Logger.debug(f"Public Key Hex: {pub_key_hex}")
+#     unique_ids = set()
+#     while asyncio.get_event_loop().time() < end_time:
+#         try:
+#             event = await asyncio.wait_for(queue.get(), timeout=1.0)
+#             if event.verify() and event.id not in unique_ids:
+#                 dm_events.append(event.to_json_object())
+#                 unique_ids.add(event.id)
+#         except asyncio.TimeoutError:
+#             Logger.debug("Timeout occurred while waiting for DMs.")
+#             break
 
-    manager = relay_manager_instance.relay_manager
+#     return dm_events
 
-    if not any(relay.connected for relay in manager.relays):
-        Logger.error("Failed to connect to any relays.")
-        return None
+# async def load_dms(relay_manager_instance, pub_key_hex=None):
+#     if pub_key_hex is None:
+#         pub_key_hex = load_user_pub_key()
+#     Logger.debug(f"Public Key Hex: {pub_key_hex}")
 
-    filter_1 = {
-        "authors": [pub_key_hex],
-        "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
-    filter_2 = {
-        'pubkey_refs': [pub_key_hex],
-        "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
+#     manager = relay_manager_instance.relay_manager
 
-    subscription_id_1 = secrets.token_hex(4)
-    subscription_id_2 = secrets.token_hex(4)
+#     if not any(relay.connected for relay in manager.relays):
+#         Logger.error("Failed to connect to any relays.")
+#         return None
 
-    results = await asyncio.gather(
-        subscribe_and_fetch(manager, subscription_id_1, filter_1),
-        # subscribe_and_fetch(manager, subscription_id_2, filter_2)
-    )
+#     filter_1 = {
+#         "authors": [pub_key_hex],
+#         "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
+#     filter_2 = {
+#         'pubkey_refs': [pub_key_hex],
+#         "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
 
-    # Flatten list of results into one list and return
-    dm_events = [event for sublist in results for event in sublist]
+#     subscription_id_1 = secrets.token_hex(4)
+#     subscription_id_2 = secrets.token_hex(4)
+
+#     results = await asyncio.gather(
+#         subscribe_and_fetch(manager, subscription_id_1, filter_1),
+#         # subscribe_and_fetch(manager, subscription_id_2, filter_2)
+#     )
+
+#     # Flatten list of results into one list and return
+#     dm_events = [event for sublist in results for event in sublist]
     
-    if dm_events:
-        Logger.info(f"Total DMs fetched: {len(dm_events)}")
-        return dm_events
-    else:
-        Logger.warn("No DM events found after fetching.")
-        return None
+#     if dm_events:
+#         Logger.info(f"Total DMs fetched: {len(dm_events)}")
+#         return dm_events
+#     else:
+#         Logger.warn("No DM events found after fetching.")
+#         return None
 
 
 

@@ -4,9 +4,10 @@ from kivymd.app import MDApp
 import tempfile
 import keyring
 from kivy.network.urlrequest import UrlRequest
-
+import ssl
 from relays import RelayScreen
 from settings import SettingsScreen
+from profile import ProfileScreen
 from kivy.clock import Clock
 
 from util import KEYRING_GROUP, Logger, NostrRelayManager
@@ -16,11 +17,15 @@ import os
 class Main(MDApp):
     def build(self):
         self.theme_cls.theme_style = "Dark"
-        # Don't initialize relay_manager here
 
     def on_start(self):
-        # Initialize relay_manager when the app starts, ensuring everything is set up
+        # Use the Kivy Clock to schedule the relay_manager initialization
+        Clock.schedule_once(self.init_relay_manager, 0)
+
+    def init_relay_manager(self, dt):
+        # Initialize relay_manager and open connections
         self.relay_manager = NostrRelayManager.get_instance()
+        self.relay_manager.relay_manager.open_connections()
 
 if __name__ == "__main__":
     try:

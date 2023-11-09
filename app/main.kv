@@ -41,9 +41,9 @@ MDScreen:
                 name: 'settings_screen'
                 id: settings_screen
 
-            # ProfileScreen:  # Now directly inside the ScreenManager
-            #     name: 'profile_screen'
-            #     id: profile_screen
+            ProfileScreen:  # Now directly inside the ScreenManager
+                name: 'profile_screen'
+                id: profile_screen
 
             # MDScreen:
             #     name: 'contacts_screen'  # name of the new contacts screen
@@ -76,12 +76,12 @@ MDScreen:
                 # MDNavigationDrawerLabel:
                 #     text: "Mail"
 
-                # DrawerClickableItem:
-                #     icon: "account-circle-outline"
-                #     text: "Profile"
-                #     on_release:
-                #         app.root.ids.screen_manager.current = 'profile_screen'
-                #         nav_drawer.set_state("close")
+                DrawerClickableItem:
+                    icon: "account-circle-outline"
+                    text: "Profile"
+                    on_release:
+                        app.root.ids.screen_manager.current = 'profile_screen'
+                        nav_drawer.set_state("close")
 
                 # DrawerClickableItem:
                 #     icon: "account-multiple-outline"

@@ -57,6 +57,13 @@
                     IconLeftWidget:
                         icon: 'content-save'
 
+                # Add the refresh button here
+                OneLineIconListItem:
+                    text: "Refresh Profile"
+                    on_release: root.refresh_profile()
+                    IconLeftWidget:
+                        icon: 'refresh'
+
                 # Status message label
                 MDLabel:
                     id: status_message

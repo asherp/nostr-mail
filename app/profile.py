@@ -14,64 +14,51 @@ from util import DEFAULT_RELAYS, DATABASE_PATH, KEYRING_GROUP
 # from aionostr.event import EventKind
 # from aionostr.event import Event
 from util import get_current_unix_timestamp, get_priv_key_hex
-from util import load_profile_data, get_screen, save_profile_to_relays
+from util import get_screen, save_profile_to_relays
 from kivy.clock import Clock
 from kivy.clock import mainthread
 from kivy.lang import Builder
 from kivy.app import App
-
+from threading import Thread
 
 Builder.load_file('profile.kv')
 
 
 class ProfileScreen(MDScreen):
+
     def on_enter(self, *args):
-        Logger.info('PROFILE SCREEN ENTERED')
-        # Schedule the load_profile_data coroutine to be executed using the shared relay_manager
-        asyncio.ensure_future(self.async_populate_profile())
+        super(ProfileScreen, self).on_enter(*args)
+        self.populate_profile()
 
-    async def async_populate_profile(self):
-        # Assuming MDApp.get_running_app().relay_manager is the shared relay_manager instance
+
+    def populate_profile(self):
+        Thread(target=self.load_profile_data_in_thread).start()
+
+    def load_profile_data_in_thread(self):
         relay_manager = MDApp.get_running_app().relay_manager
+        profile_data = relay_manager.load_profile_data()  # This should be a non-blocking call
+        if profile_data:
+            Clock.schedule_once(lambda dt: self.update_profile_ui(profile_data))
 
-        profile_data = await load_profile_data(relay_manager)
-        if profile_data is not None:
-            self.populate_profile(profile_data)
-        else:
-            Logger.error("Unable to populate profile. Profile data is None.")
+    @mainthread
+    def update_profile_ui(self, profile_data):
+        # Add logging to check the data is correct
+        Logger.info('ProfileScreen: Updating profile UI with data: {}'.format(profile_data))
 
+        # Now update the UI elements
+        try:
 
-    def populate_profile(self, profile_data):
-        if profile_data is not None:
-            # Parse the JSON string in the 'content' key of the profile data
-            content = json.loads(profile_data.get('content', '{}'))  # Default to empty dict if 'content' is not found
-
-            self.ids.display_name.text = content.get('display_name', '')
-            self.ids.name.text = content.get('name', '')
-            self.ids.picture_url.text = content.get('picture', '')
-            self.ids.about.text = content.get('about', '')
-            self.ids.email.text = content.get('email', '')
-
+            self.ids.display_name.text = profile_data.get('display_name', '')
+            self.ids.name.text = profile_data.get('name', '')
+            self.ids.picture_url.text = profile_data.get('picture', '')
+            self.ids.about.text = profile_data.get('about', '')
+            self.ids.email.text = profile_data.get('email', '')
+            
             # Handle id and pubkey
             self.profile_id = profile_data.get('id', '')
             self.public_key = profile_data.get('pubkey', '')
-        else:
-            Logger.error("Profile data is None, cannot populate profile.")
-
-
-
-    def save_profile(self):
-        Logger.info('ProfileScreen: Starting to save profile data...')
-        asyncio.ensure_future(self.schedule_and_check())
-
-    async def schedule_and_check(self):
-        # Here you should use MDApp instead of App if you're using KivyMD
-        relay_manager = MDApp.get_running_app().relay_manager.relay_manager
-        success = await save_profile_to_relays(self.get_profile_content(), relay_manager)
-        if success:
-            self.schedule_on_success()
-        else:
-            self.schedule_on_failure()
+        except Exception as e:
+            Logger.error('ProfileScreen: Error updating UI: {}'.format(e))
 
 
     def get_profile_content(self):
@@ -83,13 +70,20 @@ class ProfileScreen(MDScreen):
             "email": self.ids.email.text
         }
 
-    @mainthread
-    def schedule_on_success(self):
-        Clock.schedule_once(lambda dt: self.on_success())
+    def save_profile(self):
+        Logger.info('ProfileScreen: Starting to save profile data...')
+        relay_manager = MDApp.get_running_app().relay_manager
+        signature = relay_manager.publish_profile(self.get_profile_content())
 
-    @mainthread
-    def schedule_on_failure(self):
-        Clock.schedule_once(lambda dt: self.on_failure())
+        if signature:
+            self.on_success()
+        else:
+            self.on_failure()
+
+    def refresh_profile(self):
+        # Logic to refresh the profile data
+        self.populate_profile()
+
 
     def on_success(self):
         self.ids.status_message.text = "Profile saved successfully!"

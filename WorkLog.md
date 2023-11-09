@@ -1,3 +1,4 @@
+* reverting to synchronous
 
 # 2023-11-09 10:42:57.738861: clock-in
 

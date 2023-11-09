@@ -1,10 +1,13 @@
-from aionostr.util import PrivateKey, PublicKey
+from nostr.key import PrivateKey, PublicKey
 from kivy.logger import Logger
 import sqlite3
 import keyring
-from aionostr.relay import Manager
-from aionostr.event import EventKind
-from aionostr.event import Event
+# from aionostr.relay import Manager
+# from aionostr.event import EventKind
+# from aionostr.event import Event
+from nostr.relay_manager import RelayManager as NostrLibRelayManager
+from sqlitedict import SqliteDict
+import asyncio
 import datetime
 from kivymd.app import MDApp
 import json
@@ -47,29 +50,26 @@ class NostrRelayManager:
     def __init__(self):
         if self._instance is not None:
             raise Exception("This class is a singleton!")
-        else:
-            self.relay_manager = None
-            self.connected = False
-            NostrRelayManager._instance = self
-            self.init_manager()
+        self.relay_manager = None
+        self.connected = False
+        NostrRelayManager._instance = self
+        self.init_manager()
 
-    async def connect(self):
-        # Assuming each relay in the manager has an async 'connect' method
-        if self.relay_manager:
-            # Connect to each relay managed by the relay_manager
-            await asyncio.gather(*(relay.connect() for relay in self.relay_manager.relays))
-            self.connected = all(relay.connected for relay in self.relay_manager.relays)
-        else:
-            Logger.error("Relay manager not initialized.")
 
     def init_manager(self):
-        # Load relays from the database
-        self.relay_manager = self.load_relays_from_db()
+        relays = self.load_relays_from_db()
+        self.relay_manager = NostrLibRelayManager()
+        for relay_url in relays:
+            self.relay_manager.add_relay(relay_url)
+        Logger.info(f'relays connected: ')
+        for k,v in self.relay_manager.relays.items():
+            Logger.info(f' {k}: {v.connected}')
 
     def load_relays_from_db(self):
         with SqliteDict(DATABASE_PATH, tablename='relays') as db:
             relays = db.get('relays', DEFAULT_RELAYS)
-        return Manager(relays=relays)
+        return relays
+
 
 
 def load_user_pub_key():

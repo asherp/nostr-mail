@@ -14,7 +14,7 @@ from sqlitedict import SqliteDict
 from util import Logger
 from util import get_nostr_pub_key, DEFAULT_RELAYS, DATABASE_PATH
 from kivy.lang import Builder
-from aionostr.relay import Manager
+# from aionostr.relay import Manager
 
 Builder.load_file('relays.kv')
 
@@ -36,25 +36,24 @@ class RelayScreen(MDScreen):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.relay_manager = None
+        # self.relay_manager = None
         Logger.info("Initializing RelayScreen")
-        self.load_relays_from_db()
+        # self.load_relays_from_db()
 
 
-    def load_relays_from_db(self):
-        with SqliteDict(DATABASE_PATH, tablename='relays') as db:
-            # Directly assign the list to self.relays
-            self.relays = db.get('relays', DEFAULT_RELAYS)
-            # Initialize the NostrRelayManager with the loaded relays
-            self.relay_manager = Manager(self.relays)
-            Logger.info("Relays loaded from database and relay manager initialized.")
+    # def load_relays_from_db(self):
+    #     with SqliteDict(DATABASE_PATH, tablename='relays') as db:
+    #         # Directly assign the list to self.relays
+    #         self.relays = db.get('relays', DEFAULT_RELAYS)
+    #         # Initialize the NostrRelayManager with the loaded relays
+    #         self.relay_manager = Manager(self.relays)
+    #         Logger.info("Relays loaded from database and relay manager initialized.")
 
     def save_relays_to_db(self):
         with SqliteDict(DATABASE_PATH, tablename='relays', autocommit=True) as db:
             # Convert the ListProperty to a plain list before saving.
             db['relays'] = list(self.relays)
             Logger.info("Relays saved to database.")
-
 
 
     def load_default_relays(self):

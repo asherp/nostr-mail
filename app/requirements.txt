@@ -1,6 +1,7 @@
 kivy
 kivymd
 keyring
+git+https://github.com/jeffthibault/python-nostr.git
 git+https://github.com/davestgermain/aionostr.git#egg=aionostr
 python-dotenv
 sqlitedict

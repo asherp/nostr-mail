@@ -41,23 +41,23 @@ MDScreen:
                 name: 'settings_screen'
                 id: settings_screen
 
-            ProfileScreen:  # Now directly inside the ScreenManager
-                name: 'profile_screen'
-                id: profile_screen
+            # ProfileScreen:  # Now directly inside the ScreenManager
+            #     name: 'profile_screen'
+            #     id: profile_screen
 
-            MDScreen:
-                name: 'contacts_screen'  # name of the new contacts screen
-                BoxLayout:
-                    orientation: 'vertical'
-                    ContactsScreen:
+            # MDScreen:
+            #     name: 'contacts_screen'  # name of the new contacts screen
+            #     BoxLayout:
+            #         orientation: 'vertical'
+            #         ContactsScreen:
 
-            ConversationsScreen:
-                name: 'conversations_screen'
-                id: conversations_screen                
+            # ConversationsScreen:
+            #     name: 'conversations_screen'
+            #     id: conversations_screen                
 
-            ComposeScreen:
-                name: 'compose_screen'
-                id: compose_screen
+            # ComposeScreen:
+            #     name: 'compose_screen'
+            #     id: compose_screen
 
 
         MDNavigationDrawer:
@@ -73,42 +73,42 @@ MDScreen:
                     spacing: "4dp"
                     padding: "12dp", 0, 0, "56dp"
 
-                MDNavigationDrawerLabel:
-                    text: "Mail"
+                # MDNavigationDrawerLabel:
+                #     text: "Mail"
 
-                DrawerClickableItem:
-                    icon: "account-circle-outline"
-                    text: "Profile"
-                    on_release:
-                        app.root.ids.screen_manager.current = 'profile_screen'
-                        nav_drawer.set_state("close")
+                # DrawerClickableItem:
+                #     icon: "account-circle-outline"
+                #     text: "Profile"
+                #     on_release:
+                #         app.root.ids.screen_manager.current = 'profile_screen'
+                #         nav_drawer.set_state("close")
 
-                DrawerClickableItem:
-                    icon: "account-multiple-outline"
-                    text: "Contacts"
-                    on_release:
-                        app.root.ids.screen_manager.current = 'contacts_screen'
-                        nav_drawer.set_state("close")
+                # DrawerClickableItem:
+                #     icon: "account-multiple-outline"
+                #     text: "Contacts"
+                #     on_release:
+                #         app.root.ids.screen_manager.current = 'contacts_screen'
+                #         nav_drawer.set_state("close")
 
-                DrawerClickableItem:
-                    icon: "gmail"
-                    right_text: "+?"
-                    text_right_color: "#4a4939"
-                    text: "Conversations"
-                    on_release:
-                        app.root.ids.screen_manager.current = 'conversations_screen'  # switch to the inbox screen
-                        nav_drawer.set_state("close")
+                # DrawerClickableItem:
+                #     icon: "gmail"
+                #     right_text: "+?"
+                #     text_right_color: "#4a4939"
+                #     text: "Conversations"
+                #     on_release:
+                #         app.root.ids.screen_manager.current = 'conversations_screen'  # switch to the inbox screen
+                #         nav_drawer.set_state("close")
 
-                DrawerClickableItem:
-                    icon: "send"
-                    text: "Outbox"
+                # DrawerClickableItem:
+                #     icon: "send"
+                #     text: "Outbox"
 
-                DrawerClickableItem:
-                    icon: "pencil"
-                    text: "Compose"
-                    on_release:
-                        app.root.ids.screen_manager.current = 'compose_screen'
-                        nav_drawer.set_state("close")
+                # DrawerClickableItem:
+                #     icon: "pencil"
+                #     text: "Compose"
+                #     on_release:
+                #         app.root.ids.screen_manager.current = 'compose_screen'
+                #         nav_drawer.set_state("close")
 
                 DrawerClickableItem:
                     icon: "cog"

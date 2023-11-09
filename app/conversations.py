@@ -6,7 +6,7 @@ from kivymd.app import MDApp
 from util import load_dms, DEFAULT_RELAYS, Logger, get_screen, KEYRING_GROUP
 from kivy.lang import Builder
 from kivymd.uix.list import OneLineListItem
-from aionostr.util import PrivateKey, PublicKey
+from nostr.key import PrivateKey, PublicKey
 from kivy.clock import mainthread
 import keyring
 from util import load_user_pub_key, get_nostr_pub_key, NostrRelayManager

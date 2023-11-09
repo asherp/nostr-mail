@@ -4,15 +4,15 @@ from kivymd.uix.screen import MDScreen
 import json
 import keyring
 from util import get_nostr_pub_key
-from aionostr.util import to_nip19
+# from aionostr.util import to_nip19
 from kivymd.app import MDApp
 import aionostr
 import asyncio
 from sqlitedict import SqliteDict
 from util import DEFAULT_RELAYS, DATABASE_PATH, KEYRING_GROUP
-from aionostr.relay import Manager
-from aionostr.event import EventKind
-from aionostr.event import Event
+# from aionostr.relay import Manager
+# from aionostr.event import EventKind
+# from aionostr.event import Event
 from util import get_current_unix_timestamp, get_priv_key_hex
 from util import load_profile_data, get_screen, save_profile_to_relays
 from kivy.clock import Clock

@@ -1,3 +1,6 @@
+
+# 2023-11-09 13:31:57.636021: clock-in
+
 # 2023-11-09 11:36:04.965361: clock-out
 
 * reverting to synchronous

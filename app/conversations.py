@@ -9,6 +9,7 @@ from kivymd.uix.list import OneLineListItem
 from aionostr.util import PrivateKey
 from kivy.clock import mainthread
 import keyring
+from util import load_user_pub_key, get_nostr_pub_key
 
 
 Builder.load_file('conversations.kv')
@@ -27,63 +28,112 @@ class ConversationsScreen(MDScreen):
         relay_manager = MDApp.get_running_app().relay_manager
         try:
             Logger.debug("ConversationsScreen: Loading DMs...")
-            dms = await load_dms(relay_manager, pub_key_hex=None)
-            if dms:
+            dm_events = await load_dms(relay_manager, pub_key_hex=None)
+            if dm_events:
                 Logger.info("ConversationsScreen: DMs loaded successfully.")
                 # Call the coroutine to decrypt and update the UI
-                await self.update_ui_with_dms(dms)
+                await self.update_ui_with_dms(dm_events)
             else:
                 Logger.warning("ConversationsScreen: No DMs to load.")
         except Exception as e:
             Logger.error(f"ConversationsScreen: Error loading DMs - {e}")
 
-    async def update_ui_with_dms(self, encrypted_dms):
+    async def update_ui_with_dms(self, dm_events):
         # Fetch the user's private key
         priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
         if not priv_key_nsec:
             Logger.error("Private key not found in keyring.")
             return
         priv_key = PrivateKey.from_nsec(priv_key_nsec)
-
+        pub_key_hex = priv_key.public_key.hex()
         # Decrypt the DMs
-        decrypted_dms = []
-        for dm in encrypted_dms:
-            try: # priv_key.decrypt_message(encrypted_message, pub_key_hex)
-                decrypted_content = priv_key.decrypt_message(dm['content'], dm['pubkey'])
-                dm['decrypted_content'] = decrypted_content
-                Logger.info(f'decrypted content: {decrypted_content}')
-                decrypted_dms.append(dm.copy())
-            except Exception as e:
-                Logger.error(f"Error decrypting message from {dm['pubkey']}: {e}")
+        dms = []
+        for e in dm_events:
+            if e is None:
+                continue
+            if not e.verify():
+                dm = dict(valid=False, event_id=e.id)
+            else:
+                dm = dict(
+                    valid=True,
+                    created_at=e.created_at,
+                    event_id=e.id,
+                    author=e.pubkey,
+                    content=e.content,
+                    **dict(e.tags))
+                if dm['p'] == pub_key_hex:
+                    pass
+                elif dm['author'] == pub_key_hex:
+                    pass
+                else:
+                    raise AssertionError('pub key not associated with dm')
+                decrypted = priv_key.decrypt_message(dm['content'], dm['p'])
+                dm['decrypted'] = decrypted
+            dms.append(dm)
 
         # Call the UI update function on the main thread
-        self.schedule_update_ui(decrypted_dms)
+        self.schedule_update_ui(dms)
 
     @mainthread
-    def schedule_update_ui(self, decrypted_dms):
+    def schedule_update_ui(self, dms):
         # Clear the list before updating to avoid duplication
         self.ids.dm_list.clear_widgets()
         
         # Log the count of DMs to be added
-        Logger.info(f'ConversationsScreen: Updating UI with {len(decrypted_dms)} DMs.')
+        Logger.info(f'ConversationsScreen: Updating UI with {len(dms)} DMs.')
 
         # Loop through the decrypted DMs and add them to the list
-        for dm in decrypted_dms:
-            list_item = self.create_list_item(dm)
+        for dm in dms:
+            list_item = self.create_list_item(dm['decrypted'])
             self.ids.dm_list.add_widget(list_item)
         Logger.info('ConversationsScreen: UI updated with decrypted DMs.')
 
     def create_list_item(self, dm):
         # This method creates and returns a List Item for a DM
-        item = OneLineListItem(text=dm['decrypted_content'])
-        Logger.debug(f"ConversationsScreen: Created list item with content: {dm['decrypted_content']}")
+        item = OneLineListItem(text=dm)
+        Logger.debug(f"ConversationsScreen: Created list item with content: {dm}")
         return item
 
 async def test_load_dms():
     Logger.setLevel('DEBUG')
-    dms = await load_dms(DEFAULT_RELAYS)
-    Logger.info(dms)
+    from aionostr.key import PrivateKey
+    from util import NostrRelayManager, load_dms
 
+    priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
+    if not priv_key_nsec:
+        Logger.error("Private key not found in keyring.")
+        return
+    priv_key = PrivateKey.from_nsec(priv_key_nsec)
+    pub_key_hex = priv_key.public_key.hex()
+
+    relay_manager = NostrRelayManager()
+    await relay_manager.connect()
+    dm_events = await load_dms(relay_manager)
+
+    dms = []
+    for e in dm_events:
+        if e is None:
+            continue
+        if not e.verify():
+            dm = dict(valid=False, event_id=e.id)
+        else:
+            dm = dict(
+                valid=True,
+                created_at=e.created_at,
+                event_id=e.id,
+                author=e.pubkey,
+                content=e.content,
+                **dict(e.tags))
+            if dm['p'] == pub_key_hex:
+                pass
+            elif dm['author'] == pub_key_hex:
+                pass
+            else:
+                raise AssertionError('pub key not associated with dm')
+            decrypted = priv_key.decrypt_message(dm['content'], dm['p'])
+            dm['decrypted'] = decrypted
+        dms.append(dm)
+    print(dms)
 
 if __name__ == '__main__':
     try:

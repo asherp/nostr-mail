@@ -229,6 +229,9 @@ def get_screen(screen_name):
     screen = app.root.ids.screen_manager.get_screen(screen_name)
     return screen
 
+def get_encryption_iv(msg):
+    """extract the iv from an ecnrypted blob"""
+    return msg.split('?iv=')[-1].strip('==')
 
 async def load_dms(relay_manager_instance, pub_key_hex=None):
     if pub_key_hex is None:

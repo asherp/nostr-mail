@@ -6,10 +6,11 @@ from kivymd.app import MDApp
 from util import load_dms, DEFAULT_RELAYS, Logger, get_screen, KEYRING_GROUP
 from kivy.lang import Builder
 from kivymd.uix.list import OneLineListItem
-from aionostr.util import PrivateKey
+from aionostr.util import PrivateKey, PublicKey
 from kivy.clock import mainthread
 import keyring
 from util import load_user_pub_key, get_nostr_pub_key
+import json
 
 
 Builder.load_file('conversations.kv')
@@ -61,12 +62,14 @@ class ConversationsScreen(MDScreen):
                     author=e.pubkey,
                     content=e.content,
                     **dict(e.tags))
-                if dm['p'] == pub_key_hex:
-                    pass
-                elif dm['author'] == pub_key_hex:
-                    pass
-                else:
-                    raise AssertionError('pub key not associated with dm')
+                # if dm['p'] == pub_key_hex:
+                #     # from sender to user
+                #     pass
+                # elif dm['author'] == pub_key_hex:
+                #     # from user to sender
+                #     pass
+                # else:
+                #     raise AssertionError('pub key not associated with dm')
                 decrypted = priv_key.decrypt_message(dm['content'], dm['p'])
                 dm['decrypted'] = decrypted
             dms.append(dm)
@@ -110,30 +113,42 @@ async def test_load_dms():
     await relay_manager.connect()
     dm_events = await load_dms(relay_manager)
 
+    if dm_events is None:
+        Logger.debug('could not load dms')
+        return
+
     dms = []
     for e in dm_events:
         if e is None:
             continue
         if not e.verify():
-            dm = dict(valid=False, event_id=e.id)
-        else:
-            dm = dict(
-                valid=True,
-                created_at=e.created_at,
-                event_id=e.id,
-                author=e.pubkey,
-                content=e.content,
-                **dict(e.tags))
-            if dm['p'] == pub_key_hex:
-                pass
-            elif dm['author'] == pub_key_hex:
-                pass
-            else:
-                raise AssertionError('pub key not associated with dm')
-            decrypted = priv_key.decrypt_message(dm['content'], dm['p'])
-            dm['decrypted'] = decrypted
+            continue
+
+        dm = dict(
+            valid=True,
+            created_at=e.created_at,
+            event_id=e.id,
+            author=e.pubkey,
+            content=e.content,
+            **dict(e.tags))
+        try:
+            if e.pubkey == pub_key_hex: # sent from user
+                Logger.debug('sent from user?')
+                decrypted = priv_key.decrypt_message(dm['content'], dm['p'])
+            else: # sent to user
+                pub_key_from_hex = PublicKey(bytes.fromhex("02" + e.pubkey), True).hex()
+                Logger.debug('sent to user')
+                decrypted = priv_key.decrypt_message(dm['content'], pub_key_from_hex)
+        except:
+            raise ValueError(f'cannot decrypt {json.dumps(e.to_message(), indent=4)}')
+        dm['decrypted'] = decrypted
         dms.append(dm)
-    print(dms)
+
+    for dm in dms:
+        print(dm['created_at'])
+        for k,v in dm.items():
+            if k != 'created_at':
+                print(f'\t{k}:{v}')
 
 if __name__ == '__main__':
     try:

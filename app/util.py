@@ -244,13 +244,20 @@ async def load_dms(relay_manager_instance, pub_key_hex=None):
         Logger.error("Failed to connect to any relays.")
         return None
 
-    filter_ = {"authors": [pub_key_hex], "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
+    filter_1 = {
+        "authors": [pub_key_hex], # from user's pub key
+        "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
+    filter_2 = {
+        'pubkey_refs': [pub_key_hex], # to user's pub key
+        "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
+
     subscription_id = secrets.token_hex(4)
     Logger.debug(f"Subscription ID: {subscription_id}")
-    Logger.debug(f"Filter: {filter_}")
+    Logger.debug(f"Filter: {filter_1}")
+    Logger.debug(f"Filter: {filter_2}")
 
     try:
-        queue = await manager.subscribe(subscription_id, filter_)
+        queue = await manager.subscribe(subscription_id, filter_2)
         Logger.debug("Subscribed to DMs.")
 
         # List to hold all DM events

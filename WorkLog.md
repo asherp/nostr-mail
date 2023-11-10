@@ -1,3 +1,5 @@
+# 2023-11-09 18:05:47.878058: clock-out: T-10m 
+
 * load pub key on the fly
 
 # 2023-11-09 18:01:22.729308: clock-in: T-50m 

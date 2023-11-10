@@ -1,3 +1,6 @@
+
+# 2023-11-09 18:01:22.729308: clock-in: T-50m 
+
 # 2023-11-09 17:06:48.603988: clock-out
 
 * working load, save profile

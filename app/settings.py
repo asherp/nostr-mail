@@ -15,6 +15,17 @@ class SettingsScreen(MDScreen):
     error = BooleanProperty(False)
     priv_key = StringProperty('')  # Use a StringProperty for the private key
 
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.fbind('priv_key', self.on_priv_key)
+
+    def on_priv_key(self, instance, value):
+        # Called whenever priv_key changes
+        pub_key = get_nostr_pub_key(value)
+        self.ids.pub_key.text = pub_key  # Assuming you have a pub_key id in your kv
+
+
     def on_enter(self):
         # This will be called when the screen is about to be displayed
         self.load_priv_key()
@@ -111,10 +122,4 @@ class SettingsScreen(MDScreen):
             Logger.info(f'{credential_type} updated.')
         else:
             Logger.info(f'{credential_type} unchanged.')
-
-
-
-    def update_pub_key(self, pub_key):
-        self.ids.pub_key.text = pub_key
-        self.ids.pub_key.helper_text = "Nostr Public Key"
 

@@ -1,9 +1,8 @@
 from kivymd.uix.screen import MDScreen
 from util import Logger
 from kivy.clock import Clock
-import asyncio
 from kivymd.app import MDApp
-from util import load_dms, DEFAULT_RELAYS, Logger, get_screen, KEYRING_GROUP
+from util import get_dms, DEFAULT_RELAYS, Logger, get_screen, KEYRING_GROUP, get_convs
 from kivy.lang import Builder
 from kivymd.uix.list import OneLineListItem
 from nostr.key import PrivateKey, PublicKey
@@ -20,26 +19,26 @@ class ConversationsScreen(MDScreen):
     def on_enter(self):
         Logger.info("ConversationsScreen: Entered the conversations screen.")
         # Asynchronously load DMs when the screen is entered
-        asyncio.ensure_future(self.load_direct_messages())
+        self.load_direct_messages()
 
 
-    async def load_direct_messages(self):
+    def load_direct_messages(self):
         # Fetch the relays from the RelayScreen
 
         relay_manager = MDApp.get_running_app().relay_manager
         try:
             Logger.debug("ConversationsScreen: Loading DMs...")
-            dm_events = await load_dms(relay_manager, pub_key_hex=None)
+            dm_events = load_dms(relay_manager, pub_key_hex=None)
             if dm_events:
                 Logger.info("ConversationsScreen: DMs loaded successfully.")
                 # Call the coroutine to decrypt and update the UI
-                await self.update_ui_with_dms(dm_events)
+                self.update_ui_with_dms(dm_events)
             else:
                 Logger.warning("ConversationsScreen: No DMs to load.")
         except Exception as e:
             Logger.error(f"ConversationsScreen: Error loading DMs - {e}")
 
-    async def update_ui_with_dms(self, dm_events):
+    def update_ui_with_dms(self, dm_events):
         # Fetch the user's private key
         priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
         if not priv_key_nsec:
@@ -93,7 +92,7 @@ class ConversationsScreen(MDScreen):
         Logger.debug(f"ConversationsScreen: Created list item with content: {dm}")
         return item
 
-async def test_load_dms():
+def test_load_dms():
     Logger.setLevel('DEBUG')
 
     priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
@@ -105,9 +104,9 @@ async def test_load_dms():
     pub_key_hex = priv_key.public_key.hex()
 
     relay_manager = NostrRelayManager()
-    await relay_manager.connect()
+    relay_manager.connect()
 
-    dms = await load_dms(relay_manager)
+    dms = load_dms(relay_manager)
     
     for dm in dms:
         Logger.info(dm['created_at'])
@@ -117,7 +116,7 @@ async def test_load_dms():
 
 if __name__ == '__main__':
     try:
-        asyncio.run(test_load_dms())
+        test_load_dms()
     except KeyboardInterrupt:
         print("Program exited by user.")
 

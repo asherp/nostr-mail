@@ -1,3 +1,4 @@
+* load pub key on the fly
 
 # 2023-11-09 18:01:22.729308: clock-in: T-50m 
 

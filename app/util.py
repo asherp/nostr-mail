@@ -53,7 +53,7 @@ class NostrRelayManager:
     def __init__(self):
         if self._instance is not None:
             raise Exception("This class is a singleton!")
-        self.relay_manager = None
+        self.manager = None
         self.connected = False
         NostrRelayManager._instance = self
         self.init_manager()
@@ -61,12 +61,12 @@ class NostrRelayManager:
 
     def init_manager(self):
         relays = self.load_relays_from_db()
-        self.relay_manager = RelayManager()
+        self.manager = RelayManager()
         Logger.info('connecting relays')
         for relay_url in relays:
             Logger.info(f'adding relay: {relay_url}')
-            self.relay_manager.add_relay(relay_url)
-        Logger.info(f'relays connected: {self.relay_manager.relays}')
+            self.manager.add_relay(relay_url)
+        Logger.info(f'relays connected: {self.manager.relays}')
 
 
     def load_relays_from_db(self):
@@ -76,7 +76,7 @@ class NostrRelayManager:
 
     def get_events(self, pub_key_hex, kind='text', returns='content'):
         """fetch events of any kind for pub_key_hex"""
-        relay_manager = self.relay_manager
+        relay_manager = self.manager
 
         if kind == 'text':
             kinds = [EventKind.TEXT_NOTE]
@@ -153,7 +153,7 @@ class NostrRelayManager:
             Logger.warning(f'no profile events found for {pub_key_hex}')
 
     def publish_profile(self, profile_dict):
-        relay_manager = self.relay_manager
+        relay_manager = self.manager
 
         priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
         if not priv_key_nsec:
@@ -266,12 +266,12 @@ def get_priv_key_hex(priv_key_nsec):
 def get_nostr_pub_key(priv_key_nsec):
     """given priv key in nsec format, returns pub key in hex format"""
     if priv_key_nsec is None:
-        raise PreventUpdate
+        return 'no priv key provided'
     try:
         pub_key_hex = PrivateKey.from_nsec(priv_key_nsec).public_key.hex()
     except:
         Logger.error(f'strange priv key ----> {priv_key_nsec} <----')
-        raise IOError(f'something wrong with priv key, check nsec format: nsec1..')
+        return 'priv key does not match nsec format'
     return pub_key_hex
 
 
@@ -306,69 +306,43 @@ def get_encryption_iv(msg):
     """extract the iv from an ecnrypted blob"""
     return msg.split('?iv=')[-1].strip('==')
 
+def get_dms(pub_key_hex):
+    """Get all dms for this pub key
+    Returns list of dict objects storing metadata for each dm
+    Note: if a dm signature does not pass, the event is markded with valid=False
+    """
+    dms = []
+    dm_events = get_events(pub_key_hex, kind='dm', returns='event')
+    for e in dm_events:
+        # check signature first
+        if not e.verify():
+            dm = dict(valid=False, event_id=e.id)
+        else:
+            dm = dict(
+                valid=True,
+                time=e.created_at,
+                event_id=e.id,
+                author=e.public_key,
+                content=e.content,
+                **dict(e.tags))
+            if dm['p'] == pub_key_hex:
+                pass
+            elif dm['author'] == pub_key_hex:
+                pass
+            else:
+                raise AssertionError('pub key not associated with dm')
+        dms.append(dm)
+    return dms
 
-
-# async def subscribe_and_fetch(manager, subscription_id, event_filter):
-#     Logger.debug(f"Subscription ID: {subscription_id}")
-#     Logger.debug(f"Filter: {event_filter}")
-
-#     queue = await manager.subscribe(subscription_id, event_filter)
-#     Logger.debug("Subscribed to DMs.")
-
-#     dm_events = []
-#     end_time = asyncio.get_event_loop().time() + 10.0  # 10 seconds from now
-#     Logger.debug("Starting to fetch DMs with a timeout of 10 seconds.")
-
-#     unique_ids = set()
-#     while asyncio.get_event_loop().time() < end_time:
-#         try:
-#             event = await asyncio.wait_for(queue.get(), timeout=1.0)
-#             if event.verify() and event.id not in unique_ids:
-#                 dm_events.append(event.to_json_object())
-#                 unique_ids.add(event.id)
-#         except asyncio.TimeoutError:
-#             Logger.debug("Timeout occurred while waiting for DMs.")
-#             break
-
-#     return dm_events
-
-# async def load_dms(relay_manager_instance, pub_key_hex=None):
-#     if pub_key_hex is None:
-#         pub_key_hex = load_user_pub_key()
-#     Logger.debug(f"Public Key Hex: {pub_key_hex}")
-
-#     manager = relay_manager_instance.relay_manager
-
-#     if not any(relay.connected for relay in manager.relays):
-#         Logger.error("Failed to connect to any relays.")
-#         return None
-
-#     filter_1 = {
-#         "authors": [pub_key_hex],
-#         "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
-#     filter_2 = {
-#         'pubkey_refs': [pub_key_hex],
-#         "kinds": [EventKind.ENCRYPTED_DIRECT_MESSAGE]}
-
-#     subscription_id_1 = secrets.token_hex(4)
-#     subscription_id_2 = secrets.token_hex(4)
-
-#     results = await asyncio.gather(
-#         subscribe_and_fetch(manager, subscription_id_1, filter_1),
-#         # subscribe_and_fetch(manager, subscription_id_2, filter_2)
-#     )
-
-#     # Flatten list of results into one list and return
-#     dm_events = [event for sublist in results for event in sublist]
+def get_convs(dms):
+    """assign conversation tuples to each dm
     
-#     if dm_events:
-#         Logger.info(f"Total DMs fetched: {len(dm_events)}")
-#         return dm_events
-#     else:
-#         Logger.warn("No DM events found after fetching.")
-#         return None
-
-
-
+    dms - pd.DataFrame of dms
+    
+    """
+    convs = []
+    for _, e in dms.iterrows():
+        convs.append(tuple(sorted((e.author, e.p))))
+    return convs
 
 

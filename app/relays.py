@@ -56,7 +56,7 @@ class RelayScreen(MDScreen):
         for default_relay in DEFAULT_RELAYS:
             if default_relay not in self.relays:
                 self.relays.append(default_relay)
-                self.relay_manager.relay_manager.add_relay(default_relay)
+                self.relay_manager.manager.add_relay(default_relay)
         self.on_pre_enter()  # Refresh the list
         self.save_relays_to_db()  # Save the updated list to the database
 
@@ -68,7 +68,7 @@ class RelayScreen(MDScreen):
         if not self.relay_manager:
             self.relay_manager = MDApp.get_running_app().relay_manager
 
-        self.relays = list(self.relay_manager.relay_manager.relays.keys())
+        self.relays = list(self.relay_manager.manager.relays.keys())
         
         self.ids.relay_list.clear_widgets()
         for relay in self.relays:
@@ -119,7 +119,7 @@ class RelayScreen(MDScreen):
         '''Delete the selected relay URL.'''
         if relay_url in self.relays:
             self.relays.remove(relay_url)
-            self.relay_manager.relay_manager.remove_relay(relay_url)
+            self.relay_manager.manager.remove_relay(relay_url)
             self.on_pre_enter()  # Refresh the list
             self.save_relays_to_db()  # Save the updated list to the database
         self.close_dialog()

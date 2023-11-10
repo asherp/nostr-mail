@@ -15,6 +15,7 @@
             MDList:
                 MDTextField:
                     id: priv_key
+                    on_text: root.priv_key = self.text
                     hint_text: "Enter priv key (nsec format)"
                     password: True
                     text: root.priv_key  # Bind the text to the priv_key StringProperty

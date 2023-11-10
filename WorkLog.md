@@ -1,3 +1,6 @@
+
+# 2023-11-10 16:53:02.589367: clock-in
+
 # 2023-11-10 09:11:34.448542: clock-out
 
 * loaded dms into conversations screen

@@ -12,6 +12,7 @@ from conversations import ConversationsScreen
 from kivy.clock import Clock
 
 from util import KEYRING_GROUP, Logger, NostrRelayManager
+from util import ErrorPopup
 import os
 
 
@@ -33,5 +34,9 @@ if __name__ == "__main__":
         Main().run()
     except KeyboardInterrupt:
         print("Program exited by user.")
+    # except Exception as e:
+    #     print(f"An error occurred: {e}")
+    #     ErrorPopup(str(e)).open()
+
 
 

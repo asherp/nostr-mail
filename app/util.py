@@ -20,6 +20,10 @@ import time
 from kivy.config import Config
 from sqlitedict import SqliteDict
 import asyncio
+from kivy.uix.popup import Popup
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.boxlayout import BoxLayout
 
 # Set the directory where you want to store the log files
 log_directory = os.path.join(os.path.dirname(__file__), 'logs')
@@ -39,6 +43,26 @@ DEFAULT_RELAYS = [
     "wss://relay.damus.io",
     'wss://brb.io',
     'wss://nostr.mom']
+
+
+class ErrorPopup(Popup):
+    def __init__(self, error_message, **kwargs):
+        super().__init__(**kwargs)
+        self.title = 'An Error Occurred'
+        self.size_hint = (0.5, 0.5)
+
+        layout = BoxLayout(orientation='vertical')
+        layout.add_widget(Label(text=error_message))
+
+        close_button = Button(text='Close')
+        close_button.bind(on_press=self.dismiss)
+        layout.add_widget(close_button)
+
+        self.content = layout
+        self.bind(on_dismiss=self.on_close)
+
+    def on_close(self, instance):
+        MDApp.get_running_app().stop()
 
 
 class NostrRelayManager:
@@ -182,7 +206,43 @@ class NostrRelayManager:
 
         return event_profile.signature
 
+    def get_dms(self):
+        """Get all dms for this pub key
+        Returns list of dict objects storing metadata for each dm
+        Note: if a dm signature does not pass, the event is markded with valid=False
+        """
+        priv_key = load_user_priv_key()
+        pub_key_hex = priv_key.public_key.hex()
 
+        dms = []
+        dm_events = self.get_events(pub_key_hex, kind='dm', returns='event')
+        for e in dm_events:
+            # check signature first
+            if not e.verify():
+                continue
+            else:
+                dm = dict(
+                    valid=True,
+                    time=e.created_at,
+                    event_id=e.id,
+                    author=e.public_key,
+                    content=e.content,
+                    **dict(e.tags))
+                dm['decrypted'] = 'could not decrypt'
+                if dm['author'] == pub_key_hex: # sent from the user
+                    dm['decrypted'] = priv_key.decrypt_message(dm['content'], dm['p'])
+                else: # sent to the user
+                    dm['decrypted'] = priv_key.decrypt_message(dm['content'], dm['author'])
+            dms.append(dm)
+        return dms
+
+def load_user_priv_key():
+    priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
+    if not priv_key_nsec:
+        Logger.error("Private key not found in keyring.")
+        raise IOError("Expected private key in keyring")
+    priv_key = PrivateKey.from_nsec(priv_key_nsec)
+    return priv_key
 
 def load_user_pub_key():
     priv_key = keyring.get_password(KEYRING_GROUP, 'priv_key')
@@ -306,33 +366,7 @@ def get_encryption_iv(msg):
     """extract the iv from an ecnrypted blob"""
     return msg.split('?iv=')[-1].strip('==')
 
-def get_dms(pub_key_hex):
-    """Get all dms for this pub key
-    Returns list of dict objects storing metadata for each dm
-    Note: if a dm signature does not pass, the event is markded with valid=False
-    """
-    dms = []
-    dm_events = get_events(pub_key_hex, kind='dm', returns='event')
-    for e in dm_events:
-        # check signature first
-        if not e.verify():
-            dm = dict(valid=False, event_id=e.id)
-        else:
-            dm = dict(
-                valid=True,
-                time=e.created_at,
-                event_id=e.id,
-                author=e.public_key,
-                content=e.content,
-                **dict(e.tags))
-            if dm['p'] == pub_key_hex:
-                pass
-            elif dm['author'] == pub_key_hex:
-                pass
-            else:
-                raise AssertionError('pub key not associated with dm')
-        dms.append(dm)
-    return dms
+
 
 def get_convs(dms):
     """assign conversation tuples to each dm

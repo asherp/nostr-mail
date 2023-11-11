@@ -1,3 +1,5 @@
+# 2023-11-11 12:15:38.600326: clock-out
+
 * inherit from RelayManager, could not get profile to load
 * yet another nostr-python implementation that fixes some issues https://github.com/holgern/pynostr
 * also works on windows!

@@ -1,3 +1,6 @@
+
+# 2023-11-11 09:24:32.573287: clock-in
+
 # 2023-11-10 18:32:32.060201: clock-out
 
 * testing rest instead of html

@@ -1,3 +1,5 @@
+* testing rest instead of html
+* looking at kivy webview https://karobben.github.io/2021/04/30/Python/kivy_android_webviewer/
 
 # 2023-11-10 16:53:02.589367: clock-in
 

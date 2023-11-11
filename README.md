@@ -34,11 +34,11 @@ Nostrmail uses NIP-04, which has many [issues pointed out here](https://github.c
 Use conda/miniconda to install dependencies
 
 ```sh
-conda create -n nostrmail python=3.9
-conda activate nostrmail
-pip install -r app/requirements.txt
+conda create -n myenv python=3.9
+conda activate myenv
+conda install -c conda-forge pkg-config
+pip install --use-pep517 nostr==0.0.2
 ```
-
 
 
 

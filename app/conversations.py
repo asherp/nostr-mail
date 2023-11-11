@@ -12,17 +12,11 @@ from util import load_user_pub_key, get_nostr_pub_key, NostrRelayManager
 import json
 from collections import defaultdict
 from kivy.uix.anchorlayout import AnchorLayout
-
+from widgets import LRListItem
 
 
 Builder.load_file('conversations.kv')
 
-class RightAlignedListItem(OneLineListItem):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.add_widget(AnchorLayout(anchor_x='right', size=self.size))
-        # Assuming you have a label as a child, align it to the right
-        self.ids._lbl_primary.anchor_x = 'right'
 
 class ConversationsScreen(MDScreen):
 
@@ -67,17 +61,11 @@ class ConversationsScreen(MDScreen):
 
         for convo, msgs in conversations.items():
             for msg in sorted(msgs, key=lambda m: m['time']):
-                list_item = self.create_list_item(msg['decrypted'])
+                list_item = LRListItem(msg['decrypted'])
                 self.ids.dm_list.add_widget(list_item)
 
         Logger.info('ConversationsScreen: UI updated with decrypted DMs.')
 
-    def create_list_item(self, dm):
-        # This method creates and returns a List Item for a DM
-        # item = OneLineListItem(text=dm)
-        item = RightAlignedListItem(text=dm)
-        Logger.debug(f"ConversationsScreen: Created list item with content: {dm}")
-        return item
 
 def test_load_dms():
     Logger.setLevel('DEBUG')

@@ -29,9 +29,9 @@ Lists and Enumeration
 
 1. First item in a numbered list
 2. Second item
-   - Bullet point 1
-   - Bullet point 2
-     - Sub-bullet point
+    - Bullet point 1
+    - Bullet point 2
+        - Sub-bullet point
 
 
 Images

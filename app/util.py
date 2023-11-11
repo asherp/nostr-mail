@@ -24,6 +24,13 @@ from kivy.uix.popup import Popup
 from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.boxlayout import BoxLayout
+from kivy.cache import Cache
+from contextlib import contextmanager
+
+Cache.register('text', limit=100, timeout=60)
+Cache.register('meta', limit=100, timeout=60)
+Cache.register('dm', limit=100, timeout=60)
+
 
 # Set the directory where you want to store the log files
 log_directory = os.path.join(os.path.dirname(__file__), 'logs')
@@ -65,7 +72,7 @@ class ErrorPopup(Popup):
         MDApp.get_running_app().stop()
 
 
-class NostrRelayManager:
+class NostrRelayManager(RelayManager):
     _instance = None
 
     @classmethod
@@ -77,20 +84,17 @@ class NostrRelayManager:
     def __init__(self):
         if self._instance is not None:
             raise Exception("This class is a singleton!")
-        self.manager = None
-        self.connected = False
+        super().__init__()  # Initialize parent class
         NostrRelayManager._instance = self
         self.init_manager()
 
-
     def init_manager(self):
         relays = self.load_relays_from_db()
-        self.manager = RelayManager()
         Logger.info('connecting relays')
         for relay_url in relays:
             Logger.info(f'adding relay: {relay_url}')
-            self.manager.add_relay(relay_url)
-        Logger.info(f'relays connected: {self.manager.relays}')
+            self.add_relay(relay_url)  # Call method from RelayManager
+        Logger.info(f'relays connected: {self.relays}')  # Access attribute from RelayManager
 
 
     def load_relays_from_db(self):
@@ -98,9 +102,46 @@ class NostrRelayManager:
             relays = db.get('relays', DEFAULT_RELAYS)
         return relays
 
+
+    def add_subscription(self, id, filters: Filters):
+        super().add_subscription(id, filters)
+        Logger.info(f"Subscription added with ID {id}")
+
+
+    def close_subscription(self, id: str):
+        try:
+            super().close_subscription(id)
+            Logger.info(f"Subscription closed with ID {id}")
+        except KeyError:
+            Logger.warning(f"Attempted to close non-existing subscription with ID {id}")
+
+    @contextmanager
+    def temporary_subscription(self, filters):
+        subscription_id = secrets.token_hex(4)
+        self.add_subscription(subscription_id, filters)
+        try:
+            yield subscription_id
+        finally:
+            self.close_subscription(subscription_id)
+
+    def publish_message(self, message):
+        try:
+            super().publish_message(message)
+            Logger.info(f"Message published: {message}")
+        except WebSocketConnectionClosedException as e:
+            Logger.warning(f"WebSocket connection closed: {e}")
+            self.open_connections()
+        except Exception as e:
+            Logger.error(f"Error in publishing message: {e}")
+
     def get_events(self, pub_key_hex, kind='text', returns='content'):
         """fetch events of any kind for pub_key_hex"""
-        relay_manager = self.manager
+
+        # Check if the events are already in the cache
+        # if so, return them
+        # events = Cache.get(kind, pub_key_hex)
+        # if events is not None:
+        #     return events
 
         if kind == 'text':
             kinds = [EventKind.TEXT_NOTE]
@@ -118,49 +159,60 @@ class NostrRelayManager:
         else:
             raise NotImplementedError(f'{kind} events not supported')
         
-        subscription_id = secrets.token_hex(4)
-        request = [ClientMessageType.REQUEST, subscription_id]
-        request.extend(filters.to_json_array())
+        with self.temporary_subscription(filters) as subscription_id:
+            Logger.info(f"Temporary subscription created with ID {subscription_id}")
 
+            request = [ClientMessageType.REQUEST, subscription_id]
+            request.extend(filters.to_json_array())
+            message = json.dumps(request)
 
-        relay_manager.add_subscription(subscription_id, filters)
+            try:
+                self.publish_message(message)
+            except WebSocketConnectionClosedException:
+                Logger.warning('connection was closed, reopening..')
+                self.open_connections()
+                time.sleep(1.5)
+                self.publish_message(message)
 
-        message = json.dumps(request)
+            time.sleep(1) # allow the messages to send
+            Logger.info(f'message should have sent {kind}')
+            Logger.info(f'found events {self.message_pool.has_events()}')
 
-        try:
-            relay_manager.publish_message(message)
-        except WebSocketConnectionClosedException:
-            Logger.warning('connection was closed, reopening..')
-            relay_manager.open_connections()
-            time.sleep(1.5)
-            relay_manager.publish_message(message)
-
-        time.sleep(1) # allow the messages to send
-        Logger.info(f'message should have sent {kind}')
-        Logger.info(f'found events {relay_manager.message_pool.has_events()}')
-
-        events = []
-        while relay_manager.message_pool.has_events():
-            event_msg = relay_manager.message_pool.get_event()
-            Logger.info(f'found event {event_msg}')
-            if returns == 'content':
-                if kind == 'meta':
-                    content = json.loads(event_msg.event.content)
+            events = []
+            while self.message_pool.has_events():
+                event_msg = self.message_pool.get_event()
+                Logger.info(f"Processing event: {event_msg}")
+                if returns == 'content':
+                    if kind == 'meta':
+                        content = json.loads(event_msg.event.content)
+                    else:
+                        content = event_msg.event.content
+                elif returns == 'event':
+                    content = event_msg.event
                 else:
-                    content = event_msg.event.content
-            elif returns == 'event':
-                content = event_msg.event
-            else:
-                raise NotImplementedError(f"{returns} returns option not supported, options are 'event' or 'content'")
-            events.append(content)
-        try:
-            relay_manager.close_subscription(subscription_id)
-        except KeyError:
-            Logger.warning(f'subscription id {subscription_id} not found in relay manager:')
-            for relay in relay_manager.relays.values():
-                Logger.info(relay.subscriptions)
+                    raise NotImplementedError(f"{returns} returns option not supported, options are 'event' or 'content'")
+                events.append(content)
 
-        return events
+            Cache.append(kind, pub_key_hex, events)
+            Logger.info(f"Events fetched for {pub_key_hex}: {events}")
+            return events
+
+    def close_all_subscriptions(self):
+        for subscription_id in list(self.relays.keys()):
+            try:
+                self.close_subscription(subscription_id)
+            except KeyError as e:
+                Logger.error(f"Failed to close subscription {subscription_id}: {e}")
+
+    def __del__(self):
+        self.close_all_subscriptions()
+        self.close_connections()
+
+    def wait_and_publish_message(self, message):
+        try:
+            self.publish_message(message)
+        except WebSocketConnectionClosedException as e:
+            Logger.error(f"Failed to publish message: {e}")
 
     def load_profile_data(self, pub_key_hex=None):
         # Access the Manager instance with the relays from the relay_manager attribute
@@ -177,7 +229,6 @@ class NostrRelayManager:
             Logger.warning(f'no profile events found for {pub_key_hex}')
 
     def publish_profile(self, profile_dict):
-        relay_manager = self.manager
 
         priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
         if not priv_key_nsec:
@@ -194,12 +245,12 @@ class NostrRelayManager:
         assert event_profile.verify()
 
         try:
-            relay_manager.publish_message(event_profile.to_message())
+            self.publish_message(event_profile.to_message())
         except WebSocketConnectionClosedException:
             Logger.warning('connection was closed, reopening..')
-            relay_manager.open_connections()
+            self.open_connections()
             time.sleep(1.5)
-            relay_manager.publish_message(event_profile)
+            self.publish_message(event_profile)
 
         print('waiting 1 sec to send')
         time.sleep(1) # allow the messages to send

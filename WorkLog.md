@@ -1,3 +1,6 @@
+* inherit from RelayManager, could not get profile to load
+* yet another nostr-python implementation that fixes some issues https://github.com/holgern/pynostr
+* also works on windows!
 
 # 2023-11-11 09:24:32.573287: clock-in
 

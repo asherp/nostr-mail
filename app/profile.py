@@ -4,15 +4,11 @@ from kivymd.uix.screen import MDScreen
 import json
 import keyring
 from util import get_nostr_pub_key
-# from aionostr.util import to_nip19
 from kivymd.app import MDApp
 import aionostr
 import asyncio
 from sqlitedict import SqliteDict
 from util import DEFAULT_RELAYS, DATABASE_PATH, KEYRING_GROUP
-# from aionostr.relay import Manager
-# from aionostr.event import EventKind
-# from aionostr.event import Event
 from util import get_current_unix_timestamp, get_priv_key_hex
 from util import get_screen, save_profile_to_relays
 from kivy.clock import Clock
@@ -30,15 +26,17 @@ class ProfileScreen(MDScreen):
         super(ProfileScreen, self).on_enter(*args)
         self.populate_profile()
 
-
     def populate_profile(self):
-        Thread(target=self.load_profile_data_in_thread).start()
+        # Schedule the profile data loading in the main loop
+        Clock.schedule_once(lambda dt: self.load_profile_data())
 
-    def load_profile_data_in_thread(self):
+    def load_profile_data(self):
+        # Here, ensure that the relay_manager's load_profile_data method
+        # is non-blocking or handles long operations properly
         relay_manager = MDApp.get_running_app().relay_manager
-        profile_data = relay_manager.load_profile_data()  # This should be a non-blocking call
+        profile_data = relay_manager.load_profile_data()  # Ensure this is non-blocking
         if profile_data:
-            Clock.schedule_once(lambda dt: self.update_profile_ui(profile_data))
+            self.update_profile_ui(profile_data)
 
     @mainthread
     def update_profile_ui(self, profile_data):
@@ -47,7 +45,6 @@ class ProfileScreen(MDScreen):
 
         # Now update the UI elements
         try:
-
             self.ids.display_name.text = profile_data.get('display_name', '')
             self.ids.name.text = profile_data.get('name', '')
             self.ids.picture_url.text = profile_data.get('picture', '')

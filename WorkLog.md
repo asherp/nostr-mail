@@ -1,3 +1,4 @@
+* switching to pynostr
 
 # 2023-11-14 14:07:22.862749: clock-in
 

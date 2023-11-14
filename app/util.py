@@ -1,11 +1,11 @@
-from nostr.key import PrivateKey, PublicKey
+from pynostr.key import PrivateKey, PublicKey
 from kivy.logger import Logger
 import sqlite3
 import keyring
-from nostr.filter import Filter, Filters
-from nostr.event import Event, EventKind
-from nostr.message_type import ClientMessageType
-from nostr.relay_manager import RelayManager
+from pynostr.filters import FiltersList, Filters
+from pynostr.event import Event, EventKind
+from pynostr.message_type import ClientMessageType
+from pynostr.relay_manager import RelayManager
 from websocket import WebSocketConnectionClosedException
 from sqlitedict import SqliteDict
 import asyncio
@@ -104,16 +104,9 @@ class NostrRelayManager(RelayManager):
 
 
     def add_subscription(self, id, filters: Filters):
-        super().add_subscription(id, filters)
+        super().add_subscription_on_all_relays(id, filters)
         Logger.info(f"Subscription added with ID {id}")
 
-
-    def close_subscription(self, id: str):
-        try:
-            super().close_subscription(id)
-            Logger.info(f"Subscription closed with ID {id}")
-        except KeyError:
-            Logger.warning(f"Attempted to close non-existing subscription with ID {id}")
 
     @contextmanager
     def temporary_subscription(self, filters):
@@ -122,7 +115,7 @@ class NostrRelayManager(RelayManager):
         try:
             yield subscription_id
         finally:
-            self.close_subscription(subscription_id)
+            self.close_subscription_on_all_relays(subscription_id)
 
     def publish_message(self, message):
         try:
@@ -130,7 +123,7 @@ class NostrRelayManager(RelayManager):
             Logger.info(f"Message published: {message}")
         except WebSocketConnectionClosedException as e:
             Logger.warning(f"WebSocket connection closed: {e}")
-            self.open_connections()
+            self.run_sync()
         except Exception as e:
             Logger.error(f"Error in publishing message: {e}")
 
@@ -145,17 +138,17 @@ class NostrRelayManager(RelayManager):
 
         if kind == 'text':
             kinds = [EventKind.TEXT_NOTE]
-            filter_ = Filter(authors=[pub_key_hex], kinds=kinds)
-            filters = Filters([filter_])
+            filter_ = Filters(authors=[pub_key_hex], kinds=kinds)
+            filters = FiltersList([filter_])
         elif kind == 'meta':
             kinds = [EventKind.SET_METADATA]
-            filter_ = Filter(authors=[pub_key_hex], kinds=kinds)
-            filters = Filters([filter_])
+            filter_ = Filters(authors=[pub_key_hex], kinds=kinds)
+            filters = FiltersList([filter_])
         elif kind == 'dm':
             kinds = [EventKind.ENCRYPTED_DIRECT_MESSAGE]
-            filter_to_pub_key = Filter(pubkey_refs=[pub_key_hex], kinds=kinds)
-            filter_from_pub_key = Filter(authors=[pub_key_hex], kinds=kinds)
-            filters = Filters([filter_to_pub_key, filter_from_pub_key])
+            filter_to_pub_key = Filters(pubkey_refs=[pub_key_hex], kinds=kinds)
+            filter_from_pub_key = Filters(authors=[pub_key_hex], kinds=kinds)
+            filters = FiltersList([filter_to_pub_key, filter_from_pub_key])
         else:
             raise NotImplementedError(f'{kind} events not supported')
         
@@ -197,16 +190,10 @@ class NostrRelayManager(RelayManager):
             Logger.info(f"Events fetched for {pub_key_hex}: {events}")
             return events
 
-    def close_all_subscriptions(self):
-        for subscription_id in list(self.relays.keys()):
-            try:
-                self.close_subscription(subscription_id)
-            except KeyError as e:
-                Logger.error(f"Failed to close subscription {subscription_id}: {e}")
 
     def __del__(self):
-        self.close_all_subscriptions()
-        self.close_connections()
+        self.close_subscription_on_all_relays()
+        self.close_all_relay_connections()
 
     def wait_and_publish_message(self, message):
         try:
@@ -239,7 +226,7 @@ class NostrRelayManager(RelayManager):
         event_profile = Event(priv_key.public_key.hex(),
                               json.dumps(profile_dict),
                               kind=EventKind.SET_METADATA)
-        priv_key.sign_event(event_profile)
+        event_profile.sign(get_priv_key_hex(priv_key_nsec))
         
         # check signature
         assert event_profile.verify()

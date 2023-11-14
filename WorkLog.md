@@ -1,4 +1,7 @@
-* switching to pynostr
+# 2023-11-14 15:10:50.043499: clock-out
+
+* switching to pynostr 
+* look at dms https://github.com/holgern/pynostr/blob/main/examples/dm_communication.py
 
 # 2023-11-14 14:07:22.862749: clock-in
 

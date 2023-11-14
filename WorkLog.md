@@ -1,3 +1,6 @@
+
+# 2023-11-14 14:07:22.862749: clock-in
+
 # 2023-11-11 12:15:38.600326: clock-out
 
 * inherit from RelayManager, could not get profile to load

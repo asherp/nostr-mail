@@ -1,3 +1,6 @@
+
+# 2023-11-14 18:43:20.794718: clock-in
+
 # 2023-11-14 15:10:50.043499: clock-out
 
 * switching to pynostr 

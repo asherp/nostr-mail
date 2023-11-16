@@ -1,3 +1,5 @@
+# 2023-11-16 11:28:30.864769: clock-out
+
 * test profile loading
 
 # 2023-11-16 11:07:29.689312: clock-in

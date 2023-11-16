@@ -1,3 +1,6 @@
+
+# 2023-11-16 11:07:29.689312: clock-in
+
 # 2023-11-16 10:34:04.952257: clock-out
 
 * refactor to allow for script import

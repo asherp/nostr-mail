@@ -1,5 +1,5 @@
 from kivymd.uix.screen import MDScreen
-from util import Logger
+from ui import Logger
 from kivy.clock import Clock
 from kivymd.app import MDApp
 from util import DEFAULT_RELAYS, Logger, get_screen, KEYRING_GROUP, get_convs

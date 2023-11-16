@@ -1,5 +1,4 @@
 from pynostr.key import PrivateKey, PublicKey
-from kivy.logger import Logger
 import sqlite3
 import keyring
 from pynostr.filters import FiltersList, Filters
@@ -10,36 +9,16 @@ from websocket import WebSocketConnectionClosedException
 from sqlitedict import SqliteDict
 import asyncio
 import datetime
-from kivymd.app import MDApp
 import json
 import re
 import secrets
 import ssl
 import os
 import time
-from kivy.config import Config
 from sqlitedict import SqliteDict
 import asyncio
-from kivy.uix.popup import Popup
-from kivy.uix.label import Label
-from kivy.uix.button import Button
-from kivy.uix.boxlayout import BoxLayout
-from kivy.cache import Cache
 from contextlib import contextmanager
-
-Cache.register('text', limit=100, timeout=60)
-Cache.register('meta', limit=100, timeout=60)
-Cache.register('dm', limit=100, timeout=60)
-
-
-# Set the directory where you want to store the log files
-log_directory = os.path.join(os.path.dirname(__file__), 'logs')
-if not os.path.exists(log_directory):
-    os.makedirs(log_directory)
-
-# Configure the Kivy logger
-Config.set('kivy', 'log_dir', log_directory)
-Config.set('kivy', 'log_name', 'kivy_%y-%m-%d_%_.txt')
+import logging
 
 
 
@@ -52,49 +31,43 @@ DEFAULT_RELAYS = [
     'wss://nostr.mom']
 
 
-class ErrorPopup(Popup):
-    def __init__(self, error_message, **kwargs):
-        super().__init__(**kwargs)
-        self.title = 'An Error Occurred'
-        self.size_hint = (0.5, 0.5)
+# Initialize a standard logger; it can be replaced with a Kivy logger if needed.
+Logger = logging.getLogger(__name__)
 
-        layout = BoxLayout(orientation='vertical')
-        layout.add_widget(Label(text=error_message))
-
-        close_button = Button(text='Close')
-        close_button.bind(on_press=self.dismiss)
-        layout.add_widget(close_button)
-
-        self.content = layout
-        self.bind(on_dismiss=self.on_close)
-
-    def on_close(self, instance):
-        MDApp.get_running_app().stop()
+def setup_kivy_logger():
+    global Logger
+    from ui import Logger as KivyLogger
+    Logger = KivyLogger
 
 
 class NostrRelayManager(RelayManager):
     _instance = None
 
     @classmethod
-    def get_instance(cls):
+    def get_instance(cls, **kwargs):
         if cls._instance is None:
-            cls._instance = cls()
+            cls._instance = cls(**kwargs)
         return cls._instance
 
-    def __init__(self):
+    def __init__(self, logger=None, **kwargs):
         if self._instance is not None:
             raise Exception("This class is a singleton!")
-        super().__init__()  # Initialize parent class
+        if logger is None:
+            import logging
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger()
+        self.logger = logger
+        super().__init__(**kwargs)  # Initialize parent class
         NostrRelayManager._instance = self
         self.init_manager()
 
     def init_manager(self):
         relays = self.load_relays_from_db()
-        Logger.info('connecting relays')
+        self.logger.info('connecting relays')
         for relay_url in relays:
-            Logger.info(f'adding relay: {relay_url}')
+            self.logger.info(f'adding relay: {relay_url}')
             self.add_relay(relay_url)  # Call method from RelayManager
-        Logger.info(f'relays connected: {self.relays}')  # Access attribute from RelayManager
+        self.logger.info(f'relays connected: {self.relays}')  # Access attribute from RelayManager
 
 
     def load_relays_from_db(self):
@@ -105,7 +78,7 @@ class NostrRelayManager(RelayManager):
 
     def add_subscription(self, id, filters: Filters):
         super().add_subscription_on_all_relays(id, filters)
-        Logger.info(f"Subscription added with ID {id}")
+        self.logger.info(f"Subscription added with ID {id}")
 
 
     @contextmanager
@@ -120,12 +93,12 @@ class NostrRelayManager(RelayManager):
     def publish_message(self, message):
         try:
             super().publish_message(message)
-            Logger.info(f"Message published: {message}")
+            self.logger.info(f"Message published: {message}")
         except WebSocketConnectionClosedException as e:
-            Logger.warning(f"WebSocket connection closed: {e}")
+            self.logger.warning(f"WebSocket connection closed: {e}")
             self.run_sync()
         except Exception as e:
-            Logger.error(f"Error in publishing message: {e}")
+            self.logger.error(f"Error in publishing message: {e}")
 
     def get_events(self, pub_key_hex, kind='text', returns='content'):
         """fetch events of any kind for pub_key_hex"""
@@ -153,7 +126,7 @@ class NostrRelayManager(RelayManager):
             raise NotImplementedError(f'{kind} events not supported')
         
         with self.temporary_subscription(filters) as subscription_id:
-            Logger.info(f"Temporary subscription created with ID {subscription_id}")
+            self.logger.info(f"Temporary subscription created with ID {subscription_id}")
 
             request = [ClientMessageType.REQUEST, subscription_id]
             request.extend(filters.to_json_array())
@@ -162,19 +135,19 @@ class NostrRelayManager(RelayManager):
             try:
                 self.publish_message(message)
             except WebSocketConnectionClosedException:
-                Logger.warning('connection was closed, reopening..')
+                self.logger.warning('connection was closed, reopening..')
                 self.open_connections()
                 time.sleep(1.5)
                 self.publish_message(message)
 
             time.sleep(1) # allow the messages to send
-            Logger.info(f'message should have sent {kind}')
-            Logger.info(f'found events {self.message_pool.has_events()}')
+            self.logger.info(f'message should have sent {kind}')
+            self.logger.info(f'found events {self.message_pool.has_events()}')
 
             events = []
             while self.message_pool.has_events():
                 event_msg = self.message_pool.get_event()
-                Logger.info(f"Processing event: {event_msg}")
+                self.logger.info(f"Processing event: {event_msg}")
                 if returns == 'content':
                     if kind == 'meta':
                         content = json.loads(event_msg.event.content)
@@ -186,8 +159,8 @@ class NostrRelayManager(RelayManager):
                     raise NotImplementedError(f"{returns} returns option not supported, options are 'event' or 'content'")
                 events.append(content)
 
-            Cache.append(kind, pub_key_hex, events)
-            Logger.info(f"Events fetched for {pub_key_hex}: {events}")
+            # Cache.append(kind, pub_key_hex, events)
+            self.logger.info(f"Events fetched for {pub_key_hex}: {events}")
             return events
 
 
@@ -199,7 +172,7 @@ class NostrRelayManager(RelayManager):
         try:
             self.publish_message(message)
         except WebSocketConnectionClosedException as e:
-            Logger.error(f"Failed to publish message: {e}")
+            self.logger.error(f"Failed to publish message: {e}")
 
     def load_profile_data(self, pub_key_hex=None):
         # Access the Manager instance with the relays from the relay_manager attribute
@@ -208,18 +181,18 @@ class NostrRelayManager(RelayManager):
 
         profile_events = self.get_events(pub_key_hex, 'meta')
 
-        Logger.info(f'profile events: {profile_events}')
+        self.logger.info(f'profile events: {profile_events}')
         if len(profile_events) > 0:
             profile = profile_events[0]
             return profile
         else:
-            Logger.warning(f'no profile events found for {pub_key_hex}')
+            self.logger.warning(f'no profile events found for {pub_key_hex}')
 
     def publish_profile(self, profile_dict):
 
         priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
         if not priv_key_nsec:
-            Logger.error("Private key not found in keyring.")
+            self.logger.error("Private key not found in keyring.")
             raise IOError("Expected private key in keyring")
         priv_key = PrivateKey.from_nsec(priv_key_nsec)
 
@@ -234,7 +207,7 @@ class NostrRelayManager(RelayManager):
         try:
             self.publish_message(event_profile.to_message())
         except WebSocketConnectionClosedException:
-            Logger.warning('connection was closed, reopening..')
+            self.logger.warning('connection was closed, reopening..')
             self.open_connections()
             time.sleep(1.5)
             self.publish_message(event_profile)
@@ -394,11 +367,6 @@ def get_setting(section, key, settings_file='address_book.yaml'):
 def get_current_unix_timestamp():
     return int(datetime.datetime.now().timestamp())
 
-def get_screen(screen_name):
-    """loads screen from kivy app context"""
-    app = MDApp.get_running_app()
-    screen = app.root.ids.screen_manager.get_screen(screen_name)
-    return screen
 
 def get_encryption_iv(msg):
     """extract the iv from an ecnrypted blob"""

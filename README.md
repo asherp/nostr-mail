@@ -109,4 +109,12 @@ Configure your email account to allow sending and receiving emails. Here are ins
     1. In the "IMAP access" section, select Enable IMAP.
     1. Click Save Changes.
 
+### NIP 23 comparison (LONG_FORM_CONTENT)
+
+NIP 23 allows for long form content in the form of HTML-free markdown files.
+https://github.com/nostr-protocol/nips/blob/master/23.md
+
+However, the downside is that this raises the cost of running a relay, thus increasing the pressure to erase content over time. Email is a default archival tool, so newsletters and blog posts are naturally archived.
+
+
 

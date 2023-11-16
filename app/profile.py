@@ -10,12 +10,14 @@ import asyncio
 from sqlitedict import SqliteDict
 from util import DEFAULT_RELAYS, DATABASE_PATH, KEYRING_GROUP
 from util import get_current_unix_timestamp, get_priv_key_hex
-from util import get_screen, save_profile_to_relays
+from util import save_profile_to_relays
 from kivy.clock import Clock
 from kivy.clock import mainthread
 from kivy.lang import Builder
 from kivy.app import App
 from threading import Thread
+from util import NostrRelayManager
+from ui import get_screen, Logger
 
 Builder.load_file('profile.kv')
 
@@ -92,38 +94,15 @@ class ProfileScreen(MDScreen):
 
 
 if __name__ == "__main__":
-    # Initialize the database connection to fetch the relay information
-    with SqliteDict(DATABASE_PATH) as db:
-        stored_relays = db.get('relays', DEFAULT_RELAYS)
-
     # Initialize the Manager with the stored relays
-    relay_manager = Manager(relays=stored_relays)
+    relay_manager = NostrRelayManager(timeout=2)
 
     # Run the async function in the asyncio event loop
-    async def main():
-        # Start the manager (attempt to connect all relays)
-        await relay_manager.connect()
+    profile_data = relay_manager.load_profile_data()
 
-        # Check if connected to any relays
-        if not any(relay.connected for relay in relay_manager.relays):
-            print("Failed to connect to any relays.")
-            return
-
-        try:
-            # Once connected, run the load_profile_data function with the relay_manager
-            profile_data = await load_profile_data(relay_manager)
-
-            # Once you have profile_data, print or manipulate it as needed
-            if profile_data:
-                print(json.dumps(profile_data, indent=4))
-            else:
-                print("No profile data could be loaded.")
-        finally:
-            # Disconnect all relays
-            await relay_manager.close()
-
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Program exited by user.")
+    # Once you have profile_data, print or manipulate it as needed
+    if profile_data:
+        print(json.dumps(profile_data, indent=4))
+    else:
+        print("No profile data could be loaded.")
 

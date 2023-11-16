@@ -11,7 +11,7 @@ from kivymd.uix.label import MDLabel
 
 import keyring
 from sqlitedict import SqliteDict
-from util import Logger
+from ui import Logger
 from util import get_nostr_pub_key, DEFAULT_RELAYS, DATABASE_PATH
 from kivy.lang import Builder
 from kivy.properties import ObjectProperty

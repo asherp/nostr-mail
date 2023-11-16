@@ -1,3 +1,4 @@
+* refactor to allow for script import
 
 # 2023-11-16 09:20:31.895982: clock-in
 

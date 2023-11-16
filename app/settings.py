@@ -1,10 +1,10 @@
 from kivy.properties import BooleanProperty, StringProperty
-from kivy.logger import Logger
 from kivymd.uix.screen import MDScreen
 
 import keyring
 from util import get_nostr_pub_key, KEYRING_GROUP
 from kivy.lang import Builder
+from ui import Logger
 
 Builder.load_file('settings.kv')
 

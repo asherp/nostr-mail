@@ -1,3 +1,4 @@
+* test profile loading
 
 # 2023-11-16 11:07:29.689312: clock-in
 

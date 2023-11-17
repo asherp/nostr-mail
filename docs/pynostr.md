@@ -49,11 +49,7 @@ nest_asyncio.apply()
 ```
 
 ```python
-import sys
-```
-
-```python
-sys.path.append('../app')
+cd ../app
 ```
 
 ```python
@@ -61,113 +57,24 @@ from util import NostrRelayManager
 ```
 
 ```python
-relay_manager = NostrRelayManager(timeout=2)
+relay_manager = NostrRelayManager(error_threshold=3, timeout=2)
 ```
 
 ```python
-from pynostr.relay_list import RelayList
+for url in relay_manager.relays:
+    print(url)
 ```
 
-```python
-relay_manager.relays
-```
+## Profiles
 
 ```python
-relay_list = RelayList()
-```
+profile_data = relay_manager.fetch_profile_data(public_key_bob)
 
-```python
-relay_list.append_url_list?
-```
-
-```python
-from pynostr.message_pool import EventMessageStore
-from pynostr.utils import get_public_key, get_relay_list, get_timestamp
-import datetime
-import uuid
-from pynostr.filters import FiltersList, Filters
-from pynostr.event import Event, EventKind
-
-
-# get_relay_list can be used to fetch over 500 relays
-
-identity = public_key_bob
-
-events = EventMessageStore()
-events_by_relay = {}
-unix_timestamp = get_timestamp(days=7)
-now = datetime.datetime.utcnow()
-
-filters = FiltersList(
-    [Filters(authors=[identity.hex()], kinds=[EventKind.SET_METADATA], limit=1)]
-)
-subscription_id = uuid.uuid1().hex
-relay_manager.add_subscription_on_all_relays(subscription_id, filters)
-relay_manager.run_sync()
-
-event_messages = relay_manager.message_pool.get_all_events()
-events.add_event(event_messages)
-```
-
-```python
-events
-```
-
-```python
-for url in relay_list.get_url_list():
-
-    event_list = events.get_events_by_url(url)
-    if len(event_list) == 0:
-        continue
-    oldest_timestamp = now
-    events_by_relay[url] = {"timestamp": None, "metadata": None}
-    m = Metadata.from_event(event_list[0].event)
-    events_by_relay[url]["timestamp"] = event_list[0].event.date_time()
-    events_by_relay[url]["metadata"] = m
-```
-
-```python
-profile_data = relay_manager.load_profile_data()
 ```
 
 ```python
 profile_data
 ```
-
-```python
-from pynostr.filters import FiltersList, Filters
-from pynostr.event import EventKind
-```
-
-```python
-dir(EventKind)
-```
-
-```python
-from pynostr.relay_manager import RelayManager
-from pynostr.filters import FiltersList, Filters
-from pynostr.event import EventKind
-import time
-import uuid
-
-relay_manager = RelayManager(timeout=2)
-relay_manager.add_relay("wss://nostr-pub.wellorder.net")
-relay_manager.add_relay("wss://relay.damus.io")
-filters = FiltersList([Filters(kinds=[EventKind.TEXT_NOTE], limit=100)])
-subscription_id = uuid.uuid1().hex
-relay_manager.add_subscription_on_all_relays(subscription_id, filters)
-relay_manager.run_sync()
-while relay_manager.message_pool.has_notices():
-    notice_msg = relay_manager.message_pool.get_notice()
-    print(notice_msg.content)
-while relay_manager.message_pool.has_events():
-    event_msg = relay_manager.message_pool.get_event()
-    print(event_msg.event.content)
-relay_manager.close_all_relay_connections()
-```
-
-## Profiles
-
 
 ## Publishing
 

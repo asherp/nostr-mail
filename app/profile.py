@@ -36,7 +36,7 @@ class ProfileScreen(MDScreen):
         # Here, ensure that the relay_manager's load_profile_data method
         # is non-blocking or handles long operations properly
         relay_manager = MDApp.get_running_app().relay_manager
-        profile_data = relay_manager.load_profile_data()  # Ensure this is non-blocking
+        profile_data = relay_manager.fetch_profile_data()  # Ensure this is non-blocking
         if profile_data:
             self.update_profile_ui(profile_data)
 

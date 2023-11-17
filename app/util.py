@@ -1,24 +1,31 @@
-from pynostr.key import PrivateKey, PublicKey
+import asyncio
+import datetime
+import json
+import logging
+import os
+import re
+import secrets
 import sqlite3
+import ssl
+import time
+import uuid
+from contextlib import contextmanager
+from websocket import WebSocketConnectionClosedException
+
 import keyring
+from pynostr.key import PrivateKey, PublicKey
 from pynostr.filters import FiltersList, Filters
 from pynostr.event import Event, EventKind
 from pynostr.message_type import ClientMessageType
 from pynostr.relay_manager import RelayManager
-from websocket import WebSocketConnectionClosedException
+from pynostr.relay_list import RelayList
+from pynostr.message_pool import EventMessageStore
+from pynostr.metadata import Metadata
+from pynostr.utils import get_public_key, get_timestamp
 from sqlitedict import SqliteDict
-import asyncio
-import datetime
-import json
-import re
-import secrets
-import ssl
-import os
-import time
-from sqlitedict import SqliteDict
-import asyncio
-from contextlib import contextmanager
-import logging
+from rich.table import Table
+
+
 
 
 
@@ -61,6 +68,11 @@ class NostrRelayManager(RelayManager):
         NostrRelayManager._instance = self
         self.init_manager()
 
+    def get_relay_list(self):
+        relay_list = RelayList()
+        relay_list.append_url_list(list(self.relays))
+        return relay_list
+
     def init_manager(self):
         relays = self.load_relays_from_db()
         self.logger.info('connecting relays')
@@ -99,6 +111,68 @@ class NostrRelayManager(RelayManager):
             self.run_sync()
         except Exception as e:
             self.logger.error(f"Error in publishing message: {e}")
+
+    def fetch_profile_data(self, pub_key_hex=None):
+        """fetches profile data following example from pynostr.examples.show_metadata"""
+
+        # Access the Manager instance with the relays from the relay_manager attribute
+        if pub_key_hex is None:
+            pub_key_hex = load_user_pub_key()
+
+        relay_list = self.get_relay_list()
+
+        print(f"Checking {len(relay_list.data)} relays...")
+
+        relay_list.update_relay_information(timeout=0.5)
+        relay_list.drop_empty_metadata()
+
+        self.add_relay_list(relay_list)
+
+        events = EventMessageStore()
+        events_by_relay = {}
+        unix_timestamp = get_timestamp(days=7)
+        now = datetime.datetime.utcnow()
+
+        filters = FiltersList(
+            [Filters(authors=[pub_key_hex], kinds=[EventKind.SET_METADATA], limit=1)]
+        )
+        subscription_id = uuid.uuid1().hex
+        self.add_subscription_on_all_relays(subscription_id, filters)
+        self.run_sync()
+
+        event_messages = self.message_pool.get_all_events()
+        events.add_event(event_messages)
+
+        for url in relay_list.get_url_list():
+            event_list = events.get_events_by_url(url)
+            if len(event_list) == 0:
+                continue
+            events_by_relay[url] = {
+                "timestamp": event_list[0].event.date_time(),
+                "metadata": Metadata.from_event(event_list[0].event).metadata_to_dict()
+            }
+
+        relay_list_sorted = sorted(events_by_relay.items(), key=lambda item: item[1]["timestamp"])
+
+        result = {
+            'latest_metadata_url': relay_list_sorted[-1][0],
+            'latest_metadata': relay_list_sorted[-1][1]["metadata"]
+        }
+
+        if 'identities' in relay_list_sorted[-1][1]["metadata"]:
+            identities_info = []
+            for identity in relay_list_sorted[-1][1]["metadata"]['identities']:
+                identities_info.append({
+                    'claim_type': identity.claim_type,
+                    'identity': identity.identity,
+                    'proof': identity.proof
+                })
+            result['identities_info'] = identities_info
+
+        profile_data = result['latest_metadata']
+        return profile_data
+
+
 
     def get_events(self, pub_key_hex, kind='text', returns='content'):
         """fetch events of any kind for pub_key_hex"""

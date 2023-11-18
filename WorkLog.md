@@ -1,3 +1,4 @@
+* fixed profile save, load, fetching dms
 
 # 2023-11-18 15:27:28.999170: clock-in
 

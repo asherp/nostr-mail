@@ -24,6 +24,7 @@ from pynostr.metadata import Metadata
 from pynostr.utils import get_public_key, get_timestamp
 from sqlitedict import SqliteDict
 from rich.table import Table
+from json import JSONDecodeError
 
 
 
@@ -147,10 +148,14 @@ class NostrRelayManager(RelayManager):
             event_list = events.get_events_by_url(url)
             if len(event_list) == 0:
                 continue
-            events_by_relay[url] = {
-                "timestamp": event_list[0].event.date_time(),
-                "metadata": Metadata.from_event(event_list[0].event).metadata_to_dict()
-            }
+            try:
+                events_by_relay[url] = {
+                    "timestamp": event_list[0].event.date_time(),
+                    "metadata": Metadata.from_event(event_list[0].event).metadata_to_dict()
+                }
+            except JSONDecodeError:
+                self.logger.error(f'something wrong with event {event_list[0].event}')
+                continue
 
         relay_list_sorted = sorted(events_by_relay.items(), key=lambda item: item[1]["timestamp"])
 
@@ -270,26 +275,36 @@ class NostrRelayManager(RelayManager):
             raise IOError("Expected private key in keyring")
         priv_key = PrivateKey.from_nsec(priv_key_nsec)
 
-        event_profile = Event(priv_key.public_key.hex(),
-                              json.dumps(profile_dict),
+        event_profile = Event(pubkey=priv_key.public_key.hex(),
+                              content=json.dumps(profile_dict),
                               kind=EventKind.SET_METADATA)
         event_profile.sign(get_priv_key_hex(priv_key_nsec))
-        
+
         # check signature
         assert event_profile.verify()
 
         try:
-            self.publish_message(event_profile.to_message())
+            for relay_url, relay in self.relays.items():
+                if relay.policy.should_write:
+                    print(f'will publish to {relay_url}')
+                if not relay.is_connected:
+                    print(f'connecting to {relay_url}')
+                    relay.connect()
+                    time.sleep(1)
+                    print(f'relay connected: {relay.is_connected}')
+            self.publish_event(event_profile)
         except WebSocketConnectionClosedException:
             self.logger.warning('connection was closed, reopening..')
             self.open_connections()
             time.sleep(1.5)
-            self.publish_message(event_profile)
+            self.publish_event(event_profile)
+
+        self.run_sync()
 
         print('waiting 1 sec to send')
         time.sleep(1) # allow the messages to send
 
-        return event_profile.signature
+        return event_profile.sig
 
     def get_dms(self):
         """Get all dms for this pub key

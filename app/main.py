@@ -9,7 +9,7 @@ from util import RelayManager
 from relays import RelayScreen
 from settings import SettingsScreen
 from profile import ProfileScreen
-# from conversations import ConversationsScreen
+from conversations import ConversationsScreen
 from kivy.clock import Clock
 from util import DATABASE_PATH, DEFAULT_RELAYS
 from util import KEYRING_GROUP, NostrRelayManager, SqliteDict

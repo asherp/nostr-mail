@@ -2,7 +2,8 @@ from kivymd.uix.screen import MDScreen
 from ui import Logger
 from kivy.clock import Clock
 from kivymd.app import MDApp
-from util import DEFAULT_RELAYS, Logger, get_screen, KEYRING_GROUP, get_convs
+from util import DEFAULT_RELAYS, Logger, KEYRING_GROUP, get_convs
+from ui import get_screen
 from kivy.lang import Builder
 from kivymd.uix.list import OneLineListItem
 from nostr.key import PrivateKey, PublicKey
@@ -22,7 +23,7 @@ class ConversationsScreen(MDScreen):
 
     def on_enter(self):
         Logger.info("ConversationsScreen: Entered the conversations screen.")
-        # Asynchronously load DMs when the screen is entered
+        # load DMs when the screen is entered
         self.load_direct_messages()
 
     def load_direct_messages(self):

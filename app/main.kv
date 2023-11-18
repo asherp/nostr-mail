@@ -51,9 +51,9 @@ MDScreen:
             #         orientation: 'vertical'
             #         ContactsScreen:
 
-            # ConversationsScreen:
-            #     name: 'conversations_screen'
-            #     id: conversations_screen                
+            ConversationsScreen:
+                name: 'conversations_screen'
+                id: conversations_screen                
 
             # ComposeScreen:
             #     name: 'compose_screen'
@@ -90,14 +90,14 @@ MDScreen:
                 #         app.root.ids.screen_manager.current = 'contacts_screen'
                 #         nav_drawer.set_state("close")
 
-                # DrawerClickableItem:
-                #     icon: "gmail"
-                #     right_text: "+?"
-                #     text_right_color: "#4a4939"
-                #     text: "Conversations"
-                #     on_release:
-                #         app.root.ids.screen_manager.current = 'conversations_screen'  # switch to the inbox screen
-                #         nav_drawer.set_state("close")
+                DrawerClickableItem:
+                    icon: "email"
+                    right_text: "+?"
+                    text_right_color: "#4a4939"
+                    text: "Conversations"
+                    on_release:
+                        app.root.ids.screen_manager.current = 'conversations_screen'  # switch to the inbox screen
+                        nav_drawer.set_state("close")
 
                 # DrawerClickableItem:
                 #     icon: "send"

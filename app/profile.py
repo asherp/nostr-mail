@@ -42,10 +42,7 @@ class ProfileScreen(MDScreen):
 
     @mainthread
     def update_profile_ui(self, profile_data):
-        # Add logging to check the data is correct
-        Logger.info('ProfileScreen: Updating profile UI with data: {}'.format(profile_data))
-
-        # Now update the UI elements
+        """update the ui elements"""
         try:
             self.ids.display_name.text = profile_data.get('display_name', '')
             self.ids.name.text = profile_data.get('name', '')
@@ -87,6 +84,7 @@ class ProfileScreen(MDScreen):
     def on_success(self):
         self.ids.status_message.text = "Profile saved successfully!"
         Logger.info('ProfileScreen: Profile saved successfully.')
+        self.populate_profile()
 
     def on_failure(self):
         self.ids.status_message.text = "Failed to save profile."

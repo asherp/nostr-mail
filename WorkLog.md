@@ -1,3 +1,6 @@
+
+# 2023-11-18 15:27:28.999170: clock-in
+
 # 2023-11-17 17:42:47.921825: clock-out
 
 * profile data loading with pynostr

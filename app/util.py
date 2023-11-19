@@ -25,6 +25,7 @@ from pynostr.utils import get_public_key, get_timestamp
 from sqlitedict import SqliteDict
 from rich.table import Table
 from json import JSONDecodeError
+from collections import defaultdict
 
 
 
@@ -113,7 +114,7 @@ class NostrRelayManager(RelayManager):
         except Exception as e:
             self.logger.error(f"Error in publishing message: {e}")
 
-    def fetch_profile_data(self, pub_key_hex=None):
+    def fetch_profile_data(self, pub_key_hex=None, kind='profile'):
         """fetches profile data following example from pynostr.examples.show_metadata"""
 
         # Access the Manager instance with the relays from the relay_manager attribute
@@ -134,9 +135,16 @@ class NostrRelayManager(RelayManager):
         unix_timestamp = get_timestamp(days=7)
         now = datetime.datetime.utcnow()
 
-        filters = FiltersList(
-            [Filters(authors=[pub_key_hex], kinds=[EventKind.SET_METADATA], limit=1)]
-        )
+        if kind == 'profile':
+            filters = FiltersList(
+                [Filters(authors=[pub_key_hex], kinds=[EventKind.SET_METADATA], limit=1)]
+            )
+        elif kind == 'dm':
+            kinds=[EventKind.ENCRYPTED_DIRECT_MESSAGE]
+            filter_to_pub_key = Filters(pubkey_refs=[pub_key_hex], kinds=kinds)
+            filter_from_pub_key = Filters(authors=[pub_key_hex], kinds=kinds)
+            filters = FiltersList([filter_to_pub_key, filter_from_pub_key])
+
         subscription_id = uuid.uuid1().hex
         self.add_subscription_on_all_relays(subscription_id, filters)
         self.run_sync()
@@ -144,11 +152,16 @@ class NostrRelayManager(RelayManager):
         event_messages = self.message_pool.get_all_events()
         events.add_event(event_messages)
 
+        if kind == 'dm':
+            # decryption handled downstream
+            return events
+
         for url in relay_list.get_url_list():
             event_list = events.get_events_by_url(url)
             if len(event_list) == 0:
                 continue
             try:
+                print(f'{url} events: {len(event_list)}')
                 events_by_relay[url] = {
                     "timestamp": event_list[0].event.date_time(),
                     "metadata": Metadata.from_event(event_list[0].event).metadata_to_dict()
@@ -175,8 +188,8 @@ class NostrRelayManager(RelayManager):
             result['identities_info'] = identities_info
 
         profile_data = result['latest_metadata']
-        return profile_data
 
+        return profile_data
 
 
     def get_events(self, pub_key_hex, kind='text', returns='content'):
@@ -313,28 +326,8 @@ class NostrRelayManager(RelayManager):
         """
         priv_key = load_user_priv_key()
         pub_key_hex = priv_key.public_key.hex()
-
-        dms = []
-        dm_events = self.get_events(pub_key_hex, kind='dm', returns='event')
-        for e in dm_events:
-            # check signature first
-            if not e.verify():
-                continue
-            else:
-                dm = dict(
-                    valid=True,
-                    time=e.created_at,
-                    event_id=e.id,
-                    author=e.public_key,
-                    content=e.content,
-                    **dict(e.tags))
-                dm['decrypted'] = 'could not decrypt'
-                if dm['author'] == pub_key_hex: # sent from the user
-                    dm['decrypted'] = priv_key.decrypt_message(dm['content'], dm['p'])
-                else: # sent to the user
-                    dm['decrypted'] = priv_key.decrypt_message(dm['content'], dm['author'])
-            dms.append(dm)
-        return dms
+        events = self.fetch_profile_data(pub_key_hex, kind='dm')
+        return decrypt_dm_events(events, priv_key)
 
 def load_user_priv_key():
     priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
@@ -473,5 +466,34 @@ def get_convs(dms):
     for _, e in dms.iterrows():
         convs.append(tuple(sorted((e.author, e.p))))
     return convs
+
+
+def decrypt_dm_events(events, priv_key):
+    dms = defaultdict(dict)
+    for _ in events:
+        from_pubkey = _.event.pubkey
+        to_pubkey = dict(_.event.tags)['p']
+        conv_key = tuple(sorted([from_pubkey, to_pubkey]))
+        if priv_key.public_key.hex() == from_pubkey:
+            decrypted = priv_key.decrypt_message(_.event.content, to_pubkey)
+        else:
+            decrypted = priv_key.decrypt_message(_.event.content, from_pubkey)
+        iv = get_encryption_iv(_.event.content)
+        dms[conv_key][iv] = dict(decrypted=decrypted, time=_.event.date_time(), from_pubkey=from_pubkey)
+    return dms
+
+
+def save_profile_to_db(pub_key_hex=None, profile_data=None):
+    if pub_key_hex is None:
+        pub_key_hex = load_user_pub_key()
+
+    with SqliteDict(DATABASE_PATH, tablename='profiles', autocommit=True) as db:
+        db[pub_key_hex] = profile_data
+
+def fetch_profile_from_db(pub_key_hex=None):
+    if pub_key_hex is None:
+        pub_key_hex = load_user_pub_key()
+    with SqliteDict(DATABASE_PATH, tablename='profiles', autocommit=True) as db:
+        return db.get(pub_key_hex)
 
 

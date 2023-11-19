@@ -3,7 +3,7 @@ from kivymd.uix.screen import MDScreen
 
 import json
 import keyring
-from util import get_nostr_pub_key
+from util import get_nostr_pub_key, load_user_pub_key, fetch_profile_from_db, save_profile_to_db
 from kivymd.app import MDApp
 import aionostr
 import asyncio
@@ -36,7 +36,14 @@ class ProfileScreen(MDScreen):
         # Here, ensure that the relay_manager's load_profile_data method
         # is non-blocking or handles long operations properly
         relay_manager = MDApp.get_running_app().relay_manager
-        profile_data = relay_manager.fetch_profile_data()  # Ensure this is non-blocking
+
+        profile_data = fetch_profile_from_db()
+
+        if profile_data is None:
+            profile_data = relay_manager.fetch_profile_data()
+            if profile_data is not None:
+                save_profile_to_db(profile_data=profile_data)
+
         if profile_data:
             self.update_profile_ui(profile_data)
 
@@ -77,12 +84,19 @@ class ProfileScreen(MDScreen):
             self.on_failure()
 
     def refresh_profile(self):
-        # Logic to refresh the profile data
-        self.populate_profile()
+        # Refresh the profile data from the network
+        relay_manager = MDApp.get_running_app().relay_manager
+
+        profile_data = relay_manager.fetch_profile_data()
+        if profile_data is not None:
+            save_profile_to_db(profile_data=profile_data)
+            self.update_profile_ui(profile_data)
 
 
     def on_success(self):
-        self.ids.status_message.text = "Profile saved successfully!"
+        self.ids.status_message.text = "Profile saved successfully! Saving to db.."
+        save_profile_to_db(profile_data=self.get_profile_content())
+
         Logger.info('ProfileScreen: Profile saved successfully.')
         self.populate_profile()
 

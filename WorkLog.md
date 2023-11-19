@@ -1,3 +1,4 @@
+* profile save, load to db, refresh from network, conversations
 
 # 2023-11-19 11:03:48.194381: clock-in
 

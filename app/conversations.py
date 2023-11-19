@@ -48,21 +48,18 @@ class ConversationsScreen(MDScreen):
         self.ids.dm_list.clear_widgets()
         
         # Log the count of DMs to be added
-        Logger.info(f'ConversationsScreen: Updating UI with {len(dms)} DMs.')
-
-        def conversation_id(dm):
-            """construct a unique pairing of pub keys"""
-            return ''.join(sorted([dm['author'], dm['p']]))
-
-        conversations = defaultdict(list)
+        Logger.info(f'ConversationsScreen: Updating UI with {len(dms)} convos.')
+        pub_key_hex = load_user_pub_key()
 
         # Loop through the decrypted DMs and add them to the list
-        for dm in dms:
-            conversations[conversation_id(dm)].append(dm)
+        for conv_id, msgs in dms.items():
+            msg_list = list(msgs.items()) # iv: {**msg} -> (iv, {**msg})
 
-        for convo, msgs in conversations.items():
-            for msg in sorted(msgs, key=lambda m: m['time']):
-                list_item = LRListItem(msg['decrypted'])
+            for iv, msg in sorted(msg_list, key=lambda m: m[1]['time']):
+                if msg['from_pubkey'] == pub_key_hex:
+                    list_item = LRListItem(msg['decrypted']+iv, item_type='right')
+                else:
+                    list_item = LRListItem(msg['decrypted']+iv, item_type='left')
                 self.ids.dm_list.add_widget(list_item)
 
         Logger.info('ConversationsScreen: UI updated with decrypted DMs.')

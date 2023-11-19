@@ -10,6 +10,7 @@
             md_bg_color: "#e7e4c0"
             specific_text_color: "#4a4939"
             left_action_items: [["menu", lambda x: app.root.ids.nav_drawer.set_state("open")]]
+            right_action_items: [["refresh", lambda x: root.refresh_profile()]]
 
         ScrollView:
             MDList:
@@ -57,12 +58,12 @@
                     IconLeftWidget:
                         icon: 'content-save'
 
-                # Add the refresh button here
-                OneLineIconListItem:
-                    text: "Refresh Profile"
-                    on_release: root.refresh_profile()
-                    IconLeftWidget:
-                        icon: 'refresh'
+                # # Remove the refresh button here
+                # OneLineIconListItem:
+                #     text: "Refresh Profile"
+                #     on_release: root.refresh_profile()
+                #     IconLeftWidget:
+                #         icon: 'refresh'
 
                 # Status message label
                 MDLabel:

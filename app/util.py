@@ -154,7 +154,8 @@ class NostrRelayManager(RelayManager):
 
         if kind == 'dm':
             # decryption handled downstream
-            return events
+            #extract event from EventMessageStore
+            return [_.event for _ in events]
 
         for url in relay_list.get_url_list():
             event_list = events.get_events_by_url(url)
@@ -319,15 +320,25 @@ class NostrRelayManager(RelayManager):
 
         return event_profile.sig
 
-    def get_dms(self):
+    def get_dms(self, refresh=True):
         """Get all dms for this pub key
         Returns list of dict objects storing metadata for each dm
         Note: if a dm signature does not pass, the event is markded with valid=False
         """
         priv_key = load_user_priv_key()
         pub_key_hex = priv_key.public_key.hex()
-        events = self.fetch_profile_data(pub_key_hex, kind='dm')
-        return decrypt_dm_events(events, priv_key)
+        events = fetch_event_from_db('dm')
+
+        if refresh:
+            events_ = self.fetch_profile_data(pub_key_hex, kind='dm')
+            for event in events_:
+                save_event_to_db('dm', **event.to_dict())
+                events.add_event(event)
+
+        # this step removes any duplicate events
+        decrypted_events = decrypt_dm_events(events, priv_key)
+
+        return decrypted_events
 
 def load_user_priv_key():
     priv_key_nsec = keyring.get_password(KEYRING_GROUP, 'priv_key')
@@ -470,17 +481,40 @@ def get_convs(dms):
 
 def decrypt_dm_events(events, priv_key):
     dms = defaultdict(dict)
-    for _ in events:
-        from_pubkey = _.event.pubkey
-        to_pubkey = dict(_.event.tags)['p']
+    for event in events:
+        from_pubkey = event.pubkey
+        to_pubkey = dict(event.tags)['p']
         conv_key = tuple(sorted([from_pubkey, to_pubkey]))
         if priv_key.public_key.hex() == from_pubkey:
-            decrypted = priv_key.decrypt_message(_.event.content, to_pubkey)
+            decrypted = priv_key.decrypt_message(event.content, to_pubkey)
         else:
-            decrypted = priv_key.decrypt_message(_.event.content, from_pubkey)
-        iv = get_encryption_iv(_.event.content)
-        dms[conv_key][iv] = dict(decrypted=decrypted, time=_.event.date_time(), from_pubkey=from_pubkey)
+            decrypted = priv_key.decrypt_message(event.content, from_pubkey)
+        iv = get_encryption_iv(event.content)
+        dms[conv_key][iv] = dict(decrypted=decrypted, time=event.date_time(), from_pubkey=from_pubkey)
     return dms
+
+def save_event_to_db(table_name, id=None, **event):
+    """inserts event into database with id matching nostr id"""
+    with SqliteDict(DATABASE_PATH, tablename=table_name, autocommit=True) as db:
+        db[id] = event
+
+def fetch_event_from_db(table_name, id=None):
+    """fetch rows from db
+
+    if id is None:
+        return table dict of {id: **event}
+    else:
+        return table_name[id]
+    """
+
+    with SqliteDict(DATABASE_PATH, tablename=table_name, autocommit=True) as db:
+        if id is None:
+            events = EventMessageStore()
+            for event_id, event in dict(db).items():
+                events.add_event(event=Event.from_dict(dict(id=event_id, **event)))
+            return events
+        else:
+            return Event.from_dict(dict(id=id, **db[id]))
 
 
 def save_profile_to_db(pub_key_hex=None, profile_data=None):

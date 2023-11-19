@@ -5,6 +5,9 @@ import keyring
 from util import get_nostr_pub_key, KEYRING_GROUP
 from kivy.lang import Builder
 from ui import Logger
+from redmail import EmailSender
+from kivymd.uix.snackbar import Snackbar
+
 
 Builder.load_file('settings.kv')
 
@@ -123,3 +126,50 @@ class SettingsScreen(MDScreen):
         else:
             Logger.info(f'{credential_type} unchanged.')
 
+
+    def test_email_connection(self):
+        email_address = self.ids.email_address.text
+        email_password = self.ids.email_password.text
+        smtp_host = self.ids.smtp_host.text
+        smtp_port_text = self.ids.smtp_port.text
+
+        # Validate smtp_port
+        try:
+            smtp_port = int(smtp_port_text) if smtp_port_text else None
+        except ValueError:
+            self.update_status("Invalid SMTP port.")
+            return  # Stop execution if the port is invalid
+
+        if not all([email_address, email_password, smtp_host, smtp_port]):
+            self.update_status("Please fill in all the email settings.")
+            for k, v in dict(email_address=email_address, email_password=['*']*len(email_password),
+                smtp_host=smtp_host, smtp_port=smtp_port).items():
+                self.update_status(f"{k}: {v} invalid")
+            return
+
+        # Initialize the EmailSender with the user's settings
+        email_sender = EmailSender(
+            host=smtp_host,
+            port=smtp_port,
+            username=email_address,
+            password=email_password,
+            use_tls=True,  # or use_ssl=True, based on your email provider
+        )
+        Logger.info('testing connection')
+        # Test the connection
+        try:
+            # Attempt to log in to the email server
+            email_sender.login()
+            # If successful, show a success message to the user
+            self.show_alert("Connection successful!")
+        except Exception as e:
+            # If login fails, show an error message to the user
+            self.update_status(f"Failed to connect: {e}")
+
+    def update_status(self, message):
+        Snackbar(text=message).open()
+
+    def show_alert(self, message):
+        # This method would update the UI with an alert message
+        # You can use a Snackbar, Modal, or any other way you prefer to notify the user
+        Logger.info(message)  # Placeholder for UI update

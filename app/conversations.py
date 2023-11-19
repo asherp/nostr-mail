@@ -10,6 +10,7 @@ from nostr.key import PrivateKey, PublicKey
 from kivy.clock import mainthread
 import keyring
 from util import load_user_pub_key, get_nostr_pub_key, NostrRelayManager
+from util import fetch_profile_from_db, save_profile_to_db
 import json
 from collections import defaultdict
 from kivy.uix.anchorlayout import AnchorLayout
@@ -26,21 +27,36 @@ class ConversationsScreen(MDScreen):
         # load DMs when the screen is entered
         self.load_direct_messages()
 
-    def load_direct_messages(self):
-        # Fetch the relays from the RelayScreen
-
+    def load_direct_messages(self, refresh=False):
+        # fetch dms from database
         relay_manager = MDApp.get_running_app().relay_manager
         try:
             Logger.debug("ConversationsScreen: Loading DMs...")
-            dms = relay_manager.get_dms()
+            dms = relay_manager.get_dms(refresh=refresh)
+
             if len(dms) > 0:
                 Logger.info("ConversationsScreen: DMs loaded successfully.")
-                # Call the coroutine to decrypt and update the UI
                 self.schedule_update_ui(dms)
             else:
                 Logger.warning("ConversationsScreen: No DMs to load.")
         except Exception as e:
             Logger.error(f"ConversationsScreen: Error loading DMs - {e}")
+
+    def on_refresh_press(self):
+        # Your refresh logic here
+        Logger.info("Conversations refresh button pressed")
+        # For example, you might call the method that updates the UI:
+        self.load_direct_messages(refresh=True)
+
+
+    def load_profile(self, pub_key_hex):
+        profile_data = fetch_profile_from_db(pub_key_hex)
+        if profile_data is None:
+            relay_manager = MDApp.get_running_app().relay_manager
+            profile_data = relay_manager.fetch_profile_data(pub_key_hex=pub_key_hex, kind='profile')
+            save_profile_to_db(pub_key_hex=pub_key_hex, profile_data=profile_data)
+        return profile_data
+
 
     @mainthread
     def schedule_update_ui(self, dms):
@@ -54,12 +70,15 @@ class ConversationsScreen(MDScreen):
         # Loop through the decrypted DMs and add them to the list
         for conv_id, msgs in dms.items():
             msg_list = list(msgs.items()) # iv: {**msg} -> (iv, {**msg})
-
             for iv, msg in sorted(msg_list, key=lambda m: m[1]['time']):
+                author = msg['from_pubkey']
+                profile_data = self.load_profile(author)
+                if profile_data is not None:
+                    image_source = profile_data['picture']
                 if msg['from_pubkey'] == pub_key_hex:
-                    list_item = LRListItem(msg['decrypted']+iv, item_type='right')
+                    list_item = LRListItem(msg['decrypted'], image_source=image_source, item_type='right')
                 else:
-                    list_item = LRListItem(msg['decrypted']+iv, item_type='left')
+                    list_item = LRListItem(msg['decrypted'], image_source=image_source, item_type='left')
                 self.ids.dm_list.add_widget(list_item)
 
         Logger.info('ConversationsScreen: UI updated with decrypted DMs.')

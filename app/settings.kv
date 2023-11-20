@@ -50,7 +50,8 @@
                     helper_text_mode: "on_focus"
                 MDTextField:
                     id: imap_port
-                    hint_text: "2525"
+                    hint_text: "IMAP Port"
+                    text: "2525"
                     input_filter: 'int'  # allows only integer input
                     helper_text: "IMAP Port"
                     helper_text_mode: "on_focus"
@@ -61,9 +62,10 @@
                     helper_text_mode: "on_focus"
                 MDTextField:
                     id: smtp_port
-                    hint_text: "587"
+                    text: "587"  # Default port value displayed
+                    hint_text: "SMTP Port"
                     input_filter: 'int'  # allows only integer input
-                    helper_text: "SMTP Port"
+                    helper_text: "This is the default SMTP port."
                     helper_text_mode: "on_focus"
         MDRaisedButton:
             text: "Save"

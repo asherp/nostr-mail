@@ -6,6 +6,7 @@ from util import get_nostr_pub_key, KEYRING_GROUP
 from kivy.lang import Builder
 from ui import Logger
 from redmail import EmailSender
+import imaplib
 from kivymd.uix.snackbar import Snackbar
 
 
@@ -17,7 +18,7 @@ Logger.info(f'Using keyring backend: {keyring.get_keyring()}')
 class SettingsScreen(MDScreen):
     error = BooleanProperty(False)
     priv_key = StringProperty('')  # Use a StringProperty for the private key
-
+    current_snackbar = None
 
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -128,11 +129,11 @@ class SettingsScreen(MDScreen):
 
 
     def test_email_connection(self):
-        email_address = self.ids.email_address.text
-        email_password = self.ids.email_password.text
-        smtp_host = self.ids.smtp_host.text
-        smtp_port_text = self.ids.smtp_port.text
 
+        smtp_port_text=self.ids.smtp_port.text
+        imap_port_text=self.ids.imap_port.text
+
+        Logger.info('test_email_connection triggered')
         # Validate smtp_port
         try:
             smtp_port = int(smtp_port_text) if smtp_port_text else None
@@ -140,34 +141,88 @@ class SettingsScreen(MDScreen):
             self.update_status("Invalid SMTP port.")
             return  # Stop execution if the port is invalid
 
-        if not all([email_address, email_password, smtp_host, smtp_port]):
-            self.update_status("Please fill in all the email settings.")
-            for k, v in dict(email_address=email_address, email_password=['*']*len(email_password),
-                smtp_host=smtp_host, smtp_port=smtp_port).items():
-                self.update_status(f"{k}: {v} invalid")
+        try:
+            imap_port = int(imap_port_text) if imap_port_text else None
+        except ValueError:
+            self.update_status("Invalid IMAP port.")
+            return  # Stop execution if the port is invalid
+
+        credentials = dict(
+            email_address=self.ids.email_address.text,
+            email_password=self.ids.email_password.text,
+            imap_host=self.ids.imap_host.text,
+            imap_port=imap_port,
+            smtp_host=self.ids.smtp_host.text,
+            smtp_port=smtp_port,
+            )
+
+        if not all(credentials.values()):
+            for k, v in credentials.items():
+                if (len(str(v)) == 0) | (v is None):
+                    self.update_status(f"{k}: {v} invalid")
+                    return
+            self.update_status(f'something wrong with inputs')
+            Logger.info('something wrong with inputs')
             return
+
+        Logger.info('initializing EmailSender')
 
         # Initialize the EmailSender with the user's settings
         email_sender = EmailSender(
-            host=smtp_host,
-            port=smtp_port,
-            username=email_address,
-            password=email_password,
-            use_tls=True,  # or use_ssl=True, based on your email provider
+            host=credentials['smtp_host'],
+            port=credentials['smtp_port'],
+            username=credentials['email_address'],
+            password=credentials['email_password'],
+            use_starttls=True,  # or use_ssl=True, based on your email provider
         )
-        Logger.info('testing connection')
+        Logger.info('testing smtp (send) connection')
         # Test the connection
+
+        # Attempt to log in to the email server
         try:
-            # Attempt to log in to the email server
-            email_sender.login()
-            # If successful, show a success message to the user
-            self.show_alert("Connection successful!")
+            email_sender.connect()
+            self.update_status("Connection successful! We can send email.")
+            Logger.info('connection test successful')
+            email_sender.close()
         except Exception as e:
-            # If login fails, show an error message to the user
-            self.update_status(f"Failed to connect: {e}")
+            self.update_status(f"SMTP connection failed: {e}")
+            return
+
+        try:
+            mail = imaplib.IMAP4_SSL(host=credentials['imap_host'])
+        except:
+            self.update_status(f"Invalid IMAP host: {credentials['imap_host']}")
+
+        Logger.info(f"logging in to {credentials['email_address']}")
+
+        try:
+            response, msg = mail.login(credentials['email_address'], credentials['email_password'])
+            if response == 'OK':
+                Logger.info('connected')
+                self.update_status("Logged in successfully! We can receive emails.")
+                mail.select('Inbox')
+                mail.logout()
+            else:
+                Logger.info('could not connect')
+                self.update_status("IMAP login failed.")
+        except:
+            self.update_status(f"IMAP connection failed: {e}")
+
+        
+
 
     def update_status(self, message):
-        Snackbar(text=message).open()
+        if self.current_snackbar:
+            self.current_snackbar.text = message  # Update the text of the existing snackbar
+            if not self.current_snackbar.is_open:
+                self.current_snackbar.open()
+        else:
+            self.current_snackbar = Snackbar(text=message)
+            self.current_snackbar.open()
+            self.current_snackbar.bind(on_dismiss=lambda *x: setattr(self, 'current_snackbar', None))
+
+    def reset_snackbar(self, instance):
+        self.snackbar = None  # Reset reference when Snackbar is dismissed
 
     def show_alert(self, message):
         # This method would update the UI with an alert message

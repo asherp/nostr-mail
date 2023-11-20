@@ -1,3 +1,4 @@
+* test email connection credentials
 
 # 2023-11-20 15:16:00.328549: clock-in
 

@@ -531,3 +531,45 @@ def fetch_profile_from_db(pub_key_hex=None):
         return db.get(pub_key_hex)
 
 
+def find_email_by_subject(mail, subject):
+    # Search for emails matching a specific subject
+    result, data = mail.search(None, f'SUBJECT "{subject}"')
+
+    # Process the list of message IDs returned by the search
+    for num in data[0].split():
+        # Fetch the email message by ID
+        result, data = mail.fetch(num, '(RFC822)')
+        raw_email = data[0][1]
+        # Convert raw email data into a Python email object
+        email_message = email.message_from_bytes(raw_email)
+        subject = email_message['Subject'].strip()
+
+        # Extract the email body and print it
+        if email_message.is_multipart():
+            for part in email_message.walk():
+                content_type = part.get_content_type()
+                if content_type == 'text/plain':
+                    email_body = part.get_payload(decode=True).decode()
+                    break
+        else:
+            email_body = email_message.get_payload(decode=True).decode()
+        # just return the first one in the list
+        return email_body.strip()
+
+
+
+def load_email_credentials_from_keyring():
+    credential_fields = [
+        'email_address',
+        'email_password',
+        'imap_host',
+        'imap_port',
+        'smtp_host',
+        'smtp_port',
+    ]
+    credentials = {k: None for k in credential_fields}
+    for cred_type in credential_fields:
+        value = keyring.get_password(KEYRING_GROUP, cred_type)
+        credentials[cred_type] = value
+    return credentials
+

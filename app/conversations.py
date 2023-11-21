@@ -15,17 +15,36 @@ import json
 from collections import defaultdict
 from kivy.uix.anchorlayout import AnchorLayout
 from widgets import LRListItem
+from util import load_email_credentials_from_keyring
+from kivymd.uix.snackbar import Snackbar
 
 
 Builder.load_file('conversations.kv')
 
 
 class ConversationsScreen(MDScreen):
+    current_snackbar = None
+
+    def update_status(self, message):
+        if self.current_snackbar:
+            self.current_snackbar.text = message  # Update the text of the existing snackbar
+            self.current_snackbar.open()
+        else:
+            self.current_snackbar = Snackbar(text=message)
+            self.current_snackbar.open()
+            self.current_snackbar.bind(on_dismiss=lambda *x: setattr(self, 'current_snackbar', None))
 
     def on_enter(self):
         Logger.info("ConversationsScreen: Entered the conversations screen.")
         # load DMs when the screen is entered
         self.load_direct_messages()
+        credentials = load_email_credentials_from_keyring()
+        missing = []
+        for cred_type, value in credentials.items():
+            if value is None:
+                missing.append(cred_type)
+        if len(missing) > 0:
+            self.update_status(f'email credentials {missing} not set. go to settings')
 
     def load_direct_messages(self, refresh=False):
         # fetch dms from database

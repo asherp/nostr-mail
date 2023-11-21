@@ -129,7 +129,7 @@ class SettingsScreen(MDScreen):
 
 
     def test_email_connection(self):
-
+        """test the email connection settings"""
         smtp_port_text=self.ids.smtp_port.text
         imap_port_text=self.ids.imap_port.text
 
@@ -205,24 +205,19 @@ class SettingsScreen(MDScreen):
             else:
                 Logger.info('could not connect')
                 self.update_status("IMAP login failed.")
-        except:
+        except Exception as e:
             self.update_status(f"IMAP connection failed: {e}")
-
-        
 
 
     def update_status(self, message):
         if self.current_snackbar:
             self.current_snackbar.text = message  # Update the text of the existing snackbar
-            if not self.current_snackbar.is_open:
-                self.current_snackbar.open()
+            self.current_snackbar.open()
         else:
             self.current_snackbar = Snackbar(text=message)
             self.current_snackbar.open()
             self.current_snackbar.bind(on_dismiss=lambda *x: setattr(self, 'current_snackbar', None))
 
-    def reset_snackbar(self, instance):
-        self.snackbar = None  # Reset reference when Snackbar is dismissed
 
     def show_alert(self, message):
         # This method would update the UI with an alert message

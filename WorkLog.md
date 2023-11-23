@@ -1,3 +1,10 @@
+* nip44
+* reading summary on proposed dm improments https://gist.github.com/staab/f8284af12450dbbdcead6e0c3ed95e2c
+* reading up on nip-44 https://github.com/nostr-protocol/nips/pull/574
+* interesting that nostr-mail can solve a lot problems that relays alone can't solve
+	* out of band way of communicating new keys
+	* archival storage of dms (subject line)
+* trying to generate python version of nip44
 
 # 2023-11-23 11:33:25.125874: clock-in
 

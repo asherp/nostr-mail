@@ -1,3 +1,5 @@
+# 2023-11-23 12:53:47.287120: clock-out
+
 * nip44
 * reading summary on proposed dm improments https://gist.github.com/staab/f8284af12450dbbdcead6e0c3ed95e2c
 * reading up on nip-44 https://github.com/nostr-protocol/nips/pull/574

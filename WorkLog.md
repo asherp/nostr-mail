@@ -1,3 +1,6 @@
+
+# 2023-11-23 11:33:25.125874: clock-in
+
 # 2023-11-21 17:53:44.042064: clock-out
 
 * loading email creds into conv

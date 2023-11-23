@@ -1,3 +1,6 @@
+* nip44 tests
+* chacha20 in cryptography.hazmat.primitives.ciphers.algorithms requires a 16bit nonce 
+* go and typescript implmentations use a 12-byte nonce!
 
 # 2023-11-23 13:40:46.436417: clock-in
 

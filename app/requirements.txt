@@ -8,3 +8,4 @@ pynostr[websocket-client]
 python-dotenv
 sqlitedict
 redmail==0.5.0
+pycryptodome

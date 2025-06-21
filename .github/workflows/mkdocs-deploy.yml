@@ -22,16 +22,12 @@ jobs:
         python -m pip install pip==24.0
         pip install mkdocs markdown-include pygments mkdocs-material
 
-    - name: Build and deploy
+    - name: Deploy to GitHub Pages
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git remote set-url origin https://github.com/asherp/nostr-mail/
-        mkdocs build --verbose
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/asherp/nostr-mail.git
         mkdocs gh-deploy --force
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
 
 
 

@@ -1,4 +1,4 @@
-Let's we walk through the building blocks of NostrMail. In addition to explaining how our implementation works, this should serve to illustrate how a similar strategy could be used for other platforms.
+Let's walk through the building blocks of nostr-mail. In addition to explaining how our implementation works, this should serve to illustrate how a similar strategy could be used for other platforms.
 
 
 
@@ -6,11 +6,11 @@ Let's we walk through the building blocks of NostrMail. In addition to explainin
 
 ### nostr
 
-NostrMail builds on the `python-nostr==0.0.2`, which [may be found here](https://github.com/jeffthibault/python-nostr). 
+Nostr-mail builds on the `python-nostr==0.0.2`, which [may be found here](https://github.com/jeffthibault/python-nostr). 
 
 ### secp256k1
 
-This library handles the PGP side of NostrMail and is a dependency of `python-nostr`. It is maintained by rustyrussell and [may be found here](https://github.com/rustyrussell/secp256k1-py).
+This library handles the PGP side of nostr-mail and is a dependency of `python-nostr`. It is maintained by rustyrussell and [may be found here](https://github.com/rustyrussell/secp256k1-py).
 
 
 ## Workflow
@@ -29,7 +29,7 @@ print(f"Public key: {public_key.bech32()}")
 ```
 
 <!-- #region -->
-Copy and the above private key into `.env` at the root of this repo.
+Copy and paste the above private key into `.env` at the root of this repo.
 
 ```sh
 NOSTR_PRIV_KEY=<priv key here>
@@ -194,7 +194,7 @@ def compute_shared_secret(self, public_key_hex: str) -> bytes:
         return pk.ecdh(self.raw_secret, hashfn=copy_x)
 ```
 
-The shared secret is the result of applying Eliptic Curve Diffe Hellman, so it should return a point on the elliptic curve (which is just another public key)
+The shared secret is the result of applying Elliptic Curve Diffie-Hellman, so it should return a point on the elliptic curve (which is just another public key)
 <!-- #endregion -->
 
 ```python
@@ -421,7 +421,7 @@ bob_priv_key.public_key.hex()
 
 Test delivery of the email subject via dm. The standard is defined in https://github.com/nostr-protocol/nips/blob/master/04.md
 
-* text is encrypted with `base64-encoded, aes-256-cbc` using the x-coordinate if the shared point between sender/receiver
+* text is encrypted with `base64-encoded, aes-256-cbc` using the x-coordinate of the shared point between sender/receiver
 * content includes an initialization vector `"content": "<encrypted_text>?iv=<initialization_vector>"`
 * `tags` MUST contain an entry identifying the receiver of the message in the form `["p", "<pubkey, as a hex string>"]`.
 * `tags` MAY contain an entry identifying the previous message in a conversation or a message we are explicitly replying to, in the form `["e", "<event_id>"]`.
@@ -526,7 +526,7 @@ bob_dms
 
 ```python
 def get_encryption_iv(msg):
-    """extract the iv from an ecnrypted blob"""
+    """extract the iv from an encrypted blob"""
     return msg.split('?iv=')[-1].strip('==')
 ```
 

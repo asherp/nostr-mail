@@ -4,8 +4,7 @@ Nostr-mail profiles require the `email` keyword to be available.
 
 Profiles may be loaded with the function `load_user_profile`.
 
-
-To test this, we'll assume the alice's priv key is an environment variable.
+To test this, we'll assume Alice's priv key is stored in an environment variable.
 
 ```python
 from nostrmail.callbacks import load_user_profile, get_nostr_pub_key
@@ -30,8 +29,4 @@ Run the following cell to autoreload modifications to any above imports.
 ```python
 %load_ext autoreload
 %autoreload 2
-```
-
-```python
-
 ```

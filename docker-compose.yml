@@ -44,7 +44,7 @@ services:
       - "8000:8000"
     build:
       context: .
-      dockerfile: rigly.Dockerfile
+      dockerfile: Dockerfile
     volumes:
       - type: bind
         source: .

@@ -1,11 +1,10 @@
+## nostr-mail
 
-## NostrMail
-
-A simple email encryption tool based on secp256 key pairs.
+A simple email encryption tool based on secp256k1 key pairs.
 
 How it works:
 
-NostrMail encrypts content using a symetric key derived from a combination of the sender's private key and the receiver's public key.
+Nostr-mail encrypts content using a symmetric key derived from a combination of the sender's private key and the receiver's public key.
 
 Both sender and receiver derive a shared secret known only to them, which is used to protect their communications.
 
@@ -13,9 +12,9 @@ This application can use any email server for delivery.
 
 ### Why have you done this?
 
-NostrMail aims to improve privacy for the average pleb by bridging the gap between nostr and email. The two protocols serve different purposes, but they also solve each other's problems. For example, PGP does exist for email but it has not seen mainstream adoption because it relies on an existing key registry.
+Nostr-mail aims to improve privacy for the average person by bridging the gap between nostr and email. The two protocols serve different purposes, but they also solve each other's problems. For example, PGP does exist for email but it has not seen mainstream adoption because it relies on an existing key registry.
 
-| Feature            | Nostr                               | Email                             | NostrMail                  |
+| Feature            | Nostr                               | Email                             | nostr-mail                  |
 | -------------------|-------------------------------------| --------------------------------- |--------------------------- |
 | Social Key Registry| :material-checkbox-marked:          | :material-checkbox-blank-outline: | :material-checkbox-marked: |
 | PGP                | :material-checkbox-marked:          | :material-checkbox-marked:        | :material-checkbox-marked: |
@@ -25,11 +24,11 @@ NostrMail aims to improve privacy for the average pleb by bridging the gap betwe
 
 ## Obligatory warning
 
-Nostrmail uses NIP-04, which has many [issues pointed out here](https://github.com/nostr-protocol/nips/issues/107). While not perfect, it's better than cleartext emails. 
+Nostr-mail uses NIP-04, which has many [issues pointed out here](https://github.com/nostr-protocol/nips/issues/107). While not perfect, it's better than cleartext emails. 
 
 ## Usage
 
-You'll need [docker](https://docs.docker.com/desktop/).
+You'll need [Docker](https://docs.docker.com/desktop/).
 
 Clone and navigate to the base of the repo directory, then:
 
@@ -53,9 +52,7 @@ Here are all the services you can run with `docker compose up <service name>`
 
 ### Environment variables
 
-
 Create a `.env` file and place it in the base of this repo to set the defaults for the above containers.
-
 
 ```sh
 
@@ -66,7 +63,7 @@ Create a `.env` file and place it in the base of this repo to set the defaults f
 ### Address book/relays
 
 Create a file in the local directory called `address_book.yaml` to specify private contacts.
-Here's an example.
+Here's an example:
 
 ```yaml
 contacts:
@@ -83,14 +80,14 @@ relays:
 
 ### Email
 
-Configure your email account to allow sending and receiving emails. Here are instructions for gmail.
+Configure your email account to allow sending and receiving emails. Here are instructions for Gmail:
 
-1. Generate an app password (required if using 2-factor auth) See https://support.google.com/accounts/answer/185833?hl=en 
-1. Set `EMAIL_PASSWORD` in your `.env` file as explained above.
-1. Open gmail settings to enable IMAP
-    1. In the top right, click Settings Settings and then See all  settings.
-    1. Click the Forwarding and POP/IMAP tab.
-    1. In the "IMAP access" section, select Enable IMAP.
-    1. Click Save Changes.
+1. Generate an app password (required if using 2-factor auth). See https://support.google.com/accounts/answer/185833?hl=en 
+2. Set `EMAIL_PASSWORD` in your `.env` file as explained above.
+3. Open Gmail settings to enable IMAP:
+    1. In the top right, click Settings and then See all settings.
+    2. Click the Forwarding and POP/IMAP tab.
+    3. In the "IMAP access" section, select Enable IMAP.
+    4. Click Save Changes.
 
 

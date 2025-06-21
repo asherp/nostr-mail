@@ -26,7 +26,7 @@ jobs:
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git remote set-url origin https://github.com/silaspe/maths.git
+        git remote set-url origin https://github.com/asherp/nostr-mail/
         mkdocs build --verbose
         mkdocs gh-deploy --force
       env:

@@ -1,4 +1,6 @@
-site_name: NostrMail
+site_name: nostr-mail
+repo_name: nostr-mail
+repo_url: https://github.com/asherp/nostr-mail
 
 nav:
 - Home: README.md

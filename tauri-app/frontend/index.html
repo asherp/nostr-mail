@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nostr Mail</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h1><i class="fas fa-envelope"></i> Nostr Mail</h1>
+            </div>
+            
+            <nav class="sidebar-nav">
+                <button class="nav-item active" data-tab="compose">
+                    <i class="fas fa-pen"></i> Compose
+                </button>
+                <button class="nav-item" data-tab="inbox">
+                    <i class="fas fa-inbox"></i> Inbox
+                </button>
+                <button class="nav-item" data-tab="dm">
+                    <i class="fas fa-comments"></i> Direct Messages
+                </button>
+                <button class="nav-item" data-tab="contacts">
+                    <i class="fas fa-address-book"></i> Contacts
+                </button>
+                <button class="nav-item" data-tab="profile">
+                    <i class="fas fa-user"></i> Profile
+                </button>
+                <button class="nav-item" data-tab="settings">
+                    <i class="fas fa-cog"></i> Settings
+                </button>
+            </nav>
+            <button id="dark-mode-toggle" class="icon-button" title="Toggle dark mode" style="margin: 20px auto 10px auto; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; background: none; border: none; color: inherit; cursor: pointer;">
+                <i id="dark-mode-icon" class="fas fa-moon"></i>
+            </button>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Compose Tab -->
+            <div class="tab-content active" id="compose">
+                <div class="tab-header">
+                    <h2>Compose Email</h2>
+                </div>
+                
+                <div class="compose-form">
+                    <div class="form-group">
+                        <label for="to-address">To:</label>
+                        <input type="email" id="to-address" placeholder="recipient@example.com">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="subject">Subject:</label>
+                        <input type="text" id="subject" placeholder="Subject">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="message-body">Message:</label>
+                        <textarea id="message-body" rows="10" placeholder="Type your message here..."></textarea>
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button id="send-btn" class="btn btn-primary">
+                            <i class="fas fa-paper-plane"></i> Send
+                        </button>
+                        <button id="save-draft-btn" class="btn btn-secondary">
+                            <i class="fas fa-save"></i> Save Draft
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Inbox Tab -->
+            <div class="tab-content" id="inbox">
+                <div class="tab-header">
+                    <h2>Inbox</h2>
+                    <button id="refresh-inbox" class="btn btn-secondary">
+                        <i class="fas fa-sync"></i> Refresh
+                    </button>
+                </div>
+                
+                <div class="email-list" id="email-list">
+                    <!-- Emails will be populated here -->
+                </div>
+            </div>
+
+            <!-- Direct Messages Tab -->
+            <div class="tab-content" id="dm">
+                <div class="tab-header">
+                    <h2>Direct Messages</h2>
+                    <div class="dm-actions">
+                        <button id="new-dm-btn" class="btn btn-primary">
+                            <i class="fas fa-plus"></i> New DM
+                        </button>
+                        <button id="refresh-dm" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="dm-container">
+                    <div class="dm-sidebar">
+                        <div class="dm-contacts" id="dm-contacts">
+                            <!-- DM contacts will be populated here -->
+                        </div>
+                    </div>
+                    <div class="dm-main">
+                        <div class="dm-messages" id="dm-messages">
+                            <!-- DM messages will be populated here -->
+                        </div>
+                        
+                        <div class="dm-compose" id="dm-compose" style="display: none;">
+                            <div class="form-group">
+                                <label for="dm-recipient">To:</label>
+                                <input type="text" id="dm-recipient" placeholder="npub1...">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="dm-message">Message:</label>
+                                <textarea id="dm-message" rows="4" placeholder="Type your message..."></textarea>
+                            </div>
+                            
+                            <div class="form-actions">
+                                <button id="send-dm-btn" class="btn btn-primary">
+                                    <i class="fas fa-paper-plane"></i> Send DM
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Contacts Tab -->
+            <div class="tab-content" id="contacts">
+                <div class="tab-header">
+                    <h2>Contacts</h2>
+                    <div class="contacts-actions">
+                        <button id="refresh-contacts-btn" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                        <button id="add-contact-btn" class="btn btn-primary">
+                            <i class="fas fa-plus"></i> Add Contact
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="contacts-container">
+                    <div class="contacts-sidebar">
+                        <div class="contacts-list" id="contacts-list">
+                            <!-- Contacts will be populated here -->
+                        </div>
+                    </div>
+                    <div class="contacts-detail" id="contacts-detail">
+                        <!-- Contact profile details will be shown here -->
+                        <div class="contact-detail-placeholder">
+                            <i class="fas fa-user"></i>
+                            <p>Select a contact to view their profile</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Profile Tab -->
+            <div class="tab-content" id="profile">
+                <div class="tab-header">
+                    <h2>Profile</h2>
+                </div>
+                
+                <div class="profile-form">
+                    <img id="profile-picture" class="profile-picture" style="width:120px;height:120px;object-fit:cover;border-radius:50%;margin-bottom:16px;display:none;" alt="Profile picture">
+                    <form id="profile-fields-form">
+                        <div id="profile-fields-list" class="profile-fields-list"></div>
+                        <div class="form-actions">
+                            <button id="update-profile-btn" class="btn btn-primary" type="submit">
+                                <i class="fas fa-save"></i> Update Profile
+                            </button>
+                        </div>
+                    </form>
+                </div>
+                <div id="profile-pubkey" class="profile-pubkey"></div>
+                <textarea id="profile-raw-json" class="profile-raw-json" readonly style="display:none; width:100%; min-height:120px; margin-top:16px; font-family:monospace;"></textarea>
+            </div>
+
+            <!-- Settings Tab -->
+            <div class="tab-content" id="settings">
+                <div class="tab-header">
+                    <h2>Settings</h2>
+                </div>
+                
+                <div class="settings-form">
+                    <div class="form-group">
+                        <label for="npriv-key">Nostr Private Key (npriv/nsec):</label>
+                        <input type="password" id="npriv-key" placeholder="npriv1... or nsec1...">
+                        <small class="form-help">Your Nostr private key in bech32 format (npriv1 or nsec1). This is used for signing messages and DMs.</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="generate-key-btn">Or Generate New Key:</label>
+                        <button id="generate-key-btn" class="btn btn-secondary">
+                            <i class="fas fa-key"></i> Generate New Keypair
+                        </button>
+                        <small class="form-help">Generate a new Nostr keypair if you don't have one.</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="public-key-display">Public Key (npub):</label>
+                        <div class="input-with-button">
+                            <input type="text" id="public-key-display" readonly placeholder="Your public key will appear here">
+                            <button id="copy-pubkey-btn" class="btn btn-small">
+                                <i class="fas fa-copy"></i> Copy
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <hr class="settings-divider">
+                    
+                    <div class="form-group">
+                        <label for="email-address">Email Address:</label>
+                        <input type="email" id="email-address" placeholder="your@email.com">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="email-password">Email Password:</label>
+                        <input type="password" id="email-password" placeholder="App password">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="smtp-host">SMTP Host:</label>
+                        <input type="text" id="smtp-host" placeholder="smtp.gmail.com">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="smtp-port">SMTP Port:</label>
+                        <input type="number" id="smtp-port" placeholder="587">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="imap-host">IMAP Host:</label>
+                        <input type="text" id="imap-host" placeholder="imap.gmail.com">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="imap-port">IMAP Port:</label>
+                        <input type="number" id="imap-port" placeholder="993">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="use-tls"> Use TLS
+                        </label>
+                    </div>
+
+                    <hr class="settings-divider">
+                    <div class="relays-section">
+                        <h3>Relay Management</h3>
+                        <div id="relays-list" class="relays-list">
+                            <!-- Relays will be dynamically added here -->
+                        </div>
+                        <div class="add-relay-form">
+                            <input type="text" id="new-relay-url" placeholder="wss://relay.example.com">
+                            <button id="add-relay-btn" class="btn btn-secondary">
+                                <i class="fas fa-plus"></i> Add Relay
+                            </button>
+                        </div>
+                    </div>
+
+                    <hr class="settings-divider">
+                    <div class="form-actions">
+                        <button id="save-settings-btn" class="btn btn-primary">
+                            <i class="fas fa-save"></i> Save Settings
+                        </button>
+                        <button id="test-connection-btn" class="btn btn-secondary">
+                            <i class="fas fa-test-tube"></i> Test Connection
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modals -->
+    <div id="modal-overlay" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modal-title">Modal Title</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body">
+                <!-- Modal content will be inserted here -->
+            </div>
+        </div>
+    </div>
+
+    <script src="main.js"></script>
+</body>
+</html> 

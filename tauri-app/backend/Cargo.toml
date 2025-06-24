@@ -1,0 +1,42 @@
+[package]
+name = "nostr-mail"
+version = "0.1.0"
+description = "A simple email encryption tool based on secp256k1 key pairs"
+authors = ["Asher Pembroke"]
+edition = "2021"
+default-run = "nostr-mail"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "nostr_mail_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.0.0-beta", features = [] }
+tauri-plugin-opener = "2.0.0-beta"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+nostr-sdk = { version = "0.42.0", features = ["nip44", "nip59"] }
+anyhow = "1.0"
+tokio = { version = "1", features = ["full"] }
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
+imap = "2.4.1"
+native-tls = "0.2"
+reqwest = "0.12"
+base64 = "0.22"
+mime_guess = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+[features]
+# this feature is used for production builds or when `devPath` points to the filesystem
+# DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
+
+[[bin]]
+name = "validate_pubkey"
+path = "src/bin/validate_pubkey.rs"
+

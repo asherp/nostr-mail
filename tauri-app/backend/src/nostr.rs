@@ -4,6 +4,7 @@ use crate::types::{NostrEvent, Profile};
 use std::time::Duration;
 use base64::{engine::general_purpose, Engine as _};
 use mime_guess;
+use serde::{Serialize, Deserialize};
 
 pub async fn publish_event(
     private_key: &str,
@@ -81,6 +82,25 @@ pub async fn send_direct_message(
     Ok(event_id.to_hex())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conversation {
+    pub contact_pubkey: String,
+    pub contact_name: Option<String>,
+    pub last_message: String,
+    pub last_timestamp: i64,
+    pub message_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub id: String,
+    pub sender_pubkey: String,
+    pub receiver_pubkey: String,
+    pub content: String,
+    pub timestamp: i64,
+    pub is_sent: bool,
+}
+
 pub async fn fetch_direct_messages(
     private_key: &str,
     relays: &[String],
@@ -103,16 +123,38 @@ pub async fn fetch_direct_messages(
     
     client.connect().await;
     
-    // Create filter for encrypted direct messages
-    let filter = Filter::new()
+    // Create filter for encrypted direct messages - fetch both sent and received
+    let sent_filter = Filter::new()
         .kind(Kind::EncryptedDirectMessage)
         .author(keys.public_key());
     
-    // Get events
-    let events = client.fetch_events(filter, Duration::from_secs(10)).await?;
+    let received_filter = Filter::new()
+        .kind(Kind::EncryptedDirectMessage)
+        .pubkey(keys.public_key());
+    
+    // Get events for both sent and received
+    let sent_events = client.fetch_events(sent_filter, Duration::from_secs(10)).await?;
+    let received_events = client.fetch_events(received_filter, Duration::from_secs(10)).await?;
+    
+    // Combine and deduplicate events
+    let mut all_events = sent_events;
+    all_events.extend(received_events);
+    
+    // Remove duplicates based on event ID
+    let mut unique_events = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    
+    for event in all_events {
+        if seen_ids.insert(event.id) {
+            unique_events.push(event);
+        }
+    }
+    
+    // Sort by timestamp (newest first)
+    unique_events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     
     // Convert to our format
-    let nostr_events: Vec<NostrEvent> = events.into_iter().map(|event| {
+    let nostr_events: Vec<NostrEvent> = unique_events.into_iter().map(|event| {
         NostrEvent {
             id: event.id.to_hex(),
             pubkey: event.pubkey.to_bech32().unwrap_or_default(),
@@ -223,9 +265,31 @@ pub fn decrypt_dm_content(
     let secret_key = SecretKey::from_bech32(private_key)?;
     let sender = PublicKey::from_bech32(sender_pubkey)?;
     
-    // Use NIP-44 decryption
-    let decrypted = nip44::decrypt(&secret_key, &sender, encrypted_content)?;
-    Ok(decrypted)
+    // Try NIP-44 first (newer standard)
+    if let Ok(decrypted) = nip44::decrypt(&secret_key, &sender, encrypted_content) {
+        return Ok(decrypted);
+    }
+    
+    // Try NIP-04 format: base64(encrypted_content)?iv=base64(iv)
+    if encrypted_content.contains("?iv=") {
+        println!("[NOSTR] Attempting NIP-04 decryption");
+        println!("[NOSTR] Encrypted content: {}", encrypted_content);
+        
+        // Use the actual NIP-04 decryption from nostr-sdk
+        match nip04::decrypt(&secret_key, &sender, encrypted_content) {
+            Ok(decrypted) => {
+                println!("[NOSTR] NIP-04 decryption successful");
+                return Ok(decrypted);
+            }
+            Err(e) => {
+                println!("[NOSTR] NIP-04 decryption failed: {:?}", e);
+                return Err(anyhow::anyhow!("NIP-04 decryption failed: {:?}", e));
+            }
+        }
+    }
+    
+    // If both fail, return error
+    Err(anyhow::anyhow!("Failed to decrypt with both NIP-04 and NIP-44"))
 }
 
 pub async fn fetch_following_profiles(
@@ -303,7 +367,7 @@ pub async fn fetch_following_profiles(
         println!("[NOSTR] Fetching profiles for {} pubkeys...", followed_pubkeys.len());
         let profiles_filter = Filter::new()
             .authors(followed_pubkeys)
-            .kind(Kind::Metadata);
+            .kind(Kind::from(0)); // Profile events are kind 0
             
         let profile_events = client.fetch_events(profiles_filter, Duration::from_secs(10)).await?;
         println!("[NOSTR] Found {} profile events", profile_events.len());
@@ -359,6 +423,243 @@ pub async fn fetch_image_as_data_url(url: &str) -> Result<String> {
     let encoded = general_purpose::STANDARD.encode(&bytes);
 
     Ok(format!("data:{};base64,{}", content_type, encoded))
+}
+
+pub async fn fetch_conversations(
+    private_key: &str,
+    relays: &[String],
+) -> Result<Vec<Conversation>> {
+    println!("[NOSTR] fetch_conversations called");
+    
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let keys = Keys::new(secret_key);
+    let client = Client::new(keys.clone());
+    
+    // Add relays
+    for relay in relays {
+        client.add_relay(relay.clone()).await?;
+    }
+    
+    // If no relays provided, use defaults
+    if relays.is_empty() {
+        client.add_relay("wss://nostr-pub.wellorder.net").await?;
+        client.add_relay("wss://relay.damus.io").await?;
+    }
+    
+    client.connect().await;
+    
+    // Create filter for encrypted direct messages - fetch both sent and received
+    let sent_filter = Filter::new()
+        .kind(Kind::EncryptedDirectMessage)
+        .author(keys.public_key());
+    
+    let received_filter = Filter::new()
+        .kind(Kind::EncryptedDirectMessage)
+        .pubkey(keys.public_key());
+    
+    // Get events for both sent and received
+    let sent_events = client.fetch_events(sent_filter, Duration::from_secs(10)).await?;
+    let received_events = client.fetch_events(received_filter, Duration::from_secs(10)).await?;
+    
+    // Combine and deduplicate events
+    let mut all_events = sent_events;
+    all_events.extend(received_events);
+    
+    // Remove duplicates based on event ID
+    let mut unique_events = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    
+    for event in all_events {
+        if seen_ids.insert(event.id) {
+            unique_events.push(event);
+        }
+    }
+    
+    // Group messages by conversation (contact)
+    let mut conversations: std::collections::HashMap<String, Vec<ConversationMessage>> = std::collections::HashMap::new();
+    
+    for event in unique_events {
+        // Extract the other party's pubkey from the tags
+        let other_party = if event.pubkey == keys.public_key() {
+            // This is a sent message, find the recipient in tags
+            let raw_pubkey = event.tags.iter()
+                .find(|tag| tag.kind().as_str() == "p")
+                .and_then(|tag| tag.content())
+                .unwrap_or_default();
+            
+            // Convert hex to bech32 if needed
+            if raw_pubkey.len() == 64 && raw_pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+                // This is a hex pubkey, convert to bech32
+                match PublicKey::from_hex(raw_pubkey) {
+                    Ok(pk) => pk.to_bech32().unwrap_or_default(),
+                    Err(_) => raw_pubkey.to_string(),
+                }
+            } else {
+                raw_pubkey.to_string()
+            }
+        } else {
+            // This is a received message, the sender is the event pubkey
+            event.pubkey.to_bech32().unwrap_or_default()
+        };
+        
+        if !other_party.is_empty() {
+            // Try to decrypt the message
+            let sender_pubkey = if event.pubkey == keys.public_key() {
+                // This is a message we sent, so we need to decrypt as if we're the sender
+                // But for received messages, the sender is the other party
+                &other_party
+            } else {
+                // This is a message we received, so the sender is the event pubkey
+                &event.pubkey.to_bech32().unwrap_or_default()
+            };
+            
+            println!("[NOSTR] Attempting to decrypt message from {} to {}", 
+                sender_pubkey, keys.public_key().to_bech32().unwrap_or_default());
+            
+            let decrypted_content = match decrypt_dm_content(private_key, sender_pubkey, &event.content) {
+                Ok(content) => {
+                    println!("[NOSTR] Successfully decrypted message: {}", content);
+                    content
+                },
+                Err(e) => {
+                    println!("[NOSTR] Failed to decrypt message: {}", e);
+                    "[Encrypted message]".to_string()
+                },
+            };
+            
+            let message = ConversationMessage {
+                id: event.id.to_hex(),
+                sender_pubkey: event.pubkey.to_bech32().unwrap_or_default(),
+                receiver_pubkey: other_party.clone(),
+                content: decrypted_content,
+                timestamp: event.created_at.as_u64() as i64,
+                is_sent: event.pubkey == keys.public_key(),
+            };
+            
+            conversations.entry(other_party)
+                .or_insert_with(Vec::new)
+                .push(message);
+        }
+    }
+    
+    // Convert to conversation list
+    let mut conversation_list = Vec::new();
+    
+    for (contact_pubkey, messages) in conversations {
+        if !messages.is_empty() {
+            // Sort messages by timestamp (newest first)
+            let mut sorted_messages = messages;
+            sorted_messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            
+            let last_message = &sorted_messages[0];
+            
+            // For now, use a simple name from the pubkey
+            // In a full implementation, you'd want to fetch the profile
+            let contact_name = Some(format!("Contact {}", &contact_pubkey[..8.min(contact_pubkey.len())]));
+            
+            conversation_list.push(Conversation {
+                contact_pubkey,
+                contact_name,
+                last_message: last_message.content.clone(),
+                last_timestamp: last_message.timestamp,
+                message_count: sorted_messages.len(),
+            });
+        }
+    }
+    
+    // Sort conversations by last message timestamp (newest first)
+    conversation_list.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
+    
+    println!("[NOSTR] Found {} conversations", conversation_list.len());
+    Ok(conversation_list)
+}
+
+pub async fn fetch_conversation_messages(
+    private_key: &str,
+    contact_pubkey: &str,
+    relays: &[String],
+) -> Result<Vec<ConversationMessage>> {
+    println!("[NOSTR] fetch_conversation_messages called for contact: {}", contact_pubkey);
+    
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let keys = Keys::new(secret_key);
+    let client = Client::new(keys.clone());
+    
+    // Add relays
+    for relay in relays {
+        client.add_relay(relay.clone()).await?;
+    }
+    
+    // If no relays provided, use defaults
+    if relays.is_empty() {
+        client.add_relay("wss://nostr-pub.wellorder.net").await?;
+        client.add_relay("wss://relay.damus.io").await?;
+    }
+    
+    client.connect().await;
+    
+    // Create filter for messages between these two users
+    let contact_pubkey_parsed = PublicKey::from_bech32(contact_pubkey)?;
+    let filter = Filter::new()
+        .kind(Kind::EncryptedDirectMessage)
+        .authors([keys.public_key(), contact_pubkey_parsed])
+        .pubkeys([keys.public_key(), contact_pubkey_parsed]);
+    
+    // Get events
+    let events = client.fetch_events(filter, Duration::from_secs(10)).await?;
+    
+    // Convert to conversation messages
+    let mut messages = Vec::new();
+    
+    for event in events {
+        // Try to decrypt the message
+        let sender_pubkey = if event.pubkey == keys.public_key() {
+            // This is a message we sent, so the sender for decryption is the contact
+            contact_pubkey
+        } else {
+            // This is a message we received, so the sender is the event pubkey
+            &event.pubkey.to_bech32().unwrap_or_default()
+        };
+        
+        println!("[NOSTR] Attempting to decrypt conversation message from {} to {}", 
+            sender_pubkey, keys.public_key().to_bech32().unwrap_or_default());
+        println!("[NOSTR] Encrypted content: {}", &event.content[..event.content.len().min(100)]);
+        println!("[NOSTR] Content length: {}, starts with: {}", event.content.len(), &event.content[..event.content.len().min(10)]);
+        
+        let decrypted_content = match decrypt_dm_content(private_key, sender_pubkey, &event.content) {
+            Ok(content) => {
+                println!("[NOSTR] Successfully decrypted conversation message: {}", content);
+                content
+            },
+            Err(e) => {
+                println!("[NOSTR] Failed to decrypt conversation message: {}", e);
+                // Try alternative decryption methods or show raw content
+                if event.content.starts_with("AES") || event.content.contains("|") {
+                    // This might be a different encryption format
+                    format!("[Alternative encrypted format: {}]", &event.content[..event.content.len().min(50)])
+                } else {
+                    "[Encrypted message]".to_string()
+                }
+            },
+        };
+        
+        let message = ConversationMessage {
+            id: event.id.to_hex(),
+            sender_pubkey: event.pubkey.to_bech32().unwrap_or_default(),
+            receiver_pubkey: contact_pubkey.to_string(),
+            content: decrypted_content,
+            timestamp: event.created_at.as_u64() as i64,
+            is_sent: event.pubkey == keys.public_key(),
+        };
+        
+        messages.push(message);
+    }
+    
+    // Sort by timestamp (oldest first for conversation view)
+    messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    
+    println!("[NOSTR] Found {} messages in conversation", messages.len());
+    Ok(messages)
 }
 
 #[cfg(test)]

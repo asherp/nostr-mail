@@ -1,4 +1,6 @@
+* dm decryption
 * tauri app prototype
+
 # 2023-04-29 01:11:50.217567: clock-out
 
 * documentation, presentation

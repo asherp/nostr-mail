@@ -58,18 +58,23 @@ const elements = {
     // DM elements
     dmContacts: getElement('dm-contacts'),
     dmMessages: getElement('dm-messages'),
-    dmCompose: getElement('dm-compose'),
     dmRecipient: getElement('dm-recipient'),
     dmMessage: getElement('dm-message'),
     sendDmBtn: getElement('send-dm-btn'),
     newDmBtn: getElement('new-dm-btn'),
     refreshDm: getElement('refresh-dm'),
+    dmSearch: getElement('dm-search'),
+    dmSearchToggle: getElement('dm-search-toggle'),
+    dmSearchContainer: getElement('dm-search-container'),
     
     // Contacts
     contactsList: getElement('contacts-list'),
     addContactBtn: getElement('add-contact-btn'),
     refreshContactsBtn: getElement('refresh-contacts-btn'),
     contactsDetail: getElement('contacts-detail'),
+    contactsSearch: getElement('contacts-search'),
+    contactsSearchToggle: getElement('contacts-search-toggle'),
+    contactsSearchContainer: getElement('contacts-search-container'),
     
     // Profile
     displayName: getElement('display-name'),
@@ -144,28 +149,50 @@ function testTauriAvailability() {
 
 // Initialize app
 async function initApp() {
-    console.log('Initializing Nostr Mail...');
+    console.log('🚀 ========================================');
+    console.log('🚀   Nostr Mail - Starting Application');
+    console.log('🚀 ========================================');
+    console.log('📧 Email + 🔐 Nostr Integration');
+    console.log('🌐 Version: 1.0.0');
+    console.log('⏰ Started at:', new Date().toLocaleString());
+    console.log('🚀 ========================================');
+    
     try {
+        console.log('📋 Loading application settings...');
         // Load settings from localStorage
         loadSettings();
 
+        console.log('🌐 Loading relay configuration...');
         // Load relays from localStorage if present, else from backend
         loadRelaysFromStorageOrBackend();
 
+        console.log('🔑 Loading/generating keypair...');
         // Generate or load keypair
         await loadKeypair();
         
+        console.log('🎯 Setting up event listeners...');
         // Set up event listeners
         setupEventListeners();
         
+        console.log('📬 Loading initial data...');
         // Load initial data
         // await loadContacts(); // No longer needed here, handled by tab switching
         await loadEmails();
         await loadDmContacts();
         
-        console.log('App initialized successfully');
+        console.log('✅ ========================================');
+        console.log('✅   Nostr Mail - Successfully Started!');
+        console.log('✅ ========================================');
+        console.log('🎉 Application is ready for use');
+        console.log('📱 UI: Modern email client with Nostr integration');
+        console.log('🔐 Features: Email, DMs, Contacts, Profile Management');
+        console.log('✅ ========================================');
     } catch (error) {
-        console.error('Failed to initialize app:', error);
+        console.error('❌ ========================================');
+        console.error('❌   Nostr Mail - Startup Failed!');
+        console.error('❌ ========================================');
+        console.error('💥 Error during initialization:', error);
+        console.error('❌ ========================================');
     }
 }
 
@@ -232,7 +259,27 @@ function setupEventListeners() {
             elements.newDmBtn.addEventListener('click', showNewDmCompose);
         }
         if (elements.refreshDm) {
-            elements.refreshDm.addEventListener('click', loadDmContacts);
+            elements.refreshDm.addEventListener('click', refreshDmConversations);
+        }
+        
+        // DM Search
+        if (elements.dmSearch) {
+            elements.dmSearch.addEventListener('input', filterDmContacts);
+        }
+        
+        // DM Search Toggle
+        if (elements.dmSearchToggle) {
+            elements.dmSearchToggle.addEventListener('click', toggleDmSearch);
+        }
+        
+        // Contacts Search
+        if (elements.contactsSearch) {
+            elements.contactsSearch.addEventListener('input', filterContacts);
+        }
+        
+        // Contacts Search Toggle
+        if (elements.contactsSearchToggle) {
+            elements.contactsSearchToggle.addEventListener('click', toggleContactsSearch);
         }
         
         // Contacts
@@ -354,6 +401,34 @@ async function loadDmContacts() {
         showError('No keypair available');
         return;
     }
+
+    // Try to load from cache first for instant display
+    // CACHE LOCATION: localStorage.getItem('nostr_mail_dm_conversations')
+    // CACHE FORMAT: { conversations: [...], messages: {...}, timestamp: number }
+    // CACHE DURATION: 24 hours
+    // WARNING: Don't change this cache key or format without updating all references
+    try {
+        const cachedData = localStorage.getItem('nostr_mail_dm_conversations');
+        if (cachedData) {
+            const parsed = JSON.parse(cachedData);
+            const cacheAge = Date.now() - (parsed.timestamp || 0);
+            const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+            if (cacheAge < maxAge && parsed.conversations && parsed.messages) {
+                console.log('[JS] Found valid cached DMs, rendering immediately...');
+                appState.dmContacts = parsed.conversations;
+                appState.dmMessages = parsed.messages;
+                renderDmContacts();
+            } else {
+                console.log('[JS] DM cache expired or invalid, will fetch fresh data...');
+                localStorage.removeItem('nostr_mail_dm_conversations');
+            }
+        } else {
+            console.log('[JS] No cached DMs found.');
+        }
+    } catch (e) {
+        console.warn('Failed to load cached DMs:', e);
+        localStorage.removeItem('nostr_mail_dm_conversations');
+    }
     
     try {
         const activeRelays = getActiveRelays();
@@ -362,67 +437,169 @@ async function loadDmContacts() {
             return;
         }
 
-        // Fetch DM events from Nostr
-        const dmEvents = await tauriInvoke('fetch_direct_messages', {
+        console.log('🔄 Loading conversations...');
+        
+        // Fetch conversations from Nostr
+        const conversations = await tauriInvoke('fetch_conversations', {
             privateKey: appState.keypair.private_key,
             relays: activeRelays
         });
         
-        // Process DM events to extract contacts
-        const contacts = new Map();
-        
-        for (const event of dmEvents) {
-            // Extract recipient from tags (p tag)
-            const pTag = event.tags.find(tag => tag[0] === 'p');
-            if (pTag && pTag[1]) {
-                const pubkey = pTag[1];
-                if (!contacts.has(pubkey)) {
-                    contacts.set(pubkey, {
-                        pubkey: pubkey,
-                        lastMessage: event.content,
-                        lastMessageTime: new Date(event.created_at * 1000),
-                        messageCount: 1
-                    });
-                } else {
-                    const contact = contacts.get(pubkey);
-                    contact.messageCount++;
-                    if (event.created_at > contact.lastMessageTime.getTime() / 1000) {
-                        contact.lastMessage = event.content;
-                        contact.lastMessageTime = new Date(event.created_at * 1000);
-                    }
+        // Load cached contacts to get profile information
+        let cachedContacts = [];
+        try {
+            const cachedData = localStorage.getItem('nostr_mail_contacts');
+            if (cachedData) {
+                const parsed = JSON.parse(cachedData);
+                if (parsed.contacts) {
+                    cachedContacts = parsed.contacts;
+                    console.log(`[JS] Loaded ${cachedContacts.length} cached contacts for DM profiles`);
                 }
             }
+        } catch (e) {
+            console.warn('Failed to load cached contacts for DM profiles:', e);
         }
         
-        appState.dmContacts = Array.from(contacts.values());
+        // Convert conversations to the format expected by the UI
+        appState.dmContacts = conversations.map(conv => {
+            // Try to find this contact in the cached profiles
+            const cachedContact = cachedContacts.find(c => c.pubkey === conv.contact_pubkey);
+            
+            return {
+                pubkey: conv.contact_pubkey,
+                name: cachedContact?.name || conv.contact_name || conv.contact_pubkey.substring(0, 16) + '...',
+                lastMessage: conv.last_message,
+                lastMessageTime: new Date(conv.last_timestamp * 1000),
+                messageCount: conv.message_count,
+                picture: cachedContact?.picture_data_url || cachedContact?.picture || null,
+                profileLoaded: cachedContact !== undefined
+            };
+        });
+        
+        // Sort by most recent message
+        appState.dmContacts.sort((a, b) => b.lastMessageTime - a.lastMessageTime);
+        
+        // Render contacts immediately
         renderDmContacts();
+        
+        // Only load profiles for contacts that aren't already cached
+        const uncachedContacts = appState.dmContacts.filter(contact => !contact.profileLoaded);
+        if (uncachedContacts.length > 0) {
+            console.log(`[JS] Loading profiles for ${uncachedContacts.length} uncached DM contacts`);
+            await loadDmContactProfiles();
+        } else {
+            console.log('[JS] All DM contacts already have cached profiles');
+        }
+        
+        console.log(`✅ Loaded ${appState.dmContacts.length} conversations`);
+        
+        // Write to DM cache after successful load
+        // CACHE LOCATION: localStorage.setItem('nostr_mail_dm_conversations', ...)
+        // CACHE FORMAT: { conversations: [...], messages: {...}, timestamp: number }
+        // CACHE DURATION: 24 hours
+        // WARNING: Don't change this cache key or format without updating all references
+        const cacheData = {
+            conversations: appState.dmContacts,
+            messages: appState.dmMessages,
+            timestamp: Date.now()
+        };
+        localStorage.setItem('nostr_mail_dm_conversations', JSON.stringify(cacheData));
         
     } catch (error) {
         console.error('Failed to load DM contacts:', error);
-        showError('Failed to load DM contacts');
+        showError('Failed to load conversations');
     }
 }
 
-function renderDmContacts() {
+// Filter DM contacts based on search query
+function filterDmContacts() {
+    const searchQuery = elements.dmSearch.value.toLowerCase().trim();
+    renderDmContacts(searchQuery);
+}
+
+// Toggle DM search visibility
+function toggleDmSearch() {
+    if (elements.dmSearchContainer) {
+        const isVisible = elements.dmSearchContainer.style.display !== 'none';
+        elements.dmSearchContainer.style.display = isVisible ? 'none' : 'block';
+        
+        if (!isVisible) {
+            // Focus the search input when showing it
+            setTimeout(() => {
+                if (elements.dmSearch) {
+                    elements.dmSearch.focus();
+                }
+            }, 100);
+        } else {
+            // Clear search when hiding it
+            if (elements.dmSearch) {
+                elements.dmSearch.value = '';
+                filterDmContacts(); // Reset to show all contacts
+            }
+        }
+    }
+}
+
+function renderDmContacts(searchQuery = '') {
     if (!elements.dmContacts) return;
     
     try {
         elements.dmContacts.innerHTML = '';
         
-        if (appState.dmContacts.length === 0) {
-            elements.dmContacts.innerHTML = '<div class="text-center text-muted">No DM contacts yet</div>';
+        // Filter contacts based on search query
+        let filteredContacts = appState.dmContacts;
+        if (searchQuery) {
+            filteredContacts = appState.dmContacts.filter(contact => 
+                contact.name.toLowerCase().includes(searchQuery) ||
+                contact.pubkey.toLowerCase().includes(searchQuery) ||
+                contact.lastMessage.toLowerCase().includes(searchQuery)
+            );
+        }
+        
+        if (filteredContacts.length === 0) {
+            const message = searchQuery 
+                ? `No contacts found matching "${searchQuery}"`
+                : 'No conversations yet';
+            elements.dmContacts.innerHTML = `<div class="text-center text-muted">${message}</div>`;
             return;
         }
         
-        appState.dmContacts.forEach(contact => {
+        filteredContacts.forEach(contact => {
             const contactElement = document.createElement('div');
             contactElement.className = 'dm-contact-item';
             contactElement.dataset.pubkey = contact.pubkey;
             
+            // Format the last message time
+            const timeAgo = formatTimeAgo(contact.lastMessageTime);
+            
+            // Create preview text
+            let previewText = contact.lastMessage;
+            if (previewText.length > 50) {
+                previewText = previewText.substring(0, 50) + '...';
+            }
+            
+            // Create avatar or use picture if available
+            let avatarHtml = '';
+            if (contact.picture) {
+                avatarHtml = `<img src="${contact.picture}" alt="${contact.name}" class="contact-avatar" onerror="this.style.display='none'">`;
+            } else {
+                avatarHtml = `<div class="contact-avatar-placeholder">${contact.name.charAt(0).toUpperCase()}</div>`;
+            }
+            
             contactElement.innerHTML = `
-                <div class="dm-contact-name">${contact.pubkey.substring(0, 16)}...</div>
-                <div class="dm-contact-pubkey">${contact.pubkey}</div>
-                <div class="dm-contact-preview">${contact.lastMessage.substring(0, 50)}...</div>
+                <div class="dm-contact-avatar">
+                    ${avatarHtml}
+                </div>
+                <div class="dm-contact-content">
+                    <div class="dm-contact-header">
+                        <div class="dm-contact-name">${contact.name}</div>
+                        <div class="dm-contact-time">${timeAgo}</div>
+                    </div>
+                    <div class="dm-contact-preview">${previewText}</div>
+                    <div class="dm-contact-meta">
+                        <span class="dm-message-count">${contact.messageCount} message${contact.messageCount !== 1 ? 's' : ''}</span>
+                    </div>
+                </div>
             `;
             
             contactElement.addEventListener('click', () => selectDmContact(contact));
@@ -430,6 +607,54 @@ function renderDmContacts() {
         });
     } catch (error) {
         console.error('Error rendering DM contacts:', error);
+    }
+}
+
+// New function to load profiles for DM contacts
+async function loadDmContactProfiles() {
+    // Only process contacts that don't already have profiles loaded
+    const uncachedContacts = appState.dmContacts.filter(contact => !contact.profileLoaded);
+    
+    if (uncachedContacts.length === 0) {
+        console.log('[JS] All DM contacts already have profiles loaded');
+        return;
+    }
+    
+    try {
+        const activeRelays = getActiveRelays();
+        if (activeRelays.length === 0) return;
+        
+        console.log(`[JS] Loading profiles for ${uncachedContacts.length} uncached DM contacts`);
+        
+        // Fetch profiles for uncached DM contacts
+        const pubkeys = uncachedContacts.map(contact => contact.pubkey);
+        const profiles = await tauriInvoke('fetch_profiles', {
+            pubkeys: pubkeys,
+            relays: activeRelays
+        });
+        
+        // Update contacts with profile information
+        for (const profile of profiles) {
+            const contactIndex = appState.dmContacts.findIndex(c => c.pubkey === profile.pubkey);
+            if (contactIndex !== -1) {
+                const contact = appState.dmContacts[contactIndex];
+                contact.name = profile.fields.name || profile.fields.display_name || contact.pubkey.substring(0, 16) + '...';
+                contact.picture = profile.fields.picture || null;
+                contact.profileLoaded = true;
+                
+                // Update the contact in the array
+                appState.dmContacts[contactIndex] = contact;
+            }
+        }
+        
+        // Re-render with updated names and pictures
+        renderDmContacts();
+        
+        console.log(`[JS] Updated ${profiles.length} DM contact profiles`);
+        
+    } catch (error) {
+        console.error('Failed to load DM contact profiles:', error);
+        // Don't show error to user as this is just for display enhancement
     }
 }
 
@@ -450,20 +675,16 @@ function selectDmContact(contact) {
         // Load messages for this contact
         loadDmMessages(contact.pubkey);
         
-        // Show compose area
-        if (elements.dmCompose) {
-            elements.dmCompose.style.display = 'block';
-        }
-        if (elements.dmRecipient) {
-            elements.dmRecipient.value = contact.pubkey;
-        }
     } catch (error) {
         console.error('Error selecting DM contact:', error);
     }
 }
 
 async function loadDmMessages(contactPubkey) {
-    if (!appState.keypair) return;
+    if (!appState.keypair) {
+        showError('No keypair available');
+        return;
+    }
     
     try {
         const activeRelays = getActiveRelays();
@@ -471,42 +692,41 @@ async function loadDmMessages(contactPubkey) {
             showError('No active relays configured');
             return;
         }
-        const dmEvents = await tauriInvoke('fetch_direct_messages', {
+
+        console.log(`🔄 Loading messages for ${contactPubkey}...`);
+        
+        // Fetch conversation messages from Nostr
+        const messages = await tauriInvoke('fetch_conversation_messages', {
             privateKey: appState.keypair.private_key,
+            contactPubkey: contactPubkey,
             relays: activeRelays
         });
         
-        // Filter messages for this contact
-        const messages = dmEvents.filter(event => {
-            const pTag = event.tags.find(tag => tag[0] === 'p');
-            return pTag && pTag[1] === contactPubkey;
-        });
+        // Convert to the format expected by the UI
+        const formattedMessages = messages.map(msg => ({
+            id: msg.id,
+            content: msg.content,
+            created_at: msg.timestamp,
+            pubkey: msg.sender_pubkey,
+            is_sent: msg.is_sent
+        }));
         
-        // Decrypt messages
-        const decryptedMessages = [];
-        for (const event of messages) {
-            try {
-                const decrypted = await tauriInvoke('decrypt_dm_content', {
-                    privateKey: appState.keypair.private_key,
-                    senderPubkey: event.pubkey,
-                    encryptedContent: event.content
-                });
-                
-                decryptedMessages.push({
-                    ...event,
-                    decryptedContent: decrypted,
-                    isSent: event.pubkey === appState.keypair.public_key
-                });
-            } catch (error) {
-                console.error('Failed to decrypt message:', error);
-            }
-        }
-        
-        // Sort by timestamp
-        decryptedMessages.sort((a, b) => a.created_at - b.created_at);
-        
-        appState.dmMessages[contactPubkey] = decryptedMessages;
+        appState.dmMessages[contactPubkey] = formattedMessages;
         renderDmMessages(contactPubkey);
+        
+        console.log(`✅ Loaded ${formattedMessages.length} messages`);
+        
+        // Write to DM cache after loading messages
+        // CACHE LOCATION: localStorage.setItem('nostr_mail_dm_conversations', ...)
+        // CACHE FORMAT: { conversations: [...], messages: {...}, timestamp: number }
+        // CACHE DURATION: 24 hours
+        // WARNING: Don't change this cache key or format without updating all references
+        const cacheData = {
+            conversations: appState.dmContacts,
+            messages: appState.dmMessages,
+            timestamp: Date.now()
+        };
+        localStorage.setItem('nostr_mail_dm_conversations', JSON.stringify(cacheData));
         
     } catch (error) {
         console.error('Failed to load DM messages:', error);
@@ -519,31 +739,70 @@ function renderDmMessages(contactPubkey) {
     
     try {
         const messages = appState.dmMessages[contactPubkey] || [];
+        const contact = appState.dmContacts.find(c => c.pubkey === contactPubkey);
         
         elements.dmMessages.innerHTML = '';
         
         if (messages.length === 0) {
-            elements.dmMessages.innerHTML = '<div class="text-center text-muted">No messages yet</div>';
+            elements.dmMessages.innerHTML = `
+                <div class="text-center text-muted" style="padding: 2rem;">
+                    <i class="fas fa-comments" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
+                    <p>No messages yet</p>
+                    <p>Start a conversation with ${contact ? contact.name : 'this contact'}!</p>
+                </div>
+            `;
             return;
         }
         
+        // Create conversation header
+        const headerElement = document.createElement('div');
+        headerElement.className = 'conversation-header';
+        headerElement.innerHTML = `
+            <div class="conversation-contact-info">
+                <div class="conversation-contact-name">${contact ? contact.name : contactPubkey}</div>
+                <div class="conversation-contact-pubkey">${contactPubkey}</div>
+            </div>
+        `;
+        elements.dmMessages.appendChild(headerElement);
+        
+        // Create messages container
+        const messagesContainer = document.createElement('div');
+        messagesContainer.className = 'messages-container';
+        
         messages.forEach(message => {
             const messageElement = document.createElement('div');
-            messageElement.className = `dm-message ${message.isSent ? 'sent' : 'received'}`;
+            messageElement.className = `message ${message.is_sent ? 'message-sent' : 'message-received'}`;
+            
+            const time = new Date(message.created_at * 1000).toLocaleTimeString([], { 
+                hour: '2-digit', 
+                minute: '2-digit' 
+            });
             
             messageElement.innerHTML = `
-                <div class="dm-message-bubble">${message.decryptedContent}</div>
-                <div class="dm-message-time">${new Date(message.created_at * 1000).toLocaleString()}</div>
+                <div class="message-content">
+                    <div class="message-text">${escapeHtml(message.content)}</div>
+                    <div class="message-time">${time}</div>
+                </div>
             `;
             
-            elements.dmMessages.appendChild(messageElement);
+            messagesContainer.appendChild(messageElement);
         });
         
+        elements.dmMessages.appendChild(messagesContainer);
+        
         // Scroll to bottom
-        elements.dmMessages.scrollTop = elements.dmMessages.scrollHeight;
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        
     } catch (error) {
         console.error('Error rendering DM messages:', error);
     }
+}
+
+// Helper function to escape HTML
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 
 async function sendDirectMessage() {
@@ -574,6 +833,19 @@ async function sendDirectMessage() {
             relays: activeRelays
         });
         
+        // Clear the message input
+        if (elements.dmMessage) {
+            elements.dmMessage.value = '';
+        }
+        
+        // Refresh the conversation list to show the new message
+        await loadDmContacts();
+        
+        // If we have a selected contact, reload their messages
+        if (appState.selectedDmContact && appState.selectedDmContact.pubkey === recipientPubkey) {
+            await loadDmMessages(recipientPubkey);
+        }
+        
         showSuccess('DM sent successfully');
         
     } catch (error) {
@@ -593,20 +865,9 @@ function showNewDmCompose() {
         
         // Clear messages
         if (elements.dmMessages) {
-            elements.dmMessages.innerHTML = '<div class="text-center text-muted">Select a contact or enter a new recipient</div>';
+            elements.dmMessages.innerHTML = '<div class="text-center text-muted">Select a contact to start a conversation</div>';
         }
         
-        // Show compose area
-        if (elements.dmCompose) {
-            elements.dmCompose.style.display = 'block';
-        }
-        if (elements.dmRecipient) {
-            elements.dmRecipient.value = '';
-        }
-        if (elements.dmMessage) {
-            elements.dmMessage.value = '';
-            elements.dmRecipient.focus();
-        }
     } catch (error) {
         console.error('Error showing new DM compose:', error);
     }
@@ -854,6 +1115,10 @@ async function loadContacts() {
     console.log('[JS] loadContacts called');
     
     // Try to load from cache first for instant display
+    // CACHE LOCATION: localStorage.getItem('nostr_mail_contacts')
+    // CACHE FORMAT: { contacts: [...], timestamp: number }
+    // CACHE DURATION: 24 hours
+    // WARNING: Don't change this cache key or format without updating all references
     try {
         const cachedData = localStorage.getItem('nostr_mail_contacts');
         if (cachedData) {
@@ -921,6 +1186,10 @@ async function loadContacts() {
         updateContactsInPlace(newContacts);
 
         // Cache the contacts immediately (without images) with timestamp
+        // CACHE LOCATION: localStorage.setItem('nostr_mail_contacts', ...)
+        // CACHE FORMAT: { contacts: [...], timestamp: number }
+        // CACHE DURATION: 24 hours
+        // WARNING: Don't change this cache key or format without updating all references
         const cacheData = {
             contacts: appState.contacts,
             timestamp: Date.now()
@@ -978,6 +1247,10 @@ async function loadContactImagesProgressively() {
         await Promise.all(imagePromises);
         
         // Update cache after each batch
+        // CACHE LOCATION: localStorage.setItem('nostr_mail_contacts', ...)
+        // CACHE FORMAT: { contacts: [...], timestamp: number }
+        // CACHE DURATION: 24 hours
+        // WARNING: Don't change this cache key or format without updating all references
         const cacheData = {
             contacts: appState.contacts,
             timestamp: Date.now()
@@ -1037,14 +1310,24 @@ function renderContactItem(index) {
     }
 }
 
-function renderContacts() {
+function renderContacts(searchQuery = '') {
     if (!elements.contactsList) return;
 
     try {
         elements.contactsList.innerHTML = '';
 
-        if (appState.contacts && appState.contacts.length > 0) {
-            appState.contacts.forEach((contact, index) => {
+        // Filter contacts based on search query
+        let filteredContacts = appState.contacts;
+        if (searchQuery) {
+            filteredContacts = appState.contacts.filter(contact => 
+                contact.name.toLowerCase().includes(searchQuery) ||
+                contact.pubkey.toLowerCase().includes(searchQuery) ||
+                (contact.email && contact.email.toLowerCase().includes(searchQuery))
+            );
+        }
+
+        if (filteredContacts && filteredContacts.length > 0) {
+            filteredContacts.forEach((contact, index) => {
                 const contactElement = document.createElement('div');
                 contactElement.className = 'contact-item';
                 contactElement.setAttribute('data-pubkey', contact.pubkey);
@@ -1089,7 +1372,10 @@ function renderContacts() {
                 elements.contactsList.appendChild(contactElement);
             });
         } else {
-            elements.contactsList.innerHTML = '<div class="text-muted text-center">You are not following anyone yet, or contacts could not be loaded.</div>';
+            const message = searchQuery 
+                ? `No contacts found matching "${searchQuery}"`
+                : 'You are not following anyone yet, or contacts could not be loaded.';
+            elements.contactsList.innerHTML = `<div class="text-muted text-center">${message}</div>`;
         }
     } catch (error) {
         console.error('Error rendering contacts:', error);
@@ -1649,7 +1935,8 @@ function toggleDarkMode() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    // ... existing code ...
+    console.log('🌐 DOM loaded - Initializing Nostr Mail interface...');
+    
     // Set initial dark mode from localStorage
     const darkPref = localStorage.getItem('darkMode');
     setDarkMode(darkPref === '1');
@@ -1658,6 +1945,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (darkToggle) {
         darkToggle.addEventListener('click', toggleDarkMode);
     }
+    
+    console.log('🎨 Dark mode initialized:', darkPref === '1' ? 'enabled' : 'disabled');
 });
 
 // Initialize app when DOM is loaded
@@ -1884,6 +2173,10 @@ async function refreshContacts() {
     console.log('[JS] Refreshing contacts...');
     
     // Clear the cache
+    // CACHE LOCATION: localStorage.removeItem('nostr_mail_contacts')
+    // CACHE FORMAT: { contacts: [...], timestamp: number }
+    // CACHE DURATION: 24 hours
+    // WARNING: Don't change this cache key or format without updating all references
     localStorage.removeItem('nostr_mail_contacts');
     
     // Don't clear the contacts list - let the in-place update handle it
@@ -2135,4 +2428,85 @@ function updateContactsInPlace(newContacts) {
     renderContacts();
     
     console.log(`[JS] Updated contacts: ${updatedContacts.length} total (${newContacts.length} from network)`);
+}
+
+// New function to refresh DM conversations
+async function refreshDmConversations() {
+    console.log('[JS] Refreshing DM conversations...');
+    
+    // Clear DM cache
+    // CACHE LOCATION: localStorage.removeItem('nostr_mail_dm_conversations')
+    // CACHE FORMAT: { conversations: [...], messages: {...}, timestamp: number }
+    // CACHE DURATION: 24 hours
+    // WARNING: Don't change this cache key or format without updating all references
+    localStorage.removeItem('nostr_mail_dm_conversations');
+    
+    try {
+        // Clear current conversations
+        appState.dmContacts = [];
+        appState.dmMessages = {};
+        appState.selectedDmContact = null;
+        
+        // Clear the UI
+        if (elements.dmContacts) {
+            elements.dmContacts.innerHTML = '<div class="text-center text-muted">Loading conversations...</div>';
+        }
+        if (elements.dmMessages) {
+            elements.dmMessages.innerHTML = '<div class="text-center text-muted">Select a conversation to view messages</div>';
+        }
+        
+        // Reload conversations
+        await loadDmContacts();
+        
+        showSuccess('Conversations refreshed');
+        
+    } catch (error) {
+        console.error('Failed to refresh DM conversations:', error);
+        showError('Failed to refresh conversations');
+    }
+}
+
+// Helper function to format time ago
+function formatTimeAgo(date) {
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+    
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    
+    return date.toLocaleDateString();
+}
+
+// Filter contacts based on search query
+function filterContacts() {
+    const searchQuery = elements.contactsSearch.value.toLowerCase().trim();
+    renderContacts(searchQuery);
+}
+
+// Toggle contacts search visibility
+function toggleContactsSearch() {
+    if (elements.contactsSearchContainer) {
+        const isVisible = elements.contactsSearchContainer.style.display !== 'none';
+        elements.contactsSearchContainer.style.display = isVisible ? 'none' : 'block';
+        
+        if (!isVisible) {
+            // Focus the search input when showing it
+            setTimeout(() => {
+                if (elements.contactsSearch) {
+                    elements.contactsSearch.focus();
+                }
+            }, 100);
+        } else {
+            // Clear search when hiding it
+            if (elements.contactsSearch) {
+                elements.contactsSearch.value = '';
+                filterContacts(); // Reset to show all contacts
+            }
+        }
+    }
 }

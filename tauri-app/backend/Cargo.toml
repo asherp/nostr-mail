@@ -20,7 +20,7 @@ tauri = { version = "2.0.0-beta", features = [] }
 tauri-plugin-opener = "2.0.0-beta"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-nostr-sdk = { version = "0.42.0", features = ["nip44", "nip59"] }
+nostr-sdk = { version = "0.42.0", features = ["nip04", "nip44", "nip59"] }
 anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
 lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
@@ -30,6 +30,11 @@ reqwest = "0.12"
 base64 = "0.22"
 mime_guess = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
+aes-gcm = "0.10"
+hex = "0.4"
+block-modes = "0.9"
+cipher = "0.4"
+secp256k1 = { version = "0.28", features = ["rand"] }
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem

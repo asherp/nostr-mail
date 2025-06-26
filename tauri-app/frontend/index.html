@@ -93,8 +93,11 @@
             <!-- Direct Messages Tab -->
             <div class="tab-content" id="dm">
                 <div class="tab-header">
-                    <h2>Direct Messages</h2>
+                    <h2>Search</h2>
                     <div class="dm-actions">
+                        <button id="dm-search-toggle" class="btn btn-secondary">
+                            <i class="fas fa-search"></i> Search
+                        </button>
                         <button id="new-dm-btn" class="btn btn-primary">
                             <i class="fas fa-plus"></i> New DM
                         </button>
@@ -102,6 +105,11 @@
                             <i class="fas fa-sync"></i> Refresh
                         </button>
                     </div>
+                </div>
+                
+                <div class="dm-search-container" id="dm-search-container" style="display: none;">
+                    <input type="text" id="dm-search" placeholder="Search conversations..." class="dm-search-input">
+                    <i class="fas fa-search dm-search-icon"></i>
                 </div>
                 
                 <div class="dm-container">
@@ -114,24 +122,6 @@
                         <div class="dm-messages" id="dm-messages">
                             <!-- DM messages will be populated here -->
                         </div>
-                        
-                        <div class="dm-compose" id="dm-compose" style="display: none;">
-                            <div class="form-group">
-                                <label for="dm-recipient">To:</label>
-                                <input type="text" id="dm-recipient" placeholder="npub1...">
-                            </div>
-                            
-                            <div class="form-group">
-                                <label for="dm-message">Message:</label>
-                                <textarea id="dm-message" rows="4" placeholder="Type your message..."></textarea>
-                            </div>
-                            
-                            <div class="form-actions">
-                                <button id="send-dm-btn" class="btn btn-primary">
-                                    <i class="fas fa-paper-plane"></i> Send DM
-                                </button>
-                            </div>
-                        </div>
                     </div>
                 </div>
             </div>
@@ -141,6 +131,9 @@
                 <div class="tab-header">
                     <h2>Contacts</h2>
                     <div class="contacts-actions">
+                        <button id="contacts-search-toggle" class="btn btn-secondary">
+                            <i class="fas fa-search"></i> Search
+                        </button>
                         <button id="refresh-contacts-btn" class="btn btn-secondary">
                             <i class="fas fa-sync"></i> Refresh
                         </button>
@@ -148,6 +141,11 @@
                             <i class="fas fa-plus"></i> Add Contact
                         </button>
                     </div>
+                </div>
+                
+                <div class="contacts-search-container" id="contacts-search-container" style="display: none;">
+                    <input type="text" id="contacts-search" placeholder="Search contacts..." class="contacts-search-input">
+                    <i class="fas fa-search contacts-search-icon"></i>
                 </div>
                 
                 <div class="contacts-container">

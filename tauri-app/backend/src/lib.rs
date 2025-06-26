@@ -56,6 +56,18 @@ async fn fetch_direct_messages(private_key: String, relays: Vec<String>) -> Resu
 }
 
 #[tauri::command]
+async fn fetch_conversations(private_key: String, relays: Vec<String>) -> Result<Vec<nostr::Conversation>, String> {
+    println!("[RUST] fetch_conversations called");
+    nostr::fetch_conversations(&private_key, &relays).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_conversation_messages(private_key: String, contact_pubkey: String, relays: Vec<String>) -> Result<Vec<nostr::ConversationMessage>, String> {
+    println!("[RUST] fetch_conversation_messages called for contact: {}", contact_pubkey);
+    nostr::fetch_conversation_messages(&private_key, &contact_pubkey, &relays).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn fetch_profile(pubkey: String, relays: Vec<String>) -> Result<Option<ProfileResult>, String> {
     println!("[RUST] fetch_profile called for pubkey: {}", pubkey);
     let events = nostr::fetch_events(&pubkey, Some(0), &relays)
@@ -127,6 +139,37 @@ async fn fetch_image(url: String) -> Result<String, String> {
     nostr::fetch_image_as_data_url(&url).await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn fetch_profiles(pubkeys: Vec<String>, relays: Vec<String>) -> Result<Vec<ProfileResult>, String> {
+    println!("[RUST] fetch_profiles called for {} pubkeys", pubkeys.len());
+    let mut profiles = Vec::new();
+    
+    for pubkey in pubkeys {
+        match fetch_profile(pubkey.clone(), relays.clone()).await {
+            Ok(Some(profile)) => profiles.push(profile),
+            Ok(None) => {
+                // Create a placeholder profile for contacts without profiles
+                profiles.push(ProfileResult {
+                    pubkey: pubkey.clone(),
+                    fields: std::collections::HashMap::new(),
+                    raw_content: "{}".to_string(),
+                });
+            },
+            Err(e) => {
+                println!("[RUST] Error fetching profile for {}: {}", pubkey, e);
+                // Create a placeholder profile for failed fetches
+                profiles.push(ProfileResult {
+                    pubkey: pubkey.clone(),
+                    fields: std::collections::HashMap::new(),
+                    raw_content: "{}".to_string(),
+                });
+            }
+        }
+    }
+    
+    Ok(profiles)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("[RUST] Starting nostr-mail application...");
@@ -149,6 +192,8 @@ pub fn run() {
         get_public_key_from_private,
         send_direct_message,
         fetch_direct_messages,
+        fetch_conversations,
+        fetch_conversation_messages,
         fetch_profile,
         fetch_following_profiles,
         get_relays,
@@ -158,6 +203,7 @@ pub fn run() {
         send_email,
         fetch_emails,
         fetch_image,
+        fetch_profiles,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     

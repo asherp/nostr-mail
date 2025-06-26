@@ -28,6 +28,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
+name = "aes-gcm"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ghash",
+ "subtle",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -419,6 +444,12 @@ checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
 ]
+
+[[package]]
+name = "block-modes"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e2211b0817f061502a8dd9f11a37e879e79763e3c698d2418cf824d8cb2f21e"
 
 [[package]]
 name = "block-padding"
@@ -862,6 +893,15 @@ checksum = "32a2785755761f3ddc1492979ce1e48d2c00d09311c39e4466429188f3dd6501"
 dependencies = [
  "quote",
  "syn 2.0.104",
+]
+
+[[package]]
+name = "ctr"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -1526,6 +1566,16 @@ dependencies = [
  "libc",
  "r-efi",
  "wasi 0.14.2+wasi-0.2.4",
+]
+
+[[package]]
+name = "ghash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
+dependencies = [
+ "opaque-debug",
+ "polyval",
 ]
 
 [[package]]
@@ -2639,6 +2689,7 @@ version = "0.42.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9c1891da0e58e7eb48a1d2cd704a16f39a61bac3564a1426b26621e21073594"
 dependencies = [
+ "aes",
  "base64 0.22.1",
  "bech32",
  "bip39",
@@ -2650,7 +2701,7 @@ dependencies = [
  "instant",
  "regex",
  "scrypt",
- "secp256k1",
+ "secp256k1 0.29.1",
  "serde",
  "serde_json",
  "unicode-normalization",
@@ -2672,15 +2723,20 @@ dependencies = [
 name = "nostr-mail"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64 0.22.1",
+ "block-modes",
  "chrono",
+ "cipher",
+ "hex",
  "imap",
  "lettre",
  "mime_guess",
  "native-tls",
  "nostr-sdk",
  "reqwest",
+ "secp256k1 0.28.2",
  "serde",
  "serde_json",
  "tauri",
@@ -3366,6 +3422,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyval"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3903,13 +3971,32 @@ dependencies = [
 
 [[package]]
 name = "secp256k1"
+version = "0.28.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d24b59d129cdadea20aea4fb2352fa053712e5d713eee47d700cd4b2bc002f10"
+dependencies = [
+ "rand 0.8.5",
+ "secp256k1-sys 0.9.2",
+]
+
+[[package]]
+name = "secp256k1"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
 dependencies = [
  "rand 0.8.5",
- "secp256k1-sys",
+ "secp256k1-sys 0.10.1",
  "serde",
+]
+
+[[package]]
+name = "secp256k1-sys"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5d1746aae42c19d583c3c1a8c646bfad910498e2051c551a7f2e3c0c9fbb7eb"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

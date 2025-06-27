@@ -93,6 +93,7 @@ const elements = {
     generateKeyBtn: getElement('generate-key-btn'),
     publicKeyDisplay: getElement('public-key-display'),
     copyPubkeyBtn: getElement('copy-pubkey-btn'),
+    emailProvider: getElement('email-provider'),
     emailAddress: getElement('email-address'),
     emailPassword: getElement('email-password'),
     smtpHost: getElement('smtp-host'),
@@ -101,7 +102,12 @@ const elements = {
     imapPort: getElement('imap-port'),
     useTls: getElement('use-tls'),
     saveSettingsBtn: getElement('save-settings-btn'),
-    testConnectionBtn: getElement('test-connection-btn')
+    testConnectionBtn: getElement('test-connection-btn'),
+    testEmailConnectionBtn: getElement('test-email-connection-btn'),
+    copyNprivBtn: getElement('copy-npriv-btn'),
+    copyEmailPasswordBtn: getElement('copy-email-password-btn'),
+    toggleNprivVisibilityBtn: getElement('toggle-npriv-visibility-btn'),
+    toggleEmailPasswordVisibilityBtn: getElement('toggle-email-password-visibility-btn'),
 };
 
 // Helper function to safely call Tauri commands
@@ -176,7 +182,8 @@ async function initApp() {
         
         console.log('📬 Loading initial data...');
         // Load initial data
-        // await loadContacts(); // No longer needed here, handled by tab switching
+        // Load contacts first so DM contacts can access cached profile photos
+        await loadContacts();
         await loadEmails();
         await loadDmContacts();
         
@@ -240,6 +247,7 @@ function setupEventListeners() {
         
         // Compose form
         if (elements.sendBtn) {
+            console.log('[JS] Setting up send button event listener');
             elements.sendBtn.addEventListener('click', sendEmail);
         }
         if (elements.saveDraftBtn) {
@@ -304,14 +312,34 @@ function setupEventListeners() {
         if (elements.testConnectionBtn) {
             elements.testConnectionBtn.addEventListener('click', testConnection);
         }
+        if (elements.testEmailConnectionBtn) {
+            elements.testEmailConnectionBtn.addEventListener('click', testEmailConnection);
+        }
         if (elements.generateKeyBtn) {
             elements.generateKeyBtn.addEventListener('click', generateNewKeypair);
         }
         if (elements.copyPubkeyBtn) {
             elements.copyPubkeyBtn.addEventListener('click', copyPublicKey);
         }
+        if (elements.copyNprivBtn) {
+            elements.copyNprivBtn.addEventListener('click', copyNprivKey);
+        }
+        if (elements.copyEmailPasswordBtn) {
+            elements.copyEmailPasswordBtn.addEventListener('click', copyEmailPassword);
+        }
+        if (elements.toggleNprivVisibilityBtn) {
+            elements.toggleNprivVisibilityBtn.addEventListener('click', toggleNprivVisibility);
+        }
+        if (elements.toggleEmailPasswordVisibilityBtn) {
+            elements.toggleEmailPasswordVisibilityBtn.addEventListener('click', toggleEmailPasswordVisibility);
+        }
         if (elements.nprivKey) {
             elements.nprivKey.addEventListener('input', updatePublicKeyDisplay);
+        }
+        
+        // Email provider selection
+        if (elements.emailProvider) {
+            elements.emailProvider.addEventListener('change', handleEmailProviderChange);
         }
         
         // Contacts
@@ -354,7 +382,13 @@ function switchTab(tabName) {
         loadRelays();
     }
     if (tabName === 'contacts') {
-        loadContacts();
+        // Only load contacts if they haven't been loaded yet
+        if (!appState.contacts || appState.contacts.length === 0) {
+            loadContacts();
+        } else {
+            // Just render the existing contacts
+            renderContacts();
+        }
     }
 }
 
@@ -397,47 +431,112 @@ async function loadKeypair() {
 
 // DM Functions
 async function loadDmContacts() {
+    console.log('[JS] loadDmContacts called - starting DM loading...');
+    
     if (!appState.keypair) {
         showError('No keypair available');
         return;
     }
 
-    // Try to load from cache first for instant display
-    // CACHE LOCATION: localStorage.getItem('nostr_mail_dm_conversations')
-    // CACHE FORMAT: { conversations: [...], messages: {...}, timestamp: number }
-    // CACHE DURATION: 24 hours
-    // WARNING: Don't change this cache key or format without updating all references
+    // Load cached contacts to get profile information (needed for both cached and network data)
+    let cachedContacts = [];
     try {
-        const cachedData = localStorage.getItem('nostr_mail_dm_conversations');
-        if (cachedData) {
-            const parsed = JSON.parse(cachedData);
-            const cacheAge = Date.now() - (parsed.timestamp || 0);
-            const maxAge = 24 * 60 * 60 * 1000; // 24 hours
-            if (cacheAge < maxAge && parsed.conversations && parsed.messages) {
-                console.log('[JS] Found valid cached DMs, rendering immediately...');
-                appState.dmContacts = parsed.conversations;
-                appState.dmMessages = parsed.messages;
-                renderDmContacts();
-            } else {
-                console.log('[JS] DM cache expired or invalid, will fetch fresh data...');
-                localStorage.removeItem('nostr_mail_dm_conversations');
+        cachedContacts = await tauriInvoke('get_contacts');
+        if (cachedContacts && cachedContacts.length > 0) {
+            console.log(`[JS] Loaded ${cachedContacts.length} cached contacts for DM profiles`);
+            
+            // Debug: Check if Aria and EllyPembroke have picture_data_url
+            const ariaContact = cachedContacts.find(c => c.name === 'Aria' || c.name?.includes('Aria'));
+            const ellyContact = cachedContacts.find(c => c.name === 'EllyPembroke' || c.name?.includes('EllyPembroke'));
+            
+            if (ariaContact) {
+                console.log('[JS] Aria contact from backend:', {
+                    name: ariaContact.name,
+                    pubkey: ariaContact.pubkey,
+                    hasPictureDataUrl: !!ariaContact.picture_data_url,
+                    pictureDataUrlLength: ariaContact.picture_data_url?.length || 0
+                });
             }
-        } else {
-            console.log('[JS] No cached DMs found.');
+            if (ellyContact) {
+                console.log('[JS] EllyPembroke contact from backend:', {
+                    name: ellyContact.name,
+                    pubkey: ellyContact.pubkey,
+                    hasPictureDataUrl: !!ellyContact.picture_data_url,
+                    pictureDataUrlLength: ellyContact.picture_data_url?.length || 0
+                });
+            }
+            
+            // Debug: Show all cached contact names and pubkeys
+            console.log('[JS] All cached contact names:', cachedContacts.map(c => ({ name: c.name, pubkey: c.pubkey })));
         }
     } catch (e) {
-        console.warn('Failed to load cached DMs:', e);
-        localStorage.removeItem('nostr_mail_dm_conversations');
+        console.warn('Failed to load cached contacts for DM profiles:', e);
+    }
+
+    // Try to load from backend storage first for instant display
+    let cacheLoaded = false;
+    try {
+        console.log('[JS] Loading DM conversations from backend storage...');
+        const cachedData = await tauriInvoke('get_conversations');
+        
+        if (cachedData && cachedData.length > 0) {
+            console.log('[JS] Found cached DM conversations in backend, rendering immediately...');
+            
+            // Convert conversations to the format expected by the UI, using cached contact profiles
+            appState.dmContacts = cachedData.map(conv => {
+                // Try to find this contact in the cached profiles
+                const cachedContact = cachedContacts.find(c => c.pubkey === conv.contact_pubkey);
+                
+                return {
+                    pubkey: conv.contact_pubkey,
+                    name: cachedContact?.name || conv.contact_name || conv.contact_pubkey.substring(0, 16) + '...',
+                    lastMessage: conv.last_message,
+                    lastMessageTime: new Date(conv.last_timestamp * 1000),
+                    messageCount: conv.message_count,
+                    picture_data_url: cachedContact?.picture_data_url || cachedContact?.picture || null,
+                    profileLoaded: cachedContact !== undefined
+                };
+            });
+            
+            // Load messages from cached data
+            appState.dmMessages = {};
+            cachedData.forEach(conv => {
+                if (conv.messages && conv.messages.length > 0) {
+                    appState.dmMessages[conv.contact_pubkey] = conv.messages.map(msg => ({
+                        id: msg.id,
+                        content: msg.content,
+                        created_at: msg.timestamp,
+                        pubkey: msg.sender_pubkey,
+                        is_sent: msg.is_sent
+                    }));
+                }
+            });
+            
+            // Sort by most recent message
+            appState.dmContacts.sort((a, b) => b.lastMessageTime - a.lastMessageTime);
+            
+            renderDmContacts();
+            cacheLoaded = true;
+            
+            console.log('[JS] DM conversations loaded from backend storage with profile data');
+        } else {
+            console.log('[JS] No cached DM conversations found in backend storage.');
+        }
+    } catch (e) {
+        console.warn('Failed to load cached DM conversations from backend:', e);
     }
     
+    // Try to fetch fresh data from network (but don't fail if offline)
     try {
         const activeRelays = getActiveRelays();
         if (activeRelays.length === 0) {
-            showError('No active relays configured');
+            if (!cacheLoaded) {
+                showError('No active relays configured');
+            }
             return;
         }
 
-        console.log('🔄 Loading conversations...');
+        console.log('🔄 Loading conversations from network...');
         
         // Fetch conversations from Nostr
         const conversations = await tauriInvoke('fetch_conversations', {
@@ -445,69 +544,89 @@ async function loadDmContacts() {
             relays: activeRelays
         });
         
-        // Load cached contacts to get profile information
-        let cachedContacts = [];
-        try {
-            const cachedData = localStorage.getItem('nostr_mail_contacts');
-            if (cachedData) {
-                const parsed = JSON.parse(cachedData);
-                if (parsed.contacts) {
-                    cachedContacts = parsed.contacts;
-                    console.log(`[JS] Loaded ${cachedContacts.length} cached contacts for DM profiles`);
-                }
-            }
-        } catch (e) {
-            console.warn('Failed to load cached contacts for DM profiles:', e);
-        }
-        
-        // Convert conversations to the format expected by the UI
-        appState.dmContacts = conversations.map(conv => {
-            // Try to find this contact in the cached profiles
-            const cachedContact = cachedContacts.find(c => c.pubkey === conv.contact_pubkey);
-            
-            return {
-                pubkey: conv.contact_pubkey,
-                name: cachedContact?.name || conv.contact_name || conv.contact_pubkey.substring(0, 16) + '...',
-                lastMessage: conv.last_message,
-                lastMessageTime: new Date(conv.last_timestamp * 1000),
-                messageCount: conv.message_count,
-                picture: cachedContact?.picture_data_url || cachedContact?.picture || null,
-                profileLoaded: cachedContact !== undefined
-            };
+        console.log('[JS] Network response:', {
+            conversationsReceived: !!conversations,
+            conversationsLength: conversations?.length || 0
         });
         
-        // Sort by most recent message
-        appState.dmContacts.sort((a, b) => b.lastMessageTime - a.lastMessageTime);
-        
-        // Render contacts immediately
-        renderDmContacts();
-        
-        // Only load profiles for contacts that aren't already cached
-        const uncachedContacts = appState.dmContacts.filter(contact => !contact.profileLoaded);
-        if (uncachedContacts.length > 0) {
-            console.log(`[JS] Loading profiles for ${uncachedContacts.length} uncached DM contacts`);
-            await loadDmContactProfiles();
+        // Only update if we actually got conversations from the network
+        if (conversations && conversations.length > 0) {
+            // Convert conversations to the format expected by the UI, using cached contact profiles
+            appState.dmContacts = conversations.map(conv => {
+                // Try to find this contact in the cached profiles
+                const cachedContact = cachedContacts.find(c => c.pubkey === conv.contact_pubkey);
+                
+                // Store the messages from the conversation data
+                if (conv.messages && conv.messages.length > 0) {
+                    appState.dmMessages[conv.contact_pubkey] = conv.messages.map(msg => ({
+                        id: msg.id,
+                        content: msg.content,
+                        created_at: msg.timestamp,
+                        pubkey: msg.sender_pubkey,
+                        is_sent: msg.is_sent
+                    }));
+                }
+                
+                return {
+                    pubkey: conv.contact_pubkey,
+                    name: cachedContact?.name || conv.contact_name || conv.contact_pubkey.substring(0, 16) + '...',
+                    lastMessage: conv.last_message,
+                    lastMessageTime: new Date(conv.last_timestamp * 1000),
+                    messageCount: conv.message_count,
+                    picture_data_url: cachedContact?.picture_data_url || cachedContact?.picture || null,
+                    profileLoaded: cachedContact !== undefined
+                };
+            });
+            
+            // Sort by most recent message
+            appState.dmContacts.sort((a, b) => b.lastMessageTime - a.lastMessageTime);
+            
+            // Render contacts immediately
+            renderDmContacts();
+            
+            // Only load profiles for contacts that aren't already cached
+            const uncachedContacts = appState.dmContacts.filter(contact => !contact.profileLoaded);
+            if (uncachedContacts.length > 0) {
+                console.log(`[JS] Loading profiles for ${uncachedContacts.length} uncached DM contacts`);
+                await loadDmContactProfiles();
+            } else {
+                console.log('[JS] All DM contacts already have cached profiles');
+            }
+            
+            console.log(`✅ Loaded ${appState.dmContacts.length} conversations from network`);
+            
+            // Write to backend storage after successful load
+            try {
+                // Add cached_at field to conversations before saving
+                const conversationsWithTimestamp = conversations.map(conv => ({
+                    ...conv,
+                    cached_at: new Date().toISOString()
+                }));
+                
+                await tauriInvoke('set_conversations', { conversations: conversationsWithTimestamp });
+                console.log('[JS] Cached DM conversations in backend storage');
+            } catch (e) {
+                console.warn('Failed to cache DM conversations in backend:', e);
+            }
         } else {
-            console.log('[JS] All DM contacts already have cached profiles');
+            console.log('[JS] No conversations received from network, keeping cached data if available');
+            if (!cacheLoaded) {
+                appState.dmContacts = [];
+                appState.dmMessages = {};
+                renderDmContacts();
+            }
         }
         
-        console.log(`✅ Loaded ${appState.dmContacts.length} conversations`);
-        
-        // Write to DM cache after successful load
-        // CACHE LOCATION: localStorage.setItem('nostr_mail_dm_conversations', ...)
-        // CACHE FORMAT: { conversations: [...], messages: {...}, timestamp: number }
-        // CACHE DURATION: 24 hours
-        // WARNING: Don't change this cache key or format without updating all references
-        const cacheData = {
-            conversations: appState.dmContacts,
-            messages: appState.dmMessages,
-            timestamp: Date.now()
-        };
-        localStorage.setItem('nostr_mail_dm_conversations', JSON.stringify(cacheData));
-        
     } catch (error) {
-        console.error('Failed to load DM contacts:', error);
-        showError('Failed to load conversations');
+        console.error('Failed to load DM contacts from network:', error);
+        if (!cacheLoaded) {
+            showError('Failed to load conversations and no cached data available');
+            appState.dmContacts = [];
+            appState.dmMessages = {};
+            renderDmContacts();
+        } else {
+            console.log('[JS] Network failed, but using cached data');
+        }
     }
 }
 
@@ -580,16 +699,18 @@ function renderDmContacts(searchQuery = '') {
             
             // Create avatar or use picture if available
             let avatarHtml = '';
-            if (contact.picture) {
-                avatarHtml = `<img src="${contact.picture}" alt="${contact.name}" class="contact-avatar" onerror="this.style.display='none'">`;
+            if (contact.picture_data_url) {
+                // Use cached data URL for offline support
+                avatarHtml = `<img src="${contact.picture_data_url}" alt="${contact.name}" class="contact-avatar" onerror="this.style.display='none'">`;
+                console.log(`[JS] Using cached data URL for DM contact ${contact.name}`);
             } else {
+                // Use placeholder avatar - don't try to load from URL when offline
                 avatarHtml = `<div class="contact-avatar-placeholder">${contact.name.charAt(0).toUpperCase()}</div>`;
+                console.log(`[JS] Using placeholder avatar for DM contact ${contact.name} (no cached image available)`);
             }
             
             contactElement.innerHTML = `
-                <div class="dm-contact-avatar">
-                    ${avatarHtml}
-                </div>
+                ${avatarHtml}
                 <div class="dm-contact-content">
                     <div class="dm-contact-header">
                         <div class="dm-contact-name">${contact.name}</div>
@@ -642,6 +763,30 @@ async function loadDmContactProfiles() {
                 contact.picture = profile.fields.picture || null;
                 contact.profileLoaded = true;
                 
+                // Try to cache the profile picture as a data URL for offline use
+                if (contact.picture) {
+                    try {
+                        // First try to get from backend cache
+                        let dataUrl = await getCachedProfileImageFromBackend(contact.pubkey);
+                        
+                        // If not in cache, fetch and cache it
+                        if (!dataUrl) {
+                            dataUrl = await fetchImageAsDataUrl(contact.picture);
+                            if (dataUrl) {
+                                // Cache in backend
+                                await cacheProfileImageInBackend(contact.pubkey, dataUrl);
+                            }
+                        }
+                        
+                        if (dataUrl) {
+                            contact.picture_data_url = dataUrl;
+                            console.log(`[JS] Cached profile picture for ${contact.name}`);
+                        }
+                    } catch (e) {
+                        console.warn(`Failed to cache profile picture for ${contact.name}:`, e);
+                    }
+                }
+                
                 // Update the contact in the array
                 appState.dmContacts[contactIndex] = contact;
             }
@@ -649,6 +794,31 @@ async function loadDmContactProfiles() {
         
         // Re-render with updated names and pictures
         renderDmContacts();
+        
+        // Update the DM cache with the new profile data in backend storage
+        try {
+            // Get current conversations from backend
+            const currentConversations = await tauriInvoke('get_conversations');
+            if (currentConversations && currentConversations.length > 0) {
+                // Update conversations with new profile data
+                const updatedConversations = currentConversations.map(conv => {
+                    const updatedContact = appState.dmContacts.find(c => c.pubkey === conv.contact_pubkey);
+                    if (updatedContact) {
+                        return {
+                            ...conv,
+                            contact_name: updatedContact.name,
+                            cached_at: new Date().toISOString()
+                        };
+                    }
+                    return conv;
+                });
+                
+                await tauriInvoke('set_conversations', { conversations: updatedConversations });
+                console.log('[JS] Updated DM conversations in backend storage with profile data');
+            }
+        } catch (e) {
+            console.warn('Failed to update DM conversations in backend storage:', e);
+        }
         
         console.log(`[JS] Updated ${profiles.length} DM contact profiles`);
         
@@ -686,6 +856,13 @@ async function loadDmMessages(contactPubkey) {
         return;
     }
     
+    // Check if messages are already cached
+    if (appState.dmMessages[contactPubkey] && appState.dmMessages[contactPubkey].length > 0) {
+        console.log(`[JS] Using cached messages for ${contactPubkey}`);
+        renderDmMessages(contactPubkey);
+        return;
+    }
+    
     try {
         const activeRelays = getActiveRelays();
         if (activeRelays.length === 0) {
@@ -716,17 +893,36 @@ async function loadDmMessages(contactPubkey) {
         
         console.log(`✅ Loaded ${formattedMessages.length} messages`);
         
-        // Write to DM cache after loading messages
-        // CACHE LOCATION: localStorage.setItem('nostr_mail_dm_conversations', ...)
-        // CACHE FORMAT: { conversations: [...], messages: {...}, timestamp: number }
-        // CACHE DURATION: 24 hours
-        // WARNING: Don't change this cache key or format without updating all references
-        const cacheData = {
-            conversations: appState.dmContacts,
-            messages: appState.dmMessages,
-            timestamp: Date.now()
-        };
-        localStorage.setItem('nostr_mail_dm_conversations', JSON.stringify(cacheData));
+        // Write to backend storage after loading messages
+        try {
+            // Get current conversations from backend
+            const currentConversations = await tauriInvoke('get_conversations');
+            if (currentConversations && currentConversations.length > 0) {
+                // Update the specific conversation with new messages
+                const updatedConversations = currentConversations.map(conv => {
+                    if (conv.contact_pubkey === contactPubkey) {
+                        return {
+                            ...conv,
+                            messages: formattedMessages.map(msg => ({
+                                id: msg.id,
+                                content: msg.content,
+                                timestamp: msg.created_at,
+                                sender_pubkey: msg.pubkey,
+                                receiver_pubkey: contactPubkey,
+                                is_sent: msg.is_sent
+                            })),
+                            cached_at: new Date().toISOString()
+                        };
+                    }
+                    return conv;
+                });
+                
+                await tauriInvoke('set_conversations', { conversations: updatedConversations });
+                console.log('[JS] Updated DM messages in backend storage');
+            }
+        } catch (e) {
+            console.warn('Failed to update DM messages in backend storage:', e);
+        }
         
     } catch (error) {
         console.error('Failed to load DM messages:', error);
@@ -949,6 +1145,12 @@ function populateSettingsForm() {
         if (elements.imapPort) elements.imapPort.value = appState.settings.imap_port || '';
         if (elements.useTls) elements.useTls.checked = appState.settings.use_tls || false;
         
+        // Detect and set the email provider based on saved settings
+        if (elements.emailProvider) {
+            const provider = detectEmailProvider(appState.settings);
+            elements.emailProvider.value = provider;
+        }
+        
         // Update public key display if npriv is available
         updatePublicKeyDisplay();
     } catch (error) {
@@ -956,8 +1158,29 @@ function populateSettingsForm() {
     }
 }
 
+// Function to detect email provider from saved settings
+function detectEmailProvider(settings) {
+    if (!settings.smtp_host || !settings.imap_host) return '';
+    
+    const smtpHost = settings.smtp_host.toLowerCase();
+    const imapHost = settings.imap_host.toLowerCase();
+    
+    if (smtpHost.includes('gmail.com') && imapHost.includes('gmail.com')) {
+        return 'gmail';
+    } else if (smtpHost.includes('outlook.com') && imapHost.includes('office365.com')) {
+        return 'outlook';
+    } else if (smtpHost.includes('yahoo.com') && imapHost.includes('yahoo.com')) {
+        return 'yahoo';
+    } else {
+        return 'custom';
+    }
+}
+
 // Email functions
 async function sendEmail() {
+    console.log('[JS] sendEmail function called');
+    console.log('[JS] appState.settings:', appState.settings);
+    
     if (!appState.settings) {
         showError('Please configure your email settings first');
         return;
@@ -967,16 +1190,49 @@ async function sendEmail() {
     const subject = elements.subject?.value?.trim() || '';
     const body = elements.messageBody?.value?.trim() || '';
     
+    console.log('[JS] Form values:', { toAddress, subject, body });
+    
     if (!toAddress || !subject || !body) {
+        console.log('[JS] Form validation failed - missing fields');
         showError('Please fill in all fields');
         return;
     }
+    
+    console.log('[JS] Form validation passed');
+    
+    // Check if using Gmail and warn about App Password
+    if (appState.settings.smtp_host === 'smtp.gmail.com') {
+        console.log('[JS] Gmail detected, checking for App Password warning');
+        const isGmailAddress = appState.settings.email_address?.includes('@gmail.com');
+        if (isGmailAddress) {
+            // Show an informational message about App Passwords for Gmail (non-blocking)
+            console.log('[JS] Showing Gmail App Password info message');
+            showSuccess('Gmail detected: Make sure you\'re using an App Password, not your regular password. If you haven\'t set up an App Password, go to Google Account > Security > 2-Step Verification > App passwords.');
+        }
+    }
+    
+    console.log('[JS] About to enter try block');
     
     try {
         if (elements.sendBtn) {
             elements.sendBtn.disabled = true;
             elements.sendBtn.innerHTML = '<span class="loading"></span> Sending...';
         }
+        
+        // Determine TLS setting - automatically enable for Gmail if not set
+        let useTls = appState.settings.use_tls;
+        if (appState.settings.smtp_host === 'smtp.gmail.com' && !useTls) {
+            console.log('[JS] Auto-enabling TLS for Gmail (was disabled)');
+            useTls = true;
+        }
+        
+        console.log('[JS] Email config debug:', {
+            smtp_host: appState.settings.smtp_host,
+            smtp_port: appState.settings.smtp_port,
+            use_tls_setting: appState.settings.use_tls,
+            use_tls_final: useTls,
+            email: appState.settings.email_address
+        });
         
         const emailConfig = {
             email_address: appState.settings.email_address,
@@ -985,8 +1241,10 @@ async function sendEmail() {
             smtp_port: appState.settings.smtp_port,
             imap_host: appState.settings.imap_host,
             imap_port: appState.settings.imap_port,
-            use_tls: appState.settings.use_tls
+            use_tls: useTls
         };
+        
+        console.log('[JS] About to call tauriInvoke send_email with config:', emailConfig);
         
         await tauriInvoke('send_email', {
             emailConfig: emailConfig,
@@ -994,6 +1252,8 @@ async function sendEmail() {
             subject: subject,
             body: body
         });
+        
+        console.log('[JS] tauriInvoke send_email completed successfully');
         
         // Clear form
         if (elements.toAddress) elements.toAddress.value = '';
@@ -1003,7 +1263,8 @@ async function sendEmail() {
         showSuccess('Email sent successfully');
         
     } catch (error) {
-        console.error('Failed to send email:', error);
+        console.error('[JS] Error in sendEmail function:', error);
+        console.error('[JS] Error stack:', error.stack);
         showError('Failed to send email: ' + error);
     } finally {
         if (elements.sendBtn) {
@@ -1111,46 +1372,79 @@ function showEmailDetail(emailId) {
     }
 }
 
+// New function to create a lightweight version of contacts for localStorage caching
+function createLightweightContactsCache(contacts) {
+    return contacts.map(contact => ({
+        pubkey: contact.pubkey,
+        name: contact.name,
+        email: contact.email,
+        picture: contact.picture, // Keep the URL, not the data URL
+        fields: contact.fields || {},
+        // Don't include picture_data_url, picture_loaded, picture_loading in localStorage
+        // These will be loaded from backend cache when needed
+    }));
+}
+
+// New function to restore contacts from lightweight cache
+function restoreContactsFromLightweightCache(lightweightContacts) {
+    return lightweightContacts.map(contact => ({
+        ...contact,
+        picture_data_url: null,
+        picture_loaded: false,
+        picture_loading: false
+    }));
+}
+
 async function loadContacts() {
     console.log('[JS] loadContacts called');
     
-    // Try to load from cache first for instant display
-    // CACHE LOCATION: localStorage.getItem('nostr_mail_contacts')
-    // CACHE FORMAT: { contacts: [...], timestamp: number }
-    // CACHE DURATION: 24 hours
-    // WARNING: Don't change this cache key or format without updating all references
+    // Try to load from backend storage first for instant display
+    let cacheLoaded = false;
     try {
-        const cachedData = localStorage.getItem('nostr_mail_contacts');
-        if (cachedData) {
-            const parsed = JSON.parse(cachedData);
+        console.log('[JS] Loading contacts from backend storage...');
+        const cachedContacts = await tauriInvoke('get_contacts');
+        
+        if (cachedContacts && cachedContacts.length > 0) {
+            console.log('[JS] Found cached contacts in backend, rendering immediately...');
             
-            // Check if cache is still valid (24 hours)
-            const cacheAge = Date.now() - (parsed.timestamp || 0);
-            const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+            // Ensure cached contacts have all the necessary fields for offline display
+            appState.contacts = cachedContacts.map(contact => ({
+                pubkey: contact.pubkey,
+                name: contact.name || contact.display_name || contact.pubkey.substring(0, 16) + '...',
+                picture: contact.picture || '',
+                email: contact.email || null,
+                fields: {
+                    name: contact.name,
+                    display_name: contact.display_name,
+                    picture: contact.picture,
+                    about: contact.about,
+                    email: contact.email
+                },
+                // Load cached image data URL from backend storage
+                picture_data_url: contact.picture_data_url || null,
+                picture_loaded: !!contact.picture_data_url,
+                picture_loading: false
+            }));
             
-            if (cacheAge < maxAge && parsed.contacts) {
-                console.log('[JS] Found valid cached contacts, rendering immediately...');
-                appState.contacts = parsed.contacts;
-                
-                // Sort cached contacts alphabetically by name
-                appState.contacts.sort((a, b) => {
-                    const nameA = a.name.toLowerCase();
-                    const nameB = b.name.toLowerCase();
-                    return nameA.localeCompare(nameB);
-                });
-                
-                appState.selectedContact = null; // Clear selected contact when refreshing
-                renderContacts();
-            } else {
-                console.log('[JS] Cache expired or invalid, will fetch fresh data...');
-                localStorage.removeItem('nostr_mail_contacts');
-            }
+            // Sort cached contacts alphabetically by name
+            appState.contacts.sort((a, b) => {
+                const nameA = a.name.toLowerCase();
+                const nameB = b.name.toLowerCase();
+                return nameA.localeCompare(nameB);
+            });
+            
+            appState.selectedContact = null; // Clear selected contact when refreshing
+            renderContacts();
+            cacheLoaded = true;
+            
+            // Load images progressively for contacts that need them
+            await loadContactImagesProgressively();
+            console.log('[JS] Contacts loaded from backend storage with cached images');
         } else {
-            console.log('[JS] No cached contacts found.');
+            console.log('[JS] No cached contacts found in backend storage.');
         }
     } catch (e) {
-        console.warn('Failed to load cached contacts:', e);
-        localStorage.removeItem('nostr_mail_contacts');
+        console.warn('Failed to load cached contacts from backend:', e);
     }
 
     if (!appState.keypair) {
@@ -1162,108 +1456,251 @@ async function loadContacts() {
         return;
     }
 
-    try {
-        console.log('[JS] Fetching following profiles from backend...');
-        const followingProfiles = await tauriInvoke('fetch_following_profiles', {
-            privateKey: appState.keypair.private_key,
-            relays: getActiveRelays()
-        });
-        console.log(`[JS] Received ${followingProfiles.length} profiles from backend.`, followingProfiles);
+    // Try to fetch fresh data from network (but don't fail if offline)
+    // Only fetch if we don't have cached contacts, or if we want to refresh
+    if (!cacheLoaded) {
+        try {
+            console.log('[JS] Fetching following profiles from backend...');
+            const followingProfiles = await tauriInvoke('fetch_following_profiles', {
+                privateKey: appState.keypair.private_key,
+                relays: getActiveRelays()
+            });
+            console.log(`[JS] Received ${followingProfiles.length} profiles from backend.`, followingProfiles);
 
-        // Create contacts immediately with placeholder images
-        const newContacts = followingProfiles.map(profile => ({
-            pubkey: profile.pubkey,
-            name: profile.fields.name || profile.fields.display_name || profile.pubkey.substring(0, 16) + '...',
-            picture: profile.fields.picture || '',
-            email: profile.fields.email || null,
-            fields: profile.fields || {}, // Include all profile fields
-            picture_data_url: null,
-            picture_loading: false,
-            picture_loaded: false
-        }));
+            // Only update contacts if we actually got data from the network
+            if (followingProfiles && followingProfiles.length > 0) {
+                // Create contacts immediately with placeholder images
+                const newContacts = followingProfiles.map(profile => ({
+                    pubkey: profile.pubkey,
+                    name: profile.fields.name || profile.fields.display_name || profile.pubkey.substring(0, 16) + '...',
+                    picture: profile.fields.picture || '',
+                    email: profile.fields.email || null,
+                    fields: profile.fields || {}, // Include all profile fields
+                    picture_data_url: null,
+                    picture_loading: false,
+                    picture_loaded: false
+                }));
 
-        // Update contacts in place instead of clearing the list
-        updateContactsInPlace(newContacts);
+                // Update contacts in place instead of clearing the list
+                updateContactsInPlace(newContacts);
 
-        // Cache the contacts immediately (without images) with timestamp
-        // CACHE LOCATION: localStorage.setItem('nostr_mail_contacts', ...)
-        // CACHE FORMAT: { contacts: [...], timestamp: number }
-        // CACHE DURATION: 24 hours
-        // WARNING: Don't change this cache key or format without updating all references
-        const cacheData = {
-            contacts: appState.contacts,
-            timestamp: Date.now()
-        };
-        localStorage.setItem('nostr_mail_contacts', JSON.stringify(cacheData));
+                // Cache the contacts in backend storage (without images)
+                try {
+                    // Convert frontend contact format to backend storage format
+                    const backendContacts = appState.contacts.map(contact => ({
+                        pubkey: contact.pubkey,
+                        name: contact.name,
+                        display_name: contact.fields.display_name || contact.name,
+                        picture: contact.picture,
+                        picture_data_url: contact.picture_data_url || null,
+                        about: contact.fields.about || null,
+                        email: contact.email,
+                        cached_at: new Date().toISOString()
+                    }));
+                    
+                    await tauriInvoke('set_contacts', { contacts: backendContacts });
+                    console.log('[JS] Cached contacts in backend storage');
+                } catch (e) {
+                    console.warn('Failed to cache contacts in backend:', e);
+                }
 
-        // Load images progressively in the background
-        loadContactImagesProgressively();
+                // Load images progressively in the background
+                await loadContactImagesProgressively();
+            } else {
+                console.log('[JS] No profiles received from network, keeping cached data if available');
+                if (!cacheLoaded) {
+                    appState.contacts = [];
+                    renderContacts();
+                }
+            }
 
-    } catch (error) {
-        console.error('Failed to load contacts:', error);
-        if (!appState.contacts || appState.contacts.length === 0) {
-            showError('Failed to fetch your follow list: ' + error);
+        } catch (error) {
+            console.error('Failed to load contacts from network:', error);
+            if (!cacheLoaded) {
+                showError('Failed to fetch your follow list and no cached data available: ' + error);
+                appState.contacts = [];
+                renderContacts();
+            } else {
+                console.log('[JS] Network failed, but using cached contacts');
+            }
         }
-        renderContacts();
+    } else {
+        console.log('[JS] Using cached contacts from backend storage, skipping network fetch');
     }
 }
 
-// New function to load images progressively
+// New function to load images progressively with backend caching
 async function loadContactImagesProgressively() {
-    console.log('[JS] Starting progressive image loading...');
+    console.log('[JS] Starting progressive image loading with backend caching...');
+    
+    // First, render any contacts that already have picture_data_url but haven't been rendered
+    const contactsWithCachedImages = appState.contacts.filter(contact => 
+        contact.picture_data_url && !contact.picture_loaded
+    );
+    
+    if (contactsWithCachedImages.length > 0) {
+        console.log(`[JS] Rendering ${contactsWithCachedImages.length} contacts with cached images`);
+        contactsWithCachedImages.forEach(contact => {
+            const contactIndex = appState.contacts.findIndex(c => c.pubkey === contact.pubkey);
+            if (contactIndex !== -1) {
+                appState.contacts[contactIndex].picture_loaded = true;
+                renderContactItem(contactIndex);
+            }
+        });
+    }
     
     // Process contacts in batches to avoid overwhelming the network
-    const batchSize = 3;
+    const batchSize = 15; // Increased from 10 to 15 for even faster loading
     const contactsWithPictures = appState.contacts.filter(contact => contact.picture && !contact.picture_loaded);
+    
+    console.log(`[JS] Found ${contactsWithPictures.length} contacts with pictures that need loading`);
+    console.log('[JS] Contacts needing images:', contactsWithPictures.map(c => c.name));
+    
+    // Debug: Check what contacts are in backend storage
+    try {
+        const storedContacts = await tauriInvoke('get_contacts');
+        console.log(`[JS] Backend storage has ${storedContacts.length} contacts`);
+        const storedPubkeys = storedContacts.map(c => c.pubkey);
+        console.log('[JS] Stored pubkeys:', storedPubkeys.slice(0, 5), '...');
+    } catch (e) {
+        console.warn('[JS] Failed to check backend storage:', e);
+    }
     
     for (let i = 0; i < contactsWithPictures.length; i += batchSize) {
         const batch = contactsWithPictures.slice(i, i + batchSize);
+        console.log(`[JS] Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(contactsWithPictures.length/batchSize)}:`, batch.map(c => c.name));
         
-        // Load images in parallel for this batch
-        const imagePromises = batch.map(async (contact) => {
+        // Mark all contacts in this batch as loading
+        batch.forEach(contact => {
             const contactIndex = appState.contacts.findIndex(c => c.pubkey === contact.pubkey);
-            if (contactIndex === -1) return;
-
-            // Mark as loading
-            appState.contacts[contactIndex].picture_loading = true;
-            renderContactItem(contactIndex);
-
-            try {
-                const dataUrl = await fetchImageAsDataUrl(contact.picture);
-                if (dataUrl) {
-                    appState.contacts[contactIndex].picture_data_url = dataUrl;
-                    appState.contacts[contactIndex].picture_loaded = true;
-                    console.log(`[JS] Successfully loaded image for ${contact.name}`);
-                }
-            } catch (e) {
-                console.warn(`Failed to fetch profile picture for ${contact.name}:`, e);
-            } finally {
-                appState.contacts[contactIndex].picture_loading = false;
+            if (contactIndex !== -1) {
+                appState.contacts[contactIndex].picture_loading = true;
                 renderContactItem(contactIndex);
             }
         });
 
-        // Wait for this batch to complete before starting the next
-        await Promise.all(imagePromises);
+        try {
+            // First try to get all images from backend cache
+            const cachePromises = batch.map(async (contact) => {
+                const dataUrl = await getCachedProfileImageFromBackend(contact.pubkey);
+                return { contact, dataUrl };
+            });
+            
+            const cachedResults = await Promise.all(cachePromises);
+            const uncachedContacts = cachedResults.filter(result => !result.dataUrl).map(result => result.contact);
+            const cachedContacts = cachedResults.filter(result => result.dataUrl);
+            
+            console.log(`[JS] Found ${cachedContacts.length} cached images, need to fetch ${uncachedContacts.length} new images`);
+            
+            // Update cached contacts immediately
+            for (const { contact, dataUrl } of cachedContacts) {
+                const contactIndex = appState.contacts.findIndex(c => c.pubkey === contact.pubkey);
+                if (contactIndex !== -1) {
+                    appState.contacts[contactIndex].picture_data_url = dataUrl;
+                    appState.contacts[contactIndex].picture_loaded = true;
+                    appState.contacts[contactIndex].picture_loading = false;
+                    renderContactItem(contactIndex);
+                    
+                    // Save the cached image data URL to backend storage
+                    try {
+                        console.log(`[JS] Attempting to save cached image data URL to backend storage for ${contact.name} (${contact.pubkey})`);
+                        
+                        // First check if the contact exists in storage
+                        const storedContact = await tauriInvoke('get_contact', { pubkey: contact.pubkey });
+                        if (!storedContact) {
+                            console.warn(`[JS] Contact ${contact.name} (${contact.pubkey}) not found in backend storage, skipping update`);
+                            continue;
+                        }
+                        
+                        await tauriInvoke('update_contact_picture_data_url', {
+                            pubkey: contact.pubkey,
+                            // Note: Rust parameters in snake_case (picture_data_url) are automatically 
+                            // converted to camelCase (pictureDataUrl) for JavaScript by Tauri.
+                            // To use snake_case in JS, you need #[tauri::command(rename_all = "snake_case")]
+                            pictureDataUrl: dataUrl
+                        });
+                        console.log(`[JS] Successfully saved cached image data URL to backend storage for ${contact.name}`);
+                    } catch (e) {
+                        console.error(`[JS] Failed to save cached image data URL to backend storage for ${contact.name}:`, e);
+                    }
+                }
+            }
+            
+            // Fetch uncached images concurrently using the new backend function
+            if (uncachedContacts.length > 0) {
+                const imageUrls = uncachedContacts.map(contact => contact.picture);
+                console.log(`[JS] Fetching ${imageUrls.length} images concurrently from backend...`);
+                
+                const fetchedImages = await tauriInvoke('fetch_multiple_images', { urls: imageUrls });
+                
+                // Process fetched images
+                for (const contact of uncachedContacts) {
+                    const contactIndex = appState.contacts.findIndex(c => c.pubkey === contact.pubkey);
+                    if (contactIndex !== -1) {
+                        const dataUrl = fetchedImages[contact.picture];
+                        if (dataUrl) {
+                            // Cache in backend
+                            await cacheProfileImageInBackend(contact.pubkey, dataUrl);
+                            
+                            appState.contacts[contactIndex].picture_data_url = dataUrl;
+                            appState.contacts[contactIndex].picture_loaded = true;
+                            console.log(`[JS] Successfully loaded image for ${contact.name}`);
+                            
+                            // Save the updated contact to backend storage immediately
+                            try {
+                                console.log(`[JS] Attempting to save image data URL to backend storage for ${contact.name} (${contact.pubkey})`);
+                                
+                                // First check if the contact exists in storage
+                                const storedContact = await tauriInvoke('get_contact', { pubkey: contact.pubkey });
+                                if (!storedContact) {
+                                    console.warn(`[JS] Contact ${contact.name} (${contact.pubkey}) not found in backend storage, skipping update`);
+                                    continue;
+                                }
+                                
+                                await tauriInvoke('update_contact_picture_data_url', {
+                                    pubkey: contact.pubkey,
+                                    // Note: Rust parameters in snake_case (picture_data_url) are automatically 
+                                    // converted to camelCase (pictureDataUrl) for JavaScript by Tauri.
+                                    // To use snake_case in JS, you need #[tauri::command(rename_all = "snake_case")]
+                                    pictureDataUrl: dataUrl
+                                });
+                                console.log(`[JS] Successfully saved image data URL to backend storage for ${contact.name}`);
+                            } catch (e) {
+                                console.error(`[JS] Failed to save image data URL to backend storage for ${contact.name}:`, e);
+                            }
+                        } else {
+                            console.warn(`[JS] Failed to get image data URL for ${contact.name}`);
+                        }
+                        appState.contacts[contactIndex].picture_loading = false;
+                        renderContactItem(contactIndex);
+                    }
+                }
+            }
+            
+        } catch (e) {
+            console.warn(`Failed to fetch images for batch:`, e);
+            // Mark all contacts in this batch as not loading
+            batch.forEach(contact => {
+                const contactIndex = appState.contacts.findIndex(c => c.pubkey === contact.pubkey);
+                if (contactIndex !== -1) {
+                    appState.contacts[contactIndex].picture_loading = false;
+                    renderContactItem(contactIndex);
+                }
+            });
+        }
         
-        // Update cache after each batch
-        // CACHE LOCATION: localStorage.setItem('nostr_mail_contacts', ...)
-        // CACHE FORMAT: { contacts: [...], timestamp: number }
-        // CACHE DURATION: 24 hours
-        // WARNING: Don't change this cache key or format without updating all references
-        const cacheData = {
-            contacts: appState.contacts,
-            timestamp: Date.now()
-        };
-        localStorage.setItem('nostr_mail_contacts', JSON.stringify(cacheData));
+        console.log(`[JS] Completed batch ${Math.floor(i/batchSize) + 1}`);
+        
+        // Individual contacts are now updated efficiently, no need for batch updates
         
         // Small delay between batches to be nice to the network
         if (i + batchSize < contactsWithPictures.length) {
-            await new Promise(resolve => setTimeout(resolve, 100));
+            console.log('[JS] Waiting 30ms before next batch...'); // Reduced delay from 50ms to 30ms
+            await new Promise(resolve => setTimeout(resolve, 30));
         }
     }
     
-    console.log('[JS] Progressive image loading completed');
+    console.log('[JS] Progressive image loading with backend caching completed');
 }
 
 // New function to render individual contact items
@@ -1293,8 +1730,9 @@ function renderContactItem(index) {
         // You could add a loading spinner here if desired
     } else if (contact.picture_data_url) {
         avatarSrc = contact.picture_data_url;
-    } else if (contact.picture) {
-        avatarSrc = contact.picture;
+        console.log(`[JS] Using cached data URL for ${contact.name}`);
+    } else {
+        console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
     }
 
     // Update the avatar image
@@ -1344,7 +1782,7 @@ function renderContacts(searchQuery = '') {
                     emailIcon = `<a href="mailto:${contact.email}" class="contact-email-icon" title="Send email to ${contact.email}"><i class="fas fa-envelope"></i></a>`;
                 }
 
-                // Determine avatar source and class
+                // Determine avatar source and class - only use cached data URLs to prevent offline errors
                 let avatarSrc = defaultAvatar;
                 let avatarClass = 'contact-avatar';
                 
@@ -1352,8 +1790,9 @@ function renderContacts(searchQuery = '') {
                     avatarClass += ' loading';
                 } else if (contact.picture_data_url) {
                     avatarSrc = contact.picture_data_url;
-                } else if (contact.picture) {
-                    avatarSrc = contact.picture;
+                    console.log(`[JS] Using cached data URL for ${contact.name}`);
+                } else {
+                    console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
                 }
 
                 contactElement.innerHTML = `
@@ -1902,6 +2341,70 @@ async function copyPublicKey() {
     }
 }
 
+async function copyEmailPassword() {
+    const password = elements.emailPassword?.value || '';
+    
+    if (!password) {
+        showError('No email password to copy');
+        return;
+    }
+    
+    try {
+        await navigator.clipboard.writeText(password);
+        showSuccess('Email password copied to clipboard');
+    } catch (error) {
+        console.error('Failed to copy to clipboard:', error);
+        showError('Failed to copy email password');
+    }
+}
+
+async function copyNprivKey() {
+    const nprivKey = elements.nprivKey?.value || '';
+    
+    if (!nprivKey) {
+        showError('No private key to copy');
+        return;
+    }
+    
+    try {
+        await navigator.clipboard.writeText(nprivKey);
+        showSuccess('Private key copied to clipboard');
+    } catch (error) {
+        console.error('Failed to copy to clipboard:', error);
+        showError('Failed to copy private key');
+    }
+}
+
+function toggleNprivVisibility() {
+    const input = elements.nprivKey;
+    const button = elements.toggleNprivVisibilityBtn;
+    
+    if (input.type === 'password') {
+        input.type = 'text';
+        button.innerHTML = '<i class="fas fa-eye-slash"></i>';
+        button.title = 'Hide private key';
+    } else {
+        input.type = 'password';
+        button.innerHTML = '<i class="fas fa-eye"></i>';
+        button.title = 'Show private key';
+    }
+}
+
+function toggleEmailPasswordVisibility() {
+    const input = elements.emailPassword;
+    const button = elements.toggleEmailPasswordVisibilityBtn;
+    
+    if (input.type === 'password') {
+        input.type = 'text';
+        button.innerHTML = '<i class="fas fa-eye-slash"></i>';
+        button.title = 'Hide password';
+    } else {
+        input.type = 'password';
+        button.innerHTML = '<i class="fas fa-eye"></i>';
+        button.title = 'Show password';
+    }
+}
+
 function saveDraft() {
     try {
         const draft = {
@@ -2157,6 +2660,36 @@ function renderProfilePubkey() {
     }
 }
 
+// Helper function to cache profile image in backend
+async function cacheProfileImageInBackend(pubkey, dataUrl) {
+    try {
+        await tauriInvoke('cache_profile_image', {
+            pubkey: pubkey,
+            dataUrl: dataUrl
+        });
+        console.log(`[JS] Cached image in backend for ${pubkey}`);
+    } catch (error) {
+        console.warn(`Failed to cache image in backend for ${pubkey}:`, error);
+    }
+}
+
+// Helper function to get cached profile image from backend
+async function getCachedProfileImageFromBackend(pubkey) {
+    try {
+        const cachedDataUrl = await tauriInvoke('get_cached_profile_image', {
+            pubkey: pubkey
+        });
+        if (cachedDataUrl) {
+            console.log(`[JS] Found cached image in backend for ${pubkey}`);
+            return cachedDataUrl;
+        }
+    } catch (error) {
+        console.warn(`Failed to get cached image from backend for ${pubkey}:`, error);
+    }
+    return null;
+}
+
+// Updated function to fetch image with backend caching
 async function fetchImageAsDataUrl(url) {
     if (!url) return null;
     try {
@@ -2172,12 +2705,13 @@ async function fetchImageAsDataUrl(url) {
 async function refreshContacts() {
     console.log('[JS] Refreshing contacts...');
     
-    // Clear the cache
-    // CACHE LOCATION: localStorage.removeItem('nostr_mail_contacts')
-    // CACHE FORMAT: { contacts: [...], timestamp: number }
-    // CACHE DURATION: 24 hours
-    // WARNING: Don't change this cache key or format without updating all references
-    localStorage.removeItem('nostr_mail_contacts');
+    // Clear the backend cache
+    try {
+        await tauriInvoke('set_contacts', { contacts: [] });
+        console.log('[JS] Cleared contacts from backend storage');
+    } catch (e) {
+        console.warn('Failed to clear contacts from backend storage:', e);
+    }
     
     // Don't clear the contacts list - let the in-place update handle it
     // This prevents the UI from going blank during refresh
@@ -2434,12 +2968,13 @@ function updateContactsInPlace(newContacts) {
 async function refreshDmConversations() {
     console.log('[JS] Refreshing DM conversations...');
     
-    // Clear DM cache
-    // CACHE LOCATION: localStorage.removeItem('nostr_mail_dm_conversations')
-    // CACHE FORMAT: { conversations: [...], messages: {...}, timestamp: number }
-    // CACHE DURATION: 24 hours
-    // WARNING: Don't change this cache key or format without updating all references
-    localStorage.removeItem('nostr_mail_dm_conversations');
+    // Clear DM cache from backend storage
+    try {
+        await tauriInvoke('set_conversations', { conversations: [] });
+        console.log('[JS] Cleared DM conversations from backend storage');
+    } catch (e) {
+        console.warn('Failed to clear DM conversations from backend storage:', e);
+    }
     
     try {
         // Clear current conversations
@@ -2468,8 +3003,16 @@ async function refreshDmConversations() {
 
 // Helper function to format time ago
 function formatTimeAgo(date) {
+    // Ensure date is a Date object (handle both Date objects and date strings from cache)
+    const dateObj = date instanceof Date ? date : new Date(date);
+    
+    // Check if the date is valid
+    if (isNaN(dateObj.getTime())) {
+        return 'Unknown time';
+    }
+    
     const now = new Date();
-    const diffMs = now - date;
+    const diffMs = now - dateObj;
     const diffMins = Math.floor(diffMs / 60000);
     const diffHours = Math.floor(diffMs / 3600000);
     const diffDays = Math.floor(diffMs / 86400000);
@@ -2479,7 +3022,7 @@ function formatTimeAgo(date) {
     if (diffHours < 24) return `${diffHours}h ago`;
     if (diffDays < 7) return `${diffDays}d ago`;
     
-    return date.toLocaleDateString();
+    return dateObj.toLocaleDateString();
 }
 
 // Filter contacts based on search query
@@ -2510,3 +3053,147 @@ function toggleContactsSearch() {
         }
     }
 }
+
+async function testEmailConnection() {
+    if (!appState.settings) {
+        showError('Please save your settings first');
+        return;
+    }
+    
+    // Validate that required settings are present
+    if (!appState.settings.email_address || !appState.settings.email_address.trim()) {
+        showError('Email address is required. Please fill in your email address.');
+        return;
+    }
+    
+    if (!appState.settings.password || !appState.settings.password.trim()) {
+        showError('Password is required. Please fill in your email password.');
+        return;
+    }
+    
+    if (!appState.settings.smtp_host || !appState.settings.smtp_host.trim()) {
+        showError('SMTP host is required. Please fill in the SMTP host field.');
+        return;
+    }
+    
+    if (!appState.settings.imap_host || !appState.settings.imap_host.trim()) {
+        showError('IMAP host is required. Please fill in the IMAP host field.');
+        return;
+    }
+    
+    try {
+        if (elements.testEmailConnectionBtn) {
+            elements.testEmailConnectionBtn.disabled = true;
+            elements.testEmailConnectionBtn.innerHTML = '<span class="loading"></span> Testing...';
+        }
+        
+        const emailConfig = {
+            email_address: appState.settings.email_address,
+            password: appState.settings.password,
+            smtp_host: appState.settings.smtp_host,
+            smtp_port: appState.settings.smtp_port,
+            imap_host: appState.settings.imap_host,
+            imap_port: appState.settings.imap_port,
+            use_tls: appState.settings.use_tls
+        };
+        
+        console.log('[JS] Testing email connections with config:', {
+            smtp_host: emailConfig.smtp_host,
+            smtp_port: emailConfig.smtp_port,
+            imap_host: emailConfig.imap_host,
+            imap_port: emailConfig.imap_port,
+            use_tls: emailConfig.use_tls,
+            email: emailConfig.email_address
+        });
+        
+        // Test both IMAP and SMTP connections
+        const results = await Promise.allSettled([
+            tauriInvoke('test_imap_connection', { emailConfig }),
+            tauriInvoke('test_smtp_connection', { emailConfig })
+        ]);
+        
+        const imapResult = results[0];
+        const smtpResult = results[1];
+        
+        // Check results and provide comprehensive feedback
+        if (imapResult.status === 'fulfilled' && smtpResult.status === 'fulfilled') {
+            showSuccess('✅ Email connection test successful!\n\n• IMAP: Connected and authenticated\n• SMTP: Connected and authenticated\n\nYour email settings are working correctly.');
+        } else if (imapResult.status === 'fulfilled' && smtpResult.status === 'rejected') {
+            showError(`⚠️ Partial success:\n\n✅ IMAP: Connected and authenticated\n❌ SMTP: ${smtpResult.reason}\n\nYou can receive emails but may have issues sending them.`);
+        } else if (imapResult.status === 'rejected' && smtpResult.status === 'fulfilled') {
+            showError(`⚠️ Partial success:\n\n❌ IMAP: ${imapResult.reason}\n✅ SMTP: Connected and authenticated\n\nYou can send emails but may have issues receiving them.`);
+        } else {
+            const imapError = imapResult.status === 'rejected' ? imapResult.reason : 'Unknown error';
+            const smtpError = smtpResult.status === 'rejected' ? smtpResult.reason : 'Unknown error';
+            showError(`❌ Email connection test failed:\n\n• IMAP: ${imapError}\n• SMTP: ${smtpError}\n\nPlease check your email settings and try again.`);
+        }
+        
+    } catch (error) {
+        console.error('Email connection test failed:', error);
+        showError('Email connection test failed: ' + error);
+    } finally {
+        if (elements.testEmailConnectionBtn) {
+            elements.testEmailConnectionBtn.disabled = false;
+            elements.testEmailConnectionBtn.innerHTML = '<i class="fas fa-envelope"></i> Test Email Connection';
+        }
+    }
+}
+
+// Function to handle email provider selection
+function handleEmailProviderChange() {
+    const provider = elements.emailProvider?.value || '';
+    
+    if (!provider || provider === 'custom') {
+        return; // Don't auto-populate for custom or empty selection
+    }
+    
+    const providerSettings = {
+        gmail: {
+            smtp_host: 'smtp.gmail.com',
+            smtp_port: 587,
+            imap_host: 'imap.gmail.com',
+            imap_port: 993,
+            use_tls: true
+        },
+        outlook: {
+            smtp_host: 'smtp-mail.outlook.com',
+            smtp_port: 587,
+            imap_host: 'outlook.office365.com',
+            imap_port: 993,
+            use_tls: true
+        },
+        yahoo: {
+            smtp_host: 'smtp.mail.yahoo.com',
+            smtp_port: 587,
+            imap_host: 'imap.mail.yahoo.com',
+            imap_port: 993,
+            use_tls: true
+        }
+    };
+    
+    const settings = providerSettings[provider];
+    if (settings) {
+        // Populate the form fields
+        if (elements.smtpHost) elements.smtpHost.value = settings.smtp_host;
+        if (elements.smtpPort) elements.smtpPort.value = settings.smtp_port;
+        if (elements.imapHost) elements.imapHost.value = settings.imap_host;
+        if (elements.imapPort) elements.imapPort.value = settings.imap_port;
+        if (elements.useTls) elements.useTls.checked = settings.use_tls;
+        
+        // Show a helpful message
+        let message = `${provider.charAt(0).toUpperCase() + provider.slice(1)} settings applied.`;
+        
+        if (provider === 'gmail') {
+            message += ' For Gmail, you must use an App Password instead of your regular password. Go to your Google Account settings > Security > 2-Step Verification > App passwords to generate one.';
+        }
+        
+        // Add TLS info
+        if (settings.use_tls) {
+            message += ' TLS has been automatically enabled (required for secure connections).';
+        }
+        
+        showSuccess(message);
+    }
+}
+
+// Function to refresh all data for a new keypair

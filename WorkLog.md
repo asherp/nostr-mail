@@ -1,3 +1,4 @@
+* working email send
 * dm decryption
 * tauri app prototype
 

@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["full"] }
 lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
 imap = "2.4.1"
 native-tls = "0.2"
-reqwest = "0.12"
+reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 mime_guess = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -35,6 +35,8 @@ hex = "0.4"
 block-modes = "0.9"
 cipher = "0.4"
 secp256k1 = { version = "0.28", features = ["rand"] }
+uuid = { version = "1.0", features = ["v4"] }
+futures = "0.3"
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem

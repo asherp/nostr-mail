@@ -89,6 +89,7 @@ pub struct Conversation {
     pub last_message: String,
     pub last_timestamp: i64,
     pub message_count: usize,
+    pub messages: Vec<ConversationMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,7 +370,7 @@ pub async fn fetch_following_profiles(
             .authors(followed_pubkeys)
             .kind(Kind::from(0)); // Profile events are kind 0
             
-        let profile_events = client.fetch_events(profiles_filter, Duration::from_secs(10)).await?;
+        let profile_events = client.fetch_events(profiles_filter, Duration::from_secs(30)).await?;
         println!("[NOSTR] Found {} profile events", profile_events.len());
         
         // Use a map to store only the latest profile for each pubkey
@@ -423,6 +424,41 @@ pub async fn fetch_image_as_data_url(url: &str) -> Result<String> {
     let encoded = general_purpose::STANDARD.encode(&bytes);
 
     Ok(format!("data:{};base64,{}", content_type, encoded))
+}
+
+pub async fn fetch_multiple_images_as_data_urls(urls: &[String]) -> Result<std::collections::HashMap<String, String>> {
+    println!("[NOSTR] Fetching {} images concurrently", urls.len());
+    
+    let mut results = std::collections::HashMap::new();
+    let mut futures = Vec::new();
+    
+    // Create futures for all image fetches
+    for url in urls {
+        let url_clone = url.clone();
+        let future = async move {
+            match fetch_image_as_data_url(&url_clone).await {
+                Ok(data_url) => Some((url_clone, data_url)),
+                Err(e) => {
+                    println!("[NOSTR] Failed to fetch image {}: {}", url_clone, e);
+                    None
+                }
+            }
+        };
+        futures.push(future);
+    }
+    
+    // Execute all futures concurrently
+    let results_vec = futures::future::join_all(futures).await;
+    
+    // Collect successful results
+    for result in results_vec {
+        if let Some((url, data_url)) = result {
+            results.insert(url, data_url);
+        }
+    }
+    
+    println!("[NOSTR] Successfully fetched {} out of {} images", results.len(), urls.len());
+    Ok(results)
 }
 
 pub async fn fetch_conversations(
@@ -563,6 +599,7 @@ pub async fn fetch_conversations(
                 last_message: last_message.content.clone(),
                 last_timestamp: last_message.timestamp,
                 message_count: sorted_messages.len(),
+                messages: sorted_messages,
             });
         }
     }

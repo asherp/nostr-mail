@@ -83,6 +83,9 @@ relays:
 Configure your email account to allow sending and receiving emails. Here are instructions for Gmail:
 
 1. Generate an app password (required if using 2-factor auth). See https://support.google.com/accounts/answer/185833?hl=en 
+
+Note: The password should be 16 characters in 4 sets of 4 but if you copy/paste it there will be spaces between each set of characters that you'll need to remove.
+
 2. Set `EMAIL_PASSWORD` in your `.env` file as explained above.
 3. Open Gmail settings to enable IMAP:
     1. In the top right, click Settings and then See all settings.

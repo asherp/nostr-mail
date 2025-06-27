@@ -42,16 +42,6 @@ pub struct NostrEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Contact {
-    pub username: String,
-    pub pubkey: String,
-    pub display_name: Option<String>,
-    pub picture: Option<String>,
-    pub about: Option<String>,
-    pub email: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub pubkey: String,
     pub fields: HashMap<String, serde_json::Value>,
@@ -65,13 +55,6 @@ pub struct DirectMessage {
     pub content: String,
     pub created_at: i64,
     pub is_valid: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Conversation {
-    pub participants: Vec<String>,
-    pub messages: Vec<DirectMessage>,
-    pub last_updated: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

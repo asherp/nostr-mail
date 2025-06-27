@@ -627,6 +627,7 @@ body.dark-mode .dm-search-icon {
 .input-with-button {
     display: flex;
     align-items: center;
+    gap: 8px;
 }
 
 .input-with-button input {
@@ -634,7 +635,36 @@ body.dark-mode .dm-search-icon {
 }
 
 .input-with-button button {
-    margin-left: 10px;
+    flex-shrink: 0;
+    min-width: 40px;
+}
+
+.input-with-button button:first-of-type {
+    margin-left: 0;
+}
+
+/* Eye button specific styling */
+.input-with-button button[id*="toggle"] {
+    padding: 8px 12px;
+    background-color: #f8f9fa;
+    color: #6c757d;
+    border: 2px solid #e9ecef;
+}
+
+.input-with-button button[id*="toggle"]:hover {
+    background-color: #e9ecef;
+    color: #495057;
+}
+
+body.dark-mode .input-with-button button[id*="toggle"] {
+    background-color: #232946;
+    color: #e0e0e0;
+    border: 2px solid #232946;
+}
+
+body.dark-mode .input-with-button button[id*="toggle"]:hover {
+    background-color: #181a20;
+    color: #e0e0e0;
 }
 
 .form-actions {

@@ -130,9 +130,9 @@ async fn send_email(email_config: EmailConfig, to_address: String, subject: Stri
 }
 
 #[tauri::command]
-async fn fetch_emails(email_config: EmailConfig, limit: usize) -> Result<Vec<EmailMessage>, String> {
-    println!("[RUST] fetch_emails called");
-    email::fetch_emails(&email_config, limit).await.map_err(|e| e.to_string())
+async fn fetch_emails(email_config: EmailConfig, limit: usize, search_query: Option<String>) -> Result<Vec<EmailMessage>, String> {
+    println!("[RUST] fetch_emails called with search: {:?}", search_query);
+    email::fetch_emails(&email_config, limit, search_query).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]

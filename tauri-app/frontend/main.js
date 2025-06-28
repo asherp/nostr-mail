@@ -54,6 +54,7 @@ const elements = {
     // Inbox
     emailList: getElement('email-list'),
     refreshInbox: getElement('refresh-inbox'),
+    emailSearch: getElement('email-search'),
     
     // DM elements
     dmContacts: getElement('dm-contacts'),
@@ -256,7 +257,25 @@ function setupEventListeners() {
         
         // Inbox
         if (elements.refreshInbox) {
-            elements.refreshInbox.addEventListener('click', loadEmails);
+            elements.refreshInbox.addEventListener('click', async () => {
+                // Clear search input
+                if (elements.emailSearch) {
+                    elements.emailSearch.value = '';
+                }
+                // Load all emails (no search filter)
+                await loadEmails();
+            });
+        }
+        
+        // Back to inbox button
+        const backToInboxBtn = getElement('back-to-inbox');
+        if (backToInboxBtn) {
+            backToInboxBtn.addEventListener('click', showEmailList);
+        }
+        
+        // Email Search
+        if (elements.emailSearch) {
+            elements.emailSearch.addEventListener('input', filterEmails);
         }
         
         // DM functionality
@@ -1274,7 +1293,7 @@ async function sendEmail() {
     }
 }
 
-async function loadEmails() {
+async function loadEmails(searchQuery = '') {
     if (!appState.settings) {
         showError('Please configure your email settings first');
         return;
@@ -1296,9 +1315,12 @@ async function loadEmails() {
             use_tls: appState.settings.use_tls
         };
         
+        // Pass the search query to the backend
+        const searchParam = searchQuery.trim() || null;
         appState.emails = await tauriInvoke('fetch_emails', {
             emailConfig: emailConfig,
-            limit: 50
+            limit: 10,
+            searchQuery: searchParam
         });
         
         renderEmails();
@@ -1327,16 +1349,30 @@ function renderEmails() {
         
         appState.emails.forEach(email => {
             const emailElement = document.createElement('div');
-            emailElement.className = `email-item ${email.unread ? 'unread' : ''}`;
+            emailElement.className = `email-item ${!email.is_read ? 'unread' : ''}`;
             emailElement.dataset.emailId = email.id;
+            
+            // Format the date nicely
+            const emailDate = new Date(email.date);
+            const now = new Date();
+            const diffInHours = (now - emailDate) / (1000 * 60 * 60);
+            
+            let dateDisplay;
+            if (diffInHours < 24) {
+                dateDisplay = emailDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            } else if (diffInHours < 168) { // 7 days
+                dateDisplay = emailDate.toLocaleDateString([], { weekday: 'short' });
+            } else {
+                dateDisplay = emailDate.toLocaleDateString();
+            }
             
             emailElement.innerHTML = `
                 <div class="email-header">
-                    <div class="email-sender">${email.from}</div>
-                    <div class="email-date">${new Date(email.date).toLocaleDateString()}</div>
+                    <div class="email-sender">${escapeHtml(email.from)}</div>
+                    <div class="email-date">${dateDisplay}</div>
                 </div>
-                <div class="email-subject">${email.subject}</div>
-                <div class="email-preview">${email.body.substring(0, 100)}...</div>
+                <div class="email-subject">${escapeHtml(email.subject)}</div>
+                <div class="email-preview">${escapeHtml(email.body.substring(0, 100))}${email.body.length > 100 ? '...' : ''}</div>
             `;
             
             emailElement.addEventListener('click', () => showEmailDetail(email.id));
@@ -1347,28 +1383,80 @@ function renderEmails() {
     }
 }
 
+// Debounced search function
+let searchTimeout;
+function filterEmails() {
+    const searchQuery = elements.emailSearch?.value?.trim() || '';
+    
+    // Clear existing timeout
+    if (searchTimeout) {
+        clearTimeout(searchTimeout);
+    }
+    
+    // Set a new timeout to debounce the search
+    searchTimeout = setTimeout(async () => {
+        try {
+            await loadEmails(searchQuery);
+        } catch (error) {
+            console.error('Error filtering emails:', error);
+        }
+    }, 1500); // 1.5 second delay - increased from 500ms
+}
+
 function showEmailDetail(emailId) {
     try {
         const email = appState.emails.find(e => e.id === emailId);
         if (!email) return;
         
-        const content = `
-            <div class="email-detail">
-                <div class="email-detail-header">
-                    <div><strong>From:</strong> ${email.from}</div>
-                    <div><strong>To:</strong> ${email.to}</div>
-                    <div><strong>Date:</strong> ${new Date(email.date).toLocaleString()}</div>
-                    <div><strong>Subject:</strong> ${email.subject}</div>
-                </div>
-                <div class="email-detail-body">
-                    ${email.body.replace(/\n/g, '<br>')}
-                </div>
-            </div>
-        `;
+        // Hide the email list and show the detail view
+        const emailList = getElement('email-list');
+        const emailDetailView = getElement('email-detail-view');
+        const inboxActions = getElement('inbox-actions');
+        const inboxTitle = getElement('inbox-title');
         
-        showModal('Email Detail', content);
+        if (emailList) emailList.style.display = 'none';
+        if (emailDetailView) emailDetailView.style.display = 'flex';
+        if (inboxActions) inboxActions.style.display = 'none';
+        if (inboxTitle) inboxTitle.textContent = 'Email Detail';
+        
+        // Populate the email detail content
+        const emailDetailContent = getElement('email-detail-content');
+        if (emailDetailContent) {
+            emailDetailContent.innerHTML = `
+                <div class="email-detail">
+                    <div class="email-detail-header vertical">
+                        <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${escapeHtml(email.from)}</span></div>
+                        <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${escapeHtml(email.to)}</span></div>
+                        <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+                        <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${escapeHtml(email.subject)}</span></div>
+                    </div>
+                    <div class="email-detail-body">
+                        ${escapeHtml(email.body).replace(/\n/g, '<br>')}
+                    </div>
+                </div>
+            `;
+        }
+        
     } catch (error) {
         console.error('Error showing email detail:', error);
+    }
+}
+
+function showEmailList() {
+    try {
+        // Show the email list and hide the detail view
+        const emailList = getElement('email-list');
+        const emailDetailView = getElement('email-detail-view');
+        const inboxActions = getElement('inbox-actions');
+        const inboxTitle = getElement('inbox-title');
+        
+        if (emailList) emailList.style.display = 'block';
+        if (emailDetailView) emailDetailView.style.display = 'none';
+        if (inboxActions) inboxActions.style.display = 'flex';
+        if (inboxTitle) inboxTitle.textContent = 'Inbox';
+        
+    } catch (error) {
+        console.error('Error showing email list:', error);
     }
 }
 

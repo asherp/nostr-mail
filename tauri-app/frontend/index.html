@@ -80,14 +80,33 @@
             <!-- Inbox Tab -->
             <div class="tab-content" id="inbox">
                 <div class="tab-header">
-                    <h2>Inbox</h2>
-                    <button id="refresh-inbox" class="btn btn-secondary">
-                        <i class="fas fa-sync"></i> Refresh
-                    </button>
+                    <h2 id="inbox-title">Inbox</h2>
+                    <div class="inbox-actions" id="inbox-actions">
+                        <div class="email-search-container">
+                            <input type="text" id="email-search" placeholder="Search by sender email..." class="email-search-input">
+                            <i class="fas fa-search email-search-icon"></i>
+                        </div>
+                        <button id="refresh-inbox" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
                 </div>
                 
+                <!-- Email List View -->
                 <div class="email-list" id="email-list">
                     <!-- Emails will be populated here -->
+                </div>
+                
+                <!-- Email Detail View -->
+                <div class="email-detail-view" id="email-detail-view" style="display: none;">
+                    <div class="email-detail-header">
+                        <button id="back-to-inbox" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Inbox
+                        </button>
+                    </div>
+                    <div class="email-detail-content" id="email-detail-content">
+                        <!-- Email detail content will be populated here -->
+                    </div>
                 </div>
             </div>
 

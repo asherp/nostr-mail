@@ -1,3 +1,4 @@
+* fetch emails, filtering
 * working email send
 * dm decryption
 * tauri app prototype

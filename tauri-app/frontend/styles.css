@@ -498,17 +498,56 @@ body.dark-mode .dm-search-icon {
     word-wrap: break-word;
 }
 
+.message-meta {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
 .message-time {
     font-size: 11px;
     opacity: 0.7;
-    text-align: right;
+}
+
+.message-status {
+    font-size: 12px;
+    opacity: 0.8;
+}
+
+.message-status.pending {
+    color: #999;
+}
+
+.message-status.sent {
+    color: #4CAF50;
+}
+
+.message-status.confirmed {
+    color: #2196F3;
 }
 
 .message-sent .message-time {
     color: rgba(255, 255, 255, 0.8);
 }
 
+.message-sent .message-status.pending {
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.message-sent .message-status.sent {
+    color: rgba(255, 255, 255, 0.9);
+}
+
+.message-sent .message-status.confirmed {
+    color: rgba(255, 255, 255, 1);
+}
+
 .message-received .message-time {
+    color: var(--muted-color);
+}
+
+.message-received .message-status {
     color: var(--muted-color);
 }
 
@@ -533,12 +572,12 @@ body.dark-mode .dm-search-icon {
 .dm-compose input,
 .dm-compose textarea {
     width: 100%;
-    padding: 10px;
+    padding: 12px;
     border: 1px solid var(--border-color);
     border-radius: 6px;
+    font-size: 14px;
     background: var(--bg-color);
     color: var(--text-color);
-    font-size: 14px;
 }
 
 .dm-compose input:focus,
@@ -1787,4 +1826,96 @@ body:not(.dark-mode) .email-header-label {
 
 body:not(.dark-mode) .email-header-value {
     color: #333;
+}
+
+/* DM Message Input Styles */
+.dm-message-input-container {
+    padding: 20px;
+    border-top: 1px solid var(--border-color);
+    background: var(--bg-color);
+    flex-shrink: 0;
+}
+
+.dm-message-input-wrapper {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+}
+
+.dm-message-input {
+    flex: 1;
+    padding: 12px 16px;
+    border: 2px solid var(--border-color);
+    border-radius: 24px;
+    font-size: 14px;
+    background: var(--bg-color);
+    color: var(--text-color);
+    transition: all 0.3s ease;
+    resize: none;
+    outline: none;
+}
+
+.dm-message-input:focus {
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+}
+
+.dm-message-input:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.dm-send-btn {
+    width: 44px;
+    height: 44px;
+    border: none;
+    border-radius: 50%;
+    background: var(--primary-color);
+    color: white;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.3s ease;
+    flex-shrink: 0;
+}
+
+.dm-send-btn:hover:not(:disabled) {
+    background: var(--primary-hover);
+    transform: scale(1.05);
+}
+
+.dm-send-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+}
+
+.dm-send-btn i {
+    font-size: 16px;
+}
+
+/* Dark mode support for DM message input */
+body.dark-mode .dm-message-input-container {
+    border-top-color: var(--border-color-dark);
+    background: var(--bg-color-dark);
+}
+
+body.dark-mode .dm-message-input {
+    background: var(--bg-color-dark);
+    color: var(--text-color-dark);
+    border-color: var(--border-color-dark);
+}
+
+body.dark-mode .dm-message-input:focus {
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+}
+
+body.dark-mode .dm-send-btn {
+    background: var(--primary-color);
+}
+
+body.dark-mode .dm-send-btn:hover:not(:disabled) {
+    background: var(--primary-hover);
 }

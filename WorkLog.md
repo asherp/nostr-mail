@@ -1,3 +1,4 @@
+* send DM working
 * fetch emails, filtering
 * working email send
 * dm decryption

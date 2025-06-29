@@ -61,11 +61,11 @@ pub async fn send_direct_message(
 ) -> Result<String> {
     // Parse keys from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
-    let keys = Keys::new(secret_key);
+    let keys = Keys::new(secret_key.clone());
     let recipient = PublicKey::from_bech32(recipient_pubkey)?;
     
     // Create client
-    let client = Client::new(keys);
+    let client = Client::new(keys.clone());
     if relays.is_empty() {
         client.add_relay("wss://nostr-pub.wellorder.net").await?;
         client.add_relay("wss://relay.damus.io").await?;
@@ -76,10 +76,74 @@ pub async fn send_direct_message(
     }
     client.connect().await;
     
-    // Send private message using NIP-59 (gift wraps)
-    let event_id = client.send_private_msg(recipient, message, []).await?;
+    // Encrypt the message using NIP-04
+    let encrypted_content = nip04::encrypt(&secret_key, &recipient, message)?;
+    println!("[NOSTR] Encrypted message using NIP-04: {}", &encrypted_content[..encrypted_content.len().min(50)]);
+    
+    // Create the encrypted direct message event manually
+    let event = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content)
+        .tag(Tag::public_key(recipient))
+        .build(keys.public_key())
+        .sign_with_keys(&keys)?;
+    
+    println!("[NOSTR] Created encrypted direct message event with ID: {}", event.id.to_hex());
+    println!("[NOSTR] Event content length: {}", event.content.len());
+    println!("[NOSTR] Event tags: {:?}", event.tags);
+    
+    // Send the event to relays
+    let event_id = client.send_event(&event).await?;
+    
+    println!("[NOSTR] Successfully sent encrypted direct message, event ID: {}", event_id.to_hex());
     
     Ok(event_id.to_hex())
+}
+
+pub async fn check_message_confirmation(event_id: &str, relays: &[String]) -> Result<bool> {
+    println!("[NOSTR] check_message_confirmation called for event: {}", event_id);
+    
+    // Parse event ID
+    let event_id = EventId::from_hex(event_id)?;
+    println!("[NOSTR] Parsed event ID successfully");
+    
+    // Create a client with generated keys (we don't need our own keys for this)
+    let keys = Keys::generate();
+    let client = Client::new(keys);
+    
+    // Add relays
+    for relay in relays {
+        println!("[NOSTR] Adding relay for confirmation check: {}", relay);
+        client.add_relay(relay.clone()).await?;
+    }
+    
+    // If no relays provided, use defaults
+    if relays.is_empty() {
+        println!("[NOSTR] No relays provided, using defaults");
+        client.add_relay("wss://nostr-pub.wellorder.net").await?;
+        client.add_relay("wss://relay.damus.io").await?;
+    }
+    
+    client.connect().await;
+    println!("[NOSTR] Connected to relays for confirmation check");
+    
+    // Create filter to look for this specific event
+    let filter = Filter::new().id(event_id);
+    println!("[NOSTR] Created filter for event ID: {}", event_id.to_hex());
+    
+    // Try to fetch the event with a short timeout
+    match client.fetch_events(filter, Duration::from_secs(5)).await {
+        Ok(events) => {
+            println!("[NOSTR] Found {} events for confirmation check", events.len());
+            // If we found the event, it's confirmed
+            let confirmed = !events.is_empty();
+            println!("[NOSTR] Message confirmation result: {}", confirmed);
+            Ok(confirmed)
+        },
+        Err(e) => {
+            println!("[NOSTR] Error fetching events for confirmation: {}", e);
+            // If we can't fetch it, it's not confirmed yet
+            Ok(false)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

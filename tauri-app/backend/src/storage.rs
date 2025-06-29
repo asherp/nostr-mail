@@ -36,6 +36,12 @@ pub struct ConversationMessage {
     pub content: String,
     pub timestamp: i64,
     pub is_sent: bool,
+    #[serde(default = "default_confirmed")]
+    pub confirmed: bool,
+}
+
+fn default_confirmed() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

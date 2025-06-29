@@ -38,6 +38,8 @@ secp256k1 = { version = "0.28", features = ["rand"] }
 uuid = { version = "1.0", features = ["v4"] }
 futures = "0.3"
 mailparse = "0.14"
+qrcode = "0.13"
+image = "0.25"
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem

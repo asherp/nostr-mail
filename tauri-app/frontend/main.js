@@ -521,13 +521,23 @@ async function loadDmContacts() {
             appState.dmMessages = {};
             cachedData.forEach(conv => {
                 if (conv.messages && conv.messages.length > 0) {
-                    appState.dmMessages[conv.contact_pubkey] = conv.messages.map(msg => ({
-                        id: msg.id,
-                        content: msg.content,
-                        created_at: msg.timestamp,
-                        pubkey: msg.sender_pubkey,
-                        is_sent: msg.is_sent
-                    }));
+                    // Preserve existing local cache for this contact
+                    const existingMessages = appState.dmMessages[conv.contact_pubkey] || [];
+                    
+                    appState.dmMessages[conv.contact_pubkey] = conv.messages.map(msg => {
+                        // Check if this message exists in local cache
+                        const existingMessage = existingMessages.find(existing => existing.id === msg.id);
+                        
+                        return {
+                            id: msg.id,
+                            content: msg.content,
+                            created_at: msg.timestamp,
+                            pubkey: msg.sender_pubkey,
+                            is_sent: msg.is_sent,
+                            // Preserve local confirmation status if it exists, otherwise use network status
+                            confirmed: existingMessage ? existingMessage.confirmed : msg.is_sent
+                        };
+                    });
                 }
             });
             
@@ -577,13 +587,23 @@ async function loadDmContacts() {
                 
                 // Store the messages from the conversation data
                 if (conv.messages && conv.messages.length > 0) {
-                    appState.dmMessages[conv.contact_pubkey] = conv.messages.map(msg => ({
-                        id: msg.id,
-                        content: msg.content,
-                        created_at: msg.timestamp,
-                        pubkey: msg.sender_pubkey,
-                        is_sent: msg.is_sent
-                    }));
+                    // Preserve existing local cache for this contact
+                    const existingMessages = appState.dmMessages[conv.contact_pubkey] || [];
+                    
+                    appState.dmMessages[conv.contact_pubkey] = conv.messages.map(msg => {
+                        // Check if this message exists in local cache
+                        const existingMessage = existingMessages.find(existing => existing.id === msg.id);
+                        
+                        return {
+                            id: msg.id,
+                            content: msg.content,
+                            created_at: msg.timestamp,
+                            pubkey: msg.sender_pubkey,
+                            is_sent: msg.is_sent,
+                            // Preserve local confirmation status if it exists, otherwise use network status
+                            confirmed: existingMessage ? existingMessage.confirmed : msg.is_sent
+                        };
+                    });
                 }
                 
                 return {
@@ -904,7 +924,8 @@ async function loadDmMessages(contactPubkey) {
             content: msg.content,
             created_at: msg.timestamp,
             pubkey: msg.sender_pubkey,
-            is_sent: msg.is_sent
+            is_sent: msg.is_sent,
+            confirmed: msg.is_sent // If we can fetch it from network, it's confirmed
         }));
         
         appState.dmMessages[contactPubkey] = formattedMessages;
@@ -928,7 +949,8 @@ async function loadDmMessages(contactPubkey) {
                                 timestamp: msg.created_at,
                                 sender_pubkey: msg.pubkey,
                                 receiver_pubkey: contactPubkey,
-                                is_sent: msg.is_sent
+                                is_sent: msg.is_sent,
+                                confirmed: msg.confirmed
                             })),
                             cached_at: new Date().toISOString()
                         };
@@ -951,10 +973,13 @@ async function loadDmMessages(contactPubkey) {
 
 function renderDmMessages(contactPubkey) {
     if (!elements.dmMessages) return;
-    
     try {
         const messages = appState.dmMessages[contactPubkey] || [];
         const contact = appState.dmContacts.find(c => c.pubkey === contactPubkey);
+        
+        console.log('[JS] renderDmMessages called for contact:', contactPubkey);
+        console.log('[JS] Number of messages to render:', messages.length);
+        console.log('[JS] Messages:', messages);
         
         elements.dmMessages.innerHTML = '';
         
@@ -966,47 +991,110 @@ function renderDmMessages(contactPubkey) {
                     <p>Start a conversation with ${contact ? contact.name : 'this contact'}!</p>
                 </div>
             `;
-            return;
-        }
-        
-        // Create conversation header
-        const headerElement = document.createElement('div');
-        headerElement.className = 'conversation-header';
-        headerElement.innerHTML = `
-            <div class="conversation-contact-info">
-                <div class="conversation-contact-name">${contact ? contact.name : contactPubkey}</div>
-                <div class="conversation-contact-pubkey">${contactPubkey}</div>
-            </div>
-        `;
-        elements.dmMessages.appendChild(headerElement);
-        
-        // Create messages container
-        const messagesContainer = document.createElement('div');
-        messagesContainer.className = 'messages-container';
-        
-        messages.forEach(message => {
-            const messageElement = document.createElement('div');
-            messageElement.className = `message ${message.is_sent ? 'message-sent' : 'message-received'}`;
-            
-            const time = new Date(message.created_at * 1000).toLocaleTimeString([], { 
-                hour: '2-digit', 
-                minute: '2-digit' 
-            });
-            
-            messageElement.innerHTML = `
-                <div class="message-content">
-                    <div class="message-text">${escapeHtml(message.content)}</div>
-                    <div class="message-time">${time}</div>
+        } else {
+            // Create conversation header
+            const headerElement = document.createElement('div');
+            headerElement.className = 'conversation-header';
+            headerElement.innerHTML = `
+                <div class="conversation-contact-info">
+                    <div class="conversation-contact-name">${contact ? contact.name : contactPubkey}</div>
+                    <div class="conversation-contact-pubkey">${contactPubkey}</div>
                 </div>
             `;
+            elements.dmMessages.appendChild(headerElement);
             
-            messagesContainer.appendChild(messageElement);
-        });
+            // Create messages container
+            const messagesContainer = document.createElement('div');
+            messagesContainer.className = 'messages-container';
+            
+            // Sort messages from oldest to newest (top to bottom)
+            const sortedMessages = [...messages].sort((a, b) => a.created_at - b.created_at);
+            
+            console.log('[JS] Sorted messages:', sortedMessages);
+            
+            sortedMessages.forEach((message, index) => {
+                console.log(`[JS] Rendering message ${index}:`, message);
+                
+                const messageElement = document.createElement('div');
+                messageElement.className = `message ${message.is_sent ? 'message-sent' : 'message-received'}`;
+                
+                const time = new Date(message.created_at * 1000).toLocaleTimeString([], { 
+                    hour: '2-digit', 
+                    minute: '2-digit' 
+                });
+                
+                // Add checkmark for sent messages
+                let statusIcon = '';
+                if (message.is_sent) {
+                    if (message.confirmed) {
+                        // Double checkmark for confirmed messages
+                        statusIcon = '<i class="fas fa-check-double message-status confirmed"></i>';
+                    } else if (message.id && !message.id.startsWith('temp_')) {
+                        // Single checkmark for sent but not yet confirmed
+                        statusIcon = '<i class="fas fa-check message-status sent"></i>';
+                    } else {
+                        // Clock icon for pending messages (temporary IDs)
+                        statusIcon = '<i class="fas fa-clock message-status pending"></i>';
+                    }
+                }
+                
+                messageElement.innerHTML = `
+                    <div class="message-content">
+                        <div class="message-text">${escapeHtml(message.content)}</div>
+                        <div class="message-meta">
+                            <div class="message-time">${time}</div>
+                            ${statusIcon}
+                        </div>
+                    </div>
+                `;
+                
+                messagesContainer.appendChild(messageElement);
+            });
+            
+            elements.dmMessages.appendChild(messagesContainer);
+            
+            // Scroll to bottom to show the newest messages
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
         
-        elements.dmMessages.appendChild(messagesContainer);
+        // Add message input box at the bottom
+        const messageInputContainer = document.createElement('div');
+        messageInputContainer.className = 'dm-message-input-container';
+        messageInputContainer.innerHTML = `
+            <div class="dm-message-input-wrapper">
+                <input type="text" id="dm-reply-input" class="dm-message-input" placeholder="Type your message..." maxlength="1000">
+                <button id="dm-send-btn" class="dm-send-btn">
+                    <i class="fas fa-paper-plane"></i>
+                </button>
+            </div>
+        `;
+        elements.dmMessages.appendChild(messageInputContainer);
         
-        // Scroll to bottom
-        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        // Add event listeners for the new input elements
+        const replyInput = document.getElementById('dm-reply-input');
+        const sendBtn = document.getElementById('dm-send-btn');
+        
+        if (replyInput && sendBtn) {
+            // Send message on Enter key
+            replyInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendReplyMessage(contactPubkey);
+                }
+            });
+            
+            // Send message on button click
+            sendBtn.addEventListener('click', () => {
+                sendReplyMessage(contactPubkey);
+            });
+            
+            // Focus the input
+            setTimeout(() => {
+                replyInput.focus();
+            }, 100);
+        }
+        
+        console.log('[JS] renderDmMessages completed successfully');
         
     } catch (error) {
         console.error('Error rendering DM messages:', error);
@@ -1020,10 +1108,7 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-async function sendDirectMessage() {
-    const recipientPubkey = elements.dmRecipient.value.trim();
-    const message = elements.dmMessage.value.trim();
-    
+async function sendDirectMessage(recipientPubkey, message) {
     if (!recipientPubkey || !message) {
         showError('Recipient and message are required');
         return;
@@ -1041,35 +1126,313 @@ async function sendDirectMessage() {
     }
     
     try {
-        await tauriInvoke('send_direct_message', {
+        // Disable the send button while sending
+        const sendBtn = document.getElementById('dm-send-btn');
+        if (sendBtn) {
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending...';
+        }
+        
+        const result = await tauriInvoke('send_direct_message', {
             privateKey: appState.keypair.private_key,
             recipientPubkey,
             message,
             relays: activeRelays
         });
         
-        // Clear the message input
-        if (elements.dmMessage) {
-            elements.dmMessage.value = '';
+        console.log('[JS] Backend returned result:', result);
+        
+        // Re-enable the send button
+        if (sendBtn) {
+            sendBtn.disabled = false;
+            sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Send';
         }
+        
+        // Clear the message input
+        const messageInput = document.getElementById('dm-message');
+        if (messageInput) {
+            messageInput.value = '';
+        }
+        
+        // Show success message
+        showSuccess('DM sent successfully');
         
         // Refresh the conversation list to show the new message
         await loadDmContacts();
         
-        // If we have a selected contact, reload their messages
-        if (appState.selectedDmContact && appState.selectedDmContact.pubkey === recipientPubkey) {
-            await loadDmMessages(recipientPubkey);
+        // Start checking for message confirmation if we got an event ID
+        if (result && !result.startsWith('temp_')) {
+            checkMessageConfirmation(recipientPubkey, result);
         }
         
-        showSuccess('DM sent successfully');
+        // Save the new conversation to backend storage
+        try {
+            // Get current conversations from backend
+            const currentConversations = await tauriInvoke('get_conversations');
+            const newConversation = {
+                contact_pubkey: recipientPubkey,
+                contact_name: null, // Will be updated when profile is loaded
+                last_message: message,
+                last_timestamp: Math.floor(Date.now() / 1000),
+                message_count: 1,
+                messages: [{
+                    id: result || `temp_${Date.now()}`,
+                    content: message,
+                    timestamp: Math.floor(Date.now() / 1000),
+                    sender_pubkey: appState.keypair.public_key,
+                    receiver_pubkey: recipientPubkey,
+                    is_sent: true,
+                    confirmed: false
+                }],
+                cached_at: new Date().toISOString()
+            };
+            
+            const updatedConversations = [...(currentConversations || []), newConversation];
+            await tauriInvoke('set_conversations', { conversations: updatedConversations });
+            console.log('[JS] Saved new conversation to backend storage');
+        } catch (e) {
+            console.warn('Failed to save new conversation to backend storage:', e);
+        }
         
     } catch (error) {
         console.error('Error in sendDirectMessage:', error);
         showError('Failed to send DM');
+        
+        // Re-enable the send button on error
+        const sendBtn = document.getElementById('dm-send-btn');
+        if (sendBtn) {
+            sendBtn.disabled = false;
+            sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Send';
+        }
     }
 }
 
-function showNewDmCompose() {
+async function sendReplyMessage(contactPubkey) {
+    const replyInput = document.getElementById('dm-reply-input');
+    const message = replyInput?.value?.trim() || '';
+    
+    if (!message) {
+        showError('Message cannot be empty');
+        return;
+    }
+    
+    if (!appState.keypair) {
+        showError('No keypair available');
+        return;
+    }
+
+    const activeRelays = getActiveRelays();
+    if (activeRelays.length === 0) {
+        showError('No active relays configured');
+        return;
+    }
+    
+    try {
+        console.log('[JS] Sending reply message to:', contactPubkey);
+        console.log('[JS] Message content:', message);
+        console.log('[JS] Active relays:', activeRelays);
+        
+        // Disable the send button and input while sending
+        const sendBtn = document.getElementById('dm-send-btn');
+        if (sendBtn) {
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+        }
+        if (replyInput) {
+            replyInput.disabled = true;
+        }
+        
+        const result = await tauriInvoke('send_direct_message', {
+            privateKey: appState.keypair.private_key,
+            recipientPubkey: contactPubkey,
+            message,
+            relays: activeRelays
+        });
+        
+        console.log('[JS] Backend returned result:', result);
+        console.log('[JS] Result type:', typeof result);
+        
+        // Clear the message input
+        if (replyInput) {
+            replyInput.value = '';
+            replyInput.disabled = false;
+        }
+        
+        // Re-enable the send button
+        if (sendBtn) {
+            sendBtn.disabled = false;
+            sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i>';
+        }
+        
+        // Immediately add the sent message to the local cache
+        const newMessage = {
+            id: result || `temp_${Date.now()}`, // Backend now returns event ID directly
+            content: message,
+            created_at: Math.floor(Date.now() / 1000),
+            pubkey: appState.keypair.public_key,
+            is_sent: true,
+            confirmed: false // Will be updated when confirmed
+        };
+        
+        console.log('[JS] Created new message object:', newMessage);
+        
+        // Initialize the messages array if it doesn't exist
+        if (!appState.dmMessages[contactPubkey]) {
+            appState.dmMessages[contactPubkey] = [];
+        }
+        
+        // Add the new message to the cache
+        appState.dmMessages[contactPubkey].push(newMessage);
+        
+        console.log('[JS] Added message to cache. Total messages for this contact:', appState.dmMessages[contactPubkey].length);
+        console.log('[JS] Current cache for this contact:', appState.dmMessages[contactPubkey]);
+        
+        // Save the updated conversation to backend storage
+        try {
+            // Get current conversations from backend
+            const currentConversations = await tauriInvoke('get_conversations');
+            if (currentConversations && currentConversations.length > 0) {
+                // Update the specific conversation with the new message
+                const updatedConversations = currentConversations.map(conv => {
+                    if (conv.contact_pubkey === contactPubkey) {
+                        return {
+                            ...conv,
+                            messages: appState.dmMessages[contactPubkey].map(msg => ({
+                                id: msg.id,
+                                content: msg.content,
+                                timestamp: msg.created_at,
+                                sender_pubkey: msg.pubkey,
+                                receiver_pubkey: contactPubkey,
+                                is_sent: msg.is_sent,
+                                confirmed: msg.confirmed
+                            })),
+                            last_message: newMessage.content,
+                            last_timestamp: newMessage.created_at,
+                            message_count: appState.dmMessages[contactPubkey].length,
+                            cached_at: new Date().toISOString()
+                        };
+                    }
+                    return conv;
+                });
+                
+                await tauriInvoke('set_conversations', { conversations: updatedConversations });
+                console.log('[JS] Saved updated conversation to backend storage');
+            }
+        } catch (e) {
+            console.warn('Failed to save updated conversation to backend storage:', e);
+        }
+        
+        // Re-render the messages to show the new message immediately
+        renderDmMessages(contactPubkey);
+        
+        // Refresh the conversation list to show the new message in the sidebar
+        await loadDmContacts();
+        
+        // Start checking for message confirmation
+        if (newMessage.id && !newMessage.id.startsWith('temp_')) {
+            console.log('[JS] Starting confirmation check for message:', newMessage.id);
+            checkMessageConfirmation(contactPubkey, newMessage.id);
+        }
+        
+        showSuccess('Message sent successfully');
+        
+    } catch (error) {
+        console.error('Error in sendReplyMessage:', error);
+        showError('Failed to send message');
+        
+        // Re-enable the input and button on error
+        if (replyInput) {
+            replyInput.disabled = false;
+        }
+        const sendBtn = document.getElementById('dm-send-btn');
+        if (sendBtn) {
+            sendBtn.disabled = false;
+            sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i>';
+        }
+    }
+}
+
+// Function to check if a sent message has been observed on the network
+async function checkMessageConfirmation(contactPubkey, messageId) {
+    if (!appState.keypair) return;
+    
+    const activeRelays = getActiveRelays();
+    if (activeRelays.length === 0) return;
+    
+    try {
+        console.log('[JS] Checking message confirmation for:', messageId);
+        console.log('[JS] Using relays:', activeRelays);
+        
+        // Check if the message has been observed on the network
+        const isConfirmed = await tauriInvoke('check_message_confirmation', {
+            eventId: messageId,
+            relays: activeRelays
+        });
+        
+        console.log('[JS] Confirmation result:', isConfirmed);
+        
+        if (isConfirmed) {
+            console.log('[JS] Message confirmed! Updating cache...');
+            
+            // Update the message in the cache
+            const messageIndex = appState.dmMessages[contactPubkey]?.findIndex(msg => msg.id === messageId);
+            console.log('[JS] Found message at index:', messageIndex);
+            
+            if (messageIndex !== -1 && messageIndex !== undefined) {
+                appState.dmMessages[contactPubkey][messageIndex].confirmed = true;
+                console.log('[JS] Updated message to confirmed status');
+                
+                // Re-render to show the confirmation
+                renderDmMessages(contactPubkey);
+                console.log('[JS] Re-rendered messages to show confirmation');
+                
+                // Also update the backend storage with the confirmed status
+                try {
+                    const currentConversations = await tauriInvoke('get_conversations');
+                    if (currentConversations && currentConversations.length > 0) {
+                        const updatedConversations = currentConversations.map(conv => {
+                            if (conv.contact_pubkey === contactPubkey) {
+                                return {
+                                    ...conv,
+                                    messages: conv.messages.map(msg => 
+                                        msg.id === messageId 
+                                            ? { ...msg, confirmed: true }
+                                            : msg
+                                    ),
+                                    cached_at: new Date().toISOString()
+                                };
+                            }
+                            return conv;
+                        });
+                        
+                        await tauriInvoke('set_conversations', { conversations: updatedConversations });
+                        console.log('[JS] Updated backend storage with confirmed status');
+                    }
+                } catch (e) {
+                    console.warn('Failed to update backend storage with confirmed status:', e);
+                }
+                
+                console.log(`Message ${messageId} confirmed on network`);
+            } else {
+                console.warn('[JS] Message not found in cache for confirmation update');
+            }
+        } else {
+            console.log('[JS] Message not yet confirmed, will retry in 3 seconds');
+            // Retry after a delay if not confirmed yet
+            setTimeout(() => {
+                checkMessageConfirmation(contactPubkey, messageId);
+            }, 3000); // Check again in 3 seconds
+        }
+    } catch (error) {
+        console.warn('Error checking message confirmation:', error);
+        // Retry after a delay on error
+        setTimeout(() => {
+            checkMessageConfirmation(contactPubkey, messageId);
+        }, 5000); // Check again in 5 seconds
+    }
+}
+
+function showNewDmCompose(recipientPubkey = null) {
     try {
         appState.selectedDmContact = null;
         
@@ -1078,9 +1441,69 @@ function showNewDmCompose() {
             item.classList.remove('active');
         });
         
-        // Clear messages
+        // Show compose form instead of placeholder
         if (elements.dmMessages) {
-            elements.dmMessages.innerHTML = '<div class="text-center text-muted">Select a contact to start a conversation</div>';
+            elements.dmMessages.innerHTML = `
+                <div class="dm-compose-form" style="padding: 1rem;">
+                    <div class="form-group">
+                        <label for="dm-recipient">To:</label>
+                        <input type="text" id="dm-recipient" placeholder="npub1..." value="${recipientPubkey || ''}" ${recipientPubkey ? 'readonly' : ''}>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="dm-message">Message:</label>
+                        <textarea id="dm-message" rows="8" placeholder="Type your message here..."></textarea>
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button id="dm-send-btn" class="btn btn-primary">
+                            <i class="fas fa-paper-plane"></i> Send
+                        </button>
+                        <button id="dm-cancel-btn" class="btn btn-secondary">
+                            <i class="fas fa-times"></i> Cancel
+                        </button>
+                    </div>
+                </div>
+            `;
+            
+            // Set up event listeners for the new form
+            const sendBtn = document.getElementById('dm-send-btn');
+            const cancelBtn = document.getElementById('dm-cancel-btn');
+            const recipientInput = document.getElementById('dm-recipient');
+            const messageInput = document.getElementById('dm-message');
+            
+            if (sendBtn) {
+                sendBtn.addEventListener('click', () => {
+                    const recipient = recipientInput?.value?.trim();
+                    const message = messageInput?.value?.trim();
+                    
+                    if (!recipient) {
+                        showError('Please enter a recipient public key');
+                        return;
+                    }
+                    
+                    if (!message) {
+                        showError('Please enter a message');
+                        return;
+                    }
+                    
+                    // Send the message using the new function
+                    sendDirectMessage(recipient, message);
+                });
+            }
+            
+            if (cancelBtn) {
+                cancelBtn.addEventListener('click', () => {
+                    showNewDmCompose(); // Reset to placeholder
+                });
+            }
+            
+            // Focus the message input if recipient is pre-filled
+            if (recipientPubkey && messageInput) {
+                messageInput.focus();
+            } else if (recipientInput) {
+                recipientInput.focus();
+            }
         }
         
     } catch (error) {
@@ -2969,13 +3392,34 @@ function sendEmailToContact(email) {
 }
 
 function sendDirectMessageToContact(pubkey) {
-    // Switch to DM tab and pre-fill the recipient
+    // Switch to DM tab
     switchTab('dm');
-    showNewDmCompose();
-    if (elements.dmRecipient) {
-        elements.dmRecipient.value = pubkey;
-        elements.dmMessage.focus();
+    // Immediately clear the DM message area to prevent flashing the previous conversation
+    if (elements.dmMessages) {
+        elements.dmMessages.innerHTML = '';
     }
+    // Try to find an existing DM contact
+    let contact = appState.dmContacts.find(c => c.pubkey === pubkey);
+    if (!contact) {
+        // Try to find the contact in the contacts list for name/picture
+        const baseContact = appState.contacts.find(c => c.pubkey === pubkey);
+        contact = {
+            pubkey: pubkey,
+            name: baseContact?.name || pubkey.substring(0, 16) + '...',
+            lastMessage: '',
+            lastMessageTime: new Date(),
+            messageCount: 0,
+            picture_data_url: baseContact?.picture_data_url || null,
+            profileLoaded: !!baseContact
+        };
+        // Add to DM contacts and initialize empty messages
+        appState.dmContacts.push(contact);
+        appState.dmMessages[pubkey] = [];
+    }
+    // Render the skeleton UI immediately
+    renderDmConversationSkeleton(contact);
+    // Select the DM contact to show the conversation view (will fetch/load messages)
+    selectDmContact(contact);
 }
 
 async function copyContactPubkey(pubkey) {
@@ -3075,7 +3519,12 @@ async function refreshDmConversations() {
             elements.dmContacts.innerHTML = '<div class="text-center text-muted">Loading conversations...</div>';
         }
         if (elements.dmMessages) {
-            elements.dmMessages.innerHTML = '<div class="text-center text-muted">Select a conversation to view messages</div>';
+            elements.dmMessages.innerHTML = `
+                <div class="text-center text-muted" style="padding: 2rem;">
+                    <i class="fas fa-sync fa-spin" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
+                    <p>Refreshing conversations...</p>
+                </div>
+            `;
         }
         
         // Reload conversations
@@ -3285,3 +3734,117 @@ function handleEmailProviderChange() {
 }
 
 // Function to refresh all data for a new keypair
+
+function renderDmConversationSkeleton(contact) {
+    if (!elements.dmMessages) return;
+    elements.dmMessages.innerHTML = '';
+
+    // Header
+    const headerElement = document.createElement('div');
+    headerElement.className = 'conversation-header';
+    headerElement.innerHTML = `
+        <div class="conversation-contact-info">
+            <div class="conversation-contact-name">${contact ? contact.name : contact.pubkey}</div>
+            <div class="conversation-contact-pubkey">${contact.pubkey}</div>
+        </div>
+    `;
+    elements.dmMessages.appendChild(headerElement);
+
+    // Loading spinner for messages
+    const loadingElement = document.createElement('div');
+    loadingElement.className = 'messages-loading';
+    loadingElement.innerHTML = `
+        <div class="text-center text-muted" style="padding: 2rem;">
+            <i class="fas fa-sync fa-spin" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
+            <p>Loading messages...</p>
+        </div>
+    `;
+    elements.dmMessages.appendChild(loadingElement);
+
+    // Message input at the bottom
+    const messageInputContainer = document.createElement('div');
+    messageInputContainer.className = 'dm-message-input-container';
+    messageInputContainer.innerHTML = `
+        <div class="dm-message-input-wrapper">
+            <input type="text" id="dm-reply-input" class="dm-message-input" placeholder="Type your message..." maxlength="1000">
+            <button id="dm-send-btn" class="dm-send-btn">
+                <i class="fas fa-paper-plane"></i>
+            </button>
+        </div>
+    `;
+    elements.dmMessages.appendChild(messageInputContainer);
+
+    // Add event listeners for the new input elements
+    const replyInput = document.getElementById('dm-reply-input');
+    const sendBtn = document.getElementById('dm-send-btn');
+    if (replyInput && sendBtn) {
+        // Send message on Enter key
+        replyInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendReplyMessage(contact.pubkey);
+            }
+        });
+        // Send message on button click
+        sendBtn.addEventListener('click', () => {
+            sendReplyMessage(contact.pubkey);
+        });
+        // Focus the input
+        setTimeout(() => {
+            replyInput.focus();
+        }, 100);
+    }
+}
+
+// Add this helper function near your modal helpers
+async function showQrCodeModal(label, value) {
+    showModal(`${label} QR Code`, `<div id='qr-modal-container' style='display:flex;flex-direction:column;align-items:center;justify-content:center;'><div id='qr-code' style='margin:20px;text-align:center;'><i class="fas fa-spinner fa-spin" style="font-size:2rem;color:#666;"></i><br><small>Generating QR code...</small></div><div style='word-break:break-all;font-size:0.9em;margin-top:10px;'>${value}</div></div>`);
+    
+    try {
+        // Generate QR code using Rust backend
+        const qrDataUrl = await tauriInvoke('generate_qr_code', { data: value, size: 200 });
+        
+        // Update the modal with the generated QR code
+        const qrElement = document.getElementById('qr-code');
+        if (qrElement) {
+            qrElement.innerHTML = `<img src="${qrDataUrl}" alt="QR Code" style="max-width:200px;max-height:200px;border:1px solid #ddd;border-radius:4px;">`;
+        }
+    } catch (error) {
+        console.error('Failed to generate QR code:', error);
+        const qrElement = document.getElementById('qr-code');
+        if (qrElement) {
+            qrElement.innerHTML = '<span style="color:red">Failed to generate QR code</span>';
+        }
+    }
+}
+
+// Add event listeners for QR code buttons after DOMContentLoaded
+// (add to setupEventListeners or after DOMContentLoaded)
+document.addEventListener('DOMContentLoaded', () => {
+    // ... existing code ...
+    
+    // npriv QR
+    const qrNprivBtn = document.getElementById('qr-npriv-btn');
+    if (qrNprivBtn) {
+        qrNprivBtn.addEventListener('click', async () => {
+            const npriv = document.getElementById('npriv-key')?.value || '';
+            if (npriv) {
+                await showQrCodeModal('Private Key', npriv);
+            } else {
+                showError('No private key to show');
+            }
+        });
+    }
+    // npub QR
+    const qrNpubBtn = document.getElementById('qr-npub-btn');
+    if (qrNpubBtn) {
+        qrNpubBtn.addEventListener('click', async () => {
+            const npub = document.getElementById('public-key-display')?.value || '';
+            if (npub) {
+                await showQrCodeModal('Public Key', npub);
+            } else {
+                showError('No public key to show');
+            }
+        });
+    }
+});

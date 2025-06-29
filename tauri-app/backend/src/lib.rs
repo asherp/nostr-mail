@@ -7,6 +7,7 @@ mod nostr;
 mod types;
 mod state;
 mod storage;
+use base64::Engine;
 
 use types::*;
 use state::{AppState, Relay};
@@ -43,12 +44,25 @@ fn get_public_key_from_private(private_key: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn send_direct_message(private_key: String, recipient_pubkey: String, message: String, relays: Vec<String>) -> Result<(), String> {
+async fn send_direct_message(private_key: String, recipient_pubkey: String, message: String, relays: Vec<String>) -> Result<String, String> {
     println!("[RUST] send_direct_message called");
-    nostr::send_direct_message(&private_key, &recipient_pubkey, &message, &relays)
+    println!("[RUST] Recipient: {}", recipient_pubkey);
+    println!("[RUST] Message: {}", message);
+    println!("[RUST] Relays: {:?}", relays);
+    
+    let result = nostr::send_direct_message(&private_key, &recipient_pubkey, &message, &relays)
         .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map(|event_id| {
+            println!("[RUST] Successfully sent message, event ID: {}", event_id);
+            event_id
+        })
+        .map_err(|e| {
+            println!("[RUST] Failed to send message: {}", e);
+            e.to_string()
+        });
+    
+    println!("[RUST] Returning result: {:?}", result);
+    result
 }
 
 #[tauri::command]
@@ -428,6 +442,78 @@ async fn test_smtp_connection(email_config: EmailConfig) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn check_message_confirmation(event_id: String, relays: Vec<String>) -> Result<bool, String> {
+    println!("[RUST] check_message_confirmation called for event: {}", event_id);
+    nostr::check_message_confirmation(&event_id, &relays)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn generate_qr_code(data: String, size: Option<u32>) -> Result<String, String> {
+    println!("[RUST] generate_qr_code called for data: {}...", &data[..data.len().min(20)]);
+    
+    // Use default size of 256 if not specified
+    let qr_size = size.unwrap_or(256);
+    
+    // Generate QR code
+    let qr = qrcode::QrCode::new(&data)
+        .map_err(|e| format!("Failed to generate QR code: {}", e))?;
+    
+    // Render to string first (this works with the qrcode crate)
+    let qr_string = qr.render()
+        .light_color(' ')
+        .dark_color('#')
+        .build();
+    
+    // Split the string into lines
+    let lines: Vec<&str> = qr_string.lines().collect();
+    let qr_width = lines.len() as u32;
+    
+    // Calculate module size to fit the requested size
+    let module_size = qr_size / qr_width;
+    let final_size = qr_width * module_size;
+    
+    // Create image buffer
+    let mut img = image::RgbaImage::new(final_size, final_size);
+    
+    // Fill with white background
+    for pixel in img.pixels_mut() {
+        *pixel = image::Rgba([255, 255, 255, 255]);
+    }
+    
+    // Draw QR code from the string representation
+    for (y, line) in lines.iter().enumerate() {
+        for (x, ch) in line.chars().enumerate() {
+            if ch == '#' {
+                // Draw black squares for QR code modules
+                for dy in 0..module_size {
+                    for dx in 0..module_size {
+                        let px = (x as u32) * module_size + dx;
+                        let py = (y as u32) * module_size + dy;
+                        if px < final_size && py < final_size {
+                            img.put_pixel(px, py, image::Rgba([0, 0, 0, 255]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Convert to PNG bytes
+    let mut png_bytes = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+    
+    // Convert to base64 data URL using the new API
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    let data_url = format!("data:image/png;base64,{}", base64_data);
+    
+    println!("[RUST] QR code generated successfully, size: {}x{}", final_size, final_size);
+    Ok(data_url)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("[RUST] Starting nostr-mail application...");
@@ -493,6 +579,8 @@ pub fn run() {
         set_conversations,
         test_imap_connection,
         test_smtp_connection,
+        check_message_confirmation,
+        generate_qr_code,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     

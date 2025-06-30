@@ -415,7 +415,14 @@ pub async fn fetch_following_profiles(
         let followed_pubkeys: Vec<PublicKey> = event.tags
             .iter()
             .filter(|tag| tag.kind().as_str() == "p")
-            .filter_map(|tag| tag.content().and_then(|pk| PublicKey::from_hex(pk).ok()))
+            .filter_map(|tag| {
+                tag.content().and_then(|pk| {
+                    // Try bech32 (npub) first, then hex
+                    PublicKey::from_bech32(pk)
+                        .or_else(|_| PublicKey::from_hex(pk))
+                        .ok()
+                })
+            })
             .collect();
         
         println!("[NOSTR] Found {} followed pubkeys", followed_pubkeys.len());

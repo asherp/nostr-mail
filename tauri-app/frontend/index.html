@@ -53,7 +53,11 @@
                 <div class="compose-form">
                     <div class="form-group">
                         <label for="to-address">To:</label>
+                        <select id="nostr-contact-select" class="form-control" style="margin-bottom: 8px;">
+                            <option value="">Select a Nostr contact with email...</option>
+                        </select>
                         <input type="email" id="to-address" placeholder="recipient@example.com">
+                        <small id="to-helper-text" class="form-text text-muted">Select a Nostr contact to auto-fill and encrypt, or enter an email address manually.</small>
                     </div>
                     
                     <div class="form-group">
@@ -67,6 +71,9 @@
                     </div>
                     
                     <div class="form-actions">
+                        <button id="encrypt-btn" class="btn btn-secondary" type="button">
+                            <i class="fas fa-lock"></i> Encrypt
+                        </button>
                         <button id="send-btn" class="btn btn-primary">
                             <i class="fas fa-paper-plane"></i> Send
                         </button>
@@ -117,9 +124,6 @@
                     <div class="dm-actions">
                         <button id="dm-search-toggle" class="btn btn-secondary">
                             <i class="fas fa-search"></i> Search
-                        </button>
-                        <button id="new-dm-btn" class="btn btn-primary">
-                            <i class="fas fa-plus"></i> New DM
                         </button>
                         <button id="refresh-dm" class="btn btn-secondary">
                             <i class="fas fa-sync"></i> Refresh
@@ -195,14 +199,15 @@
                     <form id="profile-fields-form">
                         <div id="profile-fields-list" class="profile-fields-list"></div>
                         <div class="form-actions">
+                            <button type="button" id="add-profile-field-btn" class="btn btn-secondary">
+                                <i class="fas fa-plus"></i> Add Field
+                            </button>
                             <button id="update-profile-btn" class="btn btn-primary" type="submit">
                                 <i class="fas fa-save"></i> Update Profile
                             </button>
                         </div>
                     </form>
                 </div>
-                <div id="profile-pubkey" class="profile-pubkey"></div>
-                <textarea id="profile-raw-json" class="profile-raw-json" readonly style="display:none; width:100%; min-height:120px; margin-top:16px; font-family:monospace;"></textarea>
             </div>
 
             <!-- Settings Tab -->
@@ -212,124 +217,136 @@
                 </div>
                 
                 <div class="settings-form">
-                    <div class="form-group">
-                        <label for="npriv-key">Nostr Private Key (npriv/nsec):</label>
-                        <div class="input-with-button">
-                            <input type="password" id="npriv-key" placeholder="npriv1... or nsec1...">
-                            <button id="toggle-npriv-visibility-btn" class="btn btn-small" type="button">
-                                <i class="fas fa-eye"></i>
-                            </button>
-                            <button id="copy-npriv-btn" class="btn btn-small">
-                                <i class="fas fa-copy"></i> Copy
-                            </button>
-                            <button id="qr-npriv-btn" class="btn btn-small" type="button" title="Show QR Code">
-                                <i class="fas fa-qrcode"></i>
-                            </button>
+                    <!-- Nostr Settings -->
+                    <div class="settings-section">
+                        <h3><i class="fas fa-key"></i> Nostr Settings</h3>
+                        
+                        <div class="form-group">
+                            <label for="npriv-key">Private Key (nsec/npriv):</label>
+                            <div class="input-with-buttons">
+                                <input type="password" id="npriv-key" placeholder="nsec1... or npriv1...">
+                                <button type="button" id="toggle-npriv-visibility-btn" class="btn btn-secondary" title="Show private key">
+                                    <i class="fas fa-eye"></i>
+                                </button>
+                                <button type="button" id="copy-npriv-btn" class="btn btn-secondary" title="Copy private key">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                                <button type="button" id="qr-npriv-btn" class="btn btn-secondary" title="Show QR code">
+                                    <i class="fas fa-qrcode"></i>
+                                </button>
+                            </div>
                         </div>
-                        <small class="form-help">Your Nostr private key in bech32 format (npriv1 or nsec1). This is used for signing messages and DMs.</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="generate-key-btn">Or Generate New Key:</label>
-                        <button id="generate-key-btn" class="btn btn-secondary">
-                            <i class="fas fa-key"></i> Generate New Keypair
-                        </button>
-                        <small class="form-help">Generate a new Nostr keypair if you don't have one.</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="public-key-display">Public Key (npub):</label>
-                        <div class="input-with-button">
-                            <input type="text" id="public-key-display" readonly placeholder="Your public key will appear here">
-                            <button id="copy-pubkey-btn" class="btn btn-small">
-                                <i class="fas fa-copy"></i> Copy
-                            </button>
-                            <button id="qr-npub-btn" class="btn btn-small" type="button" title="Show QR Code">
-                                <i class="fas fa-qrcode"></i>
-                            </button>
+                        
+                        <div class="form-group">
+                            <label for="public-key-display">Public Key (npub):</label>
+                            <div class="input-with-buttons">
+                                <input type="text" id="public-key-display" readonly placeholder="Will be generated from private key">
+                                <button type="button" id="copy-pubkey-btn" class="btn btn-secondary" title="Copy public key">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                                <button type="button" id="qr-npub-btn" class="btn btn-secondary" title="Show QR code">
+                                    <i class="fas fa-qrcode"></i>
+                                </button>
+                            </div>
                         </div>
-                    </div>
-                    
-                    <hr class="settings-divider">
-                    
-                    <div class="form-group">
-                        <label for="email-provider">Email Provider:</label>
-                        <select id="email-provider" class="form-control">
-                            <option value="">Select an email provider...</option>
-                            <option value="gmail">Gmail</option>
-                            <option value="outlook">Outlook/Hotmail</option>
-                            <option value="yahoo">Yahoo Mail</option>
-                            <option value="custom">Custom</option>
-                        </select>
-                        <small class="form-help">Select your email provider to auto-fill server settings.</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="email-address">Email Address:</label>
-                        <input type="email" id="email-address" placeholder="your@email.com">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="email-password">Email Password:</label>
-                        <div class="input-with-button">
-                            <input type="password" id="email-password" placeholder="App password">
-                            <button id="toggle-email-password-visibility-btn" class="btn btn-small" type="button">
-                                <i class="fas fa-eye"></i>
-                            </button>
-                            <button id="copy-email-password-btn" class="btn btn-small">
-                                <i class="fas fa-copy"></i> Copy
+                        
+                        <div class="form-group">
+                            <button id="generate-key-btn" class="btn btn-secondary">
+                                <i class="fas fa-key"></i> Generate New Keypair
                             </button>
                         </div>
                     </div>
                     
-                    <div class="form-group">
-                        <label for="smtp-host">SMTP Host:</label>
-                        <input type="text" id="smtp-host" placeholder="smtp.gmail.com">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="smtp-port">SMTP Port:</label>
-                        <input type="number" id="smtp-port" placeholder="587">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="imap-host">IMAP Host:</label>
-                        <input type="text" id="imap-host" placeholder="imap.gmail.com">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="imap-port">IMAP Port:</label>
-                        <input type="number" id="imap-port" placeholder="993">
-                    </div>
-                    
-                    <div class="form-group">
-                        <button id="test-email-connection-btn" class="btn btn-secondary">
-                            <i class="fas fa-envelope"></i> Test Email Connection
-                        </button>
-                        <small class="form-help">Test both IMAP and SMTP connections to verify your email settings are correct.</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>
-                            <input type="checkbox" id="use-tls"> Use TLS
-                        </label>
-                    </div>
-
-                    <hr class="settings-divider">
-                    <div class="relays-section">
-                        <h3>Relay Management</h3>
-                        <div id="relays-list" class="relays-list">
-                            <!-- Relays will be dynamically added here -->
+                    <!-- Email Settings -->
+                    <div class="settings-section">
+                        <h3><i class="fas fa-envelope"></i> Email Settings</h3>
+                        
+                        <div class="form-group">
+                            <label for="email-provider">Email Provider:</label>
+                            <select id="email-provider">
+                                <option value="">Select provider...</option>
+                                <option value="gmail">Gmail</option>
+                                <option value="outlook">Outlook/Office 365</option>
+                                <option value="yahoo">Yahoo</option>
+                                <option value="custom">Custom</option>
+                            </select>
                         </div>
-                        <div class="add-relay-form">
-                            <input type="text" id="new-relay-url" placeholder="wss://relay.example.com">
-                            <button id="add-relay-btn" class="btn btn-secondary">
-                                <i class="fas fa-plus"></i> Add Relay
+                        
+                        <div class="form-group">
+                            <label for="email-address">Email Address:</label>
+                            <input type="email" id="email-address" placeholder="your@email.com">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="email-password">Password:</label>
+                            <div class="input-with-buttons">
+                                <input type="password" id="email-password" placeholder="Password or App Password">
+                                <button type="button" id="toggle-email-password-visibility-btn" class="btn btn-secondary" title="Show password">
+                                    <i class="fas fa-eye"></i>
+                                </button>
+                                <button type="button" id="copy-email-password-btn" class="btn btn-secondary" title="Copy password">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="smtp-host">SMTP Host:</label>
+                            <input type="text" id="smtp-host" placeholder="smtp.gmail.com">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="smtp-port">SMTP Port:</label>
+                            <input type="number" id="smtp-port" placeholder="587" value="587">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="imap-host">IMAP Host:</label>
+                            <input type="text" id="imap-host" placeholder="imap.gmail.com">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="imap-port">IMAP Port:</label>
+                            <input type="number" id="imap-port" placeholder="993" value="993">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="use-tls" checked>
+                                <span class="checkmark"></span>
+                                Use TLS/SSL
+                            </label>
+                        </div>
+                        
+                        <div class="form-actions">
+                            <button id="test-email-connection-btn" class="btn btn-secondary">
+                                <i class="fas fa-envelope"></i> Test Email Connection
                             </button>
                         </div>
                     </div>
-
-                    <hr class="settings-divider">
+                    
+                    <!-- Relay Settings -->
+                    <div class="settings-section">
+                        <h3><i class="fas fa-network-wired"></i> Relay Settings</h3>
+                        
+                        <div class="form-group">
+                            <label for="new-relay-url">Add Relay:</label>
+                            <div class="input-with-button">
+                                <input type="text" id="new-relay-url" placeholder="wss://relay.example.com">
+                                <button id="add-relay-btn" class="btn btn-secondary">
+                                    <i class="fas fa-plus"></i> Add
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Active Relays:</label>
+                            <div id="relay-list" class="relay-list">
+                                <!-- Relays will be populated here -->
+                            </div>
+                        </div>
+                    </div>
+                    
                     <div class="form-actions">
                         <button id="save-settings-btn" class="btn btn-primary">
                             <i class="fas fa-save"></i> Save Settings
@@ -343,19 +360,20 @@
         </main>
     </div>
 
-    <!-- Modals -->
+    <!-- Modal Overlay -->
     <div id="modal-overlay" class="modal-overlay hidden">
         <div class="modal">
             <div class="modal-header">
                 <h3 id="modal-title">Modal Title</h3>
                 <button class="modal-close">&times;</button>
             </div>
-            <div class="modal-body" id="modal-body">
-                <!-- Modal content will be inserted here -->
+            <div id="modal-body" class="modal-body">
+                <!-- Modal content will be populated here -->
             </div>
         </div>
     </div>
 
-    <script src="main.js"></script>
+    <!-- Load the modular JavaScript -->
+    <script type="module" src="js/app.js"></script>
 </body>
 </html> 

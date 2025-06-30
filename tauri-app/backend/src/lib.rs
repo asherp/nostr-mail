@@ -514,6 +514,55 @@ fn generate_qr_code(data: String, size: Option<u32>) -> Result<String, String> {
     Ok(data_url)
 }
 
+#[tauri::command]
+async fn follow_user(private_key: String, pubkey_to_follow: String, relays: Vec<String>) -> Result<(), String> {
+    println!("[RUST] follow_user called for pubkey: {}", pubkey_to_follow);
+    
+    // First, get the current follow list
+    let current_follows = nostr::fetch_following_profiles(&private_key, &relays)
+        .await
+        .map_err(|e| format!("Failed to fetch current follows: {}", e))?;
+    
+    // Extract pubkeys from current follows
+    let mut current_pubkeys: Vec<String> = current_follows.iter()
+        .map(|profile| profile.pubkey.clone())
+        .collect();
+    
+    // Add the new pubkey if it's not already in the list
+    if !current_pubkeys.contains(&pubkey_to_follow) {
+        current_pubkeys.push(pubkey_to_follow.clone());
+        println!("[RUST] Added {} to follow list. Total follows: {}", pubkey_to_follow, current_pubkeys.len());
+    } else {
+        println!("[RUST] {} is already in follow list", pubkey_to_follow);
+        return Ok(()); // Already following
+    }
+    
+    // Create tags for the follow event (kind 3)
+    let tags: Vec<Vec<String>> = current_pubkeys.iter()
+        .map(|pubkey| vec!["p".to_string(), pubkey.clone()])
+        .collect();
+    
+    // Empty content for follow events
+    let content = "".to_string();
+    
+    // Publish the new follow event with the complete list
+    nostr::publish_event(&private_key, &content, 3, tags, &relays)
+        .await
+        .map(|_| {
+            println!("[RUST] Successfully published follow event with {} follows", current_pubkeys.len());
+        })
+        .map_err(|e| {
+            println!("[RUST] Failed to publish follow event: {}", e);
+            e.to_string()
+        })
+}
+
+#[tauri::command]
+fn encrypt_nip04_message(private_key: String, public_key: String, message: String) -> Result<String, String> {
+    println!("[RUST] encrypt_nip04_message called");
+    crypto::encrypt_message(&private_key, &public_key, &message).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("[RUST] Starting nostr-mail application...");
@@ -581,6 +630,8 @@ pub fn run() {
         test_smtp_connection,
         check_message_confirmation,
         generate_qr_code,
+        follow_user,
+        encrypt_nip04_message,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     

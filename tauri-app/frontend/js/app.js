@@ -10,6 +10,16 @@ import { contactsService } from './contacts-service.js';
 import { dmService } from './dm-service.js';
 import { Utils } from './utils.js';
 
+// Try to import Tauri APIs if available
+let tauriDialog, tauriFs;
+try {
+    tauriDialog = window.__TAURI__ ? window.__TAURI__.dialog : undefined;
+    tauriFs = window.__TAURI__ ? window.__TAURI__.fs : undefined;
+} catch (e) {
+    tauriDialog = undefined;
+    tauriFs = undefined;
+}
+
 export class NostrMailApp {
     constructor() {
         this.initialized = false;
@@ -292,6 +302,72 @@ export class NostrMailApp {
                 profileFieldsForm.addEventListener('submit', (e) => {
                     e.preventDefault();
                     this.updateProfile();
+                });
+            }
+            
+            // Contacts: Export npubs
+            const exportNpubsBtn = document.getElementById('export-npubs-btn');
+            if (exportNpubsBtn) {
+                exportNpubsBtn.addEventListener('click', async () => {
+                    const contacts = appState.getContacts();
+                    if (!contacts || contacts.length === 0) {
+                        notificationService.showError('No contacts to export.');
+                        return;
+                    }
+                    const npubs = contacts.map(c => c.pubkey).join('\n');
+                    const filename = 'nostr-contacts.txt';
+
+                    // Tauri-native save dialog and file write
+                    if (window.__TAURI__ && window.__TAURI__.dialog && window.__TAURI__.fs) {
+                        try {
+                            const { save } = window.__TAURI__.dialog;
+                            const { writeTextFile } = window.__TAURI__.fs;
+                            const selectedPath = await save({
+                                defaultPath: filename,
+                                filters: [
+                                    { name: 'Text Files', extensions: ['txt'] },
+                                ],
+                            });
+                            if (selectedPath) {
+                                await writeTextFile({ path: selectedPath, contents: npubs });
+                                notificationService.showSuccess(`Exported all contact npubs as a file!\nSaved to: ${selectedPath}`);
+                            } else {
+                                notificationService.showError('Export cancelled.');
+                            }
+                            return;
+                        } catch (err) {
+                            notificationService.showError('Failed to save file: ' + err.message);
+                            return;
+                        }
+                    }
+
+                    // Try File System Access API
+                    if (window.showSaveFilePicker) {
+                        try {
+                            const handle = await window.showSaveFilePicker({
+                                suggestedName: filename,
+                                types: [
+                                    {
+                                        description: 'Text Files',
+                                        accept: { 'text/plain': ['.txt'] },
+                                    },
+                                ],
+                            });
+                            const writable = await handle.createWritable();
+                            await writable.write(npubs);
+                            await writable.close();
+                            notificationService.showSuccess('Exported all contact npubs as a file!');
+                            return;
+                        } catch (err) {
+                            if (err.name !== 'AbortError') {
+                                notificationService.showError('Failed to save file: ' + err.message);
+                            }
+                            return;
+                        }
+                    }
+                    // Fallback: download as file
+                    Utils.downloadAsFile(npubs, filename);
+                    notificationService.showSuccess('Exported all contact npubs as a file!');
                 });
             }
             

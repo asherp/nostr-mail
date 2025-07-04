@@ -15,58 +15,40 @@ export class ContactsService {
     // Load contacts from backend and network
     async loadContacts() {
         console.log('[JS] loadContacts called - starting contacts loading...');
-        
+
         if (!appState.hasKeypair()) {
             notificationService.showError('No keypair available');
             return;
         }
 
-        // Try to load from backend storage first for instant display
+        // Load cached contacts to get profile information (needed for both cached and network data)
         let cacheLoaded = false;
         try {
             console.log('[JS] Loading contacts from backend storage...');
             const cachedContacts = await TauriService.getContacts();
             
             if (cachedContacts && cachedContacts.length > 0) {
-                console.log('[JS] Found cached contacts in backend, rendering immediately...');
-                
-                // Ensure cached contacts have all the necessary fields for offline display
+                // Convert backend storage format to frontend format
                 const contacts = cachedContacts.map(contact => ({
                     pubkey: contact.pubkey,
-                    name: contact.name || contact.display_name || contact.pubkey.substring(0, 16) + '...',
+                    name: contact.name,
                     picture: contact.picture || '',
                     email: contact.email || null,
                     fields: {
                         name: contact.name,
-                        display_name: contact.display_name,
-                        picture: contact.picture,
-                        about: contact.about,
-                        email: contact.email
+                        display_name: contact.display_name || contact.name,
+                        picture: contact.picture || '',
+                        about: contact.about || '',
+                        email: contact.email || ''
                     },
-                    // Load cached image data URL from backend storage
                     picture_data_url: contact.picture_data_url || null,
-                    picture_loaded: !!contact.picture_data_url,
-                    picture_loading: false
+                    picture_loading: false,
+                    picture_loaded: !!contact.picture_data_url
                 }));
                 
-                // Sort cached contacts alphabetically by name
-                contacts.sort((a, b) => {
-                    const nameA = a.name.toLowerCase();
-                    const nameB = b.name.toLowerCase();
-                    return nameA.localeCompare(nameB);
-                });
-                
                 appState.setContacts(contacts);
-                appState.setSelectedContact(null); // Clear selected contact when refreshing
                 this.renderContacts();
-                if (window.emailService && typeof window.emailService.populateNostrContactDropdown === 'function') {
-                    window.emailService.populateNostrContactDropdown();
-                }
                 cacheLoaded = true;
-                
-                // Load images progressively for contacts that need them
-                await this.loadContactImagesProgressively();
-                
                 console.log('[JS] Contacts loaded from backend storage');
             } else {
                 console.log('[JS] No cached contacts found in backend storage.');
@@ -75,84 +57,12 @@ export class ContactsService {
             console.warn('Failed to load cached contacts from backend:', e);
         }
 
-        // Try to fetch fresh data from network (but don't fail if offline)
-        try {
-            const activeRelays = appState.getActiveRelays();
-            if (activeRelays.length === 0) {
-                if (!cacheLoaded) {
-                    notificationService.showError('No active relays configured');
-                }
-                return;
-            }
-
-            console.log('🔄 Loading following profiles from network...');
-            
-            // Fetch following profiles from Nostr
-            const followingProfiles = await TauriService.fetchFollowingProfiles(
-                appState.getKeypair().private_key,
-                activeRelays
-            );
-            
-            console.log('[JS] Network response:', {
-                profilesReceived: !!followingProfiles,
-                profilesLength: followingProfiles?.length || 0
-            });
-
-            // Only update contacts if we actually got data from the network
-            if (followingProfiles && followingProfiles.length > 0) {
-                // Create contacts immediately with placeholder images
-                const newContacts = followingProfiles.map(profile => ({
-                    pubkey: profile.pubkey,
-                    name: profile.fields.name || profile.fields.display_name || profile.pubkey.substring(0, 16) + '...',
-                    picture: profile.fields.picture || '',
-                    email: profile.fields.email || null,
-                    fields: profile.fields || {}, // Include all profile fields
-                    picture_data_url: null,
-                    picture_loading: false,
-                    picture_loaded: false
-                }));
-
-                // Update contacts in place instead of clearing the list
-                this.updateContactsInPlace(newContacts);
-
-                // Cache the contacts in backend storage (without images)
-                try {
-                    // Convert frontend contact format to backend storage format
-                    const backendContacts = appState.getContacts().map(contact => ({
-                        pubkey: contact.pubkey,
-                        name: contact.name,
-                        display_name: contact.fields.display_name || contact.name,
-                        picture: contact.picture,
-                        picture_data_url: contact.picture_data_url || null,
-                        about: contact.fields.about || null,
-                        email: contact.email,
-                        cached_at: new Date().toISOString()
-                    }));
-                    
-                    await TauriService.setContacts(backendContacts);
-                    console.log('[JS] Cached contacts in backend storage');
-                } catch (e) {
-                    console.warn('Failed to cache contacts in backend:', e);
-                }
-                
-                console.log(`✅ Loaded ${newContacts.length} contacts from network`);
-            } else {
-                console.log('[JS] No profiles received from network, keeping cached data if available');
-                if (!cacheLoaded) {
-                    appState.setContacts([]);
-                    this.renderContacts();
-                }
-            }
-            
-        } catch (error) {
-            console.error('Failed to load contacts from network:', error);
-            if (!cacheLoaded) {
-                notificationService.showError('Failed to load contacts and no cached data available');
-                appState.setContacts([]);
-                this.renderContacts();
-            } else {
-                console.log('[JS] Network failed, but using cached data');
-            }
+        // On startup, only load cached data - don't fetch from network automatically
+        // Users can use the refresh button to get fresh data
+        if (!cacheLoaded) {
+            appState.setContacts([]);
+            this.renderContacts();
+            console.log('[JS] No cached contacts available. Use refresh button to load from network.');
         }
     }
 
@@ -820,6 +730,85 @@ export class ContactsService {
         }
         
         notificationService.showSuccess(`Email address filled in: ${email}`);
+    }
+
+    // Refresh contacts from network (called by refresh button)
+    async refreshContacts() {
+        console.log('[JS] refreshContacts called - fetching fresh data from network...');
+        
+        if (!appState.hasKeypair()) {
+            notificationService.showError('No keypair available');
+            return;
+        }
+
+        const activeRelays = appState.getActiveRelays();
+        if (activeRelays.length === 0) {
+            notificationService.showError('No active relays configured');
+            return;
+        }
+
+        try {
+            console.log('🔄 Loading following profiles from network...');
+            
+            // Fetch following profiles from Nostr
+            const followingProfiles = await TauriService.fetchFollowingProfiles(
+                appState.getKeypair().private_key,
+                activeRelays
+            );
+            
+            console.log('[JS] Network response:', {
+                profilesReceived: !!followingProfiles,
+                profilesLength: followingProfiles?.length || 0
+            });
+
+            // Only update contacts if we actually got data from the network
+            if (followingProfiles && followingProfiles.length > 0) {
+                // Create contacts immediately with placeholder images
+                const newContacts = followingProfiles.map(profile => ({
+                    pubkey: profile.pubkey,
+                    name: profile.fields.name || profile.fields.display_name || profile.pubkey.substring(0, 16) + '...',
+                    picture: profile.fields.picture || '',
+                    email: profile.fields.email || null,
+                    fields: profile.fields || {}, // Include all profile fields
+                    picture_data_url: null,
+                    picture_loading: false,
+                    picture_loaded: false
+                }));
+
+                // Update contacts in place instead of clearing the list
+                this.updateContactsInPlace(newContacts);
+
+                // Cache the contacts in backend storage (without images)
+                try {
+                    // Convert frontend contact format to backend storage format
+                    const backendContacts = appState.getContacts().map(contact => ({
+                        pubkey: contact.pubkey,
+                        name: contact.name,
+                        display_name: contact.fields.display_name || contact.name,
+                        picture: contact.picture,
+                        picture_data_url: contact.picture_data_url || null,
+                        about: contact.fields.about || null,
+                        email: contact.email,
+                        cached_at: new Date().toISOString()
+                    }));
+                    
+                    await TauriService.setContacts(backendContacts);
+                    console.log('[JS] Cached contacts in backend storage');
+                } catch (e) {
+                    console.warn('Failed to cache contacts in backend:', e);
+                }
+                
+                console.log(`✅ Loaded ${newContacts.length} contacts from network`);
+                notificationService.showSuccess(`Refreshed ${newContacts.length} contacts`);
+            } else {
+                console.log('[JS] No profiles received from network');
+                notificationService.showInfo('No contacts found in your follow list');
+            }
+            
+        } catch (error) {
+            console.error('Failed to load contacts from network:', error);
+            notificationService.showError('Failed to refresh contacts: ' + error);
+        }
     }
 }
 

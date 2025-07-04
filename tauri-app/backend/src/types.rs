@@ -17,6 +17,7 @@ pub struct EmailConfig {
     pub imap_host: String,
     pub imap_port: u16,
     pub use_tls: bool,
+    pub private_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,8 +27,10 @@ pub struct EmailMessage {
     pub to: String,
     pub subject: String,
     pub body: String,
+    pub raw_body: String,
     pub date: DateTime<Utc>,
     pub is_read: bool,
+    pub raw_headers: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

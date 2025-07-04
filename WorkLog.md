@@ -1,3 +1,4 @@
+* fetch nostr emails only, decrypt content
 * refactor frontend
 * send DM working
 * fetch emails, filtering

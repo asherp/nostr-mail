@@ -166,7 +166,8 @@ export class EmailService {
                 smtp_port: settings.smtp_port,
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
-                use_tls: useTls
+                use_tls: useTls,
+                private_key: appState.getKeypair() ? appState.getKeypair().private_key : null
             };
             
             // If a Nostr contact is selected, send encrypted email
@@ -217,11 +218,9 @@ export class EmailService {
     // Send encrypted email using NIP-04
     async sendEncryptedEmail(emailConfig, contact, subject, body) {
         console.log('[JS] sendEncryptedEmail called for contact:', contact.name);
-        
         try {
             const keypair = appState.getKeypair();
             const activeRelays = appState.getActiveRelays();
-            
             // Send DM with encrypted subject
             const dmResult = await TauriService.sendDirectMessage(
                 keypair.private_key,
@@ -229,14 +228,10 @@ export class EmailService {
                 subject, // The subject becomes the DM content
                 activeRelays
             );
-            
             console.log('[JS] DM sent successfully, event ID:', dmResult);
-            
-            // Send encrypted email with the same subject
-            await TauriService.sendEmail(emailConfig, contact.email, subject, body);
-            
+            // Send encrypted email with the same subject and include npub header
+            await TauriService.sendEmail(emailConfig, contact.email, subject, body, keypair.public_key);
             console.log('[JS] Encrypted email sent successfully');
-            
         } catch (error) {
             console.error('[JS] Error sending encrypted email:', error);
             throw new Error(`Failed to send encrypted email: ${error}`);
@@ -249,12 +244,11 @@ export class EmailService {
             notificationService.showError('Please configure your email settings first');
             return;
         }
-        
         try {
             domManager.disable('refreshInbox');
             domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
-            
             const settings = appState.getSettings();
+            const keypair = appState.getKeypair();
             const emailConfig = {
                 email_address: settings.email_address,
                 password: settings.password,
@@ -262,16 +256,22 @@ export class EmailService {
                 smtp_port: settings.smtp_port,
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
-                use_tls: settings.use_tls
+                use_tls: settings.use_tls,
+                private_key: keypair ? keypair.private_key : null
             };
-            
-            // Pass the search query to the backend
+            // Read filter dropdown
+            const filterDropdown = document.getElementById('email-filter-dropdown');
+            const onlyNostr = !filterDropdown || filterDropdown.value === 'nostr';
+            // Pass the search query and filter to the backend
             const searchParam = searchQuery.trim() || null;
-            const emails = await TauriService.fetchEmails(emailConfig, 10, searchParam);
-            
+            let emails;
+            if (onlyNostr) {
+                emails = await TauriService.fetchNostrEmailsLast24h(emailConfig);
+            } else {
+                emails = await TauriService.fetchEmails(emailConfig, 10, searchParam, onlyNostr);
+            }
             appState.setEmails(emails);
             this.renderEmails();
-            
         } catch (error) {
             console.error('Failed to load emails:', error);
             notificationService.showError('Failed to load emails: ' + error);
@@ -334,12 +334,10 @@ export class EmailService {
     // Filter emails with debouncing
     filterEmails() {
         const searchQuery = domManager.getValue('emailSearch')?.trim() || '';
-        
         // Clear existing timeout
         if (this.searchTimeout) {
             clearTimeout(this.searchTimeout);
         }
-        
         // Set a new timeout to debounce the search
         this.searchTimeout = setTimeout(async () => {
             try {
@@ -376,19 +374,105 @@ export class EmailService {
                     .filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE'))
                     .join('\n')
                     .trim();
-                emailDetailContent.innerHTML = `
-                    <div class="email-detail">
-                        <div class="email-detail-header vertical">
-                            <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
-                            <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
-                            <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
-                            <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(email.subject)}</span></div>
+                // Try to extract Nostr pubkey from headers
+                const nostrPubkey = Utils.extractNostrPubkeyFromHeaders(email.raw_headers);
+                // Check if subject/body are likely encrypted
+                const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
+                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n]+)\s*-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----/);
+                // Prepare decrypted fields
+                let decryptedSubject = email.subject;
+                let decryptedBody = cleanedBody;
+                let originalSubject = email.subject;
+                let isDecrypted = false;
+                // Add decrypt button if possible
+                if (nostrPubkey && (isEncryptedSubject || encryptedBodyMatch)) {
+                    const decryptBtn = document.createElement('button');
+                    decryptBtn.textContent = 'Decrypt Nostr Message';
+                    decryptBtn.className = 'btn btn-primary';
+                    decryptBtn.style.marginTop = '10px';
+                    let showingOriginal = false;
+                    decryptBtn.addEventListener('click', async () => {
+                        if (!isDecrypted) {
+                            try {
+                                const keypair = appState.getKeypair();
+                                if (!keypair) {
+                                    notificationService.showError('No Nostr keypair available for decryption');
+                                    return;
+                                }
+                                // Decrypt subject
+                                if (isEncryptedSubject) {
+                                    decryptedSubject = await TauriService.decryptDmContent(keypair.private_key, nostrPubkey, email.subject);
+                                }
+                                // Decrypt body
+                                if (encryptedBodyMatch) {
+                                    const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                                    decryptedBody = await TauriService.decryptDmContent(keypair.private_key, nostrPubkey, encryptedContent);
+                                }
+                                isDecrypted = true;
+                                // Update UI to show decrypted
+                                updateDetail(decryptedSubject, decryptedBody);
+                                decryptBtn.textContent = 'Show Original Encrypted';
+                                notificationService.showSuccess('Decryption successful!');
+                            } catch (err) {
+                                notificationService.showError('Failed to decrypt: ' + err);
+                            }
+                        } else {
+                            showingOriginal = !showingOriginal;
+                            if (showingOriginal) {
+                                updateDetail(originalSubject, cleanedBody);
+                                decryptBtn.textContent = 'Show Decrypted';
+                            } else {
+                                updateDetail(decryptedSubject, decryptedBody);
+                                decryptBtn.textContent = 'Show Original Encrypted';
+                            }
+                        }
+                    });
+                    emailDetailContent.appendChild(decryptBtn);
+                }
+                // Helper to update the detail UI
+                function updateDetail(subject, body) {
+                    emailDetailContent.innerHTML = `
+                        <div class="email-detail">
+                            <button id="toggle-raw-btn" class="btn btn-secondary" style="margin-bottom: 10px;">Show Raw Content</button>
+                            <div class="email-detail-header vertical" id="email-header-info">
+                                <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
+                                <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
+                                <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+                                <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
+                            </div>
+                            <pre id="raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+                            <div class="email-detail-body" id="email-body-info">
+                                ${Utils.escapeHtml(body).replace(/\n/g, '<br>')}
+                            </div>
+                            <pre id="raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
                         </div>
-                        <div class="email-detail-body">
-                            ${Utils.escapeHtml(cleanedBody).replace(/\n/g, '<br>')}
-                        </div>
-                    </div>
-                `;
+                    `;
+                    // Toggle between display content and raw content
+                    const toggleRawBtn = document.getElementById('toggle-raw-btn');
+                    const headerInfo = document.getElementById('email-header-info');
+                    const rawHeaderInfo = document.getElementById('raw-header-info');
+                    const bodyInfo = document.getElementById('email-body-info');
+                    const rawBodyInfo = document.getElementById('raw-body-info');
+                    let showingRaw = false;
+                    toggleRawBtn.addEventListener('click', () => {
+                        showingRaw = !showingRaw;
+                        if (showingRaw) {
+                            headerInfo.style.display = 'none';
+                            rawHeaderInfo.style.display = 'block';
+                            bodyInfo.style.display = 'none';
+                            rawBodyInfo.style.display = 'block';
+                            toggleRawBtn.textContent = 'Show Display Content';
+                        } else {
+                            headerInfo.style.display = 'flex';
+                            rawHeaderInfo.style.display = 'none';
+                            bodyInfo.style.display = 'block';
+                            rawBodyInfo.style.display = 'none';
+                            toggleRawBtn.textContent = 'Show Raw Content';
+                        }
+                    });
+                }
+                // Initial render (decrypted if possible, otherwise cleaned)
+                updateDetail(originalSubject, cleanedBody);
             }
             
         } catch (error) {
@@ -473,7 +557,8 @@ export class EmailService {
                 smtp_port: settings.smtp_port,
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
-                use_tls: settings.use_tls
+                use_tls: settings.use_tls,
+                private_key: appState.getKeypair() ? appState.getKeypair().private_key : null
             };
             
             console.log('[JS] Testing email connections with config:', {

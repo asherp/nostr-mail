@@ -157,20 +157,25 @@ export class TauriService {
     }
 
     // Email operations
-    static async sendEmail(emailConfig, toAddress, subject, body) {
-        return await this.invoke('send_email', {
+    static async sendEmail(emailConfig, toAddress, subject, body, nostrNpub = null) {
+        const args = {
             emailConfig,
             toAddress,
             subject,
             body
-        });
+        };
+        if (nostrNpub) {
+            args.nostrNpub = nostrNpub;
+        }
+        return await this.invoke('send_email', args);
     }
 
-    static async fetchEmails(emailConfig, limit, searchQuery) {
+    static async fetchEmails(emailConfig, limit, searchQuery, onlyNostr = true) {
         return await this.invoke('fetch_emails', {
             emailConfig,
             limit,
-            searchQuery
+            searchQuery,
+            onlyNostr
         });
     }
 
@@ -246,5 +251,9 @@ export class TauriService {
     // QR code generation
     static async generateQrCode(data, size = 200) {
         return await this.invoke('generate_qr_code', { data, size });
+    }
+
+    static async fetchNostrEmailsLast24h(emailConfig) {
+        return await this.invoke('fetch_nostr_emails_last_24h', { emailConfig });
     }
 } 

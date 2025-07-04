@@ -877,15 +877,18 @@ body.dark-mode .input-with-button button[id*="toggle"]:hover {
 }
 
 .email-detail-body {
-    background-color: white;
-    padding: 20px;
-    border: 1px solid #e0e0e0;
-    border-radius: 8px;
-    line-height: 1.6;
-    white-space: pre-wrap;
+    padding: 0;
+    border: none;
+    background: none;
+    border-radius: 0;
+    line-height: 1.4;
+    color: inherit;
+    white-space: pre-line;
     word-wrap: break-word;
-    max-height: 400px;
-    overflow-y: auto;
+    max-height: none;
+    overflow: visible;
+    font-family: inherit;
+    font-size: 1rem;
 }
 
 body.dark-mode .email-detail-header {

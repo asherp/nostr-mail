@@ -232,4 +232,37 @@ export class Utils {
     static camelToSnake(str) {
         return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
     }
+
+    // Extract X-Nostr-Pubkey from raw headers
+    static extractNostrPubkeyFromHeaders(rawHeaders) {
+        if (!rawHeaders) return null;
+        const match = rawHeaders.match(/^X-Nostr-Pubkey:\s*([a-zA-Z0-9]+)$/m);
+        return match ? match[1] : null;
+    }
+
+    // Check if content is likely encrypted (base64-like pattern, reasonable length)
+    static isLikelyEncryptedContent(content) {
+        if (!content || typeof content !== 'string') return false;
+        
+        // Skip empty or very short content
+        if (content.length < 20) {
+            return false;
+        }
+        
+        // Check if it looks like base64 encoded content (typical for encrypted data)
+        // Base64 contains A-Z, a-z, 0-9, +, /, and = for padding
+        const base64Regex = /^[A-Za-z0-9+/=]+$/;
+        const isBase64 = base64Regex.test(content);
+        
+        // Also check that it doesn't contain typical email subject patterns
+        const hasEmailPatterns = content.includes('@') || 
+                                content.includes('Re:') || 
+                                content.includes('Fwd:') ||
+                                content.includes('FW:') ||
+                                content.includes('Subject:') ||
+                                content.includes('From:') ||
+                                content.includes('To:');
+        
+        return isBase64 && !hasEmailPatterns;
+    }
 } 

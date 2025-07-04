@@ -135,18 +135,18 @@ async fn publish_nostr_event(private_key: String, content: String, kind: u16, ta
 }
 
 #[tauri::command]
-async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String) -> Result<(), String> {
+async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>) -> Result<(), String> {
     println!("[RUST] send_email called");
-    email::send_email(&email_config, &to_address, &subject, &body)
+    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref())
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn fetch_emails(email_config: EmailConfig, limit: usize, search_query: Option<String>) -> Result<Vec<EmailMessage>, String> {
-    println!("[RUST] fetch_emails called with search: {:?}", search_query);
-    email::fetch_emails(&email_config, limit, search_query).await.map_err(|e| e.to_string())
+async fn fetch_emails(email_config: EmailConfig, limit: usize, search_query: Option<String>, only_nostr: bool) -> Result<Vec<EmailMessage>, String> {
+    println!("[RUST] fetch_emails called with search: {:?}, only_nostr: {}", search_query, only_nostr);
+    email::fetch_emails(&email_config, limit, search_query, only_nostr).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -563,6 +563,13 @@ fn encrypt_nip04_message(private_key: String, public_key: String, message: Strin
     crypto::encrypt_message(&private_key, &public_key, &message).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn fetch_nostr_emails_last_24h(email_config: EmailConfig) -> Result<Vec<EmailMessage>, String> {
+    email::fetch_nostr_emails_last_24h(&email_config)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("[RUST] Starting nostr-mail application...");
@@ -595,6 +602,7 @@ pub fn run() {
         publish_nostr_event,
         send_email,
         fetch_emails,
+        fetch_nostr_emails_last_24h,
         fetch_image,
         fetch_multiple_images,
         fetch_profiles,

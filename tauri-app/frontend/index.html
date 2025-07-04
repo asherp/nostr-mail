@@ -90,6 +90,10 @@
                     <h2 id="inbox-title">Inbox</h2>
                     <div class="inbox-actions" id="inbox-actions">
                         <div class="email-search-container">
+                            <select id="email-filter-dropdown" class="email-filter-dropdown" style="margin-right: 8px;">
+                                <option value="nostr" selected>Nostr Emails</option>
+                                <option value="all">All Emails</option>
+                            </select>
                             <input type="text" id="email-search" placeholder="Search by sender email..." class="email-search-input">
                             <i class="fas fa-search email-search-icon"></i>
                         </div>
@@ -160,6 +164,9 @@
                         </button>
                         <button id="refresh-contacts-btn" class="btn btn-secondary">
                             <i class="fas fa-sync"></i> Refresh
+                        </button>
+                        <button id="export-npubs-btn" class="btn btn-secondary">
+                            <i class="fas fa-download"></i> Export Contacts
                         </button>
                         <button id="add-contact-btn" class="btn btn-primary">
                             <i class="fas fa-plus"></i> Add Contact

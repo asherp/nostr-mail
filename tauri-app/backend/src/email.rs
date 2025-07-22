@@ -1,17 +1,20 @@
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use anyhow::Result;
-use chrono::Utc;
-use crate::types::{EmailConfig, EmailMessage};
-use native_tls::TlsConnector;
-use std::net::TcpStream;
-use tokio::task;
-use tokio::time::{timeout, Duration};
 use mailparse::{MailHeaderMap, parse_mail};
 use lettre::message::header::{Header, HeaderName, HeaderValue};
 use std::error::Error;
 use std::collections::HashSet;
 use crate::crypto;
+use crate::database::{Database, Email as DbEmail};
+use crate::types::EmailConfig;
+use chrono::Utc;
+use tokio::task;
+use tokio::time::timeout;
+use std::time::Duration;
+use crate::types::EmailMessage;
+use std::net::TcpStream;
+use native_tls::TlsConnector;
 
 #[derive(Debug, Clone)]
 struct XNostrPubkey(String);
@@ -311,11 +314,11 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                         }
                         Err(e) => {
                             println!("[RUST] fetch_emails_from_session: Email {} decryption failed: {}, using original content", email_id, e);
-                            (subject, body_text.clone())
+                            (subject.clone(), body_text.clone())
                         }
                     }
                 } else {
-                    (subject, body_text.clone())
+                    (subject.clone(), body_text.clone())
                 };
 
                 let email_message = EmailMessage {
@@ -323,11 +326,12 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     from,
                     to,
                     subject: final_subject,
-                    body: final_body,
-                    raw_body: body_text.clone(),
+                    body: final_body.clone(),
+                    raw_body: final_body.clone(),
                     date,
                     is_read: true, // We'll assume all fetched emails are read for now
-                    raw_headers,
+                    raw_headers: raw_headers.clone(),
+                    nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
                 };
 
                 emails.push(email_message);
@@ -607,7 +611,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         }
                         Err(e) => {
                             println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} decryption failed: {}, using original content", email_id, e);
-                            (subject, body_text.clone())
+                            (subject.clone(), body_text.clone())
                         }
                     };
                     
@@ -615,12 +619,13 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         id: email_id.to_string(),
                         from,
                         to,
-                        subject: final_subject,
-                        body: final_body,
+                        subject,
+                        body: body_text.clone(),
                         raw_body: body_text.clone(),
                         date,
                         is_read: true,
-                        raw_headers,
+                        raw_headers: raw_headers.clone(),
+                        nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
                     };
                     emails.push(email_message);
                 } else {
@@ -693,11 +698,11 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                         }
                         Err(e) => {
                             println!("[RUST] fetch_emails_from_session_last_24h: Email {} decryption failed: {}, using original content", email_id, e);
-                            (subject, body_text.clone())
+                            (subject.clone(), body_text.clone())
                         }
                     }
                 } else {
-                    (subject, body_text.clone())
+                    (subject.clone(), body_text.clone())
                 };
                 
                 let email_message = EmailMessage {
@@ -705,11 +710,12 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     from,
                     to,
                     subject: final_subject,
-                    body: final_body,
-                    raw_body: body_text.clone(),
+                    body: final_body.clone(),
+                    raw_body: final_body.clone(),
                     date,
                     is_read: true,
-                    raw_headers,
+                    raw_headers: raw_headers.clone(),
+                    nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
                 };
                 emails.push(email_message);
             }
@@ -720,7 +726,7 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
 }
 
 /// Extract Nostr public key from email headers
-fn extract_nostr_pubkey_from_headers(raw_headers: &str) -> Option<String> {
+pub fn extract_nostr_pubkey_from_headers(raw_headers: &str) -> Option<String> {
     for line in raw_headers.lines() {
         if line.starts_with("X-Nostr-Pubkey:") {
             let pubkey = line.split_once(':')
@@ -779,10 +785,9 @@ fn decrypt_nostr_email_content(config: &EmailConfig, raw_headers: &str, subject:
             .replace("-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----", "")
             .trim()
             .to_string();
-        
         match crypto::decrypt_message(private_key, &sender_pubkey, &clean_body) {
             Ok(decrypted) => {
-                println!("[RUST] Successfully decrypted body");
+                println!("[RUST] Successfully decrypted body: '{}'", decrypted); // <-- Print decrypted body
                 decrypted
             }
             Err(e) => {
@@ -841,4 +846,402 @@ mod tests {
         assert_eq!(config.email_address, "test@example.com");
         assert_eq!(config.smtp_port, 587);
     }
+} 
+
+pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database::Database) -> Result<Vec<EmailMessage>> {
+    use chrono::{Utc, Duration};
+    use uuid::Uuid;
+
+    let host = &config.imap_host;
+    let port = config.imap_port;
+    let username = &config.email_address;
+    let password = &config.password;
+    let use_tls = config.use_tls;
+    let addr = format!("{}:{}", host, port);
+    let is_gmail = host.contains("gmail.com");
+
+    // 1. Get latest nostr email date from DB
+    let latest = db.get_latest_nostr_email_received_at()?;
+
+    // 2. If None, fetch all Nostr emails from IMAP (no date filter)
+    // 3. If Some(date), fetch Nostr emails from IMAP since that date
+    let emails = if use_tls {
+        let tls = TlsConnector::builder().build()?;
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let tls_stream = tls.connect(host, tcp_stream)?;
+        let client = imap::Client::new(tls_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        if is_gmail {
+            // For Gmail, use a time window: if we have a latest, use since then, else use a large window (e.g. 5 years)
+            let now = Utc::now();
+            let time_window = match latest {
+                Some(dt) => now.signed_duration_since(dt),
+                None => Duration::days(365 * 5), // 5 years
+            };
+            fetch_nostr_emails_from_gmail_optimized(&mut session, config, time_window)?
+        } else {
+            // For non-Gmail, use SINCE in IMAP search
+            let since_date = match latest {
+                Some(dt) => dt.format("%d-%b-%Y").to_string(),
+                None => "01-Jan-1970".to_string(),
+            };
+            let search_criteria = format!("ALL SINCE {}", since_date);
+            let matching_messages = session.search(&search_criteria)?;
+            let message_numbers: Vec<u32> = matching_messages.iter().cloned().collect();
+            if message_numbers.is_empty() {
+                return Ok(vec![]);
+            }
+            let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
+            let mut emails = Vec::new();
+            let mut email_id = 0;
+            for message in messages.iter() {
+                email_id += 1;
+                if let Some(body) = message.body() {
+                    if let Ok(email) = parse_mail(body) {
+                        let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
+                        let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
+                        let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                        let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
+                        let date = chrono::DateTime::parse_from_rfc2822(&date_str)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now());
+                        let body_text = if let Some(body_part) = email.subparts.first() {
+                            if let Ok(body_content) = body_part.get_body() {
+                                body_content
+                            } else {
+                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
+                            }
+                        } else {
+                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
+                        };
+                        let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
+                        // Only keep Nostr emails
+                        if raw_headers.contains("X-Nostr-Pubkey:") {
+                            let (final_subject, final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
+                                Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
+                                Err(_) => (subject.clone(), body_text.clone()),
+                            };
+                            let email_message = EmailMessage {
+                                id: email_id.to_string(),
+                                from,
+                                to,
+                                subject,
+                                body: body_text.clone(),
+                                raw_body: body_text.clone(),
+                                date,
+                                is_read: true,
+                                raw_headers: raw_headers.clone(),
+                                nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                            };
+                            emails.push(email_message);
+                        }
+                    }
+                }
+            }
+            session.logout()?;
+            emails
+        }
+    } else {
+        // Not using TLS
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let client = imap::Client::new(tcp_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        if is_gmail {
+            let now = Utc::now();
+            let time_window = match latest {
+                Some(dt) => now.signed_duration_since(dt),
+                None => Duration::days(365 * 5),
+            };
+            fetch_nostr_emails_from_gmail_optimized(&mut session, config, time_window)?
+        } else {
+            let since_date = match latest {
+                Some(dt) => dt.format("%d-%b-%Y").to_string(),
+                None => "01-Jan-1970".to_string(),
+            };
+            let search_criteria = format!("ALL SINCE {}", since_date);
+            let matching_messages = session.search(&search_criteria)?;
+            let message_numbers: Vec<u32> = matching_messages.iter().cloned().collect();
+            if message_numbers.is_empty() {
+                return Ok(vec![]);
+            }
+            let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
+            let mut emails = Vec::new();
+            let mut email_id = 0;
+            for message in messages.iter() {
+                email_id += 1;
+                if let Some(body) = message.body() {
+                    if let Ok(email) = parse_mail(body) {
+                        let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
+                        let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
+                        let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                        let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
+                        let date = chrono::DateTime::parse_from_rfc2822(&date_str)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now());
+                        let body_text = if let Some(body_part) = email.subparts.first() {
+                            if let Ok(body_content) = body_part.get_body() {
+                                body_content
+                            } else {
+                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
+                            }
+                        } else {
+                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
+                        };
+                        let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
+                        if raw_headers.contains("X-Nostr-Pubkey:") {
+                            let (final_subject, final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
+                                Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
+                                Err(_) => (subject.clone(), body_text.clone()),
+                            };
+                            let email_message = EmailMessage {
+                                id: email_id.to_string(),
+                                from,
+                                to,
+                                subject,
+                                body: body_text.clone(),
+                                raw_body: body_text.clone(),
+                                date,
+                                is_read: true,
+                                raw_headers: raw_headers.clone(),
+                                nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                            };
+                            emails.push(email_message);
+                        }
+                    }
+                }
+            }
+            session.logout()?;
+            emails
+        }
+    };
+    Ok(emails)
+} 
+
+pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> anyhow::Result<usize> {
+    // Fetch latest nostr email date from DB
+    let latest = db.get_latest_nostr_email_received_at()?;
+    // Fetch new Nostr emails from IMAP (raw, not decrypted)
+    let raw_nostr_emails = fetch_nostr_emails_smart_raw(config, latest).await?;
+
+    let mut new_count = 0;
+    for email in raw_nostr_emails {
+        // Check if already in DB by message_id
+        if db.get_email(&email.message_id)?.is_none() {
+            // Save raw email to DB
+            let db_email = DbEmail {
+                id: None,
+                message_id: email.message_id.clone(),
+                from_address: email.from.clone(),
+                to_address: email.to.clone(),
+                subject: email.subject.clone(), // still encrypted
+                body: email.body.clone(),       // still encrypted
+                body_plain: None,
+                body_html: None,
+                received_at: email.date,
+                is_nostr_encrypted: true,
+                nostr_pubkey: email.nostr_pubkey.clone(),
+                created_at: chrono::Utc::now(),
+                raw_headers: Some(email.raw_headers.clone()),
+            };
+            println!("[RUST] Saving email to DB: {:?}", db_email);
+            db.save_email(&db_email)?;
+            println!("[RUST] Saved email to DB: {:?}", db_email);
+            new_count += 1;
+        }
+    }
+    Ok(new_count)
+} 
+
+pub struct RawNostrEmail {
+    pub message_id: String,
+    pub from: String,
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+    pub date: chrono::DateTime<chrono::Utc>,
+    pub nostr_pubkey: Option<String>,
+    pub raw_headers: String,
+}
+
+async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<Vec<RawNostrEmail>> {
+    use chrono::{Utc, Duration};
+    use mailparse::parse_mail;
+    use uuid::Uuid;
+    use crate::email::extract_nostr_pubkey_from_headers;
+    use std::collections::HashSet;
+
+    let host = &config.imap_host;
+    let port = config.imap_port;
+    let username = &config.email_address;
+    let password = &config.password;
+    let use_tls = config.use_tls;
+    let addr = format!("{}:{}", host, port);
+    let is_gmail = host.contains("gmail.com");
+
+    let emails = if use_tls {
+        let tls = TlsConnector::builder().build()?;
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let tls_stream = tls.connect(host, tcp_stream)?;
+        let client = imap::Client::new(tls_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        if is_gmail {
+            let now = Utc::now();
+            let time_window = match latest {
+                Some(dt) => now.signed_duration_since(dt),
+                None => Duration::days(365 * 5),
+            };
+            // fetch_nostr_emails_from_gmail_optimized returns Vec<EmailMessage>, convert to Vec<RawNostrEmail>
+            let email_msgs = fetch_nostr_emails_from_gmail_optimized(&mut session, config, time_window)?;
+            email_msgs.into_iter().map(|em| RawNostrEmail {
+                message_id: em.id,
+                from: em.from,
+                to: em.to,
+                subject: em.subject,
+                body: em.body,
+                date: em.date,
+                nostr_pubkey: extract_nostr_pubkey_from_headers(&em.raw_headers),
+                raw_headers: em.raw_headers,
+            }).collect()
+        } else {
+            let since_date = match latest {
+                Some(dt) => dt.format("%d-%b-%Y").to_string(),
+                None => "01-Jan-1970".to_string(),
+            };
+            let search_criteria = if latest.is_some() {
+                format!("ALL SINCE {}", since_date)
+            } else {
+                "ALL".to_string()
+            };
+            let matching_messages = session.search(&search_criteria)?;
+            let message_numbers: Vec<u32> = matching_messages.iter().cloned().collect();
+            if message_numbers.is_empty() {
+                return Ok(vec![]);
+            }
+            let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
+            let mut emails = Vec::new();
+            let mut email_id = 0;
+            for message in messages.iter() {
+                email_id += 1;
+                if let Some(body) = message.body() {
+                    if let Ok(email) = parse_mail(body) {
+                        let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
+                        let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
+                        let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                        let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
+                        let date = chrono::DateTime::parse_from_rfc2822(&date_str)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now());
+                        let body_text = if let Some(body_part) = email.subparts.first() {
+                            if let Ok(body_content) = body_part.get_body() {
+                                body_content
+                            } else {
+                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
+                            }
+                        } else {
+                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
+                        };
+                        let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
+                        if raw_headers.contains("X-Nostr-Pubkey:") {
+                            let message_id = email.headers.get_first_value("Message-ID").unwrap_or_else(|| Uuid::new_v4().to_string());
+                            let nostr_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            emails.push(RawNostrEmail {
+                                message_id,
+                                from,
+                                to,
+                                subject,
+                                body: body_text,
+                                date,
+                                nostr_pubkey,
+                                raw_headers: raw_headers.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            session.logout()?;
+            emails
+        }
+    } else {
+        // Not using TLS
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let client = imap::Client::new(tcp_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        if is_gmail {
+            let now = Utc::now();
+            let time_window = match latest {
+                Some(dt) => now.signed_duration_since(dt),
+                None => Duration::days(365 * 5),
+            };
+            let email_msgs = fetch_nostr_emails_from_gmail_optimized(&mut session, config, time_window)?;
+            email_msgs.into_iter().map(|em| RawNostrEmail {
+                message_id: em.id,
+                from: em.from,
+                to: em.to,
+                subject: em.subject,
+                body: em.body,
+                date: em.date,
+                nostr_pubkey: extract_nostr_pubkey_from_headers(&em.raw_headers),
+                raw_headers: em.raw_headers,
+            }).collect()
+        } else {
+            let since_date = match latest {
+                Some(dt) => dt.format("%d-%b-%Y").to_string(),
+                None => "01-Jan-1970".to_string(),
+            };
+            let search_criteria = if latest.is_some() {
+                format!("ALL SINCE {}", since_date)
+            } else {
+                "ALL".to_string()
+            };
+            let matching_messages = session.search(&search_criteria)?;
+            let message_numbers: Vec<u32> = matching_messages.iter().cloned().collect();
+            if message_numbers.is_empty() {
+                return Ok(vec![]);
+            }
+            let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
+            let mut emails = Vec::new();
+            let mut email_id = 0;
+            for message in messages.iter() {
+                email_id += 1;
+                if let Some(body) = message.body() {
+                    if let Ok(email) = parse_mail(body) {
+                        let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
+                        let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
+                        let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                        let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
+                        let date = chrono::DateTime::parse_from_rfc2822(&date_str)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now());
+                        let body_text = if let Some(body_part) = email.subparts.first() {
+                            if let Ok(body_content) = body_part.get_body() {
+                                body_content
+                            } else {
+                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
+                            }
+                        } else {
+                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
+                        };
+                        let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
+                        if raw_headers.contains("X-Nostr-Pubkey:") {
+                            let message_id = email.headers.get_first_value("Message-ID").unwrap_or_else(|| Uuid::new_v4().to_string());
+                            let nostr_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            emails.push(RawNostrEmail {
+                                message_id,
+                                from,
+                                to,
+                                subject,
+                                body: body_text,
+                                date,
+                                nostr_pubkey,
+                                raw_headers: raw_headers.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            session.logout()?;
+            emails
+        }
+    };
+    Ok(emails)
 } 

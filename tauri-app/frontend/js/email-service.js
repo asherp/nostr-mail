@@ -1,13 +1,7 @@
 // Email Service
 // Handles all email-related functionality including sending, fetching, and management
 
-import { appState } from './app-state.js';
-import { domManager } from './dom-manager.js';
-import { TauriService } from './tauri-service.js';
-import { notificationService } from './notification-service.js';
-import { Utils } from './utils.js';
-
-export class EmailService {
+class EmailService {
     constructor() {
         this.searchTimeout = null;
         this.selectedNostrContact = null;
@@ -263,12 +257,12 @@ export class EmailService {
             const filterDropdown = document.getElementById('email-filter-dropdown');
             const onlyNostr = !filterDropdown || filterDropdown.value === 'nostr';
             // Pass the search query and filter to the backend
-            const searchParam = searchQuery.trim() || null;
+            // NOTE: db_get_emails does not support searchQuery, so we ignore it for now
             let emails;
             if (onlyNostr) {
-                emails = await TauriService.fetchNostrEmailsLast24h(emailConfig);
+                emails = await TauriService.getDbEmails(50, 0, true);
             } else {
-                emails = await TauriService.fetchEmails(emailConfig, 10, searchParam, onlyNostr);
+                emails = await TauriService.getDbEmails(50, 0, false);
             }
             appState.setEmails(emails);
             this.renderEmails();
@@ -281,30 +275,103 @@ export class EmailService {
         }
     }
 
-    // Render emails
-    renderEmails() {
+    // Sync and reload emails
+    async syncAndReloadEmails() {
+        if (!appState.hasSettings()) {
+            notificationService.showError('Please configure your email settings first');
+            return;
+        }
+        const settings = appState.getSettings();
+        const keypair = appState.getKeypair();
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: settings.use_tls,
+            private_key: keypair ? keypair.private_key : null
+        };
+        await TauriService.syncNostrEmails(emailConfig);
+        await this.loadEmails();
+    }
+
+    // Fallback decryption method for Nostr messages
+    async decryptNostrMessageWithFallback(email, encryptedContent, keypair) {
+        console.log('[JS] Fallback decryption called for email:', email.from || email.from_address);
+        // 1. Try the pubkey from the header/field first
+        if (email.nostr_pubkey) {
+            try {
+                const decrypted = await TauriService.decryptDmContent(keypair.private_key, email.nostr_pubkey, encryptedContent);
+                if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
+                    return decrypted;
+                }
+            } catch (e) {
+                // continue to fallback
+            }
+        }
+
+        // 2. Fallback: search DB for pubkeys matching sender email
+        const senderEmail = email.from || email.from_address;
+        if (!senderEmail) return "Unable to decrypt: sender address not found";
+
+        let pubkeys = [];
+        try {
+            console.log('[JS] Calling db_find_pubkeys_by_email with:', senderEmail);
+            pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: senderEmail });
+        } catch (e) {
+            return "Unable to decrypt: error searching contacts";
+        }
+
+        if (!pubkeys || pubkeys.length === 0) {
+            return "Unable to decrypt: sender pubkey not found";
+        }
+
+        // 3. Try each pubkey
+        for (const pubkey of pubkeys) {
+            try {
+                const decrypted = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
+                if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
+                    // Update the email's nostr_pubkey in the DB for future use
+                    try {
+                        await window.__TAURI__.core.invoke('db_update_email_nostr_pubkey_by_id', {
+                            id: Number(email.id),
+                            nostrPubkey: pubkey
+                        });
+                        email.nostr_pubkey = pubkey; // <-- Add this line
+                    } catch (err) {
+                        console.warn('Failed to update nostr_pubkey in DB:', err);
+                    }
+                    return decrypted;
+                }
+            } catch (e) {
+                // try next
+            }
+        }
+
+        return "Unable to decrypt: tried all candidate pubkeys";
+    }
+
+    async renderEmails() {
         const emailList = domManager.get('emailList');
         if (!emailList) return;
-        
         try {
             emailList.innerHTML = '';
-            
             const emails = appState.getEmails();
             if (emails.length === 0) {
                 emailList.innerHTML = '<div class="text-center text-muted">No emails found</div>';
                 return;
             }
-            
-            emails.forEach(email => {
+            for (const email of emails) {
+                console.log('Inbox preview nostr_pubkey for email', email.id, ':', email.nostr_pubkey);
                 const emailElement = document.createElement('div');
                 emailElement.className = `email-item ${!email.is_read ? 'unread' : ''}`;
                 emailElement.dataset.emailId = email.id;
-                
                 // Format the date nicely
                 const emailDate = new Date(email.date);
                 const now = new Date();
                 const diffInHours = (now - emailDate) / (1000 * 60 * 60);
-                
                 let dateDisplay;
                 if (diffInHours < 24) {
                     dateDisplay = emailDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -313,19 +380,54 @@ export class EmailService {
                 } else {
                     dateDisplay = emailDate.toLocaleDateString();
                 }
-                
+                // Determine preview text
+                let previewText = 'Could not decrypt';
+                let showSubject = false;
+                let previewSubject = email.subject;
+
+                if (email.body && email.body.includes('BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE')) {
+                    const keypair = appState.getKeypair();
+                    if (!keypair) {
+                        previewText = 'Unable to decrypt: no keypair';
+                    } else {
+                        // Decrypt subject if it looks encrypted
+                        if (Utils.isLikelyEncryptedContent(email.subject)) {
+                            try {
+                                previewSubject = await this.decryptNostrMessageWithFallback(email, email.subject, keypair);
+                            } catch (e) {
+                                previewSubject = 'Could not decrypt';
+                            }
+                        }
+                        // Decrypt body as before
+                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n]+)\s*-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----/);
+                        if (encryptedBodyMatch) {
+                            const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                            try {
+                                const decrypted = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                previewText = Utils.escapeHtml(decrypted.substring(0, 100));
+                                showSubject = true;
+                            } catch (e) {
+                                previewText = 'Could not decrypt';
+                            }
+                        }
+                    }
+                } else {
+                    previewText = Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
+                    if (email.body && email.body.length > 100) previewText += '...';
+                    showSubject = true;
+                }
+
                 emailElement.innerHTML = `
                     <div class="email-header">
-                        <div class="email-sender">${Utils.escapeHtml(email.from)}</div>
+                        <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)}</div>
                         <div class="email-date">${dateDisplay}</div>
                     </div>
-                    <div class="email-subject">${Utils.escapeHtml(email.subject)}</div>
-                    <div class="email-preview">${Utils.escapeHtml(email.body.substring(0, 100))}${email.body.length > 100 ? '...' : ''}</div>
+                    ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
+                    <div class="email-preview">${previewText}</div>
                 `;
-                
                 emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
                 emailList.appendChild(emailElement);
-            });
+            }
         } catch (error) {
             console.error('Error rendering emails:', error);
         }
@@ -353,101 +455,58 @@ export class EmailService {
         try {
             const email = appState.getEmails().find(e => e.id === emailId);
             if (!email) return;
-            
-            // Hide the email list and show the detail view
             const emailList = domManager.get('emailList');
             const emailDetailView = document.getElementById('email-detail-view');
             const inboxActions = document.getElementById('inbox-actions');
             const inboxTitle = document.getElementById('inbox-title');
-            
             if (emailList) emailList.style.display = 'none';
             if (emailDetailView) emailDetailView.style.display = 'flex';
             if (inboxActions) inboxActions.style.display = 'none';
             if (inboxTitle) inboxTitle.textContent = 'Email Detail';
-            
-            // Populate the email detail content
             const emailDetailContent = document.getElementById('email-detail-content');
             if (emailDetailContent) {
-                // Clean up body: remove leading/trailing blank lines and collapse multiple blank lines except for header/footer
-                const cleanedBody = email.body
-                    .split('\n')
-                    .filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE'))
-                    .join('\n')
-                    .trim();
-                // Try to extract Nostr pubkey from headers
-                const nostrPubkey = Utils.extractNostrPubkeyFromHeaders(email.raw_headers);
-                // Check if subject/body are likely encrypted
+                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+                const nostrPubkey = email.nostr_pubkey;
+                console.log('Nostr pubkey for email:', nostrPubkey);
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
                 const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n]+)\s*-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----/);
-                // Prepare decrypted fields
                 let decryptedSubject = email.subject;
                 let decryptedBody = cleanedBody;
                 let originalSubject = email.subject;
-                let isDecrypted = false;
-                // Add decrypt button if possible
-                if (nostrPubkey && (isEncryptedSubject || encryptedBodyMatch)) {
-                    const decryptBtn = document.createElement('button');
-                    decryptBtn.textContent = 'Decrypt Nostr Message';
-                    decryptBtn.className = 'btn btn-primary';
-                    decryptBtn.style.marginTop = '10px';
-                    let showingOriginal = false;
-                    decryptBtn.addEventListener('click', async () => {
-                        if (!isDecrypted) {
-                            try {
-                                const keypair = appState.getKeypair();
-                                if (!keypair) {
-                                    notificationService.showError('No Nostr keypair available for decryption');
-                                    return;
-                                }
-                                // Decrypt subject
-                                if (isEncryptedSubject) {
-                                    decryptedSubject = await TauriService.decryptDmContent(keypair.private_key, nostrPubkey, email.subject);
-                                }
-                                // Decrypt body
-                                if (encryptedBodyMatch) {
-                                    const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                                    decryptedBody = await TauriService.decryptDmContent(keypair.private_key, nostrPubkey, encryptedContent);
-                                }
-                                isDecrypted = true;
-                                // Update UI to show decrypted
-                                updateDetail(decryptedSubject, decryptedBody);
-                                decryptBtn.textContent = 'Show Original Encrypted';
-                                notificationService.showSuccess('Decryption successful!');
-                            } catch (err) {
-                                notificationService.showError('Failed to decrypt: ' + err);
+                let decryptionAttempted = false;
+                const keypair = appState.getKeypair();
+                if ((nostrPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+                    (async () => {
+                        try {
+                            if (isEncryptedSubject) {
+                                decryptedSubject = await this.decryptNostrMessageWithFallback(email, email.subject, keypair);
                             }
-                        } else {
-                            showingOriginal = !showingOriginal;
-                            if (showingOriginal) {
-                                updateDetail(originalSubject, cleanedBody);
-                                decryptBtn.textContent = 'Show Decrypted';
-                            } else {
-                                updateDetail(decryptedSubject, decryptedBody);
-                                decryptBtn.textContent = 'Show Original Encrypted';
+                            if (encryptedBodyMatch) {
+                                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                                decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
                             }
+                            updateDetail(decryptedSubject, decryptedBody);
+                        } catch (err) {
+                            updateDetail('Could not decrypt', 'Could not decrypt');
                         }
-                    });
-                    emailDetailContent.appendChild(decryptBtn);
+                    })();
+                } else {
+                    updateDetail(decryptedSubject, decryptedBody);
                 }
-                // Helper to update the detail UI
                 function updateDetail(subject, body) {
-                    emailDetailContent.innerHTML = `
-                        <div class="email-detail">
-                            <button id="toggle-raw-btn" class="btn btn-secondary" style="margin-bottom: 10px;">Show Raw Content</button>
-                            <div class="email-detail-header vertical" id="email-header-info">
-                                <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
-                                <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
-                                <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
-                                <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
-                            </div>
-                            <pre id="raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
-                            <div class="email-detail-body" id="email-body-info">
-                                ${Utils.escapeHtml(body).replace(/\n/g, '<br>')}
-                            </div>
-                            <pre id="raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
-                        </div>
-                    `;
-                    // Toggle between display content and raw content
+                    emailDetailContent.innerHTML =
+                        `<div class="email-detail">
+<div class="email-detail-header vertical" id="email-header-info">
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
+<div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
+<div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+<div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
+</div>
+<pre id="raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+<div class="email-detail-body" id="email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
+<button id="toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
+<pre id="raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
+</div>`;
                     const toggleRawBtn = document.getElementById('toggle-raw-btn');
                     const headerInfo = document.getElementById('email-header-info');
                     const rawHeaderInfo = document.getElementById('raw-header-info');
@@ -457,24 +516,23 @@ export class EmailService {
                     toggleRawBtn.addEventListener('click', () => {
                         showingRaw = !showingRaw;
                         if (showingRaw) {
-                            headerInfo.style.display = 'none';
+                            headerInfo.classList.add('hidden-header');
                             rawHeaderInfo.style.display = 'block';
                             bodyInfo.style.display = 'none';
                             rawBodyInfo.style.display = 'block';
                             toggleRawBtn.textContent = 'Show Display Content';
+                            rawBodyInfo.parentNode.insertBefore(toggleRawBtn, rawBodyInfo.nextSibling);
                         } else {
-                            headerInfo.style.display = 'flex';
+                            headerInfo.classList.remove('hidden-header');
                             rawHeaderInfo.style.display = 'none';
                             bodyInfo.style.display = 'block';
                             rawBodyInfo.style.display = 'none';
                             toggleRawBtn.textContent = 'Show Raw Content';
+                            bodyInfo.parentNode.insertBefore(toggleRawBtn, bodyInfo.nextSibling);
                         }
                     });
                 }
-                // Initial render (decrypted if possible, otherwise cleaned)
-                updateDetail(originalSubject, cleanedBody);
             }
-            
         } catch (error) {
             console.error('Error showing email detail:', error);
         }
@@ -717,7 +775,6 @@ export class EmailService {
 }
 
 // Create and export a singleton instance
-export const emailService = new EmailService();
-
-// Make it available globally for other services to access
-window.emailService = emailService; 
+// Remove all 'import' and 'export' statements. Ensure EmailService and emailService are attached to window at the end. No ES module syntax.
+window.EmailService = EmailService;
+window.emailService = new EmailService(); 

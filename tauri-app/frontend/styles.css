@@ -1826,47 +1826,35 @@ body.dark-mode .email-search-icon {
 
 /* Email detail header vertical layout */
 .email-detail-header.vertical {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    background: var(--header-bg, #232946);
-    border-radius: 10px;
-    padding: 16px 0 16px 24px;
-    margin-bottom: 18px;
-    align-items: flex-start;
-    box-shadow: none;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    justify-content: flex-start !important;
+    background: #fff !important;
+    color: #232946 !important;
 }
-
-.email-header-row {
-    display: flex;
-    gap: 8px;
-    align-items: baseline;
-    font-size: 1rem;
-    justify-content: flex-start;
-}
-
 .email-header-label {
-    font-weight: bold;
-    color: #fff;
-    min-width: 70px;
-    display: inline-block;
+    color: #232946 !important;
 }
-
 .email-header-value {
-    color: #e0e0e0;
-    word-break: break-all;
+    color: #232946 !important;
+}
+body.dark-mode .email-detail-header.vertical {
+    background: #232946 !important;
+    color: #e0e0e0 !important;
+}
+body.dark-mode .email-header-label {
+    color: #e0e0e0 !important;
+}
+body.dark-mode .email-header-value {
+    color: #e0e0e0 !important;
+}
+.hidden-header {
+    display: none !important;
 }
 
-body:not(.dark-mode) .email-detail-header.vertical {
-    background: #222b3a;
-}
-
-body:not(.dark-mode) .email-header-label {
-    color: #222b3a;
-}
-
-body:not(.dark-mode) .email-header-value {
-    color: #333;
+.email-detail-header.vertical.hidden-header {
+    display: none !important;
 }
 
 /* DM Message Input Styles */
@@ -2254,4 +2242,12 @@ body.dark-mode .form-text {
 .form-group textarea {
     resize: vertical;
     min-height: 100px;
+}
+
+.email-list-strong {
+    font-weight: 600;
+    color: #fff;
+}
+body:not(.dark-mode) .email-list-strong {
+    color: #232946;
 }

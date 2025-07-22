@@ -31,6 +31,7 @@ pub struct EmailMessage {
     pub date: DateTime<Utc>,
     pub is_read: bool,
     pub raw_headers: String,
+    pub nostr_pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

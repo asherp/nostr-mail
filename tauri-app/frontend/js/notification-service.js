@@ -1,7 +1,7 @@
 // Notification Service
 // Handles user notifications, success messages, and error feedback
 
-export class NotificationService {
+class NotificationService {
     constructor() {
         this.notifications = [];
         this.init();
@@ -275,4 +275,5 @@ export class NotificationService {
 }
 
 // Create and export a singleton instance
-export const notificationService = new NotificationService(); 
+window.NotificationService = NotificationService;
+window.notificationService = new NotificationService(); 

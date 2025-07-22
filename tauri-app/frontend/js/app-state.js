@@ -1,7 +1,7 @@
 // App State Management
 // Handles all application state and provides a centralized state management system
 
-export class AppState {
+class AppState {
     constructor() {
         this.currentUser = null;
         this.contacts = [];
@@ -151,4 +151,5 @@ export class AppState {
 }
 
 // Create and export a singleton instance
-export const appState = new AppState(); 
+window.AppState = AppState;
+window.appState = new AppState(); 

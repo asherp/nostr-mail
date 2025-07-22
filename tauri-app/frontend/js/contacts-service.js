@@ -1,115 +1,109 @@
 // Contacts Service
 // Handles all contacts-related functionality including loading, rendering, and management
 
-import { appState } from './app-state.js';
-import { domManager } from './dom-manager.js';
-import { TauriService } from './tauri-service.js';
-import { notificationService } from './notification-service.js';
-import { Utils } from './utils.js';
+// Remove all import/export statements. Attach ContactsService and contactsService to window. Replace any usage of imported symbols with window equivalents if needed.
 
-export class ContactsService {
+class ContactsService {
     constructor() {
         this.searchTimeout = null;
     }
 
-    // Load contacts from backend and network
+    // Load contacts from database only
     async loadContacts() {
-        console.log('[JS] loadContacts called - starting contacts loading...');
+        console.log('[JS] loadContacts called - loading contacts from database...');
 
-        if (!appState.hasKeypair()) {
-            notificationService.showError('No keypair available');
+        // Optionally, you can keep the keypair check if you want
+        if (!window.appState.hasKeypair()) {
+            window.notificationService.showError('No keypair available');
             return;
         }
 
-        // Load cached contacts to get profile information (needed for both cached and network data)
-        let cacheLoaded = false;
         try {
-            console.log('[JS] Loading contacts from backend storage...');
-            const cachedContacts = await TauriService.getContacts();
-            
-            if (cachedContacts && cachedContacts.length > 0) {
-                // Convert backend storage format to frontend format
-                const contacts = cachedContacts.map(contact => ({
-                    pubkey: contact.pubkey,
+            const dbContacts = await window.DatabaseService.getAllContacts();
+            // Convert DB format to frontend format if needed
+            const contacts = dbContacts.map(contact => ({
+                pubkey: contact.pubkey,
+                name: contact.name,
+                picture: contact.picture_url || contact.picture || '',
+                email: contact.email || null,
+                fields: {
                     name: contact.name,
-                    picture: contact.picture || '',
-                    email: contact.email || null,
-                    fields: {
-                        name: contact.name,
-                        display_name: contact.display_name || contact.name,
-                        picture: contact.picture || '',
-                        about: contact.about || '',
-                        email: contact.email || ''
-                    },
-                    picture_data_url: contact.picture_data_url || null,
-                    picture_loading: false,
-                    picture_loaded: !!contact.picture_data_url
-                }));
-                
-                appState.setContacts(contacts);
-                this.renderContacts();
-                cacheLoaded = true;
-                console.log('[JS] Contacts loaded from backend storage');
-            } else {
-                console.log('[JS] No cached contacts found in backend storage.');
-            }
-        } catch (e) {
-            console.warn('Failed to load cached contacts from backend:', e);
-        }
-
-        // On startup, only load cached data - don't fetch from network automatically
-        // Users can use the refresh button to get fresh data
-        if (!cacheLoaded) {
-            appState.setContacts([]);
+                    display_name: contact.display_name || contact.name,
+                    picture: contact.picture_url || contact.picture || '',
+                    about: contact.about || '',
+                    email: contact.email || ''
+                },
+                picture_data_url: contact.picture_data_url || null,
+                picture_loading: false,
+                picture_loaded: !!contact.picture_data_url
+            }));
+            window.appState.setContacts(contacts);
             this.renderContacts();
-            console.log('[JS] No cached contacts available. Use refresh button to load from network.');
+            console.log('[JS] Contacts loaded from database');
+            // Defer image loading so UI is responsive
+            this.loadContactImagesProgressively(); // don't await
+        } catch (e) {
+            console.warn('Failed to load contacts from database:', e);
+            window.appState.setContacts([]);
+            this.renderContacts();
+            window.notificationService.showError('Failed to load contacts from database');
         }
     }
 
     // Load contact images progressively
     async loadContactImagesProgressively() {
-        const contacts = appState.getContacts();
+        const contacts = window.appState.getContacts();
         if (contacts.length === 0) return;
-        
+
         console.log(`[JS] Loading images progressively for ${contacts.length} contacts`);
-        
-        for (const contact of contacts) {
-            if (contact.picture && !contact.picture_data_url && !contact.picture_loading) {
-                try {
-                    contact.picture_loading = true;
-                    
-                    // First try to get from backend cache
-                    let dataUrl = await TauriService.getCachedProfileImage(contact.pubkey);
-                    
-                    // If not in cache, fetch and cache it
-                    if (!dataUrl) {
-                        dataUrl = await TauriService.fetchImage(contact.picture);
-                        if (dataUrl) {
-                            // Cache in backend
-                            await TauriService.cacheProfileImage(contact.pubkey, dataUrl);
+
+        // Helper to serialize DB writes
+        let lastDbWrite = Promise.resolve();
+        const queueDbWrite = (fn) => {
+            lastDbWrite = lastDbWrite.then(fn, fn);
+            return lastDbWrite;
+        };
+
+        const batchSize = 10;
+        let i = 0;
+
+        while (i < contacts.length) {
+            const batch = contacts.slice(i, i + batchSize);
+            await Promise.all(batch.map(async (contact) => {
+                if (contact.picture && !contact.picture_data_url && !contact.picture_loading) {
+                    try {
+                        contact.picture_loading = true;
+                        let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey);
+                        if (!dataUrl) {
+                            dataUrl = await window.TauriService.fetchImage(contact.picture);
+                            if (dataUrl) {
+                                // Update UI immediately after fetch
+                                contact.picture_data_url = dataUrl;
+                                contact.picture_loaded = true;
+                                this.renderContactItem(contact);
+                                // Queue DB write, but don't await for UI
+                                queueDbWrite(() => window.TauriService.cacheProfileImage(contact.pubkey, dataUrl));
+                            }
+                        } else {
+                            // If found in cache, update UI immediately
+                            contact.picture_data_url = dataUrl;
+                            contact.picture_loaded = true;
+                            this.renderContactItem(contact);
                         }
+                    } catch (e) {
+                        console.warn(`Failed to cache profile picture for ${contact.name}:`, e);
+                    } finally {
+                        contact.picture_loading = false;
                     }
-                    
-                    if (dataUrl) {
-                        contact.picture_data_url = dataUrl;
-                        contact.picture_loaded = true;
-                        console.log(`[JS] Cached profile picture for ${contact.name}`);
-                        
-                        // Update just this contact's avatar without re-rendering the entire list
-                        this.renderContactItem(contact);
-                    }
-                } catch (e) {
-                    console.warn(`Failed to cache profile picture for ${contact.name}:`, e);
-                } finally {
-                    contact.picture_loading = false;
                 }
-            }
+            }));
+            i += batchSize;
         }
     }
 
     // Render individual contact item (for progressive image loading)
     renderContactItem(contact) {
-        const contactsList = domManager.get('contactsList');
+        const contactsList = window.domManager.get('contactsList');
         if (!contactsList) return;
         
         // Find existing contact element
@@ -132,7 +126,7 @@ export class ContactsService {
             // You could add a loading spinner here if desired
         } else if (contact.picture_data_url) {
             avatarSrc = contact.picture_data_url;
-            console.log(`[JS] Using cached data URL for ${contact.name}`);
+            // console.log(`[JS] Using cached data URL for ${contact.name}`);
         } else {
             console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
         }
@@ -152,16 +146,16 @@ export class ContactsService {
 
     // Render contacts
     renderContacts(searchQuery = '') {
-        const contactsList = domManager.get('contactsList');
+        const contactsList = window.domManager.get('contactsList');
         if (!contactsList) return;
 
         try {
             contactsList.innerHTML = '';
 
             // Filter contacts based on search query
-            let filteredContacts = appState.getContacts();
+            let filteredContacts = window.appState.getContacts();
             if (searchQuery) {
-                filteredContacts = appState.getContacts().filter(contact => 
+                filteredContacts = window.appState.getContacts().filter(contact => 
                     contact.name.toLowerCase().includes(searchQuery) ||
                     contact.pubkey.toLowerCase().includes(searchQuery) ||
                     (contact.email && contact.email.toLowerCase().includes(searchQuery))
@@ -175,7 +169,7 @@ export class ContactsService {
                     contactElement.setAttribute('data-pubkey', contact.pubkey);
                     
                     // Add active class if this contact is selected
-                    if (appState.getSelectedContact() && appState.getSelectedContact().pubkey === contact.pubkey) {
+                    if (window.appState.getSelectedContact() && window.appState.getSelectedContact().pubkey === contact.pubkey) {
                         contactElement.classList.add('active');
                     }
 
@@ -194,7 +188,7 @@ export class ContactsService {
                         avatarClass += ' loading';
                     } else if (contact.picture_data_url) {
                         avatarSrc = contact.picture_data_url;
-                        console.log(`[JS] Using cached data URL for ${contact.name}`);
+                        // console.log(`[JS] Using cached data URL for ${contact.name}`);
                     } else {
                         console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
                     }
@@ -228,7 +222,7 @@ export class ContactsService {
     // Select a contact
     selectContact(contact) {
         try {
-            appState.setSelectedContact(contact);
+            window.appState.setSelectedContact(contact);
             
             // Update UI - remove active class from all contacts
             document.querySelectorAll('.contact-item').forEach(item => {
@@ -251,7 +245,7 @@ export class ContactsService {
 
     // Render contact detail
     renderContactDetail(contact) {
-        const contactsDetail = domManager.get('contactsDetail');
+        const contactsDetail = window.domManager.get('contactsDetail');
         if (!contactsDetail) return;
         
         try {
@@ -295,7 +289,7 @@ export class ContactsService {
             // Add any additional fields from the profile data
             if (contact.fields) {
                 Object.entries(contact.fields).forEach(([key, value]) => {
-                    if (value && value.trim() !== '') {
+                    if (typeof value === 'string' && value.trim() !== '') {
                         // Skip fields we already handled
                         if (['name', 'display_name', 'email', 'pubkey', 'picture'].includes(key)) {
                             return;
@@ -386,13 +380,13 @@ export class ContactsService {
             }
             
             // Clear any selected contact
-            appState.setSelectedContact(null);
+            window.appState.setSelectedContact(null);
             document.querySelectorAll('.contact-item').forEach(item => {
                 item.classList.remove('active');
             });
             
             // Show add contact form in the detail panel
-            const contactsDetail = domManager.get('contactsDetail');
+            const contactsDetail = window.domManager.get('contactsDetail');
             if (contactsDetail) {
                 contactsDetail.innerHTML = `
                     <div class="add-contact-form">
@@ -438,7 +432,7 @@ export class ContactsService {
     async scanQRCode() {
         try {
             // Show QR scanner in the detail panel
-            const contactsDetail = domManager.get('contactsDetail');
+            const contactsDetail = window.domManager.get('contactsDetail');
             if (contactsDetail) {
                 contactsDetail.innerHTML = `
                     <div id="qr-scanner-container">
@@ -516,7 +510,7 @@ export class ContactsService {
 
     // Show camera error
     showCameraError() {
-        const contactsDetail = domManager.get('contactsDetail');
+        const contactsDetail = window.domManager.get('contactsDetail');
         if (contactsDetail) {
             contactsDetail.innerHTML = `
                 <div class="camera-error">
@@ -547,16 +541,16 @@ export class ContactsService {
             // Validate public key
             try {
                 if (!pubkey.startsWith('npub1') && !pubkey.startsWith('nsec1')) {
-                    notificationService.showError('Invalid public key format. Must start with npub1 or nsec1');
+                    window.notificationService.showError('Invalid public key format. Must start with npub1 or nsec1');
                     return;
                 }
             } catch (e) {
-                notificationService.showError('Invalid public key format');
+                window.notificationService.showError('Invalid public key format');
                 return;
             }
             
             // Show loading state in the detail panel
-            const contactsDetail = domManager.get('contactsDetail');
+            const contactsDetail = window.domManager.get('contactsDetail');
             if (contactsDetail) {
                 contactsDetail.innerHTML = `
                     <div class="loading-profile">
@@ -568,39 +562,39 @@ export class ContactsService {
             
             // Fetch the profile
             try {
-                const activeRelays = appState.getActiveRelays();
+                const activeRelays = window.appState.getActiveRelays();
                 if (activeRelays.length === 0) {
-                    notificationService.showError('No active relays to fetch profile');
+                    window.notificationService.showError('No active relays to fetch profile');
                     return;
                 }
                 
                 console.log('Fetching profile for:', pubkey);
-                const profile = await TauriService.fetchProfile(pubkey, activeRelays);
+                const profile = await window.TauriService.fetchProfile(pubkey, activeRelays);
                 
                 if (profile) {
                     // Show the profile in the detail panel with follow button
                     this.showProfileForAdding(pubkey, profile);
                 } else {
-                    notificationService.showError('Could not fetch profile for this public key');
+                    window.notificationService.showError('Could not fetch profile for this public key');
                     // Go back to the add contact form
                     this.showAddContactModal();
                 }
             } catch (error) {
                 console.error('Failed to fetch profile:', error);
-                notificationService.showError('Failed to fetch profile: ' + error);
+                window.notificationService.showError('Failed to fetch profile: ' + error);
                 // Go back to the add contact form
                 this.showAddContactModal();
             }
             
         } catch (error) {
             console.error('Error adding contact:', error);
-            notificationService.showError('Failed to add contact');
+            window.notificationService.showError('Failed to add contact');
         }
     }
 
     // Show profile for adding (not following yet)
     showProfileForAdding(pubkey, profile) {
-        const contactsDetail = domManager.get('contactsDetail');
+        const contactsDetail = window.domManager.get('contactsDetail');
         if (!contactsDetail) return;
         
         try {
@@ -647,7 +641,7 @@ export class ContactsService {
             // Try to load and cache the profile picture (but don't re-render the entire profile)
             if (profilePicture) {
                 tempContact.picture_loading = true;
-                TauriService.fetchImage(profilePicture).then(dataUrl => {
+                window.TauriService.fetchImage(profilePicture).then(dataUrl => {
                     if (dataUrl) {
                         tempContact.picture_data_url = dataUrl;
                         tempContact.picture_loaded = true;
@@ -690,7 +684,7 @@ export class ContactsService {
             window.dmService.sendDirectMessageToContact(pubkey);
         } else {
             console.error('DM service not available');
-            notificationService.showError('DM service not available');
+            window.notificationService.showError('DM service not available');
         }
     }
 
@@ -698,7 +692,7 @@ export class ContactsService {
     copyContactPubkey(pubkey) {
         try {
             navigator.clipboard.writeText(pubkey).then(() => {
-                notificationService.showSuccess('Public key copied to clipboard');
+                window.notificationService.showSuccess('Public key copied to clipboard');
             }).catch(() => {
                 // Fallback for older browsers
                 const textArea = document.createElement('textarea');
@@ -707,11 +701,11 @@ export class ContactsService {
                 textArea.select();
                 document.execCommand('copy');
                 document.body.removeChild(textArea);
-                notificationService.showSuccess('Public key copied to clipboard');
+                window.notificationService.showSuccess('Public key copied to clipboard');
             });
         } catch (error) {
             console.error('Failed to copy public key:', error);
-            notificationService.showError('Failed to copy public key');
+            window.notificationService.showError('Failed to copy public key');
         }
     }
 
@@ -724,26 +718,26 @@ export class ContactsService {
         }
         
         // Fill in the email address
-        const toAddressInput = domManager.get('toAddress');
+        const toAddressInput = window.domManager.get('toAddress');
         if (toAddressInput) {
             toAddressInput.value = email;
         }
         
-        notificationService.showSuccess(`Email address filled in: ${email}`);
+        window.notificationService.showSuccess(`Email address filled in: ${email}`);
     }
 
     // Refresh contacts from network (called by refresh button)
     async refreshContacts() {
         console.log('[JS] refreshContacts called - fetching fresh data from network...');
         
-        if (!appState.hasKeypair()) {
-            notificationService.showError('No keypair available');
+        if (!window.appState.hasKeypair()) {
+            window.notificationService.showError('No keypair available');
             return;
         }
 
-        const activeRelays = appState.getActiveRelays();
+        const activeRelays = window.appState.getActiveRelays();
         if (activeRelays.length === 0) {
-            notificationService.showError('No active relays configured');
+            window.notificationService.showError('No active relays configured');
             return;
         }
 
@@ -751,8 +745,8 @@ export class ContactsService {
             console.log('🔄 Loading following profiles from network...');
             
             // Fetch following profiles from Nostr
-            const followingProfiles = await TauriService.fetchFollowingProfiles(
-                appState.getKeypair().private_key,
+            const followingProfiles = await window.TauriService.fetchFollowingProfiles(
+                window.appState.getKeypair().private_key,
                 activeRelays
             );
             
@@ -776,12 +770,21 @@ export class ContactsService {
                 }));
 
                 // Update contacts in place instead of clearing the list
-                this.updateContactsInPlace(newContacts);
+                window.appState.setContacts(newContacts);
+                this.renderContacts();
+                // Defer image loading so UI is responsive
+                this.loadContactImagesProgressively(); // don't await
+
+                // Also update the database with the new contacts
+                for (const contact of newContacts) {
+                    const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
+                    await window.DatabaseService.saveContact(dbContact);
+                }
 
                 // Cache the contacts in backend storage (without images)
                 try {
                     // Convert frontend contact format to backend storage format
-                    const backendContacts = appState.getContacts().map(contact => ({
+                    const backendContacts = window.appState.getContacts().map(contact => ({
                         pubkey: contact.pubkey,
                         name: contact.name,
                         display_name: contact.fields.display_name || contact.name,
@@ -792,28 +795,26 @@ export class ContactsService {
                         cached_at: new Date().toISOString()
                     }));
                     
-                    await TauriService.setContacts(backendContacts);
+                    await window.TauriService.setContacts(backendContacts);
                     console.log('[JS] Cached contacts in backend storage');
                 } catch (e) {
                     console.warn('Failed to cache contacts in backend:', e);
                 }
                 
                 console.log(`✅ Loaded ${newContacts.length} contacts from network`);
-                notificationService.showSuccess(`Refreshed ${newContacts.length} contacts`);
+                window.notificationService.showSuccess(`Refreshed ${newContacts.length} contacts`);
             } else {
                 console.log('[JS] No profiles received from network');
-                notificationService.showInfo('No contacts found in your follow list');
+                window.notificationService.showInfo('No contacts found in your follow list');
             }
             
         } catch (error) {
             console.error('Failed to load contacts from network:', error);
-            notificationService.showError('Failed to refresh contacts: ' + error);
+            window.notificationService.showError('Failed to refresh contacts: ' + error);
         }
     }
 }
 
 // Create and export a singleton instance
-export const contactsService = new ContactsService();
-
-// Make it available globally for backward compatibility
-window.contactsService = contactsService;
+window.ContactsService = ContactsService;
+window.contactsService = new ContactsService();

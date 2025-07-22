@@ -1,7 +1,7 @@
 // DOM Manager
 // Handles DOM element selection, manipulation, and utilities
 
-export class DOMManager {
+class DOMManager {
     constructor() {
         this.elements = {};
         this.initializeElements();
@@ -63,7 +63,7 @@ export class DOMManager {
             updateProfileBtn: this.getElement('update-profile-btn'),
             
             // Relays
-            relaysList: this.getElement('relays-list'),
+            relaysList: this.getElement('relay-list'),
             newRelayUrl: this.getElement('new-relay-url'),
             addRelayBtn: this.getElement('add-relay-btn'),
             
@@ -79,7 +79,7 @@ export class DOMManager {
             smtpPort: this.getElement('smtp-port'),
             imapHost: this.getElement('imap-host'),
             imapPort: this.getElement('imap-port'),
-            useTls: this.getElement('use-tls'),
+            'use-tls': this.getElement('use-tls'),
             saveSettingsBtn: this.getElement('save-settings-btn'),
             testConnectionBtn: this.getElement('test-connection-btn'),
             testEmailConnectionBtn: this.getElement('test-email-connection-btn'),
@@ -229,4 +229,4 @@ export class DOMManager {
 }
 
 // Create and export a singleton instance
-export const domManager = new DOMManager(); 
+window.DOMManager = DOMManager; 

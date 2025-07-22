@@ -1,3 +1,4 @@
+* sqlite db
 * fetch nostr emails only, decrypt content
 * refactor frontend
 * send DM working

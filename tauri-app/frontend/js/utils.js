@@ -1,7 +1,9 @@
 // Utilities
 // Common helper functions used throughout the application
 
-export class Utils {
+// Remove all import/export statements. Attach Utils to window. Replace any usage of imported symbols with window equivalents if needed.
+
+class Utils {
     // Helper function to escape HTML
     static escapeHtml(text) {
         const div = document.createElement('div');
@@ -266,3 +268,4 @@ export class Utils {
         return isBase64 && !hasEmailPatterns;
     }
 } 
+window.Utils = Utils; 

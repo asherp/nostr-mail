@@ -1,13 +1,9 @@
 // DM Service
 // Handles all direct message functionality including conversations, messages, and management
 
-import { appState } from './app-state.js';
-import { domManager } from './dom-manager.js';
-import { TauriService } from './tauri-service.js';
-import { notificationService } from './notification-service.js';
-import { Utils } from './utils.js';
+// Remove all import/export statements. Attach DMService and dmService to window. Replace any usage of imported symbols with window equivalents if needed.
 
-export class DMService {
+class DMService {
     constructor() {
         this.searchTimeout = null;
     }
@@ -16,15 +12,15 @@ export class DMService {
     async loadDmContacts() {
         console.log('[JS] loadDmContacts called - starting DM loading...');
         
-        if (!appState.hasKeypair()) {
-            notificationService.showError('No keypair available');
+        if (!window.appState.hasKeypair()) {
+            window.notificationService.showError('No keypair available');
             return;
         }
 
         // Load cached contacts to get profile information (needed for both cached and network data)
         let cachedContacts = [];
         try {
-            cachedContacts = await TauriService.getContacts();
+            cachedContacts = await window.DatabaseService.getAllContacts();
             if (cachedContacts && cachedContacts.length > 0) {
                 console.log(`[JS] Loaded ${cachedContacts.length} cached contacts for DM profiles`);
             }
@@ -36,7 +32,7 @@ export class DMService {
         let cacheLoaded = false;
         try {
             console.log('[JS] Loading DM conversations from backend storage...');
-            const cachedData = await TauriService.getConversations();
+            const cachedData = await window.TauriService.getConversations();
             
             if (cachedData && cachedData.length > 0) {
                 console.log('[JS] Found cached DM conversations in backend, rendering immediately...');
@@ -62,7 +58,7 @@ export class DMService {
                 cachedData.forEach(conv => {
                     if (conv.messages && conv.messages.length > 0) {
                         // Preserve existing local cache for this contact
-                        const existingMessages = appState.getDmMessages(conv.contact_pubkey) || [];
+                        const existingMessages = window.appState.getDmMessages(conv.contact_pubkey) || [];
                         
                         dmMessages[conv.contact_pubkey] = conv.messages.map(msg => {
                             // Check if this message exists in local cache
@@ -84,9 +80,9 @@ export class DMService {
                 // Sort by most recent message
                 dmContacts.sort((a, b) => b.lastMessageTime - a.lastMessageTime);
                 
-                appState.setDmContacts(dmContacts);
+                window.appState.setDmContacts(dmContacts);
                 Object.keys(dmMessages).forEach(pubkey => {
-                    appState.setDmMessages(pubkey, dmMessages[pubkey]);
+                    window.appState.setDmMessages(pubkey, dmMessages[pubkey]);
                 });
                 
                 this.renderDmContacts();
@@ -102,10 +98,10 @@ export class DMService {
         
         // Try to fetch fresh data from network (but don't fail if offline)
         try {
-            const activeRelays = appState.getActiveRelays();
+            const activeRelays = window.appState.getActiveRelays();
             if (activeRelays.length === 0) {
                 if (!cacheLoaded) {
-                    notificationService.showError('No active relays configured');
+                    window.notificationService.showError('No active relays configured');
                 }
                 return;
             }
@@ -113,8 +109,8 @@ export class DMService {
             console.log('🔄 Loading conversations from network...');
             
             // Fetch conversations from Nostr
-            const conversations = await TauriService.fetchConversations(
-                appState.getKeypair().private_key,
+            const conversations = await window.TauriService.fetchConversations(
+                window.appState.getKeypair().private_key,
                 activeRelays
             );
             
@@ -133,7 +129,7 @@ export class DMService {
                     // Store the messages from the conversation data
                     if (conv.messages && conv.messages.length > 0) {
                         // Preserve existing local cache for this contact
-                        const existingMessages = appState.getDmMessages(conv.contact_pubkey) || [];
+                        const existingMessages = window.appState.getDmMessages(conv.contact_pubkey) || [];
                         
                         const messages = conv.messages.map(msg => {
                             // Check if this message exists in local cache
@@ -150,7 +146,7 @@ export class DMService {
                             };
                         });
                         
-                        appState.setDmMessages(conv.contact_pubkey, messages);
+                        window.appState.setDmMessages(conv.contact_pubkey, messages);
                     }
                     
                     return {
@@ -167,7 +163,7 @@ export class DMService {
                 // Sort by most recent message
                 dmContacts.sort((a, b) => b.lastMessageTime - a.lastMessageTime);
                 
-                appState.setDmContacts(dmContacts);
+                window.appState.setDmContacts(dmContacts);
                 
                 // Render contacts immediately
                 this.renderDmContacts();
@@ -191,7 +187,7 @@ export class DMService {
                         cached_at: new Date().toISOString()
                     }));
                     
-                    await TauriService.setConversations(conversationsWithTimestamp);
+                    await window.TauriService.setConversations(conversationsWithTimestamp);
                     console.log('[JS] Cached DM conversations in backend storage');
                 } catch (e) {
                     console.warn('Failed to cache DM conversations in backend:', e);
@@ -199,7 +195,7 @@ export class DMService {
             } else {
                 console.log('[JS] No conversations received from network, keeping cached data if available');
                 if (!cacheLoaded) {
-                    appState.setDmContacts([]);
+                    window.appState.setDmContacts([]);
                     this.renderDmContacts();
                 }
             }
@@ -207,8 +203,8 @@ export class DMService {
         } catch (error) {
             console.error('Failed to load DM contacts from network:', error);
             if (!cacheLoaded) {
-                notificationService.showError('Failed to load conversations and no cached data available');
-                appState.setDmContacts([]);
+                window.notificationService.showError('Failed to load conversations and no cached data available');
+                window.appState.setDmContacts([]);
                 this.renderDmContacts();
             } else {
                 console.log('[JS] Network failed, but using cached data');
@@ -219,7 +215,7 @@ export class DMService {
     // Load profiles for DM contacts
     async loadDmContactProfiles() {
         // Only process contacts that don't already have profiles loaded
-        const dmContacts = appState.getDmContacts();
+        const dmContacts = window.appState.getDmContacts();
         const uncachedContacts = dmContacts.filter(contact => !contact.profileLoaded);
         
         if (uncachedContacts.length === 0) {
@@ -228,14 +224,14 @@ export class DMService {
         }
         
         try {
-            const activeRelays = appState.getActiveRelays();
+            const activeRelays = window.appState.getActiveRelays();
             if (activeRelays.length === 0) return;
             
             console.log(`[JS] Loading profiles for ${uncachedContacts.length} uncached DM contacts`);
             
             // Fetch profiles for uncached DM contacts
             const pubkeys = uncachedContacts.map(contact => contact.pubkey);
-            const profiles = await TauriService.fetchProfiles(pubkeys, activeRelays);
+            const profiles = await window.TauriService.fetchProfiles(pubkeys, activeRelays);
             
             // Update contacts with profile information
             for (const profile of profiles) {
@@ -250,14 +246,14 @@ export class DMService {
                     if (contact.picture) {
                         try {
                             // First try to get from backend cache
-                            let dataUrl = await TauriService.getCachedProfileImage(contact.pubkey);
+                            let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey);
                             
                             // If not in cache, fetch and cache it
                             if (!dataUrl) {
-                                dataUrl = await TauriService.fetchImage(contact.picture);
+                                dataUrl = await window.TauriService.fetchImage(contact.picture);
                                 if (dataUrl) {
                                     // Cache in backend
-                                    await TauriService.cacheProfileImage(contact.pubkey, dataUrl);
+                                    await window.TauriService.cacheProfileImage(contact.pubkey, dataUrl);
                                 }
                             }
                             
@@ -275,7 +271,7 @@ export class DMService {
                 }
             }
             
-            appState.setDmContacts(dmContacts);
+            window.appState.setDmContacts(dmContacts);
             
             // Re-render with updated names and pictures
             this.renderDmContacts();
@@ -283,7 +279,7 @@ export class DMService {
             // Update the DM cache with the new profile data in backend storage
             try {
                 // Get current conversations from backend
-                const currentConversations = await TauriService.getConversations();
+                const currentConversations = await window.TauriService.getConversations();
                 if (currentConversations && currentConversations.length > 0) {
                     // Update conversations with new profile data
                     const updatedConversations = currentConversations.map(conv => {
@@ -298,7 +294,7 @@ export class DMService {
                         return conv;
                     });
                     
-                    await TauriService.setConversations(updatedConversations);
+                    await window.TauriService.setConversations(updatedConversations);
                     console.log('[JS] Updated DM conversations in backend storage with profile data');
                 }
             } catch (e) {
@@ -315,16 +311,16 @@ export class DMService {
 
     // Render DM contacts
     renderDmContacts(searchQuery = '') {
-        const dmContacts = domManager.get('dmContacts');
+        const dmContacts = window.domManager.get('dmContacts');
         if (!dmContacts) return;
         
         try {
             dmContacts.innerHTML = '';
             
             // Filter contacts based on search query
-            let filteredContacts = appState.getDmContacts();
+            let filteredContacts = window.appState.getDmContacts();
             if (searchQuery) {
-                filteredContacts = appState.getDmContacts().filter(contact => 
+                filteredContacts = window.appState.getDmContacts().filter(contact => 
                     contact.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
                     contact.pubkey.toLowerCase().includes(searchQuery.toLowerCase()) ||
                     contact.lastMessage.toLowerCase().includes(searchQuery.toLowerCase())
@@ -340,12 +336,17 @@ export class DMService {
             }
             
             filteredContacts.forEach(contact => {
+                // Sync picture_data_url from main contacts list if available
+                const mainContact = window.appState.getContacts().find(c => c.pubkey === contact.pubkey);
+                if (mainContact && mainContact.picture_data_url) {
+                    contact.picture_data_url = mainContact.picture_data_url;
+                }
                 const contactElement = document.createElement('div');
                 contactElement.className = 'dm-contact-item';
                 contactElement.dataset.pubkey = contact.pubkey;
                 
                 // Format the last message time
-                const timeAgo = Utils.formatTimeAgo(contact.lastMessageTime);
+                const timeAgo = window.Utils.formatTimeAgo(contact.lastMessageTime);
                 
                 // Create preview text
                 let previewText = contact.lastMessage;
@@ -390,7 +391,7 @@ export class DMService {
     // Select DM contact
     selectDmContact(contact) {
         try {
-            appState.setSelectedDmContact(contact);
+            window.appState.setSelectedDmContact(contact);
             
             // Update UI
             document.querySelectorAll('.dm-contact-item').forEach(item => {
@@ -412,30 +413,30 @@ export class DMService {
 
     // Load DM messages
     async loadDmMessages(contactPubkey) {
-        if (!appState.hasKeypair()) {
-            notificationService.showError('No keypair available');
+        if (!window.appState.hasKeypair()) {
+            window.notificationService.showError('No keypair available');
             return;
         }
         
         // Check if messages are already cached
-        if (appState.getDmMessages(contactPubkey) && appState.getDmMessages(contactPubkey).length > 0) {
+        if (window.appState.getDmMessages(contactPubkey) && window.appState.getDmMessages(contactPubkey).length > 0) {
             console.log(`[JS] Using cached messages for ${contactPubkey}`);
             this.renderDmMessages(contactPubkey);
             return;
         }
         
         try {
-            const activeRelays = appState.getActiveRelays();
+            const activeRelays = window.appState.getActiveRelays();
             if (activeRelays.length === 0) {
-                notificationService.showError('No active relays configured');
+                window.notificationService.showError('No active relays configured');
                 return;
             }
 
             console.log(`🔄 Loading messages for ${contactPubkey}...`);
             
             // Fetch conversation messages from Nostr
-            const messages = await TauriService.fetchConversationMessages(
-                appState.getKeypair().private_key,
+            const messages = await window.TauriService.fetchConversationMessages(
+                window.appState.getKeypair().private_key,
                 contactPubkey,
                 activeRelays
             );
@@ -450,25 +451,25 @@ export class DMService {
                 confirmed: msg.is_sent // If we can fetch it from network, it's confirmed
             }));
             
-            appState.setDmMessages(contactPubkey, formattedMessages);
+            window.appState.setDmMessages(contactPubkey, formattedMessages);
             this.renderDmMessages(contactPubkey);
             
             console.log(`✅ Loaded ${formattedMessages.length} messages`);
             
         } catch (error) {
             console.error('Failed to load DM messages:', error);
-            notificationService.showError('Failed to load messages');
+            window.notificationService.showError('Failed to load messages');
         }
     }
 
     // Render DM messages
     renderDmMessages(contactPubkey) {
-        const dmMessages = domManager.get('dmMessages');
+        const dmMessages = window.domManager.get('dmMessages');
         if (!dmMessages) return;
         
         try {
-            const messages = appState.getDmMessages(contactPubkey) || [];
-            const contact = appState.getDmContacts().find(c => c.pubkey === contactPubkey);
+            const messages = window.appState.getDmMessages(contactPubkey) || [];
+            const contact = window.appState.getDmContacts().find(c => c.pubkey === contactPubkey);
             
             console.log('[JS] renderDmMessages called for contact:', contactPubkey);
             console.log('[JS] Number of messages to render:', messages.length);
@@ -533,7 +534,7 @@ export class DMService {
                     
                     messageElement.innerHTML = `
                         <div class="message-content">
-                            <div class="message-text">${Utils.escapeHtml(message.content)}</div>
+                            <div class="message-text">${window.Utils.escapeHtml(message.content)}</div>
                             <div class="message-meta">
                                 <div class="message-time">${time}</div>
                                 ${statusIcon}
@@ -602,8 +603,8 @@ export class DMService {
         const message = replyInput.value.trim();
         if (!message) return;
         
-        if (!appState.hasKeypair()) {
-            notificationService.showError('No keypair available');
+        if (!window.appState.hasKeypair()) {
+            window.notificationService.showError('No keypair available');
             return;
         }
         
@@ -613,51 +614,51 @@ export class DMService {
             
             // Create temporary message for immediate display
             const tempMessage = {
-                id: Utils.generateId(),
+                id: window.Utils.generateId(),
                 content: message,
                 created_at: Math.floor(Date.now() / 1000),
-                pubkey: appState.getKeypair().public_key,
+                pubkey: window.appState.getKeypair().public_key,
                 is_sent: true,
                 confirmed: false
             };
             
             // Add to messages
-            const currentMessages = appState.getDmMessages(contactPubkey) || [];
+            const currentMessages = window.appState.getDmMessages(contactPubkey) || [];
             currentMessages.push(tempMessage);
-            appState.setDmMessages(contactPubkey, currentMessages);
+            window.appState.setDmMessages(contactPubkey, currentMessages);
             
             // Re-render messages
             this.renderDmMessages(contactPubkey);
             
             // Send via Nostr
-            const activeRelays = appState.getActiveRelays();
+            const activeRelays = window.appState.getActiveRelays();
             if (activeRelays.length === 0) {
-                notificationService.showError('No active relays configured');
+                window.notificationService.showError('No active relays configured');
                 return;
             }
             
-            const result = await TauriService.sendDirectMessage(
-                appState.getKeypair().private_key,
+            const result = await window.TauriService.sendDirectMessage(
+                window.appState.getKeypair().private_key,
                 contactPubkey,
                 message,
                 activeRelays
             );
             
             // Update message as confirmed
-            const updatedMessages = appState.getDmMessages(contactPubkey);
+            const updatedMessages = window.appState.getDmMessages(contactPubkey);
             const messageIndex = updatedMessages.findIndex(m => m.id === tempMessage.id);
             if (messageIndex !== -1) {
                 updatedMessages[messageIndex].confirmed = true;
                 updatedMessages[messageIndex].id = result.event_id || tempMessage.id;
-                appState.setDmMessages(contactPubkey, updatedMessages);
+                window.appState.setDmMessages(contactPubkey, updatedMessages);
                 this.renderDmMessages(contactPubkey);
             }
             
-            notificationService.showSuccess('Message sent');
+            window.notificationService.showSuccess('Message sent');
             
         } catch (error) {
             console.error('Failed to send DM:', error);
-            notificationService.showError('Failed to send message');
+            window.notificationService.showError('Failed to send message');
         }
     }
 
@@ -665,12 +666,12 @@ export class DMService {
     renderMessage(message) {
         const isSent = message.is_sent;
         const messageClass = isSent ? 'dm-message sent' : 'dm-message received';
-        const timeAgo = Utils.formatTimeAgo(new Date(message.created_at * 1000));
+        const timeAgo = window.Utils.formatTimeAgo(new Date(message.created_at * 1000));
         
         return `
             <div class="${messageClass}">
                 <div class="dm-message-content">
-                    <div class="dm-message-text">${Utils.escapeHtml(message.content)}</div>
+                    <div class="dm-message-text">${window.Utils.escapeHtml(message.content)}</div>
                     <div class="dm-message-time">${timeAgo}</div>
                     ${isSent ? `<div class="dm-message-status">${message.confirmed ? '✓' : '⏳'}</div>` : ''}
                 </div>
@@ -685,7 +686,7 @@ export class DMService {
 
     // Filter DM contacts
     filterDmContacts() {
-        const searchQuery = domManager.getValue('dmSearch')?.trim() || '';
+        const searchQuery = window.domManager.getValue('dmSearch')?.trim() || '';
         
         // Clear existing timeout
         if (this.searchTimeout) {
@@ -704,20 +705,20 @@ export class DMService {
 
     // Toggle DM search
     toggleDmSearch() {
-        const searchContainer = domManager.get('dmSearchContainer');
+        const searchContainer = window.domManager.get('dmSearchContainer');
         if (searchContainer) {
             const isVisible = searchContainer.style.display !== 'none';
             searchContainer.style.display = isVisible ? 'none' : 'block';
             
             if (!isVisible) {
                 // Focus the search input when showing
-                const searchInput = domManager.get('dmSearch');
+                const searchInput = window.domManager.get('dmSearch');
                 if (searchInput) {
                     searchInput.focus();
                 }
             } else {
                 // Clear search when hiding
-                domManager.clear('dmSearch');
+                window.domManager.clear('dmSearch');
                 this.renderDmContacts();
             }
         }
@@ -732,16 +733,16 @@ export class DMService {
         }
         
         // Immediately clear the DM message area to prevent flashing the previous conversation
-        const dmMessages = domManager.get('dmMessages');
+        const dmMessages = window.domManager.get('dmMessages');
         if (dmMessages) {
             dmMessages.innerHTML = '';
         }
         
         // Try to find an existing DM contact
-        let contact = appState.getDmContacts().find(c => c.pubkey === pubkey);
+        let contact = window.appState.getDmContacts().find(c => c.pubkey === pubkey);
         if (!contact) {
             // Try to find the contact in the contacts list for name/picture
-            const baseContact = appState.getContacts().find(c => c.pubkey === pubkey);
+            const baseContact = window.appState.getContacts().find(c => c.pubkey === pubkey);
             contact = {
                 pubkey: pubkey,
                 name: baseContact?.name || pubkey.substring(0, 16) + '...',
@@ -752,10 +753,10 @@ export class DMService {
                 profileLoaded: !!baseContact
             };
             // Add to DM contacts and initialize empty messages
-            const currentDmContacts = appState.getDmContacts();
+            const currentDmContacts = window.appState.getDmContacts();
             currentDmContacts.push(contact);
-            appState.setDmContacts(currentDmContacts);
-            appState.setDmMessages(pubkey, []);
+            window.appState.setDmContacts(currentDmContacts);
+            window.appState.setDmMessages(pubkey, []);
         }
         
         // Render the skeleton UI immediately
@@ -767,7 +768,7 @@ export class DMService {
 
     // Render DM conversation skeleton (loading state)
     renderDmConversationSkeleton(contact) {
-        const dmMessages = domManager.get('dmMessages');
+        const dmMessages = window.domManager.get('dmMessages');
         if (!dmMessages) return;
         
         dmMessages.innerHTML = '';
@@ -838,7 +839,7 @@ export class DMService {
         
         // Clear DM cache from backend storage
         try {
-            await TauriService.setConversations([]);
+            await window.TauriService.setConversations([]);
             console.log('[JS] Cleared DM conversations from backend storage');
         } catch (e) {
             console.warn('Failed to clear DM conversations from backend storage:', e);
@@ -846,16 +847,16 @@ export class DMService {
         
         try {
             // Clear current conversations
-            appState.setDmContacts([]);
-            appState.setDmMessages({});
-            appState.setSelectedDmContact(null);
+            window.appState.setDmContacts([]);
+            window.appState.setDmMessages({});
+            window.appState.setSelectedDmContact(null);
             
             // Clear the UI
-            const dmContacts = domManager.get('dmContacts');
+            const dmContacts = window.domManager.get('dmContacts');
             if (dmContacts) {
                 dmContacts.innerHTML = '<div class="text-center text-muted">Loading conversations...</div>';
             }
-            const dmMessages = domManager.get('dmMessages');
+            const dmMessages = window.domManager.get('dmMessages');
             if (dmMessages) {
                 dmMessages.innerHTML = `
                     <div class="text-center text-muted" style="padding: 2rem;">
@@ -868,17 +869,18 @@ export class DMService {
             // Reload conversations
             await this.loadDmContacts();
             
-            notificationService.showSuccess('Conversations refreshed');
+            window.notificationService.showSuccess('Conversations refreshed');
             
         } catch (error) {
             console.error('Failed to refresh DM conversations:', error);
-            notificationService.showError('Failed to refresh conversations');
+            window.notificationService.showError('Failed to refresh conversations');
         }
     }
 }
 
 // Create and export a singleton instance
-export const dmService = new DMService();
+window.DMService = DMService;
+window.dmService = new DMService();
 
 // Make it available globally for other services to access
 window.dmService = dmService; 

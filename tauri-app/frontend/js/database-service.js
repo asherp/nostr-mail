@@ -1,3 +1,8 @@
+// Tauri command parameter naming:
+// Tauri automatically converts camelCase keys in JS to snake_case for Rust command parameters.
+// For example, passing { userEmail: ... } from JS will be received as user_email in Rust.
+// You can use camelCase in JS and it will map to the expected snake_case Rust parameter.
+// See: https://tauri.app/v1/guides/features/command/#naming-conventions
 /**
  * Database Service
  * Handles all database operations through Tauri commands

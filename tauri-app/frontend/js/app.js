@@ -54,7 +54,8 @@ NostrMailApp.prototype.init = async function() {
         console.log('📬 Loading initial data...');
         // Load contacts first so DM contacts can access cached profile photos
         await contactsService.loadContacts();
-        await emailService.loadEmails();
+        // NOTE: We do NOT load emails here. Emails are only loaded when the inbox tab is clicked.
+        // await emailService.loadEmails(); // <-- Remove or comment out this line so emails are not loaded on startup
         // await dmService.loadDmContacts(); // TODO: add this back in once we have stored DMs in the DB
         
         // Populate Nostr contact dropdown for compose page
@@ -476,6 +477,9 @@ NostrMailApp.prototype.switchTab = function(tabName) {
             dmService.renderDmContacts();
         }
     }
+    if (tabName === 'inbox') {
+        emailService.loadEmails();
+    }
 }
 
 // Modal functions
@@ -775,18 +779,42 @@ NostrMailApp.prototype.lastRenderedProfilePubkey = null;
 
 NostrMailApp.prototype.loadProfile = async function() {
     const currentPubkey = appState.getKeypair() && appState.getKeypair().public_key;
-    // Always define these at the top so they are accessible throughout the function
     const profileSpinner = document.getElementById('profile-loading-spinner');
     const profileFieldsList = document.getElementById('profile-fields-list');
     const profilePicture = document.getElementById('profile-picture');
-    if (this.lastRenderedProfilePubkey !== currentPubkey) {
+
+    // Only clear UI if switching pubkeys
+    if (this.lastRenderedProfilePubkey !== null && this.lastRenderedProfilePubkey !== currentPubkey) {
+        console.log('[Profile] Switching pubkey from', this.lastRenderedProfilePubkey, 'to', currentPubkey, '- clearing UI and showing spinner');
         if (profileFieldsList) profileFieldsList.innerHTML = '';
         if (profilePicture) {
-            // Show placeholder avatar
             profilePicture.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
             profilePicture.style.display = '';
         }
         if (profileSpinner) profileSpinner.style.display = '';
+    }
+
+    // Always try to render cached profile immediately
+    let cachedProfile = null;
+    let cachedPictureDataUrl = null;
+    try {
+        const cached = localStorage.getItem('nostr_mail_profiles');
+        if (cached && currentPubkey) {
+            const profileDict = JSON.parse(cached);
+            cachedProfile = profileDict[currentPubkey];
+            cachedPictureDataUrl = localStorage.getItem('nostr_mail_profile_picture');
+            if (cachedProfile) {
+                console.log('[Profile] Rendering cached profile for pubkey', currentPubkey);
+                if (profileSpinner) profileSpinner.style.display = 'none';
+                this.renderProfileFromObject(cachedProfile, cachedPictureDataUrl);
+            } else {
+                console.log('[Profile] No cached profile found for pubkey', currentPubkey);
+            }
+        } else {
+            console.log('[Profile] No cached profiles in localStorage or no current pubkey');
+        }
+    } catch (e) {
+        console.warn('[Profile] Error loading cached profile:', e);
     }
 
     if (!appState.hasKeypair() || !appState.getKeypair().public_key) {
@@ -915,51 +943,36 @@ NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPicture
         this.editableProfileFields.email = '';
     }
     this.renderProfileFieldsList(this.editableProfileFields);
-    
     // Show warning if profile email and settings email differ
-    const settings = appState.getSettings();
-    const profileEmail = this.editableProfileFields.email || '';
-    const settingsEmail = settings && settings.email_address ? settings.email_address : '';
-    let warningDiv = document.getElementById('profile-email-warning');
-    if (!warningDiv) {
-        warningDiv = document.createElement('div');
-        warningDiv.id = 'profile-email-warning';
-        warningDiv.style.color = 'orange';
-        warningDiv.style.marginBottom = '8px';
-        const form = document.getElementById('profile-fields-form');
-        if (form) form.insertBefore(warningDiv, form.firstChild);
-    }
-    if (profileEmail && settingsEmail && profileEmail !== settingsEmail) {
-        warningDiv.innerHTML = `
-            <i class="fas fa-exclamation-triangle"></i>
-            The email in your profile does not match your settings email.<br>
-            <button id="sync-profile-email-btn" class="btn btn-warning btn-small" type="button" style="margin-top:4px;">
-                Copy settings email to profile
-            </button>
-        `;
-        document.getElementById('sync-profile-email-btn').onclick = () => {
-            this.editableProfileFields.email = settingsEmail;
-            this.renderProfileFieldsList(this.editableProfileFields);
-            warningDiv.innerHTML = '';
-        };
-    } else {
-        warningDiv.innerHTML = '';
-    }
+    this.renderProfileEmailWarning();
 
     // Show profile picture if present, otherwise show a placeholder
     const profilePicture = document.getElementById('profile-picture');
     if (profilePicture) {
-        if (cachedPictureDataUrl) {
-            profilePicture.src = cachedPictureDataUrl;
-            profilePicture.style.display = '';
-        } else if (this.editableProfileFields.picture) {
-            profilePicture.src = this.editableProfileFields.picture;
-            profilePicture.style.display = '';
+        // Helper: placeholder SVG
+        const placeholderSVG = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
+
+        // Set image source with fallback logic and log what is used
+        let src = '';
+        if (cachedPictureDataUrl && typeof cachedPictureDataUrl === 'string' && cachedPictureDataUrl.startsWith('data:image')) {
+            src = cachedPictureDataUrl;
+            console.log('[Profile] Using cached profile picture data URL');
+        } else if (this.editableProfileFields.picture && typeof this.editableProfileFields.picture === 'string' && this.editableProfileFields.picture.trim() !== '') {
+            src = this.editableProfileFields.picture.trim();
+            console.log('[Profile] Using profile.fields.picture URL:', src);
         } else {
-            // Use a default SVG avatar as a placeholder
-            profilePicture.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
-            profilePicture.style.display = '';
+            src = placeholderSVG;
+            console.log('[Profile] Using placeholder profile picture');
         }
+        profilePicture.src = src;
+        profilePicture.style.display = '';
+
+        // Always set an error handler to fallback to placeholder and log error
+        profilePicture.onerror = function() {
+            console.warn('[Profile] Failed to load profile picture, falling back to placeholder. Tried src:', src);
+            profilePicture.src = placeholderSVG;
+            profilePicture.style.display = '';
+        };
     }
 
     // Live preview: update profile picture as user types/pastes a new URL
@@ -1014,6 +1027,15 @@ NostrMailApp.prototype.renderProfileFieldsList = function(fields) {
         .sort();
     for (const key of customKeys) {
         this._renderProfileFieldItem(listDiv, key, fields[key]);
+    }
+
+    // Add real-time warning update for email field
+    const emailInput = document.getElementById('profile-field-email');
+    if (emailInput) {
+        emailInput.addEventListener('input', () => {
+            this.editableProfileFields.email = emailInput.value;
+            this.renderProfileEmailWarning();
+        });
     }
 }
 
@@ -1182,6 +1204,38 @@ NostrMailApp.prototype.toggleDarkMode = function() {
     const enabled = !document.body.classList.contains('dark-mode');
     this.setDarkMode(enabled);
 }
+
+// Add a method to render the email warning
+NostrMailApp.prototype.renderProfileEmailWarning = function() {
+    const settings = appState.getSettings();
+    const profileEmail = this.editableProfileFields.email || '';
+    const settingsEmail = settings && settings.email_address ? settings.email_address : '';
+    let warningDiv = document.getElementById('profile-email-warning');
+    if (!warningDiv) {
+        warningDiv = document.createElement('div');
+        warningDiv.id = 'profile-email-warning';
+        warningDiv.style.color = 'orange';
+        warningDiv.style.marginBottom = '8px';
+        const form = document.getElementById('profile-fields-form');
+        if (form) form.insertBefore(warningDiv, form.firstChild);
+    }
+    if (profileEmail && settingsEmail && profileEmail !== settingsEmail) {
+        warningDiv.innerHTML = `
+            <i class=\"fas fa-exclamation-triangle\"></i>
+            The email in your profile does not match your settings email.<br>
+            <span id=\"sync-profile-email-link\" style=\"color:#ffb300;cursor:pointer;text-decoration:underline;display:inline-block;margin-top:4px;\">
+                Click here to copy email from settings
+            </span>
+        `;
+        document.getElementById('sync-profile-email-link').onclick = () => {
+            this.editableProfileFields.email = settingsEmail;
+            this.renderProfileFieldsList(this.editableProfileFields);
+            this.renderProfileEmailWarning();
+        };
+    } else {
+        warningDiv.innerHTML = '';
+    }
+};
 
 // Create and export the main application instance
 window.app = new NostrMailApp();

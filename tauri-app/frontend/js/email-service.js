@@ -1,3 +1,8 @@
+// Tauri command parameter naming:
+// Tauri automatically converts camelCase keys in JS to snake_case for Rust command parameters.
+// For example, passing { userEmail: ... } from JS will be received as user_email in Rust.
+// You can use camelCase in JS and it will map to the expected snake_case Rust parameter.
+// See: https://tauri.app/v1/guides/features/command/#naming-conventions
 // Email Service
 // Handles all email-related functionality including sending, fetching, and management
 
@@ -256,13 +261,14 @@ class EmailService {
             // Read filter dropdown
             const filterDropdown = document.getElementById('email-filter-dropdown');
             const onlyNostr = !filterDropdown || filterDropdown.value === 'nostr';
-            // Pass the search query and filter to the backend
-            // NOTE: db_get_emails does not support searchQuery, so we ignore it for now
+            // Always pass the user's email address for filtering
+            const userEmail = settings.email_address ? settings.email_address : null;
+            console.log('[JS] getDbEmails userEmail:', userEmail);
             let emails;
             if (onlyNostr) {
-                emails = await TauriService.getDbEmails(50, 0, true);
+                emails = await TauriService.getDbEmails(50, 0, true, userEmail);
             } else {
-                emails = await TauriService.getDbEmails(50, 0, false);
+                emails = await TauriService.getDbEmails(50, 0, false, userEmail);
             }
             appState.setEmails(emails);
             this.renderEmails();

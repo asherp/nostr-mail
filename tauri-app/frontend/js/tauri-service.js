@@ -1,3 +1,8 @@
+// Tauri command parameter naming:
+// Tauri automatically converts camelCase keys in JS to snake_case for Rust command parameters.
+// For example, passing { userEmail: ... } from JS will be received as user_email in Rust.
+// You can use camelCase in JS and it will map to the expected snake_case Rust parameter.
+// See: https://tauri.app/v1/guides/features/command/#naming-conventions
 // Tauri Service
 // Handles all communication with the Rust backend via Tauri commands
 
@@ -156,8 +161,14 @@ const TauriService = {
     syncNostrEmails: async function(emailConfig) {
         return await this.invoke('sync_nostr_emails', { emailConfig });
     },
-    getDbEmails: async function(limit = 50, offset = 0, nostrOnly = true) {
-        return await this.invoke('db_get_emails', { limit, offset, nostrOnly });
+    /**
+     * Tauri automatically converts camelCase keys in JS to snake_case for Rust command parameters.
+     * For example, passing { userEmail: ... } from JS will be received as user_email in Rust.
+     * You can use camelCase in JS and it will map to the expected snake_case Rust parameter.
+     * See: https://tauri.app/v1/guides/features/command/#naming-conventions
+     */
+    getDbEmails: async function(limit = 50, offset = 0, nostrOnly = true, userEmail = null) {
+        return await this.invoke('db_get_emails', { limit, offset, nostrOnly, userEmail: userEmail });
     },
     decryptDmContent: async function(privateKey, senderPubkey, encryptedContent) {
         return await this.invoke('decrypt_dm_content', { privateKey, senderPubkey, encryptedContent });

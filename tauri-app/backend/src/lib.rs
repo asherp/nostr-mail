@@ -567,10 +567,15 @@ fn db_get_email(message_id: String, state: tauri::State<AppState>) -> Result<Opt
 }
 
 #[tauri::command]
-fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
+fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
     println!("[RUST] db_get_emails called");
+    if let Some(ref email) = user_email {
+        println!("[RUST] db_get_emails: Filtering for user_email: {}", email);
+    } else {
+        println!("[RUST] db_get_emails: No user_email filter provided");
+    }
     let db = state.get_database()?;
-    let emails = db.get_emails(limit, offset, nostr_only).map_err(|e| e.to_string())?;
+    let emails = db.get_emails(limit, offset, nostr_only, user_email.as_deref()).map_err(|e| e.to_string())?;
     let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
     println!("[RUST] Sending {} emails to frontend:", mapped.len());
     for (i, email) in mapped.iter().enumerate() {

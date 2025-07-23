@@ -8,13 +8,16 @@ mod types;
 mod state;
 mod storage;
 mod database;
-use database::Database;
 
 use types::*;
 use state::{AppState, Relay};
 use storage::{Storage, Contact, Conversation, UserProfile, AppSettings, EmailDraft};
 use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay};
 use crate::types::EmailMessage;
+
+use nostr_sdk::Metadata;
+use nostr_sdk::ToBech32;
+use std::str::FromStr;
 
 fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
     let raw_headers = email.raw_headers.clone().unwrap_or_default();
@@ -85,9 +88,9 @@ async fn send_direct_message(private_key: String, recipient_pubkey: String, mess
 }
 
 #[tauri::command]
-async fn fetch_direct_messages(private_key: String, relays: Vec<String>) -> Result<Vec<NostrEvent>, String> {
+async fn fetch_direct_messages(private_key: String, relays: Vec<String>, since: Option<i64>) -> Result<Vec<NostrEvent>, String> {
     println!("[RUST] fetch_direct_messages called");
-    nostr::fetch_direct_messages(&private_key, &relays).await.map_err(|e| e.to_string())
+    nostr::fetch_direct_messages(&private_key, &relays, since).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -145,7 +148,7 @@ fn decrypt_dm_content(private_key: String, sender_pubkey: String, encrypted_cont
     println!("[RUST] Encrypted content: {}", encrypted_content);
     let result = nostr::decrypt_dm_content(&private_key, &sender_pubkey, &encrypted_content);
     match &result {
-        Ok(decrypted) => println!("[RUST] Decryption successful:"),
+        Ok(decrypted) => println!("[RUST] Decryption successful: {}", decrypted),
         Err(e) => println!("[RUST] Decryption failed: {}", e),
     }
     result.map_err(|e| e.to_string())
@@ -484,11 +487,19 @@ async fn check_message_confirmation(event_id: String, relays: Vec<String>) -> Re
 
 #[tauri::command]
 fn generate_qr_code(data: String, _size: Option<u32>) -> Result<String, String> {
-    println!("[RUST] generate_qr_code called");
-    let qr = qrcode::QrCode::new(data.as_bytes()).map_err(|e| e.to_string())?;
+    println!("[RUST] generate_qr_code called with data: '{}', length: {}", data, data.len());
+    let qr = match qrcode::QrCode::new(data.as_bytes()) {
+        Ok(qr) => qr,
+        Err(e) => {
+            println!("[RUST] QR code generation failed: {:?}", e);
+            return Err(e.to_string());
+        }
+    };
     // Render to SVG string
     let svg = qr.render::<qrcode::render::svg::Color>().build();
+    println!("[RUST] QR code SVG generated, length: {}", svg.len());
     let data_url = format!("data:image/svg+xml;utf8,{}", urlencoding::encode(&svg));
+    println!("[RUST] Returning data_url, length: {}", data_url.len());
     Ok(data_url)
 }
 
@@ -593,6 +604,46 @@ fn db_get_dms_for_conversation(user_pubkey: String, contact_pubkey: String, stat
     println!("[RUST] db_get_dms_for_conversation called");
     let db = state.get_database()?;
     db.get_dms_for_conversation(&user_pubkey, &contact_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_decrypted_dms_for_conversation(
+    private_key: String,
+    user_pubkey: String,
+    contact_pubkey: String,
+    state: tauri::State<AppState>
+) -> Result<Vec<crate::database::DirectMessage>, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let mut messages = db.get_dms_for_conversation(&user_pubkey, &contact_pubkey)
+        .map_err(|e| e.to_string())?;
+    for msg in &mut messages {
+        let decrypt_sender_pubkey = if msg.sender_pubkey == user_pubkey {
+            &msg.recipient_pubkey
+        } else {
+            &msg.sender_pubkey
+        };
+        let id_str = msg.id.map(|id| id.to_string()).unwrap_or_else(|| "<no id>".to_string());
+        match crate::nostr::decrypt_dm_content(&private_key, decrypt_sender_pubkey, &msg.content) {
+            Ok(decrypted) => {
+                println!("[DM DECRYPT] Success: id={}, sender={}, recipient={}, decrypted='{}'", id_str, msg.sender_pubkey, msg.recipient_pubkey, &decrypted.chars().take(80).collect::<String>());
+                msg.content = decrypted;
+            },
+            Err(e) => {
+                println!(
+                    "[DM DECRYPT] Failed: id={}, sender={}, recipient={}, error={}, sender_pubkey_raw={:?}, recipient_pubkey_raw={:?}, content_sample={:?}",
+                    id_str,
+                    msg.sender_pubkey,
+                    msg.recipient_pubkey,
+                    e,
+                    msg.sender_pubkey,
+                    msg.recipient_pubkey,
+                    &msg.content.chars().take(40).collect::<String>()
+                );
+                msg.content = "[Failed to decrypt]".to_string();
+            },
+        }
+    }
+    Ok(messages)
 }
 
 // Database commands for settings
@@ -726,6 +777,99 @@ async fn sync_nostr_emails(email_config: EmailConfig, state: tauri::State<'_, Ap
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn sync_direct_messages_with_network(private_key: String, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    println!("SYNC COMMAND CALLED");
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    // 1. Get latest DM timestamp
+    let latest = db.get_latest_dm_created_at().map_err(|e| e.to_string())?;
+    let since = latest.map(|dt| dt.timestamp());
+    // 2. Fetch new DMs from network
+    let events = crate::nostr::fetch_direct_messages(&private_key, &relays, since)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 3. Convert NostrEvent to DirectMessage
+    let dms: Vec<DbDirectMessage> = events.iter().map(|event| {
+        // Convert sender_pubkey to npub format
+        let sender_npub = if event.pubkey.starts_with("npub1") {
+            event.pubkey.clone()
+        } else if event.pubkey.len() == 64 && event.pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+            match nostr_sdk::prelude::PublicKey::from_hex(&event.pubkey) {
+                Ok(pk) => pk.to_bech32().unwrap_or(event.pubkey.clone()),
+                Err(_) => event.pubkey.clone(),
+            }
+        } else {
+            event.pubkey.clone()
+        };
+        // Convert recipient_pubkey to npub format
+        let raw_recipient = event.tags.iter()
+            .find(|tag| tag.get(0) == Some(&"p".to_string()) && tag.get(1).is_some())
+            .and_then(|tag| tag.get(1).cloned())
+            .unwrap_or_default();
+        let recipient_npub = if raw_recipient.starts_with("npub1") {
+            raw_recipient.clone()
+        } else if raw_recipient.len() == 64 && raw_recipient.chars().all(|c| c.is_ascii_hexdigit()) {
+            match nostr_sdk::prelude::PublicKey::from_hex(&raw_recipient) {
+                Ok(pk) => pk.to_bech32().unwrap_or(raw_recipient.clone()),
+                Err(_) => raw_recipient.clone(),
+            }
+        } else {
+            raw_recipient.clone()
+        };
+        DbDirectMessage {
+            id: None,
+            event_id: event.id.clone(),
+            sender_pubkey: sender_npub,
+            recipient_pubkey: recipient_npub,
+            content: event.content.clone(),
+            created_at: chrono::DateTime::from_timestamp(event.created_at, 0).unwrap_or_else(|| chrono::Utc::now()),
+            received_at: chrono::Utc::now(),
+        }
+    }).collect();
+    // 4. Save new DMs
+    let inserted = db.save_dm_batch(&dms).map_err(|e| e.to_string())?;
+    // 5. Return number of new messages
+    Ok(inserted)
+}
+
+#[tauri::command]
+fn db_get_all_dm_pubkeys(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    db.get_all_dm_pubkeys().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_all_dm_pubkeys_sorted(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    db.get_all_dm_pubkeys_sorted().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_profile(private_key: String, fields: std::collections::HashMap<String, serde_json::Value>, relays: Vec<String>) -> Result<(), String> {
+
+    // Convert fields to JSON string
+    let content = serde_json::to_string(&fields).map_err(|e| e.to_string())?;
+
+    // Parse private key
+    let secret_key = nostr_sdk::prelude::SecretKey::from_str(&private_key).map_err(|e| e.to_string())?;
+    let keys = nostr_sdk::prelude::Keys::new(secret_key);
+
+    // Build the profile event (kind 0)
+    let metadata: Metadata = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let event = nostr_sdk::prelude::EventBuilder::metadata(&metadata);
+    let event = event.build(keys.public_key()).sign_with_keys(&keys).map_err(|e| e.to_string())?;
+
+    // Connect to relays and publish
+    let client = nostr_sdk::prelude::Client::new(keys);
+    for relay in &relays {
+        client.add_relay(relay).await.map_err(|e| e.to_string())?;
+    }
+    client.connect().await;
+    client.send_event(&event).await.map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("[RUST] Starting nostr-mail application...");
@@ -840,6 +984,7 @@ pub fn run() {
         db_update_email_nostr_pubkey_by_id,
         db_save_dm,
         db_get_dms_for_conversation,
+        db_get_decrypted_dms_for_conversation,
         db_save_setting,
         db_get_setting,
         db_get_all_settings,
@@ -851,6 +996,10 @@ pub fn run() {
         db_get_all_relays,
         db_delete_relay,
         sync_nostr_emails,
+        sync_direct_messages_with_network,
+        db_get_all_dm_pubkeys,
+        db_get_all_dm_pubkeys_sorted,
+        update_profile,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     

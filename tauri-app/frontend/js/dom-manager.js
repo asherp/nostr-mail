@@ -34,13 +34,9 @@ class DOMManager {
             refreshInbox: this.getElement('refresh-inbox'),
             emailSearch: this.getElement('email-search'),
             
-            // DM elements
+            // DM elements (only static ones)
             dmContacts: this.getElement('dm-contacts'),
             dmMessages: this.getElement('dm-messages'),
-            dmRecipient: this.getElement('dm-recipient'),
-            dmMessage: this.getElement('dm-message'),
-            sendDmBtn: this.getElement('send-dm-btn'),
-            newDmBtn: this.getElement('new-dm-btn'),
             refreshDm: this.getElement('refresh-dm'),
             dmSearch: this.getElement('dm-search'),
             dmSearchToggle: this.getElement('dm-search-toggle'),
@@ -55,11 +51,7 @@ class DOMManager {
             contactsSearchToggle: this.getElement('contacts-search-toggle'),
             contactsSearchContainer: this.getElement('contacts-search-container'),
             
-            // Profile
-            displayName: this.getElement('display-name'),
-            about: this.getElement('about'),
-            email: this.getElement('email'),
-            nip05: this.getElement('nip05'),
+            // Profile (do not look for display-name, about, email, nip05)
             updateProfileBtn: this.getElement('update-profile-btn'),
             
             // Relays
@@ -81,12 +73,13 @@ class DOMManager {
             imapPort: this.getElement('imap-port'),
             'use-tls': this.getElement('use-tls'),
             saveSettingsBtn: this.getElement('save-settings-btn'),
-            testConnectionBtn: this.getElement('test-connection-btn'),
             testEmailConnectionBtn: this.getElement('test-email-connection-btn'),
             copyNprivBtn: this.getElement('copy-npriv-btn'),
             copyEmailPasswordBtn: this.getElement('copy-email-password-btn'),
             toggleNprivVisibilityBtn: this.getElement('toggle-npriv-visibility-btn'),
             toggleEmailPasswordVisibilityBtn: this.getElement('toggle-email-password-visibility-btn'),
+            qrNprivBtn: this.getElement('qr-npriv-btn'),
+            qrNpubBtn: this.getElement('qr-npub-btn'),
         };
     }
 

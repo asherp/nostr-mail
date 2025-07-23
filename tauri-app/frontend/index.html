@@ -9,7 +9,6 @@
     <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
     <script src="storage-service.js"></script>
     <script src="js/database-service.js"></script>
-    <script src="js/database-migration.js"></script>
     <script src="js/contacts-service.js"></script>
     <script src="js/dm-service.js"></script>
     <script src="js/dom-manager.js"></script>
@@ -211,15 +210,12 @@
                 <div class="tab-header">
                     <h2>Profile</h2>
                 </div>
-                
-                <div class="profile-form">
+                <div class="profile-form no-card">
                     <img id="profile-picture" class="profile-picture" style="width:120px;height:120px;object-fit:cover;border-radius:50%;margin-bottom:16px;display:none;" alt="Profile picture">
                     <form id="profile-fields-form">
                         <div id="profile-fields-list" class="profile-fields-list"></div>
                         <div class="form-actions">
-                            <button type="button" id="add-profile-field-btn" class="btn btn-secondary">
-                                <i class="fas fa-plus"></i> Add Field
-                            </button>
+                            
                             <button id="update-profile-btn" class="btn btn-primary" type="submit">
                                 <i class="fas fa-save"></i> Update Profile
                             </button>
@@ -368,9 +364,6 @@
                     <div class="form-actions">
                         <button id="save-settings-btn" class="btn btn-primary">
                             <i class="fas fa-save"></i> Save Settings
-                        </button>
-                        <button id="test-connection-btn" class="btn btn-secondary">
-                            <i class="fas fa-test-tube"></i> Test Connection
                         </button>
                     </div>
                 </div>

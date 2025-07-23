@@ -55,6 +55,12 @@ class AppState {
         return this.dmContacts;
     }
 
+    addDmContact(contact) {
+        if (!this.dmContacts.find(c => c.pubkey === contact.pubkey)) {
+            this.dmContacts.push(contact);
+        }
+    }
+
     setDmMessages(contactPubkey, messages) {
         this.dmMessages[contactPubkey] = messages;
     }

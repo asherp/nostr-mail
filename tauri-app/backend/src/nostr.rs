@@ -2,9 +2,18 @@ use nostr_sdk::prelude::*;
 use anyhow::Result;
 use crate::types::{NostrEvent, Profile};
 use std::time::Duration;
-use base64::{engine::general_purpose, Engine as _};
-use mime_guess;
 use serde::{Serialize, Deserialize};
+use base64::engine::{general_purpose, Engine as _};
+
+fn parse_pubkey(pubkey: &str) -> anyhow::Result<nostr_sdk::prelude::PublicKey> {
+    if pubkey.starts_with("npub1") {
+        nostr_sdk::prelude::PublicKey::from_bech32(pubkey).map_err(|e| anyhow::anyhow!(e))
+    } else if pubkey.len() == 64 && pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        nostr_sdk::prelude::PublicKey::from_hex(pubkey).map_err(|e| anyhow::anyhow!(e))
+    } else {
+        Err(anyhow::anyhow!("Unknown pubkey format: {}", pubkey))
+    }
+}
 
 pub async fn publish_event(
     private_key: &str,
@@ -169,6 +178,7 @@ pub struct ConversationMessage {
 pub async fn fetch_direct_messages(
     private_key: &str,
     relays: &[String],
+    since: Option<i64>,
 ) -> Result<Vec<NostrEvent>> {
     // Parse private key from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
@@ -189,13 +199,17 @@ pub async fn fetch_direct_messages(
     client.connect().await;
     
     // Create filter for encrypted direct messages - fetch both sent and received
-    let sent_filter = Filter::new()
+    let mut sent_filter = Filter::new()
         .kind(Kind::EncryptedDirectMessage)
         .author(keys.public_key());
-    
-    let received_filter = Filter::new()
+    let mut received_filter = Filter::new()
         .kind(Kind::EncryptedDirectMessage)
         .pubkey(keys.public_key());
+    if let Some(since_ts) = since {
+        let ts = Timestamp::from(since_ts as u64);
+        sent_filter = sent_filter.since(ts);
+        received_filter = received_filter.since(ts);
+    }
     
     // Get events for both sent and received
     let sent_events = client.fetch_events(sent_filter, Duration::from_secs(10)).await?;
@@ -285,6 +299,7 @@ pub async fn fetch_events(
     Ok(nostr_events)
 }
 
+#[allow(dead_code)]
 pub async fn validate_nip05(_pubkey: &str, nip05: &str) -> Result<bool> {
     if !nip05.contains('@') {
         return Ok(false);
@@ -328,7 +343,7 @@ pub fn decrypt_dm_content(
     encrypted_content: &str,
 ) -> Result<String> {
     let secret_key = SecretKey::from_bech32(private_key)?;
-    let sender = PublicKey::from_bech32(sender_pubkey)?;
+    let sender = parse_pubkey(sender_pubkey)?;
     
     // Try NIP-44 first (newer standard)
     if let Ok(decrypted) = nip44::decrypt(&secret_key, &sender, encrypted_content) {
@@ -593,10 +608,10 @@ pub async fn fetch_conversations(
                 .find(|tag| tag.kind().as_str() == "p")
                 .and_then(|tag| tag.content())
                 .unwrap_or_default();
-            
+            // Log for debugging self-DMs and recipient extraction
+            println!("[NOSTR DEBUG] Event {}: sender={}, raw recipient tag='{}'", event.id.to_hex(), event.pubkey.to_bech32().unwrap_or_default(), raw_pubkey);
             // Convert hex to bech32 if needed
             if raw_pubkey.len() == 64 && raw_pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
-                // This is a hex pubkey, convert to bech32
                 match PublicKey::from_hex(raw_pubkey) {
                     Ok(pk) => pk.to_bech32().unwrap_or_default(),
                     Err(_) => raw_pubkey.to_string(),

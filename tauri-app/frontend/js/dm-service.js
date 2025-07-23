@@ -10,206 +10,60 @@ class DMService {
 
     // Load DM contacts from backend and network
     async loadDmContacts() {
-        console.log('[JS] loadDmContacts called - starting DM loading...');
-        
+        console.log('[JS] loadDmContacts from database (decrypted in backend)...');
         if (!window.appState.hasKeypair()) {
             window.notificationService.showError('No keypair available');
             return;
         }
 
-        // Load cached contacts to get profile information (needed for both cached and network data)
-        let cachedContacts = [];
-        try {
-            cachedContacts = await window.DatabaseService.getAllContacts();
-            if (cachedContacts && cachedContacts.length > 0) {
-                console.log(`[JS] Loaded ${cachedContacts.length} cached contacts for DM profiles`);
-            }
-        } catch (e) {
-            console.warn('Failed to load cached contacts for DM profiles:', e);
-        }
+        // 1. Get sorted list of DM pubkeys
+        const pubkeys = await window.__TAURI__.core.invoke('db_get_all_dm_pubkeys_sorted');
+        const myPubkey = window.appState.getKeypair().public_key;
+        const privateKey = window.appState.getKeypair().private_key;
+        const dmContacts = [];
 
-        // Try to load from backend storage first for instant display
-        let cacheLoaded = false;
-        try {
-            console.log('[JS] Loading DM conversations from backend storage...');
-            const cachedData = await window.TauriService.getConversations();
-            
-            if (cachedData && cachedData.length > 0) {
-                console.log('[JS] Found cached DM conversations in backend, rendering immediately...');
-                
-                // Convert conversations to the format expected by the UI, using cached contact profiles
-                const dmContacts = cachedData.map(conv => {
-                    // Try to find this contact in the cached profiles
-                    const cachedContact = cachedContacts.find(c => c.pubkey === conv.contact_pubkey);
-                    
-                    return {
-                        pubkey: conv.contact_pubkey,
-                        name: cachedContact?.name || conv.contact_name || conv.contact_pubkey.substring(0, 16) + '...',
-                        lastMessage: conv.last_message,
-                        lastMessageTime: new Date(conv.last_timestamp * 1000),
-                        messageCount: conv.message_count,
-                        picture_data_url: cachedContact?.picture_data_url || cachedContact?.picture || null,
-                        profileLoaded: cachedContact !== undefined
-                    };
-                });
-                
-                // Load messages from cached data
-                const dmMessages = {};
-                cachedData.forEach(conv => {
-                    if (conv.messages && conv.messages.length > 0) {
-                        // Preserve existing local cache for this contact
-                        const existingMessages = window.appState.getDmMessages(conv.contact_pubkey) || [];
-                        
-                        dmMessages[conv.contact_pubkey] = conv.messages.map(msg => {
-                            // Check if this message exists in local cache
-                            const existingMessage = existingMessages.find(existing => existing.id === msg.id);
-                            
-                            return {
-                                id: msg.id,
-                                content: msg.content,
-                                created_at: msg.timestamp,
-                                pubkey: msg.sender_pubkey,
-                                is_sent: msg.is_sent,
-                                // Preserve local confirmation status if it exists, otherwise use network status
-                                confirmed: existingMessage ? existingMessage.confirmed : msg.is_sent
-                            };
-                        });
-                    }
-                });
-                
-                // Sort by most recent message
-                dmContacts.sort((a, b) => b.lastMessageTime - a.lastMessageTime);
-                
-                window.appState.setDmContacts(dmContacts);
-                Object.keys(dmMessages).forEach(pubkey => {
-                    window.appState.setDmMessages(pubkey, dmMessages[pubkey]);
-                });
-                
-                this.renderDmContacts();
-                cacheLoaded = true;
-                
-                console.log('[JS] DM conversations loaded from backend storage with profile data');
-            } else {
-                console.log('[JS] No cached DM conversations found in backend storage.');
-            }
-        } catch (e) {
-            console.warn('Failed to load cached DM conversations from backend:', e);
-        }
-        
-        // Try to fetch fresh data from network (but don't fail if offline)
-        try {
-            const activeRelays = window.appState.getActiveRelays();
-            if (activeRelays.length === 0) {
-                if (!cacheLoaded) {
-                    window.notificationService.showError('No active relays configured');
-                }
-                return;
-            }
-
-            console.log('🔄 Loading conversations from network...');
-            
-            // Fetch conversations from Nostr
-            const conversations = await window.TauriService.fetchConversations(
-                window.appState.getKeypair().private_key,
-                activeRelays
-            );
-            
-            console.log('[JS] Network response:', {
-                conversationsReceived: !!conversations,
-                conversationsLength: conversations?.length || 0
+        for (const contactPubkey of pubkeys) {
+            // LOG: Show which pubkeys are being used for the conversation fetch
+            console.log(`[DM DEBUG] Fetching DMs for userPubkey: ${myPubkey}, contactPubkey: ${contactPubkey}`);
+            // 1. Fetch decrypted messages for this conversation
+            const messages = await window.__TAURI__.core.invoke('db_get_decrypted_dms_for_conversation', {
+                privateKey: privateKey,
+                userPubkey: myPubkey,
+                contactPubkey: contactPubkey
             });
-            
-            // Only update if we actually got conversations from the network
-            if (conversations && conversations.length > 0) {
-                // Convert conversations to the format expected by the UI, using cached contact profiles
-                const dmContacts = conversations.map(conv => {
-                    // Try to find this contact in the cached profiles
-                    const cachedContact = cachedContacts.find(c => c.pubkey === conv.contact_pubkey);
-                    
-                    // Store the messages from the conversation data
-                    if (conv.messages && conv.messages.length > 0) {
-                        // Preserve existing local cache for this contact
-                        const existingMessages = window.appState.getDmMessages(conv.contact_pubkey) || [];
-                        
-                        const messages = conv.messages.map(msg => {
-                            // Check if this message exists in local cache
-                            const existingMessage = existingMessages.find(existing => existing.id === msg.id);
-                            
-                            return {
-                                id: msg.id,
-                                content: msg.content,
-                                created_at: msg.timestamp,
-                                pubkey: msg.sender_pubkey,
-                                is_sent: msg.is_sent,
-                                // Preserve local confirmation status if it exists, otherwise use network status
-                                confirmed: existingMessage ? existingMessage.confirmed : msg.is_sent
-                            };
-                        });
-                        
-                        window.appState.setDmMessages(conv.contact_pubkey, messages);
-                    }
-                    
-                    return {
-                        pubkey: conv.contact_pubkey,
-                        name: cachedContact?.name || conv.contact_name || conv.contact_pubkey.substring(0, 16) + '...',
-                        lastMessage: conv.last_message,
-                        lastMessageTime: new Date(conv.last_timestamp * 1000),
-                        messageCount: conv.message_count,
-                        picture_data_url: cachedContact?.picture_data_url || cachedContact?.picture || null,
-                        profileLoaded: cachedContact !== undefined
-                    };
-                });
-                
-                // Sort by most recent message
-                dmContacts.sort((a, b) => b.lastMessageTime - a.lastMessageTime);
-                
-                window.appState.setDmContacts(dmContacts);
-                
-                // Render contacts immediately
-                this.renderDmContacts();
-                
-                // Only load profiles for contacts that aren't already cached
-                const uncachedContacts = dmContacts.filter(contact => !contact.profileLoaded);
-                if (uncachedContacts.length > 0) {
-                    console.log(`[JS] Loading profiles for ${uncachedContacts.length} uncached DM contacts`);
-                    await this.loadDmContactProfiles();
-                } else {
-                    console.log('[JS] All DM contacts already have cached profiles');
-                }
-                
-                console.log(`✅ Loaded ${dmContacts.length} conversations from network`);
-                
-                // Write to backend storage after successful load
-                try {
-                    // Add cached_at field to conversations before saving
-                    const conversationsWithTimestamp = conversations.map(conv => ({
-                        ...conv,
-                        cached_at: new Date().toISOString()
-                    }));
-                    
-                    await window.TauriService.setConversations(conversationsWithTimestamp);
-                    console.log('[JS] Cached DM conversations in backend storage');
-                } catch (e) {
-                    console.warn('Failed to cache DM conversations in backend:', e);
-                }
-            } else {
-                console.log('[JS] No conversations received from network, keeping cached data if available');
-                if (!cacheLoaded) {
-                    window.appState.setDmContacts([]);
-                    this.renderDmContacts();
-                }
-            }
-            
-        } catch (error) {
-            console.error('Failed to load DM contacts from network:', error);
-            if (!cacheLoaded) {
-                window.notificationService.showError('Failed to load conversations and no cached data available');
-                window.appState.setDmContacts([]);
-                this.renderDmContacts();
-            } else {
-                console.log('[JS] Network failed, but using cached data');
-            }
+            // LOG: Show how many messages were returned
+            console.log(`[DM DEBUG] Got ${messages?.length || 0} messages for userPubkey: ${myPubkey}, contactPubkey: ${contactPubkey}`);
+            if (!messages || messages.length === 0) continue;
+
+            // 2. Find the most recent message
+            const lastMessageObj = messages[messages.length - 1];
+            const lastMessage = lastMessageObj.content;
+            const lastMessageTime = new Date(lastMessageObj.created_at);
+
+            // 3. Always fetch contact info from the database
+            const profile = await window.DatabaseService.getContact(contactPubkey);
+            const name = profile?.name || contactPubkey.substring(0, 16) + '...';
+            // Use picture_data_url for avatars
+            const picture_data_url = profile?.picture_data_url || null;
+            const profileLoaded = !!profile;
+
+            dmContacts.push({
+                pubkey: contactPubkey,
+                name,
+                lastMessage,
+                lastMessageTime,
+                messageCount: messages.length,
+                picture_data_url,
+                profileLoaded
+            });
+
+            // 6. Cache decrypted messages in appState
+            window.appState.setDmMessages(contactPubkey, messages);
         }
+
+        // 7. Set and render contacts
+        window.appState.setDmContacts(dmContacts);
+        this.renderDmContacts();
     }
 
     // Load profiles for DM contacts
@@ -346,7 +200,13 @@ class DMService {
                 contactElement.dataset.pubkey = contact.pubkey;
                 
                 // Format the last message time
-                const timeAgo = window.Utils.formatTimeAgo(contact.lastMessageTime);
+                let dateObj;
+                if (typeof contact.lastMessageTime === 'number') {
+                    dateObj = new Date(contact.lastMessageTime * 1000);
+                } else {
+                    dateObj = new Date(contact.lastMessageTime);
+                }
+                const timeAgo = dateObj.toString() === 'Invalid Date' ? 'Unknown time' : window.Utils.formatTimeAgo(dateObj);
                 
                 // Create preview text
                 let previewText = contact.lastMessage;
@@ -417,45 +277,33 @@ class DMService {
             window.notificationService.showError('No keypair available');
             return;
         }
-        
         // Check if messages are already cached
         if (window.appState.getDmMessages(contactPubkey) && window.appState.getDmMessages(contactPubkey).length > 0) {
             console.log(`[JS] Using cached messages for ${contactPubkey}`);
             this.renderDmMessages(contactPubkey);
             return;
         }
-        
         try {
-            const activeRelays = window.appState.getActiveRelays();
-            if (activeRelays.length === 0) {
-                window.notificationService.showError('No active relays configured');
-                return;
-            }
-
-            console.log(`🔄 Loading messages for ${contactPubkey}...`);
-            
-            // Fetch conversation messages from Nostr
-            const messages = await window.TauriService.fetchConversationMessages(
-                window.appState.getKeypair().private_key,
-                contactPubkey,
-                activeRelays
-            );
-            
+            const myPubkey = window.appState.getKeypair().public_key;
+            const privateKey = window.appState.getKeypair().private_key;
+            // Fetch conversation messages from the local database (decrypted)
+            const messages = await window.__TAURI__.core.invoke('db_get_decrypted_dms_for_conversation', {
+                privateKey: privateKey,
+                userPubkey: myPubkey,
+                contactPubkey: contactPubkey
+            });
             // Convert to the format expected by the UI
             const formattedMessages = messages.map(msg => ({
                 id: msg.id,
                 content: msg.content,
-                created_at: msg.timestamp,
-                pubkey: msg.sender_pubkey,
-                is_sent: msg.is_sent,
-                confirmed: msg.is_sent // If we can fetch it from network, it's confirmed
+                created_at: msg.created_at || msg.timestamp,
+                sender_pubkey: msg.sender_pubkey,
+                is_sent: msg.sender_pubkey === myPubkey,
+                confirmed: true // All DB messages are confirmed
             }));
-            
             window.appState.setDmMessages(contactPubkey, formattedMessages);
             this.renderDmMessages(contactPubkey);
-            
-            console.log(`✅ Loaded ${formattedMessages.length} messages`);
-            
+            console.log(`✅ Loaded ${formattedMessages.length} messages from DB`);
         } catch (error) {
             console.error('Failed to load DM messages:', error);
             window.notificationService.showError('Failed to load messages');
@@ -506,13 +354,23 @@ class DMService {
                 
                 console.log('[JS] Sorted messages:', sortedMessages);
                 
+                const myPubkey = window.appState.getKeypair()?.public_key;
                 sortedMessages.forEach((message, index) => {
+                    const isMe = message.sender_pubkey === myPubkey;
+                    console.log(`[DM DEBUG] sender_pubkey:`, message.sender_pubkey, '| myPubkey:', myPubkey, '| isMe:', isMe);
                     console.log(`[JS] Rendering message ${index}:`, message);
-                    
+                    // Determine if this message is from me
                     const messageElement = document.createElement('div');
-                    messageElement.className = `message ${message.is_sent ? 'message-sent' : 'message-received'}`;
+                    messageElement.className = `message ${isMe ? 'message-sent' : 'message-received'}`;
                     
-                    const time = new Date(message.created_at * 1000).toLocaleTimeString([], { 
+                    // Defensive date handling
+                    let dateObj;
+                    if (typeof message.created_at === 'number') {
+                        dateObj = new Date(message.created_at * 1000);
+                    } else {
+                        dateObj = new Date(message.created_at);
+                    }
+                    const time = dateObj.toString() === 'Invalid Date' ? 'Unknown' : dateObj.toLocaleTimeString([], { 
                         hour: '2-digit', 
                         minute: '2-digit' 
                     });
@@ -589,19 +447,21 @@ class DMService {
             }
             
             console.log('[JS] renderDmMessages completed successfully');
-            
         } catch (error) {
             console.error('Error rendering DM messages:', error);
         }
     }
 
-    // Send reply message (renamed from sendDmMessage to match original)
+    // Send reply message
     async sendReplyMessage(contactPubkey) {
         const replyInput = document.getElementById('dm-reply-input');
-        if (!replyInput) return;
-        
-        const message = replyInput.value.trim();
-        if (!message) return;
+        const sendBtn = document.getElementById('dm-send-btn');
+        const replyText = replyInput.value.trim();
+
+        if (!replyText) {
+            window.notificationService.showError('Message cannot be empty');
+            return;
+        }
         
         if (!window.appState.hasKeypair()) {
             window.notificationService.showError('No keypair available');
@@ -609,234 +469,259 @@ class DMService {
         }
         
         try {
-            // Clear input
-            replyInput.value = '';
-            
-            // Create temporary message for immediate display
-            const tempMessage = {
-                id: window.Utils.generateId(),
-                content: message,
-                created_at: Math.floor(Date.now() / 1000),
-                pubkey: window.appState.getKeypair().public_key,
-                is_sent: true,
-                confirmed: false
-            };
-            
-            // Add to messages
-            const currentMessages = window.appState.getDmMessages(contactPubkey) || [];
-            currentMessages.push(tempMessage);
-            window.appState.setDmMessages(contactPubkey, currentMessages);
-            
-            // Re-render messages
-            this.renderDmMessages(contactPubkey);
-            
-            // Send via Nostr
             const activeRelays = window.appState.getActiveRelays();
             if (activeRelays.length === 0) {
                 window.notificationService.showError('No active relays configured');
                 return;
             }
             
-            const result = await window.TauriService.sendDirectMessage(
+            console.log(`🔄 Sending message to ${contactPubkey}...`);
+            
+            // Send message to Nostr
+            const message = await window.TauriService.sendDirectMessage(
                 window.appState.getKeypair().private_key,
                 contactPubkey,
-                message,
+                replyText,
                 activeRelays
             );
             
-            // Update message as confirmed
-            const updatedMessages = window.appState.getDmMessages(contactPubkey);
-            const messageIndex = updatedMessages.findIndex(m => m.id === tempMessage.id);
-            if (messageIndex !== -1) {
-                updatedMessages[messageIndex].confirmed = true;
-                updatedMessages[messageIndex].id = result.event_id || tempMessage.id;
-                window.appState.setDmMessages(contactPubkey, updatedMessages);
+            // Add the message to the UI
                 this.renderDmMessages(contactPubkey);
+            
+            console.log(`✅ Message sent to ${contactPubkey}`);
+            replyInput.value = ''; // Clear input after sending
+            sendBtn.disabled = true; // Disable button until new message is sent
+            
+            // Update the DM cache with the new message in backend storage
+            try {
+                // Get current conversations from backend
+                const currentConversations = await window.TauriService.getConversations();
+                if (currentConversations && currentConversations.length > 0) {
+                    // Update conversations with new message
+                    const updatedConversations = currentConversations.map(conv => {
+                        if (conv.contact_pubkey === contactPubkey) {
+                            return {
+                                ...conv,
+                                last_message: replyText,
+                                last_message_time: new Date().toISOString(),
+                                message_count: conv.message_count + 1,
+                                cached_at: new Date().toISOString()
+                            };
+                        }
+                        return conv;
+                    });
+                    
+                    await window.TauriService.setConversations(updatedConversations);
+                    console.log('[JS] Updated DM conversations in backend storage with new message');
+                }
+            } catch (e) {
+                console.warn('Failed to update DM conversations in backend storage:', e);
             }
             
-            window.notificationService.showSuccess('Message sent');
-            
         } catch (error) {
-            console.error('Failed to send DM:', error);
+            console.error('Failed to send DM message:', error);
             window.notificationService.showError('Failed to send message');
         }
     }
 
-    // Render a single message (for backward compatibility)
-    renderMessage(message) {
-        const isSent = message.is_sent;
-        const messageClass = isSent ? 'dm-message sent' : 'dm-message received';
-        const timeAgo = window.Utils.formatTimeAgo(new Date(message.created_at * 1000));
-        
-        return `
-            <div class="${messageClass}">
-                <div class="dm-message-content">
-                    <div class="dm-message-text">${window.Utils.escapeHtml(message.content)}</div>
-                    <div class="dm-message-time">${timeAgo}</div>
-                    ${isSent ? `<div class="dm-message-status">${message.confirmed ? '✓' : '⏳'}</div>` : ''}
-                </div>
-            </div>
-        `;
-    }
-
-    // Send DM message (for backward compatibility)
-    async sendDmMessage(contactPubkey) {
-        return this.sendReplyMessage(contactPubkey);
-    }
-
-    // Filter DM contacts
-    filterDmContacts() {
-        const searchQuery = window.domManager.getValue('dmSearch')?.trim() || '';
-        
-        // Clear existing timeout
-        if (this.searchTimeout) {
-            clearTimeout(this.searchTimeout);
-        }
-        
-        // Set a new timeout to debounce the search
-        this.searchTimeout = setTimeout(() => {
-            try {
-                this.renderDmContacts(searchQuery);
-            } catch (error) {
-                console.error('Error filtering DM contacts:', error);
-            }
-        }, 300); // 300ms delay
-    }
-
-    // Toggle DM search
-    toggleDmSearch() {
-        const searchContainer = window.domManager.get('dmSearchContainer');
-        if (searchContainer) {
-            const isVisible = searchContainer.style.display !== 'none';
-            searchContainer.style.display = isVisible ? 'none' : 'block';
-            
-            if (!isVisible) {
-                // Focus the search input when showing
-                const searchInput = window.domManager.get('dmSearch');
-                if (searchInput) {
-                    searchInput.focus();
-                }
-            } else {
-                // Clear search when hiding
-                window.domManager.clear('dmSearch');
-                this.renderDmContacts();
-            }
-        }
-    }
-
-    // Send direct message to contact
-    sendDirectMessageToContact(pubkey) {
-        // Switch to DM tab
-        const dmTab = document.querySelector('[data-tab="dm"]');
-        if (dmTab) {
-            dmTab.click();
-        }
-        
-        // Immediately clear the DM message area to prevent flashing the previous conversation
-        const dmMessages = window.domManager.get('dmMessages');
-        if (dmMessages) {
-            dmMessages.innerHTML = '';
-        }
-        
-        // Try to find an existing DM contact
-        let contact = window.appState.getDmContacts().find(c => c.pubkey === pubkey);
-        if (!contact) {
-            // Try to find the contact in the contacts list for name/picture
-            const baseContact = window.appState.getContacts().find(c => c.pubkey === pubkey);
-            contact = {
-                pubkey: pubkey,
-                name: baseContact?.name || pubkey.substring(0, 16) + '...',
-                lastMessage: '',
-                lastMessageTime: new Date(),
-                messageCount: 0,
-                picture_data_url: baseContact?.picture_data_url || null,
-                profileLoaded: !!baseContact
-            };
-            // Add to DM contacts and initialize empty messages
-            const currentDmContacts = window.appState.getDmContacts();
-            currentDmContacts.push(contact);
-            window.appState.setDmContacts(currentDmContacts);
-            window.appState.setDmMessages(pubkey, []);
-        }
-        
-        // Render the skeleton UI immediately
-        this.renderDmConversationSkeleton(contact);
-        
-        // Select the DM contact to show the conversation view (will fetch/load messages)
-        this.selectDmContact(contact);
-    }
-
-    // Render DM conversation skeleton (loading state)
-    renderDmConversationSkeleton(contact) {
+    // Handle message status updates (e.g., from backend)
+    async handleMessageStatusUpdate(messageId, status) {
         const dmMessages = window.domManager.get('dmMessages');
         if (!dmMessages) return;
-        
-        dmMessages.innerHTML = '';
 
-        // Header
-        const headerElement = document.createElement('div');
-        headerElement.className = 'conversation-header';
-        headerElement.innerHTML = `
-            <div class="conversation-contact-info">
-                <div class="conversation-contact-name">${contact ? contact.name : contact.pubkey}</div>
-                <div class="conversation-contact-pubkey">${contact.pubkey}</div>
-            </div>
-        `;
-        dmMessages.appendChild(headerElement);
-
-        // Loading spinner for messages
-        const loadingElement = document.createElement('div');
-        loadingElement.className = 'messages-loading';
-        loadingElement.innerHTML = `
-            <div class="text-center text-muted" style="padding: 2rem;">
-                <i class="fas fa-sync fa-spin" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
-                <p>Loading messages...</p>
-            </div>
-        `;
-        dmMessages.appendChild(loadingElement);
-
-        // Message input at the bottom
-        const messageInputContainer = document.createElement('div');
-        messageInputContainer.className = 'dm-message-input-container';
-        messageInputContainer.innerHTML = `
-            <div class="dm-message-input-wrapper">
-                <input type="text" id="dm-reply-input" class="dm-message-input" placeholder="Type your message..." maxlength="1000">
-                <button id="dm-send-btn" class="dm-send-btn">
-                    <i class="fas fa-paper-plane"></i>
-                </button>
-            </div>
-        `;
-        dmMessages.appendChild(messageInputContainer);
-
-        // Add event listeners for the new input elements
-        const replyInput = document.getElementById('dm-reply-input');
-        const sendBtn = document.getElementById('dm-send-btn');
-        
-        if (replyInput && sendBtn) {
-            // Send message on Enter key
-            replyInput.addEventListener('keypress', (e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    this.sendReplyMessage(contact.pubkey);
-                }
-            });
-            
-            // Send message on button click
-            sendBtn.addEventListener('click', () => {
-                this.sendReplyMessage(contact.pubkey);
-            });
-            
-            // Focus the input
-            setTimeout(() => {
-                replyInput.focus();
-            }, 100);
+        const messageElement = dmMessages.querySelector(`.message[data-message-id="${messageId}"]`);
+        if (messageElement) {
+            const statusIcon = messageElement.querySelector('.message-status');
+            if (statusIcon) {
+                statusIcon.className = `fas fa-${status} message-status`;
+            }
         }
+    }
+
+    // Handle conversation status updates (e.g., from backend)
+    async handleConversationStatusUpdate(contactPubkey, status) {
+        const dmContacts = window.domManager.get('dmContacts');
+        if (!dmContacts) return;
+
+        const contactElement = dmContacts.querySelector(`.dm-contact-item[data-pubkey="${contactPubkey}"]`);
+        if (contactElement) {
+            const statusIcon = contactElement.querySelector('.dm-message-count');
+            if (statusIcon) {
+                statusIcon.className = `dm-message-count ${status}`;
+            }
+        }
+    }
+
+    // Handle conversation deletion (e.g., from backend)
+    async handleConversationDeletion(contactPubkey) {
+        const dmContacts = window.domManager.get('dmContacts');
+        if (!dmContacts) return;
+
+        const contactElement = dmContacts.querySelector(`.dm-contact-item[data-pubkey="${contactPubkey}"]`);
+        if (contactElement) {
+            contactElement.remove();
+        }
+        window.appState.removeDmContact(contactPubkey);
+        console.log(`[JS] Conversation with ${contactPubkey} deleted from UI`);
+        }
+        
+    // Handle new conversation (e.g., from backend)
+    async handleNewConversation(conversation) {
+        const dmContacts = window.domManager.get('dmContacts');
+        if (!dmContacts) return;
+
+        const contact = window.appState.getDmContacts().find(c => c.pubkey === conversation.contact_pubkey);
+        if (!contact) {
+            // If contact is not in the current list, add it
+            const newContact = {
+                pubkey: conversation.contact_pubkey,
+                name: conversation.contact_name,
+                lastMessage: conversation.last_message,
+                lastMessageTime: new Date(conversation.last_message_time),
+                messageCount: conversation.message_count,
+                picture_data_url: null, // Will be loaded later
+                profileLoaded: false
+            };
+            window.appState.addDmContact(newContact);
+            this.renderDmContacts(); // Re-render to show new contact
+        } else {
+            // If contact is already in the list, update its last message and time
+            contact.lastMessage = conversation.last_message;
+            contact.lastMessageTime = new Date(conversation.last_message_time);
+            contact.messageCount = conversation.message_count;
+            window.appState.setDmContacts(window.appState.getDmContacts()); // Force re-render
+        }
+        console.log(`[JS] New conversation with ${conversation.contact_pubkey} added to UI`);
+    }
+
+    // Handle conversation update (e.g., from backend)
+    async handleConversationUpdate(conversation) {
+        const dmContacts = window.domManager.get('dmContacts');
+        if (!dmContacts) return;
+
+        const contact = window.appState.getDmContacts().find(c => c.pubkey === conversation.contact_pubkey);
+        if (contact) {
+            contact.name = conversation.contact_name;
+            contact.picture = conversation.picture;
+            contact.profileLoaded = true;
+            window.appState.setDmContacts(window.appState.getDmContacts()); // Force re-render
+        }
+        console.log(`[JS] Conversation with ${conversation.contact_pubkey} updated in UI`);
+    }
+
+    // Handle conversation profile update (e.g., from backend)
+    async handleConversationProfileUpdate(profile) {
+        const dmContacts = window.domManager.get('dmContacts');
+        if (!dmContacts) return;
+
+        const contact = window.appState.getDmContacts().find(c => c.pubkey === profile.pubkey);
+        if (contact) {
+            contact.name = profile.fields.name || profile.fields.display_name || contact.pubkey.substring(0, 16) + '...';
+            contact.picture = profile.fields.picture || null;
+            contact.profileLoaded = true;
+            window.appState.setDmContacts(window.appState.getDmContacts()); // Force re-render
+        }
+        console.log(`[JS] Conversation profile with ${profile.pubkey} updated in UI`);
+    }
+
+    // Handle conversation deletion (e.g., from backend)
+    async handleConversationDeletion(contactPubkey) {
+        const dmContacts = window.domManager.get('dmContacts');
+        if (!dmContacts) return;
+
+        const contactElement = dmContacts.querySelector(`.dm-contact-item[data-pubkey="${contactPubkey}"]`);
+        if (contactElement) {
+            contactElement.remove();
+        }
+        window.appState.removeDmContact(contactPubkey);
+        console.log(`[JS] Conversation with ${contactPubkey} deleted from UI`);
+    }
+
+    // Handle new conversation (e.g., from backend)
+    async handleNewConversation(conversation) {
+        const dmContacts = window.domManager.get('dmContacts');
+        if (!dmContacts) return;
+
+        const contact = window.appState.getDmContacts().find(c => c.pubkey === conversation.contact_pubkey);
+        if (!contact) {
+            // If contact is not in the current list, add it
+            const newContact = {
+                pubkey: conversation.contact_pubkey,
+                name: conversation.contact_name,
+                lastMessage: conversation.last_message,
+                lastMessageTime: new Date(conversation.last_message_time),
+                messageCount: conversation.message_count,
+                picture_data_url: null, // Will be loaded later
+                profileLoaded: false
+            };
+            window.appState.addDmContact(newContact);
+            this.renderDmContacts(); // Re-render to show new contact
+        } else {
+            // If contact is already in the list, update its last message and time
+            contact.lastMessage = conversation.last_message;
+            contact.lastMessageTime = new Date(conversation.last_message_time);
+            contact.messageCount = conversation.message_count;
+            window.appState.setDmContacts(window.appState.getDmContacts()); // Force re-render
+        }
+        console.log(`[JS] New conversation with ${conversation.contact_pubkey} added to UI`);
+    }
+
+    // Handle conversation update (e.g., from backend)
+    async handleConversationUpdate(conversation) {
+        const dmContacts = window.domManager.get('dmContacts');
+        if (!dmContacts) return;
+
+        const contact = window.appState.getDmContacts().find(c => c.pubkey === conversation.contact_pubkey);
+        if (contact) {
+            contact.name = conversation.contact_name;
+            contact.picture = conversation.picture;
+            contact.profileLoaded = true;
+            window.appState.setDmContacts(window.appState.getDmContacts()); // Force re-render
+        }
+        console.log(`[JS] Conversation with ${conversation.contact_pubkey} updated in UI`);
+    }
+
+    // Handle conversation profile update (e.g., from backend)
+    async handleConversationProfileUpdate(profile) {
+            const dmContacts = window.domManager.get('dmContacts');
+        if (!dmContacts) return;
+
+        const contact = window.appState.getDmContacts().find(c => c.pubkey === profile.pubkey);
+        if (contact) {
+            contact.name = profile.fields.name || profile.fields.display_name || contact.pubkey.substring(0, 16) + '...';
+            contact.picture = profile.fields.picture || null;
+            contact.profileLoaded = true;
+            window.appState.setDmContacts(window.appState.getDmContacts()); // Force re-render
+        }
+        console.log(`[JS] Conversation profile with ${profile.pubkey} updated in UI`);
     }
 
     // Refresh DM conversations
     async refreshDmConversations() {
         console.log('[JS] Refreshing DM conversations...');
-        
+        // Show loading notification
+        window.notificationService.showInfo('Syncing DMs from network...');
+        try {
+            // Sync DMs from network to database
+            const privateKey = window.appState.getKeypair()?.private_key;
+            const relays = window.appState.getActiveRelays();
+            if (!privateKey) {
+                window.notificationService.showError('No private key available for DM sync');
+                return;
+            }
+            if (!relays || relays.length === 0) {
+                window.notificationService.showError('No active relays configured');
+                return;
+            }
+            await window.__TAURI__.core.invoke('sync_direct_messages_with_network', {
+                privateKey,
+                relays
+            });
+            window.notificationService.showSuccess('DMs synced from network');
+        } catch (error) {
+            console.error('Failed to sync DMs from network:', error);
+            window.notificationService.showError('Failed to sync DMs from network');
+        }
         // Clear DM cache from backend storage
         try {
             await window.TauriService.setConversations([]);
@@ -844,13 +729,11 @@ class DMService {
         } catch (e) {
             console.warn('Failed to clear DM conversations from backend storage:', e);
         }
-        
         try {
             // Clear current conversations
             window.appState.setDmContacts([]);
             window.appState.setDmMessages({});
             window.appState.setSelectedDmContact(null);
-            
             // Clear the UI
             const dmContacts = window.domManager.get('dmContacts');
             if (dmContacts) {
@@ -865,22 +748,67 @@ class DMService {
                     </div>
                 `;
             }
-            
             // Reload conversations
             await this.loadDmContacts();
-            
             window.notificationService.showSuccess('Conversations refreshed');
-            
         } catch (error) {
             console.error('Failed to refresh DM conversations:', error);
             window.notificationService.showError('Failed to refresh conversations');
         }
     }
+
+    // Send direct message to contact from contacts page
+    sendDirectMessageToContact(pubkey) {
+        // Switch to the DM tab
+        const dmTab = document.querySelector('[data-tab="dm"]');
+        if (dmTab) {
+            dmTab.click();
+        }
+        // Find the contact in main contacts list
+        const contact = window.appState.getContacts().find(c => c.pubkey === pubkey);
+        const myPubkey = window.appState.getKeypair()?.public_key;
+        if (!contact && pubkey !== myPubkey) {
+            window.notificationService.showError('Contact not found');
+            return;
+        }
+        // Special case: DM to self
+        if (pubkey === myPubkey) {
+            console.log('[DM DEBUG] Starting DM to self');
+            // Add to DM contacts if not already present
+            if (!window.appState.getDmContacts().find(c => c.pubkey === pubkey)) {
+                window.appState.addDmContact({
+                    pubkey: myPubkey,
+                    name: 'Myself',
+                    lastMessage: '',
+                    lastMessageTime: new Date(),
+                    messageCount: 0,
+                    picture_data_url: null,
+                    profileLoaded: true
+                });
+            }
+            const dmContact = window.appState.getDmContacts().find(c => c.pubkey === pubkey);
+            window.appState.setSelectedDmContact(dmContact);
+            this.loadDmMessages(pubkey);
+            return;
+        }
+        // Add to DM contacts if not already present
+        if (!window.appState.getDmContacts().find(c => c.pubkey === pubkey)) {
+            window.appState.addDmContact({
+                pubkey: contact.pubkey,
+                name: contact.name,
+                lastMessage: '',
+                lastMessageTime: new Date(),
+                messageCount: 0,
+                picture_data_url: contact.picture_data_url || null,
+                profileLoaded: true
+            });
+        }
+        // Select the DM contact and load messages
+        const dmContact = window.appState.getDmContacts().find(c => c.pubkey === pubkey) || contact;
+        window.appState.setSelectedDmContact(dmContact);
+        this.loadDmMessages(pubkey);
+    }
 }
 
-// Create and export a singleton instance
-window.DMService = DMService;
+// Export the service to window
 window.dmService = new DMService();
-
-// Make it available globally for other services to access
-window.dmService = dmService; 

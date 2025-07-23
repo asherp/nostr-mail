@@ -2094,15 +2094,15 @@ body.dark-mode .follow-btn:hover:not(:disabled) {
     display: flex;
     flex-direction: row;
     align-items: flex-start;
-    gap: 32px;
+    gap: 12px;
     width: 100%;
     max-width: 900px;
-    margin: 40px auto 0 auto;
-    padding: 32px 32px 24px 32px;
-    background: rgba(255,255,255,0.04);
-    border: 1.5px solid var(--border-color, #232946);
-    border-radius: 18px;
-    box-shadow: 0 6px 32px rgba(0,0,0,0.10);
+    margin: 10px auto 0 auto;
+    padding: 8px 0 8px 0;
+    background: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
 }
 
 .profile-picture {
@@ -2121,24 +2121,25 @@ body.dark-mode .follow-btn:hover:not(:disabled) {
 .profile-fields-list {
     width: 100%;
     min-width: 0;
-    max-width: 100%;
+    max-width: 700px; /* Increased from 100% to 700px for wider fields */
     display: flex;
     flex-direction: column;
     gap: 0;
+    align-self: center; /* Center the list in the form */
 }
 
 .profile-field-item {
     display: flex;
     align-items: center;
-    margin-bottom: 20px;
-    padding: 0 0 8px 0;
+    margin-bottom: 8px;
+    padding: 0 0 2px 0;
     background: none;
     border: none;
     border-bottom: 1px solid var(--border-color);
     border-radius: 0;
     box-shadow: none;
     position: relative;
-    min-height: 44px;
+    min-height: 36px;
 }
 
 .profile-field-item label {
@@ -2157,6 +2158,7 @@ body.dark-mode .follow-btn:hover:not(:disabled) {
 .profile-field-input {
     flex: 1 1 0%;
     width: 100%;
+    max-width: 650px; /* Added max-width for wider input fields */
     font-size: 1rem;
     padding: 10px 14px;
     border-radius: 6px;
@@ -2187,11 +2189,11 @@ body.dark-mode .profile-field-input {
 }
 
 .form-actions {
-    margin-top: 32px;
-    padding-top: 18px;
+    margin-top: 12px;
+    padding-top: 6px;
     border-top: 1px solid #e0e0e0;
     display: flex;
-    gap: 16px;
+    gap: 8px;
 }
 
 @media (max-width: 900px) {

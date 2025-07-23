@@ -141,8 +141,8 @@ const TauriService = {
     getDbRelays: async function() {
         return await this.invoke('db_get_all_relays');
     },
-    generateQrCode: async function(data, size = 200) {
-        return await this.invoke('generate_qr_code', { data, size });
+    generateQrCode: async function(data) {
+        return await this.invoke('generate_qr_code', { data });
     },
     fetchNostrEmailsLast24h: async function(emailConfig) {
         return await this.invoke('fetch_nostr_emails_last_24h', { emailConfig });

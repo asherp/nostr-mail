@@ -15,6 +15,7 @@ use std::time::Duration;
 use crate::types::EmailMessage;
 use std::net::TcpStream;
 use native_tls::TlsConnector;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 struct XNostrPubkey(String);
@@ -414,7 +415,7 @@ pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
 
 /// Fetch up to 100 emails from the last 24 hours that have the X-Nostr-Pubkey header
 pub async fn fetch_nostr_emails_last_24h(config: &EmailConfig) -> Result<Vec<EmailMessage>> {
-    use chrono::{Duration, Utc};
+    use chrono::Duration;
     let host = &config.imap_host;
     let port = config.imap_port;
     let username = &config.email_address;
@@ -604,7 +605,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                     println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} is confirmed as Nostr email", email_id);
                     
                     // Try to decrypt the email content
-                    let (final_subject, final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
+                    let (_final_subject, _final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
                         Ok((dec_subject, dec_body)) => {
                             println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} decryption completed", email_id);
                             (dec_subject, dec_body)
@@ -661,10 +662,10 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
     }
     let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
     let mut emails = Vec::new();
-    let mut email_id = 0;
+    let mut _email_id = 0;
     let cutoff = Utc::now() - Duration::hours(24);
     for message in messages.iter() {
-        email_id += 1;
+        _email_id += 1;
         if let Some(body) = message.body() {
             if let Ok(email) = parse_mail(body) {
                 let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
@@ -690,14 +691,14 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                 let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
                 
                 // Check if this is a Nostr email and try to decrypt it
-                let (final_subject, final_body) = if raw_headers.contains("X-Nostr-Pubkey:") {
+                let (_final_subject, _final_body) = if raw_headers.contains("X-Nostr-Pubkey:") {
                     match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
                         Ok((dec_subject, dec_body)) => {
-                            println!("[RUST] fetch_emails_from_session_last_24h: Email {} decryption completed", email_id);
+                            println!("[RUST] fetch_emails_from_session_last_24h: Email {} decryption completed", _email_id);
                             (dec_subject, dec_body)
                         }
                         Err(e) => {
-                            println!("[RUST] fetch_emails_from_session_last_24h: Email {} decryption failed: {}, using original content", email_id, e);
+                            println!("[RUST] fetch_emails_from_session_last_24h: Email {} decryption failed: {}, using original content", _email_id, e);
                             (subject.clone(), body_text.clone())
                         }
                     }
@@ -706,12 +707,12 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                 };
                 
                 let email_message = EmailMessage {
-                    id: email_id.to_string(),
+                    id: _email_id.to_string(),
                     from,
                     to,
-                    subject: final_subject,
-                    body: final_body.clone(),
-                    raw_body: final_body.clone(),
+                    subject: _final_subject,
+                    body: _final_body.clone(),
+                    raw_body: _final_body.clone(),
                     date,
                     is_read: true,
                     raw_headers: raw_headers.clone(),
@@ -850,7 +851,7 @@ mod tests {
 
 pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database::Database) -> Result<Vec<EmailMessage>> {
     use chrono::{Utc, Duration};
-    use uuid::Uuid;
+    use crate::email::extract_nostr_pubkey_from_headers;
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -893,9 +894,9 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
             }
             let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
             let mut emails = Vec::new();
-            let mut email_id = 0;
+            let mut _email_id = 0;
             for message in messages.iter() {
-                email_id += 1;
+                _email_id += 1;
                 if let Some(body) = message.body() {
                     if let Ok(email) = parse_mail(body) {
                         let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
@@ -917,12 +918,12 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                         let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
                         // Only keep Nostr emails
                         if raw_headers.contains("X-Nostr-Pubkey:") {
-                            let (final_subject, final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
+                            let (_final_subject, _final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
                                 Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
                                 Err(_) => (subject.clone(), body_text.clone()),
                             };
                             let email_message = EmailMessage {
-                                id: email_id.to_string(),
+                                id: _email_id.to_string(),
                                 from,
                                 to,
                                 subject,
@@ -966,9 +967,9 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
             }
             let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
             let mut emails = Vec::new();
-            let mut email_id = 0;
+            let mut _email_id = 0;
             for message in messages.iter() {
-                email_id += 1;
+                _email_id += 1;
                 if let Some(body) = message.body() {
                     if let Ok(email) = parse_mail(body) {
                         let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
@@ -989,12 +990,12 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                         };
                         let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
                         if raw_headers.contains("X-Nostr-Pubkey:") {
-                            let (final_subject, final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
+                            let (_final_subject, _final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
                                 Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
                                 Err(_) => (subject.clone(), body_text.clone()),
                             };
                             let email_message = EmailMessage {
-                                id: email_id.to_string(),
+                                id: _email_id.to_string(),
                                 from,
                                 to,
                                 subject,
@@ -1066,9 +1067,7 @@ pub struct RawNostrEmail {
 async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<Vec<RawNostrEmail>> {
     use chrono::{Utc, Duration};
     use mailparse::parse_mail;
-    use uuid::Uuid;
     use crate::email::extract_nostr_pubkey_from_headers;
-    use std::collections::HashSet;
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -1119,9 +1118,9 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
             }
             let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
             let mut emails = Vec::new();
-            let mut email_id = 0;
+            let mut _email_id = 0;
             for message in messages.iter() {
-                email_id += 1;
+                _email_id += 1;
                 if let Some(body) = message.body() {
                     if let Ok(email) = parse_mail(body) {
                         let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
@@ -1200,9 +1199,9 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
             }
             let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
             let mut emails = Vec::new();
-            let mut email_id = 0;
+            let mut _email_id = 0;
             for message in messages.iter() {
-                email_id += 1;
+                _email_id += 1;
                 if let Some(body) = message.body() {
                     if let Ok(email) = parse_mail(body) {
                         let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());

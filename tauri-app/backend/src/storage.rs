@@ -100,7 +100,7 @@ pub struct Relay {
 }
 
 pub struct Storage {
-    data_dir: PathBuf,
+    _data_dir: PathBuf,
     data_file: PathBuf,
 }
 
@@ -114,7 +114,7 @@ impl Storage {
             fs::create_dir_all(&data_dir)?;
         }
         
-        Ok(Self { data_dir, data_file })
+        Ok(Self { _data_dir: data_dir, data_file })
     }
     
     fn get_data_dir() -> Result<PathBuf> {

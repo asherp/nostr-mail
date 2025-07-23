@@ -42,7 +42,6 @@ pub struct DirectMessage {
     pub sender_pubkey: String,
     pub recipient_pubkey: String,
     pub content: String,
-    pub decrypted_content: String,
     pub created_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
 }
@@ -127,7 +126,6 @@ impl Database {
                 sender_pubkey TEXT NOT NULL,
                 recipient_pubkey TEXT NOT NULL,
                 content TEXT NOT NULL,
-                decrypted_content TEXT NOT NULL,
                 created_at DATETIME NOT NULL,
                 received_at DATETIME NOT NULL
             )",
@@ -380,31 +378,55 @@ impl Database {
             conn.execute(
                 "UPDATE direct_messages SET 
                     event_id = ?, sender_pubkey = ?, recipient_pubkey = ?, content = ?, 
-                    decrypted_content = ?, created_at = ?, received_at = ?
+                    created_at = ?, received_at = ?
                 WHERE id = ?",
                 params![
                     dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.decrypted_content, dm.created_at, dm.received_at, id
+                    dm.created_at, dm.received_at, id
                 ],
             )?;
             Ok(id)
         } else {
             let _id = conn.execute(
-                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, decrypted_content, created_at, received_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at)
+                VALUES (?, ?, ?, ?, ?, ?)",
                 params![
                     dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.decrypted_content, dm.created_at, dm.received_at
+                    dm.created_at, dm.received_at
                 ],
             )?;
             Ok(conn.last_insert_rowid())
         }
     }
 
+    /// Save a batch of direct messages, skipping any that already exist by event_id
+    pub fn save_dm_batch(&self, dms: &[DirectMessage]) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut inserted = 0;
+        for dm in dms {
+            // Check if this event_id already exists
+            let mut stmt = conn.prepare("SELECT 1 FROM direct_messages WHERE event_id = ? LIMIT 1")?;
+            let mut rows = stmt.query(params![dm.event_id])?;
+            if rows.next()?.is_some() {
+                continue; // Skip if already exists
+            }
+            conn.execute(
+                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at)
+                VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
+                    dm.created_at, dm.received_at
+                ],
+            )?;
+            inserted += 1;
+        }
+        Ok(inserted)
+    }
+
     pub fn get_dms_for_conversation(&self, user_pubkey: &str, contact_pubkey: &str) -> Result<Vec<DirectMessage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, event_id, sender_pubkey, recipient_pubkey, content, decrypted_content, created_at, received_at
+            "SELECT id, event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at
              FROM direct_messages 
              WHERE (sender_pubkey = ? AND recipient_pubkey = ?) OR (sender_pubkey = ? AND recipient_pubkey = ?)
              ORDER BY created_at ASC"
@@ -417,13 +439,26 @@ impl Database {
                 sender_pubkey: row.get(2)?,
                 recipient_pubkey: row.get(3)?,
                 content: row.get(4)?,
-                decrypted_content: row.get(5)?,
-                created_at: row.get(6)?,
-                received_at: row.get(7)?,
+                created_at: row.get(5)?,
+                received_at: row.get(6)?,
             })
         })?;
         
         rows.collect()
+    }
+
+    // Returns the latest created_at timestamp from direct_messages, or None if no messages exist
+    pub fn get_latest_dm_created_at(&self) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT created_at FROM direct_messages ORDER BY created_at DESC LIMIT 1"
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
     }
 
     // Settings operations
@@ -545,6 +580,44 @@ impl Database {
         )?;
         println!("[RUST] Rows affected by nostr_pubkey update: {}", rows);
         Ok(())
+    }
+
+    /// Get all unique pubkeys (npubs) that appear as sender or recipient in direct_messages, including the user's own pubkey
+    pub fn get_all_dm_pubkeys(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT sender_pubkey FROM direct_messages UNION SELECT recipient_pubkey FROM direct_messages"
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut set = std::collections::HashSet::new();
+        for row in rows {
+            let pk: String = row?;
+            if !pk.is_empty() {
+                set.insert(pk);
+            }
+        }
+        Ok(set.into_iter().collect())
+    }
+
+    pub fn get_all_dm_pubkeys_sorted(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pubkey
+             FROM (
+               SELECT sender_pubkey as pubkey, created_at FROM direct_messages
+               UNION ALL
+               SELECT recipient_pubkey as pubkey, created_at FROM direct_messages
+             )
+             WHERE pubkey != ''
+             GROUP BY pubkey
+             ORDER BY MAX(created_at) DESC"
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut pubkeys = Vec::new();
+        for row in rows {
+            pubkeys.push(row?);
+        }
+        Ok(pubkeys)
     }
 
     // Utility operations

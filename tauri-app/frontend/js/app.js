@@ -266,6 +266,37 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (emailProvider) {
             emailProvider.addEventListener('change', () => emailService.handleEmailProviderChange());
         }
+        // Toggle private key visibility (eye button)
+        const toggleNprivVisibilityBtn = domManager.get('toggleNprivVisibilityBtn');
+        const nprivKeyInput = domManager.get('nprivKey');
+        if (toggleNprivVisibilityBtn && nprivKeyInput) {
+            toggleNprivVisibilityBtn.addEventListener('click', () => {
+                if (nprivKeyInput.type === 'password') {
+                    nprivKeyInput.type = 'text';
+                    toggleNprivVisibilityBtn.title = 'Hide private key';
+                } else {
+                    nprivKeyInput.type = 'password';
+                    toggleNprivVisibilityBtn.title = 'Show private key';
+                }
+            });
+        }
+        // Copy private key to clipboard (copy button)
+        const copyNprivBtn = domManager.get('copyNprivBtn');
+        if (copyNprivBtn && nprivKeyInput) {
+            copyNprivBtn.addEventListener('click', () => {
+                const value = nprivKeyInput.value;
+                if (!value) return;
+                navigator.clipboard.writeText(value)
+                    .then(() => notificationService.showSuccess('Private key copied to clipboard'))
+                    .catch(() => notificationService.showError('Failed to copy private key'));
+            });
+        }
+        // Instantly update npub as npriv changes
+        if (nprivKeyInput) {
+            nprivKeyInput.addEventListener('input', () => {
+                this.updatePublicKeyDisplay();
+            });
+        }
         
         // Dark mode toggle
         const darkToggle = document.getElementById('dark-mode-toggle');
@@ -358,6 +389,36 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 // Fallback: download as file
                 Utils.downloadAsFile(npubs, filename);
                 notificationService.showSuccess('Exported all contact npubs as a file!');
+            });
+        }
+        
+        // Copy public key to clipboard (copy button)
+        const copyPubkeyBtn = domManager.get('copyPubkeyBtn');
+        const publicKeyDisplayInput = domManager.get('publicKeyDisplay');
+        if (copyPubkeyBtn && publicKeyDisplayInput) {
+            copyPubkeyBtn.addEventListener('click', () => {
+                const value = publicKeyDisplayInput.value;
+                if (!value) return;
+                navigator.clipboard.writeText(value)
+                    .then(() => notificationService.showSuccess('Public key copied to clipboard'))
+                    .catch(() => notificationService.showError('Failed to copy public key'));
+            });
+        }
+        
+        // Generate new keypair button
+        const generateKeyBtn = domManager.get('generateKeyBtn');
+        if (generateKeyBtn) {
+            generateKeyBtn.addEventListener('click', async () => {
+                try {
+                    const keypair = await TauriService.generateKeypair();
+                    appState.setKeypair(keypair);
+                    localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
+                    domManager.setValue('nprivKey', keypair.private_key);
+                    await app.updatePublicKeyDisplay();
+                    notificationService.showSuccess('New keypair generated!');
+                } catch (error) {
+                    notificationService.showError('Failed to generate keypair: ' + error);
+                }
             });
         }
         
@@ -500,7 +561,8 @@ NostrMailApp.prototype.saveSettings = async function() {
     }
 }
 
-NostrMailApp.prototype.populateSettingsForm = function() {
+NostrMailApp.prototype.populateSettingsForm = async function() {
+    console.log('[QR] populateSettingsForm called');
     const settings = appState.getSettings();
     if (!settings) return;
     
@@ -522,9 +584,59 @@ NostrMailApp.prototype.populateSettingsForm = function() {
         }
         
         // Update public key display if npriv is available
-        this.updatePublicKeyDisplay();
+        await this.updatePublicKeyDisplay();
+        this.setupQrCodeEventListeners();
     } catch (error) {
         console.error('Error populating settings form:', error);
+    }
+}
+
+NostrMailApp.prototype.setupQrCodeEventListeners = function() {
+    console.log('[QR] setupQrCodeEventListeners called');
+    const nprivKeyInput = domManager.get('nprivKey');
+    const publicKeyDisplayInput = domManager.get('publicKeyDisplay');
+    let qrNprivBtn = domManager.get('qrNprivBtn');
+    let qrNpubBtn = domManager.get('qrNpubBtn');
+
+    if (qrNprivBtn && nprivKeyInput) {
+        const newQrNprivBtn = qrNprivBtn.cloneNode(true);
+        qrNprivBtn.parentNode.replaceChild(newQrNprivBtn, qrNprivBtn);
+        newQrNprivBtn.addEventListener('click', async () => {
+            const value = nprivKeyInput.value;
+            console.log('[QR] Private key QR button clicked. Value:', value);
+            if (!value) return;
+            try {
+                const dataUrl = await TauriService.generateQrCode(value);
+                showQrModal('Private Key QR Code', dataUrl, value);
+            } catch (err) {
+                notificationService.showError('Failed to generate QR code');
+            }
+        });
+    }
+    qrNprivBtn = domManager.get('qrNprivBtn'); // update reference in case replaced
+    if (qrNpubBtn && publicKeyDisplayInput) {
+        const newQrNpubBtn = qrNpubBtn.cloneNode(true);
+        qrNpubBtn.parentNode.replaceChild(newQrNpubBtn, qrNpubBtn);
+        newQrNpubBtn.addEventListener('click', async () => {
+            const value = publicKeyDisplayInput.value;
+            console.log('[QR] Public key QR button clicked. Value:', value);
+            if (!value) return;
+            try {
+                const dataUrl = await TauriService.generateQrCode(value);
+                showQrModal('Public Key QR Code', dataUrl, value);
+            } catch (err) {
+                notificationService.showError('Failed to generate QR code');
+            }
+        });
+    }
+    function showQrModal(title, dataUrl, value) {
+        const modalContent = `
+            <div style="text-align:center;">
+                <img src="${dataUrl}" alt="QR Code" style="max-width:220px;max-height:220px;" />
+                <p style="word-break:break-all;margin-top:10px;">${value}</p>
+            </div>
+        `;
+        window.app.showModal(title, modalContent);
     }
 }
 
@@ -769,7 +881,9 @@ NostrMailApp.prototype.editableProfileFields = {};
 
 NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPictureDataUrl) {
     // Build editable fields from profile.fields, always include email
+    // Ensure all fields from the profile are included, even if not in standard order
     this.editableProfileFields = { ...(profile && profile.fields ? profile.fields : {}) };
+    // Optionally, always include email if missing
     if (!('email' in this.editableProfileFields)) {
         this.editableProfileFields.email = '';
     }
@@ -800,58 +914,80 @@ NostrMailApp.prototype.renderProfileFieldsList = function(fields) {
         listDiv.innerHTML = '<div class="text-muted">No fields found.</div>';
         return;
     }
-    
-    for (const [key, value] of Object.entries(fields)) {
-        const fieldDiv = document.createElement('div');
-        fieldDiv.className = 'form-group profile-field-item';
-        
-        const label = document.createElement('label');
-        label.textContent = key.charAt(0).toUpperCase() + key.slice(1) + ':';
-        label.setAttribute('for', `profile-field-${key}`);
-        
-        let input;
-        if (key === 'about') {
-            input = document.createElement('textarea');
-            input.rows = 3;
-        } else if (key === 'picture') {
-            input = document.createElement('input');
-            input.type = 'url';
-            input.placeholder = 'https://example.com/avatar.png';
-        } else if (typeof value === 'string' && value.length > 60) {
-            input = document.createElement('textarea');
-            input.rows = 3;
-        } else {
-            input = document.createElement('input');
-            input.type = key === 'email' ? 'email' : 'text';
+
+    // Define the standard order
+    const standardOrder = [
+        'name',
+        'display_name',
+        'email',
+        'about',
+        'picture',
+        'banner',
+        'lud16',
+        'nip05',
+    ];
+
+    // Render standard fields in order if present
+    for (const key of standardOrder) {
+        if (fields.hasOwnProperty(key)) {
+            this._renderProfileFieldItem(listDiv, key, fields[key]);
         }
-        
-        input.id = `profile-field-${key}`;
-        input.value = value ?? '';
-        input.dataset.key = key;
-        input.className = 'profile-field-input';
-        input.addEventListener('input', (e) => {
-            this.editableProfileFields[key] = e.target.value;
-        });
-        
-        fieldDiv.appendChild(label);
-        fieldDiv.appendChild(input);
-        
-        // Remove button for custom fields (not for standard ones)
-        if (!['display_name','about','email','nip05','picture','banner','lud16','name'].includes(key)) {
-            const removeBtn = document.createElement('button');
-            removeBtn.type = 'button';
-            removeBtn.className = 'btn btn-danger btn-small';
-            removeBtn.innerHTML = '<i class="fas fa-trash"></i>';
-            removeBtn.title = 'Remove field';
-            removeBtn.addEventListener('click', () => {
-                delete this.editableProfileFields[key];
-                this.renderProfileFieldsList(this.editableProfileFields);
-            });
-            fieldDiv.appendChild(removeBtn);
-        }
-        
-        listDiv.appendChild(fieldDiv);
     }
+
+    // Render custom fields (not in standardOrder), sorted alphabetically
+    const customKeys = Object.keys(fields)
+        .filter(key => !standardOrder.includes(key))
+        .sort();
+    for (const key of customKeys) {
+        this._renderProfileFieldItem(listDiv, key, fields[key]);
+    }
+}
+
+// Helper to render a single field item
+NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value) {
+    const fieldDiv = document.createElement('div');
+    fieldDiv.className = 'form-group profile-field-item';
+    const label = document.createElement('label');
+    label.textContent = key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, ' ') + ':';
+    label.setAttribute('for', `profile-field-${key}`);
+    let input;
+    if (key === 'about') {
+        input = document.createElement('textarea');
+        input.rows = 3;
+    } else if (key === 'picture') {
+        input = document.createElement('input');
+        input.type = 'url';
+        input.placeholder = 'https://example.com/avatar.png';
+    } else if (typeof value === 'string' && value.length > 60) {
+        input = document.createElement('textarea');
+        input.rows = 3;
+    } else {
+        input = document.createElement('input');
+        input.type = key === 'email' ? 'email' : 'text';
+    }
+    input.id = `profile-field-${key}`;
+    input.value = value ?? '';
+    input.dataset.key = key;
+    input.className = 'profile-field-input';
+    input.addEventListener('input', (e) => {
+        this.editableProfileFields[key] = e.target.value;
+    });
+    fieldDiv.appendChild(label);
+    fieldDiv.appendChild(input);
+    // Remove button for custom fields (not for standard ones)
+    if (!['display_name','about','email','nip05','picture','banner','lud16','name'].includes(key)) {
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'btn btn-danger btn-small';
+        removeBtn.innerHTML = '<i class="fas fa-trash"></i>';
+        removeBtn.title = 'Remove field';
+        removeBtn.addEventListener('click', () => {
+            delete this.editableProfileFields[key];
+            this.renderProfileFieldsList(this.editableProfileFields);
+        });
+        fieldDiv.appendChild(removeBtn);
+    }
+    listDiv.appendChild(fieldDiv);
 }
 
 // Add new profile field
@@ -926,7 +1062,7 @@ NostrMailApp.prototype.updateProfile = async function() {
     }
 }
 
-NostrMailApp.prototype.updatePublicKeyDisplay = function() {
+NostrMailApp.prototype.updatePublicKeyDisplay = async function() {
     const nprivKey = domManager.getValue('nprivKey')?.trim() || '';
     
     if (!nprivKey) {
@@ -935,16 +1071,14 @@ NostrMailApp.prototype.updatePublicKeyDisplay = function() {
     }
     
     try {
-        // Validate the private key first
-        const isValid = TauriService.validatePrivateKey(nprivKey);
+        const isValid = await TauriService.validatePrivateKey(nprivKey);
         
         if (!isValid) {
             domManager.setValue('publicKeyDisplay', 'Invalid private key');
             return;
         }
         
-        // Get the public key from the private key
-        const publicKey = TauriService.getPublicKeyFromPrivate(nprivKey);
+        const publicKey = await TauriService.getPublicKeyFromPrivate(nprivKey);
         domManager.setValue('publicKeyDisplay', publicKey);
         
     } catch (error) {

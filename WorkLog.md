@@ -1,3 +1,4 @@
+* switch between profiles
 * fixed profile update button, jump to send dm
 * sqlite db
 * fetch nostr emails only, decrypt content

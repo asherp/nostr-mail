@@ -770,22 +770,27 @@ NostrMailApp.prototype.removeRelayById = async function(relayId, relayUrl) {
 }
 
 // Profile management
+// Track the last rendered profile pubkey
+NostrMailApp.prototype.lastRenderedProfilePubkey = null;
+
 NostrMailApp.prototype.loadProfile = async function() {
-    // Try to load cached profile first
-    let cachedProfile = null;
-    let cachedPictureDataUrl = null;
-    try {
-        const cached = localStorage.getItem('nostr_mail_profile');
-        if (cached) {
-            cachedProfile = JSON.parse(cached);
-            cachedPictureDataUrl = localStorage.getItem('nostr_mail_profile_picture');
-            this.renderProfileFromObject(cachedProfile, cachedPictureDataUrl);
+    const currentPubkey = appState.getKeypair() && appState.getKeypair().public_key;
+    // Always define these at the top so they are accessible throughout the function
+    const profileSpinner = document.getElementById('profile-loading-spinner');
+    const profileFieldsList = document.getElementById('profile-fields-list');
+    const profilePicture = document.getElementById('profile-picture');
+    if (this.lastRenderedProfilePubkey !== currentPubkey) {
+        if (profileFieldsList) profileFieldsList.innerHTML = '';
+        if (profilePicture) {
+            // Show placeholder avatar
+            profilePicture.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
+            profilePicture.style.display = '';
         }
-    } catch (e) {
-        console.warn('Failed to load cached profile:', e);
+        if (profileSpinner) profileSpinner.style.display = '';
     }
 
     if (!appState.hasKeypair() || !appState.getKeypair().public_key) {
+        if (profileSpinner) profileSpinner.style.display = 'none';
         console.log('No public key available to fetch profile.');
         this.renderProfilePubkey();
         if (Utils.isDevMode()) {
@@ -829,7 +834,6 @@ NostrMailApp.prototype.loadProfile = async function() {
                         this.renderProfileFromObject(profile, null);
                     }
                 } catch (e) {
-                    console.warn('Failed to cache profile picture:', e);
                     this.renderProfileFromObject(profile, null);
                 }
             } else {
@@ -837,7 +841,27 @@ NostrMailApp.prototype.loadProfile = async function() {
                 this.renderProfileFromObject(profile, null);
             }
             // Cache the profile in localStorage
-            localStorage.setItem('nostr_mail_profile', JSON.stringify(profile));
+            const pubkey = appState.getKeypair() && appState.getKeypair().public_key;
+            if (pubkey) {
+                let profileDict = {};
+                const cached = localStorage.getItem('nostr_mail_profiles');
+                if (cached) {
+                    profileDict = JSON.parse(cached);
+                }
+                profileDict[pubkey] = profile;
+                localStorage.setItem('nostr_mail_profiles', JSON.stringify(profileDict));
+            }
+            if (profileSpinner) profileSpinner.style.display = 'none';
+        } else {
+            if (profileSpinner) profileSpinner.style.display = 'none';
+            // Show placeholder fields and picture so the user can create a new profile
+            const emptyFields = {};
+            PROFILE_FIELD_ORDER.forEach(key => { emptyFields[key] = ''; });
+            const emptyProfile = {
+                pubkey: appState.getKeypair().public_key,
+                fields: emptyFields
+            };
+            this.renderProfileFromObject(emptyProfile, null);
         }
         this.renderProfilePubkey();
         if (Utils.isDevMode()) {
@@ -854,6 +878,7 @@ NostrMailApp.prototype.loadProfile = async function() {
             }
         }
     } catch (error) {
+        if (profileSpinner) profileSpinner.style.display = 'none';
         console.error('Failed to fetch profile:', error);
         notificationService.showError('Could not fetch profile from relays.');
         this.renderProfilePubkey();
@@ -865,6 +890,8 @@ NostrMailApp.prototype.loadProfile = async function() {
             }
         }
     }
+    // After rendering a profile (cached or fetched), update the last rendered pubkey
+    this.lastRenderedProfilePubkey = currentPubkey;
 }
 
 NostrMailApp.prototype.renderProfilePubkey = function() {
@@ -889,7 +916,37 @@ NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPicture
     }
     this.renderProfileFieldsList(this.editableProfileFields);
     
-    // Show profile picture if present
+    // Show warning if profile email and settings email differ
+    const settings = appState.getSettings();
+    const profileEmail = this.editableProfileFields.email || '';
+    const settingsEmail = settings && settings.email_address ? settings.email_address : '';
+    let warningDiv = document.getElementById('profile-email-warning');
+    if (!warningDiv) {
+        warningDiv = document.createElement('div');
+        warningDiv.id = 'profile-email-warning';
+        warningDiv.style.color = 'orange';
+        warningDiv.style.marginBottom = '8px';
+        const form = document.getElementById('profile-fields-form');
+        if (form) form.insertBefore(warningDiv, form.firstChild);
+    }
+    if (profileEmail && settingsEmail && profileEmail !== settingsEmail) {
+        warningDiv.innerHTML = `
+            <i class="fas fa-exclamation-triangle"></i>
+            The email in your profile does not match your settings email.<br>
+            <button id="sync-profile-email-btn" class="btn btn-warning btn-small" type="button" style="margin-top:4px;">
+                Copy settings email to profile
+            </button>
+        `;
+        document.getElementById('sync-profile-email-btn').onclick = () => {
+            this.editableProfileFields.email = settingsEmail;
+            this.renderProfileFieldsList(this.editableProfileFields);
+            warningDiv.innerHTML = '';
+        };
+    } else {
+        warningDiv.innerHTML = '';
+    }
+
+    // Show profile picture if present, otherwise show a placeholder
     const profilePicture = document.getElementById('profile-picture');
     if (profilePicture) {
         if (cachedPictureDataUrl) {
@@ -899,10 +956,39 @@ NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPicture
             profilePicture.src = this.editableProfileFields.picture;
             profilePicture.style.display = '';
         } else {
-            profilePicture.style.display = 'none';
+            // Use a default SVG avatar as a placeholder
+            profilePicture.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
+            profilePicture.style.display = '';
         }
     }
+
+    // Live preview: update profile picture as user types/pastes a new URL
+    const pictureInput = document.getElementById('profile-field-picture');
+    if (pictureInput && profilePicture) {
+        pictureInput.addEventListener('input', function() {
+            const url = pictureInput.value.trim();
+            if (url) {
+                profilePicture.src = url;
+                profilePicture.style.display = '';
+            } else {
+                profilePicture.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
+                profilePicture.style.display = '';
+            }
+        });
+    }
 }
+
+// Top-level constant for profile field order
+const PROFILE_FIELD_ORDER = [
+    'name',
+    'display_name',
+    'email',
+    'about',
+    'picture',
+    'banner',
+    'lud16',
+    'nip05',
+];
 
 NostrMailApp.prototype.renderProfileFieldsList = function(fields) {
     const listDiv = document.getElementById('profile-fields-list');
@@ -915,28 +1001,16 @@ NostrMailApp.prototype.renderProfileFieldsList = function(fields) {
         return;
     }
 
-    // Define the standard order
-    const standardOrder = [
-        'name',
-        'display_name',
-        'email',
-        'about',
-        'picture',
-        'banner',
-        'lud16',
-        'nip05',
-    ];
-
-    // Render standard fields in order if present
-    for (const key of standardOrder) {
+    // Use the top-level constant for field order
+    for (const key of PROFILE_FIELD_ORDER) {
         if (fields.hasOwnProperty(key)) {
             this._renderProfileFieldItem(listDiv, key, fields[key]);
         }
     }
 
-    // Render custom fields (not in standardOrder), sorted alphabetically
+    // Render custom fields (not in PROFILE_FIELD_ORDER), sorted alphabetically
     const customKeys = Object.keys(fields)
-        .filter(key => !standardOrder.includes(key))
+        .filter(key => !PROFILE_FIELD_ORDER.includes(key))
         .sort();
     for (const key of customKeys) {
         this._renderProfileFieldItem(listDiv, key, fields[key]);
@@ -1041,7 +1115,14 @@ NostrMailApp.prototype.updateProfile = async function() {
             pubkey: appState.getKeypair().public_key,
             fields: cleanedFields
         };
-        localStorage.setItem('nostr_mail_profile', JSON.stringify(updatedProfile));
+        const pubkey = updatedProfile.pubkey;
+        let profileDict = {};
+        const cached = localStorage.getItem('nostr_mail_profiles');
+        if (cached) {
+            profileDict = JSON.parse(cached);
+        }
+        profileDict[pubkey] = updatedProfile;
+        localStorage.setItem('nostr_mail_profiles', JSON.stringify(profileDict));
 
         // Update the editable fields
         this.editableProfileFields = { ...cleanedFields };

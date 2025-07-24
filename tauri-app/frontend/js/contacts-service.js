@@ -163,6 +163,13 @@ class ContactsService {
             }
 
             if (filteredContacts && filteredContacts.length > 0) {
+                // Sort: contacts with email first
+                filteredContacts.sort((a, b) => {
+                    const aHasEmail = !!(a.email && a.email.trim());
+                    const bHasEmail = !!(b.email && b.email.trim());
+                    if (aHasEmail === bHasEmail) return 0;
+                    return aHasEmail ? -1 : 1;
+                });
                 filteredContacts.forEach((contact, index) => {
                     const contactElement = document.createElement('div');
                     contactElement.className = 'contact-item';

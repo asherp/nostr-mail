@@ -48,8 +48,9 @@ class DMService {
             // 3. Always fetch contact info from the database
             const profile = await window.DatabaseService.getContact(contactPubkey);
             const name = profile?.name || contactPubkey.substring(0, 16) + '...';
-            // Use picture_data_url for avatars
+            // Use picture_data_url for avatars, fallback to picture_url or picture
             const picture_data_url = profile?.picture_data_url || null;
+            const picture = profile?.picture_url || profile?.picture || '';
             const profileLoaded = !!profile;
 
             dmContacts.push({
@@ -59,6 +60,7 @@ class DMService {
                 lastMessageTime,
                 messageCount: messages.length,
                 picture_data_url,
+                picture, // ensure this is set for avatar fallback
                 profileLoaded
             });
 
@@ -219,20 +221,30 @@ class DMService {
                     previewText = previewText.substring(0, 50) + '...';
                 }
                 
-                // Create avatar or use picture if available
-                let avatarHtml = '';
-                if (contact.picture_data_url) {
-                    // Use cached data URL for offline support
-                    avatarHtml = `<img src="${contact.picture_data_url}" alt="${contact.name}" class="contact-avatar" onerror="this.style.display='none'">`;
-                    console.log(`[JS] Using cached data URL for DM contact ${contact.name}`);
+                // --- Avatar fallback logic (copied from contacts-service.js) ---
+                const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+                let avatarSrc = defaultAvatar;
+                let avatarClass = 'contact-avatar';
+                const isValidDataUrl = contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
+                if (contact.picture_loading) {
+                    avatarClass += ' loading';
+                    console.log(`[DM AVATAR] ${contact.name}: picture_loading true, using default avatar.`);
+                } else if (isValidDataUrl) {
+                    avatarSrc = contact.picture_data_url;
+                    console.log(`[DM AVATAR] ${contact.name}: using picture_data_url.`);
+                } else if (contact.picture_data_url && !isValidDataUrl && contact.picture) {
+                    avatarSrc = contact.picture;
+                    console.log(`[DM AVATAR] ${contact.name}: invalid picture_data_url, falling back to picture (URL or fallback).`);
+                } else if (contact.picture) {
+                    avatarSrc = contact.picture;
+                    console.log(`[DM AVATAR] ${contact.name}: using picture (URL or fallback).`);
                 } else {
-                    // Use placeholder avatar - don't try to load from URL when offline
-                    avatarHtml = `<div class="contact-avatar-placeholder">${contact.name.charAt(0).toUpperCase()}</div>`;
-                    console.log(`[JS] Using placeholder avatar for DM contact ${contact.name} (no cached image available)`);
+                    console.log(`[DM AVATAR] ${contact.name}: using default avatar (no image available).`);
                 }
+                // --- End avatar fallback logic ---
                 
                 contactElement.innerHTML = `
-                    ${avatarHtml}
+                    <img class="${avatarClass}" src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
                     <div class="dm-contact-content">
                         <div class="dm-contact-header">
                             <div class="dm-contact-name">${contact.name}</div>
@@ -339,13 +351,34 @@ class DMService {
                     </div>
                 `;
             } else {
-                // Create conversation header
+                // --- Avatar fallback logic for conversation header ---
+                const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+                let avatarSrc = defaultAvatar;
+                let avatarClass = 'contact-avatar';
+                const isValidDataUrl = contact && contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
+                if (contact && contact.picture_loading) {
+                    avatarClass += ' loading';
+                    console.log(`[DM HEADER AVATAR] ${contact.name}: picture_loading true, using default avatar.`);
+                } else if (isValidDataUrl) {
+                    avatarSrc = contact.picture_data_url;
+                    console.log(`[DM HEADER AVATAR] ${contact.name}: using picture_data_url.`);
+                } else if (contact && contact.picture_data_url && !isValidDataUrl && contact.picture) {
+                    avatarSrc = contact.picture;
+                    console.log(`[DM HEADER AVATAR] ${contact.name}: invalid picture_data_url, falling back to picture (URL or fallback).`);
+                } else if (contact && contact.picture) {
+                    avatarSrc = contact.picture;
+                    console.log(`[DM HEADER AVATAR] ${contact.name}: using picture (URL or fallback).`);
+                } else {
+                    console.log(`[DM HEADER AVATAR] ${contact ? contact.name : contactPubkey}: using default avatar (no image available).`);
+                }
+                // --- End avatar fallback logic ---
                 const headerElement = document.createElement('div');
                 headerElement.className = 'conversation-header';
                 headerElement.innerHTML = `
-                    <div class="conversation-contact-info">
-                        <div class="conversation-contact-name">${contact ? contact.name : contactPubkey}</div>
-                        <div class="conversation-contact-pubkey">${contactPubkey}</div>
+                    <div class="conversation-contact-info" style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1.5rem 0 1rem 0;">
+                        <img class="${avatarClass}" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';" style="width: 64px; height: 64px; border-radius: 50%; margin-bottom: 1rem; object-fit: cover;">
+                        <div class="conversation-contact-name" style="font-size: 1.3rem; font-weight: bold; text-align: center;">${contact ? contact.name : contactPubkey}</div>
+                        <div class="conversation-contact-pubkey" style="font-size: 0.95rem; color: #aaa; text-align: center; margin-top: 0.2rem;">${contactPubkey}</div>
                     </div>
                 `;
                 dmMessages.appendChild(headerElement);
@@ -411,7 +444,9 @@ class DMService {
                 dmMessages.appendChild(messagesContainer);
                 
                 // Scroll to bottom to show the newest messages
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                setTimeout(() => {
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                }, 0);
             }
             
             // Add message input box at the bottom

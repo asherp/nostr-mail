@@ -1,3 +1,4 @@
+* fix render dm avatar
 * fix follow contact, jwt image rendering
 * fetch inbox emails for current user
 * switch between profiles

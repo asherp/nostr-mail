@@ -1,3 +1,6 @@
+// NOTE: For Tauri commands, do NOT use 'pub' (do not export with pub) on the function definitions.
+// Exporting Tauri commands with 'pub' can cause duplicate macro errors at compile time.
+// Only use 'async fn' or 'fn' without 'pub' for #[tauri::command] functions.
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -123,6 +126,12 @@ async fn fetch_profile(pubkey: String, relays: Vec<String>) -> Result<Option<Pro
         Ok(None)
     }
 }
+
+#[tauri::command]
+async fn fetch_nostr_following_pubkeys(pubkey: String, relays: Vec<String>) -> Result<Vec<String>, String> {
+    nostr::fetch_following_pubkeys(&pubkey, &relays).await.map_err(|e| e.to_string())
+}
+
 
 #[tauri::command]
 async fn fetch_following_profiles(private_key: String, relays: Vec<String>) -> Result<Vec<Profile>, String> {
@@ -551,6 +560,18 @@ fn db_find_pubkeys_by_email(email: String, state: tauri::State<AppState>) -> Res
     db.find_pubkeys_by_email(&email).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn db_filter_new_contacts(pubkeys: Vec<String>, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.get_database()?;
+    let existing: std::collections::HashSet<String> = db.get_all_contacts()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|c| c.pubkey)
+        .collect();
+    let new: Vec<String> = pubkeys.into_iter().filter(|pk| !existing.contains(pk)).collect();
+    Ok(new)
+}
+
 // Database commands for emails
 #[tauri::command]
 fn db_save_email(email: DbEmail, state: tauri::State<AppState>) -> Result<i64, String> {
@@ -933,6 +954,7 @@ pub fn run() {
         fetch_conversation_messages,
         fetch_profile,
         fetch_following_profiles,
+        fetch_nostr_following_pubkeys,
         get_relays,
         set_relays,
         decrypt_dm_content,
@@ -982,6 +1004,7 @@ pub fn run() {
         db_get_all_contacts,
         db_delete_contact,
         db_find_pubkeys_by_email,
+        db_filter_new_contacts,
         db_save_email,
         db_get_email,
         db_get_emails,

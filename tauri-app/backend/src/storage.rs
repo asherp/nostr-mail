@@ -208,6 +208,12 @@ impl Storage {
     }
     
     pub fn update_contact_picture_data_url(&self, pubkey: &str, picture_data_url: String) -> Result<()> {
+        // Only store if valid image data URL
+        let is_valid = picture_data_url.starts_with("data:image") && picture_data_url != "data:application/octet-stream;base64," && !picture_data_url.trim().is_empty();
+        if !is_valid {
+            println!("[STORAGE] Not storing invalid picture_data_url for {}", pubkey);
+            return Ok(()); // No-op
+        }
         let mut data = self.load_data()?;
         if let Some(contact) = data.contacts.get_mut(pubkey) {
             contact.picture_data_url = Some(picture_data_url);

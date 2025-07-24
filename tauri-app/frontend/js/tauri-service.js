@@ -172,6 +172,12 @@ const TauriService = {
     },
     decryptDmContent: async function(privateKey, senderPubkey, encryptedContent) {
         return await this.invoke('decrypt_dm_content', { privateKey, senderPubkey, encryptedContent });
+    },
+    filterNewContacts: async function(pubkeys) {
+        return await this.invoke('db_filter_new_contacts', { pubkeys });
+    },
+    fetchFollowingPubkeys: async function(pubkey, relays) {
+        return await this.invoke('fetch_nostr_following_pubkeys', { pubkey, relays });
     }
 };
 window.TauriService = TauriService; 

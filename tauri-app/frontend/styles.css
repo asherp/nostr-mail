@@ -2253,3 +2253,43 @@ body.dark-mode .form-text {
 body:not(.dark-mode) .email-list-strong {
     color: #232946;
 }
+
+body.dark-mode .confirmation-modal .confirmation-dialog {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    max-width: 90vw;
+    width: auto;
+    min-width: 320px;
+    text-align: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    word-break: break-all;
+}
+
+/* Ensure confirmation dialog text wraps and breaks long words */
+.confirmation-modal .confirmation-dialog p {
+    word-break: break-all;
+    white-space: normal;
+}
+
+/* Dark mode override for confirmation dialog */
+body.dark-mode .confirmation-modal .confirmation-dialog {
+    background: #232946 !important;
+    color: #e0e0e0 !important;
+}
+body.dark-mode .confirmation-modal .confirmation-dialog h3,
+body.dark-mode .confirmation-modal .confirmation-dialog p {
+    color: #e0e0e0 !important;
+}
+
+body.dark-mode .confirmation-modal .confirmation-actions button {
+    background: #181a20 !important;
+    color: #e0e0e0 !important;
+    border: 1px solid #3a404a !important;
+}
+
+body.dark-mode .confirmation-modal .confirmation-actions button#confirm-ok {
+    background: #3b82f6 !important;
+    color: #fff !important;
+    border: none !important;
+}

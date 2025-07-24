@@ -1,3 +1,4 @@
+* fix follow contact, jwt image rendering
 * fetch inbox emails for current user
 * switch between profiles
 * fixed profile update button, jump to send dm

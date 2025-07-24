@@ -184,11 +184,13 @@ class ContactsService {
                     let avatarSrc = defaultAvatar;
                     let avatarClass = 'contact-avatar';
                     
+                    const isValidDataUrl = contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
                     if (contact.picture_loading) {
                         avatarClass += ' loading';
-                    } else if (contact.picture_data_url) {
+                    } else if (isValidDataUrl) {
                         avatarSrc = contact.picture_data_url;
-                        // console.log(`[JS] Using cached data URL for ${contact.name}`);
+                    } else if (contact.picture) {
+                        avatarSrc = contact.picture;
                     } else {
                         console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
                     }
@@ -253,24 +255,19 @@ class ContactsService {
             
             // Determine avatar source
             let avatarSrc = defaultAvatar;
-            if (contact.picture_data_url) {
+            const isValidDataUrl = contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
+            if (isValidDataUrl) {
                 avatarSrc = contact.picture_data_url;
             } else if (contact.picture) {
                 avatarSrc = contact.picture;
             }
             
-            // Create avatar element
-            let avatarElement;
-            if (avatarSrc === defaultAvatar) {
-                avatarElement = `<div class="contact-detail-avatar">${contact.name.charAt(0).toUpperCase()}</div>`;
-            } else {
-                avatarElement = `
-                    <div class="contact-detail-avatar">
-                        <img src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.style.display='none';this.parentElement.textContent='${contact.name.charAt(0).toUpperCase()}';">
-                        ${contact.name.charAt(0).toUpperCase()}
-                    </div>
-                `;
-            }
+            // Always render avatar as an <img> tag
+            let avatarElement = `
+                <div class="contact-detail-avatar">
+                    <img src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+                </div>
+            `;
             
             // Get all available profile fields from the contact
             const profileFields = [];
@@ -598,6 +595,8 @@ class ContactsService {
         if (!contactsDetail) return;
         
         try {
+            console.log('Fetched profile:', profile);
+            console.log('Profile picture field:', profile.fields.picture);
             const profileName = profile.fields.name || profile.fields.display_name || pubkey.substring(0, 16) + '...';
             const profileAbout = profile.fields.about || 'No bio available';
             const profilePicture = profile.fields.picture || '';
@@ -642,18 +641,47 @@ class ContactsService {
             if (profilePicture) {
                 tempContact.picture_loading = true;
                 window.TauriService.fetchImage(profilePicture).then(dataUrl => {
-                    if (dataUrl) {
+                    if (dataUrl && dataUrl.startsWith('data:image')) {
+                        console.log('Fetched image dataUrl (start):', dataUrl.substring(0, 80));
                         tempContact.picture_data_url = dataUrl;
                         tempContact.picture_loaded = true;
-                        
-                        // Update just the avatar image without re-rendering the entire profile
-                        const avatarImg = contactsDetail.querySelector('.contact-detail-avatar img');
-                        if (avatarImg) {
-                            avatarImg.src = dataUrl;
-                            avatarImg.style.display = 'block';
+                        tempContact.picture_loading = false;
+                        // Re-render the profile with the new image
+                        this.renderContactDetail(tempContact);
+                        // Re-add the follow button after re-render
+                        const actionsDiv2 = contactsDetail.querySelector('.contact-detail-actions');
+                        if (actionsDiv2) {
+                            const existingFollowBtn2 = actionsDiv2.querySelector('.follow-btn');
+                            if (existingFollowBtn2) existingFollowBtn2.remove();
+                            const followBtn2 = document.createElement('button');
+                            followBtn2.className = 'btn btn-primary follow-btn';
+                            followBtn2.innerHTML = '<i class="fas fa-user-plus"></i> Follow & Add Contact';
+                            followBtn2.addEventListener('click', () => {
+                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '');
+                            });
+                            actionsDiv2.insertBefore(followBtn2, actionsDiv2.firstChild);
+                        }
+                    } else {
+                        // Fallback: use the raw URL as the picture
+                        console.log('Fetched image dataUrl: null or not an image, falling back to raw URL');
+                        tempContact.picture_data_url = null;
+                        tempContact.picture = profilePicture;
+                        tempContact.picture_loading = false;
+                        this.renderContactDetail(tempContact);
+                        // Re-add the follow button after re-render
+                        const actionsDiv2 = contactsDetail.querySelector('.contact-detail-actions');
+                        if (actionsDiv2) {
+                            const existingFollowBtn2 = actionsDiv2.querySelector('.follow-btn');
+                            if (existingFollowBtn2) existingFollowBtn2.remove();
+                            const followBtn2 = document.createElement('button');
+                            followBtn2.className = 'btn btn-primary follow-btn';
+                            followBtn2.innerHTML = '<i class="fas fa-user-plus"></i> Follow & Add Contact';
+                            followBtn2.addEventListener('click', () => {
+                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '');
+                            });
+                            actionsDiv2.insertBefore(followBtn2, actionsDiv2.firstChild);
                         }
                     }
-                    tempContact.picture_loading = false;
                 }).catch(e => {
                     console.warn('Failed to load profile picture:', e);
                     tempContact.picture_loading = false;
@@ -729,88 +757,113 @@ class ContactsService {
     // Refresh contacts from network (called by refresh button)
     async refreshContacts() {
         console.log('[JS] refreshContacts called - fetching fresh data from network...');
-        
         if (!window.appState.hasKeypair()) {
             window.notificationService.showError('No keypair available');
             return;
         }
-
         const activeRelays = window.appState.getActiveRelays();
         if (activeRelays.length === 0) {
             window.notificationService.showError('No active relays configured');
             return;
         }
-
         try {
-            console.log('🔄 Loading following profiles from network...');
-            
-            // Fetch following profiles from Nostr
-            const followingProfiles = await window.TauriService.fetchFollowingProfiles(
-                window.appState.getKeypair().private_key,
+            // 1. Fetch followed npubs (just pubkeys, not full profiles)
+            const followedPubkeys = await window.TauriService.fetchFollowingPubkeys(
+                window.appState.getKeypair().public_key,
                 activeRelays
             );
-            
-            console.log('[JS] Network response:', {
-                profilesReceived: !!followingProfiles,
-                profilesLength: followingProfiles?.length || 0
-            });
-
-            // Only update contacts if we actually got data from the network
-            if (followingProfiles && followingProfiles.length > 0) {
-                // Create contacts immediately with placeholder images
-                const newContacts = followingProfiles.map(profile => ({
+            console.log('[JS] Fetched followed npubs:', followedPubkeys);
+            if (!followedPubkeys || followedPubkeys.length === 0) {
+                window.notificationService.showInfo('No follows found on the network');
+                return;
+            }
+            // 2. Filter out npubs already in the DB
+            const newPubkeys = await window.TauriService.filterNewContacts(followedPubkeys);
+            console.log('[JS] New npubs not in DB:', newPubkeys);
+            // 3. Fetch profiles for only new npubs
+            let newProfiles = [];
+            if (newPubkeys.length > 0) {
+                newProfiles = await window.TauriService.fetchProfiles(newPubkeys, activeRelays);
+                console.log('[JS] Fetched new profiles:', newProfiles);
+            }
+            // 4. Get all local contacts
+            const localContacts = await window.DatabaseService.getAllContacts();
+            // 5. Add new contacts to app state and DB
+            if (newProfiles.length > 0) {
+                // Create new contact objects
+                const newContacts = newProfiles.map(profile => ({
                     pubkey: profile.pubkey,
                     name: profile.fields.name || profile.fields.display_name || profile.pubkey.substring(0, 16) + '...',
                     picture: profile.fields.picture || '',
                     email: profile.fields.email || null,
-                    fields: profile.fields || {}, // Include all profile fields
+                    fields: profile.fields || {},
                     picture_data_url: null,
                     picture_loading: false,
-                    picture_loaded: false
+                    picture_loaded: false,
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString()
                 }));
-
-                // Update contacts in place instead of clearing the list
-                window.appState.setContacts(newContacts);
+                // Add to app state
+                const allContacts = [...localContacts, ...newContacts];
+                window.appState.setContacts(allContacts);
                 this.renderContacts();
-                // Defer image loading so UI is responsive
-                this.loadContactImagesProgressively(); // don't await
-
-                // Also update the database with the new contacts
+                this.loadContactImagesProgressively();
+                // Save new contacts to DB
                 for (const contact of newContacts) {
                     const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
                     await window.DatabaseService.saveContact(dbContact);
                 }
-
-                // Cache the contacts in backend storage (without images)
-                try {
-                    // Convert frontend contact format to backend storage format
-                    const backendContacts = window.appState.getContacts().map(contact => ({
-                        pubkey: contact.pubkey,
-                        name: contact.name,
-                        display_name: contact.fields.display_name || contact.name,
-                        picture: contact.picture,
-                        picture_data_url: contact.picture_data_url || null,
-                        about: contact.fields.about || null,
-                        email: contact.email,
-                        cached_at: new Date().toISOString()
-                    }));
-                    
-                    await window.TauriService.setContacts(backendContacts);
-                    console.log('[JS] Cached contacts in backend storage');
-                } catch (e) {
-                    console.warn('Failed to cache contacts in backend:', e);
-                }
-                
-                console.log(`✅ Loaded ${newContacts.length} contacts from network`);
-                window.notificationService.showSuccess(`Refreshed ${newContacts.length} contacts`);
+                window.notificationService.showSuccess(`Added ${newContacts.length} new contacts`);
             } else {
-                console.log('[JS] No profiles received from network');
-                window.notificationService.showInfo('No contacts found in your follow list');
+                // No new contacts, just re-render
+                window.appState.setContacts(localContacts);
+                this.renderContacts();
+                window.notificationService.showInfo('No new contacts found in your follow list');
             }
-            
         } catch (error) {
             console.error('Failed to load contacts from network:', error);
             window.notificationService.showError('Failed to refresh contacts: ' + error);
+        }
+    }
+
+    async confirmFollowContact(pubkey, profile, profileName, email) {
+        // Show a confirmation dialog
+        const confirmed = await window.notificationService.showConfirmation(
+            `Do you want to follow nostr user ${pubkey} ?`,
+            'Confirm Follow'
+        );
+        if (!confirmed) return;
+
+        try {
+            // Get your private key and relays
+            const privateKey = window.appState.getKeypair().private_key;
+            const relays = window.appState.getActiveRelays();
+
+            // Call backend to follow the user on Nostr
+            await window.TauriService.followUser(privateKey, pubkey, relays);
+
+            // Save the contact locally
+            const now = new Date().toISOString();
+            const contact = {
+                pubkey,
+                name: profileName,
+                email,
+                picture: profile.fields.picture || '',
+                fields: profile.fields,
+                picture_data_url: null,
+                picture_loaded: false,
+                picture_loading: false,
+                created_at: now,
+                updated_at: now
+            };
+            await window.DatabaseService.saveContact(contact);
+
+            // Update app state and UI
+            window.appState.addContact(contact);
+            this.renderContacts();
+            window.notificationService.showSuccess(`You are now following ${profileName}!`);
+        } catch (error) {
+            window.notificationService.showError('Failed to follow and add contact: ' + error);
         }
     }
 }

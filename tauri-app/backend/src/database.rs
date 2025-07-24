@@ -648,6 +648,12 @@ impl Database {
     }
 
     pub fn update_contact_picture_data_url(&self, pubkey: &str, picture_data_url: &str) -> rusqlite::Result<()> {
+        // Only store if valid image data URL
+        let is_valid = picture_data_url.starts_with("data:image") && picture_data_url != "data:application/octet-stream;base64," && !picture_data_url.trim().is_empty();
+        if !is_valid {
+            println!("[DB] Not storing invalid picture_data_url for {}", pubkey);
+            return Ok(()); // No-op
+        }
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now();
         conn.execute(

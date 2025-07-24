@@ -495,6 +495,62 @@ pub async fn fetch_following_profiles(
     }
 }
 
+/// Fetch the list of npubs (bech32 public keys) that the given pubkey is following
+pub async fn fetch_following_pubkeys(
+    pubkey: &str,
+    relays: &[String],
+) -> Result<Vec<String>> {
+    println!("[NOSTR] fetch_following_pubkeys called for pubkey: {}", pubkey);
+    println!("[NOSTR] Using relays: {:?}", relays);
+    let pubkey = match PublicKey::from_bech32(pubkey) {
+        Ok(pk) => pk,
+        Err(_) => PublicKey::from_hex(pubkey)?
+    };
+    let client = Client::new(Keys::generate()); // ephemeral keys, not used for signing
+    // Connect to relays
+    if relays.is_empty() {
+        println!("[NOSTR] No relays provided, using defaults");
+        client.add_relay("wss://nostr-pub.wellorder.net").await?;
+        client.add_relay("wss://relay.damus.io").await?;
+    } else {
+        for relay in relays {
+            println!("[NOSTR] Adding relay: {}", relay);
+            client.add_relay(relay.clone()).await?;
+        }
+    }
+    client.connect().await;
+    println!("[NOSTR] Connected to relays");
+    // Fetch user's kind 3 event (contact list)
+    let contact_list_filter = Filter::new()
+        .author(pubkey)
+        .kind(Kind::ContactList)
+        .limit(1);
+    println!("[NOSTR] Fetching contact list events...");
+    let contact_events = client.fetch_events(contact_list_filter, Duration::from_secs(10)).await?;
+    println!("[NOSTR] Found {} contact list events", contact_events.len());
+    let latest_contact_event = contact_events.into_iter().max_by_key(|e| e.created_at);
+    if let Some(event) = latest_contact_event {
+        // Get followed pubkeys from 'p' tags
+        let followed_pubkeys: Vec<String> = event.tags
+            .iter()
+            .filter(|tag| tag.kind().as_str() == "p")
+            .filter_map(|tag| {
+                tag.content().and_then(|pk| {
+                    PublicKey::from_bech32(pk)
+                        .or_else(|_| PublicKey::from_hex(pk))
+                        .ok()
+                        .and_then(|pk| pk.to_bech32().ok())
+                })
+            })
+            .collect();
+        println!("[NOSTR] Found {} followed pubkeys", followed_pubkeys.len());
+        Ok(followed_pubkeys)
+    } else {
+        println!("[NOSTR] No contact list event found for user");
+        Ok(vec![])
+    }
+}
+
 pub async fn fetch_image_as_data_url(url: &str) -> Result<String> {
     let response = reqwest::get(url).await?;
 

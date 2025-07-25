@@ -33,6 +33,14 @@ class DOMManager {
             emailList: this.getElement('email-list'),
             refreshInbox: this.getElement('refresh-inbox'),
             emailSearch: this.getElement('email-search'),
+            // Sent
+            refreshSent: this.getElement('refresh-sent'),
+            sentList: this.getElement('sent-list'),
+            backToSent: this.getElement('back-to-sent'),
+            sentDetailView: this.getElement('sent-detail-view'),
+            sentDetailContent: this.getElement('sent-detail-content'),
+            sentActions: this.getElement('sent-actions'),
+            sentTitle: this.getElement('sent-title'),
             
             // DM elements (only static ones)
             dmContacts: this.getElement('dm-contacts'),

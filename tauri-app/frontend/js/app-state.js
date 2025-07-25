@@ -6,6 +6,7 @@ class AppState {
         this.currentUser = null;
         this.contacts = [];
         this.emails = [];
+        this.sentEmails = [];
         this.settings = null;
         this.keypair = null;
         this.dmContacts = [];
@@ -83,6 +84,13 @@ class AppState {
 
     getEmails() {
         return this.emails;
+    }
+
+    setSentEmails(emails) {
+        this.sentEmails = emails;
+    }
+    getSentEmails() {
+        return this.sentEmails || [];
     }
 
     // Settings management

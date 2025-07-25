@@ -329,8 +329,50 @@ impl Database {
             params.push(Box::new(nostr_only));
         }
         if let Some(email) = user_email {
-            where_clauses.push("(LOWER(TRIM(to_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?)))");
+            where_clauses.push("LOWER(TRIM(to_address)) = LOWER(TRIM(?))");
             params.push(Box::new(email));
+        }
+        if !where_clauses.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(&where_clauses.join(" AND "));
+        }
+        query.push_str(" ORDER BY received_at DESC LIMIT ? OFFSET ?");
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(Email {
+                id: Some(row.get(0)?),
+                message_id: row.get(1)?,
+                from_address: row.get(2)?,
+                to_address: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                body_plain: row.get(6)?,
+                body_html: row.get(7)?,
+                received_at: row.get(8)?,
+                is_nostr_encrypted: row.get(9)?,
+                nostr_pubkey: row.get(10)?,
+                raw_headers: row.get(11)?,
+                created_at: row.get(12)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_sent_emails(&self, limit: Option<i64>, offset: Option<i64>, user_email: Option<&str>) -> Result<Vec<Email>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.unwrap_or(50);
+        let offset = offset.unwrap_or(0);
+
+        let mut query = String::from(
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, created_at FROM emails"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut where_clauses = Vec::new();
+        if let Some(email) = user_email {
+            where_clauses.push("LOWER(TRIM(from_address)) = LOWER(TRIM(?))");
             params.push(Box::new(email));
         }
         if !where_clauses.is_empty() {

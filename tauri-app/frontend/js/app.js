@@ -164,9 +164,43 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const encryptBtn = domManager.get('encryptBtn');
         if (encryptBtn) {
             console.log('[JS] Setting up encrypt button event listener');
-            encryptBtn.addEventListener('click', () => {
-                console.log('[JS] Encrypt button clicked');
-                emailService.encryptEmailFields();
+            encryptBtn.dataset.encrypted = 'false';
+            encryptBtn.addEventListener('click', async function handleEncryptClick() {
+                const iconSpan = encryptBtn.querySelector('.encrypt-btn-icon i');
+                const labelSpan = encryptBtn.querySelector('.encrypt-btn-label');
+                const isEncrypted = encryptBtn.dataset.encrypted === 'true';
+                if (!isEncrypted) {
+                    // Encrypt mode
+                    console.log('[JS] Encrypt button clicked');
+                    await emailService.encryptEmailFields();
+                    if (iconSpan) iconSpan.className = 'fas fa-unlock';
+                    if (labelSpan) labelSpan.textContent = 'Decrypt';
+                    encryptBtn.dataset.encrypted = 'true';
+                } else {
+                    // Decrypt mode
+                    console.log('[JS] Decrypt button clicked');
+                    // Get keys and contact
+                    const privkey = appState.getKeypair().private_key;
+                    const pubkey = emailService.selectedNostrContact?.pubkey;
+                    const armoredBody = domManager.getValue('messageBody') || '';
+                    // Extract the encrypted content from the armored body
+                    const match = armoredBody.match(/-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n]+)\s*-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----/);
+                    if (match && privkey && pubkey) {
+                        const encryptedContent = match[1].replace(/\s+/g, '');
+                        try {
+                            const decrypted = await TauriService.decryptDmContent(privkey, pubkey, encryptedContent);
+                            domManager.setValue('messageBody', decrypted);
+                            notificationService.showSuccess('Body decrypted');
+                        } catch (err) {
+                            notificationService.showError('Failed to decrypt: ' + err);
+                        }
+                    } else {
+                        notificationService.showError('No encrypted message found or missing keys');
+                    }
+                    if (iconSpan) iconSpan.className = 'fas fa-lock';
+                    if (labelSpan) labelSpan.textContent = 'Encrypt';
+                    encryptBtn.dataset.encrypted = 'false';
+                }
             });
         } else {
             console.error('[JS] Encrypt button not found in DOM');
@@ -423,6 +457,18 @@ NostrMailApp.prototype.setupEventListeners = function() {
             });
         }
         
+        // Sent
+        const refreshSent = domManager.get('refreshSent');
+        if (refreshSent) {
+            refreshSent.addEventListener('click', async () => {
+                await emailService.loadSentEmails();
+            });
+        }
+        const backToSentBtn = document.getElementById('back-to-sent');
+        if (backToSentBtn) {
+            backToSentBtn.addEventListener('click', () => emailService.showSentList());
+        }
+        
         console.log('Event listeners set up successfully');
     } catch (error) {
         console.error('Error setting up event listeners:', error);
@@ -479,6 +525,9 @@ NostrMailApp.prototype.switchTab = function(tabName) {
     }
     if (tabName === 'inbox') {
         emailService.loadEmails();
+    }
+    if (tabName === 'sent') {
+        emailService.loadSentEmails();
     }
 }
 

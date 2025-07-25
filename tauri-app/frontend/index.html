@@ -34,6 +34,9 @@
                 <button class="nav-item" data-tab="inbox">
                     <i class="fas fa-inbox"></i> Inbox
                 </button>
+                <button class="nav-item" data-tab="sent">
+                    <i class="fas fa-paper-plane"></i> Sent
+                </button>
                 <button class="nav-item" data-tab="dm">
                     <i class="fas fa-comments"></i> Direct Messages
                 </button>
@@ -82,7 +85,8 @@
                     
                     <div class="form-actions">
                         <button id="encrypt-btn" class="btn btn-secondary" type="button">
-                            <i class="fas fa-lock"></i> Encrypt
+                            <span class="encrypt-btn-icon"><i class="fas fa-lock"></i></span>
+                            <span class="encrypt-btn-label">Encrypt</span>
                         </button>
                         <button id="send-btn" class="btn btn-primary">
                             <i class="fas fa-paper-plane"></i> Send
@@ -127,6 +131,31 @@
                     </div>
                     <div class="email-detail-content" id="email-detail-content">
                         <!-- Email detail content will be populated here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sent Tab -->
+            <div class="tab-content" id="sent">
+                <div class="tab-header">
+                    <h2 id="sent-title">Sent</h2>
+                    <div class="inbox-actions" id="sent-actions">
+                        <button id="refresh-sent" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                <div class="email-list" id="sent-list">
+                    <!-- Sent emails will be populated here -->
+                </div>
+                <div class="email-detail-view" id="sent-detail-view" style="display: none;">
+                    <div class="email-detail-header">
+                        <button id="back-to-sent" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Sent
+                        </button>
+                    </div>
+                    <div class="email-detail-content" id="sent-detail-content">
+                        <!-- Sent email detail content will be populated here -->
                     </div>
                 </div>
             </div>

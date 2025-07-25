@@ -617,6 +617,24 @@ fn db_update_email_nostr_pubkey_by_id(id: i64, nostr_pubkey: String, state: taur
     db.update_email_nostr_pubkey_by_id(id, &nostr_pubkey).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
+    println!("[RUST] db_get_sent_emails called");
+    if let Some(ref email) = user_email {
+        println!("[RUST] db_get_sent_emails: Filtering for user_email: {}", email);
+    } else {
+        println!("[RUST] db_get_sent_emails: No user_email filter provided");
+    }
+    let db = state.get_database()?;
+    let emails = db.get_sent_emails(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
+    let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
+    println!("[RUST] Sending {} sent emails to frontend:", mapped.len());
+    for (i, email) in mapped.iter().enumerate() {
+        println!("[RUST] Sent Email {}: {:#?}", i + 1, email);
+    }
+    Ok(mapped)
+}
+
 // Database commands for direct messages
 #[tauri::command]
 fn db_save_dm(dm: DbDirectMessage, state: tauri::State<AppState>) -> Result<i64, String> {
@@ -1010,6 +1028,7 @@ pub fn run() {
         db_get_emails,
         db_update_email_nostr_pubkey,
         db_update_email_nostr_pubkey_by_id,
+        db_get_sent_emails,
         db_save_dm,
         db_get_dms_for_conversation,
         db_get_decrypted_dms_for_conversation,

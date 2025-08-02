@@ -504,24 +504,50 @@ class EmailService {
 
     // Sync and reload emails
     async syncAndReloadEmails() {
-        if (!appState.hasSettings()) {
-            notificationService.showError('Please configure your email settings first');
-            return;
+        try {
+            // Sync emails from network
+            const newCount = await TauriService.syncNostrEmails();
+            console.log(`[JS] Synced ${newCount} new emails from network`);
+            
+            // Reload emails from database
+            await this.loadEmails();
+        } catch (error) {
+            console.error('[JS] Error in syncAndReloadEmails:', error);
+            throw error;
         }
-        const settings = appState.getSettings();
-        const keypair = appState.getKeypair();
-        const emailConfig = {
-            email_address: settings.email_address,
-            password: settings.password,
-            smtp_host: settings.smtp_host,
-            smtp_port: settings.smtp_port,
-            imap_host: settings.imap_host,
-            imap_port: settings.imap_port,
-            use_tls: settings.use_tls,
-            private_key: keypair ? keypair.private_key : null
-        };
-        await TauriService.syncNostrEmails(emailConfig);
-        await this.loadEmails();
+    }
+
+    async syncInboxEmails() {
+        try {
+            const newCount = await TauriService.syncNostrEmails();
+            console.log(`[JS] Synced ${newCount} new inbox emails from network`);
+            return newCount;
+        } catch (error) {
+            console.error('[JS] Error in syncInboxEmails:', error);
+            throw error;
+        }
+    }
+
+    async syncSentEmails() {
+        try {
+            const newCount = await TauriService.syncSentEmails();
+            console.log(`[JS] Synced ${newCount} new sent emails from network`);
+            return newCount;
+        } catch (error) {
+            console.error('[JS] Error in syncSentEmails:', error);
+            throw error;
+        }
+    }
+
+    async syncAllEmails() {
+        try {
+            const [inboxCount, sentCount] = await TauriService.syncAllEmails();
+            console.log(`[JS] Synced ${inboxCount} inbox emails and ${sentCount} sent emails from network`);
+            return { inboxCount, sentCount };
+        } catch (error) {
+            console.error('[JS] Error in syncAllEmails:', error);
+            throw error;
+        }
     }
 
     // Fallback decryption method for Nostr messages
@@ -1257,7 +1283,10 @@ class EmailService {
                 let previewText = email.body ? Utils.escapeHtml(email.body.substring(0, 100)) : '';
                 let showSubject = true;
                 let previewSubject = email.subject;
-                if (email.body && email.body.includes('BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE')) {
+                
+                // Detect any NOSTR NIP-X ENCRYPTED MESSAGE (same as inbox)
+                const armorRegex = /-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/;
+                if (email.body && armorRegex.test(email.body)) {
                     const keypair = appState.getKeypair();
                     if (!keypair) {
                         previewText = 'Unable to decrypt: no keypair';
@@ -1270,8 +1299,8 @@ class EmailService {
                                 previewSubject = 'Could not decrypt';
                             }
                         }
-                        // Decrypt body as before
-                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n]+)\s*-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----/);
+                        // Decrypt body using generic NIP-X regex (same as inbox)
+                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                         if (encryptedBodyMatch) {
                             const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
                             try {
@@ -1330,7 +1359,8 @@ class EmailService {
                 const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
                 const nostrPubkey = email.nostr_pubkey;
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
-                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n]+)\s*-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----/);
+                // Use generic NIP-X regex (same as inbox)
+                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 let decryptedSubject = email.subject;
                 let decryptedBody = cleanedBody;
                 const keypair = appState.getKeypair();
@@ -1351,19 +1381,7 @@ class EmailService {
                         }
                     })();
                 } else {
-                    // If subject looks like encrypted base64, try to decrypt (no ASCII armor required)
-                    if (Utils.isLikelyEncryptedContent(email.subject)) {
-                        (async () => {
-                            try {
-                                decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
-                                updateDetail(decryptedSubject, decryptedBody);
-                            } catch (err) {
-                                updateDetail('Could not decrypt', decryptedBody);
-                            }
-                        })();
-                    } else {
-                        updateDetail(decryptedSubject, decryptedBody);
-                    }
+                    updateDetail(decryptedSubject, decryptedBody);
                 }
                 function updateDetail(subject, body) {
                     sentDetailContent.innerHTML =

@@ -860,11 +860,30 @@ async fn fetch_nostr_emails_smart(email_config: EmailConfig, state: tauri::State
 }
 
 #[tauri::command]
-async fn sync_nostr_emails(email_config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+async fn sync_nostr_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
-    email::sync_nostr_emails_to_db(&email_config, &db)
-        .await
-        .map_err(|e| e.to_string())
+    email::sync_nostr_emails_to_db(&config, &db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sync_sent_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    email::sync_sent_emails_to_db(&config, &db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sync_all_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<(usize, usize), String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    
+    // Sync both inbox and sent emails
+    let inbox_result = email::sync_nostr_emails_to_db(&config, &db).await;
+    let sent_result = email::sync_sent_emails_to_db(&config, &db).await;
+    
+    match (inbox_result, sent_result) {
+        (Ok(inbox_count), Ok(sent_count)) => Ok((inbox_count, sent_count)),
+        (Err(e), _) => Err(format!("Inbox sync failed: {}", e)),
+        (_, Err(e)) => Err(format!("Sent sync failed: {}", e)),
+    }
 }
 
 #[tauri::command]
@@ -1118,6 +1137,8 @@ pub fn run() {
         db_get_all_relays,
         db_delete_relay,
         sync_nostr_emails,
+        sync_sent_emails,
+        sync_all_emails,
         sync_direct_messages_with_network,
         db_get_all_dm_pubkeys,
         db_get_all_dm_pubkeys_sorted,

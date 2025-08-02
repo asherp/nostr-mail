@@ -454,12 +454,14 @@ body.dark-mode .dm-search-icon {
     display: flex;
     flex-direction: column;
     gap: 12px;
+    min-height: 0;
 }
 
 .message {
     display: flex;
     margin-bottom: 8px;
     max-width: 70%;
+    min-width: 0;
 }
 
 .message-sent {
@@ -478,7 +480,11 @@ body.dark-mode .dm-search-icon {
     border-radius: 18px;
     position: relative;
     word-wrap: break-word;
+    overflow-wrap: break-word;
+    word-break: break-all;
     max-width: 100%;
+    min-width: 0;
+    flex-shrink: 1;
 }
 
 .message-sent .message-content {
@@ -496,6 +502,19 @@ body.dark-mode .dm-search-icon {
     line-height: 1.4;
     margin-bottom: 4px;
     word-wrap: break-word;
+    overflow-wrap: break-word;
+    word-break: break-all;
+    white-space: pre-wrap;
+    max-width: 100%;
+    min-width: 0;
+    hyphens: auto;
+}
+
+/* Special handling for very long encrypted content */
+.message-text:not(:empty) {
+    overflow-wrap: anywhere;
+    word-break: break-all;
+    hyphens: none;
 }
 
 .message-meta {
@@ -1258,17 +1277,19 @@ body.dark-mode .modal-footer {
     .sidebar {
         width: 100%;
         height: auto;
+        border-right: none;
+        border-bottom: 1px solid #e0e0e0;
     }
     
     .sidebar-nav {
-        display: flex;
+        flex-direction: row;
         overflow-x: auto;
         padding: 10px;
     }
     
     .nav-item {
         flex-shrink: 0;
-        padding: 10px 15px;
+        margin-right: 15px;
     }
     
     .form-actions {
@@ -1276,8 +1297,7 @@ body.dark-mode .modal-footer {
     }
     
     .btn {
-        width: 100%;
-        justify-content: center;
+        margin-bottom: 10px;
     }
     
     .dm-container {
@@ -1288,11 +1308,12 @@ body.dark-mode .modal-footer {
         width: 100%;
         height: 300px;
         border-right: none;
-        border-bottom: 1px solid var(--border-color);
+        border-bottom: 1px solid #e0e0e0;
     }
     
     .dm-main {
-        height: 400px;
+        flex: 1;
+        min-height: 400px;
     }
     
     .message {

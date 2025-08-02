@@ -274,7 +274,14 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 // Clear search input
                 domManager.clear('emailSearch');
                 // Sync and load all emails (no search filter)
-                await emailService.syncAndReloadEmails();
+                try {
+                    await emailService.syncInboxEmails();
+                    await emailService.loadEmails();
+                    notificationService.showSuccess('Inbox synced successfully');
+                } catch (error) {
+                    console.error('[JS] Error syncing inbox:', error);
+                    notificationService.showError('Failed to sync inbox: ' + error.message);
+                }
             });
         }
         
@@ -518,7 +525,14 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const refreshSent = domManager.get('refreshSent');
         if (refreshSent) {
             refreshSent.addEventListener('click', async () => {
-                await emailService.loadSentEmails();
+                try {
+                    await emailService.syncSentEmails();
+                    await emailService.loadSentEmails();
+                    notificationService.showSuccess('Sent emails synced successfully');
+                } catch (error) {
+                    console.error('[JS] Error syncing sent emails:', error);
+                    notificationService.showError('Failed to sync sent emails: ' + error.message);
+                }
             });
         }
         const backToSentBtn = document.getElementById('back-to-sent');

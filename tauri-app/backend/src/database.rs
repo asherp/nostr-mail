@@ -432,6 +432,34 @@ impl Database {
         }
     }
 
+    pub fn get_latest_sent_email_received_at(&self, user_email: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.conn.lock().unwrap();
+        
+        if let Some(email) = user_email {
+            // Properly identify sent emails as those where the user is the sender
+            let mut stmt = conn.prepare(
+                "SELECT received_at FROM emails WHERE is_nostr_encrypted = 1 AND LOWER(TRIM(from_address)) = LOWER(TRIM(?)) ORDER BY received_at DESC LIMIT 1"
+            )?;
+            let mut rows = stmt.query(params![email])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        } else {
+            // Fallback to the old logic if no user email provided
+            let mut stmt = conn.prepare(
+                "SELECT received_at FROM emails WHERE is_nostr_encrypted = 1 AND from_address = to_address ORDER BY received_at DESC LIMIT 1"
+            )?;
+            let mut rows = stmt.query([])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
     // Direct message operations
     pub fn save_dm(&self, dm: &DirectMessage) -> Result<i64> {
         let conn = self.conn.lock().unwrap();

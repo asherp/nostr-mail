@@ -81,7 +81,7 @@ const TauriService = {
             encryption_algorithm: encryptionAlgorithm
         };
         
-        return await this.invoke('send_direct_message', request);
+        return await this.invoke('send_direct_message', { request });
     },
     
     sendEncryptedDirectMessage: async function(privateKey, recipientPubkey, encryptedMessage, relays) {
@@ -98,7 +98,7 @@ const TauriService = {
             encryption_algorithm: encryptionAlgorithm
         };
         
-        return await this.invoke('send_direct_message', request);
+        return await this.invoke('send_direct_message', { request });
     },
     fetchDirectMessages: async function(privateKey, relays) {
         return await this.invoke('fetch_direct_messages', { privateKey, relays });
@@ -213,8 +213,70 @@ const TauriService = {
     initDatabase: async function() {
         return await this.invoke('init_database');
     },
-    syncNostrEmails: async function(emailConfig) {
-        return await this.invoke('sync_nostr_emails', { emailConfig });
+    syncNostrEmails: async function() {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: settings.use_tls,
+            private_key: keypair.private_key
+        };
+        
+        return await this.invoke('sync_nostr_emails', { config: emailConfig });
+    },
+
+    syncSentEmails: async function() {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: settings.use_tls,
+            private_key: keypair.private_key
+        };
+        
+        return await this.invoke('sync_sent_emails', { config: emailConfig });
+    },
+
+    syncAllEmails: async function() {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: settings.use_tls,
+            private_key: keypair.private_key
+        };
+        
+        return await this.invoke('sync_all_emails', { config: emailConfig });
     },
     /**
      * Tauri automatically converts camelCase keys in JS to snake_case for Rust command parameters.

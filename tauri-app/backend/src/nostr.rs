@@ -85,9 +85,100 @@ pub async fn send_direct_message(
     }
     client.connect().await;
     
-    // Encrypt the message using NIP-04
-    let encrypted_content = nip04::encrypt(&secret_key, &recipient, message)?;
-    println!("[NOSTR] Encrypted message using NIP-04: {}", &encrypted_content[..encrypted_content.len().min(50)]);
+    // Check if the message is already encrypted (base64-like pattern, reasonable length)
+    let is_already_encrypted = message.len() >= 20 && 
+        message.chars().all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '+' || c == '/' || c == '=') &&
+        !message.contains('@') && 
+        !message.contains("Re:") && 
+        !message.contains("Fwd:") &&
+        !message.contains("FW:") &&
+        !message.contains("Subject:") &&
+        !message.contains("From:") &&
+        !message.contains("To:");
+    
+    let encrypted_content = if is_already_encrypted {
+        println!("[NOSTR] Message appears to be already encrypted, using as-is");
+        message.to_string()
+    } else {
+        println!("[NOSTR] Encrypting message using NIP-04");
+        // Encrypt the message using NIP-04
+        nip04::encrypt(&secret_key, &recipient, message)?
+    };
+    
+    println!("[NOSTR] Final encrypted content: {}", &encrypted_content[..encrypted_content.len().min(50)]);
+    
+    // Create the encrypted direct message event manually
+    let event = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content)
+        .tag(Tag::public_key(recipient))
+        .build(keys.public_key())
+        .sign_with_keys(&keys)?;
+    
+    println!("[NOSTR] Created encrypted direct message event with ID: {}", event.id.to_hex());
+    println!("[NOSTR] Event content length: {}", event.content.len());
+    println!("[NOSTR] Event tags: {:?}", event.tags);
+    
+    // Send the event to relays
+    let event_id = client.send_event(&event).await?;
+    
+    println!("[NOSTR] Successfully sent encrypted direct message, event ID: {}", event_id.to_hex());
+    
+    Ok(event_id.to_hex())
+}
+
+pub async fn send_direct_message_with_content(
+    private_key: &str,
+    recipient_pubkey: &str,
+    content: &crate::types::MessageContent,
+    relays: &[String],
+    encryption_algorithm: Option<&str>,
+) -> Result<String> {
+    // Parse keys from bech32 format
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let keys = Keys::new(secret_key.clone());
+    let recipient = PublicKey::from_bech32(recipient_pubkey)?;
+    
+    // Create client
+    let client = Client::new(keys.clone());
+    if relays.is_empty() {
+        client.add_relay("wss://nostr-pub.wellorder.net").await?;
+        client.add_relay("wss://relay.damus.io").await?;
+    } else {
+        for relay in relays {
+            client.add_relay(relay.clone()).await?;
+        }
+    }
+    client.connect().await;
+    
+    // Determine encryption algorithm (default to NIP-44)
+    let algorithm = encryption_algorithm.unwrap_or("nip44");
+    println!("[NOSTR] Using encryption algorithm: {}", algorithm);
+    
+    // Handle content based on its type
+    let encrypted_content = match content {
+        crate::types::MessageContent::Plaintext(text) => {
+            println!("[NOSTR] Encrypting plaintext message using {}", algorithm.to_uppercase());
+            match algorithm {
+                "nip04" => {
+                    // Use NIP-04 encryption
+                    nip04::encrypt(&secret_key, &recipient, text)?
+                },
+                "nip44" => {
+                    // Use NIP-44 encryption
+                    nip44::encrypt(&secret_key, &recipient, text, nip44::Version::default())?
+                },
+                _ => {
+                    println!("[NOSTR] Unknown encryption algorithm: {}, defaulting to NIP-44", algorithm);
+                    nip44::encrypt(&secret_key, &recipient, text, nip44::Version::default())?
+                }
+            }
+        },
+        crate::types::MessageContent::Encrypted(text) => {
+            println!("[NOSTR] Using already encrypted content as-is");
+            text.clone()
+        },
+    };
+    
+    println!("[NOSTR] Final encrypted content: {}", &encrypted_content[..encrypted_content.len().min(50)]);
     
     // Create the encrypted direct message event manually
     let event = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content)

@@ -32,12 +32,104 @@ impl Header for XNostrPubkey {
     }
 }
 
+/// Construct email headers without sending the email
+pub fn construct_email_headers(
+    config: &EmailConfig,
+    to_address: &str,
+    subject: &str,
+    body: &str,
+    nostr_npub: Option<&str>,
+    message_id: Option<&str>,
+) -> Result<String> {
+    println!("[RUST] construct_email_headers: Constructing email headers");
+    println!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
+    
+    let mut builder = Message::builder()
+        .from(config.email_address.parse()?)
+        .to(to_address.parse()?)
+        .subject(subject);
+    
+    // Add custom message ID if provided
+    if let Some(msg_id) = message_id {
+        println!("[RUST] construct_email_headers: Setting message ID: {}", msg_id);
+        // Try using the builder's message_id method
+        builder = builder.message_id(Some(msg_id.to_string()));
+        
+        // Also try manually adding the header as a fallback
+        // Note: This might not work with lettre's builder pattern, but worth trying
+        // builder = builder.header(("Message-ID", msg_id));
+    } else {
+        println!("[RUST] construct_email_headers: No message ID provided");
+    }
+    
+    // Add the sender's public key to the headers (not the receiver's)
+    // This allows the receiver to derive the shared secret using their private key
+    if let Some(private_key) = &config.private_key {
+        // Extract public key from private key
+        match crypto::get_public_key_from_private(private_key) {
+            Ok(sender_pubkey) => {
+                println!("[RUST] construct_email_headers: Adding sender pubkey to headers: {}", sender_pubkey);
+                builder = builder.header(XNostrPubkey(sender_pubkey));
+            }
+            Err(e) => {
+                println!("[RUST] construct_email_headers: Failed to get public key from private key: {}", e);
+            }
+        }
+    }
+    
+    let email = builder.body(body.to_string())?;
+    
+    // Convert the email to a string to get the raw headers
+    let email_bytes = email.formatted();
+    let email_string = String::from_utf8(email_bytes)?;
+    
+    println!("[RUST] construct_email_headers: Full email string:");
+    println!("{}", email_string);
+    
+    // Extract headers from the email string
+    let lines: Vec<&str> = email_string.lines().collect();
+    let mut headers = Vec::new();
+    let mut in_body = false;
+    
+    for line in lines {
+        if line.is_empty() {
+            in_body = true;
+            break;
+        }
+        if !in_body {
+            headers.push(line);
+        }
+    }
+    
+    let final_headers = headers.join("\n");
+    println!("[RUST] construct_email_headers: Final headers:");
+    println!("{}", final_headers);
+    
+    // Check if Message-ID is present in the headers
+    if final_headers.to_lowercase().contains("message-id:") {
+        println!("[RUST] construct_email_headers: Message-ID found in headers");
+    } else {
+        println!("[RUST] construct_email_headers: Message-ID NOT found in headers");
+        // If Message-ID is not present, manually add it
+        if let Some(msg_id) = message_id {
+            println!("[RUST] construct_email_headers: Manually adding Message-ID: {}", msg_id);
+            let headers_with_message_id = format!("Message-ID: {}\n{}", msg_id, final_headers);
+            println!("[RUST] construct_email_headers: Headers with manually added Message-ID:");
+            println!("{}", headers_with_message_id);
+            return Ok(headers_with_message_id);
+        }
+    }
+    
+    Ok(final_headers)
+}
+
 pub async fn send_email(
     config: &EmailConfig,
     to_address: &str,
     subject: &str,
     body: &str,
     nostr_npub: Option<&str>,
+    message_id: Option<&str>,
 ) -> Result<String> {
     println!("[RUST] send_email: Starting email send process");
     println!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
@@ -48,9 +140,28 @@ pub async fn send_email(
         .from(config.email_address.parse()?)
         .to(to_address.parse()?)
         .subject(subject);
-    if let Some(npub) = nostr_npub {
-        builder = builder.header(XNostrPubkey(npub.to_string()));
+    
+    // Add custom message ID if provided
+    if let Some(msg_id) = message_id {
+        // Pass the message ID as Option<String> to the builder
+        builder = builder.message_id(Some(msg_id.to_string()));
     }
+    
+    // Add the sender's public key to the headers (not the receiver's)
+    // This allows the receiver to derive the shared secret using their private key
+    if let Some(private_key) = &config.private_key {
+        // Extract public key from private key
+        match crypto::get_public_key_from_private(private_key) {
+            Ok(sender_pubkey) => {
+                println!("[RUST] send_email: Adding sender pubkey to headers: {}", sender_pubkey);
+                builder = builder.header(XNostrPubkey(sender_pubkey));
+            }
+            Err(e) => {
+                println!("[RUST] send_email: Failed to get public key from private key: {}", e);
+            }
+        }
+    }
+    
     let email = builder.body(body.to_string())?;
 
     let creds = Credentials::new(config.email_address.clone(), config.password.clone());
@@ -333,6 +444,7 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     is_read: true, // We'll assume all fetched emails are read for now
                     raw_headers: raw_headers.clone(),
                     nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                    message_id: extract_message_id_from_headers(&raw_headers),
                 };
 
                 emails.push(email_message);
@@ -493,10 +605,11 @@ pub async fn fetch_nostr_emails_last_24h(config: &EmailConfig) -> Result<Vec<Ema
 /// Nostr-related emails without having to download and filter all emails client-side.
 /// 
 /// Search Strategy:
-/// 1. Search for "BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE" - finds emails with encrypted content
+/// 1. Search for any "BEGIN NOSTR NIP-<number> ENCRYPTED MESSAGE" - finds emails with NIP-based encrypted content
 /// 2. Search for "X-Nostr-Pubkey:" - finds emails with Nostr public key headers
-/// 3. Combine results and remove duplicates
-/// 4. Fetch only the matching emails (much more efficient than fetching all emails)
+/// 3. Search for any "END NOSTR NIP-<number> ENCRYPTED MESSAGE"
+/// 4. Combine results and remove duplicates
+/// 5. Fetch only the matching emails (much more efficient than fetching all emails)
 /// 
 /// Benefits:
 /// - Dramatically reduces bandwidth usage
@@ -512,9 +625,9 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
     
     // Use more specific search terms to avoid false positives
     let search_terms = vec![
-        "X-GM-RAW \"BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE\"",
+        "X-GM-RAW \"BEGIN NOSTR NIP-\"",
         "X-GM-RAW \"X-Nostr-Pubkey:\"",
-        "X-GM-RAW \"END NOSTR NIP-04 ENCRYPTED MESSAGE\"",
+        "X-GM-RAW \"END NOSTR NIP-\"",
     ];
     
     let mut all_message_numbers: HashSet<u32> = HashSet::new();
@@ -627,6 +740,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         is_read: true,
                         raw_headers: raw_headers.clone(),
                         nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                        message_id: extract_message_id_from_headers(&raw_headers),
                     };
                     emails.push(email_message);
                 } else {
@@ -717,6 +831,7 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     is_read: true,
                     raw_headers: raw_headers.clone(),
                     nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                    message_id: extract_message_id_from_headers(&raw_headers),
                 };
                 emails.push(email_message);
             }
@@ -729,11 +844,18 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
 /// Extract Nostr public key from email headers
 pub fn extract_nostr_pubkey_from_headers(raw_headers: &str) -> Option<String> {
     for line in raw_headers.lines() {
-        if line.starts_with("X-Nostr-Pubkey:") {
-            let pubkey = line.split_once(':')
-                .and_then(|(_, value)| Some(value.trim()))
-                .filter(|s| !s.is_empty());
-            return pubkey.map(|s| s.to_string());
+        if line.to_lowercase().starts_with("x-nostr-pubkey:") {
+            return Some(line.split_once(':').unwrap_or(("", "")).1.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract message ID from email headers
+pub fn extract_message_id_from_headers(raw_headers: &str) -> Option<String> {
+    for line in raw_headers.lines() {
+        if line.to_lowercase().starts_with("message-id:") {
+            return Some(line.split_once(':').unwrap_or(("", "")).1.trim().to_string());
         }
     }
     None
@@ -933,6 +1055,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 is_read: true,
                                 raw_headers: raw_headers.clone(),
                                 nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                                message_id: extract_message_id_from_headers(&raw_headers),
                             };
                             emails.push(email_message);
                         }
@@ -1005,6 +1128,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 is_read: true,
                                 raw_headers: raw_headers.clone(),
                                 nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                                message_id: extract_message_id_from_headers(&raw_headers),
                             };
                             emails.push(email_message);
                         }
@@ -1041,8 +1165,11 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> any
                 received_at: email.date,
                 is_nostr_encrypted: true,
                 nostr_pubkey: email.nostr_pubkey.clone(),
-                created_at: chrono::Utc::now(),
                 raw_headers: Some(email.raw_headers.clone()),
+                is_draft: false,
+                is_read: false,
+                updated_at: None,
+                created_at: chrono::Utc::now(),
             };
             println!("[RUST] Saving email to DB: {:?}", db_email);
             db.save_email(&db_email)?;
@@ -1140,19 +1267,24 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                             email.get_body().unwrap_or_else(|_| "No body content".to_string())
                         };
                         let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
-                        if raw_headers.contains("X-Nostr-Pubkey:") {
-                            let message_id = email.headers.get_first_value("Message-ID").unwrap_or_else(|| Uuid::new_v4().to_string());
-                            let nostr_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
-                            emails.push(RawNostrEmail {
-                                message_id,
+                        // Only keep Nostr emails (header or armor)
+                        let is_nostr_email = raw_headers.contains("X-Nostr-Pubkey:") || body_text.contains("BEGIN NOSTR NIP-");
+                        if is_nostr_email {
+                            let (_final_subject, _final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
+                                Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
+                                Err(_) => (subject.clone(), body_text.clone()),
+                            };
+                            let email_message = RawNostrEmail {
+                                message_id: email.headers.get_first_value("Message-ID").unwrap_or_else(|| Uuid::new_v4().to_string()),
                                 from,
                                 to,
                                 subject,
                                 body: body_text,
                                 date,
-                                nostr_pubkey,
+                                nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
                                 raw_headers: raw_headers.clone(),
-                            });
+                            };
+                            emails.push(email_message);
                         }
                     }
                 }
@@ -1221,19 +1353,24 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                             email.get_body().unwrap_or_else(|_| "No body content".to_string())
                         };
                         let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
-                        if raw_headers.contains("X-Nostr-Pubkey:") {
-                            let message_id = email.headers.get_first_value("Message-ID").unwrap_or_else(|| Uuid::new_v4().to_string());
-                            let nostr_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
-                            emails.push(RawNostrEmail {
-                                message_id,
+                        // Only keep Nostr emails (header or armor)
+                        let is_nostr_email = raw_headers.contains("X-Nostr-Pubkey:") || body_text.contains("BEGIN NOSTR NIP-");
+                        if is_nostr_email {
+                            let (_final_subject, _final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
+                                Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
+                                Err(_) => (subject.clone(), body_text.clone()),
+                            };
+                            let email_message = RawNostrEmail {
+                                message_id: email.headers.get_first_value("Message-ID").unwrap_or_else(|| Uuid::new_v4().to_string()),
                                 from,
                                 to,
                                 subject,
                                 body: body_text,
                                 date,
-                                nostr_pubkey,
+                                nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
                                 raw_headers: raw_headers.clone(),
-                            });
+                            };
+                            emails.push(email_message);
                         }
                     }
                 }

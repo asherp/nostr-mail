@@ -26,8 +26,10 @@ class DOMManager {
             messageBody: this.getElement('message-body'),
             sendBtn: this.getElement('send-btn'),
             saveDraftBtn: this.getElement('save-draft-btn'),
+            previewHeadersBtn: this.getElement('preview-headers-btn'),
             nostrContactSelect: this.getElement('nostr-contact-select'),
             encryptBtn: this.getElement('encrypt-btn'),
+            sendMatchingDm: this.getElement('send-matching-dm'),
             
             // Inbox
             emailList: this.getElement('email-list'),
@@ -41,6 +43,15 @@ class DOMManager {
             sentDetailContent: this.getElement('sent-detail-content'),
             sentActions: this.getElement('sent-actions'),
             sentTitle: this.getElement('sent-title'),
+            
+            // Drafts
+            refreshDrafts: this.getElement('refresh-drafts'),
+            draftsList: this.getElement('drafts-list'),
+            backToDrafts: this.getElement('back-to-drafts'),
+            draftsDetailView: this.getElement('drafts-detail-view'),
+            draftsDetailContent: this.getElement('drafts-detail-content'),
+            draftsActions: this.getElement('drafts-actions'),
+            draftsTitle: this.getElement('drafts-title'),
             
             // DM elements (only static ones)
             dmContacts: this.getElement('dm-contacts'),
@@ -72,6 +83,7 @@ class DOMManager {
             generateKeyBtn: this.getElement('generate-key-btn'),
             publicKeyDisplay: this.getElement('public-key-display'),
             copyPubkeyBtn: this.getElement('copy-pubkey-btn'),
+            encryptionAlgorithm: this.getElement('encryption-algorithm'),
             emailProvider: this.getElement('email-provider'),
             emailAddress: this.getElement('email-address'),
             emailPassword: this.getElement('email-password'),
@@ -126,6 +138,12 @@ class DOMManager {
     getValue(key) {
         const element = this.elements[key];
         return element ? element.value : '';
+    }
+
+    // Get checkbox checked state
+    isChecked(key) {
+        const element = this.elements[key];
+        return element ? element.checked : false;
     }
 
     // Set element text content

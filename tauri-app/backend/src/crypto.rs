@@ -12,20 +12,41 @@ pub fn generate_keypair() -> Result<KeyPair> {
     })
 }
 
-pub fn encrypt_message(private_key: &str, public_key: &str, message: &str) -> Result<String> {
+pub fn encrypt_message(private_key: &str, public_key: &str, message: &str, algorithm: Option<&str>) -> Result<String> {
     // Parse the keys from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
     let public_key = PublicKey::from_bech32(public_key)?;
     
-    // Use NIP-44 encryption (the proper way)
-    let encrypted = nip44::encrypt(
-        &secret_key,
-        &public_key,
-        message,
-        nip44::Version::default()
-    )?;
+    // Determine encryption algorithm (default to NIP-44)
+    let algorithm = algorithm.unwrap_or("nip44");
     
-    Ok(encrypted)
+    match algorithm {
+        "nip04" => {
+            // Use NIP-04 encryption (legacy)
+            let encrypted = nip04::encrypt(&secret_key, &public_key, message)?;
+            Ok(encrypted)
+        },
+        "nip44" => {
+            // Use NIP-44 encryption (the proper way)
+            let encrypted = nip44::encrypt(
+                &secret_key,
+                &public_key,
+                message,
+                nip44::Version::default()
+            )?;
+            Ok(encrypted)
+        },
+        _ => {
+            // Default to NIP-44 for unknown algorithms
+            let encrypted = nip44::encrypt(
+                &secret_key,
+                &public_key,
+                message,
+                nip44::Version::default()
+            )?;
+            Ok(encrypted)
+        }
+    }
 }
 
 pub fn decrypt_message(private_key: &str, public_key: &str, encrypted_message: &str) -> Result<String> {
@@ -91,7 +112,7 @@ mod tests {
         
         let message = "Hello, this is a test message!";
         
-        let encrypted = encrypt_message(&keypair1.private_key, &keypair2.public_key, message).unwrap();
+        let encrypted = encrypt_message(&keypair1.private_key, &keypair2.public_key, message, None).unwrap();
         let decrypted = decrypt_message(&keypair2.private_key, &keypair1.public_key, &encrypted).unwrap();
         
         assert_eq!(message, decrypted);

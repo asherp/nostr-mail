@@ -32,6 +32,7 @@ pub struct EmailMessage {
     pub is_read: bool,
     pub raw_headers: String,
     pub nostr_pubkey: Option<String>,
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,4 +85,23 @@ pub struct ProfileResult {
     pub pubkey: String,
     pub fields: HashMap<String, serde_json::Value>,
     pub raw_content: String,
+}
+
+/// Represents the content of a message with explicit encryption state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MessageContent {
+    /// Plaintext content that needs to be encrypted
+    Plaintext(String),
+    /// Already encrypted content that should be sent as-is
+    Encrypted(String),
+}
+
+/// Request structure for sending direct messages with explicit content type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectMessageRequest {
+    pub sender_private_key: String,
+    pub recipient_pubkey: String,
+    pub content: MessageContent,
+    pub relays: Vec<String>,
+    pub encryption_algorithm: Option<String>, // "nip04" or "nip44"
 } 

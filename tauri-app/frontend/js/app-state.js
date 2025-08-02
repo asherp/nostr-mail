@@ -93,6 +93,15 @@ class AppState {
         return this.sentEmails || [];
     }
 
+    // Drafts management
+    setDrafts(drafts) {
+        this.drafts = drafts;
+    }
+
+    getDrafts() {
+        return this.drafts || [];
+    }
+
     // Settings management
     setSettings(settings) {
         this.settings = settings;

@@ -1007,7 +1007,6 @@ body.dark-mode .email-detail-content .email-detail-body {
     width: 50px;
     height: 50px;
     border-radius: 50%;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1114,6 +1113,39 @@ body.dark-mode .email-detail-content .email-detail-body {
 .modal-body {
     padding: 30px;
     overflow-y: auto;
+}
+
+/* Headers preview modal specific styles */
+.headers-preview {
+    background-color: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: 8px;
+    padding: 20px;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+body.dark-mode .headers-preview {
+    background-color: #2d3748;
+    border-color: #4a5568;
+    color: #e2e8f0;
+}
+
+.modal-footer {
+    padding: 20px 30px;
+    border-top: 1px solid #e0e0e0;
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+
+body.dark-mode .modal-footer {
+    border-top-color: #4a5568;
 }
 
 /* Utility classes */
@@ -1468,7 +1500,6 @@ body.dark-mode .profile-raw-json {
     border-radius: 50%;
     margin-right: 20px;
     object-fit: cover;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -2289,7 +2320,80 @@ body.dark-mode .confirmation-modal .confirmation-actions button {
 }
 
 body.dark-mode .confirmation-modal .confirmation-actions button#confirm-ok {
-    background: #3b82f6 !important;
-    color: #fff !important;
-    border: none !important;
+    background-color: #dc3545;
+    color: #fff;
+}
+
+/* Draft actions styling */
+.draft-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.draft-actions .btn-small {
+    padding: 4px 8px;
+    font-size: 12px;
+    min-width: auto;
+}
+
+.email-item .draft-actions {
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+
+.email-item:hover .draft-actions {
+    opacity: 1;
+}
+
+body.dark-mode .draft-actions .btn-small {
+    background-color: #232946;
+    color: #e0e0e0;
+    border: 1px solid #232946;
+}
+
+body.dark-mode .draft-actions .btn-small:hover {
+    background-color: #181a20;
+    border-color: #181a20;
+}
+
+body.dark-mode .draft-actions .btn-danger.btn-small {
+    background-color: #c82333;
+    color: #fff;
+    border-color: #c82333;
+}
+
+body.dark-mode .draft-actions .btn-danger.btn-small:hover {
+    background-color: #a71e2a;
+    border-color: #a71e2a;
+}
+
+.form-text {
+    font-size: 0.875rem;
+    color: #6c757d;
+    margin-top: 0.25rem;
+}
+
+.checkbox-group {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 8px;
+    display: none; /* Hidden by default, shown when Nostr contact is selected */
+}
+
+.checkbox-group input[type="checkbox"] {
+    margin: 0;
+    margin-top: 2px;
+}
+
+.checkbox-group label {
+    margin: 0;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.checkbox-group .form-text {
+    margin-top: 4px;
+    margin-left: 24px;
 }

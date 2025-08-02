@@ -251,6 +251,12 @@ class Utils {
             return false;
         }
         
+        // Check for NIP-04 format: base64?iv=base64
+        const nip04Regex = /^[A-Za-z0-9+/=]+\?iv=[A-Za-z0-9+/=]+$/;
+        if (nip04Regex.test(content)) {
+            return true;
+        }
+        
         // Check if it looks like base64 encoded content (typical for encrypted data)
         // Base64 contains A-Z, a-z, 0-9, +, /, and = for padding
         const base64Regex = /^[A-Za-z0-9+/=]+$/;

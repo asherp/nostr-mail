@@ -1,3 +1,4 @@
+* checkbox for dm notification
 * fixed double encryption bug in subject dm
 * fix render dm avatar
 * fix follow contact, jwt image rendering

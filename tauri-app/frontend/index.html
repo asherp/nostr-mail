@@ -37,6 +37,9 @@
                 <button class="nav-item" data-tab="sent">
                     <i class="fas fa-paper-plane"></i> Sent
                 </button>
+                <button class="nav-item" data-tab="drafts">
+                    <i class="fas fa-save"></i> Drafts
+                </button>
                 <button class="nav-item" data-tab="dm">
                     <i class="fas fa-comments"></i> Direct Messages
                 </button>
@@ -83,10 +86,21 @@
                         <textarea id="message-body" rows="10" placeholder="Type your message here..."></textarea>
                     </div>
                     
+                    <div class="form-group">
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="send-matching-dm" checked>
+                            <label for="send-matching-dm">Send matching DM</label>
+                            <small class="form-text text-muted">Send a direct message with the same subject line to the selected Nostr contact</small>
+                        </div>
+                    </div>
+                    
                     <div class="form-actions">
                         <button id="encrypt-btn" class="btn btn-secondary" type="button">
                             <span class="encrypt-btn-icon"><i class="fas fa-lock"></i></span>
                             <span class="encrypt-btn-label">Encrypt</span>
+                        </button>
+                        <button id="preview-headers-btn" class="btn btn-secondary" type="button">
+                            <i class="fas fa-eye"></i> Preview Headers
                         </button>
                         <button id="send-btn" class="btn btn-primary">
                             <i class="fas fa-paper-plane"></i> Send
@@ -156,6 +170,31 @@
                     </div>
                     <div class="email-detail-content" id="sent-detail-content">
                         <!-- Sent email detail content will be populated here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Drafts Tab -->
+            <div class="tab-content" id="drafts">
+                <div class="tab-header">
+                    <h2 id="drafts-title">Drafts</h2>
+                    <div class="inbox-actions" id="drafts-actions">
+                        <button id="refresh-drafts" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                <div class="email-list" id="drafts-list">
+                    <!-- Drafts will be populated here -->
+                </div>
+                <div class="email-detail-view" id="drafts-detail-view" style="display: none;">
+                    <div class="email-detail-header">
+                        <button id="back-to-drafts" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Drafts
+                        </button>
+                    </div>
+                    <div class="email-detail-content" id="drafts-detail-content">
+                        <!-- Draft detail content will be populated here -->
                     </div>
                 </div>
             </div>
@@ -301,6 +340,17 @@
                             <button id="generate-key-btn" class="btn btn-secondary">
                                 <i class="fas fa-key"></i> Generate New Keypair
                             </button>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="encryption-algorithm">Encryption Algorithm:</label>
+                            <select id="encryption-algorithm">
+                                <option value="nip44">NIP-44 (Recommended)</option>
+                                <option value="nip04">NIP-04 (Legacy)</option>
+                            </select>
+                            <div class="form-text">
+                                NIP-44 is the modern, secure encryption standard. NIP-04 is legacy and less secure.
+                            </div>
                         </div>
                     </div>
                     

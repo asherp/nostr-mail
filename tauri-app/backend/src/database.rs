@@ -32,6 +32,9 @@ pub struct Email {
     pub is_nostr_encrypted: bool,
     pub nostr_pubkey: Option<String>,
     pub raw_headers: Option<String>,
+    pub is_draft: bool,
+    pub is_read: bool,
+    pub updated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -102,7 +105,7 @@ impl Database {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS emails (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id TEXT UNIQUE NOT NULL,
+                message_id TEXT NOT NULL,
                 from_address TEXT NOT NULL,
                 to_address TEXT NOT NULL,
                 subject TEXT NOT NULL,
@@ -113,6 +116,9 @@ impl Database {
                 is_nostr_encrypted BOOLEAN NOT NULL DEFAULT 0,
                 nostr_pubkey TEXT,
                 raw_headers TEXT,
+                is_draft BOOLEAN NOT NULL DEFAULT 0,
+                is_read BOOLEAN NOT NULL DEFAULT 0,
+                updated_at DATETIME,
                 created_at DATETIME NOT NULL
             )",
             [],
@@ -262,23 +268,23 @@ impl Database {
                 "UPDATE emails SET 
                     message_id = ?, from_address = ?, to_address = ?, subject = ?, 
                     body = ?, body_plain = ?, body_html = ?, received_at = ?, 
-                    is_nostr_encrypted = ?, nostr_pubkey = ?, raw_headers = ?
+                    is_nostr_encrypted = ?, nostr_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?
                 WHERE id = ?",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
-                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, id
+                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now, id
                 ],
             )?;
             Ok(id)
         } else {
             let _id = conn.execute(
-                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
-                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, now
+                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -288,7 +294,7 @@ impl Database {
     pub fn get_email(&self, message_id: &str) -> Result<Option<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, created_at
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
              FROM emails WHERE message_id = ?"
         )?;
         
@@ -307,7 +313,10 @@ impl Database {
                 is_nostr_encrypted: row.get(9)?,
                 nostr_pubkey: row.get(10)?,
                 raw_headers: row.get(11)?,
-                created_at: row.get(12)?,
+                is_draft: row.get(12)?,
+                is_read: row.get(13)?,
+                updated_at: row.get(14)?,
+                created_at: row.get(15)?,
             }))
         } else {
             Ok(None)
@@ -320,7 +329,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, created_at FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
@@ -355,7 +364,10 @@ impl Database {
                 is_nostr_encrypted: row.get(9)?,
                 nostr_pubkey: row.get(10)?,
                 raw_headers: row.get(11)?,
-                created_at: row.get(12)?,
+                is_draft: row.get(12)?,
+                is_read: row.get(13)?,
+                updated_at: row.get(14)?,
+                created_at: row.get(15)?,
             })
         })?;
         rows.collect()
@@ -367,7 +379,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, created_at FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
@@ -398,7 +410,10 @@ impl Database {
                 is_nostr_encrypted: row.get(9)?,
                 nostr_pubkey: row.get(10)?,
                 raw_headers: row.get(11)?,
-                created_at: row.get(12)?,
+                is_draft: row.get(12)?,
+                is_read: row.get(13)?,
+                updated_at: row.get(14)?,
+                created_at: row.get(15)?,
             })
         })?;
         rows.collect()
@@ -620,12 +635,142 @@ impl Database {
 
     pub fn update_email_nostr_pubkey_by_id(&self, id: i64, nostr_pubkey: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        println!("[RUST] Updating nostr_pubkey for id {} to {}", id, nostr_pubkey);
-        let rows = conn.execute(
-            "UPDATE emails SET nostr_pubkey = ?1 WHERE id = ?2",
+        conn.execute(
+            "UPDATE emails SET nostr_pubkey = ? WHERE id = ?",
             params![nostr_pubkey, id],
         )?;
-        println!("[RUST] Rows affected by nostr_pubkey update: {}", rows);
+        Ok(())
+    }
+
+    pub fn find_emails_by_message_id(&self, message_id: &str) -> Result<Vec<Email>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
+             FROM emails WHERE message_id = ? ORDER BY received_at DESC"
+        )?;
+        
+        let rows = stmt.query_map(params![message_id], |row| {
+            Ok(Email {
+                id: Some(row.get(0)?),
+                message_id: row.get(1)?,
+                from_address: row.get(2)?,
+                to_address: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                body_plain: row.get(6)?,
+                body_html: row.get(7)?,
+                received_at: row.get(8)?,
+                is_nostr_encrypted: row.get(9)?,
+                nostr_pubkey: row.get(10)?,
+                raw_headers: row.get(11)?,
+                is_draft: row.get(12)?,
+                is_read: row.get(13)?,
+                updated_at: row.get(14)?,
+                created_at: row.get(15)?,
+            })
+        })?;
+        
+        let mut emails = Vec::new();
+        for row in rows {
+            emails.push(row?);
+        }
+        Ok(emails)
+    }
+
+    // Draft operations
+    pub fn save_draft(&self, draft: &Email) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        
+        if let Some(id) = draft.id {
+            conn.execute(
+                "UPDATE emails SET 
+                    message_id = ?, from_address = ?, to_address = ?, subject = ?, 
+                    body = ?, body_plain = ?, body_html = ?, received_at = ?, 
+                    is_nostr_encrypted = ?, nostr_pubkey = ?, raw_headers = ?, 
+                    is_draft = ?, is_read = ?, updated_at = ?
+                WHERE id = ?",
+                params![
+                    draft.message_id, draft.from_address, draft.to_address, draft.subject,
+                    draft.body, draft.body_plain, draft.body_html, draft.received_at,
+                    draft.is_nostr_encrypted, draft.nostr_pubkey, draft.raw_headers,
+                    true, draft.is_read, now, id
+                ],
+            )?;
+            Ok(id)
+        } else {
+            let _id = conn.execute(
+                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    draft.message_id, draft.from_address, draft.to_address, draft.subject,
+                    draft.body, draft.body_plain, draft.body_html, draft.received_at,
+                    draft.is_nostr_encrypted, draft.nostr_pubkey, draft.raw_headers,
+                    true, draft.is_read, now
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+
+    pub fn get_drafts(&self, user_email: Option<&str>) -> Result<Vec<Email>> {
+        let conn = self.conn.lock().unwrap();
+        let mut query = String::from(
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at FROM emails WHERE is_draft = 1"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        
+        if let Some(email) = user_email {
+            query.push_str(" AND from_address = ?");
+            params.push(Box::new(email));
+        }
+        
+        query.push_str(" ORDER BY updated_at DESC, created_at DESC");
+        
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(Email {
+                id: Some(row.get(0)?),
+                message_id: row.get(1)?,
+                from_address: row.get(2)?,
+                to_address: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                body_plain: row.get(6)?,
+                body_html: row.get(7)?,
+                received_at: row.get(8)?,
+                is_nostr_encrypted: row.get(9)?,
+                nostr_pubkey: row.get(10)?,
+                raw_headers: row.get(11)?,
+                is_draft: row.get(12)?,
+                is_read: row.get(13)?,
+                updated_at: row.get(14)?,
+                created_at: row.get(15)?,
+            })
+        })?;
+        
+        let mut drafts = Vec::new();
+        for row in rows {
+            drafts.push(row?);
+        }
+        Ok(drafts)
+    }
+
+    pub fn delete_draft(&self, message_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM emails WHERE message_id = ? AND is_draft = 1",
+            params![message_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_as_read(&self, message_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE emails SET is_read = 1 WHERE message_id = ?",
+            params![message_id],
+        )?;
         Ok(())
     }
 

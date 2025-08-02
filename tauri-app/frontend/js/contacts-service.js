@@ -873,6 +873,61 @@ class ContactsService {
             window.notificationService.showError('Failed to follow and add contact: ' + error);
         }
     }
+
+    // Refresh the selected contact's profile
+    async refreshSelectedContactProfile() {
+        const selectedContact = window.appState.getSelectedContact();
+        if (!selectedContact) {
+            return;
+        }
+        const pubkey = selectedContact.pubkey;
+        const activeRelays = window.appState.getActiveRelays();
+        if (!pubkey || activeRelays.length === 0) {
+            return;
+        }
+        try {
+            const profile = await window.TauriService.fetchProfile(pubkey, activeRelays);
+            if (profile) {
+                // Update the contact object with new profile fields
+                selectedContact.name = profile.fields.name || profile.fields.display_name || pubkey.substring(0, 16) + '...';
+                selectedContact.picture = profile.fields.picture || '';
+                selectedContact.email = profile.fields.email || null;
+                selectedContact.fields = profile.fields || {};
+                // Optionally update picture_data_url if picture changed
+                if (selectedContact.picture) {
+                    try {
+                        let dataUrl = await window.TauriService.getCachedProfileImage(pubkey);
+                        if (!dataUrl) {
+                            dataUrl = await window.TauriService.fetchImage(selectedContact.picture);
+                            if (dataUrl) {
+                                await window.TauriService.cacheProfileImage(pubkey, dataUrl);
+                            }
+                        }
+                        if (dataUrl) {
+                            selectedContact.picture_data_url = dataUrl;
+                            selectedContact.picture_loaded = true;
+                        }
+                    } catch (e) {
+                        // Ignore image errors
+                    }
+                }
+                // Update in app state
+                const contacts = window.appState.getContacts();
+                const idx = contacts.findIndex(c => c.pubkey === pubkey);
+                if (idx !== -1) {
+                    contacts[idx] = selectedContact;
+                    window.appState.setContacts(contacts);
+                    // Save updated contact to the database
+                    const dbContact = window.DatabaseService.convertContactToDbFormat(selectedContact);
+                    await window.DatabaseService.saveContact(dbContact);
+                }
+                // Re-render the contact detail
+                this.renderContactDetail(selectedContact);
+            }
+        } catch (error) {
+            console.error('Failed to refresh selected contact profile:', error);
+        }
+    }
 }
 
 // Create and export a singleton instance

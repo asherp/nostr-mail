@@ -61,6 +61,9 @@ NostrMailApp.prototype.init = async function() {
         // Populate Nostr contact dropdown for compose page
         emailService.populateNostrContactDropdown();
         
+        // Try to restore saved contact selection
+        emailService.restoreContactSelection();
+        
         console.log('✅ ========================================');
         console.log('✅   Nostr Mail - Successfully Started!');
         console.log('✅ ========================================');
@@ -165,17 +168,34 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (encryptBtn) {
             console.log('[JS] Setting up encrypt button event listener');
             encryptBtn.dataset.encrypted = 'false';
+            // Update DM checkbox visibility on initialization
+            emailService.updateDmCheckboxVisibility();
             encryptBtn.addEventListener('click', async function handleEncryptClick() {
                 const iconSpan = encryptBtn.querySelector('.encrypt-btn-icon i');
                 const labelSpan = encryptBtn.querySelector('.encrypt-btn-label');
                 const isEncrypted = encryptBtn.dataset.encrypted === 'true';
+                const subjectInput = domManager.get('subject');
+                const messageBodyInput = domManager.get('messageBody');
                 if (!isEncrypted) {
                     // Encrypt mode
                     console.log('[JS] Encrypt button clicked');
-                    await emailService.encryptEmailFields();
-                    if (iconSpan) iconSpan.className = 'fas fa-unlock';
-                    if (labelSpan) labelSpan.textContent = 'Decrypt';
-                    encryptBtn.dataset.encrypted = 'true';
+                    const subjectValue = domManager.getValue('subject') || '';
+                    const messageBodyValue = domManager.getValue('messageBody') || '';
+                    if (!subjectValue || !messageBodyValue) {
+                        notificationService.showError('Both subject and message body must be filled to encrypt.');
+                        return;
+                    }
+                    const didEncrypt = await emailService.encryptEmailFields();
+                    if (didEncrypt) {
+                        if (iconSpan) iconSpan.className = 'fas fa-unlock';
+                        if (labelSpan) labelSpan.textContent = 'Decrypt';
+                        encryptBtn.dataset.encrypted = 'true';
+                        // Disable editing
+                        if (subjectInput) subjectInput.disabled = true;
+                        if (messageBodyInput) messageBodyInput.disabled = true;
+                        // Update DM checkbox visibility
+                        emailService.updateDmCheckboxVisibility();
+                    }
                 } else {
                     // Decrypt mode
                     console.log('[JS] Decrypt button clicked');
@@ -183,16 +203,36 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     const privkey = appState.getKeypair().private_key;
                     const pubkey = emailService.selectedNostrContact?.pubkey;
                     const armoredBody = domManager.getValue('messageBody') || '';
-                    // Extract the encrypted content from the armored body
-                    const match = armoredBody.match(/-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n]+)\s*-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----/);
-                    if (match && privkey && pubkey) {
-                        const encryptedContent = match[1].replace(/\s+/g, '');
-                        try {
-                            const decrypted = await TauriService.decryptDmContent(privkey, pubkey, encryptedContent);
-                            domManager.setValue('messageBody', decrypted);
-                            notificationService.showSuccess('Body decrypted');
-                        } catch (err) {
-                            notificationService.showError('Failed to decrypt: ' + err);
+                    const encryptedSubject = domManager.getValue('subject') || '';
+                    // Regex for both NIP-04 and NIP-44 armored messages
+                    const match = armoredBody.match(/-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----/);
+                    let decryptedAny = false;
+                    if (privkey && pubkey) {
+                        // Decrypt subject if it looks encrypted
+                        if (window.Utils && window.Utils.isLikelyEncryptedContent(encryptedSubject)) {
+                            try {
+                                const decryptedSubject = await TauriService.decryptDmContent(privkey, pubkey, encryptedSubject);
+                                domManager.setValue('subject', decryptedSubject);
+                                notificationService.showSuccess('Subject decrypted');
+                                decryptedAny = true;
+                            } catch (err) {
+                                notificationService.showError('Failed to decrypt subject: ' + err);
+                            }
+                        }
+                        // Decrypt body if armored
+                        if (match) {
+                            const encryptedContent = match[2].replace(/\s+/g, '');
+                            try {
+                                const decrypted = await TauriService.decryptDmContent(privkey, pubkey, encryptedContent);
+                                domManager.setValue('messageBody', decrypted);
+                                notificationService.showSuccess('Body decrypted');
+                                decryptedAny = true;
+                            } catch (err) {
+                                notificationService.showError('Failed to decrypt body: ' + err);
+                            }
+                        }
+                        if (!decryptedAny) {
+                            notificationService.showError('No encrypted message found in subject or body');
                         }
                     } else {
                         notificationService.showError('No encrypted message found or missing keys');
@@ -200,10 +240,24 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     if (iconSpan) iconSpan.className = 'fas fa-lock';
                     if (labelSpan) labelSpan.textContent = 'Encrypt';
                     encryptBtn.dataset.encrypted = 'false';
+                    // Re-enable editing
+                    if (subjectInput) subjectInput.disabled = false;
+                    if (messageBodyInput) messageBodyInput.disabled = false;
+                    // Update DM checkbox visibility
+                    emailService.updateDmCheckboxVisibility();
                 }
             });
         } else {
             console.error('[JS] Encrypt button not found in DOM');
+        }
+        
+        // Preview headers button
+        const previewHeadersBtn = domManager.get('previewHeadersBtn');
+        if (previewHeadersBtn) {
+            console.log('[JS] Setting up preview headers button event listener');
+            previewHeadersBtn.addEventListener('click', () => emailService.previewEmailHeaders());
+        } else {
+            console.error('[JS] Preview headers button not found in DOM');
         }
         
         // Nostr contact dropdown
@@ -265,7 +319,10 @@ NostrMailApp.prototype.setupEventListeners = function() {
         
         const refreshContactsBtn = domManager.get('refreshContactsBtn');
         if (refreshContactsBtn) {
-            refreshContactsBtn.addEventListener('click', () => contactsService.refreshContacts());
+            refreshContactsBtn.addEventListener('click', async () => {
+                await contactsService.refreshContacts();
+                await contactsService.refreshSelectedContactProfile();
+            });
         }
         
         const contactsSearch = domManager.get('contactsSearch');
@@ -469,6 +526,19 @@ NostrMailApp.prototype.setupEventListeners = function() {
             backToSentBtn.addEventListener('click', () => emailService.showSentList());
         }
         
+        // Drafts event listeners
+        const refreshDrafts = domManager.get('refreshDrafts');
+        if (refreshDrafts) {
+            refreshDrafts.addEventListener('click', async () => {
+                await emailService.loadDrafts();
+            });
+        }
+        
+        const backToDraftsBtn = domManager.get('backToDrafts');
+        if (backToDraftsBtn) {
+            backToDraftsBtn.addEventListener('click', () => emailService.showDraftsList());
+        }
+        
         console.log('Event listeners set up successfully');
     } catch (error) {
         console.error('Error setting up event listeners:', error);
@@ -529,6 +599,17 @@ NostrMailApp.prototype.switchTab = function(tabName) {
     if (tabName === 'sent') {
         emailService.loadSentEmails();
     }
+    if (tabName === 'drafts') {
+        emailService.loadDrafts();
+    }
+    if (tabName === 'compose') {
+        // Clear current draft state when switching to compose (unless we're loading a draft)
+        if (!emailService.currentDraftId) {
+            emailService.clearCurrentDraft();
+        }
+        // Try to restore contact selection when switching to compose
+        emailService.restoreContactSelection();
+    }
 }
 
 // Modal functions
@@ -574,6 +655,7 @@ NostrMailApp.prototype.saveSettings = async function() {
         
         const settings = {
             npriv_key: nprivKey,
+            encryption_algorithm: domManager.getValue('encryptionAlgorithm') || 'nip44',
             email_address: domManager.getValue('emailAddress') || '',
             password: domManager.getValue('emailPassword') || '',
             smtp_host: domManager.getValue('smtpHost') || '',
@@ -621,6 +703,7 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
     
     try {
         domManager.setValue('nprivKey', settings.npriv_key || '');
+        domManager.setValue('encryptionAlgorithm', settings.encryption_algorithm || 'nip44');
         domManager.setValue('emailAddress', settings.email_address || '');
         domManager.setValue('emailPassword', settings.password || '');
         domManager.setValue('smtpHost', settings.smtp_host || '');

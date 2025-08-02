@@ -35,6 +35,7 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         is_read: true, // or use a real field if available
         raw_headers: raw_headers.clone(),
         nostr_pubkey: email.nostr_pubkey.clone(),
+        message_id: Some(email.message_id.clone()),
     }
 }
 
@@ -69,22 +70,29 @@ fn get_public_key_from_private(private_key: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn send_direct_message(private_key: String, recipient_pubkey: String, message: String, relays: Vec<String>) -> Result<String, String> {
+async fn send_direct_message(request: DirectMessageRequest) -> Result<String, String> {
     println!("[RUST] send_direct_message called");
-    println!("[RUST] Recipient: {}", recipient_pubkey);
-    println!("[RUST] Message: {}", message);
-    println!("[RUST] Relays: {:?}", relays);
+    println!("[RUST] Recipient: {}", request.recipient_pubkey);
+    println!("[RUST] Content type: {:?}", request.content);
+    println!("[RUST] Encryption algorithm: {:?}", request.encryption_algorithm);
+    println!("[RUST] Relays: {:?}", request.relays);
     
-    let result = nostr::send_direct_message(&private_key, &recipient_pubkey, &message, &relays)
-        .await
-        .map(|event_id| {
-            println!("[RUST] Successfully sent message, event ID: {}", event_id);
-            event_id
-        })
-        .map_err(|e| {
-            println!("[RUST] Failed to send message: {}", e);
-            e.to_string()
-        });
+    let result = nostr::send_direct_message_with_content(
+        &request.sender_private_key,
+        &request.recipient_pubkey,
+        &request.content,
+        &request.relays,
+        request.encryption_algorithm.as_deref()
+    )
+    .await
+    .map(|event_id| {
+        println!("[RUST] Successfully sent message, event ID: {}", event_id);
+        event_id
+    })
+    .map_err(|e| {
+        println!("[RUST] Failed to send message: {}", e);
+        e.to_string()
+    });
     
     println!("[RUST] Returning result: {:?}", result);
     result
@@ -173,11 +181,18 @@ async fn publish_nostr_event(private_key: String, content: String, kind: u16, ta
 }
 
 #[tauri::command]
-async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>) -> Result<(), String> {
+async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>) -> Result<(), String> {
     println!("[RUST] send_email called");
-    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref())
+    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref())
         .await
         .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn construct_email_headers(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>) -> Result<String, String> {
+    println!("[RUST] construct_email_headers called");
+    email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref())
         .map_err(|e| e.to_string())
 }
 
@@ -613,8 +628,18 @@ fn db_update_email_nostr_pubkey(message_id: String, nostr_pubkey: String, state:
 
 #[tauri::command]
 fn db_update_email_nostr_pubkey_by_id(id: i64, nostr_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
-    let db = state.get_database()?;
+    println!("[RUST] db_update_email_nostr_pubkey_by_id called");
+    let db = state.get_database().map_err(|e| e.to_string())?;
     db.update_email_nostr_pubkey_by_id(id, &nostr_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_find_emails_by_message_id(message_id: String, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
+    println!("[RUST] db_find_emails_by_message_id called for message_id: {}", message_id);
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let emails = db.find_emails_by_message_id(&message_id).map_err(|e| e.to_string())?;
+    let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
+    Ok(mapped)
 }
 
 #[tauri::command]
@@ -795,7 +820,28 @@ async fn follow_user(private_key: String, pubkey_to_follow: String, relays: Vec<
 #[tauri::command]
 fn encrypt_nip04_message(private_key: String, public_key: String, message: String) -> Result<String, String> {
     println!("[RUST] encrypt_nip04_message called");
-    crypto::encrypt_message(&private_key, &public_key, &message).map_err(|e| e.to_string())
+    crypto::encrypt_message(&private_key, &public_key, &message, Some("nip04")).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn encrypt_nip04_message_legacy(private_key: String, public_key: String, message: String) -> Result<String, String> {
+    println!("[RUST] encrypt_nip04_message_legacy called");
+    use nostr_sdk::prelude::*;
+    
+    // Parse the keys from bech32 format
+    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let public_key = PublicKey::from_bech32(&public_key).map_err(|e| e.to_string())?;
+    
+    // Use NIP-04 encryption (legacy)
+    let encrypted = nip04::encrypt(&secret_key, &public_key, message).map_err(|e| e.to_string())?;
+    
+    Ok(encrypted)
+}
+
+#[tauri::command]
+fn encrypt_message_with_algorithm(private_key: String, public_key: String, message: String, algorithm: String) -> Result<String, String> {
+    println!("[RUST] encrypt_message_with_algorithm called with algorithm: {}", algorithm);
+    crypto::encrypt_message(&private_key, &public_key, &message, Some(&algorithm)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -914,6 +960,31 @@ async fn update_profile(private_key: String, fields: std::collections::HashMap<S
     Ok(())
 }
 
+// Draft operations
+#[tauri::command]
+fn db_save_draft(draft: DbEmail, state: tauri::State<AppState>) -> Result<i64, String> {
+    let db = state.get_database()?;
+    db.save_draft(&draft).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_drafts(user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<DbEmail>, String> {
+    let db = state.get_database()?;
+    db.get_drafts(user_email.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_delete_draft(message_id: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let db = state.get_database()?;
+    db.delete_draft(&message_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_mark_as_read(message_id: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let db = state.get_database()?;
+    db.mark_as_read(&message_id).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("[RUST] Starting nostr-mail application...");
@@ -978,6 +1049,7 @@ pub fn run() {
         decrypt_dm_content,
         publish_nostr_event,
         send_email,
+        construct_email_headers,
         fetch_emails,
         fetch_nostr_emails_last_24h,
         fetch_nostr_emails_smart,
@@ -1028,6 +1100,7 @@ pub fn run() {
         db_get_emails,
         db_update_email_nostr_pubkey,
         db_update_email_nostr_pubkey_by_id,
+        db_find_emails_by_message_id,
         db_get_sent_emails,
         db_save_dm,
         db_get_dms_for_conversation,
@@ -1039,6 +1112,8 @@ pub fn run() {
         db_clear_all_data,
         follow_user,
         encrypt_nip04_message,
+        encrypt_nip04_message_legacy,
+        encrypt_message_with_algorithm,
         db_save_relay,
         db_get_all_relays,
         db_delete_relay,
@@ -1047,6 +1122,10 @@ pub fn run() {
         db_get_all_dm_pubkeys,
         db_get_all_dm_pubkeys_sorted,
         update_profile,
+        db_save_draft,
+        db_get_drafts,
+        db_delete_draft,
+        db_mark_as_read,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     

@@ -52,11 +52,53 @@ const TauriService = {
     getPublicKeyFromPrivate: async function(privateKey) {
         return await this.invoke('get_public_key_from_private', { privateKey });
     },
-    encryptNip04Message: async function(privateKey, publicKey, message) {
+    encryptNip44Message: async function(privateKey, publicKey, message) {
         return await this.invoke('encrypt_nip04_message', { privateKey, publicKey, message });
     },
+    encryptNip04MessageLegacy: async function(privateKey, publicKey, message) {
+        return await this.invoke('encrypt_nip04_message_legacy', { privateKey, publicKey, message });
+    },
+    
+    encryptMessageWithAlgorithm: async function(privateKey, publicKey, message, algorithm) {
+        return await this.invoke('encrypt_message_with_algorithm', { privateKey, publicKey, message, algorithm });
+    },
     sendDirectMessage: async function(privateKey, recipientPubkey, message, relays) {
-        return await this.invoke('send_direct_message', { privateKey, recipientPubkey, message, relays });
+        // Determine if the message is already encrypted
+        const isEncrypted = Utils.isLikelyEncryptedContent(message);
+        
+        // Get encryption algorithm from settings
+        const settings = window.appState?.getSettings();
+        const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+        
+        // Create the request with explicit content type
+        const request = {
+            sender_private_key: privateKey,
+            recipient_pubkey: recipientPubkey,
+            content: isEncrypted ? 
+                { Encrypted: message } : 
+                { Plaintext: message },
+            relays: relays,
+            encryption_algorithm: encryptionAlgorithm
+        };
+        
+        return await this.invoke('send_direct_message', request);
+    },
+    
+    sendEncryptedDirectMessage: async function(privateKey, recipientPubkey, encryptedMessage, relays) {
+        // Get encryption algorithm from settings
+        const settings = window.appState?.getSettings();
+        const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+        
+        // Explicitly send already-encrypted content
+        const request = {
+            sender_private_key: privateKey,
+            recipient_pubkey: recipientPubkey,
+            content: { Encrypted: encryptedMessage },
+            relays: relays,
+            encryption_algorithm: encryptionAlgorithm
+        };
+        
+        return await this.invoke('send_direct_message', request);
     },
     fetchDirectMessages: async function(privateKey, relays) {
         return await this.invoke('fetch_direct_messages', { privateKey, relays });
@@ -88,12 +130,25 @@ const TauriService = {
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
     },
-    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null) {
+    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
         }
+        if (messageId) {
+            args.messageId = messageId;
+        }
         return await this.invoke('send_email', args);
+    },
+    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null) {
+        const args = { emailConfig, toAddress, subject, body };
+        if (nostrNpub) {
+            args.nostrNpub = nostrNpub;
+        }
+        if (messageId) {
+            args.messageId = messageId;
+        }
+        return await this.invoke('construct_email_headers', args);
     },
     fetchEmails: async function(emailConfig, limit, searchQuery, onlyNostr = true) {
         return await this.invoke('fetch_emails', { emailConfig, limit, searchQuery, onlyNostr });
@@ -179,8 +234,27 @@ const TauriService = {
     filterNewContacts: async function(pubkeys) {
         return await this.invoke('db_filter_new_contacts', { pubkeys });
     },
+    findEmailsByMessageId: async function(messageId) {
+        return await this.invoke('db_find_emails_by_message_id', { messageId });
+    },
     fetchFollowingPubkeys: async function(pubkey, relays) {
         return await this.invoke('fetch_nostr_following_pubkeys', { pubkey, relays });
+    },
+    // Draft operations
+    saveDraft: async function(draft) {
+        return await this.invoke('db_save_draft', { draft });
+    },
+
+    getDrafts: async function(userEmail) {
+        return await this.invoke('db_get_drafts', { userEmail });
+    },
+
+    deleteDraft: async function(messageId) {
+        return await this.invoke('db_delete_draft', { messageId });
+    },
+
+    markAsRead: async function(messageId) {
+        return await this.invoke('db_mark_as_read', { messageId });
     }
 };
 window.TauriService = TauriService; 

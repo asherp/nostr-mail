@@ -551,6 +551,18 @@ impl Database {
         }
     }
 
+    pub fn get_dm_encrypted_content_by_event_id(&self, event_id: &str) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT content FROM direct_messages WHERE event_id = ?"
+        )?;
+        let mut rows = stmt.query_map(params![event_id], |row| {
+            Ok(row.get::<_, String>(0)?)
+        })?;
+        
+        rows.next().ok_or(rusqlite::Error::QueryReturnedNoRows)?
+    }
+
     // Settings operations
     pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();

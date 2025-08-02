@@ -45,7 +45,21 @@ class DMService {
             const lastMessage = lastMessageObj.content;
             const lastMessageTime = new Date(lastMessageObj.created_at);
 
-            // 3. Always fetch contact info from the database
+            // 3. Check if any messages have email matches
+            let hasEmailMatch = false;
+            for (const msg of messages) {
+                const emailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
+                    dmEventId: msg.event_id,
+                    userPubkey: myPubkey,
+                    contactPubkey: contactPubkey
+                });
+                if (emailMatch) {
+                    hasEmailMatch = true;
+                    break;
+                }
+            }
+
+            // 4. Always fetch contact info from the database
             const profile = await window.DatabaseService.getContact(contactPubkey);
             const name = profile?.name || contactPubkey.substring(0, 16) + '...';
             // Use picture_data_url for avatars, fallback to picture_url or picture
@@ -61,14 +75,15 @@ class DMService {
                 messageCount: messages.length,
                 picture_data_url,
                 picture, // ensure this is set for avatar fallback
-                profileLoaded
+                profileLoaded,
+                hasEmailMatch // New field to track if this conversation has email matches
             });
 
-            // 6. Cache decrypted messages in appState
+            // 5. Cache decrypted messages in appState
             window.appState.setDmMessages(contactPubkey, messages);
         }
 
-        // 7. Set and render contacts
+        // 6. Set and render contacts
         window.appState.setDmContacts(dmContacts);
         this.renderDmContacts();
     }
@@ -243,11 +258,17 @@ class DMService {
                 }
                 // --- End avatar fallback logic ---
                 
+                // Add email emoji if this conversation has email matches
+                let emailEmoji = '';
+                if (contact.hasEmailMatch) {
+                    emailEmoji = '<span class="email-emoji"><i class="fas fa-envelope"></i></span>';
+                }
+                
                 contactElement.innerHTML = `
                     <img class="${avatarClass}" src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
                     <div class="dm-contact-content">
                         <div class="dm-contact-header">
-                            <div class="dm-contact-name">${contact.name}</div>
+                            <div class="dm-contact-name">${contact.name} ${emailEmoji}</div>
                             <div class="dm-contact-time">${timeAgo}</div>
                         </div>
                         <div class="dm-contact-preview">${previewText}</div>
@@ -294,30 +315,66 @@ class DMService {
             window.notificationService.showError('No keypair available');
             return;
         }
+        
+        const myPubkey = window.appState.getKeypair().public_key;
+        const privateKey = window.appState.getKeypair().private_key;
+        
         // Check if messages are already cached
-        if (window.appState.getDmMessages(contactPubkey) && window.appState.getDmMessages(contactPubkey).length > 0) {
+        const cachedMessages = window.appState.getDmMessages(contactPubkey);
+        if (cachedMessages && cachedMessages.length > 0) {
             console.log(`[JS] Using cached messages for ${contactPubkey}`);
+            // Even with cached messages, we need to check for email matches
+            const messagesWithEmailMatches = await Promise.all(cachedMessages.map(async (msg) => {
+                // Check if this DM content matches an encrypted email subject
+                console.log(`[JS] Checking email match for cached message: ${msg.content.substring(0, 50)}...`);
+                const hasEmailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
+                    dmEventId: msg.event_id,
+                    userPubkey: myPubkey,
+                    contactPubkey: contactPubkey
+                });
+                console.log(`[JS] Email match result for cached message: ${hasEmailMatch}`);
+                
+                return {
+                    ...msg,
+                    hasEmailMatch: hasEmailMatch
+                };
+            }));
+            
+            window.appState.setDmMessages(contactPubkey, messagesWithEmailMatches);
             this.renderDmMessages(contactPubkey);
             return;
         }
+        
         try {
-            const myPubkey = window.appState.getKeypair().public_key;
-            const privateKey = window.appState.getKeypair().private_key;
             // Fetch conversation messages from the local database (decrypted)
             const messages = await window.__TAURI__.core.invoke('db_get_decrypted_dms_for_conversation', {
                 privateKey: privateKey,
                 userPubkey: myPubkey,
                 contactPubkey: contactPubkey
             });
-            // Convert to the format expected by the UI
-            const formattedMessages = messages.map(msg => ({
-                id: msg.id,
-                content: msg.content,
-                created_at: msg.created_at || msg.timestamp,
-                sender_pubkey: msg.sender_pubkey,
-                is_sent: msg.sender_pubkey === myPubkey,
-                confirmed: true // All DB messages are confirmed
+            
+            // Check for email matches for each message
+            const formattedMessages = await Promise.all(messages.map(async (msg) => {
+                // Check if this DM content matches an encrypted email subject
+                console.log(`[JS] Checking email match for message: ${msg.content.substring(0, 50)}...`);
+                const hasEmailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
+                    dmEventId: msg.event_id,
+                    userPubkey: myPubkey,
+                    contactPubkey: contactPubkey
+                });
+                console.log(`[JS] Email match result for message: ${hasEmailMatch}`);
+                
+                return {
+                    id: msg.id,
+                    content: msg.content,
+                    created_at: msg.created_at || msg.timestamp,
+                    sender_pubkey: msg.sender_pubkey,
+                    is_sent: msg.sender_pubkey === myPubkey,
+                    confirmed: true, // All DB messages are confirmed
+                    hasEmailMatch: hasEmailMatch // New field to track email matches
+                };
             }));
+            
             window.appState.setDmMessages(contactPubkey, formattedMessages);
             this.renderDmMessages(contactPubkey);
             console.log(`✅ Loaded ${formattedMessages.length} messages from DB`);
@@ -408,10 +465,37 @@ class DMService {
                     } else {
                         dateObj = new Date(message.created_at);
                     }
-                    const time = dateObj.toString() === 'Invalid Date' ? 'Unknown' : dateObj.toLocaleTimeString([], { 
-                        hour: '2-digit', 
-                        minute: '2-digit' 
-                    });
+                    
+                    // Format date and time
+                    let dateTimeDisplay = 'Unknown';
+                    if (dateObj.toString() !== 'Invalid Date') {
+                        const now = new Date();
+                        const isToday = dateObj.toDateString() === now.toDateString();
+                        const isYesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000).toDateString() === dateObj.toDateString();
+                        
+                        if (isToday) {
+                            // Today: show time only
+                            dateTimeDisplay = dateObj.toLocaleTimeString([], { 
+                                hour: '2-digit', 
+                                minute: '2-digit' 
+                            });
+                        } else if (isYesterday) {
+                            // Yesterday: show "Yesterday" and time
+                            dateTimeDisplay = `Yesterday ${dateObj.toLocaleTimeString([], { 
+                                hour: '2-digit', 
+                                minute: '2-digit' 
+                            })}`;
+                        } else {
+                            // Other days: show date and time
+                            dateTimeDisplay = dateObj.toLocaleDateString([], {
+                                month: 'short',
+                                day: 'numeric'
+                            }) + ' ' + dateObj.toLocaleTimeString([], { 
+                                hour: '2-digit', 
+                                minute: '2-digit' 
+                            });
+                        }
+                    }
                     
                     // Add checkmark for sent messages
                     let statusIcon = '';
@@ -428,15 +512,55 @@ class DMService {
                         }
                     }
                     
-                    messageElement.innerHTML = `
-                        <div class="message-content">
-                            <div class="message-text">${window.Utils.escapeHtml(message.content)}</div>
-                            <div class="message-meta">
-                                <div class="message-time">${time}</div>
-                                ${statusIcon}
+                    // Add email emoji if it's an email match
+                    let emailEmoji = '';
+                    console.log(`[JS] Message ${index} hasEmailMatch:`, message.hasEmailMatch);
+                    if (message.hasEmailMatch) {
+                        emailEmoji = '<span class="email-emoji"><i class="fas fa-envelope"></i></span>';
+                        console.log(`[JS] Adding email emoji to message ${index}`);
+                    }
+
+                    if (message.hasEmailMatch) {
+                        // For messages with email matches, replace DM content with details
+                        const dmContent = `
+                            <details class="email-body-details">
+                                <summary class="email-body-summary">${window.Utils.escapeHtml(message.content)}</summary>
+                                <div class="email-body-content"></div>
+                            </details>
+                        `;
+                        
+                        messageElement.innerHTML = `
+                            <div class="message-content">
+                                <div class="message-text">${dmContent}</div>
+                                <div class="message-meta">
+                                    <div class="message-time">${dateTimeDisplay}</div>
+                                    ${statusIcon}
+                                    <span class="email-emoji"><i class="fas fa-envelope"></i></span>
+                                </div>
                             </div>
-                        </div>
-                    `;
+                        `;
+                        
+                        // Handle details toggle to load email body
+                        const detailsElement = messageElement.querySelector('.email-body-details');
+                        if (detailsElement) {
+                            detailsElement.addEventListener('toggle', async (event) => {
+                                if (event.target.open) {
+                                    await this.loadEmailBody(message, detailsElement, contactPubkey);
+                                }
+                            });
+                        }
+                    } else {
+                        // For regular messages, use normal message structure
+                        messageElement.innerHTML = `
+                            <div class="message-content">
+                                <div class="message-text">${window.Utils.escapeHtml(message.content)}</div>
+                                <div class="message-meta">
+                                    <div class="message-time">${dateTimeDisplay}</div>
+                                    ${statusIcon}
+                                </div>
+                            </div>
+                        `;
+                    }
                     
                     messagesContainer.appendChild(messageElement);
                 });
@@ -847,6 +971,43 @@ class DMService {
         const dmContact = window.appState.getDmContacts().find(c => c.pubkey === pubkey) || contact;
         window.appState.setSelectedDmContact(dmContact);
         this.loadDmMessages(pubkey);
+    }
+
+    // Load email body into details element
+    async loadEmailBody(message, detailsElement, contactPubkey) {
+        const emailBodyContent = detailsElement.querySelector('.email-body-content');
+        if (emailBodyContent && !emailBodyContent.innerHTML.trim()) {
+            // Show loading state
+            emailBodyContent.innerHTML = '<div style="padding: 10px; text-align: center; color: #666;"><i class="fas fa-spinner fa-spin"></i> Loading email...</div>';
+            
+            try {
+                // Fetch and display email body
+                const privateKey = window.appState.getKeypair().private_key;
+                const userPubkey = window.appState.getKeypair().public_key;
+                
+                const emailBody = await window.__TAURI__.core.invoke('db_get_matching_email_body', {
+                    dmEventId: message.event_id,
+                    privateKey: privateKey,
+                    userPubkey: userPubkey,
+                    contactPubkey: contactPubkey
+                });
+                
+                if (emailBody) {
+                    emailBodyContent.innerHTML = `
+                        <div class="email-body-display">
+                            <div class="email-body-content-text">
+                                ${window.Utils.escapeHtml(emailBody)}
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    emailBodyContent.innerHTML = '<div style="padding: 10px; color: #888; text-align: center;">No matching email found</div>';
+                }
+            } catch (error) {
+                console.error('Failed to fetch email body:', error);
+                emailBodyContent.innerHTML = '<div style="padding: 10px; color: #dc3545; text-align: center;">Failed to load email body</div>';
+            }
+        }
     }
 }
 

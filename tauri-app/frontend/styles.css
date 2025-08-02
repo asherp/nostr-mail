@@ -527,6 +527,9 @@ body.dark-mode .dm-search-icon {
 .message-time {
     font-size: 11px;
     opacity: 0.7;
+    white-space: nowrap;
+    min-width: 60px;
+    text-align: right;
 }
 
 .message-status {
@@ -544,6 +547,36 @@ body.dark-mode .dm-search-icon {
 
 .message-status.confirmed {
     color: #2196F3;
+}
+
+/* Email emoji styling */
+.message-meta .email-emoji {
+    font-size: 12px;
+    opacity: 0.8;
+    margin-left: 4px;
+}
+
+.message-meta .email-emoji i {
+    font-size: 12px;
+}
+
+.message-sent .message-meta .email-emoji {
+    color: rgba(255, 255, 255, 0.9);
+}
+
+.message-received .message-meta .email-emoji {
+    color: var(--muted-color);
+}
+
+/* Email emoji in DM contact names */
+.dm-contact-name .email-emoji {
+    font-size: 14px;
+    margin-left: 6px;
+    opacity: 0.8;
+}
+
+.dm-contact-name .email-emoji i {
+    font-size: 14px;
 }
 
 .message-sent .message-time {
@@ -2417,4 +2450,211 @@ body.dark-mode .draft-actions .btn-danger.btn-small:hover {
 .checkbox-group .form-text {
     margin-top: 4px;
     margin-left: 24px;
+}
+
+/* Email body display styling */
+.email-body-container {
+    margin-top: 8px;
+    margin-left: 16px;
+    margin-right: 16px;
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--light-bg);
+    border: 1px solid var(--border-color);
+}
+
+.message-sent .email-body-container {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.message-received .email-body-container {
+    background: var(--light-bg);
+    border-color: var(--border-color);
+}
+
+.email-body-display {
+    padding: 0;
+}
+
+.email-body-header {
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, 0.05);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted-color);
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.message-sent .email-body-header {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.8);
+    border-bottom-color: rgba(255, 255, 255, 0.2);
+}
+
+.email-body-content {
+    padding: 12px;
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--text-color);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.message-sent .email-body-content {
+    color: rgba(255, 255, 255, 0.9);
+}
+
+/* Dark mode support for email body */
+body.dark-mode .email-body-container {
+    background: var(--light-bg-dark);
+    border-color: var(--border-color-dark);
+}
+
+body.dark-mode .email-body-header {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--muted-color-dark);
+    border-bottom-color: var(--border-color-dark);
+}
+
+body.dark-mode .email-body-content {
+    color: var(--text-color-dark);
+}
+
+/* Email body details styling */
+.email-body-details {
+    margin: 0;
+    border-radius: 0;
+    overflow: visible;
+    background: transparent;
+    border: none;
+}
+
+.message-sent .email-body-details {
+    background: transparent;
+    border: none;
+}
+
+.message-received .email-body-details {
+    background: transparent;
+    border: none;
+}
+
+.email-body-summary {
+    padding: 0;
+    background: transparent;
+    font-size: inherit;
+    color: inherit;
+    border: none;
+    cursor: pointer;
+    list-style: none;
+    line-height: inherit;
+    word-wrap: inherit;
+    display: inline;
+}
+
+.message-sent .email-body-summary {
+    background: transparent;
+    color: inherit;
+    border: none;
+}
+
+.email-body-summary::-webkit-details-marker {
+    display: none;
+}
+
+.email-body-summary::before {
+    content: '▶';
+    font-size: 10px;
+    margin-right: 4px;
+    transition: transform 0.2s ease;
+    color: inherit;
+}
+
+.email-body-details[open] .email-body-summary::before {
+    transform: rotate(90deg);
+}
+
+.email-body-content {
+    margin-top: 8px;
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.05);
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+}
+
+.message-sent .email-body-content {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.email-body-summary .message-text {
+    margin-bottom: 4px;
+    font-size: 14px;
+    line-height: 1.4;
+    word-wrap: break-word;
+    white-space: pre-wrap;
+}
+
+.email-body-summary .message-meta {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    font-size: 11px;
+    opacity: 0.7;
+}
+
+.email-body-content {
+    margin-top: 8px;
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.05);
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+}
+
+.message-sent .email-body-content {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.email-body-content-text {
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--text-color);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.message-sent .email-body-content-text {
+    color: rgba(255, 255, 255, 0.9);
+}
+
+/* Dark mode support for email body details */
+body.dark-mode .email-body-details {
+    background: var(--light-bg-dark);
+    border-color: var(--border-color-dark);
+}
+
+body.dark-mode .email-body-summary {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--muted-color-dark);
+    border-bottom-color: var(--border-color-dark);
+}
+
+body.dark-mode .email-body-content-text {
+    color: var(--text-color-dark);
+}
+
+/* Hover effect for clickable messages */
+.message-content[style*="cursor: pointer"]:hover {
+    opacity: 0.9;
+    transition: opacity 0.2s ease;
 }

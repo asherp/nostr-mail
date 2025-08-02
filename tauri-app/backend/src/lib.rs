@@ -1004,6 +1004,132 @@ fn db_mark_as_read(message_id: String, state: tauri::State<AppState>) -> Result<
     db.mark_as_read(&message_id).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<bool, String> {
+    println!("[RUST] db_check_dm_matches_email_encrypted called for DM event_id: {}", dm_event_id);
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    
+    // Get the encrypted DM content from the database using a proper method
+    // We'll need to add this method to the database module
+    let encrypted_dm_content = db.get_dm_encrypted_content_by_event_id(&dm_event_id)
+        .map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Found encrypted DM content length: {}", encrypted_dm_content.len());
+    println!("[RUST] Encrypted DM content sample: {}", encrypted_dm_content.chars().take(50).collect::<String>());
+    
+    // Get all emails for this user that have encrypted subjects
+    let emails = db.get_emails(None, None, Some(true), None).map_err(|e| e.to_string())?;
+    println!("[RUST] Found {} emails with encrypted subjects", emails.len());
+    
+    for email in emails {
+        println!("[RUST] Checking email ID {} with subject length: {}", email.id.unwrap_or(0), email.subject.len());
+        println!("[RUST] Email subject sample: {}", email.subject.chars().take(50).collect::<String>());
+        
+        // Check if the encrypted email subject matches the encrypted DM content
+        if email.subject == encrypted_dm_content {
+            println!("[RUST] Found matching email for DM content. Email ID: {}, Subject length: {}", 
+                email.id.unwrap_or(0), email.subject.len());
+            return Ok(true);
+        }
+    }
+    
+    println!("[RUST] No matching email found for DM content");
+    Ok(false)
+}
+
+/// Extract encrypted content from ASCII armor
+fn extract_encrypted_content_from_armor(body: &str) -> Option<String> {
+    // Look for the start and end markers
+    let start_marker = "-----BEGIN NOSTR NIP-";
+    let end_marker = "-----END NOSTR NIP-";
+    
+    if let Some(start_pos) = body.find(start_marker) {
+        if let Some(end_pos) = body.find(end_marker) {
+            // Find the actual start of encrypted content (after the header line)
+            if let Some(content_start) = body[start_pos..].find('\n') {
+                let content_start = start_pos + content_start + 1;
+                let encrypted_content = &body[content_start..end_pos];
+                
+                // Remove whitespace from the encrypted content
+                let cleaned_content = encrypted_content.replace(|c: char| c.is_whitespace(), "");
+                return Some(cleaned_content);
+            }
+        }
+    }
+    
+    None
+}
+
+#[tauri::command]
+fn db_get_matching_email_body(dm_event_id: String, private_key: String, user_pubkey: String, contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<String>, String> {
+    println!("[RUST] db_get_matching_email_body called for DM event_id: {}", dm_event_id);
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    
+    // Get the encrypted DM content from the database
+    let encrypted_dm_content = db.get_dm_encrypted_content_by_event_id(&dm_event_id)
+        .map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Found encrypted DM content length: {}", encrypted_dm_content.len());
+    
+    // Get all emails for this user that have encrypted subjects
+    let emails = db.get_emails(None, None, Some(true), None).map_err(|e| e.to_string())?;
+    println!("[RUST] Found {} emails with encrypted subjects", emails.len());
+    
+    for email in emails {
+        // Check if the encrypted email subject matches the encrypted DM content
+        if email.subject == encrypted_dm_content {
+            println!("[RUST] Found matching email for DM content. Email ID: {}, Subject length: {}", 
+                email.id.unwrap_or(0), email.subject.len());
+            
+            // Extract recipient email from the email
+            let recipient_email = email.to_address;
+            println!("[RUST] Recipient email: {}", recipient_email);
+            
+            // Find the recipient's pubkey using the email address
+            let recipient_pubkeys = db.find_pubkeys_by_email(&recipient_email)
+                .map_err(|e| e.to_string())?;
+            
+            if recipient_pubkeys.is_empty() {
+                println!("[RUST] No pubkeys found for recipient email: {}", recipient_email);
+                return Ok(None);
+            }
+            
+            // Extract encrypted content from ASCII armor
+            let encrypted_content = match extract_encrypted_content_from_armor(&email.body) {
+                Some(content) => {
+                    println!("[RUST] Extracted encrypted content from ASCII armor, length: {}", content.len());
+                    content
+                },
+                None => {
+                    println!("[RUST] No ASCII armor found in email body, trying raw body");
+                    email.body.clone()
+                }
+            };
+            
+            // Try to decrypt the email body using each recipient pubkey
+            for recipient_pubkey in recipient_pubkeys {
+                println!("[RUST] Trying to decrypt with recipient pubkey: {}", recipient_pubkey);
+                match nostr::decrypt_dm_content(&private_key, &recipient_pubkey, &encrypted_content) {
+                    Ok(decrypted_body) => {
+                        println!("[RUST] Successfully decrypted email body with pubkey: {}", recipient_pubkey);
+                        return Ok(Some(decrypted_body));
+                    },
+                    Err(e) => {
+                        println!("[RUST] Failed to decrypt with pubkey {}: {}", recipient_pubkey, e);
+                        // Continue to try the next pubkey
+                    }
+                }
+            }
+            
+            println!("[RUST] Failed to decrypt email body with any recipient pubkey");
+            return Ok(None);
+        }
+    }
+    
+    println!("[RUST] No matching email found for DM content");
+    Ok(None)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("[RUST] Starting nostr-mail application...");
@@ -1147,6 +1273,8 @@ pub fn run() {
         db_get_drafts,
         db_delete_draft,
         db_mark_as_read,
+        db_check_dm_matches_email_encrypted,
+        db_get_matching_email_body,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     

@@ -1,3 +1,4 @@
+* email body inline with DM
 * checkbox for dm notification
 * fixed double encryption bug in subject dm
 * fix render dm avatar

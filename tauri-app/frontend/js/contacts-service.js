@@ -271,8 +271,15 @@ class ContactsService {
             
             // Always render avatar as an <img> tag
             let avatarElement = `
-                <div class="contact-detail-avatar">
-                    <img src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+                <div class="contact-detail-header">
+                    <img class="profile-picture" src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='profile-picture';" style="width:120px;height:120px;object-fit:cover;border-radius:50%;margin-right:20px;">
+                    <div class="contact-detail-info">
+                        <h3>${contact.name}</h3>
+                        <div class="contact-detail-pubkey">
+                            <code>${contact.pubkey}</code>
+                        </div>
+                        ${contact.email ? `<div class="contact-detail-email">${contact.email}</div>` : ''}
+                    </div>
                 </div>
             `;
             
@@ -332,13 +339,7 @@ class ContactsService {
             // Build contact detail HTML
             const detailHTML = `
                 <div class="contact-detail-content">
-                    <div class="contact-detail-header">
-                        ${avatarElement}
-                        <div class="contact-detail-info">
-                            <h3>${contact.name}</h3>
-                            <div class="contact-detail-pubkey">${contact.pubkey}</div>
-                        </div>
-                    </div>
+                    ${avatarElement}
                     
                     <div class="contact-detail-section">
                         <h4>Profile Information</h4>

@@ -1,0 +1,186 @@
+/* Forms */
+.compose-form,
+.profile-form,
+.settings-form {
+    flex: 1;
+    padding: 30px;
+    overflow-y: auto;
+}
+
+.form-group {
+    margin-bottom: var(--spacing-lg);
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: var(--spacing-sm);
+    font-weight: 500;
+    color: #555;
+}
+
+.form-group input,
+.form-group textarea,
+.form-group select {
+    width: 100%;
+    padding: var(--spacing-sm) var(--spacing-md);
+    border: 2px solid #e0e0e0;
+    border-radius: var(--radius-md);
+    font-size: 1rem;
+    transition: border-color 0.3s ease;
+    background-color: #fff;
+}
+
+.form-group input:focus,
+.form-group textarea:focus,
+.form-group select:focus {
+    outline: none;
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+}
+
+/* Select dropdown specific styling */
+.form-group select {
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23343a40' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    background-size: 16px 12px;
+    padding-right: 40px;
+}
+
+.form-group select:focus {
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23667eea' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");
+}
+
+/* Dark mode select styling */
+body.dark-mode .form-group select {
+    background-color: #232946;
+    color: #e0e0e0;
+    border-color: #232946;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23e0e0e0' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");
+}
+
+body.dark-mode .form-group select:focus {
+    border-color: #667eea;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23667eea' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");
+}
+
+/* Form text styling */
+.form-text {
+    display: block;
+    margin-top: 5px;
+    font-size: 0.85rem;
+    color: #6c757d;
+    font-style: italic;
+}
+
+body.dark-mode .form-text {
+    color: #a0a0a0;
+}
+
+.form-help {
+    display: block;
+    margin-top: 5px;
+    font-size: 0.85rem;
+    color: #6c757d;
+    font-style: italic;
+}
+
+.input-with-button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.input-with-button input {
+    flex: 1;
+}
+
+.input-with-button button {
+    flex-shrink: 0;
+    min-width: 40px;
+}
+
+.input-with-button button:first-of-type {
+    margin-left: 0;
+}
+
+/* Eye button specific styling */
+.input-with-button button[id*="toggle"] {
+    padding: 8px 12px;
+    background-color: #f8f9fa;
+    color: #6c757d;
+    border: 2px solid #e9ecef;
+}
+
+.input-with-button button[id*="toggle"]:hover {
+    background-color: #e9ecef;
+    color: #495057;
+}
+
+body.dark-mode .input-with-button button[id*="toggle"] {
+    background-color: #232946;
+    color: #e0e0e0;
+    border: 2px solid #232946;
+}
+
+body.dark-mode .input-with-button button[id*="toggle"]:hover {
+    background-color: #181a20;
+    color: #e0e0e0;
+}
+
+/* Dark mode form styling */
+body.dark-mode .form-group input,
+body.dark-mode .form-group textarea {
+    background-color: #181a20;
+    color: #e0e0e0;
+    border: 2px solid #232946;
+}
+
+body.dark-mode .form-group input:focus,
+body.dark-mode .form-group textarea:focus {
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+}
+
+/* Checkbox group styling */
+.checkbox-group {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 8px;
+    display: none; /* Hidden by default, shown when Nostr contact is selected */
+}
+
+.checkbox-group input[type="checkbox"] {
+    margin: 0;
+    margin-top: 2px;
+}
+
+.checkbox-group label {
+    margin: 0;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.checkbox-group .form-text {
+    margin-top: 4px;
+    margin-left: 24px;
+}
+
+/* Form text utility */
+.form-text {
+    font-size: 0.875rem;
+    color: #6c757d;
+    margin-top: 0.25rem;
+}
+
+body.dark-mode .form-text {
+    color: #a0a0a0;
+}
+
+.form-group textarea {
+    resize: vertical;
+    min-height: 100px;
+} 

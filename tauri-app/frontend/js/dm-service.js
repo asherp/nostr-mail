@@ -433,7 +433,7 @@ class DMService {
                 headerElement.className = 'conversation-header';
                 headerElement.innerHTML = `
                     <div class="conversation-contact-info" style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1.5rem 0 1rem 0;">
-                        <img class="${avatarClass}" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';" style="width: 64px; height: 64px; border-radius: 50%; margin-bottom: 1rem; object-fit: cover;">
+                        <img class="profile-picture" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='profile-picture';" style="width:120px;height:120px;object-fit:cover;border-radius:50%;margin-bottom:1rem;">
                         <div class="conversation-contact-name" style="font-size: 1.3rem; font-weight: bold; text-align: center;">${contact ? contact.name : contactPubkey}</div>
                         <div class="conversation-contact-pubkey" style="font-size: 0.95rem; color: #aaa; text-align: center; margin-top: 0.2rem;">${contactPubkey}</div>
                     </div>

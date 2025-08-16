@@ -432,10 +432,12 @@ class DMService {
                 const headerElement = document.createElement('div');
                 headerElement.className = 'conversation-header';
                 headerElement.innerHTML = `
-                    <div class="conversation-contact-info" style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1.5rem 0 1rem 0;">
-                        <img class="profile-picture" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='profile-picture';" style="width:120px;height:120px;object-fit:cover;border-radius:50%;margin-bottom:1rem;">
-                        <div class="conversation-contact-name" style="font-size: 1.3rem; font-weight: bold; text-align: center;">${contact ? contact.name : contactPubkey}</div>
-                        <div class="conversation-contact-pubkey" style="font-size: 0.95rem; color: #aaa; text-align: center; margin-top: 0.2rem;">${contactPubkey}</div>
+                    <div class="conversation-contact-info">
+                        <img class="contact-avatar" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';">
+                        <div class="conversation-contact-details">
+                            <div class="conversation-contact-name">${contact ? contact.name : contactPubkey}</div>
+                            <div class="conversation-contact-pubkey">${contactPubkey}</div>
+                        </div>
                     </div>
                 `;
                 dmMessages.appendChild(headerElement);
@@ -523,15 +525,14 @@ class DMService {
                     if (message.hasEmailMatch) {
                         // For messages with email matches, replace DM content with details
                         const dmContent = `
-                            <details class="email-body-details">
-                                <summary class="email-body-summary">${window.Utils.escapeHtml(message.content)}</summary>
-                                <div class="email-body-content"></div>
-                            </details>
+                            <div class="email-body-expandable">
+                                <div class="email-body-summary" data-expanded="false">${window.Utils.escapeHtml(message.content)}</div>
+                            </div>
                         `;
                         
                         messageElement.innerHTML = `
                             <div class="message-content">
-                                <div class="message-text">${dmContent}</div>
+                                ${dmContent}
                                 <div class="message-meta">
                                     <div class="message-time">${dateTimeDisplay}</div>
                                     ${statusIcon}
@@ -540,12 +541,22 @@ class DMService {
                             </div>
                         `;
                         
-                        // Handle details toggle to load email body
-                        const detailsElement = messageElement.querySelector('.email-body-details');
-                        if (detailsElement) {
-                            detailsElement.addEventListener('toggle', async (event) => {
-                                if (event.target.open) {
-                                    await this.loadEmailBody(message, detailsElement, contactPubkey);
+                        // Handle click toggle to load email body
+                        const expandableElement = messageElement.querySelector('.email-body-expandable');
+                        const summaryElement = messageElement.querySelector('.email-body-summary');
+                        if (expandableElement && summaryElement) {
+                            summaryElement.addEventListener('click', async (event) => {
+                                const isExpanded = summaryElement.getAttribute('data-expanded') === 'true';
+                                if (!isExpanded) {
+                                    summaryElement.setAttribute('data-expanded', 'true');
+                                    await this.loadEmailBody(message, expandableElement, contactPubkey);
+                                } else {
+                                    summaryElement.setAttribute('data-expanded', 'false');
+                                    // Remove email content when collapsing
+                                    const emailContent = expandableElement.querySelector('.email-body-content-text');
+                                    if (emailContent) {
+                                        expandableElement.removeChild(emailContent);
+                                    }
                                 }
                             });
                         }
@@ -973,40 +984,56 @@ class DMService {
         this.loadDmMessages(pubkey);
     }
 
-    // Load email body into details element
-    async loadEmailBody(message, detailsElement, contactPubkey) {
-        const emailBodyContent = detailsElement.querySelector('.email-body-content');
-        if (emailBodyContent && !emailBodyContent.innerHTML.trim()) {
-            // Show loading state
-            emailBodyContent.innerHTML = '<div style="padding: 10px; text-align: center; color: #666;"><i class="fas fa-spinner fa-spin"></i> Loading email...</div>';
+    // Load email body into expandable element
+    async loadEmailBody(message, expandableElement, contactPubkey) {
+        // Check if content is already loaded
+        if (expandableElement.querySelector('.email-body-content-text')) {
+            return;
+        }
+        
+        // Show loading state
+        const loadingDiv = document.createElement('div');
+        loadingDiv.className = 'email-loading';
+        loadingDiv.style.cssText = 'padding: 6px; text-align: center; color: #666; font-size: 12px;';
+        loadingDiv.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading email...';
+        expandableElement.appendChild(loadingDiv);
+        
+        try {
+            // Fetch and display email body
+            const privateKey = window.appState.getKeypair().private_key;
+            const userPubkey = window.appState.getKeypair().public_key;
             
-            try {
-                // Fetch and display email body
-                const privateKey = window.appState.getKeypair().private_key;
-                const userPubkey = window.appState.getKeypair().public_key;
-                
-                const emailBody = await window.__TAURI__.core.invoke('db_get_matching_email_body', {
-                    dmEventId: message.event_id,
-                    privateKey: privateKey,
-                    userPubkey: userPubkey,
-                    contactPubkey: contactPubkey
-                });
-                
-                if (emailBody) {
-                    emailBodyContent.innerHTML = `
-                        <div class="email-body-display">
-                            <div class="email-body-content-text">
-                                ${window.Utils.escapeHtml(emailBody)}
-                            </div>
-                        </div>
-                    `;
-                } else {
-                    emailBodyContent.innerHTML = '<div style="padding: 10px; color: #888; text-align: center;">No matching email found</div>';
-                }
-            } catch (error) {
-                console.error('Failed to fetch email body:', error);
-                emailBodyContent.innerHTML = '<div style="padding: 10px; color: #dc3545; text-align: center;">Failed to load email body</div>';
+            const emailBody = await window.__TAURI__.core.invoke('db_get_matching_email_body', {
+                dmEventId: message.event_id,
+                privateKey: privateKey,
+                userPubkey: userPubkey,
+                contactPubkey: contactPubkey
+            });
+            
+            // Remove loading state
+            expandableElement.removeChild(loadingDiv);
+            
+            if (emailBody) {
+                const emailDiv = document.createElement('div');
+                emailDiv.className = 'email-body-content-text';
+                emailDiv.textContent = emailBody;
+                expandableElement.appendChild(emailDiv);
+            } else {
+                const noEmailDiv = document.createElement('div');
+                noEmailDiv.style.cssText = 'padding: 6px; color: #888; text-align: center; font-size: 12px;';
+                noEmailDiv.textContent = 'No matching email found';
+                expandableElement.appendChild(noEmailDiv);
             }
+        } catch (error) {
+            console.error('Failed to fetch email body:', error);
+            // Remove loading state
+            if (expandableElement.contains(loadingDiv)) {
+                expandableElement.removeChild(loadingDiv);
+            }
+            const errorDiv = document.createElement('div');
+            errorDiv.style.cssText = 'padding: 6px; color: #dc3545; text-align: center; font-size: 12px;';
+            errorDiv.textContent = 'Failed to load email body';
+            expandableElement.appendChild(errorDiv);
         }
     }
 }

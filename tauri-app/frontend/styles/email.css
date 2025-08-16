@@ -292,67 +292,30 @@ body:not(.dark-mode) .email-list-strong {
 /* Email body display styling */
 .email-body-display {
     padding: 0;
-}
-
-.email-body-content {
-    padding: 12px;
-    font-size: 13px;
-    line-height: 1.4;
-    color: var(--text-color);
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    max-height: 300px;
-    overflow-y: auto;
-}
-
-.message-sent .email-body-content {
-    color: rgba(255, 255, 255, 0.9);
-}
-
-body.dark-mode .email-body-content {
-    color: var(--text-color-dark);
-}
-
-/* Email body details styling */
-.email-body-details {
     margin: 0;
-    border-radius: 0;
-    overflow: visible;
-    background: transparent;
-    border: none;
 }
 
-.message-sent .email-body-details {
+/* Email body expandable styling */
+.email-body-expandable {
+    margin: 0;
     background: transparent;
-    border: none;
-}
-
-.message-received .email-body-details {
-    background: transparent;
-    border: none;
+    width: 100%;
 }
 
 .email-body-summary {
     padding: 0;
+    margin: 0;
     background: transparent;
-    font-size: inherit;
+    font-size: 14px;
+    line-height: 1.4;
     color: inherit;
     border: none;
     cursor: pointer;
-    list-style: none;
-    line-height: inherit;
-    word-wrap: inherit;
-    display: inline;
-}
-
-.message-sent .email-body-summary {
-    background: transparent;
-    color: inherit;
-    border: none;
-}
-
-.email-body-summary::-webkit-details-marker {
-    display: none;
+    outline: none;
+    word-wrap: break-word;
+    white-space: pre-wrap;
+    display: block;
+    width: 100%;
 }
 
 .email-body-summary::before {
@@ -361,23 +324,11 @@ body.dark-mode .email-body-content {
     margin-right: 4px;
     transition: transform 0.2s ease;
     color: inherit;
+    display: inline-block;
 }
 
-.email-body-details[open] .email-body-summary::before {
+.email-body-expandable .email-body-summary[data-expanded="true"]::before {
     transform: rotate(90deg);
-}
-
-.email-body-content {
-    margin-top: 8px;
-    padding: 12px;
-    background: rgba(0, 0, 0, 0.05);
-    border-radius: 8px;
-    border: 1px solid var(--border-color);
-}
-
-.message-sent .email-body-content {
-    background: rgba(255, 255, 255, 0.1);
-    border-color: rgba(255, 255, 255, 0.2);
 }
 
 .email-body-summary .message-text {
@@ -398,46 +349,48 @@ body.dark-mode .email-body-content {
 }
 
 .email-body-content {
-    margin-top: 8px;
-    padding: 12px;
-    background: rgba(0, 0, 0, 0.05);
-    border-radius: 8px;
+    margin-top: 6px;
+    padding: 8px;
+    background: rgba(0, 0, 0, 0.03);
+    border-radius: 6px;
     border: 1px solid var(--border-color);
 }
 
 .message-sent .email-body-content {
-    background: rgba(255, 255, 255, 0.1);
-    border-color: rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.15);
 }
 
 .email-body-content-text {
-    font-size: 13px;
+    font-size: 14px;
     line-height: 1.4;
     color: var(--text-color);
     white-space: pre-wrap;
     word-wrap: break-word;
-    max-height: 300px;
+    max-height: 200px;
     overflow-y: auto;
+    margin: 4px 0 0 0;
+    padding: 6px;
+    background: rgba(0, 0, 0, 0.03);
+    border-radius: 4px;
+    border: 1px solid var(--border-color);
 }
 
 .message-sent .email-body-content-text {
-    color: rgba(255, 255, 255, 0.9);
+    color: rgba(255, 255, 255, 0.85);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.15);
 }
 
-/* Dark mode support for email body details */
-body.dark-mode .email-body-details {
-    background: var(--light-bg-dark);
-    border-color: var(--border-color-dark);
-}
-
-body.dark-mode .email-body-summary {
-    background: rgba(255, 255, 255, 0.05);
-    color: var(--muted-color-dark);
-    border-bottom-color: var(--border-color-dark);
+/* Dark mode support for email body expandable */
+body.dark-mode .email-body-expandable {
+    background: transparent;
 }
 
 body.dark-mode .email-body-content-text {
     color: var(--text-color-dark);
+    background: rgba(255, 255, 255, 0.05);
+    border-color: var(--border-color-dark);
 }
 
 /* Hover effect for clickable messages */

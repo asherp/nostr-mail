@@ -778,39 +778,57 @@ class EmailService {
                 function updateDetail(subject, body) {
                     emailDetailContent.innerHTML =
                         `<div class="email-detail">
-<div class="email-detail-header vertical" id="email-header-info">
+<div class="email-detail-header vertical" id="inbox-email-header-info">
 <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
 <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
 </div>
-<pre id="raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
-<div class="email-detail-body" id="email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
-<button id="toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
-<pre id="raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
+<pre id="inbox-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+<div class="email-detail-body" id="inbox-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
+<button id="inbox-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
+<pre id="inbox-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
 </div>`;
-                    const toggleRawBtn = document.getElementById('toggle-raw-btn');
-                    const headerInfo = document.getElementById('email-header-info');
-                    const rawHeaderInfo = document.getElementById('raw-header-info');
-                    const bodyInfo = document.getElementById('email-body-info');
-                    const rawBodyInfo = document.getElementById('raw-body-info');
-                    let showingRaw = false;
-                    toggleRawBtn.addEventListener('click', () => {
-                        showingRaw = !showingRaw;
-                        if (showingRaw) {
-                            headerInfo.classList.add('hidden-header');
-                            rawHeaderInfo.style.display = 'block';
-                            bodyInfo.style.display = 'none';
-                            rawBodyInfo.style.display = 'block';
-                            toggleRawBtn.textContent = 'Show Display Content';
-                        } else {
-                            headerInfo.classList.remove('hidden-header');
-                            rawHeaderInfo.style.display = 'none';
-                            bodyInfo.style.display = 'block';
-                            rawBodyInfo.style.display = 'none';
-                            toggleRawBtn.textContent = 'Show Raw Content';
-                        }
-                    });
+                    const toggleRawBtn = document.getElementById('inbox-toggle-raw-btn');
+                    const headerInfo = document.getElementById('inbox-email-header-info');
+                    const rawHeaderInfo = document.getElementById('inbox-raw-header-info');
+                    const bodyInfo = document.getElementById('inbox-email-body-info');
+                    const rawBodyInfo = document.getElementById('inbox-raw-body-info');
+                    
+                    if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
+                        // Remove any existing event listeners by cloning the button
+                        const newToggleBtn = toggleRawBtn.cloneNode(true);
+                        toggleRawBtn.parentNode.replaceChild(newToggleBtn, toggleRawBtn);
+                        
+                        let showingRaw = false;
+                        newToggleBtn.addEventListener('click', (event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            
+                            showingRaw = !showingRaw;
+                            if (showingRaw) {
+                                headerInfo.classList.add('hidden-header');
+                                rawHeaderInfo.style.display = 'block';
+                                bodyInfo.style.display = 'none';
+                                rawBodyInfo.style.display = 'block';
+                                newToggleBtn.textContent = 'Show Display Content';
+                                // Only move button if it's not already in the right position
+                                if (newToggleBtn.nextSibling !== rawBodyInfo.nextSibling) {
+                                    rawBodyInfo.parentNode.insertBefore(newToggleBtn, rawBodyInfo.nextSibling);
+                                }
+                            } else {
+                                headerInfo.classList.remove('hidden-header');
+                                rawHeaderInfo.style.display = 'none';
+                                bodyInfo.style.display = 'block';
+                                rawBodyInfo.style.display = 'none';
+                                newToggleBtn.textContent = 'Show Raw Content';
+                                // Only move button if it's not already in the right position
+                                if (newToggleBtn.nextSibling !== bodyInfo.nextSibling) {
+                                    bodyInfo.parentNode.insertBefore(newToggleBtn, bodyInfo.nextSibling);
+                                }
+                            }
+                        });
+                    }
                 }
             }
         } catch (error) {
@@ -1386,41 +1404,57 @@ class EmailService {
                 function updateDetail(subject, body) {
                     sentDetailContent.innerHTML =
                         `<div class="email-detail">
-<div class="email-detail-header vertical" id="email-header-info">
+<div class="email-detail-header vertical" id="sent-email-header-info">
 <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
 <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
 </div>
-<pre id="raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
-<div class="email-detail-body" id="email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
+<pre id="sent-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+<div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
 <button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
-<pre id="raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
+<pre id="sent-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
 </div>`;
                     const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
-                    const headerInfo = document.getElementById('email-header-info');
-                    const rawHeaderInfo = document.getElementById('raw-header-info');
-                    const bodyInfo = document.getElementById('email-body-info');
-                    const rawBodyInfo = document.getElementById('raw-body-info');
-                    let showingRaw = false;
-                    toggleRawBtn.addEventListener('click', () => {
-                        showingRaw = !showingRaw;
-                        if (showingRaw) {
-                            headerInfo.classList.add('hidden-header');
-                            rawHeaderInfo.style.display = 'block';
-                            bodyInfo.style.display = 'none';
-                            rawBodyInfo.style.display = 'block';
-                            toggleRawBtn.textContent = 'Show Display Content';
-                            rawBodyInfo.parentNode.insertBefore(toggleRawBtn, rawBodyInfo.nextSibling);
-                        } else {
-                            headerInfo.classList.remove('hidden-header');
-                            rawHeaderInfo.style.display = 'none';
-                            bodyInfo.style.display = 'block';
-                            rawBodyInfo.style.display = 'none';
-                            toggleRawBtn.textContent = 'Show Raw Content';
-                            bodyInfo.parentNode.insertBefore(toggleRawBtn, bodyInfo.nextSibling);
-                        }
-                    });
+                    const headerInfo = document.getElementById('sent-email-header-info');
+                    const rawHeaderInfo = document.getElementById('sent-raw-header-info');
+                    const bodyInfo = document.getElementById('sent-email-body-info');
+                    const rawBodyInfo = document.getElementById('sent-raw-body-info');
+                    
+                    if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
+                        // Remove any existing event listeners by cloning the button
+                        const newToggleBtn = toggleRawBtn.cloneNode(true);
+                        toggleRawBtn.parentNode.replaceChild(newToggleBtn, toggleRawBtn);
+                        
+                        let showingRaw = false;
+                        newToggleBtn.addEventListener('click', (event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            
+                            showingRaw = !showingRaw;
+                            if (showingRaw) {
+                                headerInfo.classList.add('hidden-header');
+                                rawHeaderInfo.style.display = 'block';
+                                bodyInfo.style.display = 'none';
+                                rawBodyInfo.style.display = 'block';
+                                newToggleBtn.textContent = 'Show Display Content';
+                                // Only move button if it's not already in the right position
+                                if (newToggleBtn.nextSibling !== rawBodyInfo.nextSibling) {
+                                    rawBodyInfo.parentNode.insertBefore(newToggleBtn, rawBodyInfo.nextSibling);
+                                }
+                            } else {
+                                headerInfo.classList.remove('hidden-header');
+                                rawHeaderInfo.style.display = 'none';
+                                bodyInfo.style.display = 'block';
+                                rawBodyInfo.style.display = 'none';
+                                newToggleBtn.textContent = 'Show Raw Content';
+                                // Only move button if it's not already in the right position
+                                if (newToggleBtn.nextSibling !== bodyInfo.nextSibling) {
+                                    bodyInfo.parentNode.insertBefore(newToggleBtn, bodyInfo.nextSibling);
+                                }
+                            }
+                        });
+                    }
                 }
             }
         } catch (error) {

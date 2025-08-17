@@ -198,8 +198,26 @@ const TauriService = {
     setRelays: async function(relays) {
         return await this.invoke('set_relays', { relays });
     },
+    updateSingleRelay: async function(relayUrl, isActive) {
+        return await this.invoke('update_single_relay', { relayUrl, isActive });
+    },
+    syncRelayStates: async function() {
+        return await this.invoke('sync_relay_states');
+    },
     getDbRelays: async function() {
         return await this.invoke('db_get_all_relays');
+    },
+    getRelayStatus: async function() {
+        return await this.invoke('get_relay_status');
+    },
+    initPersistentNostrClient: async function(privateKey) {
+        return await this.invoke('init_persistent_nostr_client', { privateKey });
+    },
+    disconnectNostrClient: async function() {
+        return await this.invoke('disconnect_nostr_client');
+    },
+    getNostrClientStatus: async function() {
+        return await this.invoke('get_nostr_client_status');
     },
     generateQrCode: async function(data) {
         return await this.invoke('generate_qr_code', { data });

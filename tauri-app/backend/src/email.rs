@@ -89,7 +89,7 @@ pub fn construct_email_headers(
     // Extract headers from the email string
     let lines: Vec<&str> = email_string.lines().collect();
     let mut headers = Vec::new();
-    let mut in_body = false;
+    let in_body = false;
     
     for line in lines {
         if line.is_empty() {

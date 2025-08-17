@@ -9,6 +9,7 @@
     background-color: #f0f0f0;
     border-radius: 8px;
     border: 1px solid #e0e0e0;
+    margin-bottom: 8px;
 }
 
 body.dark-mode .relay-item {
@@ -16,11 +17,88 @@ body.dark-mode .relay-item {
     border-color: #3a404a;
 }
 
+.relay-item-info {
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+    margin-right: 15px;
+}
+
 .relay-item-url {
     font-family: 'Courier New', Courier, monospace;
     font-size: 0.95rem;
-    flex-grow: 1;
-    margin-right: 15px;
+    margin-bottom: 4px;
+}
+
+.relay-status {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.8rem;
+    font-weight: 500;
+}
+
+.relay-status-text {
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Status Colors */
+.status-connected {
+    color: #28a745;
+}
+
+.status-connected .fa-circle {
+    color: #28a745;
+    animation: pulse-green 2s infinite;
+}
+
+.status-disconnected {
+    color: #dc3545;
+}
+
+.status-disconnected .fa-circle {
+    color: #dc3545;
+}
+
+.status-disabled {
+    color: #6c757d;
+}
+
+.status-disabled .fa-circle {
+    color: #6c757d;
+}
+
+.status-unknown {
+    color: #ffc107;
+}
+
+.status-unknown .fa-question-circle {
+    color: #ffc107;
+}
+
+/* Dark mode status colors */
+body.dark-mode .status-connected {
+    color: #20c997;
+}
+
+body.dark-mode .status-connected .fa-circle {
+    color: #20c997;
+}
+
+body.dark-mode .status-disconnected {
+    color: #fd7e14;
+}
+
+body.dark-mode .status-disconnected .fa-circle {
+    color: #fd7e14;
+}
+
+/* Pulse animation for connected status */
+@keyframes pulse-green {
+    0% { opacity: 1; }
+    50% { opacity: 0.5; }
+    100% { opacity: 1; }
 }
 
 .relay-item-actions {

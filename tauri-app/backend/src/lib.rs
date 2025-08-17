@@ -16,7 +16,7 @@ use types::*;
 use state::{AppState, Relay};
 use storage::{Storage, Contact, Conversation, UserProfile, AppSettings, EmailDraft};
 use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay};
-use crate::types::EmailMessage;
+use crate::types::{EmailMessage, RelayStatus, RelayConnectionStatus};
 
 use nostr_sdk::Metadata;
 use nostr_sdk::ToBech32;
@@ -37,6 +37,71 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         nostr_pubkey: email.nostr_pubkey.clone(),
         message_id: Some(email.message_id.clone()),
     }
+}
+
+/// Send a direct message using the persistent client
+async fn send_direct_message_persistent(
+    private_key: &str,
+    recipient_pubkey: &str,
+    content: &MessageContent,
+    encryption_algorithm: Option<&str>,
+    state: &AppState,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+    use crate::types::MessageContent;
+    
+    println!("[RUST] send_direct_message_persistent called");
+    
+    // Get or initialize the persistent client
+    let client = state.get_nostr_client(Some(private_key)).await?;
+    
+    // Parse recipient pubkey
+    let recipient = PublicKey::from_bech32(recipient_pubkey).map_err(|e| e.to_string())?;
+    
+    // Get keys for encryption
+    let keys = state.get_current_keys().ok_or("No keys available")?;
+    
+    // Determine encryption algorithm (default to NIP-44)
+    let algorithm = encryption_algorithm.unwrap_or("nip44");
+    println!("[RUST] Using encryption algorithm: {}", algorithm);
+    
+    // Handle content based on type
+    let encrypted_content = match content {
+        MessageContent::Plaintext(text) => {
+            println!("[RUST] Encrypting plaintext message");
+            match algorithm {
+                "nip04" => {
+                    nip04::encrypt(keys.secret_key(), &recipient, text)
+                        .map_err(|e| e.to_string())?
+                },
+                "nip44" => {
+                    nip44::encrypt(keys.secret_key(), &recipient, text, nip44::Version::default())
+                        .map_err(|e| e.to_string())?
+                },
+                _ => {
+                    return Err(format!("Unsupported encryption algorithm: {}", algorithm));
+                }
+            }
+        },
+        MessageContent::Encrypted(encrypted) => {
+            println!("[RUST] Using pre-encrypted content");
+            encrypted.clone()
+        }
+    };
+    
+    // Create and send the event
+    let event = EventBuilder::new(Kind::EncryptedDirectMessage, &encrypted_content)
+        .tag(Tag::public_key(recipient));
+    
+    let output = client.send_event_builder(event).await.map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Message sent successfully with output: {:?}", output);
+    
+    // The output.success contains relay URLs that successfully received the event
+    // For now, we'll generate a placeholder event ID since we can't get the actual ID from Output
+    // In a real implementation, you might want to store the event before sending
+    let placeholder_id = format!("sent_to_{}_relays", output.success.len());
+    Ok(placeholder_id)
 }
 
 #[tauri::command]
@@ -70,19 +135,18 @@ fn get_public_key_from_private(private_key: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn send_direct_message(request: DirectMessageRequest) -> Result<String, String> {
+async fn send_direct_message(request: DirectMessageRequest, state: tauri::State<'_, AppState>) -> Result<String, String> {
     println!("[RUST] send_direct_message called");
     println!("[RUST] Recipient: {}", request.recipient_pubkey);
     println!("[RUST] Content type: {:?}", request.content);
     println!("[RUST] Encryption algorithm: {:?}", request.encryption_algorithm);
-    println!("[RUST] Relays: {:?}", request.relays);
     
-    let result = nostr::send_direct_message_with_content(
+    let result = send_direct_message_persistent(
         &request.sender_private_key,
         &request.recipient_pubkey,
         &request.content,
-        &request.relays,
-        request.encryption_algorithm.as_deref()
+        request.encryption_algorithm.as_deref(),
+        &state
     )
     .await
     .map(|event_id| {
@@ -153,9 +217,202 @@ fn get_relays(state: tauri::State<AppState>) -> Result<Vec<Relay>, String> {
 }
 
 #[tauri::command]
-fn set_relays(relays: Vec<Relay>, state: tauri::State<AppState>) -> Result<(), String> {
-    *state.relays.lock().unwrap() = relays;
-    Ok(())
+async fn set_relays(relays: Vec<Relay>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.update_relays(relays).await
+}
+
+#[tauri::command]
+async fn update_single_relay(relay_url: String, is_active: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] update_single_relay called for: {} (active: {})", relay_url, is_active);
+    state.update_single_relay(&relay_url, is_active).await
+}
+
+#[tauri::command]
+async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    println!("[RUST] sync_relay_states called - auto-disabling disconnected relays");
+    
+    let client_option = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        client_guard.clone()
+    };
+    
+    let mut updated_relays = Vec::new();
+    
+    if let Some(client) = client_option {
+        let connected_relays = client.relays().await;
+        
+        // Get current relay configuration
+        let mut relays_to_update = Vec::new();
+        {
+            let relays_guard = state.relays.lock().unwrap();
+            for relay in relays_guard.iter() {
+                if relay.is_active {
+                    let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == relay.url);
+                    if !is_connected {
+                        // This relay is marked as active but not actually connected
+                        relays_to_update.push(relay.url.clone());
+                    }
+                }
+            }
+        }
+        
+        // Update disconnected relays to inactive
+        for relay_url in relays_to_update {
+            println!("[RUST] Auto-disabling disconnected relay: {}", relay_url);
+            
+            // Update in state
+            {
+                let mut relays_guard = state.relays.lock().unwrap();
+                if let Some(relay) = relays_guard.iter_mut().find(|r| r.url == relay_url) {
+                    relay.is_active = false;
+                }
+            }
+            
+            // Update in database
+            let db = state.get_database().map_err(|e| e.to_string())?;
+            // Try to get relay from database and update it
+            let all_relays = db.get_all_relays().map_err(|e| e.to_string())?;
+            if let Some(db_relay) = all_relays.iter().find(|r| r.url == relay_url) {
+                let updated_relay = crate::database::DbRelay {
+                    id: db_relay.id,
+                    url: relay_url.clone(),
+                    is_active: false,
+                    created_at: db_relay.created_at,
+                    updated_at: chrono::Utc::now(),
+                };
+                if let Err(e) = db.save_relay(&updated_relay) {
+                    println!("[RUST] Failed to update relay in database: {}", e);
+                }
+            }
+            
+            updated_relays.push(relay_url);
+        }
+    }
+    
+    Ok(updated_relays)
+}
+
+#[tauri::command]
+async fn init_persistent_nostr_client(private_key: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] init_persistent_nostr_client called");
+    state.init_nostr_client(&private_key).await
+}
+
+#[tauri::command]
+async fn disconnect_nostr_client(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] disconnect_nostr_client called");
+    state.disconnect_nostr_client().await
+}
+
+#[tauri::command]
+async fn get_nostr_client_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    println!("[RUST] get_nostr_client_status called");
+    let client_option = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        client_guard.clone()
+    };
+    
+    if let Some(client) = client_option {
+        let relay_count = client.relays().await.len();
+        println!("[RUST] Nostr client connected to {} relays", relay_count);
+        Ok(relay_count > 0)
+    } else {
+        println!("[RUST] Nostr client not initialized");
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+async fn get_relay_status(state: tauri::State<'_, AppState>) -> Result<Vec<RelayStatus>, String> {
+    println!("[RUST] get_relay_status called");
+    let client_option = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        client_guard.clone()
+    };
+    
+    let configured_relays = {
+        let relays_guard = state.relays.lock().unwrap();
+        relays_guard.clone()
+    };
+    
+    let mut relay_statuses = Vec::new();
+    
+    if let Some(client) = client_option {
+        let connected_relays = client.relays().await;
+        
+        for configured_relay in configured_relays {
+            let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == configured_relay.url);
+            
+            let status = if !configured_relay.is_active {
+                RelayConnectionStatus::Disabled
+            } else if is_connected {
+                RelayConnectionStatus::Connected
+            } else {
+                RelayConnectionStatus::Disconnected
+            };
+            
+            relay_statuses.push(RelayStatus {
+                url: configured_relay.url,
+                is_active: configured_relay.is_active,
+                status,
+            });
+        }
+    } else {
+        // No client initialized - all relays are disconnected
+        for configured_relay in configured_relays {
+            let status = if !configured_relay.is_active {
+                RelayConnectionStatus::Disabled
+            } else {
+                RelayConnectionStatus::Disconnected
+            };
+            
+            relay_statuses.push(RelayStatus {
+                url: configured_relay.url,
+                is_active: configured_relay.is_active,
+                status,
+            });
+        }
+    }
+    
+    Ok(relay_statuses)
+}
+
+#[tauri::command]
+async fn test_relay_connection(relay_url: String) -> Result<bool, String> {
+    println!("[RUST] test_relay_connection called for: {}", relay_url);
+    
+    use nostr_sdk::prelude::*;
+    
+    // Create a temporary client to test the connection
+    let keys = Keys::generate(); // Use ephemeral keys for testing
+    let client = Client::new(keys);
+    
+    // Try to add and connect to the relay
+    match client.add_relay(&relay_url).await {
+        Ok(_) => {
+            println!("[RUST] Successfully added relay: {}", relay_url);
+            
+            // Try to connect
+            client.connect().await;
+            
+            // Wait a moment for connection to establish
+            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+            
+            // Check if connected
+            let relays = client.relays().await;
+            let is_connected = relays.iter().any(|(url, _)| url.to_string() == relay_url);
+            
+            // Disconnect the test client
+            client.disconnect().await;
+            
+            println!("[RUST] Relay {} connection test result: {}", relay_url, is_connected);
+            Ok(is_connected)
+        },
+        Err(e) => {
+            println!("[RUST] Failed to add relay {}: {}", relay_url, e);
+            Err(format!("Failed to connect to relay: {}", e))
+        }
+    }
 }
 
 #[tauri::command]
@@ -1061,7 +1318,7 @@ fn extract_encrypted_content_from_armor(body: &str) -> Option<String> {
 }
 
 #[tauri::command]
-fn db_get_matching_email_body(dm_event_id: String, private_key: String, user_pubkey: String, contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<String>, String> {
+fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<String>, String> {
     println!("[RUST] db_get_matching_email_body called for DM event_id: {}", dm_event_id);
     let db = state.get_database().map_err(|e| e.to_string())?;
     
@@ -1191,6 +1448,13 @@ pub fn run() {
         fetch_nostr_following_pubkeys,
         get_relays,
         set_relays,
+        update_single_relay,
+        sync_relay_states,
+        init_persistent_nostr_client,
+        disconnect_nostr_client,
+        get_nostr_client_status,
+        get_relay_status,
+        test_relay_connection,
         decrypt_dm_content,
         publish_nostr_event,
         send_email,

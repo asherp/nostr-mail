@@ -102,7 +102,10 @@ NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
         const relays = await TauriService.getDbRelays();
         console.log('Loaded relays from DB:', relays); // DEBUG
         appState.setRelays(relays);
-        this.renderRelays();
+        
+        // Sync disconnected relays first, then render
+        await this.syncDisconnectedRelays();
+        await this.renderRelays();
     } catch (error) {
         console.error('Failed to load relays from database:', error);
         notificationService.showError('Could not load relays from database.');
@@ -123,9 +126,37 @@ NostrMailApp.prototype.loadKeypair = async function() {
         }
         console.log('Keypair loaded:', appState.getKeypair().public_key.substring(0, 20) + '...');
         this.renderProfilePubkey();
+        
+        // Initialize persistent Nostr client with the loaded keypair
+        await this.initializeNostrClient();
     } catch (error) {
         console.error('Failed to load keypair:', error);
         notificationService.showError('Failed to load encryption keys');
+    }
+}
+
+// Initialize the persistent Nostr client
+NostrMailApp.prototype.initializeNostrClient = async function() {
+    try {
+        const keypair = appState.getKeypair();
+        if (!keypair || !keypair.private_key) {
+            console.warn('[APP] No keypair available for Nostr client initialization');
+            return;
+        }
+        
+        console.log('[APP] Initializing persistent Nostr client...');
+        await TauriService.initPersistentNostrClient(keypair.private_key);
+        console.log('[APP] ✅ Nostr client initialized successfully');
+        
+        // Update relay status display after client initialization
+        if (appState.getRelays().length > 0) {
+            setTimeout(async () => {
+                await this.renderRelays();
+            }, 1000); // Give the client time to connect
+        }
+    } catch (error) {
+        console.error('[APP] Failed to initialize Nostr client:', error);
+        notificationService.showError('Failed to initialize Nostr client: ' + error);
     }
 }
 
@@ -828,17 +859,40 @@ NostrMailApp.prototype.saveRelaysToLocalStorage = function() {
     localStorage.setItem('nostr_mail_relays', JSON.stringify(appState.getRelays()));
 }
 
-NostrMailApp.prototype.renderRelays = function() {
+NostrMailApp.prototype.renderRelays = async function() {
     const relaysList = domManager.get('relaysList');
     if (!relaysList) return;
     relaysList.innerHTML = '';
+    
+    // Get relay connection statuses from backend
+    let relayStatuses = [];
+    try {
+        relayStatuses = await TauriService.getRelayStatus();
+        console.log('Relay statuses from backend:', relayStatuses);
+    } catch (error) {
+        console.error('Failed to get relay statuses:', error);
+    }
+    
     // Sort relays by updated_at descending
     const relays = [...appState.getRelays()].sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
     relays.forEach((relay) => {
+        // Find matching status from backend
+        const status = relayStatuses.find(s => s.url === relay.url);
+        const connectionStatus = status?.status || 'Disconnected';
+        const statusClass = this.getRelayStatusClass(connectionStatus);
+        const statusIcon = this.getRelayStatusIcon(connectionStatus);
+        const statusText = this.getRelayStatusText(connectionStatus);
+        
         const relayItem = document.createElement('div');
         relayItem.className = 'relay-item';
         relayItem.innerHTML = `
-            <span class="relay-item-url">${relay.url}</span>
+            <div class="relay-item-info">
+                <span class="relay-item-url">${relay.url}</span>
+                <div class="relay-status ${statusClass}">
+                    <i class="fas ${statusIcon}"></i>
+                    <span class="relay-status-text">${statusText}</span>
+                </div>
+            </div>
             <div class="relay-item-actions">
                 <label class="toggle-switch">
                     <input type="checkbox" ${relay.is_active ? 'checked' : ''} data-relay-id="${relay.id}" data-relay-url="${relay.url}">
@@ -859,6 +913,91 @@ NostrMailApp.prototype.renderRelays = function() {
     });
 }
 
+// Helper methods for relay status display
+NostrMailApp.prototype.getRelayStatusClass = function(connectionStatus) {
+    switch (connectionStatus) {
+        case 'Connected': return 'status-connected';
+        case 'Disconnected': return 'status-disconnected';
+        case 'Disabled': return 'status-disabled';
+        default: return 'status-unknown';
+    }
+}
+
+NostrMailApp.prototype.getRelayStatusIcon = function(connectionStatus) {
+    switch (connectionStatus) {
+        case 'Connected': return 'fa-circle';
+        case 'Disconnected': return 'fa-circle';
+        case 'Disabled': return 'fa-circle';
+        default: return 'fa-question-circle';
+    }
+}
+
+NostrMailApp.prototype.getRelayStatusText = function(connectionStatus) {
+    switch (connectionStatus) {
+        case 'Connected': return 'Connected';
+        case 'Disconnected': return 'Disconnected';
+        case 'Disabled': return 'Disabled';
+        default: return 'Unknown';
+    }
+}
+
+// Update status for a single relay without full re-render
+NostrMailApp.prototype.updateSingleRelayStatus = function(relayUrl, connectionStatus) {
+    const statusElement = document.querySelector(`input[data-relay-url="${relayUrl}"]`)?.closest('.relay-item')?.querySelector('.relay-status');
+    if (statusElement) {
+        const statusClass = this.getRelayStatusClass(connectionStatus);
+        const statusIcon = this.getRelayStatusIcon(connectionStatus);
+        const statusText = this.getRelayStatusText(connectionStatus);
+        
+        // Update the status element
+        statusElement.className = `relay-status ${statusClass}`;
+        statusElement.innerHTML = `
+            <i class="fas ${statusIcon}"></i>
+            <span class="relay-status-text">${statusText}</span>
+        `;
+    }
+}
+
+// Sync relay states and auto-disable disconnected ones
+NostrMailApp.prototype.syncDisconnectedRelays = async function() {
+    console.log('[APP] syncDisconnectedRelays called');
+    try {
+        const updatedRelays = await TauriService.syncRelayStates();
+        console.log('[APP] syncRelayStates returned:', updatedRelays);
+        if (updatedRelays.length > 0) {
+            console.log('Auto-disabled disconnected relays:', updatedRelays);
+            
+            // Update the UI for each disabled relay
+            for (const relayUrl of updatedRelays) {
+                // Update toggle switch to OFF
+                const toggleElement = document.querySelector(`input[data-relay-url="${relayUrl}"]`);
+                if (toggleElement) {
+                    toggleElement.checked = false;
+                }
+                
+                // Update status to Disabled
+                this.updateSingleRelayStatus(relayUrl, 'Disabled');
+                
+                // Update local state
+                const relay = appState.getRelays().find(r => r.url === relayUrl);
+                if (relay) {
+                    relay.is_active = false;
+                    relay.updated_at = new Date().toISOString();
+                }
+            }
+            
+            // Show notification to user
+            if (updatedRelays.length === 1) {
+                notificationService.showWarning(`Relay ${updatedRelays[0]} was automatically disabled (disconnected)`);
+            } else {
+                notificationService.showWarning(`${updatedRelays.length} disconnected relays were automatically disabled`);
+            }
+        }
+    } catch (error) {
+        console.error('Failed to sync disconnected relays:', error);
+    }
+}
+
 NostrMailApp.prototype.addRelay = async function() {
     const url = domManager.getValue('newRelayUrl')?.trim();
     if (url && (url.startsWith('ws://') || url.startsWith('wss://'))) {
@@ -876,6 +1015,9 @@ NostrMailApp.prototype.addRelay = async function() {
                 });
                 domManager.clear('newRelayUrl');
                 await this.loadRelaysFromDatabase();
+                
+                // Re-initialize client to pick up new relay
+                await this.initializeNostrClient();
             } catch (error) {
                 notificationService.showError('Failed to add relay: ' + error);
             }
@@ -891,17 +1033,58 @@ NostrMailApp.prototype.toggleRelayById = async function(relayId, relayUrl) {
     const relay = appState.getRelays().find(r => String(r.id) === String(relayId) || r.url === relayUrl);
     if (relay) {
         try {
+            const newActiveState = !relay.is_active;
+            
+            // Update the database first
             await TauriService.invoke('db_save_relay', {
                 relay: {
                     id: relay.id || null,
                     url: relay.url,
-                    is_active: !relay.is_active,
+                    is_active: newActiveState,
                     created_at: relay.created_at,
                     updated_at: new Date().toISOString()
                 }
             });
-            await this.loadRelaysFromDatabase();
+            
+            // Update the backend Nostr client connection immediately
+            try {
+                await TauriService.updateSingleRelay(relayUrl, newActiveState);
+                console.log(`[APP] ${newActiveState ? 'Connected to' : 'Disconnected from'} relay: ${relayUrl}`);
+            } catch (relayError) {
+                // Log the error but don't fail the entire operation
+                console.warn(`[APP] Relay connection update had issues: ${relayError}`);
+                // Continue with UI updates since database was updated successfully
+            }
+            
+            // Update the local state
+            relay.is_active = newActiveState;
+            relay.updated_at = new Date().toISOString();
+            
+            // Update just the toggle switch state without re-rendering everything
+            const toggleElement = document.querySelector(`input[data-relay-url="${relayUrl}"]`);
+            if (toggleElement) {
+                toggleElement.checked = newActiveState;
+            }
+            
+            // Update the status indicator immediately
+            const expectedStatus = newActiveState ? 'Connected' : 'Disabled';
+            this.updateSingleRelayStatus(relayUrl, expectedStatus);
+            
+            // Verify actual status after a short delay
+            setTimeout(async () => {
+                try {
+                    const relayStatuses = await TauriService.getRelayStatus();
+                    const status = relayStatuses.find(s => s.url === relayUrl);
+                    if (status) {
+                        this.updateSingleRelayStatus(relayUrl, status.status);
+                    }
+                } catch (error) {
+                    console.error('Failed to verify relay status:', error);
+                }
+            }, 1000);
+            
         } catch (error) {
+            console.error('Failed to toggle relay:', error);
             notificationService.showError('Failed to update relay: ' + error);
         }
     }
@@ -911,8 +1094,17 @@ NostrMailApp.prototype.removeRelayById = async function(relayId, relayUrl) {
     const relay = appState.getRelays().find(r => String(r.id) === String(relayId) || r.url === relayUrl);
     if (relay) {
         try {
+            // Store scroll position before update
+            const relaysList = domManager.get('relaysList');
+            const scrollTop = relaysList ? relaysList.scrollTop : 0;
+            
             await TauriService.invoke('db_delete_relay', { url: relay.url });
             await this.loadRelaysFromDatabase();
+            
+            // Restore scroll position after update (adjust for removed item)
+            if (relaysList) {
+                relaysList.scrollTop = Math.max(0, scrollTop - 60); // Approximate height of one relay item
+            }
         } catch (error) {
             notificationService.showError('Failed to remove relay: ' + error);
         }
@@ -1386,6 +1578,62 @@ NostrMailApp.prototype.renderProfileEmailWarning = function() {
 // Create and export the main application instance
 window.app = new NostrMailApp();
 
+// Debug function to check Nostr client status
+NostrMailApp.prototype.checkNostrClientStatus = async function() {
+    try {
+        const isConnected = await TauriService.getNostrClientStatus();
+        console.log('[APP] Nostr client status:', isConnected ? '✅ Connected' : '❌ Disconnected');
+        return isConnected;
+    } catch (error) {
+        console.error('[APP] Failed to check Nostr client status:', error);
+        return false;
+    }
+}
+
+// Debug function to manually trigger relay sync
+NostrMailApp.prototype.manualSyncRelays = async function() {
+    console.log('[APP] Manual relay sync triggered...');
+    try {
+        await this.syncDisconnectedRelays();
+        console.log('[APP] Manual relay sync completed');
+    } catch (error) {
+        console.error('[APP] Manual relay sync failed:', error);
+    }
+}
+
+// Start periodic relay status updates
+NostrMailApp.prototype.startRelayStatusUpdates = function() {
+    // Update every 15 seconds
+    this.relayStatusInterval = setInterval(async () => {
+        try {
+            // Only update if we're on the settings page and have relays
+            const settingsPanel = domManager.get('settingsPanel');
+            const isOnSettingsPage = settingsPanel && !settingsPanel.classList.contains('hidden');
+            const hasRelays = appState.getRelays().length > 0;
+            
+            console.log(`[APP] Periodic update check: settingsPage=${isOnSettingsPage}, hasRelays=${hasRelays}`);
+            
+            if (isOnSettingsPage && hasRelays) {
+                console.log('[APP] Running periodic relay sync...');
+                // First sync disconnected relays (auto-disable them)
+                await this.syncDisconnectedRelays();
+                // Then update the display
+                await this.renderRelays();
+            }
+        } catch (error) {
+            console.error('Error updating relay status:', error);
+        }
+    }, 15000); // Increased to 15 seconds to reduce load
+}
+
+// Stop periodic updates
+NostrMailApp.prototype.stopRelayStatusUpdates = function() {
+    if (this.relayStatusInterval) {
+        clearInterval(this.relayStatusInterval);
+        this.relayStatusInterval = null;
+    }
+}
+
 // Initialize when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
     window.domManager = new DOMManager();
@@ -1399,4 +1647,7 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Initialize the application
     window.app.init();
+    
+    // Start relay status updates
+    window.app.startRelayStatusUpdates();
 }); 

@@ -104,4 +104,20 @@ pub struct DirectMessageRequest {
     pub content: MessageContent,
     pub relays: Vec<String>,
     pub encryption_algorithm: Option<String>, // "nip04" or "nip44"
+}
+
+/// Connection status for a relay
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RelayConnectionStatus {
+    Connected,
+    Disconnected,
+    Disabled,
+}
+
+/// Status information for a relay
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayStatus {
+    pub url: String,
+    pub is_active: bool,
+    pub status: RelayConnectionStatus,
 } 

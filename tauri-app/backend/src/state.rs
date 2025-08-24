@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use crate::database::Database;
 use nostr_sdk::prelude::*;
 use anyhow::Result;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relay {
@@ -17,13 +18,23 @@ pub struct CachedImage {
     pub timestamp: u64, // Unix timestamp when cached
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct EventSubscription {
+    pub subscription_ids: Vec<SubscriptionId>,
+    pub is_active: bool,
+    pub filters: Vec<Filter>,
+    pub user_pubkey: PublicKey,
+    pub since_timestamp: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct AppState {
     pub relays: Arc<Mutex<Vec<Relay>>>,
     pub image_cache: Arc<Mutex<HashMap<String, CachedImage>>>, // pubkey -> cached image
     pub database: Arc<Mutex<Option<Database>>>,
     pub nostr_client: Arc<Mutex<Option<Client>>>,
     pub current_keys: Arc<Mutex<Option<Keys>>>,
+    pub active_subscription: Arc<RwLock<Option<EventSubscription>>>,
 }
 
 impl AppState {
@@ -44,6 +55,7 @@ impl AppState {
             database: Arc::new(Mutex::new(None)),
             nostr_client: Arc::new(Mutex::new(None)),
             current_keys: Arc::new(Mutex::new(None)),
+            active_subscription: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -71,8 +83,37 @@ impl AppState {
         // Create new client
         let client = Client::new(keys.clone());
         
-        // Get current relays
-        let relays = self.relays.lock().unwrap().clone();
+        // Load relays from database first (don't rely on in-memory state)
+        let db_relays = match self.get_database() {
+            Ok(db) => {
+                match db.get_all_relays() {
+                    Ok(relays) => {
+                        println!("[RUST] Loaded {} relays from database for client init", relays.len());
+                        // Convert DbRelay to Relay and update in-memory state
+                        let state_relays: Vec<Relay> = relays.iter().map(|db_relay| Relay {
+                            url: db_relay.url.clone(),
+                            is_active: db_relay.is_active,
+                        }).collect();
+                        
+                        // Update in-memory state
+                        *self.relays.lock().unwrap() = state_relays.clone();
+                        
+                        state_relays
+                    },
+                    Err(e) => {
+                        println!("[RUST] Failed to load relays from database: {}, using in-memory state", e);
+                        self.relays.lock().unwrap().clone()
+                    }
+                }
+            },
+            Err(e) => {
+                println!("[RUST] Database not available: {}, using in-memory state", e);
+                self.relays.lock().unwrap().clone()
+            }
+        };
+        
+        // Use the loaded relays (either from DB or in-memory fallback)
+        let relays = db_relays;
         
         // Add active relays to client
         let mut added_relays = false;
@@ -100,8 +141,46 @@ impl AppState {
         println!("[RUST] Connected to {} relays", client.relays().await.len());
         
         // Store client and keys
-        *self.nostr_client.lock().unwrap() = Some(client);
+        *self.nostr_client.lock().unwrap() = Some(client.clone());
         *self.current_keys.lock().unwrap() = Some(keys);
+        
+        // Check if there was an active subscription that needs to be restarted
+        let subscription_to_restart = {
+            let subscription_guard = self.active_subscription.read().await;
+            subscription_guard.clone()
+        };
+        
+        if let Some(subscription) = subscription_to_restart {
+            println!("[RUST] Restarting active subscription after client reconnection");
+            // Restart the subscription with the new client
+            let mut new_subscription_ids = Vec::new();
+            let mut restart_success = true;
+            
+            for filter in &subscription.filters {
+                match client.subscribe(filter.clone(), None).await {
+                    Ok(output) => {
+                        // output.val is a single SubscriptionId, not a HashMap
+                        new_subscription_ids.push(output.val);
+                    },
+                    Err(e) => {
+                        println!("[RUST] Failed to restart subscription for filter: {}", e);
+                        restart_success = false;
+                        break;
+                    }
+                }
+            }
+            
+            if restart_success {
+                let mut subscription_guard = self.active_subscription.write().await;
+                if let Some(ref mut sub) = subscription_guard.as_mut() {
+                    sub.subscription_ids = new_subscription_ids.clone();
+                    sub.is_active = true;
+                    println!("[RUST] Subscription restarted with {} IDs", new_subscription_ids.len());
+                }
+            } else {
+                println!("[RUST] Failed to restart some subscriptions");
+            }
+        }
         
         Ok(())
     }

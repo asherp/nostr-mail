@@ -183,4 +183,50 @@ body.dark-mode .form-text {
 .form-group textarea {
     resize: vertical;
     min-height: 100px;
+}
+
+/* Live Events Status Indicator */
+.live-events-status {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+}
+
+.status-indicator i {
+    font-size: 0.75rem;
+}
+
+.status-indicator.active {
+    color: #28a745;
+}
+
+.status-indicator.inactive {
+    color: #6c757d;
+}
+
+.status-indicator.error {
+    color: #dc3545;
+}
+
+.status-description {
+    color: #6c757d;
+    font-size: 0.75rem;
+    margin-left: 1.25rem;
+}
+
+/* Dark mode styles */
+body.dark-mode .status-indicator.inactive {
+    color: #a0a0a0;
+}
+
+body.dark-mode .status-description {
+    color: #a0a0a0;
 } 

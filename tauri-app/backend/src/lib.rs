@@ -20,7 +20,13 @@ use crate::types::{EmailMessage, RelayStatus, RelayConnectionStatus};
 
 use nostr_sdk::Metadata;
 use nostr_sdk::ToBech32;
+use nostr_sdk::{PublicKey, Filter, Kind, FromBech32, SecretKey, Keys, RelayPoolNotification, Timestamp};
 use std::str::FromStr;
+use std::time::Duration;
+
+use state::EventSubscription;
+use serde_json;
+use tauri::Emitter;
 
 fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
     let raw_headers = email.raw_headers.clone().unwrap_or_default();
@@ -200,8 +206,134 @@ async fn fetch_profile(pubkey: String, relays: Vec<String>) -> Result<Option<Pro
 }
 
 #[tauri::command]
+async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppState>) -> Result<Option<ProfileResult>, String> {
+    println!("[RUST] fetch_profile_persistent called for pubkey: {}", pubkey);
+    
+    // Get the persistent client
+    let client = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        match client_guard.as_ref() {
+            Some(client) => client.clone(),
+            None => return Err("Persistent Nostr client not initialized".to_string()),
+        }
+    };
+    
+    // Parse pubkey
+    let public_key = PublicKey::from_bech32(&pubkey)
+        .or_else(|_| PublicKey::from_hex(&pubkey))
+        .map_err(|e| format!("Invalid pubkey {}: {}", pubkey, e))?;
+    
+    println!("[RUST] Using persistent client to fetch profile for: {}", pubkey);
+    
+    // Create filter for single profile
+    let profile_filter = Filter::new()
+        .author(public_key)
+        .kind(Kind::from(0)) // Profile events are kind 0
+        .limit(1);
+        
+    let profile_events = client
+        .fetch_events(profile_filter, Duration::from_secs(30))
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Found {} profile events using persistent client", profile_events.len());
+    
+    // Find latest profile event
+    if let Some(latest_event) = profile_events.into_iter().max_by_key(|e| e.created_at) {
+        println!("[RUST] Latest profile event ID: {}", latest_event.id.to_hex());
+        
+        // Parse profile content
+        match serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&latest_event.content) {
+            Ok(fields) => {
+                println!("[RUST] Successfully parsed profile for: {}", pubkey);
+                Ok(Some(ProfileResult {
+                    pubkey: pubkey.clone(),
+                    fields,
+                    raw_content: latest_event.content,
+                }))
+            },
+            Err(e) => {
+                println!("[RUST] Failed to parse profile JSON for {}: {}", pubkey, e);
+                Ok(Some(ProfileResult {
+                    pubkey: pubkey.clone(),
+                    fields: std::collections::HashMap::new(),
+                    raw_content: latest_event.content,
+                }))
+            }
+        }
+    } else {
+        println!("[RUST] No profile found for pubkey: {}", pubkey);
+        Ok(None)
+    }
+}
+
+#[tauri::command]
 async fn fetch_nostr_following_pubkeys(pubkey: String, relays: Vec<String>) -> Result<Vec<String>, String> {
     nostr::fetch_following_pubkeys(&pubkey, &relays).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_following_pubkeys_persistent(pubkey: String, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    println!("[RUST] fetch_following_pubkeys_persistent called for pubkey: {}", pubkey);
+    
+    // Get the persistent client
+    let client = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        match client_guard.as_ref() {
+            Some(client) => client.clone(),
+            None => return Err("Persistent Nostr client not initialized".to_string()),
+        }
+    };
+    
+    // Parse the pubkey
+    let public_key = match PublicKey::from_bech32(&pubkey) {
+        Ok(pk) => pk,
+        Err(_) => PublicKey::from_hex(&pubkey).map_err(|e| e.to_string())?,
+    };
+    
+    println!("[RUST] Using persistent client to fetch following for: {}", pubkey);
+    
+    // Fetch user's kind 3 event (contact list) using persistent client
+    let contact_list_filter = Filter::new()
+        .author(public_key)
+        .kind(Kind::ContactList)
+        .limit(1);
+
+    println!("[RUST] Fetching contact list events using persistent client...");
+    let contact_events = client
+        .fetch_events(contact_list_filter, Duration::from_secs(10))
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Found {} contact list events", contact_events.len());
+    
+    let latest_contact_event = contact_events.into_iter().max_by_key(|e| e.created_at);
+
+    if let Some(event) = latest_contact_event {
+        println!("[RUST] Latest contact event ID: {}", event.id.to_hex());
+        println!("[RUST] Contact event has {} tags", event.tags.len());
+        
+        // Get followed pubkeys from 'p' tags
+        let followed_pubkeys: Vec<String> = event.tags
+            .iter()
+            .filter(|tag| tag.kind().as_str() == "p")
+            .filter_map(|tag| {
+                tag.content().and_then(|pk| {
+                    // Try bech32 (npub) first, then hex, convert to bech32
+                    PublicKey::from_bech32(pk)
+                        .or_else(|_| PublicKey::from_hex(pk))
+                        .ok()
+                        .and_then(|pubkey| pubkey.to_bech32().ok())
+                })
+            })
+            .collect();
+        
+        println!("[RUST] Found {} followed pubkeys using persistent client", followed_pubkeys.len());
+        Ok(followed_pubkeys)
+    } else {
+        println!("[RUST] No contact list events found");
+        Ok(vec![])
+    }
 }
 
 
@@ -240,18 +372,27 @@ async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
     
     if let Some(client) = client_option {
         let connected_relays = client.relays().await;
+        println!("[RUST] Currently connected relays: {} relays", connected_relays.len());
+        for (url, _) in connected_relays.iter() {
+            println!("[RUST]   Connected: {}", url);
+        }
         
-        // Get current relay configuration
+        // Get current relay configuration from database (not just in-memory state)
+        let db = state.get_database().map_err(|e| e.to_string())?;
+        let all_db_relays = db.get_all_relays().map_err(|e| e.to_string())?;
+        println!("[RUST] Database relays: {} total", all_db_relays.len());
+        for db_relay in all_db_relays.iter() {
+            println!("[RUST]   DB relay: {} (active: {})", db_relay.url, db_relay.is_active);
+        }
+        
         let mut relays_to_update = Vec::new();
-        {
-            let relays_guard = state.relays.lock().unwrap();
-            for relay in relays_guard.iter() {
-                if relay.is_active {
-                    let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == relay.url);
-                    if !is_connected {
-                        // This relay is marked as active but not actually connected
-                        relays_to_update.push(relay.url.clone());
-                    }
+        for db_relay in all_db_relays.iter() {
+            if db_relay.is_active {
+                let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == db_relay.url);
+                if !is_connected {
+                    // This relay is marked as active but not actually connected
+                    println!("[RUST] Found disconnected active relay: {}", db_relay.url);
+                    relays_to_update.push(db_relay.url.clone());
                 }
             }
         }
@@ -260,11 +401,14 @@ async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
         for relay_url in relays_to_update {
             println!("[RUST] Auto-disabling disconnected relay: {}", relay_url);
             
-            // Update in state
+            // Update in-memory state (if relay exists there)
             {
                 let mut relays_guard = state.relays.lock().unwrap();
                 if let Some(relay) = relays_guard.iter_mut().find(|r| r.url == relay_url) {
                     relay.is_active = false;
+                    println!("[RUST] Updated in-memory state for relay: {}", relay_url);
+                } else {
+                    println!("[RUST] Relay {} not found in in-memory state (database-only relay)", relay_url);
                 }
             }
             
@@ -560,6 +704,94 @@ async fn fetch_profiles(pubkeys: Vec<String>, relays: Vec<String>) -> Result<Vec
     }
     
     Ok(profiles)
+}
+
+#[tauri::command]
+async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<ProfileResult>, String> {
+    println!("[RUST] fetch_profiles_persistent called for {} pubkeys", pubkeys.len());
+    
+    if pubkeys.is_empty() {
+        return Ok(vec![]);
+    }
+    
+    // Get the persistent client
+    let client = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        match client_guard.as_ref() {
+            Some(client) => client.clone(),
+            None => return Err("Persistent Nostr client not initialized".to_string()),
+        }
+    };
+    
+    // Parse all pubkeys
+    let public_keys: Result<Vec<PublicKey>, String> = pubkeys.iter()
+        .map(|pubkey_str| {
+            PublicKey::from_bech32(pubkey_str)
+                .or_else(|_| PublicKey::from_hex(pubkey_str))
+                .map_err(|e| format!("Invalid pubkey {}: {}", pubkey_str, e))
+        })
+        .collect();
+    
+    let public_keys = public_keys?;
+    
+    println!("[RUST] Using persistent client to fetch {} profiles", public_keys.len());
+    
+    // Fetch profiles for all pubkeys in one request using persistent client
+    let profiles_filter = Filter::new()
+        .authors(public_keys.clone())
+        .kind(Kind::from(0)) // Profile events are kind 0
+        .limit(1000); // Allow for multiple profiles
+        
+    let profile_events = client
+        .fetch_events(profiles_filter, Duration::from_secs(30))
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Found {} profile events using persistent client", profile_events.len());
+    
+    let mut results = Vec::new();
+    
+    // Process each requested pubkey
+    for (i, pubkey_str) in pubkeys.iter().enumerate() {
+        let public_key = &public_keys[i];
+        
+        // Find the latest profile event for this pubkey
+        let latest_event = profile_events.iter()
+            .filter(|event| event.pubkey == *public_key)
+            .max_by_key(|event| event.created_at);
+        
+        if let Some(event) = latest_event {
+            // Parse profile content
+            match serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&event.content) {
+                Ok(fields) => {
+                    results.push(ProfileResult {
+                        pubkey: pubkey_str.clone(),
+                        fields: fields,
+                        raw_content: event.content.clone(),
+                    });
+                    
+                    println!("[RUST] Found profile for: {}", pubkey_str);
+                },
+                Err(e) => {
+                    println!("[RUST] Failed to parse profile JSON for {}: {}", pubkey_str, e);
+                    results.push(ProfileResult {
+                        pubkey: pubkey_str.clone(),
+                        fields: std::collections::HashMap::new(),
+                        raw_content: event.content.clone(),
+                    });
+                }
+            }
+        } else {
+            println!("[RUST] No profile found for pubkey: {}", pubkey_str);
+            results.push(ProfileResult {
+                pubkey: pubkey_str.clone(),
+                fields: std::collections::HashMap::new(),
+                raw_content: "{}".to_string(),
+            });
+        }
+    }
+    
+    Ok(results)
 }
 
 // Storage commands
@@ -1236,6 +1468,396 @@ async fn update_profile(private_key: String, fields: std::collections::HashMap<S
     Ok(())
 }
 
+#[tauri::command]
+async fn update_profile_persistent(private_key: String, fields: std::collections::HashMap<String, serde_json::Value>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] update_profile_persistent called");
+    
+    // Get the persistent client
+    let client = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        match client_guard.as_ref() {
+            Some(client) => client.clone(),
+            None => return Err("Persistent Nostr client not initialized".to_string()),
+        }
+    };
+    
+    // Convert fields to JSON string
+    let content = serde_json::to_string(&fields).map_err(|e| e.to_string())?;
+    println!("[RUST] Profile content: {}", content);
+
+    // Parse private key and create keys
+    let secret_key = nostr_sdk::prelude::SecretKey::from_str(&private_key).map_err(|e| e.to_string())?;
+    let keys = nostr_sdk::prelude::Keys::new(secret_key);
+    
+    // Verify the client is using the same keys
+    let current_keys = state.get_current_keys().ok_or("No current keys available")?;
+    if current_keys.public_key() != keys.public_key() {
+        return Err("Private key doesn't match the persistent client's keys".to_string());
+    }
+
+    // Build the profile event (kind 0)
+    let metadata: Metadata = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let event = nostr_sdk::prelude::EventBuilder::metadata(&metadata);
+    let event = event.build(keys.public_key()).sign_with_keys(&keys).map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Built profile event with ID: {}", event.id.to_hex());
+
+    // Get connected relays count for logging
+    let connected_relays = client.relays().await;
+    println!("[RUST] Publishing profile update to {} connected relays", connected_relays.len());
+    
+    // Publish event using persistent client
+    let output = client.send_event(&event).await.map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Profile update published successfully to {} relays", output.success.len());
+    if !output.failed.is_empty() {
+        println!("[RUST] Failed to publish to {} relays: {:?}", output.failed.len(), output.failed);
+    }
+
+    Ok(())
+}
+
+// Live Event Subscription System
+#[tauri::command]
+async fn start_live_event_subscription(
+    private_key: String,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>
+) -> Result<(), String> {
+    println!("[RUST] start_live_event_subscription called");
+    
+    // Get the persistent client
+    let client = state.get_nostr_client(Some(&private_key)).await?;
+    
+    // Parse user's public key from private key
+    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let keys = Keys::new(secret_key);
+    let user_pubkey = keys.public_key();
+    
+    println!("[RUST] Starting subscription for user: {}", user_pubkey.to_bech32().unwrap_or_default());
+    
+    // Get the latest DM timestamp for 'since' parameter to avoid gaps
+    let since_timestamp = {
+        let db = state.get_database().map_err(|e| e.to_string())?;
+        db.get_latest_dm_created_at().map_err(|e| e.to_string())?
+            .map(|dt| dt.timestamp())
+    };
+    
+    println!("[RUST] Using since timestamp: {:?}", since_timestamp);
+    
+    // Create separate filters - need individual subscriptions for each
+    let mut filters = Vec::new();
+    
+    // Filter 1: Direct messages sent by user
+    let mut dm_sent_filter = Filter::new()
+        .kind(Kind::EncryptedDirectMessage)
+        .author(user_pubkey);
+    
+    if let Some(since) = since_timestamp {
+        dm_sent_filter = dm_sent_filter.since(Timestamp::from(since as u64));
+    }
+    filters.push(dm_sent_filter);
+    
+    // Filter 2: Direct messages received by user (tagged with user's pubkey)
+    let mut dm_received_filter = Filter::new()
+        .kind(Kind::EncryptedDirectMessage)
+        .pubkey(user_pubkey);
+    
+    if let Some(since) = since_timestamp {
+        dm_received_filter = dm_received_filter.since(Timestamp::from(since as u64));
+    }
+    filters.push(dm_received_filter);
+    
+    // Filter 3: Profile updates for user's own profile
+    let mut profile_filter = Filter::new()
+        .kind(Kind::Metadata)
+        .author(user_pubkey);
+    
+    if let Some(since) = since_timestamp {
+        profile_filter = profile_filter.since(Timestamp::from(since as u64));
+    }
+    filters.push(profile_filter);
+    
+    println!("[RUST] Created {} filters for subscription", filters.len());
+    
+    // Subscribe to each filter separately
+    let mut subscription_ids = Vec::new();
+    for (i, filter) in filters.iter().enumerate() {
+        match client.subscribe(filter.clone(), None).await {
+            Ok(output) => {
+                // output.val is a single SubscriptionId, not a HashMap
+                let subscription_id = output.val;
+                println!("[RUST] Filter {} created subscription ID: {}", i, subscription_id);
+                subscription_ids.push(subscription_id);
+            },
+            Err(e) => {
+                println!("[RUST] Failed to subscribe to filter {}: {}", i, e);
+                return Err(format!("Failed to subscribe to filter {}: {}", i, e));
+            }
+        }
+    }
+    
+    println!("[RUST] Started {} total subscriptions", subscription_ids.len());
+    
+    // Store subscription info
+    let subscription = EventSubscription {
+        subscription_ids: subscription_ids.clone(),
+        is_active: true,
+        filters,
+        user_pubkey,
+        since_timestamp,
+    };
+    
+    *state.active_subscription.write().await = Some(subscription);
+    
+    // Spawn task to handle notifications
+    let client_clone = client.clone();
+    let app_handle_clone = app_handle.clone();
+    let state_clone = state.inner().clone();
+    let user_pubkey_clone = user_pubkey;
+    
+    tokio::spawn(async move {
+        handle_subscription_notifications(client_clone, app_handle_clone, state_clone, user_pubkey_clone).await;
+    });
+    
+    println!("[RUST] Live event subscription started successfully");
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_live_event_subscription(
+    state: tauri::State<'_, AppState>
+) -> Result<(), String> {
+    println!("[RUST] stop_live_event_subscription called");
+    
+    let client = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        match client_guard.as_ref() {
+            Some(client) => client.clone(),
+            None => {
+                println!("[RUST] No client available");
+                return Ok(());
+            }
+        }
+    };
+    
+    let subscription_ids = {
+        let mut subscription_guard = state.active_subscription.write().await;
+        if let Some(subscription) = subscription_guard.take() {
+            subscription.subscription_ids
+        } else {
+            println!("[RUST] No active subscription to stop");
+            return Ok(());
+        }
+    };
+    
+    // Unsubscribe from all subscriptions (no Result to handle)
+    for subscription_id in subscription_ids {
+        client.unsubscribe(&subscription_id).await;
+        println!("[RUST] Unsubscribed from: {}", subscription_id);
+    }
+    
+    println!("[RUST] All live event subscriptions stopped");
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_live_subscription_status(
+    state: tauri::State<'_, AppState>
+) -> Result<bool, String> {
+    let subscription_guard = state.active_subscription.read().await;
+    let is_active = subscription_guard.as_ref().map(|s| s.is_active).unwrap_or(false);
+    println!("[RUST] Live subscription status: {}", is_active);
+    Ok(is_active)
+}
+
+// Handle subscription notifications with automatic retry and exponential backoff
+async fn handle_subscription_notifications(
+    client: nostr_sdk::Client,
+    app_handle: tauri::AppHandle,
+    state: AppState,
+    user_pubkey: PublicKey,
+) {
+    println!("[RUST] Starting notification handler for user: {}", user_pubkey.to_bech32().unwrap_or_default());
+    
+    let mut retry_count = 0;
+    let max_retries = 5;
+    let base_delay = Duration::from_secs(1);
+    
+    loop {
+        let mut notifications = client.notifications();
+        
+        while let Ok(notification) = notifications.recv().await {
+            match notification {
+                RelayPoolNotification::Event { event, .. } => {
+                    println!("[RUST] Received event: kind={}, id={}", event.kind.as_u16(), event.id.to_hex());
+                    
+                    match event.kind {
+                        Kind::EncryptedDirectMessage => {
+                            if let Err(e) = handle_live_direct_message(&event, &app_handle, &state, &user_pubkey).await {
+                                println!("[RUST] Error handling DM: {}", e);
+                            }
+                        },
+                        Kind::Metadata => {
+                            if let Err(e) = handle_live_profile_update(&event, &app_handle, &state, &user_pubkey).await {
+                                println!("[RUST] Error handling profile update: {}", e);
+                            }
+                        },
+                        _ => {
+                            println!("[RUST] Ignoring event of kind: {}", event.kind.as_u16());
+                        }
+                    }
+                },
+                RelayPoolNotification::Message { message, .. } => {
+                    println!("[RUST] Received relay message: {:?}", message);
+                },
+                RelayPoolNotification::Shutdown => {
+                    println!("[RUST] Received shutdown notification");
+                    break;
+                }
+            }
+        }
+        
+        // If we get here, the notification stream ended - implement retry logic
+        retry_count += 1;
+        if retry_count > max_retries {
+            println!("[RUST] Max retries exceeded, stopping notification handler");
+            // Emit error event to frontend
+            if let Err(e) = app_handle.emit("subscription-error", "Max retries exceeded") {
+                println!("[RUST] Failed to emit subscription error: {}", e);
+            }
+            break;
+        }
+        
+        // Exponential backoff
+        let delay = base_delay * (2_u32.pow(retry_count.min(5)));
+        println!("[RUST] Notification stream ended, retrying in {:?} (attempt {})", delay, retry_count);
+        tokio::time::sleep(delay).await;
+        
+        // Check if subscription is still active
+        let is_still_active = {
+            let subscription_guard = state.active_subscription.read().await;
+            subscription_guard.as_ref().map(|s| s.is_active).unwrap_or(false)
+        };
+        
+        if !is_still_active {
+            println!("[RUST] Subscription no longer active, stopping notification handler");
+            break;
+        }
+    }
+    
+    println!("[RUST] Notification handler stopped");
+}
+
+// Handle live direct message events
+async fn handle_live_direct_message(
+    event: &nostr_sdk::Event,
+    app_handle: &tauri::AppHandle,
+    state: &AppState,
+    user_pubkey: &PublicKey,
+) -> Result<(), String> {
+    println!("[RUST] Processing live DM: {}", event.id.to_hex());
+    
+    // Convert sender_pubkey to npub format
+    let sender_npub = event.pubkey.to_bech32().map_err(|e| e.to_string())?;
+    
+    // Find recipient from p tags
+    let recipient_npub = event.tags.iter()
+        .find(|tag| tag.kind().as_str() == "p")
+        .and_then(|tag| tag.content())
+        .and_then(|pk| {
+            PublicKey::from_bech32(pk)
+                .or_else(|_| PublicKey::from_hex(pk))
+                .ok()
+                .and_then(|pubkey| pubkey.to_bech32().ok())
+        })
+        .unwrap_or_else(|| user_pubkey.to_bech32().unwrap_or_default());
+    
+    // Create DirectMessage for database
+    let dm = DbDirectMessage {
+        id: None,
+        event_id: event.id.to_hex(),
+        sender_pubkey: sender_npub.clone(),
+        recipient_pubkey: recipient_npub.clone(),
+        content: event.content.clone(),
+        created_at: chrono::DateTime::from_timestamp(event.created_at.as_u64() as i64, 0)
+            .unwrap_or_else(|| chrono::Utc::now()),
+        received_at: chrono::Utc::now(),
+    };
+    
+    // Save to database (will handle deduplication via UNIQUE constraint)
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    match db.save_dm(&dm) {
+        Ok(_) => {
+            println!("[RUST] Saved live DM to database");
+            
+            // Emit event to frontend
+            let dm_payload = serde_json::json!({
+                "event_id": event.id.to_hex(),
+                "sender_pubkey": sender_npub,
+                "recipient_pubkey": recipient_npub,
+                "content": event.content,
+                "created_at": event.created_at.as_u64(),
+                "is_live": true
+            });
+            
+            if let Err(e) = app_handle.emit("dm-received", &dm_payload) {
+                println!("[RUST] Failed to emit dm-received event: {}", e);
+            } else {
+                println!("[RUST] Emitted dm-received event");
+            }
+        },
+        Err(e) => {
+            // Check if it's a duplicate (UNIQUE constraint violation)
+            if e.to_string().contains("UNIQUE constraint failed") {
+                println!("[RUST] DM already exists in database (duplicate): {}", event.id.to_hex());
+            } else {
+                println!("[RUST] Failed to save DM: {}", e);
+                return Err(format!("Failed to save DM: {}", e));
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// Handle live profile update events
+async fn handle_live_profile_update(
+    event: &nostr_sdk::Event,
+    app_handle: &tauri::AppHandle,
+    _state: &AppState,
+    user_pubkey: &PublicKey,
+) -> Result<(), String> {
+    println!("[RUST] Processing live profile update: {}", event.id.to_hex());
+    
+    // Only process profile updates for the current user
+    if event.pubkey != *user_pubkey {
+        println!("[RUST] Ignoring profile update from different user");
+        return Ok(());
+    }
+    
+    // Parse profile content
+    let fields: std::collections::HashMap<String, serde_json::Value> = 
+        serde_json::from_str(&event.content).unwrap_or_default();
+    
+    // Emit event to frontend
+    let profile_payload = serde_json::json!({
+        "pubkey": event.pubkey.to_bech32().unwrap_or_default(),
+        "fields": fields,
+        "created_at": event.created_at.as_u64(),
+        "raw_content": event.content,
+        "is_live": true
+    });
+    
+    if let Err(e) = app_handle.emit("profile-updated", &profile_payload) {
+        println!("[RUST] Failed to emit profile-updated event: {}", e);
+    } else {
+        println!("[RUST] Emitted profile-updated event");
+    }
+    
+    Ok(())
+}
+
 // Draft operations
 #[tauri::command]
 fn db_save_draft(draft: DbEmail, state: tauri::State<AppState>) -> Result<i64, String> {
@@ -1444,8 +2066,11 @@ pub fn run() {
         fetch_conversations,
         fetch_conversation_messages,
         fetch_profile,
+        fetch_profile_persistent,
         fetch_following_profiles,
         fetch_nostr_following_pubkeys,
+        fetch_following_pubkeys_persistent,
+        fetch_profiles_persistent,
         get_relays,
         set_relays,
         update_single_relay,
@@ -1533,6 +2158,10 @@ pub fn run() {
         db_get_all_dm_pubkeys,
         db_get_all_dm_pubkeys_sorted,
         update_profile,
+        update_profile_persistent,
+        start_live_event_subscription,
+        stop_live_event_subscription,
+        get_live_subscription_status,
         db_save_draft,
         db_get_drafts,
         db_delete_draft,

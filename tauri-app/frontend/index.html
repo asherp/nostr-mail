@@ -354,6 +354,17 @@
                         </div>
                         
                         <div class="form-group">
+                            <label>Live Events Status:</label>
+                            <div class="live-events-status">
+                                <span id="live-events-indicator" class="status-indicator">
+                                    <i class="fas fa-circle"></i>
+                                    <span id="live-events-text">Initializing...</span>
+                                </span>
+                                <small class="status-description">Real-time direct messages and profile updates</small>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
                             <button id="generate-key-btn" class="btn btn-secondary">
                                 <i class="fas fa-key"></i> Generate New Keypair
                             </button>
@@ -441,22 +452,30 @@
                     
                     <!-- Relay Settings -->
                     <div class="settings-section">
-                        <h3><i class="fas fa-network-wired"></i> Relay Settings</h3>
-                        
-                        <div class="form-group">
-                            <label for="new-relay-url">Add Relay:</label>
-                            <div class="input-with-button">
-                                <input type="text" id="new-relay-url" placeholder="wss://relay.example.com">
-                                <button id="add-relay-btn" class="btn btn-secondary">
-                                    <i class="fas fa-plus"></i> Add
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-network-wired"></i> Relay Settings</h3>
+                            <div class="relay-summary-container">
+                                <span id="relay-summary" class="relay-summary">Loading...</span>
+                                <button id="relay-edit-toggle" class="btn btn-secondary btn-small relay-edit-btn">
+                                    <i class="fas fa-edit"></i> Edit
                                 </button>
                             </div>
                         </div>
                         
                         <div class="form-group">
-                            <label>Active Relays:</label>
-                            <div id="relay-list" class="relay-list">
+                            <div id="relay-list" class="relay-list collapsed">
                                 <!-- Relays will be populated here -->
+                                <div class="add-relay-section">
+                                    <div class="form-group">
+                                        <label for="new-relay-url">Add Relay:</label>
+                                        <div class="input-with-button">
+                                            <input type="text" id="new-relay-url" placeholder="wss://relay.example.com">
+                                            <button id="add-relay-btn" class="btn btn-secondary">
+                                                <i class="fas fa-plus"></i> Add
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>

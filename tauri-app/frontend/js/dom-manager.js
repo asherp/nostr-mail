@@ -75,6 +75,12 @@ class DOMManager {
             
             // Relays
             relaysList: this.getElement('relay-list'),
+            relaySummary: this.getElement('relay-summary'),
+            relayEditToggle: this.getElement('relay-edit-toggle'),
+            
+            // Live Events
+            liveEventsIndicator: this.getElement('live-events-indicator'),
+            liveEventsText: this.getElement('live-events-text'),
             newRelayUrl: this.getElement('new-relay-url'),
             addRelayBtn: this.getElement('add-relay-btn'),
             

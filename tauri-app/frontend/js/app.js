@@ -48,6 +48,9 @@ NostrMailApp.prototype.init = async function() {
         console.log('🔑 Loading/generating keypair...');
         await this.loadKeypair();
         
+        console.log('🔄 Initializing live event subscription...');
+        await this.initializeLiveEvents();
+        
         console.log('🎯 Setting up event listeners...');
         this.setupEventListeners();
         
@@ -105,10 +108,15 @@ NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
         
         // Sync disconnected relays first, then render
         await this.syncDisconnectedRelays();
+        
+        // Always render (which will show summary by default)
         await this.renderRelays();
     } catch (error) {
         console.error('Failed to load relays from database:', error);
         notificationService.showError('Could not load relays from database.');
+        
+        // Show empty summary on error
+        this.updateRelaySummary([]);
     }
 }
 
@@ -391,6 +399,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (addRelayBtn) {
             addRelayBtn.addEventListener('click', () => this.addRelay());
         }
+        
+        // Relay edit toggle button
+        const relayEditToggle = domManager.get('relayEditToggle');
+        if (relayEditToggle) {
+            relayEditToggle.addEventListener('click', () => this.toggleRelayEdit());
+        }
         // Email provider selection
         const emailProvider = domManager.get('emailProvider');
         if (emailProvider) {
@@ -545,6 +559,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
                     domManager.setValue('nprivKey', keypair.private_key);
                     await app.updatePublicKeyDisplay();
+                    
+                    // Restart live events with new keypair
+                    console.log('[LiveEvents] New keypair generated, restarting live events');
+                    await app.cleanupLiveEvents();
+                    await app.initializeLiveEvents();
+                    
                     notificationService.showSuccess('New keypair generated!');
                 } catch (error) {
                     notificationService.showError('Failed to generate keypair: ' + error);
@@ -589,6 +609,361 @@ NostrMailApp.prototype.setupEventListeners = function() {
         console.error('Error setting up event listeners:', error);
     }
 }
+
+// Live Event Subscription System
+NostrMailApp.prototype.initializeLiveEvents = async function() {
+    if (!appState.hasKeypair()) {
+        console.log('[LiveEvents] No keypair available, skipping live event subscription');
+        this.updateLiveEventsStatus('inactive', 'No keypair');
+        return;
+    }
+    
+    const privateKey = appState.getKeypair().private_key;
+    
+    try {
+        // Start unified subscription for DMs and profile updates
+        await TauriService.startLiveEventSubscription(privateKey);
+        
+        // Set up event listeners for live events
+        await this.setupLiveEventListeners();
+        
+        this.liveEventsActive = true;
+        this.updateLiveEventsStatus('active', 'Connected');
+        console.log('[LiveEvents] Live event subscription initialized successfully');
+        
+    } catch (error) {
+        console.error('[LiveEvents] Failed to initialize live events:', error);
+        this.updateLiveEventsStatus('error', 'Connection failed');
+        // Don't throw - app should continue working with polling fallback
+    }
+};
+
+NostrMailApp.prototype.setupLiveEventListeners = async function() {
+    try {
+        console.log('[LiveEvents] Setting up event listeners...');
+        
+        // Listen for live direct messages
+        this.dmUnlisten = await window.__TAURI__.event.listen('dm-received', (event) => {
+            console.log('[LiveEvents] *** DM EVENT LISTENER TRIGGERED ***');
+            console.log('[LiveEvents] Raw event:', event);
+            console.log('[LiveEvents] Event payload:', event.payload);
+            this.handleLiveDM(event.payload);
+        });
+        
+        // Listen for live profile updates
+        this.profileUnlisten = await window.__TAURI__.event.listen('profile-updated', (event) => {
+            console.log('[LiveEvents] *** PROFILE EVENT LISTENER TRIGGERED ***');
+            console.log('[LiveEvents] Raw event:', event);
+            console.log('[LiveEvents] Event payload:', event.payload);
+            this.handleLiveProfileUpdate(event.payload);
+        });
+        
+        console.log('[LiveEvents] Event listeners set up successfully');
+        console.log('[LiveEvents] DM listener:', this.dmUnlisten ? 'ACTIVE' : 'FAILED');
+        console.log('[LiveEvents] Profile listener:', this.profileUnlisten ? 'ACTIVE' : 'FAILED');
+        
+    } catch (error) {
+        console.error('[LiveEvents] Failed to set up event listeners:', error);
+    }
+};
+
+NostrMailApp.prototype.handleLiveDM = function(dmData) {
+    try {
+        console.log('[LiveEvents] *** LIVE DM RECEIVED ***');
+        console.log('[LiveEvents] DM Data:', dmData);
+        console.log('[LiveEvents] Event payload:', JSON.stringify(dmData, null, 2));
+        
+        // Start performance timing
+        const startTime = performance.now();
+        console.log('[LiveEvents] Starting UI refresh at', startTime);
+        
+        // Run refreshes in parallel for better performance
+        const refreshPromises = [];
+        
+        // Always refresh DM conversations to show new message immediately
+        if (window.dmService) {
+            console.log('[LiveEvents] Starting DM conversations refresh');
+            const contactsPromise = window.dmService.loadDmContacts().catch(error => {
+                console.error('[LiveEvents] Failed to refresh DM conversations:', error);
+            });
+            refreshPromises.push(contactsPromise);
+        }
+        
+        // If currently viewing messages tab, also refresh the active conversation immediately
+        if (document.querySelector('.tab-content#messages.active')) {
+            // Check if we're viewing a conversation with this sender
+            const currentContact = window.appState.getSelectedDmContact();
+            if (currentContact && 
+                (currentContact.pubkey === dmData.sender_pubkey || currentContact.pubkey === dmData.recipient_pubkey)) {
+                console.log('[LiveEvents] Starting active conversation refresh');
+                if (window.dmService) {
+                    const messagesPromise = window.dmService.loadDmMessages(currentContact.pubkey).catch(error => {
+                        console.error('[LiveEvents] Failed to refresh conversation messages:', error);
+                    });
+                    refreshPromises.push(messagesPromise);
+                }
+            }
+        }
+        
+        // Wait for all refreshes to complete and log timing
+        Promise.all(refreshPromises).then(() => {
+            const endTime = performance.now();
+            console.log(`[LiveEvents] UI refresh completed in ${(endTime - startTime).toFixed(2)}ms`);
+        }).catch(error => {
+            const endTime = performance.now();
+            console.error(`[LiveEvents] UI refresh failed after ${(endTime - startTime).toFixed(2)}ms:`, error);
+        });
+        
+        // Show notification for new message immediately (don't wait for UI refresh)
+        const senderShort = dmData.sender_pubkey.slice(0, 8) + '...';
+        notificationService.showInfo(`New message from ${senderShort}`);
+        
+        // Try to add message to UI immediately if possible (experimental)
+        this.tryDirectMessageInsertion(dmData);
+        
+        // Update unread count or other UI indicators
+        // TODO: Implement unread count system
+        
+        console.log('[LiveEvents] Live DM processed successfully');
+        
+    } catch (error) {
+        console.error('[LiveEvents] Error handling live DM:', error);
+    }
+};
+
+NostrMailApp.prototype.handleLiveProfileUpdate = function(profileData) {
+    try {
+        // Only update if it's for the current user and we're on profile tab
+        const currentPubkey = appState.getKeypair()?.public_key;
+        const isCurrentUser = profileData.pubkey === currentPubkey;
+        const isOnProfileTab = document.querySelector('.tab-content#profile.active');
+        
+        if (isCurrentUser && isOnProfileTab) {
+            console.log('[LiveEvents] Updating profile UI for live update');
+            
+            // Update profile UI with new data
+            const updatedProfile = {
+                pubkey: profileData.pubkey,
+                fields: profileData.fields,
+                created_at: profileData.created_at,
+                raw_content: profileData.raw_content
+            };
+            
+            this.renderProfileFromObject(updatedProfile);
+            
+            // Update localStorage cache
+            this.updateProfileCache(updatedProfile);
+            
+            // Show notification
+            notificationService.showInfo('Profile updated from another device');
+        }
+        
+        // Update contact profile if this person is in contacts
+        if (profileData.fields) {
+            contactsService.updateContactProfile(profileData.pubkey, profileData.fields);
+        }
+        
+        console.log('[LiveEvents] Live profile update processed successfully');
+        
+    } catch (error) {
+        console.error('[LiveEvents] Error handling live profile update:', error);
+    }
+};
+
+NostrMailApp.prototype.updateProfileCache = function(profileData) {
+    try {
+        const pubkey = profileData.pubkey;
+        if (pubkey) {
+            let profileDict = {};
+            const cached = localStorage.getItem('nostr_mail_profiles');
+            if (cached) {
+                profileDict = JSON.parse(cached);
+            }
+            profileDict[pubkey] = profileData;
+            localStorage.setItem('nostr_mail_profiles', JSON.stringify(profileDict));
+            console.log('[LiveEvents] Profile cache updated for', pubkey);
+        }
+    } catch (error) {
+        console.error('[LiveEvents] Error updating profile cache:', error);
+    }
+};
+
+NostrMailApp.prototype.cleanupLiveEvents = async function() {
+    if (this.liveEventsActive) {
+        try {
+            // Stop the backend subscription
+            await TauriService.stopLiveEventSubscription();
+            
+            // Clean up event listeners
+            if (this.dmUnlisten) {
+                this.dmUnlisten();
+                this.dmUnlisten = null;
+            }
+            
+            if (this.profileUnlisten) {
+                this.profileUnlisten();
+                this.profileUnlisten = null;
+            }
+            
+            this.liveEventsActive = false;
+            this.updateLiveEventsStatus('inactive', 'Disconnected');
+            console.log('[LiveEvents] Live events cleaned up successfully');
+            
+        } catch (error) {
+            console.error('[LiveEvents] Error cleaning up live events:', error);
+        }
+    }
+};
+
+NostrMailApp.prototype.updateLiveEventsStatus = function(status, text) {
+    try {
+        const indicator = domManager.get('liveEventsIndicator');
+        const textElement = domManager.get('liveEventsText');
+        
+        if (indicator && textElement) {
+            // Remove existing status classes
+            indicator.classList.remove('active', 'inactive', 'error');
+            
+            // Add new status class
+            indicator.classList.add(status);
+            
+            // Update text
+            textElement.textContent = text;
+            
+            console.log(`[LiveEvents] Status updated: ${status} - ${text}`);
+        }
+    } catch (error) {
+        console.error('[LiveEvents] Error updating status indicator:', error);
+    }
+};
+
+// Debug method to check live events status
+NostrMailApp.prototype.debugLiveEvents = function() {
+    console.log('=== LIVE EVENTS DEBUG INFO ===');
+    console.log('Live events active:', this.liveEventsActive);
+    console.log('Has keypair:', appState.hasKeypair());
+    console.log('Current pubkey:', appState.getKeypair()?.public_key);
+    console.log('DM listener active:', !!this.dmUnlisten);
+    console.log('Profile listener active:', !!this.profileUnlisten);
+    
+    const indicator = domManager.get('liveEventsIndicator');
+    const textElement = domManager.get('liveEventsText');
+    console.log('Status indicator element:', !!indicator);
+    console.log('Status text element:', !!textElement);
+    if (indicator) {
+        console.log('Current status classes:', indicator.className);
+    }
+    if (textElement) {
+        console.log('Current status text:', textElement.textContent);
+    }
+    
+    // Test backend connection
+    TauriService.getLiveSubscriptionStatus().then(status => {
+        console.log('Backend subscription status:', status);
+    }).catch(error => {
+        console.error('Failed to get backend status:', error);
+    });
+    
+    console.log('=== END DEBUG INFO ===');
+};
+
+// Experimental: Try to insert message directly into UI for instant updates
+NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
+    try {
+        console.log('[LiveEvents] Attempting direct message insertion');
+        
+        // Only try if we're viewing the messages tab
+        if (!document.querySelector('.tab-content#messages.active')) {
+            console.log('[LiveEvents] Not on messages tab, skipping direct insertion');
+            return;
+        }
+        
+        // Check if we're viewing a conversation with this sender/recipient
+        const currentContact = window.appState.getSelectedDmContact();
+        if (!currentContact) {
+            console.log('[LiveEvents] No active conversation, skipping direct insertion');
+            return;
+        }
+        
+        const isRelevantMessage = currentContact.pubkey === dmData.sender_pubkey || 
+                                 currentContact.pubkey === dmData.recipient_pubkey;
+        
+        if (!isRelevantMessage) {
+            console.log('[LiveEvents] Message not for current conversation, skipping direct insertion');
+            return;
+        }
+        
+        // Find the messages container
+        const messagesContainer = document.querySelector('#dm-messages');
+        if (!messagesContainer) {
+            console.log('[LiveEvents] Messages container not found, skipping direct insertion');
+            return;
+        }
+        
+        // Check if this message already exists (prevent duplicates)
+        const existingMessage = messagesContainer.querySelector(`[data-event-id="${dmData.event_id}"]`);
+        if (existingMessage) {
+            console.log('[LiveEvents] Message already exists in UI, skipping direct insertion');
+            return;
+        }
+        
+        console.log('[LiveEvents] Messages container found, proceeding with insertion');
+        
+        // Create message element matching the actual DM service structure
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'message';
+        messageDiv.setAttribute('data-event-id', dmData.event_id);
+        
+        // Determine if this is an incoming or outgoing message
+        const currentUserPubkey = window.appState.getKeypair()?.public_key;
+        const isOutgoing = dmData.sender_pubkey === currentUserPubkey;
+        
+        if (isOutgoing) {
+            messageDiv.classList.add('outgoing');
+        } else {
+            messageDiv.classList.add('incoming');
+        }
+        
+        // Format timestamp to match existing messages
+        const messageDate = new Date(dmData.created_at * 1000);
+        const now = new Date();
+        const isToday = messageDate.toDateString() === now.toDateString();
+        const dateTimeDisplay = isToday 
+            ? messageDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            : messageDate.toLocaleString([], { 
+                month: 'short', 
+                day: 'numeric', 
+                hour: '2-digit', 
+                minute: '2-digit' 
+            });
+        
+        // Use the same structure as dm-service.js
+        messageDiv.innerHTML = `
+            <div class="message-content">
+                <div class="message-text">${window.Utils?.escapeHtml(dmData.content) || dmData.content || '[Encrypted message]'}</div>
+                <div class="message-meta">
+                    <div class="message-time">${dateTimeDisplay}</div>
+                    <span class="message-status live-message" title="Live message">⚡</span>
+                </div>
+            </div>
+        `;
+        
+        // Add to messages container
+        messagesContainer.appendChild(messageDiv);
+        console.log('[LiveEvents] Message element appended to container');
+        
+        // Scroll to bottom
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        console.log('[LiveEvents] Scrolled to bottom');
+        
+        console.log('[LiveEvents] Message inserted directly into UI successfully');
+        console.log('[LiveEvents] Message content preview:', dmData.content?.substring(0, 50) + '...');
+        
+    } catch (error) {
+        console.error('[LiveEvents] Error in direct message insertion:', error);
+        // Fail silently - the regular refresh will handle it
+    }
+};
 
 // Tab switching
 NostrMailApp.prototype.switchTab = function(tabName) {
@@ -723,9 +1098,22 @@ NostrMailApp.prototype.saveSettings = async function() {
             }
             const publicKey = await TauriService.getPublicKeyFromPrivate(nprivKey);
             const keypair = { private_key: nprivKey, public_key: publicKey };
+            
+            // Check if this is a different keypair
+            const currentKeypair = appState.getKeypair();
+            const isNewKeypair = !currentKeypair || currentKeypair.private_key !== nprivKey;
+            
             appState.setKeypair(keypair);
             localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
             this.renderProfilePubkey();
+            
+            // If keypair changed, restart live events with new key
+            if (isNewKeypair) {
+                console.log('[LiveEvents] Keypair changed, restarting live events');
+                await this.cleanupLiveEvents();
+                await this.initializeLiveEvents();
+            }
+            
             // If on profile tab, reload profile
             if (document.querySelector('.tab-content#profile.active')) {
                 this.loadProfile();
@@ -862,7 +1250,6 @@ NostrMailApp.prototype.saveRelaysToLocalStorage = function() {
 NostrMailApp.prototype.renderRelays = async function() {
     const relaysList = domManager.get('relaysList');
     if (!relaysList) return;
-    relaysList.innerHTML = '';
     
     // Get relay connection statuses from backend
     let relayStatuses = [];
@@ -873,8 +1260,25 @@ NostrMailApp.prototype.renderRelays = async function() {
         console.error('Failed to get relay statuses:', error);
     }
     
+    // Update summary first
+    this.updateRelaySummary(relayStatuses);
+    
+    // Only render the full list if in edit mode
+    const isEditing = relaysList.classList.contains('expanded');
+    if (!isEditing) {
+        return; // Don't render the full list when collapsed
+    }
+    
+    // Clear only the relay items, not the add-relay-section
+    const existingRelayItems = relaysList.querySelectorAll('.relay-item');
+    existingRelayItems.forEach(item => item.remove());
+    
     // Sort relays by updated_at descending
     const relays = [...appState.getRelays()].sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+    
+    // Get the add-relay-section to insert relays before it
+    const addRelaySection = relaysList.querySelector('.add-relay-section');
+    
     relays.forEach((relay) => {
         // Find matching status from backend
         const status = relayStatuses.find(s => s.url === relay.url);
@@ -885,6 +1289,13 @@ NostrMailApp.prototype.renderRelays = async function() {
         
         const relayItem = document.createElement('div');
         relayItem.className = 'relay-item';
+        // Add retry button for disconnected relays that are active
+        const showRetryButton = relay.is_active && connectionStatus === 'Disconnected';
+        const retryButtonHtml = showRetryButton ? 
+            `<button class="btn btn-secondary btn-small retry-btn" data-relay-id="${relay.id}" data-relay-url="${relay.url}" title="Retry connection">
+                <i class="fas fa-redo"></i>
+            </button>` : '';
+            
         relayItem.innerHTML = `
             <div class="relay-item-info">
                 <span class="relay-item-url">${relay.url}</span>
@@ -894,6 +1305,7 @@ NostrMailApp.prototype.renderRelays = async function() {
                 </div>
             </div>
             <div class="relay-item-actions">
+                ${retryButtonHtml}
                 <label class="toggle-switch">
                     <input type="checkbox" ${relay.is_active ? 'checked' : ''} data-relay-id="${relay.id}" data-relay-url="${relay.url}">
                 </label>
@@ -902,7 +1314,13 @@ NostrMailApp.prototype.renderRelays = async function() {
                 </button>
             </div>
         `;
-        relaysList.appendChild(relayItem);
+        
+        // Insert before the add-relay-section
+        if (addRelaySection) {
+            relaysList.insertBefore(relayItem, addRelaySection);
+        } else {
+            relaysList.appendChild(relayItem);
+        }
     });
     // Add event listeners after rendering
     relaysList.querySelectorAll('input[type="checkbox"]').forEach(toggle => {
@@ -910,6 +1328,9 @@ NostrMailApp.prototype.renderRelays = async function() {
     });
     relaysList.querySelectorAll('.btn-danger').forEach(button => {
         button.addEventListener('click', (e) => this.removeRelayById(e.currentTarget.dataset.relayId, e.currentTarget.dataset.relayUrl));
+    });
+    relaysList.querySelectorAll('.retry-btn').forEach(button => {
+        button.addEventListener('click', (e) => this.retryRelayConnection(e.currentTarget.dataset.relayId, e.currentTarget.dataset.relayUrl));
     });
 }
 
@@ -919,6 +1340,8 @@ NostrMailApp.prototype.getRelayStatusClass = function(connectionStatus) {
         case 'Connected': return 'status-connected';
         case 'Disconnected': return 'status-disconnected';
         case 'Disabled': return 'status-disabled';
+        case 'Connecting': return 'status-connecting';
+        case 'Disconnecting': return 'status-disconnecting';
         default: return 'status-unknown';
     }
 }
@@ -928,6 +1351,8 @@ NostrMailApp.prototype.getRelayStatusIcon = function(connectionStatus) {
         case 'Connected': return 'fa-circle';
         case 'Disconnected': return 'fa-circle';
         case 'Disabled': return 'fa-circle';
+        case 'Connecting': return 'fa-spinner fa-spin';
+        case 'Disconnecting': return 'fa-spinner fa-spin';
         default: return 'fa-question-circle';
     }
 }
@@ -935,8 +1360,10 @@ NostrMailApp.prototype.getRelayStatusIcon = function(connectionStatus) {
 NostrMailApp.prototype.getRelayStatusText = function(connectionStatus) {
     switch (connectionStatus) {
         case 'Connected': return 'Connected';
-        case 'Disconnected': return 'Disconnected';
+        case 'Disconnected': return 'Connection Failed';
         case 'Disabled': return 'Disabled';
+        case 'Connecting': return 'Connecting...';
+        case 'Disconnecting': return 'Disconnecting...';
         default: return 'Unknown';
     }
 }
@@ -1035,6 +1462,10 @@ NostrMailApp.prototype.toggleRelayById = async function(relayId, relayUrl) {
         try {
             const newActiveState = !relay.is_active;
             
+            // Show immediate feedback with connecting/disconnecting status
+            const intermediateStatus = newActiveState ? 'Connecting' : 'Disconnecting';
+            this.updateSingleRelayStatus(relayUrl, intermediateStatus);
+            
             // Update the database first
             await TauriService.invoke('db_save_relay', {
                 relay: {
@@ -1049,11 +1480,14 @@ NostrMailApp.prototype.toggleRelayById = async function(relayId, relayUrl) {
             // Update the backend Nostr client connection immediately
             try {
                 await TauriService.updateSingleRelay(relayUrl, newActiveState);
-                console.log(`[APP] ${newActiveState ? 'Connected to' : 'Disconnected from'} relay: ${relayUrl}`);
+                console.log(`[APP] ${newActiveState ? 'Connecting to' : 'Disconnecting from'} relay: ${relayUrl}`);
             } catch (relayError) {
                 // Log the error but don't fail the entire operation
                 console.warn(`[APP] Relay connection update had issues: ${relayError}`);
-                // Continue with UI updates since database was updated successfully
+                // Show error status
+                this.updateSingleRelayStatus(relayUrl, 'Disconnected');
+                notificationService.showWarning(`Relay connection issue: ${relayError}`);
+                return;
             }
             
             // Update the local state
@@ -1066,26 +1500,44 @@ NostrMailApp.prototype.toggleRelayById = async function(relayId, relayUrl) {
                 toggleElement.checked = newActiveState;
             }
             
-            // Update the status indicator immediately
-            const expectedStatus = newActiveState ? 'Connected' : 'Disabled';
-            this.updateSingleRelayStatus(relayUrl, expectedStatus);
+            // Show success feedback
+            const successMessage = newActiveState ? 
+                `Attempting to connect to relay: ${relayUrl}` : 
+                `Disconnected from relay: ${relayUrl}`;
+            notificationService.showInfo(successMessage);
             
-            // Verify actual status after a short delay
+            // Verify actual status after connection attempts
             setTimeout(async () => {
                 try {
                     const relayStatuses = await TauriService.getRelayStatus();
                     const status = relayStatuses.find(s => s.url === relayUrl);
                     if (status) {
                         this.updateSingleRelayStatus(relayUrl, status.status);
+                        
+                        // Show final connection result
+                        if (newActiveState && status.status === 'Connected') {
+                            notificationService.showSuccess(`✅ Successfully connected to ${relayUrl}`);
+                        } else if (newActiveState && status.status === 'Disconnected') {
+                            notificationService.showError(`❌ Failed to connect to ${relayUrl}`);
+                        }
+                    } else {
+                        // Fallback to expected status
+                        const expectedStatus = newActiveState ? 'Connected' : 'Disabled';
+                        this.updateSingleRelayStatus(relayUrl, expectedStatus);
                     }
                 } catch (error) {
                     console.error('Failed to verify relay status:', error);
+                    // Fallback to expected status
+                    const expectedStatus = newActiveState ? 'Connected' : 'Disabled';
+                    this.updateSingleRelayStatus(relayUrl, expectedStatus);
                 }
-            }, 1000);
+            }, 2000); // Increased to 2 seconds for better connection verification
             
         } catch (error) {
             console.error('Failed to toggle relay:', error);
             notificationService.showError('Failed to update relay: ' + error);
+            // Reset status on error
+            this.updateSingleRelayStatus(relayUrl, 'Disconnected');
         }
     }
 }
@@ -1169,22 +1621,24 @@ NostrMailApp.prototype.loadProfile = async function() {
         return;
     }
 
-    const activeRelays = appState.getActiveRelays();
-    if (activeRelays.length === 0) {
-        notificationService.showError('No active relays to fetch profile from.');
+    // Check if we have any relays configured (persistent client will handle connection logic)
+    const allRelays = appState.getRelays();
+    if (allRelays.length === 0) {
+        notificationService.showError('No relays configured to fetch profile from.');
         this.renderProfilePubkey();
         if (Utils.isDevMode()) {
             const rawJsonBox = document.getElementById('profile-raw-json');
             if (rawJsonBox) {
                 rawJsonBox.style.display = '';
-                rawJsonBox.value = 'No active relays.';
+                rawJsonBox.value = 'No relays configured.';
             }
         }
         return;
     }
 
     try {
-        const profile = await TauriService.fetchProfile(appState.getKeypair().public_key, activeRelays);
+        // Use persistent client for better performance (reuses existing connections)
+        const profile = await TauriService.fetchProfilePersistent(appState.getKeypair().public_key);
 
         if (profile) {
             // If there's a new picture URL, fetch and cache the image as a data URL
@@ -1441,9 +1895,10 @@ NostrMailApp.prototype.updateProfile = async function() {
         return;
     }
 
-    const activeRelays = appState.getActiveRelays();
-    if (activeRelays.length === 0) {
-        notificationService.showError('No active relays configured');
+    // Check if we have any relays configured (persistent client will handle connection logic)
+    const allRelays = appState.getRelays();
+    if (allRelays.length === 0) {
+        notificationService.showError('No relays configured to publish profile');
         return;
     }
 
@@ -1463,11 +1918,10 @@ NostrMailApp.prototype.updateProfile = async function() {
             }
         }
 
-        // Update profile on Nostr
-        await TauriService.updateProfile(
+        // Update profile on Nostr using persistent client (more efficient)
+        await TauriService.updateProfilePersistent(
             appState.getKeypair().private_key,
-            cleanedFields,
-            activeRelays
+            cleanedFields
         );
 
         // Cache the updated profile
@@ -1603,27 +2057,198 @@ NostrMailApp.prototype.manualSyncRelays = async function() {
 
 // Start periodic relay status updates
 NostrMailApp.prototype.startRelayStatusUpdates = function() {
-    // Update every 15 seconds
+    // Update every 10 seconds as requested
     this.relayStatusInterval = setInterval(async () => {
         try {
-            // Only update if we're on the settings page and have relays
-            const settingsPanel = domManager.get('settingsPanel');
-            const isOnSettingsPage = settingsPanel && !settingsPanel.classList.contains('hidden');
+            // Check if we're on the settings tab (more reliable check)
+            const settingsTab = document.querySelector('.nav-item[data-tab="settings"]');
+            const isOnSettingsPage = settingsTab && settingsTab.classList.contains('active');
             const hasRelays = appState.getRelays().length > 0;
             
             console.log(`[APP] Periodic update check: settingsPage=${isOnSettingsPage}, hasRelays=${hasRelays}`);
             
             if (isOnSettingsPage && hasRelays) {
-                console.log('[APP] Running periodic relay sync...');
-                // First sync disconnected relays (auto-disable them)
-                await this.syncDisconnectedRelays();
-                // Then update the display
-                await this.renderRelays();
+                console.log('[APP] Running periodic relay status update...');
+                await this.updateRelayStatusOnly();
             }
         } catch (error) {
             console.error('Error updating relay status:', error);
         }
-    }, 15000); // Increased to 15 seconds to reduce load
+    }, 10000); // Changed to 10 seconds as requested
+}
+
+// Toggle relay edit mode (collapse/expand)
+NostrMailApp.prototype.toggleRelayEdit = function() {
+    const relaysList = domManager.get('relaysList');
+    const relayEditToggle = domManager.get('relayEditToggle');
+    
+    if (!relaysList || !relayEditToggle) return;
+    
+    const isCollapsed = relaysList.classList.contains('collapsed');
+    
+    if (isCollapsed) {
+        // Expand - show edit mode
+        relaysList.classList.remove('collapsed');
+        relaysList.classList.add('expanded');
+        relayEditToggle.classList.add('editing');
+        relayEditToggle.innerHTML = '<i class="fas fa-times"></i> Done';
+        
+        // Render the full relay list
+        this.renderRelays();
+    } else {
+        // Collapse - show summary mode
+        relaysList.classList.remove('expanded');
+        relaysList.classList.add('collapsed');
+        relayEditToggle.classList.remove('editing');
+        relayEditToggle.innerHTML = '<i class="fas fa-edit"></i> Edit';
+        
+        // Clear only the relay items to save memory, keep add-relay-section
+        const relayItems = relaysList.querySelectorAll('.relay-item');
+        relayItems.forEach(item => item.remove());
+    }
+}
+
+// Update relay summary display
+NostrMailApp.prototype.updateRelaySummary = function(relayStatuses = []) {
+    const relaySummary = domManager.get('relaySummary');
+    if (!relaySummary) return;
+    
+    const relays = appState.getRelays();
+    const totalRelays = relays.length;
+    const activeRelays = relays.filter(r => r.is_active).length;
+    
+    // Count connected relays from status
+    const connectedCount = relayStatuses.filter(status => 
+        status.status === 'Connected' && 
+        relays.find(r => r.url === status.url && r.is_active)
+    ).length;
+    
+    // Create summary text with visual indicators
+    let summaryHtml = '';
+    
+    if (totalRelays === 0) {
+        summaryHtml = '<span style="color: #6c757d;">No relays configured</span>';
+    } else if (activeRelays === 0) {
+        summaryHtml = `<span style="color: #6c757d;">${totalRelays} relay${totalRelays > 1 ? 's' : ''} (all disabled)</span>`;
+    } else {
+        // Show connection status with colored dots
+        const statusDots = [];
+        const disconnectedCount = activeRelays - connectedCount;
+        const disabledCount = totalRelays - activeRelays;
+        
+        // Only show breakdown if there are mixed states
+        if (disconnectedCount > 0 || disabledCount > 0) {
+            if (connectedCount > 0) {
+                statusDots.push(`<span class="relay-status-dot connected"></span>${connectedCount} connected`);
+            }
+            if (disconnectedCount > 0) {
+                statusDots.push(`<span class="relay-status-dot disconnected"></span>${disconnectedCount} failed`);
+            }
+            if (disabledCount > 0) {
+                statusDots.push(`<span class="relay-status-dot disabled"></span>${disabledCount} disabled`);
+            }
+            summaryHtml = `${connectedCount}/${totalRelays} connected • ${statusDots.join(' • ')}`;
+        } else {
+            // All relays are connected - just show the simple count
+            summaryHtml = `${connectedCount}/${totalRelays} connected`;
+        }
+    }
+    
+    relaySummary.innerHTML = summaryHtml;
+}
+
+// Retry a failed relay connection
+NostrMailApp.prototype.retryRelayConnection = async function(relayId, relayUrl) {
+    console.log(`[APP] Retrying connection to relay: ${relayUrl}`);
+    
+    try {
+        // Show connecting status
+        this.updateSingleRelayStatus(relayUrl, 'Connecting');
+        notificationService.showInfo(`🔄 Retrying connection to ${relayUrl}...`);
+        
+        // Attempt to reconnect by toggling the relay off and on
+        await TauriService.updateSingleRelay(relayUrl, false);
+        await new Promise(resolve => setTimeout(resolve, 500)); // Brief pause
+        await TauriService.updateSingleRelay(relayUrl, true);
+        
+        // Wait a bit longer for connection to establish
+        setTimeout(async () => {
+            try {
+                const relayStatuses = await TauriService.getRelayStatus();
+                const status = relayStatuses.find(s => s.url === relayUrl);
+                
+                if (status) {
+                    this.updateSingleRelayStatus(relayUrl, status.status);
+                    
+                    if (status.status === 'Connected') {
+                        notificationService.showSuccess(`✅ Successfully reconnected to ${relayUrl}`);
+                        // Re-render to remove retry button
+                        await this.renderRelays();
+                    } else {
+                        notificationService.showError(`❌ Retry failed for ${relayUrl}. Check relay URL and network connection.`);
+                    }
+                } else {
+                    this.updateSingleRelayStatus(relayUrl, 'Disconnected');
+                    notificationService.showError(`❌ Retry failed for ${relayUrl}`);
+                }
+            } catch (error) {
+                console.error('Failed to verify retry status:', error);
+                this.updateSingleRelayStatus(relayUrl, 'Disconnected');
+                notificationService.showError(`❌ Retry failed for ${relayUrl}: ${error}`);
+            }
+        }, 3000); // Give more time for connection to establish
+        
+    } catch (error) {
+        console.error('Failed to retry relay connection:', error);
+        this.updateSingleRelayStatus(relayUrl, 'Disconnected');
+        notificationService.showError(`Failed to retry connection: ${error}`);
+    }
+}
+
+// Update only relay status without full re-render (more efficient)
+NostrMailApp.prototype.updateRelayStatusOnly = async function() {
+    try {
+        const relayStatuses = await TauriService.getRelayStatus();
+        console.log('[APP] Got relay statuses:', relayStatuses);
+        
+        // Always update the summary
+        this.updateRelaySummary(relayStatuses);
+        
+        // Update each relay's status in the UI (only if expanded)
+        const relaysList = domManager.get('relaysList');
+        const isExpanded = relaysList && relaysList.classList.contains('expanded');
+        
+        if (isExpanded) {
+            relayStatuses.forEach(status => {
+                this.updateSingleRelayStatus(status.url, status.status);
+            });
+            
+            // Check if we need to re-render to show/hide retry buttons
+            const hasDisconnectedActive = relayStatuses.some(status => 
+                status.status === 'Disconnected' && 
+                appState.getRelays().find(r => r.url === status.url && r.is_active)
+            );
+            
+            // Re-render if there are new disconnected active relays that need retry buttons
+            if (hasDisconnectedActive) {
+                const currentRetryButtons = document.querySelectorAll('.retry-btn').length;
+                const expectedRetryButtons = relayStatuses.filter(status => 
+                    status.status === 'Disconnected' && 
+                    appState.getRelays().find(r => r.url === status.url && r.is_active)
+                ).length;
+                
+                if (currentRetryButtons !== expectedRetryButtons) {
+                    await this.renderRelays();
+                }
+            }
+        }
+        
+        // Also check for any relays that might need auto-disabling
+        await this.syncDisconnectedRelays();
+        
+    } catch (error) {
+        console.error('[APP] Failed to update relay status:', error);
+    }
 }
 
 // Stop periodic updates

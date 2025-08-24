@@ -112,6 +112,9 @@ const TauriService = {
     fetchProfile: async function(pubkey, relays) {
         return await this.invoke('fetch_profile', { pubkey, relays });
     },
+    fetchProfilePersistent: async function(pubkey) {
+        return await this.invoke('fetch_profile_persistent', { pubkey });
+    },
     fetchFollowingProfiles: async function(privateKey, relays) {
         return await this.invoke('fetch_following_profiles', { privateKey, relays });
     },
@@ -126,6 +129,10 @@ const TauriService = {
     },
     updateProfile: async function(privateKey, fields, relays) {
         return await this.invoke('update_profile', { privateKey, fields, relays });
+    },
+    // Update profile using persistent client (more efficient)
+    updateProfilePersistent: async function(privateKey, fields) {
+        return await this.invoke('update_profile_persistent', { privateKey, fields });
     },
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
@@ -320,6 +327,18 @@ const TauriService = {
     fetchFollowingPubkeys: async function(pubkey, relays) {
         return await this.invoke('fetch_nostr_following_pubkeys', { pubkey, relays });
     },
+    // Fetch following pubkeys using persistent client (more efficient)
+    fetchFollowingPubkeysPersistent: async function(pubkey) {
+        return await this.invoke('fetch_following_pubkeys_persistent', { pubkey });
+    },
+    // Fetch single profile using persistent client (more efficient)
+    fetchProfilePersistent: async function(pubkey) {
+        return await this.invoke('fetch_profile_persistent', { pubkey });
+    },
+    // Fetch profiles using persistent client (more efficient)
+    fetchProfilesPersistent: async function(pubkeys) {
+        return await this.invoke('fetch_profiles_persistent', { pubkeys });
+    },
     // Draft operations
     saveDraft: async function(draft) {
         return await this.invoke('db_save_draft', { draft });
@@ -335,6 +354,19 @@ const TauriService = {
 
     markAsRead: async function(messageId) {
         return await this.invoke('db_mark_as_read', { messageId });
+    },
+
+    // Live Event Subscription System
+    startLiveEventSubscription: async function(privateKey) {
+        return await this.invoke('start_live_event_subscription', { privateKey });
+    },
+
+    stopLiveEventSubscription: async function() {
+        return await this.invoke('stop_live_event_subscription');
+    },
+
+    getLiveSubscriptionStatus: async function() {
+        return await this.invoke('get_live_subscription_status');
     }
 };
 window.TauriService = TauriService; 

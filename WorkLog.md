@@ -1,3 +1,4 @@
+* live updates
 * persistent relay connections
 * email body inline with DM
 * checkbox for dm notification

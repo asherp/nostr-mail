@@ -574,7 +574,7 @@ class ContactsService {
                 }
                 
                 console.log('Fetching profile for:', pubkey);
-                const profile = await window.TauriService.fetchProfile(pubkey, activeRelays);
+                const profile = await window.TauriService.fetchProfilePersistent(pubkey);
                 
                 if (profile) {
                     // Show the profile in the detail panel with follow button
@@ -775,12 +775,11 @@ class ContactsService {
             return;
         }
         try {
-            // 1. Fetch followed npubs (just pubkeys, not full profiles)
-            const followedPubkeys = await window.TauriService.fetchFollowingPubkeys(
-                window.appState.getKeypair().public_key,
-                activeRelays
+            // 1. Fetch followed npubs using persistent client (more efficient!)
+            const followedPubkeys = await window.TauriService.fetchFollowingPubkeysPersistent(
+                window.appState.getKeypair().public_key
             );
-            console.log('[JS] Fetched followed npubs:', followedPubkeys);
+            console.log('[JS] Fetched followed npubs using persistent client:', followedPubkeys);
             if (!followedPubkeys || followedPubkeys.length === 0) {
                 window.notificationService.showInfo('No follows found on the network');
                 return;
@@ -788,11 +787,11 @@ class ContactsService {
             // 2. Filter out npubs already in the DB
             const newPubkeys = await window.TauriService.filterNewContacts(followedPubkeys);
             console.log('[JS] New npubs not in DB:', newPubkeys);
-            // 3. Fetch profiles for only new npubs
+            // 3. Fetch profiles for only new npubs using persistent client
             let newProfiles = [];
             if (newPubkeys.length > 0) {
-                newProfiles = await window.TauriService.fetchProfiles(newPubkeys, activeRelays);
-                console.log('[JS] Fetched new profiles:', newProfiles);
+                newProfiles = await window.TauriService.fetchProfilesPersistent(newPubkeys);
+                console.log('[JS] Fetched new profiles using persistent client:', newProfiles);
             }
             // 4. Get all local contacts
             const localContacts = await window.DatabaseService.getAllContacts();
@@ -887,7 +886,7 @@ class ContactsService {
             return;
         }
         try {
-            const profile = await window.TauriService.fetchProfile(pubkey, activeRelays);
+            const profile = await window.TauriService.fetchProfilePersistent(pubkey);
             if (profile) {
                 // Update the contact object with new profile fields
                 selectedContact.name = profile.fields.name || profile.fields.display_name || pubkey.substring(0, 16) + '...';
@@ -927,6 +926,37 @@ class ContactsService {
             }
         } catch (error) {
             console.error('Failed to refresh selected contact profile:', error);
+        }
+    }
+
+    // Update contact profile from live events
+    updateContactProfile(pubkey, profileFields) {
+        try {
+            // Find contact in current list
+            const contact = this.contacts.find(c => c.pubkey === pubkey);
+            if (contact) {
+                // Update contact fields
+                if (profileFields.name) contact.name = profileFields.name;
+                if (profileFields.display_name) contact.display_name = profileFields.display_name;
+                if (profileFields.about) contact.about = profileFields.about;
+                if (profileFields.picture) contact.picture = profileFields.picture;
+                if (profileFields.nip05) contact.nip05 = profileFields.nip05;
+                
+                console.log('[ContactsService] Updated contact profile for', pubkey);
+                
+                // Re-render contacts list if visible
+                if (document.querySelector('.tab-content#contacts.active')) {
+                    this.renderContacts();
+                }
+                
+                // Update contact detail if this contact is currently selected
+                const selectedContact = this.getSelectedContact();
+                if (selectedContact && selectedContact.pubkey === pubkey) {
+                    this.renderContactDetail(contact);
+                }
+            }
+        } catch (error) {
+            console.error('[ContactsService] Error updating contact profile:', error);
         }
     }
 }

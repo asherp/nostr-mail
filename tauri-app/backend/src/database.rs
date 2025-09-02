@@ -67,6 +67,23 @@ pub struct DbRelay {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Attachment {
+    pub id: Option<i64>,
+    pub email_id: i64,
+    pub filename: String,
+    pub content_type: String,
+    pub data: String, // Base64 encoded data
+    pub size: usize,
+    pub is_encrypted: bool,
+    pub encryption_method: Option<String>,
+    pub algorithm: Option<String>,
+    pub original_filename: Option<String>,
+    pub original_type: Option<String>,
+    pub original_size: Option<usize>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -162,6 +179,27 @@ impl Database {
             [],
         )?;
 
+        // Attachments table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                is_encrypted BOOLEAN NOT NULL DEFAULT 0,
+                encryption_method TEXT,
+                algorithm TEXT,
+                original_filename TEXT,
+                original_type TEXT,
+                original_size INTEGER,
+                created_at DATETIME NOT NULL,
+                FOREIGN KEY (email_id) REFERENCES emails (id) ON DELETE CASCADE
+            )",
+            [],
+        )?;
+
         // Create indexes for better performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_pubkey ON contacts(pubkey)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_message_id ON emails(message_id)", [])?;
@@ -170,6 +208,7 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_created_at ON direct_messages(created_at)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_key ON user_settings(key)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_relays_url ON relays(url)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_email_id ON attachments(email_id)", [])?;
 
         Ok(())
     }
@@ -561,6 +600,150 @@ impl Database {
         })?;
         
         rows.next().ok_or(rusqlite::Error::QueryReturnedNoRows)?
+    }
+
+    // Attachment operations
+    pub fn save_attachment(&self, attachment: &Attachment) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        
+        if let Some(id) = attachment.id {
+            // Update existing attachment
+            conn.execute(
+                "UPDATE attachments SET 
+                    email_id = ?, filename = ?, content_type = ?, data = ?, size = ?,
+                    is_encrypted = ?, encryption_method = ?, algorithm = ?, 
+                    original_filename = ?, original_type = ?, original_size = ?
+                WHERE id = ?",
+                params![
+                    attachment.email_id, attachment.filename, attachment.content_type, 
+                    attachment.data, attachment.size as i64, attachment.is_encrypted,
+                    attachment.encryption_method, attachment.algorithm,
+                    attachment.original_filename, attachment.original_type, 
+                    attachment.original_size.map(|s| s as i64), id
+                ],
+            )?;
+            Ok(id)
+        } else {
+            // Insert new attachment
+            conn.execute(
+                "INSERT INTO attachments (
+                    email_id, filename, content_type, data, size, is_encrypted,
+                    encryption_method, algorithm, original_filename, original_type, 
+                    original_size, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    attachment.email_id, attachment.filename, attachment.content_type,
+                    attachment.data, attachment.size as i64, attachment.is_encrypted,
+                    attachment.encryption_method, attachment.algorithm,
+                    attachment.original_filename, attachment.original_type,
+                    attachment.original_size.map(|s| s as i64), now
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+
+    pub fn get_attachments_for_email(&self, email_id: i64) -> Result<Vec<Attachment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, email_id, filename, content_type, data, size, is_encrypted,
+                    encryption_method, algorithm, original_filename, original_type, 
+                    original_size, created_at
+             FROM attachments WHERE email_id = ? ORDER BY created_at"
+        )?;
+        
+        let rows = stmt.query_map(params![email_id], |row| {
+            Ok(Attachment {
+                id: Some(row.get(0)?),
+                email_id: row.get(1)?,
+                filename: row.get(2)?,
+                content_type: row.get(3)?,
+                data: row.get(4)?,
+                size: row.get::<_, i64>(5)? as usize,
+                is_encrypted: row.get(6)?,
+                encryption_method: row.get(7)?,
+                algorithm: row.get(8)?,
+                original_filename: row.get(9)?,
+                original_type: row.get(10)?,
+                original_size: row.get::<_, Option<i64>>(11)?.map(|s| s as usize),
+                created_at: row.get(12)?,
+            })
+        })?;
+        
+        rows.collect()
+    }
+
+    pub fn get_attachment(&self, attachment_id: i64) -> Result<Option<Attachment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, email_id, filename, content_type, data, size, is_encrypted,
+                    encryption_method, algorithm, original_filename, original_type, 
+                    original_size, created_at
+             FROM attachments WHERE id = ?"
+        )?;
+        
+        let mut rows = stmt.query(params![attachment_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Attachment {
+                id: Some(row.get(0)?),
+                email_id: row.get(1)?,
+                filename: row.get(2)?,
+                content_type: row.get(3)?,
+                data: row.get(4)?,
+                size: row.get::<_, i64>(5)? as usize,
+                is_encrypted: row.get(6)?,
+                encryption_method: row.get(7)?,
+                algorithm: row.get(8)?,
+                original_filename: row.get(9)?,
+                original_type: row.get(10)?,
+                original_size: row.get::<_, Option<i64>>(11)?.map(|s| s as usize),
+                created_at: row.get(12)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete_attachment(&self, attachment_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM attachments WHERE id = ?", params![attachment_id])?;
+        Ok(())
+    }
+
+    pub fn delete_attachments_for_email(&self, email_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM attachments WHERE email_id = ?", params![email_id])?;
+        Ok(())
+    }
+
+    // Combined operations
+    pub fn save_email_with_attachments(&self, email: &Email, attachments: &[crate::types::EmailAttachment]) -> Result<i64> {
+        // First save the email
+        let email_id = self.save_email(email)?;
+        
+        // Then save each attachment
+        for attachment in attachments {
+            let db_attachment = Attachment {
+                id: None,
+                email_id,
+                filename: attachment.filename.clone(),
+                content_type: attachment.content_type.clone(),
+                data: attachment.data.clone(),
+                size: attachment.size,
+                is_encrypted: attachment.is_encrypted,
+                encryption_method: attachment.encryption_method.clone(),
+                algorithm: attachment.algorithm.clone(),
+                original_filename: attachment.original_filename.clone(),
+                original_type: attachment.original_type.clone(),
+                original_size: attachment.original_size,
+                created_at: Utc::now(),
+            };
+            
+            self.save_attachment(&db_attachment)?;
+        }
+        
+        Ok(email_id)
     }
 
     // Settings operations

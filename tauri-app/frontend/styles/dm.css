@@ -92,6 +92,14 @@ body.dark-mode .dm-search-icon {
     gap: 12px;
 }
 
+.dm-contact-item .contact-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    object-fit: cover;
+    flex-shrink: 0;
+}
+
 .dm-contact-item:hover {
     background-color: var(--hover-color);
 }
@@ -201,8 +209,8 @@ body.dark-mode .dm-search-icon {
 }
 
 .conversation-contact-info .contact-avatar {
-    width: 40px;
-    height: 40px;
+    width: 35px;
+    height: 35px;
     border-radius: 50%;
     object-fit: cover;
     flex-shrink: 0;

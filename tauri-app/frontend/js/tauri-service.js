@@ -137,23 +137,29 @@ const TauriService = {
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
     },
-    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null) {
+    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
         }
         if (messageId) {
             args.messageId = messageId;
+        }
+        if (attachments) {
+            args.attachments = attachments;
         }
         return await this.invoke('send_email', args);
     },
-    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null) {
+    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
         }
         if (messageId) {
             args.messageId = messageId;
+        }
+        if (attachments) {
+            args.attachments = attachments;
         }
         return await this.invoke('construct_email_headers', args);
     },
@@ -320,6 +326,26 @@ const TauriService = {
     },
     filterNewContacts: async function(pubkeys) {
         return await this.invoke('db_filter_new_contacts', { pubkeys });
+    },
+    
+    // Attachment functions
+    getAttachmentsForEmail: async function(emailId) {
+        return await this.invoke('db_get_attachments_for_email', { emailId: parseInt(emailId) });
+    },
+    getAttachment: async function(attachmentId) {
+        return await this.invoke('db_get_attachment', { attachmentId: parseInt(attachmentId) });
+    },
+    saveAttachment: async function(attachment) {
+        return await this.invoke('db_save_attachment', { attachment });
+    },
+    deleteAttachment: async function(attachmentId) {
+        return await this.invoke('db_delete_attachment', { attachmentId });
+    },
+    saveAttachmentToDisk: async function(filename, data, mimeType) {
+        return await this.invoke('save_attachment_to_disk', { filename, data, mimeType });
+    },
+    saveAttachmentsAsZip: async function(zipFilename, attachments) {
+        return await this.invoke('save_attachments_as_zip', { zipFilename, attachments });
     },
     findEmailsByMessageId: async function(messageId) {
         return await this.invoke('db_find_emails_by_message_id', { messageId });

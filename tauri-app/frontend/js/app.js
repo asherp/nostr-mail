@@ -64,6 +64,9 @@ NostrMailApp.prototype.init = async function() {
         // Populate Nostr contact dropdown for compose page
         emailService.populateNostrContactDropdown();
         
+        // Initialize attachment functionality
+        emailService.initializeAttachmentListeners();
+        
         // Try to restore saved contact selection
         emailService.restoreContactSelection();
         
@@ -220,6 +223,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     console.log('[JS] Encrypt button clicked');
                     const subjectValue = domManager.getValue('subject') || '';
                     const messageBodyValue = domManager.getValue('messageBody') || '';
+                    
+                    // Always require both subject and body
                     if (!subjectValue || !messageBodyValue) {
                         notificationService.showError('Both subject and message body must be filled to encrypt.');
                         return;
@@ -260,14 +265,21 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         }
                         // Decrypt body if armored
                         if (match) {
-                            const encryptedContent = match[2].replace(/\s+/g, '');
                             try {
-                                const decrypted = await TauriService.decryptDmContent(privkey, pubkey, encryptedContent);
-                                domManager.setValue('messageBody', decrypted);
-                                notificationService.showSuccess('Body decrypted');
+                                // Use the new manifest-aware decryption function
+                                await emailService.decryptBodyContent();
                                 decryptedAny = true;
                             } catch (err) {
-                                notificationService.showError('Failed to decrypt body: ' + err);
+                                // Fallback to legacy decryption
+                                const encryptedContent = match[2].replace(/\s+/g, '');
+                                try {
+                                    const decrypted = await TauriService.decryptDmContent(privkey, pubkey, encryptedContent);
+                                    domManager.setValue('messageBody', decrypted);
+                                    notificationService.showSuccess('Body decrypted');
+                                    decryptedAny = true;
+                                } catch (legacyErr) {
+                                    notificationService.showError('Failed to decrypt body: ' + legacyErr);
+                                }
                             }
                         }
                         if (!decryptedAny) {
@@ -275,6 +287,13 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         }
                     } else {
                         notificationService.showError('No encrypted message found or missing keys');
+                    }
+                    
+                    // Also decrypt any encrypted attachments
+                    try {
+                        await emailService.decryptAllAttachments();
+                    } catch (error) {
+                        console.error('Failed to decrypt attachments:', error);
                     }
                     if (iconSpan) iconSpan.className = 'fas fa-lock';
                     if (labelSpan) labelSpan.textContent = 'Encrypt';
@@ -690,7 +709,7 @@ NostrMailApp.prototype.handleLiveDM = function(dmData) {
         }
         
         // If currently viewing messages tab, also refresh the active conversation immediately
-        if (document.querySelector('.tab-content#messages.active')) {
+        if (document.querySelector('.tab-content#dm.active')) {
             // Check if we're viewing a conversation with this sender
             const currentContact = window.appState.getSelectedDmContact();
             if (currentContact && 
@@ -873,7 +892,7 @@ NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
         console.log('[LiveEvents] Attempting direct message insertion');
         
         // Only try if we're viewing the messages tab
-        if (!document.querySelector('.tab-content#messages.active')) {
+        if (!document.querySelector('.tab-content#dm.active')) {
             console.log('[LiveEvents] Not on messages tab, skipping direct insertion');
             return;
         }

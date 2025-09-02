@@ -43,6 +43,7 @@ image = "0.25"
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 urlencoding = "2"
 dirs = "5"
+zip = "2.1"
 tauri-plugin-dialog = "2.0.0-beta"
 
 [features]

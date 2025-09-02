@@ -923,6 +923,8 @@ class ContactsService {
                 }
                 // Re-render the contact detail
                 this.renderContactDetail(selectedContact);
+                // Also re-render the contacts list to update the contact item
+                this.renderContacts();
             }
         } catch (error) {
             console.error('Failed to refresh selected contact profile:', error);

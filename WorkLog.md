@@ -1,3 +1,5 @@
+* encrypted attachments, manifest
+* NIP-44 may fail if email body is too long, so witch to mainfest style if/when that happens
 * live updates
 * persistent relay connections
 * email body inline with DM

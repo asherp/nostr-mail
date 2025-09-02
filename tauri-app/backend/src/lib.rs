@@ -582,18 +582,80 @@ async fn publish_nostr_event(private_key: String, content: String, kind: u16, ta
 }
 
 #[tauri::command]
-async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>) -> Result<(), String> {
-    println!("[RUST] send_email called");
-    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref())
+async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] send_email called with {} attachments", attachments.as_ref().map(|a| a.len()).unwrap_or(0));
+    
+    // First send the email via SMTP
+    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref())
         .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    
+    // If sending was successful, save the email to the database
+    if let Some(msg_id) = &message_id {
+        println!("[RUST] send_email: Saving sent email to database with message_id: {}", msg_id);
+        
+        let db = state.get_database().map_err(|e| e.to_string())?;
+        
+        // Create the email record
+        let email_record = crate::database::Email {
+            id: None,
+            message_id: msg_id.clone(),
+            from_address: email_config.email_address.clone(),
+            to_address: to_address.clone(),
+            subject: subject.clone(),
+            body: body.clone(),
+            body_plain: Some(body.clone()),
+            body_html: None,
+            received_at: chrono::Utc::now(),
+            is_nostr_encrypted: nostr_npub.is_some(),
+            nostr_pubkey: if let Some(private_key) = &email_config.private_key {
+                crate::crypto::get_public_key_from_private(private_key).ok()
+            } else {
+                None
+            },
+            raw_headers: None, // We don't have the raw headers here
+            is_draft: false,
+            is_read: true, // Mark sent emails as read
+            updated_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        
+        // Save email with attachments if any
+        if let Some(attachments) = &attachments {
+            if !attachments.is_empty() {
+                db.save_email_with_attachments(&email_record, attachments)
+                    .map_err(|e| {
+                        println!("[RUST] send_email: Failed to save email with attachments: {}", e);
+                        format!("Failed to save sent email to database: {}", e)
+                    })?;
+                println!("[RUST] send_email: Successfully saved sent email with {} attachments to database", attachments.len());
+            } else {
+                db.save_email(&email_record)
+                    .map_err(|e| {
+                        println!("[RUST] send_email: Failed to save email: {}", e);
+                        format!("Failed to save sent email to database: {}", e)
+                    })?;
+                println!("[RUST] send_email: Successfully saved sent email to database");
+            }
+        } else {
+            db.save_email(&email_record)
+                .map_err(|e| {
+                    println!("[RUST] send_email: Failed to save email: {}", e);
+                    format!("Failed to save sent email to database: {}", e)
+                })?;
+            println!("[RUST] send_email: Successfully saved sent email to database");
+        }
+    } else {
+        println!("[RUST] send_email: No message_id provided, skipping database save");
+    }
+    
+    Ok(())
 }
 
 #[tauri::command]
-async fn construct_email_headers(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>) -> Result<String, String> {
-    println!("[RUST] construct_email_headers called");
-    email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref())
+async fn construct_email_headers(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>) -> Result<String, String> {
+    println!("[RUST] construct_email_headers called with {} attachments", attachments.as_ref().map(|a| a.len()).unwrap_or(0));
+    email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref())
         .map_err(|e| e.to_string())
 }
 
@@ -1204,6 +1266,158 @@ fn db_get_decrypted_dms_for_conversation(
     Ok(messages)
 }
 
+// Database commands for attachments
+#[tauri::command]
+fn db_save_attachment(attachment: crate::database::Attachment, state: tauri::State<AppState>) -> Result<i64, String> {
+    println!("[RUST] db_save_attachment called");
+    let db = state.get_database()?;
+    db.save_attachment(&attachment).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_attachments_for_email(email_id: i64, state: tauri::State<AppState>) -> Result<Vec<crate::database::Attachment>, String> {
+    println!("[RUST] db_get_attachments_for_email called for email_id: {}", email_id);
+    let db = state.get_database()?;
+    db.get_attachments_for_email(email_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_attachment(attachment_id: i64, state: tauri::State<AppState>) -> Result<Option<crate::database::Attachment>, String> {
+    println!("[RUST] db_get_attachment called for attachment_id: {}", attachment_id);
+    let db = state.get_database()?;
+    db.get_attachment(attachment_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_delete_attachment(attachment_id: i64, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_delete_attachment called for attachment_id: {}", attachment_id);
+    let db = state.get_database()?;
+    db.delete_attachment(attachment_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn save_attachment_to_disk(filename: String, data: String, _mime_type: String) -> Result<String, String> {
+    println!("[RUST] save_attachment_to_disk called for filename: {}", filename);
+    
+    use base64::{Engine as _, engine::general_purpose};
+    
+    // Get user's Downloads directory
+    let downloads_dir = dirs::download_dir()
+        .ok_or_else(|| "Could not find Downloads directory".to_string())?;
+    
+    // Create full path for the file
+    let mut file_path = downloads_dir.join(&filename);
+    
+    // If file exists, add a number to make it unique
+    let mut counter = 1;
+    while file_path.exists() {
+        let stem = std::path::Path::new(&filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&filename);
+        let extension = std::path::Path::new(&filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        
+        let new_filename = if extension.is_empty() {
+            format!("{} ({})", stem, counter)
+        } else {
+            format!("{} ({}).{}", stem, counter, extension)
+        };
+        
+        file_path = downloads_dir.join(new_filename);
+        counter += 1;
+    }
+    
+    // Decode base64 data
+    let decoded_data = general_purpose::STANDARD
+        .decode(&data)
+        .map_err(|e| format!("Failed to decode base64 data: {}", e))?;
+    
+    // Write file to disk
+    std::fs::write(&file_path, decoded_data)
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+    
+    let path_str = file_path.to_string_lossy().to_string();
+    println!("[RUST] Successfully saved attachment to: {}", path_str);
+    
+    Ok(path_str)
+}
+
+#[derive(serde::Deserialize)]
+struct AttachmentForZip {
+    filename: String,
+    data: String,
+}
+
+#[tauri::command]
+async fn save_attachments_as_zip(zip_filename: String, attachments: Vec<AttachmentForZip>) -> Result<String, String> {
+    println!("[RUST] save_attachments_as_zip called with {} attachments", attachments.len());
+    
+    use std::io::Write;
+    use base64::{Engine as _, engine::general_purpose};
+    
+    // Get user's Downloads directory
+    let downloads_dir = dirs::download_dir()
+        .ok_or_else(|| "Could not find Downloads directory".to_string())?;
+    
+    // Create unique ZIP filename
+    let mut zip_path = downloads_dir.join(&zip_filename);
+    let mut counter = 1;
+    while zip_path.exists() {
+        let stem = std::path::Path::new(&zip_filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&zip_filename);
+        let new_filename = format!("{} ({}).zip", stem, counter);
+        zip_path = downloads_dir.join(new_filename);
+        counter += 1;
+    }
+    
+    // Create ZIP file
+    let zip_file = std::fs::File::create(&zip_path)
+        .map_err(|e| format!("Failed to create ZIP file: {}", e))?;
+    
+    let mut zip = zip::ZipWriter::new(zip_file);
+    let options = zip::write::FileOptions::<()>::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o755);
+    
+    // Add each attachment to the ZIP
+    for attachment in attachments {
+        println!("[RUST] Adding to ZIP: {}", attachment.filename);
+        
+        // Decode base64 data
+        let decoded_data = general_purpose::STANDARD
+            .decode(&attachment.data)
+            .map_err(|e| format!("Failed to decode base64 data for {}: {}", attachment.filename, e))?;
+        
+        // Add file to ZIP
+        zip.start_file(&attachment.filename, options)
+            .map_err(|e| format!("Failed to start file in ZIP: {}", e))?;
+        
+        zip.write_all(&decoded_data)
+            .map_err(|e| format!("Failed to write file data to ZIP: {}", e))?;
+    }
+    
+    // Finish ZIP file
+    zip.finish()
+        .map_err(|e| format!("Failed to finish ZIP file: {}", e))?;
+    
+    let path_str = zip_path.to_string_lossy().to_string();
+    println!("[RUST] Successfully created ZIP file: {}", path_str);
+    
+    Ok(path_str)
+}
+
+#[tauri::command]
+fn db_save_email_with_attachments(email: crate::database::Email, attachments: Vec<crate::types::EmailAttachment>, state: tauri::State<AppState>) -> Result<i64, String> {
+    println!("[RUST] db_save_email_with_attachments called with {} attachments", attachments.len());
+    let db = state.get_database()?;
+    db.save_email_with_attachments(&email, &attachments).map_err(|e| e.to_string())
+}
+
 // Database commands for settings
 #[tauri::command]
 fn db_save_setting(key: String, value: String, state: tauri::State<AppState>) -> Result<(), String> {
@@ -1690,26 +1904,26 @@ async fn handle_subscription_notifications(
         while let Ok(notification) = notifications.recv().await {
             match notification {
                 RelayPoolNotification::Event { event, .. } => {
-                    println!("[RUST] Received event: kind={}, id={}", event.kind.as_u16(), event.id.to_hex());
-                    
                     match event.kind {
                         Kind::EncryptedDirectMessage => {
+                            println!("[RUST] Processing DM: {}", event.id.to_hex()[..8].to_string() + "...");
                             if let Err(e) = handle_live_direct_message(&event, &app_handle, &state, &user_pubkey).await {
                                 println!("[RUST] Error handling DM: {}", e);
                             }
                         },
                         Kind::Metadata => {
+                            println!("[RUST] Processing profile update: {}", event.id.to_hex()[..8].to_string() + "...");
                             if let Err(e) = handle_live_profile_update(&event, &app_handle, &state, &user_pubkey).await {
                                 println!("[RUST] Error handling profile update: {}", e);
                             }
                         },
                         _ => {
-                            println!("[RUST] Ignoring event of kind: {}", event.kind.as_u16());
+                            // Silently ignore other event types - no logging
                         }
                     }
                 },
-                RelayPoolNotification::Message { message, .. } => {
-                    println!("[RUST] Received relay message: {:?}", message);
+                RelayPoolNotification::Message { .. } => {
+                    // Silently handle relay messages - no logging to reduce verbosity
                 },
                 RelayPoolNotification::Shutdown => {
                     println!("[RUST] Received shutdown notification");
@@ -1756,7 +1970,7 @@ async fn handle_live_direct_message(
     state: &AppState,
     user_pubkey: &PublicKey,
 ) -> Result<(), String> {
-    println!("[RUST] Processing live DM: {}", event.id.to_hex());
+    // Processing live DM - logging handled by caller
     
     // Convert sender_pubkey to npub format
     let sender_npub = event.pubkey.to_bech32().map_err(|e| e.to_string())?;
@@ -2139,6 +2353,13 @@ pub fn run() {
         db_save_dm,
         db_get_dms_for_conversation,
         db_get_decrypted_dms_for_conversation,
+        db_save_attachment,
+        db_get_attachments_for_email,
+        db_get_attachment,
+        db_delete_attachment,
+        save_attachment_to_disk,
+        save_attachments_as_zip,
+        db_save_email_with_attachments,
         db_save_setting,
         db_get_setting,
         db_get_all_settings,

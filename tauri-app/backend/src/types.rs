@@ -120,4 +120,19 @@ pub struct RelayStatus {
     pub url: String,
     pub is_active: bool,
     pub status: RelayConnectionStatus,
+}
+
+/// Represents an email attachment
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub data: String, // Base64 encoded data
+    pub size: usize,
+    pub is_encrypted: bool,
+    pub encryption_method: Option<String>,
+    pub algorithm: Option<String>,
+    pub original_filename: Option<String>,
+    pub original_type: Option<String>,
+    pub original_size: Option<usize>,
 } 

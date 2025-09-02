@@ -229,4 +229,124 @@ body.dark-mode .status-indicator.inactive {
 
 body.dark-mode .status-description {
     color: #a0a0a0;
+}
+
+/* Attachment Styles */
+.attachment-section {
+    border: 2px dashed var(--border-color);
+    border-radius: 8px;
+    padding: 16px;
+    background: var(--light-bg);
+    transition: border-color 0.2s ease;
+}
+
+.attachment-section:hover {
+    border-color: var(--primary-color);
+}
+
+.attachment-input-wrapper {
+    text-align: center;
+    margin-bottom: 16px;
+}
+
+.attachment-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.attachment-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px;
+    background: white;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    transition: all 0.2s ease;
+}
+
+.attachment-item:hover {
+    border-color: var(--primary-color);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.attachment-item.encrypted {
+    border-color: #28a745;
+    background: rgba(40, 167, 69, 0.05);
+}
+
+.attachment-info {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 1;
+    min-width: 0;
+}
+
+.attachment-icon {
+    font-size: 18px;
+    color: var(--primary-color);
+    flex-shrink: 0;
+}
+
+.attachment-details {
+    flex: 1;
+    min-width: 0;
+}
+
+.attachment-name {
+    font-weight: 500;
+    color: var(--text-color);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.attachment-size {
+    font-size: 0.875rem;
+    color: var(--muted-color);
+}
+
+.attachment-status {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.875rem;
+    margin-top: 4px;
+}
+
+.attachment-status.encrypted {
+    color: #28a745;
+}
+
+.attachment-status.encrypting {
+    color: #ffc107;
+}
+
+.attachment-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.attachment-actions .btn {
+    padding: 6px 8px;
+    font-size: 0.875rem;
+}
+
+/* Dark mode support */
+body.dark-mode .attachment-section {
+    background: #181a20;
+    border-color: #232946;
+}
+
+body.dark-mode .attachment-item {
+    background: #232946;
+    border-color: #181a20;
+}
+
+body.dark-mode .attachment-item.encrypted {
+    background: rgba(40, 167, 69, 0.1);
 } 

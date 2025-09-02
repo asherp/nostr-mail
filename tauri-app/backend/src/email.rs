@@ -1,13 +1,14 @@
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
+use lettre::message::{MultiPart, SinglePart, Attachment};
 use anyhow::Result;
 use mailparse::{MailHeaderMap, parse_mail};
-use lettre::message::header::{Header, HeaderName, HeaderValue};
+use lettre::message::header::{Header, HeaderName, HeaderValue, ContentType};
 use std::error::Error;
 use std::collections::HashSet;
 use crate::crypto;
 use crate::database::{Database, Email as DbEmail};
-use crate::types::EmailConfig;
+use crate::types::{EmailConfig, EmailAttachment};
 use chrono::Utc;
 use tokio::task;
 use tokio::time::timeout;
@@ -16,6 +17,7 @@ use crate::types::EmailMessage;
 use std::net::TcpStream;
 use native_tls::TlsConnector;
 use uuid::Uuid;
+use base64::{Engine as _, engine::general_purpose};
 
 #[derive(Debug, Clone)]
 struct XNostrPubkey(String);
@@ -40,6 +42,7 @@ pub fn construct_email_headers(
     body: &str,
     _nostr_npub: Option<&str>,
     message_id: Option<&str>,
+    attachments: Option<&Vec<EmailAttachment>>,
 ) -> Result<String> {
     println!("[RUST] construct_email_headers: Constructing email headers");
     println!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
@@ -77,7 +80,41 @@ pub fn construct_email_headers(
         }
     }
     
-    let email = builder.body(body.to_string())?;
+    // Build email with or without attachments (for header construction)
+    let email = if let Some(attachments) = attachments {
+        if attachments.is_empty() {
+            // No attachments, simple text email
+            builder.body(body.to_string())?
+        } else {
+            println!("[RUST] construct_email_headers: Building multipart email with {} attachments", attachments.len());
+            
+            // Create multipart email with text body and attachments
+            let mut multipart = MultiPart::mixed()
+                .singlepart(SinglePart::builder()
+                    .header(ContentType::TEXT_PLAIN)
+                    .body(body.to_string()));
+            
+            // Add each attachment (for header construction, we don't need the actual data)
+            for attachment in attachments {
+                println!("[RUST] construct_email_headers: Adding attachment header: {}", attachment.filename);
+                
+                // Parse content type
+                let content_type = attachment.content_type.parse::<ContentType>()
+                    .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
+                
+                // Create attachment part with empty data for header construction
+                let attachment_part = Attachment::new(attachment.filename.clone())
+                    .body(Vec::new(), content_type);
+                
+                multipart = multipart.singlepart(attachment_part);
+            }
+            
+            builder.multipart(multipart)?
+        }
+    } else {
+        // No attachments, simple text email
+        builder.body(body.to_string())?
+    };
     
     // Convert the email to a string to get the raw headers
     let email_bytes = email.formatted();
@@ -129,6 +166,7 @@ pub async fn send_email(
     body: &str,
     _nostr_npub: Option<&str>,
     message_id: Option<&str>,
+    attachments: Option<&Vec<EmailAttachment>>,
 ) -> Result<String> {
     println!("[RUST] send_email: Starting email send process");
     println!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
@@ -161,7 +199,50 @@ pub async fn send_email(
         }
     }
     
-    let email = builder.body(body.to_string())?;
+    // Build email with or without attachments
+    let email = if let Some(attachments) = attachments {
+        if attachments.is_empty() {
+            // No attachments, simple text email
+            builder.body(body.to_string())?
+        } else {
+            println!("[RUST] send_email: Building multipart email with {} attachments", attachments.len());
+            
+            // Create multipart email with text body and attachments
+            let mut multipart = MultiPart::mixed()
+                .singlepart(SinglePart::builder()
+                    .header(ContentType::TEXT_PLAIN)
+                    .body(body.to_string()));
+            
+            // Add each attachment
+            for attachment in attachments {
+                println!("[RUST] send_email: Adding attachment: {} ({})", attachment.filename, attachment.size);
+                
+                // Decode base64 data
+                let attachment_data = match general_purpose::STANDARD.decode(&attachment.data) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        println!("[RUST] send_email: Failed to decode base64 attachment data for {}: {}", attachment.filename, e);
+                        continue;
+                    }
+                };
+                
+                // Parse content type
+                let content_type = attachment.content_type.parse::<ContentType>()
+                    .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
+                
+                // Create attachment part
+                let attachment_part = Attachment::new(attachment.filename.clone())
+                    .body(attachment_data, content_type);
+                
+                multipart = multipart.singlepart(attachment_part);
+            }
+            
+            builder.multipart(multipart)?
+        }
+    } else {
+        // No attachments, simple text email
+        builder.body(body.to_string())?
+    };
 
     let creds = Credentials::new(config.email_address.clone(), config.password.clone());
 

@@ -434,12 +434,21 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const nprivKeyInput = domManager.get('nprivKey');
         if (toggleNprivVisibilityBtn && nprivKeyInput) {
             toggleNprivVisibilityBtn.addEventListener('click', () => {
+                const icon = toggleNprivVisibilityBtn.querySelector('i');
                 if (nprivKeyInput.type === 'password') {
                     nprivKeyInput.type = 'text';
                     toggleNprivVisibilityBtn.title = 'Hide private key';
+                    if (icon) {
+                        icon.classList.remove('fa-eye');
+                        icon.classList.add('fa-eye-slash');
+                    }
                 } else {
                     nprivKeyInput.type = 'password';
                     toggleNprivVisibilityBtn.title = 'Show private key';
+                    if (icon) {
+                        icon.classList.remove('fa-eye-slash');
+                        icon.classList.add('fa-eye');
+                    }
                 }
             });
         }
@@ -454,6 +463,43 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     .catch(() => notificationService.showError('Failed to copy private key'));
             });
         }
+        
+        // Toggle email password visibility (eye button)
+        const toggleEmailPasswordVisibilityBtn = domManager.get('toggleEmailPasswordVisibilityBtn');
+        const emailPasswordInput = domManager.get('emailPassword');
+        if (toggleEmailPasswordVisibilityBtn && emailPasswordInput) {
+            toggleEmailPasswordVisibilityBtn.addEventListener('click', () => {
+                const icon = toggleEmailPasswordVisibilityBtn.querySelector('i');
+                if (emailPasswordInput.type === 'password') {
+                    emailPasswordInput.type = 'text';
+                    toggleEmailPasswordVisibilityBtn.title = 'Hide password';
+                    if (icon) {
+                        icon.classList.remove('fa-eye');
+                        icon.classList.add('fa-eye-slash');
+                    }
+                } else {
+                    emailPasswordInput.type = 'password';
+                    toggleEmailPasswordVisibilityBtn.title = 'Show password';
+                    if (icon) {
+                        icon.classList.remove('fa-eye-slash');
+                        icon.classList.add('fa-eye');
+                    }
+                }
+            });
+        }
+        
+        // Copy email password to clipboard (copy button)
+        const copyEmailPasswordBtn = domManager.get('copyEmailPasswordBtn');
+        if (copyEmailPasswordBtn && emailPasswordInput) {
+            copyEmailPasswordBtn.addEventListener('click', () => {
+                const value = emailPasswordInput.value;
+                if (!value) return;
+                navigator.clipboard.writeText(value)
+                    .then(() => notificationService.showSuccess('Password copied to clipboard'))
+                    .catch(() => notificationService.showError('Failed to copy password'));
+            });
+        }
+        
         // Instantly update npub as npriv changes
         if (nprivKeyInput) {
             nprivKeyInput.addEventListener('input', () => {
@@ -1126,11 +1172,15 @@ NostrMailApp.prototype.saveSettings = async function() {
             localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
             this.renderProfilePubkey();
             
-            // If keypair changed, restart live events with new key
+            // If keypair changed, restart live events with new key and reinitialize persistent client
             if (isNewKeypair) {
                 console.log('[LiveEvents] Keypair changed, restarting live events');
                 await this.cleanupLiveEvents();
                 await this.initializeLiveEvents();
+                
+                // Reinitialize the persistent Nostr client with the new keypair
+                console.log('[APP] Keypair changed, reinitializing persistent Nostr client');
+                await this.initializeNostrClient();
             }
             
             // If on profile tab, reload profile

@@ -8,12 +8,13 @@ pub mod crypto;
 mod email;
 mod nostr;
 mod types;
-mod state;
+pub mod state;
 mod storage;
 mod database;
 
 use types::*;
-use state::{AppState, Relay};
+pub use state::{AppState, Relay};
+pub use types::KeyPair;
 use storage::{Storage, Contact, Conversation, UserProfile, AppSettings, EmailDraft};
 use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay};
 use crate::types::{EmailMessage, RelayStatus, RelayConnectionStatus};
@@ -1420,24 +1421,34 @@ fn db_save_email_with_attachments(email: crate::database::Email, attachments: Ve
 
 // Database commands for settings
 #[tauri::command]
-fn db_save_setting(key: String, value: String, state: tauri::State<AppState>) -> Result<(), String> {
-    println!("[RUST] db_save_setting called for key: {}", key);
+fn db_save_setting(pubkey: String, key: String, value: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_save_setting called for pubkey: {}, key: {}", pubkey, key);
     let db = state.get_database()?;
-    db.save_setting(&key, &value).map_err(|e| e.to_string())
+    db.save_setting(&pubkey, &key, &value).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn db_get_setting(key: String, state: tauri::State<AppState>) -> Result<Option<String>, String> {
-    println!("[RUST] db_get_setting called for key: {}", key);
+fn db_get_setting(pubkey: String, key: String, state: tauri::State<AppState>) -> Result<Option<String>, String> {
+    println!("[RUST] db_get_setting called for pubkey: {}, key: {}", pubkey, key);
     let db = state.get_database()?;
-    db.get_setting(&key).map_err(|e| e.to_string())
+    db.get_setting(&pubkey, &key).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn db_get_all_settings(state: tauri::State<AppState>) -> Result<std::collections::HashMap<String, String>, String> {
-    println!("[RUST] db_get_all_settings called");
+fn db_get_all_settings(pubkey: String, state: tauri::State<AppState>) -> Result<std::collections::HashMap<String, String>, String> {
+    println!("[RUST] db_get_all_settings called for pubkey: {}", pubkey);
     let db = state.get_database()?;
-    db.get_all_settings().map_err(|e| e.to_string())
+    db.get_all_settings(&pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_save_settings_batch(pubkey: String, settings: std::collections::HashMap<String, String>, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_save_settings_batch called for pubkey: {}, {} settings", pubkey, settings.len());
+    let db = state.get_database()?;
+    for (key, value) in settings.iter() {
+        db.save_setting(&pubkey, key, value).map_err(|e| format!("Failed to save setting {}: {}", key, e))?;
+    }
+    Ok(())
 }
 
 // Database commands for relays
@@ -2363,6 +2374,7 @@ pub fn run() {
         db_save_setting,
         db_get_setting,
         db_get_all_settings,
+        db_save_settings_batch,
         db_get_database_size,
         db_clear_all_data,
         follow_user,
@@ -2399,4 +2411,201 @@ pub fn run() {
     println!("[RUST] Starting Tauri application...");
     builder.run(context)
         .expect("error while running tauri application");
+}
+
+// HTTP Server Support Functions
+// These functions wrap Tauri commands for use in HTTP handlers
+
+pub async fn init_app_state() -> AppState {
+    let app_state = AppState::new();
+    let app_dir = dirs::data_dir()
+        .ok_or_else(|| "Could not get app data directory".to_string())
+        .map(|d| d.join("nostr-mail"));
+    match app_dir {
+        Ok(app_dir) => {
+            if let Err(e) = std::fs::create_dir_all(&app_dir) {
+                println!("[RUST] Failed to create app data directory: {}", e);
+            } else {
+                let db_path = app_dir.join("nostr_mail.db");
+                if let Err(e) = app_state.init_database(&db_path) {
+                    println!("[RUST] Failed to initialize database: {}", e);
+                }
+            }
+        },
+        Err(e) => println!("[RUST] Could not get app data directory: {}", e),
+    }
+    app_state
+}
+
+// HTTP wrapper functions - these call the same underlying crypto functions
+pub fn generate_keypair_http() -> Result<KeyPair, String> {
+    crypto::generate_keypair().map_err(|e| e.to_string())
+}
+
+pub fn validate_private_key_http(private_key: &str) -> Result<bool, String> {
+    crypto::validate_private_key(private_key).map_err(|e| e.to_string())
+}
+
+pub fn validate_public_key_http(public_key: &str) -> Result<bool, String> {
+    crypto::validate_public_key(public_key).map_err(|e| e.to_string())
+}
+
+pub fn get_public_key_from_private_http(private_key: &str) -> Result<String, String> {
+    crypto::get_public_key_from_private(private_key).map_err(|e| e.to_string())
+}
+
+pub async fn http_init_database(_app_state: std::sync::Arc<AppState>) -> Result<(), String> {
+    // Database should already be initialized in init_app_state
+    // This is just a placeholder for consistency
+    Ok(())
+}
+
+pub async fn http_db_get_all_contacts(app_state: std::sync::Arc<AppState>) -> Result<Vec<DbContact>, String> {
+    let db = app_state.get_database()?;
+    db.get_all_contacts().map_err(|e| e.to_string())
+}
+
+pub async fn http_db_get_all_relays(app_state: std::sync::Arc<AppState>) -> Result<Vec<DbRelay>, String> {
+    let db = app_state.get_database()?;
+    db.get_all_relays().map_err(|e| e.to_string())
+}
+
+pub async fn http_db_get_emails(
+    app_state: std::sync::Arc<AppState>,
+    limit: usize,
+    offset: usize,
+    nostr_only: bool,
+    user_email: Option<String>,
+) -> Result<Vec<DbEmail>, String> {
+    let db = app_state.get_database()?;
+    db.get_emails(
+        Some(limit as i64),
+        Some(offset as i64),
+        Some(nostr_only),
+        user_email.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub async fn http_get_relays(app_state: std::sync::Arc<AppState>) -> Result<Vec<Relay>, String> {
+    Ok(app_state.relays.lock().unwrap().clone())
+}
+
+pub async fn http_set_relays(app_state: std::sync::Arc<AppState>, relays: Vec<Relay>) -> Result<(), String> {
+    app_state.update_relays(relays).await
+}
+
+pub async fn http_init_persistent_nostr_client(app_state: std::sync::Arc<AppState>, private_key: String) -> Result<(), String> {
+    app_state.init_nostr_client(&private_key).await
+}
+
+pub async fn http_sync_relay_states(app_state: std::sync::Arc<AppState>) -> Result<Vec<String>, String> {
+    // This is the same logic as sync_relay_states command
+    let client_option = {
+        let client_guard = app_state.nostr_client.lock().unwrap();
+        client_guard.clone()
+    };
+    
+    let mut updated_relays = Vec::new();
+    
+    if let Some(client) = client_option {
+        let connected_relays = client.relays().await;
+        
+        let db = app_state.get_database().map_err(|e| e.to_string())?;
+        let all_db_relays = db.get_all_relays().map_err(|e| e.to_string())?;
+        
+        let mut relays_to_update = Vec::new();
+        for db_relay in all_db_relays.iter() {
+            if db_relay.is_active {
+                let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == db_relay.url);
+                if !is_connected {
+                    relays_to_update.push(db_relay.url.clone());
+                }
+            }
+        }
+        
+        for relay_url in relays_to_update {
+            let mut relays_guard = app_state.relays.lock().unwrap();
+            if let Some(relay) = relays_guard.iter_mut().find(|r| r.url == relay_url) {
+                relay.is_active = false;
+            }
+            
+            let db = app_state.get_database().map_err(|e| e.to_string())?;
+            let all_relays = db.get_all_relays().map_err(|e| e.to_string())?;
+            if let Some(db_relay) = all_relays.iter().find(|r| r.url == relay_url) {
+                let updated_relay = crate::database::DbRelay {
+                    id: db_relay.id,
+                    url: relay_url.clone(),
+                    is_active: false,
+                    created_at: db_relay.created_at,
+                    updated_at: chrono::Utc::now(),
+                };
+                if let Err(e) = db.save_relay(&updated_relay) {
+                    println!("[RUST] Failed to update relay in database: {}", e);
+                }
+            }
+            
+            updated_relays.push(relay_url);
+        }
+    }
+    
+    Ok(updated_relays)
+}
+
+pub async fn http_get_relay_status(app_state: std::sync::Arc<AppState>) -> Result<Vec<RelayStatus>, String> {
+    let client_option = {
+        let client_guard = app_state.nostr_client.lock().unwrap();
+        client_guard.clone()
+    };
+    
+    let configured_relays = {
+        let relays_guard = app_state.relays.lock().unwrap();
+        relays_guard.clone()
+    };
+    
+    let mut relay_statuses = Vec::new();
+    
+    if let Some(client) = client_option {
+        let connected_relays = client.relays().await;
+        
+        for configured_relay in configured_relays {
+            let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == configured_relay.url);
+            
+            let status = if !configured_relay.is_active {
+                RelayConnectionStatus::Disabled
+            } else if is_connected {
+                RelayConnectionStatus::Connected
+            } else {
+                RelayConnectionStatus::Disconnected
+            };
+            
+            relay_statuses.push(RelayStatus {
+                url: configured_relay.url,
+                is_active: configured_relay.is_active,
+                status,
+            });
+        }
+    } else {
+        for configured_relay in configured_relays {
+            let status = if !configured_relay.is_active {
+                RelayConnectionStatus::Disabled
+            } else {
+                RelayConnectionStatus::Disconnected
+            };
+            
+            relay_statuses.push(RelayStatus {
+                url: configured_relay.url,
+                is_active: configured_relay.is_active,
+                status,
+            });
+        }
+    }
+    
+    Ok(relay_statuses)
+}
+
+// Note: start_live_event_subscription requires Tauri AppHandle for event emission
+// In HTTP mode, we can't emit Tauri events, so this will return an error
+pub async fn http_start_live_event_subscription(_app_state: std::sync::Arc<AppState>, _private_key: String) -> Result<(), String> {
+    Err("Live event subscriptions are not supported in HTTP mode. Please use the Tauri app for real-time updates.".to_string())
 } 

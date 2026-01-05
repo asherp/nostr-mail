@@ -138,7 +138,41 @@ impl AppState {
         
         // Connect to relays
         client.connect().await;
-        println!("[RUST] Connected to {} relays", client.relays().await.len());
+        
+        // Wait for connections to establish (with timeout)
+        // WebSocket connections are asynchronous and need time to establish
+        let max_wait_time = std::time::Duration::from_secs(10);
+        let start_time = std::time::Instant::now();
+        let check_interval = std::time::Duration::from_millis(500);
+        
+        while start_time.elapsed() < max_wait_time {
+            let relays = client.relays().await;
+            
+            // Check if we have at least one relay added (connection may still be establishing)
+            if !relays.is_empty() {
+                println!("[RUST] Relays added, waiting for connections to establish...");
+                // Give connections more time to establish
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                break;
+            }
+            
+            // Wait before checking again
+            tokio::time::sleep(check_interval).await;
+        }
+        
+        // Log final connection status
+        let final_relays = client.relays().await;
+        let relay_urls: Vec<String> = final_relays.iter()
+            .map(|(url, _)| url.to_string())
+            .collect();
+        
+        println!("[RUST] Connection attempt completed. Total relays added: {}", final_relays.len());
+        if !relay_urls.is_empty() {
+            println!("[RUST] Relay URLs: {:?}", relay_urls);
+            println!("[RUST] Note: Connection status will be checked asynchronously");
+        } else {
+            println!("[RUST] Warning: No relays were added");
+        }
         
         // Store client and keys
         *self.nostr_client.lock().unwrap() = Some(client.clone());
@@ -268,7 +302,41 @@ impl AppState {
             
             // Reconnect
             client.connect().await;
-            println!("[RUST] Reconnected to {} relays", client.relays().await.len());
+            
+            // Wait for connections to establish (with timeout)
+            // WebSocket connections are asynchronous and need time to establish
+            let max_wait_time = std::time::Duration::from_secs(10);
+            let start_time = std::time::Instant::now();
+            let check_interval = std::time::Duration::from_millis(500);
+            
+            while start_time.elapsed() < max_wait_time {
+                let relays = client.relays().await;
+                
+                // Check if we have at least one relay added (connection may still be establishing)
+                if !relays.is_empty() {
+                    println!("[RUST] Relays added after update, waiting for connections to establish...");
+                    // Give connections more time to establish
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    break;
+                }
+                
+                // Wait before checking again
+                tokio::time::sleep(check_interval).await;
+            }
+            
+            // Log final connection status
+            let final_relays = client.relays().await;
+            let relay_urls: Vec<String> = final_relays.iter()
+                .map(|(url, _)| url.to_string())
+                .collect();
+            
+            println!("[RUST] Reconnection attempt completed. Total relays added: {}", final_relays.len());
+            if !relay_urls.is_empty() {
+                println!("[RUST] Relay URLs: {:?}", relay_urls);
+                println!("[RUST] Note: Connection status will be checked asynchronously");
+            } else {
+                println!("[RUST] Warning: No relays were added after update");
+            }
         }
         
         Ok(())

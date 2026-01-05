@@ -50,6 +50,44 @@ class ContactsService {
         }
     }
 
+    // Load a single contact image asynchronously
+    async loadContactImageAsync(contact) {
+        if (!contact.picture || contact.picture_loading) return;
+        
+        try {
+            contact.picture_loading = true;
+            let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey);
+            if (!dataUrl && contact.picture) {
+                dataUrl = await window.TauriService.fetchImage(contact.picture);
+                if (dataUrl) {
+                    // Update UI immediately
+                    contact.picture_data_url = dataUrl;
+                    contact.picture_loaded = true;
+                    this.renderContactItem(contact);
+                    // Update detail view if this contact is selected
+                    const selectedContact = window.appState.getSelectedContact();
+                    if (selectedContact && selectedContact.pubkey === contact.pubkey) {
+                        this.renderContactDetail(contact);
+                    }
+                    // Cache in database
+                    await window.TauriService.cacheProfileImage(contact.pubkey, dataUrl);
+                }
+            } else if (dataUrl) {
+                contact.picture_data_url = dataUrl;
+                contact.picture_loaded = true;
+                this.renderContactItem(contact);
+                const selectedContact = window.appState.getSelectedContact();
+                if (selectedContact && selectedContact.pubkey === contact.pubkey) {
+                    this.renderContactDetail(contact);
+                }
+            }
+        } catch (e) {
+            console.warn(`Failed to load image for ${contact.name}:`, e);
+        } finally {
+            contact.picture_loading = false;
+        }
+    }
+
     // Load contact images progressively
     async loadContactImagesProgressively() {
         const contacts = window.appState.getContacts();
@@ -229,7 +267,7 @@ class ContactsService {
     }
 
     // Select a contact
-    selectContact(contact) {
+    async selectContact(contact) {
         try {
             window.appState.setSelectedContact(contact);
             
@@ -244,13 +282,100 @@ class ContactsService {
                 contactElement.classList.add('active');
             }
             
-            // Render the contact detail
+            // Show local/cached data immediately for better UX
             this.renderContactDetail(contact);
+            
+            // Fetch fresh profile data from Nostr relays in the background
+            // This will update the UI when fresh data arrives
+            this.fetchAndUpdateContactProfile(contact).catch(error => {
+                console.error('[JS] Background profile fetch failed:', error);
+                // Silently fail - user already sees cached data
+            });
             
         } catch (error) {
             console.error('Error selecting contact:', error);
+            // Fallback to rendering with existing data
+            this.renderContactDetail(contact);
         }
     }
+
+    // Fetch fresh profile data and update contact (called in background)
+    async fetchAndUpdateContactProfile(contact) {
+        try {
+            console.log('[JS] Fetching fresh profile data for:', contact.pubkey);
+            const freshProfile = await window.TauriService.fetchProfilePersistent(contact.pubkey);
+            
+            if (freshProfile && freshProfile.fields) {
+                // Merge fresh data with existing contact data
+                const updatedContact = {
+                    ...contact,
+                    name: freshProfile.fields.name || freshProfile.fields.display_name || contact.name,
+                    display_name: freshProfile.fields.display_name || freshProfile.fields.name || contact.display_name,
+                    picture: freshProfile.fields.picture || contact.picture,
+                    email: freshProfile.fields.email || contact.email,
+                    about: freshProfile.fields.about || contact.about,
+                    fields: {
+                        ...contact.fields,
+                        ...freshProfile.fields
+                    },
+                    updated_at: new Date().toISOString()
+                };
+                
+                // Check if data actually changed
+                const dataChanged = 
+                    updatedContact.name !== contact.name ||
+                    updatedContact.email !== contact.email ||
+                    updatedContact.picture !== contact.picture ||
+                    updatedContact.about !== contact.about;
+                
+                if (dataChanged) {
+                    // Update contact in app state
+                    const contacts = window.appState.getContacts();
+                    const contactIndex = contacts.findIndex(c => c.pubkey === contact.pubkey);
+                    if (contactIndex !== -1) {
+                        contacts[contactIndex] = updatedContact;
+                        window.appState.setContacts(contacts);
+                        // Re-render the contact item in the list if needed
+                        this.renderContactItem(updatedContact);
+                    }
+                    
+                    // Update in database
+                    try {
+                        const dbContact = window.DatabaseService.convertContactToDbFormat(updatedContact);
+                        await window.DatabaseService.saveContact(dbContact);
+                        console.log('[JS] Updated contact in database:', contact.pubkey);
+                    } catch (dbError) {
+                        console.warn('[JS] Failed to update contact in database:', dbError);
+                    }
+                    
+                    // Only update UI if this contact is still selected
+                    const selectedContact = window.appState.getSelectedContact();
+                    if (selectedContact && selectedContact.pubkey === contact.pubkey) {
+                        // Render with fresh data
+                        this.renderContactDetail(updatedContact);
+                        window.appState.setSelectedContact(updatedContact);
+                        
+                        // Show subtle notification that profile was updated
+                        window.notificationService.showInfo('Profile updated', 2000);
+                    }
+                    
+                    // If picture URL changed, fetch and cache the new image
+                    if (freshProfile.fields.picture && freshProfile.fields.picture !== contact.picture) {
+                        // Load image in background
+                        this.loadContactImageAsync(updatedContact);
+                    }
+                } else {
+                    console.log('[JS] Profile data unchanged, no update needed');
+                }
+            } else {
+                console.log('[JS] No fresh profile data found');
+            }
+        } catch (fetchError) {
+            console.error('[JS] Failed to fetch fresh profile data:', fetchError);
+            // Don't show error to user - they already see cached data
+        }
+    }
+
 
     // Render contact detail
     renderContactDetail(contact) {
@@ -960,6 +1085,47 @@ class ContactsService {
         } catch (error) {
             console.error('[ContactsService] Error updating contact profile:', error);
         }
+    }
+
+    // Toggle contacts search visibility
+    toggleContactsSearch() {
+        const searchContainer = window.domManager.get('contactsSearchContainer');
+        const searchInput = window.domManager.get('contactsSearch');
+        const searchToggle = window.domManager.get('contactsSearchToggle');
+        
+        if (!searchContainer) return;
+        
+        const isVisible = searchContainer.style.display !== 'none';
+        
+        if (isVisible) {
+            // Hide search
+            searchContainer.style.display = 'none';
+            if (searchInput) {
+                searchInput.value = '';
+                this.filterContacts(); // Clear filter
+            }
+            if (searchToggle) {
+                searchToggle.innerHTML = '<i class="fas fa-search"></i> Search';
+            }
+        } else {
+            // Show search
+            searchContainer.style.display = 'block';
+            if (searchInput) {
+                searchInput.focus();
+            }
+            if (searchToggle) {
+                searchToggle.innerHTML = '<i class="fas fa-times"></i> Close';
+            }
+        }
+    }
+
+    // Filter contacts based on search query
+    filterContacts() {
+        const searchInput = window.domManager.get('contactsSearch');
+        if (!searchInput) return;
+        
+        const searchQuery = searchInput.value.trim().toLowerCase();
+        this.renderContacts(searchQuery);
     }
 }
 

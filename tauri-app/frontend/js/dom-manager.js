@@ -29,7 +29,6 @@ class DOMManager {
             previewHeadersBtn: this.getElement('preview-headers-btn'),
             nostrContactSelect: this.getElement('nostr-contact-select'),
             encryptBtn: this.getElement('encrypt-btn'),
-            sendMatchingDm: this.getElement('send-matching-dm'),
             
             // Inbox
             emailList: this.getElement('email-list'),
@@ -98,7 +97,8 @@ class DOMManager {
             imapHost: this.getElement('imap-host'),
             imapPort: this.getElement('imap-port'),
             'use-tls': this.getElement('use-tls'),
-            saveSettingsBtn: this.getElement('save-settings-btn'),
+            emailFilterPreference: this.getElement('email-filter-preference'),
+            'send-matching-dm-preference': this.getElement('send-matching-dm-preference'),
             testEmailConnectionBtn: this.getElement('test-email-connection-btn'),
             copyNprivBtn: this.getElement('copy-npriv-btn'),
             copyEmailPasswordBtn: this.getElement('copy-email-password-btn'),

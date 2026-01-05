@@ -40,7 +40,8 @@ NostrMailApp.prototype.init = async function() {
     }
     try {
         console.log('📋 Loading application settings...');
-        this.loadSettings();
+        // Settings will be loaded after keypair is loaded (in loadKeypair)
+        // This ensures we load settings for the correct pubkey
 
         console.log('🌐 Loading relay configuration from database...');
         await this.loadRelaysFromDatabase();
@@ -89,8 +90,42 @@ NostrMailApp.prototype.init = async function() {
 }
 
 // Load settings from localStorage
-NostrMailApp.prototype.loadSettings = function() {
+NostrMailApp.prototype.loadSettings = async function() {
     try {
+        // First try to load from database based on current pubkey
+        const keypair = appState.getKeypair();
+        if (keypair && keypair.public_key) {
+            try {
+                const dbSettings = await TauriService.dbGetAllSettings(keypair.public_key);
+                if (dbSettings && Object.keys(dbSettings).length > 0) {
+                    console.log('[APP] Loaded settings from database for pubkey:', keypair.public_key);
+                    // Convert database settings back to settings object format
+                    const settings = {
+                        npriv_key: keypair.private_key,
+                        encryption_algorithm: dbSettings.encryption_algorithm || 'nip44',
+                        email_address: dbSettings.email_address || '',
+                        password: dbSettings.password || '',
+                        smtp_host: dbSettings.smtp_host || '',
+                        smtp_port: parseInt(dbSettings.smtp_port) || 587,
+                        imap_host: dbSettings.imap_host || '',
+                        imap_port: parseInt(dbSettings.imap_port) || 993,
+                        use_tls: dbSettings.use_tls === 'true',
+                        email_filter: dbSettings.email_filter || 'nostr',
+                        send_matching_dm: dbSettings.send_matching_dm !== 'false' // Default to true if not set
+                    };
+                    appState.setSettings(settings);
+                    this.populateSettingsForm();
+                    // Also update localStorage as backup
+                    localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
+                    return;
+                }
+            } catch (error) {
+                console.error('[APP] Failed to load settings from database:', error);
+                // Fall through to localStorage fallback
+            }
+        }
+        
+        // Fallback to localStorage if database load failed or no pubkey
         const stored = localStorage.getItem('nostr_mail_settings');
         if (stored) {
             const settings = JSON.parse(stored);
@@ -99,6 +134,64 @@ NostrMailApp.prototype.loadSettings = function() {
         }
     } catch (error) {
         console.error('Error loading settings:', error);
+    }
+}
+
+NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
+    try {
+        if (!pubkey) {
+            console.log('[APP] No pubkey provided, skipping settings load');
+            return;
+        }
+        
+        console.log('[APP] Loading settings for pubkey:', pubkey);
+        const dbSettings = await TauriService.dbGetAllSettings(pubkey);
+        
+        if (dbSettings && Object.keys(dbSettings).length > 0) {
+            // Get current keypair to include private key in settings
+            const keypair = appState.getKeypair();
+            const settings = {
+                npriv_key: keypair ? keypair.private_key : '',
+                encryption_algorithm: dbSettings.encryption_algorithm || 'nip44',
+                email_address: dbSettings.email_address || '',
+                password: dbSettings.password || '',
+                smtp_host: dbSettings.smtp_host || '',
+                smtp_port: parseInt(dbSettings.smtp_port) || 587,
+                imap_host: dbSettings.imap_host || '',
+                imap_port: parseInt(dbSettings.imap_port) || 993,
+                use_tls: dbSettings.use_tls === 'true',
+                email_filter: dbSettings.email_filter || 'nostr',
+                send_matching_dm: dbSettings.send_matching_dm !== 'false' // Default to true if not set
+            };
+            
+            appState.setSettings(settings);
+            this.populateSettingsForm();
+            // Update localStorage as backup
+            localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
+            console.log('[APP] Settings loaded for pubkey:', pubkey);
+        } else {
+            console.log('[APP] No settings found in database for pubkey:', pubkey);
+            // Try to load from localStorage as fallback
+            const stored = localStorage.getItem('nostr_mail_settings');
+            if (stored) {
+                const settings = JSON.parse(stored);
+                appState.setSettings(settings);
+                this.populateSettingsForm();
+            }
+        }
+    } catch (error) {
+        console.error('[APP] Error loading settings for pubkey:', error);
+        // Fallback to localStorage
+        const stored = localStorage.getItem('nostr_mail_settings');
+        if (stored) {
+            try {
+                const settings = JSON.parse(stored);
+                appState.setSettings(settings);
+                this.populateSettingsForm();
+            } catch (e) {
+                console.error('[APP] Failed to load from localStorage:', e);
+            }
+        }
     }
 }
 
@@ -127,16 +220,22 @@ NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
 NostrMailApp.prototype.loadKeypair = async function() {
     try {
         const stored = localStorage.getItem('nostr_keypair');
+        let keypair;
         if (stored) {
-            const keypair = JSON.parse(stored);
+            keypair = JSON.parse(stored);
             appState.setKeypair(keypair);
         } else {
-            const keypair = await TauriService.generateKeypair();
+            keypair = await TauriService.generateKeypair();
             appState.setKeypair(keypair);
             localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
         }
         console.log('Keypair loaded:', appState.getKeypair().public_key.substring(0, 20) + '...');
         this.renderProfilePubkey();
+        
+        // Load settings for this pubkey
+        if (keypair && keypair.public_key) {
+            await this.loadSettingsForPubkey(keypair.public_key);
+        }
         
         // Initialize persistent Nostr client with the loaded keypair
         await this.initializeNostrClient();
@@ -401,10 +500,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
         }
         
         // Settings
-        const saveSettingsBtn = domManager.get('saveSettingsBtn');
-        if (saveSettingsBtn) {
-            saveSettingsBtn.addEventListener('click', () => this.saveSettings());
-        }
+        // Auto-save setup - removed save button, settings auto-save on change
+        this.setupAutoSaveSettings();
         const testConnectionBtn = domManager.get('testConnectionBtn');
         if (testConnectionBtn) {
             testConnectionBtn.addEventListener('click', () => this.testConnection());
@@ -1129,17 +1226,26 @@ NostrMailApp.prototype.showNewDmCompose = function() {
 }
 
 // Settings management
-NostrMailApp.prototype.saveSettings = async function() {
+NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
     try {
+        // Get current keypair - REQUIRED for saving
+        const currentKeypair = appState.getKeypair();
+        if (!currentKeypair || !currentKeypair.public_key) {
+            this.showSettingsStatus('warning', 'Please enter a private key to save settings');
+            // Toast notification is shown in showSettingsStatus for better visibility
+            return false;
+        }
+        
         // Validate npriv key if provided
         const nprivKey = domManager.getValue('nprivKey')?.trim() || '';
         if (nprivKey && !nprivKey.startsWith('npriv1') && !nprivKey.startsWith('nsec1')) {
-            notificationService.showError('Invalid Nostr private key format. Should start with "npriv1" or "nsec1"');
-            return;
+            this.showSettingsStatus('error', 'Invalid Nostr private key format. Should start with "npriv1" or "nsec1"');
+            // Toast notification is shown in showSettingsStatus for better visibility
+            return false;
         }
         
         const settings = {
-            npriv_key: nprivKey,
+            npriv_key: nprivKey || currentKeypair.private_key,
             encryption_algorithm: domManager.getValue('encryptionAlgorithm') || 'nip44',
             email_address: domManager.getValue('emailAddress') || '',
             password: domManager.getValue('emailPassword') || '',
@@ -1147,33 +1253,40 @@ NostrMailApp.prototype.saveSettings = async function() {
             smtp_port: parseInt(domManager.getValue('smtpPort')) || 587,
             imap_host: domManager.getValue('imapHost') || '',
             imap_port: parseInt(domManager.getValue('imapPort')) || 993,
-            use_tls: domManager.get('use-tls')?.checked || false
+            use_tls: domManager.get('use-tls')?.checked || false,
+            email_filter: domManager.getValue('emailFilterPreference') || 'nostr',
+            send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false // Default to true
         };
         
+        // Keep localStorage as backup
         localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
         appState.setSettings(settings);
-        appState.setNprivKey(nprivKey);
+        appState.setNprivKey(settings.npriv_key);
         
-        // If a private key is provided, update appState.keypair and localStorage
+        // If a private key is provided in the form, update appState.keypair
+        let publicKey = currentKeypair.public_key;
         if (nprivKey && (nprivKey.startsWith('npriv1') || nprivKey.startsWith('nsec1'))) {
             const isValid = await TauriService.validatePrivateKey(nprivKey);
             if (!isValid) {
-                notificationService.showError('Invalid private key');
-                return;
+                this.showSettingsStatus('error', 'Invalid private key');
+                // Toast notification is shown in showSettingsStatus for better visibility
+                return false;
             }
-            const publicKey = await TauriService.getPublicKeyFromPrivate(nprivKey);
+            publicKey = await TauriService.getPublicKeyFromPrivate(nprivKey);
             const keypair = { private_key: nprivKey, public_key: publicKey };
             
             // Check if this is a different keypair
-            const currentKeypair = appState.getKeypair();
-            const isNewKeypair = !currentKeypair || currentKeypair.private_key !== nprivKey;
+            const isNewKeypair = currentKeypair.private_key !== nprivKey;
             
             appState.setKeypair(keypair);
             localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
             this.renderProfilePubkey();
             
-            // If keypair changed, restart live events with new key and reinitialize persistent client
+            // If keypair changed, load settings for new pubkey and restart services
             if (isNewKeypair) {
+                console.log('[LiveEvents] Keypair changed, loading settings for new pubkey');
+                await this.loadSettingsForPubkey(publicKey);
+                
                 console.log('[LiveEvents] Keypair changed, restarting live events');
                 await this.cleanupLiveEvents();
                 await this.initializeLiveEvents();
@@ -1189,13 +1302,119 @@ NostrMailApp.prototype.saveSettings = async function() {
             }
         }
         
+        // Save settings to database with pubkey association (REQUIRED)
+        try {
+            // Convert settings object to key-value pairs for database storage
+            const settingsMap = new Map();
+            settingsMap.set('encryption_algorithm', settings.encryption_algorithm);
+            settingsMap.set('email_address', settings.email_address);
+            settingsMap.set('password', settings.password);
+            settingsMap.set('smtp_host', settings.smtp_host);
+            settingsMap.set('smtp_port', settings.smtp_port.toString());
+            settingsMap.set('imap_host', settings.imap_host);
+            settingsMap.set('imap_port', settings.imap_port.toString());
+            settingsMap.set('use_tls', settings.use_tls.toString());
+            settingsMap.set('email_filter', settings.email_filter);
+            
+            const settingsObj = Object.fromEntries(settingsMap);
+            await TauriService.dbSaveSettingsBatch(publicKey, settingsObj);
+            console.log('[APP] Settings auto-saved to database for pubkey:', publicKey);
+            
+            this.showSettingsStatus('success', 'Settings saved automatically');
+            // Toast notification is shown in showSettingsStatus for better visibility
+        } catch (error) {
+            console.error('[APP] Failed to save settings to database:', error);
+            this.showSettingsStatus('error', 'Failed to save settings');
+            // Toast notification is shown in showSettingsStatus for better visibility
+            return false;
+        }
+        
         await this.saveRelays();
         this.saveRelaysToLocalStorage();
-        notificationService.showSuccess('Settings saved successfully');
+        return true;
     } catch (error) {
         console.error('Error saving settings:', error);
-        notificationService.showError('Failed to save settings');
+        this.showSettingsStatus('error', 'Error saving settings');
+        // Toast notification is shown in showSettingsStatus for better visibility
+        return false;
     }
+}
+
+// Show settings status message (toast notification only)
+NostrMailApp.prototype.showSettingsStatus = function(type, message) {
+    // Show toast notification for visibility
+    if (type === 'success') {
+        notificationService.showSuccess(message, 2000);
+    } else if (type === 'error') {
+        notificationService.showError(message, 4000);
+    } else if (type === 'warning') {
+        notificationService.showWarning(message, 4000);
+    } else {
+        notificationService.showInfo(message, 3000);
+    }
+}
+
+// Setup auto-save for settings fields
+NostrMailApp.prototype.setupAutoSaveSettings = function() {
+    // Track if we're currently populating the form to avoid auto-save loops
+    let isPopulatingForm = false;
+    
+    // Debounce function to prevent excessive saves
+    let saveTimeout = null;
+    const debouncedSave = () => {
+        // Don't auto-save if we're populating the form
+        if (isPopulatingForm) {
+            return;
+        }
+        
+        if (saveTimeout) {
+            clearTimeout(saveTimeout);
+        }
+        saveTimeout = setTimeout(() => {
+            this.saveSettings(false); // Don't show notification for auto-save
+        }, 1000); // Wait 1 second after last change
+    };
+    
+    // List of all settings fields that should trigger auto-save
+    const settingsFields = [
+        'nprivKey',
+        'encryptionAlgorithm',
+        'emailAddress',
+        'emailPassword',
+        'smtpHost',
+        'smtpPort',
+        'imapHost',
+        'imapPort',
+        'use-tls',
+        'emailFilterPreference',
+        'send-matching-dm-preference'
+    ];
+    
+    settingsFields.forEach(fieldId => {
+        const field = domManager.get(fieldId);
+        if (field) {
+            // Handle different input types
+            if (field.type === 'checkbox') {
+                field.addEventListener('change', debouncedSave);
+            } else {
+                field.addEventListener('input', debouncedSave);
+                field.addEventListener('change', debouncedSave);
+            }
+        }
+    });
+    
+    // Also listen for email provider changes (which may auto-fill other fields)
+    const emailProvider = domManager.get('emailProvider');
+    if (emailProvider) {
+        emailProvider.addEventListener('change', () => {
+            // Wait a bit for auto-fill to complete, then save
+            setTimeout(debouncedSave, 500);
+        });
+    }
+    
+    // Store flag for populateSettingsForm to use
+    this._isPopulatingForm = () => isPopulatingForm;
+    this._setPopulatingForm = (value) => { isPopulatingForm = value; };
 }
 
 NostrMailApp.prototype.populateSettingsForm = async function() {
@@ -1204,6 +1423,11 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
     if (!settings) return;
     
     try {
+        // Set flag to prevent auto-save during form population
+        if (this._setPopulatingForm) {
+            this._setPopulatingForm(true);
+        }
+        
         domManager.setValue('nprivKey', settings.npriv_key || '');
         domManager.setValue('encryptionAlgorithm', settings.encryption_algorithm || 'nip44');
         domManager.setValue('emailAddress', settings.email_address || '');
@@ -1213,6 +1437,13 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.setValue('imapHost', settings.imap_host || '');
         domManager.setValue('imapPort', settings.imap_port || '');
         domManager.get('use-tls').checked = settings.use_tls || false;
+        domManager.setValue('emailFilterPreference', settings.email_filter || 'nostr');
+        
+        // Set send matching DM preference (default to true if not set)
+        const sendMatchingDmPref = domManager.get('send-matching-dm-preference');
+        if (sendMatchingDmPref) {
+            sendMatchingDmPref.checked = settings.send_matching_dm !== false;
+        }
         
         // Detect and set the email provider based on saved settings
         const emailProvider = domManager.get('emailProvider');
@@ -1224,6 +1455,13 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         // Update public key display if npriv is available
         await this.updatePublicKeyDisplay();
         this.setupQrCodeEventListeners();
+        
+        // Clear flag after a short delay to allow any pending events to settle
+        setTimeout(() => {
+            if (this._setPopulatingForm) {
+                this._setPopulatingForm(false);
+            }
+        }, 100);
     } catch (error) {
         console.error('Error populating settings form:', error);
     }

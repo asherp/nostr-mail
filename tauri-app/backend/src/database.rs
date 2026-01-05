@@ -52,6 +52,7 @@ pub struct DirectMessage {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserSettings {
     pub id: Option<i64>,
+    pub pubkey: String,
     pub key: String,
     pub value: String,
     pub created_at: DateTime<Utc>,
@@ -155,17 +156,50 @@ impl Database {
             [],
         )?;
 
-        // User settings table
+        // User settings table - create with pubkey support
         conn.execute(
             "CREATE TABLE IF NOT EXISTS user_settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                key TEXT UNIQUE NOT NULL,
+                pubkey TEXT NOT NULL DEFAULT '',
+                key TEXT NOT NULL,
                 value TEXT NOT NULL,
                 created_at DATETIME NOT NULL,
-                updated_at DATETIME NOT NULL
+                updated_at DATETIME NOT NULL,
+                UNIQUE(pubkey, key)
             )",
             [],
         )?;
+        
+        // Migrate existing settings: add pubkey column if it doesn't exist
+        // Check if pubkey column exists by querying table_info
+        let has_pubkey = match conn.prepare("PRAGMA table_info(user_settings)") {
+            Ok(mut check_stmt) => {
+                let columns: Result<Vec<String>, _> = check_stmt.query_map([], |row| {
+                    Ok(row.get::<_, String>(1)?) // column name
+                })?.collect();
+                columns.map(|cols| cols.contains(&"pubkey".to_string())).unwrap_or(false)
+            },
+            Err(_) => {
+                // Table doesn't exist yet, no migration needed (will be created with new schema)
+                false
+            }
+        };
+        
+        if !has_pubkey {
+            // Add pubkey column for existing databases
+            if let Err(e) = conn.execute(
+                "ALTER TABLE user_settings ADD COLUMN pubkey TEXT NOT NULL DEFAULT ''",
+                [],
+            ) {
+                println!("[DB] Warning: Could not add pubkey column (may already exist): {}", e);
+            } else {
+                // Update existing rows to have empty string pubkey (legacy settings)
+                conn.execute(
+                    "UPDATE user_settings SET pubkey = '' WHERE pubkey IS NULL OR pubkey = ''",
+                    [],
+                )?;
+            }
+        }
 
         // Relays table
         conn.execute(
@@ -207,6 +241,8 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_event_id ON direct_messages(event_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_created_at ON direct_messages(created_at)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_key ON user_settings(key)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_pubkey ON user_settings(pubkey)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_pubkey_key ON user_settings(pubkey, key)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_relays_url ON relays(url)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_email_id ON attachments(email_id)", [])?;
 
@@ -747,24 +783,24 @@ impl Database {
     }
 
     // Settings operations
-    pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
+    pub fn save_setting(&self, pubkey: &str, key: &str, value: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         
         conn.execute(
-            "INSERT OR REPLACE INTO user_settings (key, value, created_at, updated_at)
-             VALUES (?, ?, ?, ?)",
-            params![key, value, now, now],
+            "INSERT OR REPLACE INTO user_settings (pubkey, key, value, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)",
+            params![pubkey, key, value, now, now],
         )?;
         
         Ok(())
     }
 
-    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+    pub fn get_setting(&self, pubkey: &str, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT value FROM user_settings WHERE key = ?")?;
+        let mut stmt = conn.prepare("SELECT value FROM user_settings WHERE pubkey = ? AND key = ?")?;
         
-        let mut rows = stmt.query(params![key])?;
+        let mut rows = stmt.query(params![pubkey, key])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
         } else {
@@ -772,15 +808,22 @@ impl Database {
         }
     }
 
-    pub fn get_all_settings(&self) -> Result<HashMap<String, String>> {
+    pub fn get_all_settings(&self, pubkey: &str) -> Result<HashMap<String, String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT key, value FROM user_settings")?;
+        let mut stmt = conn.prepare("SELECT key, value FROM user_settings WHERE pubkey = ?")?;
         
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![pubkey], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         
         rows.collect()
+    }
+    
+    // Delete all settings for a pubkey (useful for cleanup)
+    pub fn delete_settings_for_pubkey(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM user_settings WHERE pubkey = ?", params![pubkey])?;
+        Ok(())
     }
 
     // Relay operations
@@ -1054,6 +1097,12 @@ impl Database {
         conn.execute("DELETE FROM direct_messages", [])?;
         conn.execute("DELETE FROM user_settings", [])?;
         conn.execute("DELETE FROM relays", [])?;
+        Ok(())
+    }
+    
+    pub fn clear_settings_for_pubkey(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM user_settings WHERE pubkey = ?", params![pubkey])?;
         Ok(())
     }
 

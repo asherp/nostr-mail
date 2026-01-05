@@ -90,6 +90,30 @@ cargo tauri build
 # The built application will be in src-tauri/target/release/
 ```
 
+### Running Frontend in Browser (Development Mode)
+
+You can run the frontend as a static site in your browser while connecting to the backend via HTTP:
+
+```bash
+# On macOS/Linux:
+./run-browser-dev.sh
+
+# On Windows:
+run-browser-dev.bat
+
+# Or manually:
+# Terminal 1: Start HTTP server
+cd backend
+cargo run --bin http-server --release
+
+# Terminal 2: Serve frontend
+cd frontend
+python3 -m http.server 8080
+# Then open http://127.0.0.1:8080 in your browser
+```
+
+The HTTP server runs on `http://127.0.0.1:1420` and the frontend is served on `http://127.0.0.1:8080`. The frontend automatically detects browser mode and uses HTTP instead of Tauri APIs.
+
 ### Configuration
 1. **Email Setup**: Configure your SMTP and IMAP settings in the Settings tab
 2. **Nostr Setup**: Generate or import your Nostr private key

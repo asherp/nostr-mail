@@ -148,9 +148,9 @@ class DatabaseService {
         }
     }
 
-    static async getAllSettings() {
+    static async getAllSettings(pubkey = '') {
         try {
-            const settings = await window.__TAURI__.core.invoke('db_get_all_settings');
+            const settings = await window.__TAURI__.core.invoke('db_get_all_settings', { pubkey });
             return settings;
         } catch (error) {
             console.error('Failed to get all settings:', error);

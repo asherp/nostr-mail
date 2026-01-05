@@ -815,7 +815,7 @@ class EmailService {
         const messageId = this.generateAndStoreMessageId();
         console.log('[JS] Using message ID:', messageId);
         
-        // Check if using Gmail and warn about App Password
+        // Check if using Gmail or Yahoo and warn about App Password
         const settings = appState.getSettings();
         if (settings.smtp_host === 'smtp.gmail.com') {
             console.log('[JS] Gmail detected, checking for App Password warning');
@@ -823,6 +823,13 @@ class EmailService {
             if (isGmailAddress) {
                 console.log('[JS] Showing Gmail App Password info message');
                 notificationService.showSuccess('Gmail detected: Make sure you\'re using an App Password, not your regular password. If you haven\'t set up an App Password, go to Google Account > Security > 2-Step Verification > App passwords.');
+            }
+        } else if (settings.smtp_host === 'smtp.mail.yahoo.com') {
+            console.log('[JS] Yahoo detected, checking for App Password warning');
+            const isYahooAddress = settings.email_address?.includes('@yahoo.com') || settings.email_address?.includes('@ymail.com');
+            if (isYahooAddress) {
+                console.log('[JS] Showing Yahoo App Password info message');
+                notificationService.showSuccess('Yahoo detected: Make sure you\'re using an App Password, not your regular password. If you haven\'t set up an App Password, go to your Yahoo Account Security settings > Generate app password.');
             }
         }
         
@@ -1048,10 +1055,11 @@ class EmailService {
             const activeRelays = appState.getActiveRelays();
             const encryptBtn = domManager.get('encryptBtn');
             
-            // Check if user wants to send a matching DM
-            const shouldSendDm = domManager.isChecked('sendMatchingDm');
+            // Check if user wants to send a matching DM (from settings)
+            const settings = appState.getSettings();
+            const shouldSendDm = settings && settings.send_matching_dm !== false; // Default to true
             
-            // Only send DM if checkbox is checked and encrypt button is in encrypted state
+            // Only send DM if setting is enabled and encrypt button is in encrypted state
             if (shouldSendDm && encryptBtn && encryptBtn.dataset.encrypted === 'true') {
                 console.log('[JS] Sending matching DM to contact:', contact.name);
                 // Use the encrypted subject for the DM to match the email subject blob
@@ -1067,7 +1075,7 @@ class EmailService {
                 console.warn('[JS] Encrypt button not in encrypted state, DM will NOT be sent for security reasons.');
                 notificationService.showInfo('No DM sent: Email is not encrypted.');
             } else {
-                console.log('[JS] Send matching DM checkbox is unchecked, skipping DM.');
+                console.log('[JS] Send matching DM setting is disabled, skipping DM.');
             }
             
             // Send encrypted email with the encrypted subject and body
@@ -1102,12 +1110,13 @@ class EmailService {
                 use_tls: settings.use_tls,
                 private_key: keypair ? keypair.private_key : null
             };
-            // Read filter dropdown
-            const filterDropdown = document.getElementById('email-filter-dropdown');
-            const onlyNostr = !filterDropdown || filterDropdown.value === 'nostr';
+            // Read filter preference from settings
+            const emailFilter = settings.email_filter || 'nostr';
+            const onlyNostr = emailFilter === 'nostr';
             // Always pass the user's email address for filtering (only as recipient)
             const userEmail = settings.email_address ? settings.email_address : null;
             console.log('[JS] getDbEmails userEmail:', userEmail);
+            console.log('[JS] Email filter preference:', emailFilter, 'onlyNostr:', onlyNostr);
             let emails;
             if (onlyNostr) {
                 emails = await TauriService.getDbEmails(50, 0, true, userEmail);
@@ -2062,6 +2071,8 @@ class EmailService {
             
             if (provider === 'gmail') {
                 message += ' For Gmail, you must use an App Password instead of your regular password. Go to your Google Account settings > Security > 2-Step Verification > App passwords to generate one.';
+            } else if (provider === 'yahoo') {
+                message += ' For Yahoo, you must use an App Password instead of your regular password. Go to your Yahoo Account Security settings > Generate app password to create one.';
             }
             
             // Add TLS info

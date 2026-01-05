@@ -16,11 +16,46 @@ class StorageService {
         this.initialized = true;
     }
 
+    // Helper to invoke commands (works with both Tauri and HTTP)
+    async _invoke(command, args = {}) {
+        // Use TauriService if available (loaded after this file), otherwise fall back to direct Tauri or HTTP
+        if (window.TauriService && window.TauriService.invoke) {
+            return await window.TauriService.invoke(command, args);
+        } else if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+            return await window.__TAURI__.core.invoke(command, args);
+        } else {
+            // Fall back to HTTP if neither Tauri nor TauriService is available
+            const httpBaseUrl = 'http://127.0.0.1:1420';
+            const response = await fetch(`${httpBaseUrl}/invoke`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    command: command,
+                    args: args,
+                }),
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            
+            const result = await response.json();
+            
+            if (result.success) {
+                return result.data;
+            } else {
+                throw new Error(result.error || 'Unknown error');
+            }
+        }
+    },
+
     // Contact operations
     async saveContacts(contacts) {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_save_contacts', { contacts });
+            await this._invoke('storage_save_contacts', { contacts });
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to save contacts:', error);
@@ -31,7 +66,7 @@ class StorageService {
     async getContacts() {
         await this.initialize();
         try {
-            return await window.__TAURI__.invoke('storage_get_contacts');
+            return await this._invoke('storage_get_contacts');
         } catch (error) {
             console.error('[STORAGE] Failed to get contacts:', error);
             return [];
@@ -41,7 +76,7 @@ class StorageService {
     async clearContacts() {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_clear_contacts');
+            await this._invoke('storage_clear_contacts');
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to clear contacts:', error);
@@ -53,7 +88,7 @@ class StorageService {
     async saveConversations(conversations) {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_save_conversations', { conversations });
+            await this._invoke('storage_save_conversations', { conversations });
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to save conversations:', error);
@@ -64,7 +99,7 @@ class StorageService {
     async getConversations() {
         await this.initialize();
         try {
-            return await window.__TAURI__.invoke('storage_get_conversations');
+            return await this._invoke('storage_get_conversations');
         } catch (error) {
             console.error('[STORAGE] Failed to get conversations:', error);
             return [];
@@ -74,7 +109,7 @@ class StorageService {
     async clearConversations() {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_clear_conversations');
+            await this._invoke('storage_clear_conversations');
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to clear conversations:', error);
@@ -86,7 +121,7 @@ class StorageService {
     async saveUserProfile(profile) {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_save_user_profile', { profile });
+            await this._invoke('storage_save_user_profile', { profile });
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to save user profile:', error);
@@ -97,7 +132,7 @@ class StorageService {
     async getUserProfile() {
         await this.initialize();
         try {
-            return await window.__TAURI__.invoke('storage_get_user_profile');
+            return await this._invoke('storage_get_user_profile');
         } catch (error) {
             console.error('[STORAGE] Failed to get user profile:', error);
             return null;
@@ -107,7 +142,7 @@ class StorageService {
     async clearUserProfile() {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_clear_user_profile');
+            await this._invoke('storage_clear_user_profile');
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to clear user profile:', error);
@@ -119,7 +154,7 @@ class StorageService {
     async saveSettings(settings) {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_save_settings', { settings });
+            await this._invoke('storage_save_settings', { settings });
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to save settings:', error);
@@ -130,7 +165,7 @@ class StorageService {
     async getSettings() {
         await this.initialize();
         try {
-            return await window.__TAURI__.invoke('storage_get_settings');
+            return await this._invoke('storage_get_settings');
         } catch (error) {
             console.error('[STORAGE] Failed to get settings:', error);
             return null;
@@ -141,7 +176,7 @@ class StorageService {
     async saveEmailDraft(draft) {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_save_email_draft', { draft });
+            await this._invoke('storage_save_email_draft', { draft });
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to save email draft:', error);
@@ -152,7 +187,7 @@ class StorageService {
     async getEmailDraft(id) {
         await this.initialize();
         try {
-            return await window.__TAURI__.invoke('storage_get_email_draft', { id });
+            return await this._invoke('storage_get_email_draft', { id });
         } catch (error) {
             console.error('[STORAGE] Failed to get email draft:', error);
             return null;
@@ -162,7 +197,7 @@ class StorageService {
     async clearEmailDraft(id) {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_clear_email_draft', { id });
+            await this._invoke('storage_clear_email_draft', { id });
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to clear email draft:', error);
@@ -174,7 +209,7 @@ class StorageService {
     async saveRelays(relays) {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_save_relays', { relays });
+            await this._invoke('storage_save_relays', { relays });
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to save relays:', error);
@@ -185,7 +220,7 @@ class StorageService {
     async getRelays() {
         await this.initialize();
         try {
-            return await window.__TAURI__.invoke('storage_get_relays');
+            return await this._invoke('storage_get_relays');
         } catch (error) {
             console.error('[STORAGE] Failed to get relays:', error);
             return [];
@@ -196,7 +231,7 @@ class StorageService {
     async clearAllData() {
         await this.initialize();
         try {
-            await window.__TAURI__.invoke('storage_clear_all_data');
+            await this._invoke('storage_clear_all_data');
             return true;
         } catch (error) {
             console.error('[STORAGE] Failed to clear all data:', error);
@@ -207,7 +242,7 @@ class StorageService {
     async getDataSize() {
         await this.initialize();
         try {
-            return await window.__TAURI__.invoke('storage_get_data_size');
+            return await this._invoke('storage_get_data_size');
         } catch (error) {
             console.error('[STORAGE] Failed to get data size:', error);
             return 0;

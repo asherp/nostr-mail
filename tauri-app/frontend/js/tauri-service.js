@@ -4,15 +4,55 @@
 // You can use camelCase in JS and it will map to the expected snake_case Rust parameter.
 // See: https://tauri.app/v1/guides/features/command/#naming-conventions
 // Tauri Service
-// Handles all communication with the Rust backend via Tauri commands
+// Handles all communication with the Rust backend via Tauri commands or HTTP
 
 const TauriService = {
+    // Detect if running in Tauri or browser
+    isTauriAvailable: function() {
+        return typeof window !== 'undefined' && window.__TAURI__ && window.__TAURI__.core;
+    },
+    
+    // HTTP API base URL (for browser mode)
+    httpBaseUrl: 'http://127.0.0.1:1420',
+    
     invoke: async function(command, args = {}) {
-        try {
-            return await window.__TAURI__.core.invoke(command, args);
-        } catch (error) {
-            console.error(`Tauri command failed: ${command}`, error);
-            throw error;
+        // Use Tauri if available, otherwise use HTTP
+        if (this.isTauriAvailable()) {
+            try {
+                return await window.__TAURI__.core.invoke(command, args);
+            } catch (error) {
+                console.error(`Tauri command failed: ${command}`, error);
+                throw error;
+            }
+        } else {
+            // Use HTTP API
+            try {
+                const response = await fetch(`${this.httpBaseUrl}/invoke`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        command: command,
+                        args: args,
+                    }),
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    return result.data;
+                } else {
+                    throw new Error(result.error || 'Unknown error');
+                }
+            } catch (error) {
+                console.error(`HTTP command failed: ${command}`, error);
+                throw error;
+            }
         }
     },
     testTauriAvailability: function() {
@@ -393,6 +433,23 @@ const TauriService = {
 
     getLiveSubscriptionStatus: async function() {
         return await this.invoke('get_live_subscription_status');
+    },
+    
+    // Settings with pubkey association
+    dbSaveSetting: async function(pubkey, key, value) {
+        return await this.invoke('db_save_setting', { pubkey, key, value });
+    },
+    
+    dbGetSetting: async function(pubkey, key) {
+        return await this.invoke('db_get_setting', { pubkey, key });
+    },
+    
+    dbGetAllSettings: async function(pubkey) {
+        return await this.invoke('db_get_all_settings', { pubkey });
+    },
+    
+    dbSaveSettingsBatch: async function(pubkey, settings) {
+        return await this.invoke('db_save_settings_batch', { pubkey, settings });
     }
 };
 window.TauriService = TauriService; 

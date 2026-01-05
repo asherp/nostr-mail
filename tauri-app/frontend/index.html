@@ -119,14 +119,6 @@
                         </div>
                     </div>
                     
-                    <div class="form-group">
-                        <div class="checkbox-group">
-                            <input type="checkbox" id="send-matching-dm" checked>
-                            <label for="send-matching-dm">Send matching DM</label>
-                            <small class="form-text text-muted">Send a direct message with the same subject line to the selected Nostr contact</small>
-                        </div>
-                    </div>
-                    
                     <div class="form-actions">
                         <button id="encrypt-btn" class="btn btn-secondary" type="button">
                             <span class="encrypt-btn-icon"><i class="fas fa-lock"></i></span>
@@ -151,10 +143,6 @@
                     <h2 id="inbox-title">Inbox</h2>
                     <div class="inbox-actions" id="inbox-actions">
                         <div class="email-search-container">
-                            <select id="email-filter-dropdown" class="email-filter-dropdown" style="margin-right: 8px;">
-                                <option value="nostr" selected>Nostr Emails</option>
-                                <option value="all">All Emails</option>
-                            </select>
                             <input type="text" id="email-search" placeholder="Search by sender email..." class="email-search-input">
                             <i class="fas fa-search email-search-icon"></i>
                         </div>
@@ -459,6 +447,24 @@
                             </label>
                         </div>
                         
+                        <div class="form-group">
+                            <label for="email-filter-preference">Inbox Filter:</label>
+                            <select id="email-filter-preference">
+                                <option value="nostr">Nostr Emails Only</option>
+                                <option value="all">All Emails</option>
+                            </select>
+                            <small class="form-text text-muted">Choose whether to show only Nostr-encrypted emails or all emails in your inbox</small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="send-matching-dm-preference" checked>
+                                <span class="checkmark"></span>
+                                Send Matching DM
+                            </label>
+                            <small class="form-text text-muted">Automatically send a direct message with the same subject line when sending encrypted emails to Nostr contacts</small>
+                        </div>
+                        
                         <div class="form-actions">
                             <button id="test-email-connection-btn" class="btn btn-secondary">
                                 <i class="fas fa-envelope"></i> Test Email Connection
@@ -494,12 +500,6 @@
                                 </div>
                             </div>
                         </div>
-                    </div>
-                    
-                    <div class="form-actions">
-                        <button id="save-settings-btn" class="btn btn-primary">
-                            <i class="fas fa-save"></i> Save Settings
-                        </button>
                     </div>
                 </div>
             </div>

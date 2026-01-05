@@ -1,0 +1,70 @@
+/* Responsive Design Styles */
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .app-container {
+        flex-direction: column;
+    }
+    
+    .sidebar {
+        width: 100%;
+        height: auto;
+        border-right: none;
+        border-bottom: 1px solid #e0e0e0;
+    }
+    
+    .sidebar-nav {
+        flex-direction: row;
+        overflow-x: auto;
+        padding: 10px;
+    }
+    
+    .nav-item {
+        flex-shrink: 0;
+        margin-right: 15px;
+    }
+    
+    .form-actions {
+        flex-direction: column;
+    }
+    
+    .btn {
+        margin-bottom: 10px;
+    }
+    
+    .dm-container {
+        flex-direction: column;
+    }
+    
+    .dm-sidebar {
+        width: 100%;
+        height: 300px;
+        border-right: none;
+        border-bottom: 1px solid #e0e0e0;
+    }
+    
+    .dm-main {
+        flex: 1;
+        min-height: 400px;
+    }
+    
+    .message {
+        max-width: 85%;
+    }
+    
+    /* Contacts responsive layout */
+    .contacts-container {
+        flex-direction: column;
+    }
+    
+    .contacts-sidebar {
+        width: 100%;
+        height: 300px;
+        border-right: none;
+        border-bottom: 1px solid #e0e0e0;
+    }
+    
+    .contacts-detail {
+        height: 400px;
+    }
+} 

@@ -1,0 +1,400 @@
+/* Email Styles */
+/* Email list */
+.email-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+}
+
+.email-item {
+    padding: 20px;
+    border-bottom: 1px solid #e0e0e0;
+    cursor: pointer;
+    transition: background-color 0.3s ease;
+}
+
+.email-item:hover {
+    background-color: #f8f9fa;
+}
+
+.email-item.unread {
+    background-color: #e3f2fd;
+    border-left: 4px solid #2196f3;
+}
+
+.email-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 10px;
+}
+
+.email-sender {
+    font-weight: 600;
+    color: #333;
+}
+
+.email-date {
+    font-size: 0.875rem;
+    color: #6c757d;
+}
+
+.email-subject {
+    font-weight: 500;
+    margin-bottom: 8px;
+    color: #333;
+}
+
+.email-preview {
+    color: #6c757d;
+    font-size: 0.875rem;
+    line-height: 1.4;
+}
+
+/* Email detail modal styles */
+.email-detail {
+    max-width: 100%;
+}
+
+.email-detail-header {
+    background-color: #f8f9fa;
+    padding: 20px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+}
+
+.email-detail-header div {
+    margin-bottom: 8px;
+    font-size: 0.9rem;
+}
+
+.email-detail-header div:last-child {
+    margin-bottom: 0;
+}
+
+.email-detail-header strong {
+    color: #333;
+    min-width: 60px;
+    display: inline-block;
+}
+
+.email-detail-body {
+    padding: 0;
+    border: none;
+    background: none;
+    border-radius: 0;
+    line-height: 1.4;
+    color: inherit;
+    white-space: pre-line;
+    word-wrap: break-word;
+    max-height: none;
+    overflow: visible;
+    font-family: inherit;
+    font-size: 1rem;
+}
+
+body.dark-mode .email-detail-header {
+    background-color: #181a20;
+    color: #e0e0e0;
+}
+
+body.dark-mode .email-detail-header strong {
+    color: #e0e0e0;
+}
+
+body.dark-mode .email-detail-body {
+    background-color: #232946;
+    color: #e0e0e0;
+    border-color: #181a20;
+}
+
+/* Email detail view styles */
+.email-detail-view {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.email-detail-header {
+    padding: 20px 30px;
+    border-bottom: 1px solid #e0e0e0;
+    background-color: #fafafa;
+    display: flex;
+    align-items: center;
+}
+
+.email-detail-content {
+    flex: 1;
+    padding: 30px;
+    overflow-y: auto;
+}
+
+.email-detail-content .email-detail-header {
+    background-color: #f8f9fa;
+    padding: 20px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    border: none;
+}
+
+.email-detail-content .email-detail-body {
+    background-color: white;
+    padding: 20px;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: none;
+    overflow-y: visible;
+}
+
+/* Dark mode support for email detail view */
+body.dark-mode .email-detail-header {
+    background-color: #181a20;
+    border-bottom-color: #232946;
+}
+
+body.dark-mode .email-detail-content {
+    background-color: #232946;
+    color: #e0e0e0;
+}
+
+body.dark-mode .email-detail-content .email-detail-header {
+    background-color: #181a20;
+    color: #e0e0e0;
+}
+
+body.dark-mode .email-detail-content .email-detail-body {
+    background-color: #232946;
+    color: #e0e0e0;
+    border-color: #181a20;
+}
+
+/* Dark mode email styles */
+body.dark-mode .email-item {
+    background-color: #232946;
+    color: #e0e0e0;
+    border-bottom: 1px solid #181a20;
+}
+
+body.dark-mode .email-item.unread {
+    background-color: #181a20;
+    border-left: 4px solid #667eea;
+}
+
+/* Inbox Search Styles */
+.inbox-actions {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+
+.email-search-container {
+    position: relative;
+    min-width: 250px;
+}
+
+.email-search-input {
+    width: 100%;
+    padding: 10px 35px 10px 12px;
+    border: 2px solid #e0e0e0;
+    border-radius: 8px;
+    font-size: 14px;
+    background-color: #fafafa;
+    transition: all 0.3s ease;
+}
+
+.email-search-input:focus {
+    outline: none;
+    border-color: #667eea;
+    background-color: white;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+}
+
+.email-search-icon {
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: #999;
+    font-size: 14px;
+    pointer-events: none;
+}
+
+/* Dark mode support for email search */
+body.dark-mode .email-search-input {
+    background-color: #181a20;
+    border-color: #232946;
+    color: #e0e0e0;
+}
+
+body.dark-mode .email-search-input:focus {
+    border-color: #667eea;
+    background-color: #232946;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+}
+
+body.dark-mode .email-search-icon {
+    color: #666;
+}
+
+/* Email detail header vertical layout */
+.email-detail-header.vertical {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    justify-content: flex-start !important;
+    background: #fff !important;
+    color: #232946 !important;
+}
+
+.email-header-label {
+    color: #232946 !important;
+}
+
+.email-header-value {
+    color: #232946 !important;
+}
+
+body.dark-mode .email-detail-header.vertical {
+    background: #232946 !important;
+    color: #e0e0e0 !important;
+}
+
+body.dark-mode .email-header-label {
+    color: #e0e0e0 !important;
+}
+
+body.dark-mode .email-header-value {
+    color: #e0e0e0 !important;
+}
+
+.hidden-header {
+    display: none !important;
+}
+
+.email-detail-header.vertical.hidden-header {
+    display: none !important;
+}
+
+/* Email list strong styling */
+.email-list-strong {
+    font-weight: 600;
+    color: #fff;
+}
+
+body:not(.dark-mode) .email-list-strong {
+    color: #232946;
+}
+
+/* Email body display styling */
+.email-body-display {
+    padding: 0;
+    margin: 0;
+}
+
+/* Email body expandable styling */
+.email-body-expandable {
+    margin: 0;
+    background: transparent;
+    width: 100%;
+}
+
+.email-body-summary {
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    font-size: 14px;
+    line-height: 1.4;
+    color: inherit;
+    border: none;
+    cursor: pointer;
+    outline: none;
+    word-wrap: break-word;
+    white-space: pre-wrap;
+    display: block;
+    width: 100%;
+}
+
+.email-body-summary::before {
+    content: '▶';
+    font-size: 10px;
+    margin-right: 4px;
+    transition: transform 0.2s ease;
+    color: inherit;
+    display: inline-block;
+}
+
+.email-body-expandable .email-body-summary[data-expanded="true"]::before {
+    transform: rotate(90deg);
+}
+
+.email-body-summary .message-text {
+    margin-bottom: 4px;
+    font-size: 14px;
+    line-height: 1.4;
+    word-wrap: break-word;
+    white-space: pre-wrap;
+}
+
+.email-body-summary .message-meta {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    font-size: 11px;
+    opacity: 0.7;
+}
+
+.email-body-content {
+    margin-top: 6px;
+    padding: 8px;
+    background: rgba(0, 0, 0, 0.03);
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+}
+
+.message-sent .email-body-content {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+.email-body-content-text {
+    font-size: 14px;
+    line-height: 1.4;
+    color: var(--text-color);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 200px;
+    overflow-y: auto;
+    margin: 4px 0 0 0;
+    padding: 6px;
+    background: rgba(0, 0, 0, 0.03);
+    border-radius: 4px;
+    border: 1px solid var(--border-color);
+}
+
+.message-sent .email-body-content-text {
+    color: rgba(255, 255, 255, 0.85);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+/* Dark mode support for email body expandable */
+body.dark-mode .email-body-expandable {
+    background: transparent;
+}
+
+body.dark-mode .email-body-content-text {
+    color: var(--text-color-dark);
+    background: rgba(255, 255, 255, 0.05);
+    border-color: var(--border-color-dark);
+}
+
+/* Hover effect for clickable messages */
+.message-content[style*="cursor: pointer"]:hover {
+    opacity: 0.9;
+    transition: opacity 0.2s ease;
+} 

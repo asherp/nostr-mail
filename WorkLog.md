@@ -1,3 +1,24 @@
+* encrypted attachments, manifest
+* NIP-44 may fail if email body is too long, so witch to mainfest style if/when that happens
+* live updates
+* persistent relay connections
+* email body inline with DM
+* checkbox for dm notification
+* fixed double encryption bug in subject dm
+* fix render dm avatar
+* fix follow contact, jwt image rendering
+* fetch inbox emails for current user
+* switch between profiles
+* fixed profile update button, jump to send dm
+* sqlite db
+* fetch nostr emails only, decrypt content
+* refactor frontend
+* send DM working
+* fetch emails, filtering
+* working email send
+* dm decryption
+* tauri app prototype
+
 # 2023-04-29 01:11:50.217567: clock-out
 
 * documentation, presentation

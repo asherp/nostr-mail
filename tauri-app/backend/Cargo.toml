@@ -45,6 +45,9 @@ urlencoding = "2"
 dirs = "5"
 zip = "2.1"
 tauri-plugin-dialog = "2.0.0-beta"
+axum = { version = "0.7", features = ["json"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem
@@ -55,3 +58,6 @@ custom-protocol = ["tauri/custom-protocol"]
 name = "validate_pubkey"
 path = "src/bin/validate_pubkey.rs"
 
+[[bin]]
+name = "http-server"
+path = "src/bin/http_server.rs"

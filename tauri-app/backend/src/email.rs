@@ -1146,11 +1146,8 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
     Ok(emails)
 }
 
-fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::io::Read + std::io::Write>, config: &EmailConfig, time_window: chrono::Duration) -> Result<Vec<EmailMessage>> {
+fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::io::Read + std::io::Write>, config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>) -> Result<Vec<EmailMessage>> {
     use chrono::Utc;
-    
-    let time_window_str = if time_window == chrono::Duration::hours(24) { "24h" } else { "7 days" };
-    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Using Gmail's X-GM-RAW search for sent emails in last {}", time_window_str);
     
     // Try to select the sent folder
     let sent_folder = "[Gmail]/Sent Mail";
@@ -1158,29 +1155,48 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
     session.select(sent_folder)?;
     
     // Calculate cutoff date for filtering
-    let cutoff = Utc::now() - time_window;
-    let cutoff_date_str = cutoff.format("%Y/%m/%d").to_string();
-    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for emails after: {} ({})", cutoff, cutoff_date_str);
+    // If latest is provided, use it directly; otherwise search all emails
+    let cutoff = latest.unwrap_or_else(|| Utc::now() - chrono::Duration::days(365 * 5));
     
     // Use Gmail's date filtering in X-GM-RAW search to reduce server load
-    // Gmail supports "after:YYYY/MM/DD" syntax in X-GM-RAW searches
-    // Combine with AND to filter by both content and date
-    // Format: X-GM-RAW "content search AND after:YYYY/MM/DD"
-    let date_filter = if time_window < chrono::Duration::days(365 * 5) {
-        // Only add date filter if we're not doing a full sync (5 years)
-        format!(" AND after:{}", cutoff_date_str)
+    // IMPORTANT: Gmail interprets "after:YYYY/MM/DD" as midnight (00:00) Pacific Time, not UTC!
+    // To avoid timezone issues, we use Unix timestamps instead, which are timezone-independent
+    // Format: X-GM-RAW "content search AND after:unix_timestamp"
+    // Unix timestamps are in seconds since epoch (1970-01-01 00:00:00 UTC)
+    let date_filter = if latest.is_some() {
+        // Convert cutoff timestamp to Unix timestamp (seconds)
+        let unix_timestamp = cutoff.timestamp();
+        // Subtract a small buffer (1 hour) to account for any timing edge cases
+        let search_timestamp = unix_timestamp - 3600;
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for emails after: {} (using Unix timestamp: {} to avoid timezone issues)", cutoff, search_timestamp);
+        format!(" AND after:{}", search_timestamp)
     } else {
         String::new()
     };
     
     // Use more specific search terms with date filtering to avoid fetching old emails
-    // Gmail X-GM-RAW syntax: "search term AND after:date"
-    // Note: Gmail searches body content by default, so "BEGIN NOSTR NIP-" should work
-    let search_terms = vec![
+    // Gmail X-GM-RAW syntax supports various search operators
+    // Try multiple search strategies to catch all Nostr emails:
+    // 1. Search body content for encrypted message markers (partial match should work)
+    // 2. Search for header using has: operator (Gmail-specific)
+    // 3. Search for "npub" which appears in X-Nostr-Pubkey header values
+    let mut search_terms = vec![
         format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
-        format!("X-GM-RAW \"X-Nostr-Pubkey:{}\"", date_filter),
         format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
     ];
+    
+    // Add header searches - try multiple approaches
+    if !date_filter.is_empty() {
+        // With date filter, try different header search syntaxes
+        // Note: Gmail's has: operator searches for header existence
+        search_terms.push(format!("X-GM-RAW \"has:X-Nostr-Pubkey{}\"", date_filter));
+        // Also search for "npub" which is in the header value - this might be more reliable
+        search_terms.push(format!("X-GM-RAW \"npub{}\"", date_filter));
+    } else {
+        // Without date filter
+        search_terms.push("X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string());
+        search_terms.push("X-GM-RAW \"npub\"".to_string());
+    }
     
     let mut all_message_numbers: HashSet<u32> = HashSet::new();
     
@@ -1199,8 +1215,39 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
         }
     }
     
-    let message_numbers: Vec<u32> = all_message_numbers.into_iter().collect();
+    let mut message_numbers: Vec<u32> = all_message_numbers.into_iter().collect();
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Total unique sent messages to fetch: {}", message_numbers.len());
+    
+    // If no results and we have a latest date that's recent (within last 7 days), try searching without date filter
+    // This handles cases where Gmail's date filtering might be too strict
+    if message_numbers.is_empty() && latest.is_some() {
+        let days_since_latest = Utc::now().signed_duration_since(cutoff).num_days();
+        if days_since_latest <= 7 {
+            println!("[RUST] fetch_sent_emails_from_gmail_optimized: No results with date filter, trying without date filter (latest was {} days ago)", days_since_latest);
+            let fallback_search_terms = vec![
+                "X-GM-RAW \"BEGIN NOSTR NIP-\"".to_string(),
+                "X-GM-RAW \"END NOSTR NIP-\"".to_string(),
+                "X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string(),
+                "X-GM-RAW \"npub\"".to_string(), // Search for npub in header values
+            ];
+            
+            let mut fallback_message_numbers: HashSet<u32> = HashSet::new();
+            for search_term in fallback_search_terms {
+                match session.search(&search_term) {
+                    Ok(messages) => {
+                        let count = messages.len();
+                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fallback search '{}' found {} messages", search_term, count);
+                        fallback_message_numbers.extend(messages.iter().cloned());
+                    }
+                    Err(e) => {
+                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fallback search '{}' failed: {}", search_term, e);
+                    }
+                }
+            }
+            message_numbers = fallback_message_numbers.into_iter().collect();
+            println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fallback search found {} total messages", message_numbers.len());
+        }
+    }
     
     if message_numbers.is_empty() {
         println!("[RUST] fetch_sent_emails_from_gmail_optimized: No sent messages found, returning empty result");
@@ -1214,8 +1261,7 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
     let mut emails = Vec::new();
     let mut email_id = 0;
     
-    // Filter for emails within the specified time window
-    let cutoff = Utc::now() - time_window;
+    // Filter for emails after the cutoff timestamp (client-side filtering since Gmail only supports dates)
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for sent emails after: {}", cutoff);
     
     for message in messages.iter() {
@@ -1234,9 +1280,9 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                 println!("[RUST] fetch_sent_emails_from_gmail_optimized: Processing sent email {} - From: {}, Subject (raw): {:?}, Subject (decoded): {}, Date: {}", 
                     email_id, from, subject_raw, subject, date);
                 
-                // Only keep emails within the time window
-                if date < cutoff {
-                    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} is too old ({} < {}), skipping", 
+                // Only keep emails after the cutoff timestamp (strict comparison)
+                if date <= cutoff {
+                    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} is not newer than cutoff ({} <= {}), skipping", 
                         email_id, date, cutoff);
                     continue;
                 }
@@ -1895,13 +1941,8 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
         }
         
         let emails_result: anyhow::Result<Vec<RawNostrEmail>> = if is_gmail {
-            let now = Utc::now();
-            let time_window = match latest {
-                Some(dt) => now.signed_duration_since(dt),
-                None => Duration::days(365 * 5),
-            };
-            // Use the same optimized function but for sent emails
-            let email_msgs = fetch_sent_emails_from_gmail_optimized(&mut session, config, time_window)?;
+            // Pass latest directly to the optimized function
+            let email_msgs = fetch_sent_emails_from_gmail_optimized(&mut session, config, latest)?;
             Ok(email_msgs.into_iter().map(|em| RawNostrEmail {
                 message_id: em.message_id.unwrap_or_else(|| em.id.clone()),
                 from: em.from,

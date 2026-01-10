@@ -348,6 +348,11 @@ class ContactsService {
                         console.warn('[JS] Failed to update contact in database:', dbError);
                     }
                     
+                    // Refresh compose dropdown in case email was added/updated
+                    if (window.emailService) {
+                        window.emailService.populateNostrContactDropdown();
+                    }
+                    
                     // Only update UI if this contact is still selected
                     const selectedContact = window.appState.getSelectedContact();
                     if (selectedContact && selectedContact.pubkey === contact.pubkey) {
@@ -945,6 +950,10 @@ class ContactsService {
                     const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
                     await window.DatabaseService.saveContact(dbContact);
                 }
+                // Refresh compose dropdown to include new contacts
+                if (window.emailService) {
+                    window.emailService.populateNostrContactDropdown();
+                }
                 window.notificationService.showSuccess(`Added ${newContacts.length} new contacts`);
             } else {
                 // No new contacts, just re-render
@@ -993,6 +1002,10 @@ class ContactsService {
             // Update app state and UI
             window.appState.addContact(contact);
             this.renderContacts();
+            // Refresh compose dropdown to include new contact
+            if (window.emailService) {
+                window.emailService.populateNostrContactDropdown();
+            }
             window.notificationService.showSuccess(`You are now following ${profileName}!`);
         } catch (error) {
             window.notificationService.showError('Failed to follow and add contact: ' + error);
@@ -1050,6 +1063,10 @@ class ContactsService {
                 this.renderContactDetail(selectedContact);
                 // Also re-render the contacts list to update the contact item
                 this.renderContacts();
+                // Refresh compose dropdown in case email was added/updated
+                if (window.emailService) {
+                    window.emailService.populateNostrContactDropdown();
+                }
             }
         } catch (error) {
             console.error('Failed to refresh selected contact profile:', error);
@@ -1080,6 +1097,11 @@ class ContactsService {
                 const selectedContact = this.getSelectedContact();
                 if (selectedContact && selectedContact.pubkey === pubkey) {
                     this.renderContactDetail(contact);
+                }
+                
+                // Refresh compose dropdown in case email was added/updated
+                if (window.emailService) {
+                    window.emailService.populateNostrContactDropdown();
                 }
             }
         } catch (error) {

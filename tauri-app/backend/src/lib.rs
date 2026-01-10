@@ -1141,19 +1141,9 @@ fn db_find_emails_by_message_id(message_id: String, state: tauri::State<AppState
 
 #[tauri::command]
 fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
-    println!("[RUST] db_get_sent_emails called");
-    if let Some(ref email) = user_email {
-        println!("[RUST] db_get_sent_emails: Filtering for user_email: {}", email);
-    } else {
-        println!("[RUST] db_get_sent_emails: No user_email filter provided");
-    }
     let db = state.get_database()?;
     let emails = db.get_sent_emails(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
     let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
-    println!("[RUST] Sending {} sent emails to frontend:", mapped.len());
-    for (i, email) in mapped.iter().enumerate() {
-        println!("[RUST] Sent Email {}: {:#?}", i + 1, email);
-    }
     Ok(mapped)
 }
 

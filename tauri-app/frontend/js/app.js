@@ -740,13 +740,24 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const refreshSent = domManager.get('refreshSent');
         if (refreshSent) {
             refreshSent.addEventListener('click', async () => {
+                // Save original button state
+                const originalRefreshBtnHTML = refreshSent.innerHTML;
+                
+                // Show loading state
+                refreshSent.disabled = true;
+                refreshSent.innerHTML = '<span class="loading"></span> Syncing...';
+                
                 try {
                     await window.emailService.syncSentEmails();
+                    // loadSentEmails() will manage the button state from here
                     await window.emailService.loadSentEmails();
                     notificationService.showSuccess('Sent emails synced successfully');
                 } catch (error) {
                     console.error('[JS] Error syncing sent emails:', error);
                     notificationService.showError('Failed to sync sent emails: ' + error.message);
+                    // Restore button state on error (loadSentEmails won't run if sync fails)
+                    refreshSent.disabled = false;
+                    refreshSent.innerHTML = originalRefreshBtnHTML;
                 }
             });
         }

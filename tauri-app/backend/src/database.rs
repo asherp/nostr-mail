@@ -690,7 +690,6 @@ impl Database {
             // Normalize the user email for Gmail addresses
             let normalized_user_email = Self::normalize_gmail_address(email);
             let user_email_lower = email.trim().to_lowercase();
-            println!("[DB] get_sent_emails: user_email={}, normalized={}", email, normalized_user_email);
             
             // For Gmail addresses, always match both the original and normalized versions
             // This handles cases where:
@@ -699,13 +698,11 @@ impl Database {
             if email.contains("@gmail.com") {
                 if normalized_user_email != user_email_lower {
                     // User email has a + alias, match both versions
-                    println!("[DB] get_sent_emails: Matching both original ({}) and normalized ({}) Gmail addresses", user_email_lower, normalized_user_email);
                     where_clauses.push("(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?)))");
                     params.push(Box::new(user_email_lower.clone()));
                     params.push(Box::new(normalized_user_email.clone()));
                 } else {
                     // User email is already normalized (no + alias), but still match both to handle from_address with + aliases
-                    println!("[DB] get_sent_emails: Matching Gmail address {} and normalized version", user_email_lower);
                     where_clauses.push("(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?)))");
                     params.push(Box::new(user_email_lower.clone()));
                     params.push(Box::new(normalized_user_email.clone()));
@@ -714,10 +711,7 @@ impl Database {
                 // Non-Gmail, just match exactly
                 where_clauses.push("LOWER(TRIM(from_address)) = LOWER(TRIM(?))");
                 params.push(Box::new(user_email_lower));
-                println!("[DB] get_sent_emails: Matching non-Gmail email address");
             }
-        } else {
-            println!("[DB] get_sent_emails: No user_email filter provided, returning all non-draft emails");
         }
         if !where_clauses.is_empty() {
             query.push_str(" WHERE ");
@@ -726,8 +720,6 @@ impl Database {
         query.push_str(" ORDER BY received_at DESC LIMIT ? OFFSET ?");
         params.push(Box::new(limit));
         params.push(Box::new(offset));
-        
-        println!("[DB] get_sent_emails: Executing query: {}", query);
 
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
@@ -751,11 +743,6 @@ impl Database {
             })
         })?;
         let emails: Vec<Email> = rows.collect::<Result<Vec<_>, _>>()?;
-        println!("[DB] get_sent_emails: Found {} emails matching query", emails.len());
-        for (i, email) in emails.iter().enumerate() {
-            println!("[DB] get_sent_emails: Email {}: id={:?}, from={}, subject={}", 
-                i + 1, email.id, email.from_address, email.subject);
-        }
         Ok(emails)
     }
 

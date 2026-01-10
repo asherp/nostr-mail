@@ -1242,8 +1242,8 @@ class DMService {
                                         ${attachmentDisplayData.map(attachment => {
                                             const sizeFormatted = (attachment.displaySize / 1024).toFixed(2) + ' KB';
                                             const isEncrypted = attachment.encryption_method === 'manifest_aes';
-                                            const statusIcon = isEncrypted ? '🔓' : '📄';
-                                            const statusText = isEncrypted ? 'Decrypted' : 'Plain';
+                                            const statusIcon = isEncrypted ? '🔒' : '📄';
+                                            const statusText = isEncrypted ? 'Encrypted' : 'Plain';
                                             
                                             return `
                                             <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;">

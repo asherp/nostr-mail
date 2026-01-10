@@ -113,7 +113,8 @@ NostrMailApp.prototype.loadSettings = async function() {
                         imap_port: parseInt(dbSettings.imap_port) || 993,
                         use_tls: dbSettings.use_tls === 'true',
                         email_filter: dbSettings.email_filter || 'nostr',
-                        send_matching_dm: dbSettings.send_matching_dm !== 'false' // Default to true if not set
+                        send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
+                        sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 365 // Default to 1 year
                     };
                     appState.setSettings(settings);
                     this.populateSettingsForm();
@@ -163,7 +164,8 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 imap_port: parseInt(dbSettings.imap_port) || 993,
                 use_tls: dbSettings.use_tls === 'true',
                 email_filter: dbSettings.email_filter || 'nostr',
-                send_matching_dm: dbSettings.send_matching_dm !== 'false' // Default to true if not set
+                send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
+                sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 1825 // Default to 5 years
             };
             
             appState.setSettings(settings);
@@ -432,6 +434,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
             refreshInbox.addEventListener('click', async () => {
                 // Clear search input
                 domManager.clear('emailSearch');
+                // Show loading state immediately
+                domManager.disable('refreshInbox');
+                domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
                 // Sync and load all emails (no search filter)
                 try {
                     await window.emailService.syncInboxEmails();
@@ -440,6 +445,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 } catch (error) {
                     console.error('[JS] Error syncing inbox:', error);
                     notificationService.showError('Failed to sync inbox: ' + error.message);
+                    // Restore button state on error
+                    domManager.enable('refreshInbox');
+                    domManager.setHTML('refreshInbox', '<i class="fas fa-sync"></i> Refresh');
                 }
             });
         }
@@ -454,6 +462,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const emailSearch = domManager.get('emailSearch');
         if (emailSearch) {
             emailSearch.addEventListener('input', () => window.emailService?.filterEmails());
+        }
+        
+        // Sent Email Search
+        const sentSearch = domManager.get('sentSearch');
+        if (sentSearch) {
+            sentSearch.addEventListener('input', () => window.emailService?.filterSentEmails());
         }
         
         // DM elements
@@ -740,6 +754,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const refreshSent = domManager.get('refreshSent');
         if (refreshSent) {
             refreshSent.addEventListener('click', async () => {
+                // Clear search input
+                domManager.clear('sentSearch');
                 // Save original button state
                 const originalRefreshBtnHTML = refreshSent.innerHTML;
                 
@@ -1289,7 +1305,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             imap_port: parseInt(domManager.getValue('imapPort')) || 993,
             use_tls: domManager.get('use-tls')?.checked || false,
             email_filter: domManager.getValue('emailFilterPreference') || 'nostr',
-            send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false // Default to true
+            send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false, // Default to true
+            sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 365 // Default to 1 year
         };
         
         // Keep localStorage as backup
@@ -1349,6 +1366,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('imap_port', settings.imap_port.toString());
             settingsMap.set('use_tls', settings.use_tls.toString());
             settingsMap.set('email_filter', settings.email_filter);
+            settingsMap.set('sync_cutoff_days', settings.sync_cutoff_days.toString());
             
             const settingsObj = Object.fromEntries(settingsMap);
             await TauriService.dbSaveSettingsBatch(publicKey, settingsObj);
@@ -1472,6 +1490,7 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.setValue('imapPort', settings.imap_port || '');
         domManager.get('use-tls').checked = settings.use_tls || false;
         domManager.setValue('emailFilterPreference', settings.email_filter || 'nostr');
+        domManager.setValue('syncCutoffDays', settings.sync_cutoff_days || 365);
         
         // Set send matching DM preference (default to true if not set)
         const sendMatchingDmPref = domManager.get('send-matching-dm-preference');

@@ -37,6 +37,7 @@ class DOMManager {
             // Sent
             refreshSent: this.getElement('refresh-sent'),
             sentList: this.getElement('sent-list'),
+            sentSearch: this.getElement('sent-search'),
             backToSent: this.getElement('back-to-sent'),
             sentDetailView: this.getElement('sent-detail-view'),
             sentDetailContent: this.getElement('sent-detail-content'),

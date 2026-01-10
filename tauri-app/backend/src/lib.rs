@@ -39,7 +39,7 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         body: email.body.clone(),
         raw_body: email.body.clone(),
         date: email.received_at,
-        is_read: true, // or use a real field if available
+        is_read: email.is_read,
         raw_headers: raw_headers.clone(),
         nostr_pubkey: email.nostr_pubkey.clone(),
         message_id: Some(email.message_id.clone()),
@@ -1118,6 +1118,161 @@ fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<boo
 }
 
 #[tauri::command]
+async fn db_search_emails(
+    search_query: String, 
+    user_email: Option<String>, 
+    private_key: Option<String>, 
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>
+) -> Result<usize, String> {
+    println!("[RUST] db_search_emails called with query: '{}'", search_query);
+    let db = state.get_database()?;
+    
+    // Emit search started event
+    if let Err(e) = app_handle.emit("email-search-started", &serde_json::json!({})) {
+        println!("[RUST] Failed to emit search-started event: {}", e);
+    }
+    
+    // Get all emails (or a large limit) - we'll filter after decryption
+    let all_emails = db.get_emails(Some(10000), Some(0), Some(true), user_email.as_deref())
+        .map_err(|e| e.to_string())?;
+    
+    let search_query_lower = search_query.to_lowercase();
+    let mut match_count = 0;
+    
+    // Create email config for decryption
+    let email_config = crate::types::EmailConfig {
+        email_address: "".to_string(),
+        password: "".to_string(),
+        smtp_host: "".to_string(),
+        smtp_port: 0,
+        imap_host: "".to_string(),
+        imap_port: 0,
+        use_tls: false,
+        private_key,
+    };
+    
+    for (index, email) in all_emails.iter().enumerate() {
+        // Emit progress update every 10 emails
+        if index % 10 == 0 {
+            let progress = serde_json::json!({
+                "processed": index,
+                "total": all_emails.len()
+            });
+            if let Err(e) = app_handle.emit("email-search-progress", &progress) {
+                println!("[RUST] Failed to emit search-progress event: {}", e);
+            }
+            // Yield to allow UI updates
+            tokio::task::yield_now().await;
+        }
+        
+        // Decrypt subject and body
+        let raw_headers = email.raw_headers.as_deref().unwrap_or("");
+        let (decrypted_subject, decrypted_body) = if email.is_nostr_encrypted && email_config.private_key.is_some() {
+            match email::decrypt_nostr_email_content(&email_config, raw_headers, &email.subject, &email.body) {
+                Ok((subj, body)) => (subj, body),
+                Err(e) => {
+                    println!("[RUST] Failed to decrypt email {}: {}", email.id.unwrap_or(0), e);
+                    (email.subject.clone(), email.body.clone())
+                }
+            }
+        } else {
+            (email.subject.clone(), email.body.clone())
+        };
+        
+        // Get attachments for this email and extract original filenames from manifest if available
+        let mut attachment_filenames = Vec::new();
+        if let Some(email_id) = email.id {
+            match db.get_attachments_for_email(email_id) {
+                Ok(attachments) => {
+                    // Add encrypted filenames
+                    attachment_filenames.extend(attachments.iter().map(|att| att.filename.to_lowercase()));
+                    
+                    // Try to extract original filenames from manifest if email has manifest-encrypted attachments
+                    let has_manifest_attachments = attachments.iter().any(|att| att.encryption_method.as_deref() == Some("manifest_aes"));
+                    if has_manifest_attachments && email_config.private_key.is_some() {
+                        println!("[RUST] Inbox email {} has manifest-encrypted attachments, attempting to extract original filenames", email.id.unwrap_or(0));
+                        println!("[RUST] Decrypted body length: {}, preview: {}", decrypted_body.len(), &decrypted_body.chars().take(200).collect::<String>());
+                        
+                        // Try to parse decrypted body as manifest JSON
+                        match serde_json::from_str::<serde_json::Value>(&decrypted_body) {
+                            Ok(manifest_json) => {
+                                println!("[RUST] Successfully parsed decrypted body as JSON");
+                                if let Some(manifest_obj) = manifest_json.as_object() {
+                                    if let Some(attachments_array) = manifest_obj.get("attachments").and_then(|v| v.as_array()) {
+                                        println!("[RUST] Found {} attachments in manifest", attachments_array.len());
+                                        for attachment_obj in attachments_array {
+                                            if let Some(orig_filename) = attachment_obj.get("orig_filename")
+                                                .and_then(|v| v.as_str()) {
+                                                println!("[RUST] Found original filename in manifest: {}", orig_filename);
+                                                attachment_filenames.push(orig_filename.to_lowercase());
+                                            } else {
+                                                println!("[RUST] Attachment object missing orig_filename: {:?}", attachment_obj);
+                                            }
+                                        }
+                                    } else {
+                                        println!("[RUST] Manifest JSON does not have attachments array");
+                                    }
+                                } else {
+                                    println!("[RUST] Manifest JSON is not an object");
+                                }
+                            }
+                            Err(e) => {
+                                println!("[RUST] Failed to parse decrypted body as JSON: {}", e);
+                                println!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        
+        // Search in: from, to, subject, body, attachment filenames (both encrypted and decrypted)
+        let from_matches = email.from_address.to_lowercase().contains(&search_query_lower);
+        let to_matches = email.to_address.to_lowercase().contains(&search_query_lower);
+        let subject_matches = decrypted_subject.to_lowercase().contains(&search_query_lower);
+        let body_matches = decrypted_body.to_lowercase().contains(&search_query_lower);
+        let attachment_matches = attachment_filenames.iter().any(|f| f.contains(&search_query_lower));
+        
+        if attachment_filenames.len() > 0 {
+            println!("[RUST] Inbox email {} attachment filenames to search: {:?}", email.id.unwrap_or(0), attachment_filenames);
+        }
+        
+        let matches = from_matches || to_matches || subject_matches || body_matches || attachment_matches;
+        
+        if matches {
+            println!("[RUST] Inbox email {} matches search query '{}' (from: {}, to: {}, subject: {}, body: {}, attachments: {})", 
+                email.id.unwrap_or(0), search_query, from_matches, to_matches, subject_matches, body_matches, attachment_matches);
+        }
+        
+        if matches {
+            // Create EmailMessage with same format as normal emails (encrypted content, frontend will decrypt)
+            // Use map_db_email_to_email_message to ensure consistent format
+            let email_message = map_db_email_to_email_message(&email);
+            
+            // Emit this matching email immediately
+            if let Err(e) = app_handle.emit("email-search-result", &email_message) {
+                println!("[RUST] Failed to emit search-result event: {}", e);
+            }
+            
+            match_count += 1;
+        }
+    }
+    
+    // Emit search completed event
+    let completion = serde_json::json!({
+        "total_found": match_count
+    });
+    if let Err(e) = app_handle.emit("email-search-completed", &completion) {
+        println!("[RUST] Failed to emit search-completed event: {}", e);
+    }
+    
+    println!("[RUST] Search found {} matching emails", match_count);
+    Ok(match_count)
+}
+
+#[tauri::command]
 fn db_update_email_nostr_pubkey(message_id: String, nostr_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
     let db = state.get_database()?;
     db.update_email_nostr_pubkey(&message_id, &nostr_pubkey).map_err(|e| e.to_string())
@@ -1145,6 +1300,239 @@ fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Optio
     let emails = db.get_sent_emails(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
     let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
     Ok(mapped)
+}
+
+#[tauri::command]
+async fn db_search_sent_emails(
+    search_query: String, 
+    user_email: Option<String>, 
+    private_key: Option<String>, 
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>
+) -> Result<usize, String> {
+    println!("[RUST] db_search_sent_emails called with query: '{}'", search_query);
+    let db = state.get_database()?;
+    
+    // Emit search started event
+    if let Err(e) = app_handle.emit("sent-search-started", &serde_json::json!({})) {
+        println!("[RUST] Failed to emit sent-search-started event: {}", e);
+    }
+    
+    // Get all sent emails (or a large limit) - we'll filter after decryption
+    let all_emails = db.get_sent_emails(Some(10000), Some(0), user_email.as_deref())
+        .map_err(|e| e.to_string())?;
+    
+    let search_query_lower = search_query.to_lowercase();
+    let mut match_count = 0;
+    
+    // Create email config for decryption
+    let email_config = crate::types::EmailConfig {
+        email_address: "".to_string(),
+        password: "".to_string(),
+        smtp_host: "".to_string(),
+        smtp_port: 0,
+        imap_host: "".to_string(),
+        imap_port: 0,
+        use_tls: false,
+        private_key,
+    };
+    
+    for (index, email) in all_emails.iter().enumerate() {
+        // Emit progress update every 10 emails
+        if index % 10 == 0 {
+            let progress = serde_json::json!({
+                "processed": index,
+                "total": all_emails.len()
+            });
+            if let Err(e) = app_handle.emit("sent-search-progress", &progress) {
+                println!("[RUST] Failed to emit sent-search-progress event: {}", e);
+            }
+            // Yield to allow UI updates
+            tokio::task::yield_now().await;
+        }
+        
+        // For sent emails, decrypt using recipient's pubkey
+        let raw_headers = email.raw_headers.as_deref().unwrap_or("");
+        let (decrypted_subject, decrypted_body) = if email.is_nostr_encrypted && email_config.private_key.is_some() {
+            // For sent emails, we need the recipient's pubkey to decrypt
+            // Try to find recipient pubkey from contacts
+            let recipient_email = &email.to_address;
+            let mut decrypted_body_result = None;
+            let mut decrypted_subject_result = email.subject.clone();
+            
+            // Try to find recipient pubkeys
+            println!("[RUST] Searching for recipient pubkeys for email: {}", recipient_email);
+            if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email(recipient_email) {
+                println!("[RUST] Found {} recipient pubkey(s) for {}", recipient_pubkeys.len(), recipient_email);
+                // Also try normalized Gmail address
+                let normalized_email = if recipient_email.contains("@gmail.com") {
+                    let parts: Vec<&str> = recipient_email.split('@').collect();
+                    if parts.len() == 2 {
+                        let local = parts[0].split('+').next().unwrap_or(parts[0]);
+                        format!("{}@{}", local, parts[1]).to_lowercase()
+                    } else {
+                        recipient_email.to_lowercase()
+                    }
+                } else {
+                    recipient_email.to_lowercase()
+                };
+                
+                let mut all_pubkeys = recipient_pubkeys;
+                if normalized_email != recipient_email.to_lowercase() {
+                    println!("[RUST] Also searching for normalized email: {}", normalized_email);
+                    if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email(&normalized_email) {
+                        println!("[RUST] Found {} pubkey(s) for normalized email", normalized_pubkeys.len());
+                        all_pubkeys.extend(normalized_pubkeys);
+                    }
+                }
+                all_pubkeys.dedup();
+                println!("[RUST] Total unique recipient pubkeys to try: {}", all_pubkeys.len());
+                
+                // Extract encrypted content from body (remove ASCII armor if present)
+                let encrypted_content = match extract_encrypted_content_from_armor(&email.body) {
+                    Some(content) => {
+                        println!("[RUST] Extracted encrypted content from ASCII armor, length: {}", content.len());
+                        content
+                    },
+                    None => {
+                        println!("[RUST] No ASCII armor found, using raw body");
+                        email.body.clone()
+                    }
+                };
+                
+                // Try decrypting with each recipient pubkey
+                for recipient_pubkey in &all_pubkeys {
+                    println!("[RUST] Trying to decrypt sent email body with recipient pubkey: {}", recipient_pubkey);
+                    match nostr::decrypt_dm_content(
+                        email_config.private_key.as_ref().unwrap(),
+                        recipient_pubkey,
+                        &encrypted_content
+                    ) {
+                        Ok(decrypted) => {
+                            println!("[RUST] Successfully decrypted sent email body with recipient pubkey, length: {}", decrypted.len());
+                            decrypted_body_result = Some(decrypted);
+                            break;
+                        }
+                        Err(e) => {
+                            println!("[RUST] Failed to decrypt with recipient pubkey {}: {}", recipient_pubkey, e);
+                        }
+                    }
+                }
+            } else {
+                println!("[RUST] No recipient pubkeys found for email: {}", recipient_email);
+            }
+            
+            // Fallback to sender pubkey decryption (for inbox emails or if recipient pubkey not found)
+            if decrypted_body_result.is_none() {
+                match email::decrypt_nostr_email_content(&email_config, raw_headers, &email.subject, &email.body) {
+                    Ok((subj, body)) => {
+                        decrypted_subject_result = subj;
+                        decrypted_body_result = Some(body);
+                    }
+                    Err(e) => {
+                        println!("[RUST] Failed to decrypt sent email {}: {}", email.id.unwrap_or(0), e);
+                        decrypted_body_result = Some(email.body.clone());
+                    }
+                }
+            } else {
+                // Subject decryption (try with sender pubkey from header)
+                if email::is_likely_encrypted_content(&email.subject) {
+                    if let Some(sender_pubkey) = email.nostr_pubkey.as_ref() {
+                        if let Ok(decrypted) = crypto::decrypt_message(
+                            email_config.private_key.as_ref().unwrap(),
+                            sender_pubkey,
+                            &email.subject
+                        ) {
+                            decrypted_subject_result = decrypted;
+                        }
+                    }
+                }
+            }
+            
+            (decrypted_subject_result, decrypted_body_result.unwrap_or_else(|| email.body.clone()))
+        } else {
+            (email.subject.clone(), email.body.clone())
+        };
+        
+        // Get attachments for this email and extract original filenames from manifest if available
+        let mut attachment_filenames = Vec::new();
+        if let Some(email_id) = email.id {
+            match db.get_attachments_for_email(email_id) {
+                Ok(attachments) => {
+                    // Add encrypted filenames
+                    attachment_filenames.extend(attachments.iter().map(|att| att.filename.to_lowercase()));
+                    
+                    // Try to extract original filenames from manifest if email has manifest-encrypted attachments
+                    let has_manifest_attachments = attachments.iter().any(|att| att.encryption_method.as_deref() == Some("manifest_aes"));
+                    if has_manifest_attachments && email_config.private_key.is_some() {
+                        println!("[RUST] Sent email {} has manifest-encrypted attachments, attempting to extract original filenames", email.id.unwrap_or(0));
+                        println!("[RUST] Decrypted body length: {}, preview: {}", decrypted_body.len(), &decrypted_body.chars().take(200).collect::<String>());
+                        
+                        // Try to parse decrypted body as manifest JSON
+                        match serde_json::from_str::<serde_json::Value>(&decrypted_body) {
+                            Ok(manifest_json) => {
+                                println!("[RUST] Successfully parsed decrypted body as JSON");
+                                if let Some(manifest_obj) = manifest_json.as_object() {
+                                    if let Some(attachments_array) = manifest_obj.get("attachments").and_then(|v| v.as_array()) {
+                                        println!("[RUST] Found {} attachments in manifest", attachments_array.len());
+                                        for attachment_obj in attachments_array {
+                                            if let Some(orig_filename) = attachment_obj.get("orig_filename")
+                                                .and_then(|v| v.as_str()) {
+                                                println!("[RUST] Found original filename in manifest: {}", orig_filename);
+                                                attachment_filenames.push(orig_filename.to_lowercase());
+                                            } else {
+                                                println!("[RUST] Attachment object missing orig_filename: {:?}", attachment_obj);
+                                            }
+                                        }
+                                    } else {
+                                        println!("[RUST] Manifest JSON does not have attachments array");
+                                    }
+                                } else {
+                                    println!("[RUST] Manifest JSON is not an object");
+                                }
+                            }
+                            Err(e) => {
+                                println!("[RUST] Failed to parse decrypted body as JSON: {}", e);
+                                println!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        
+        // Search in: from, to, subject, body, attachment filenames (both encrypted and decrypted)
+        let matches = email.from_address.to_lowercase().contains(&search_query_lower) ||
+                     email.to_address.to_lowercase().contains(&search_query_lower) ||
+                     decrypted_subject.to_lowercase().contains(&search_query_lower) ||
+                     decrypted_body.to_lowercase().contains(&search_query_lower) ||
+                     attachment_filenames.iter().any(|f| f.contains(&search_query_lower));
+        
+        if matches {
+            // Create EmailMessage with same format as normal emails (encrypted content, frontend will decrypt)
+            // Use map_db_email_to_email_message to ensure consistent format
+            let email_message = map_db_email_to_email_message(&email);
+            
+            // Emit this matching email immediately
+            if let Err(e) = app_handle.emit("sent-search-result", &email_message) {
+                println!("[RUST] Failed to emit sent-search-result event: {}", e);
+            }
+            
+            match_count += 1;
+        }
+    }
+    
+    // Emit search completed event
+    let completion = serde_json::json!({
+        "total_found": match_count
+    });
+    if let Err(e) = app_handle.emit("sent-search-completed", &completion) {
+        println!("[RUST] Failed to emit sent-search-completed event: {}", e);
+    }
+    
+    println!("[RUST] Sent search found {} matching emails", match_count);
+    Ok(match_count)
 }
 
 // Database commands for direct messages
@@ -2418,10 +2806,12 @@ pub fn run() {
         db_save_email,
         db_get_email,
         db_get_emails,
+        db_search_emails,
         db_update_email_nostr_pubkey,
         db_update_email_nostr_pubkey_by_id,
         db_find_emails_by_message_id,
         db_get_sent_emails,
+        db_search_sent_emails,
         db_save_dm,
         db_get_dms_for_conversation,
         db_get_decrypted_dms_for_conversation,

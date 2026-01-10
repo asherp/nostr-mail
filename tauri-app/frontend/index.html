@@ -175,6 +175,10 @@
                 <div class="tab-header">
                     <h2 id="sent-title">Sent</h2>
                     <div class="inbox-actions" id="sent-actions">
+                        <div class="email-search-container">
+                            <input type="text" id="sent-search" placeholder="Search sent emails..." class="email-search-input">
+                            <i class="fas fa-search email-search-icon"></i>
+                        </div>
                         <button id="refresh-sent" class="btn btn-secondary">
                             <i class="fas fa-sync"></i> Refresh
                         </button>
@@ -463,6 +467,12 @@
                                 Send Matching DM
                             </label>
                             <small class="form-text text-muted">Automatically send a direct message with the same subject line when sending encrypted emails to Nostr contacts</small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="sync-cutoff-days">Sync Cutoff (Days):</label>
+                            <input type="number" id="sync-cutoff-days" placeholder="365" min="1" max="36500" value="365">
+                            <small class="form-text text-muted">How far back in time to sync emails when setting up on a new device. Default: 365 days (1 year). Set to 0 to sync all emails.</small>
                         </div>
                         
                         <div class="form-actions">

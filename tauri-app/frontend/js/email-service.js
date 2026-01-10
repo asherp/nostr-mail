@@ -9,6 +9,13 @@
 class EmailService {
     constructor() {
         this.searchTimeout = null;
+        this.searchUnlisten = null;
+        this.searchResults = [];
+        this.searchInProgress = false;
+        this.sentSearchTimeout = null;
+        this.sentSearchUnlisten = null;
+        this.sentSearchResults = [];
+        this.sentSearchInProgress = false;
         this.selectedNostrContact = null;
         this.plaintextSubject = ''; // Store plaintext subject
         this.plaintextBody = ''; // Store plaintext body
@@ -1165,6 +1172,52 @@ class EmailService {
             } else {
                 emails = await TauriService.getDbEmails(50, 0, false, userEmail);
             }
+            
+            // Load attachments for each email in parallel with timeout
+            console.log(`[JS] Loading attachments for ${emails.length} inbox emails`);
+            const attachmentPromises = emails.map(async (email) => {
+                try {
+                    // Convert email.id to integer - it might be a string
+                    const emailIdInt = parseInt(email.id);
+                    if (isNaN(emailIdInt)) {
+                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
+                        // Try to get email by message_id to get the real database ID
+                        if (email.message_id) {
+                            try {
+                                const emailData = await TauriService.getDbEmail(email.message_id);
+                                if (emailData && emailData.id) {
+                                    const realId = parseInt(emailData.id);
+                                    if (!isNaN(realId)) {
+                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
+                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
+                                        return;
+                                    }
+                                }
+                            } catch (e) {
+                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
+                            }
+                        }
+                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
+                        email.attachments = [];
+                        return;
+                    }
+                    
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
+                    );
+                    email.attachments = await Promise.race([
+                        TauriService.getAttachmentsForEmail(emailIdInt),
+                        timeoutPromise
+                    ]);
+                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
+                } catch (error) {
+                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
+                    email.attachments = [];
+                }
+            });
+            
+            await Promise.all(attachmentPromises);
+            
             appState.setEmails(emails);
             this.renderEmails();
         } catch (error) {
@@ -1177,7 +1230,7 @@ class EmailService {
     }
 
     // Load sent emails
-    async loadSentEmails() {
+    async loadSentEmails(searchQuery = '') {
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
@@ -1195,16 +1248,41 @@ class EmailService {
             console.log(`[JS] Loading attachments for ${emails.length} sent emails`);
             const attachmentPromises = emails.map(async (email) => {
                 try {
+                    // Convert email.id to integer - it might be a string
+                    const emailIdInt = parseInt(email.id);
+                    if (isNaN(emailIdInt)) {
+                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
+                        // Try to get email by message_id to get the real database ID
+                        if (email.message_id) {
+                            try {
+                                const emailData = await TauriService.getDbEmail(email.message_id);
+                                if (emailData && emailData.id) {
+                                    const realId = parseInt(emailData.id);
+                                    if (!isNaN(realId)) {
+                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
+                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
+                                        return;
+                                    }
+                                }
+                            } catch (e) {
+                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
+                            }
+                        }
+                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
+                        email.attachments = [];
+                        return;
+                    }
+                    
                     const timeoutPromise = new Promise((_, reject) => 
                         setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
                     );
                     email.attachments = await Promise.race([
-                        TauriService.getAttachmentsForEmail(email.id),
+                        TauriService.getAttachmentsForEmail(emailIdInt),
                         timeoutPromise
                     ]);
-                    console.log(`[JS] Email ${email.id} has ${email.attachments.length} attachments:`, email.attachments);
+                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
                 } catch (error) {
-                    console.error(`Failed to load attachments for email ${email.id}:`, error);
+                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
                     email.attachments = [];
                 }
             });
@@ -1255,6 +1333,166 @@ class EmailService {
         } catch (error) {
             console.error('[JS] Error in syncSentEmails:', error);
             throw error;
+        }
+    }
+
+    async filterSentEmails() {
+        const searchQuery = domManager.getValue('sentSearch')?.trim() || '';
+        
+        // If search query is empty, load all sent emails normally
+        if (!searchQuery) {
+            // Clean up any existing search listeners
+            if (this.sentSearchUnlisten) {
+                this.sentSearchUnlisten();
+                this.sentSearchUnlisten = null;
+            }
+            await this.loadSentEmails('');
+            return;
+        }
+        
+        // Clear existing timeout
+        if (this.sentSearchTimeout) {
+            clearTimeout(this.sentSearchTimeout);
+        }
+        
+        // Clean up any existing search listeners
+        if (this.sentSearchUnlisten) {
+            this.sentSearchUnlisten();
+            this.sentSearchUnlisten = null;
+        }
+        
+        // Set a new timeout to debounce the search
+        this.sentSearchTimeout = setTimeout(async () => {
+            try {
+                const settings = appState.getSettings();
+                const keypair = appState.getKeypair();
+                const userEmail = settings.email_address ? settings.email_address : null;
+                const privateKey = keypair ? keypair.private_key : null;
+                
+                // Initialize search results accumulator
+                this.sentSearchResults = [];
+                this.sentSearchInProgress = true;
+                
+                // Show searching state
+                const sentList = domManager.get('sentList');
+                if (sentList) {
+                    sentList.innerHTML = '<div class="text-center text-muted" style="padding: 20px;"><i class="fas fa-spinner fa-spin"></i> Searching...</div>';
+                }
+                
+                // Set up event listeners for incremental search results
+                this.sentSearchUnlisten = await window.__TAURI__.event.listen('sent-search-result', (event) => {
+                    const email = event.payload;
+                    this.sentSearchResults.push(email);
+                    console.log(`[JS] Sent search result received: ${this.sentSearchResults.length} emails found so far`);
+                    
+                    // Update UI incrementally
+                    this.updateSentSearchResults();
+                });
+                
+                // Listen for progress updates
+                const progressUnlisten = await window.__TAURI__.event.listen('sent-search-progress', (event) => {
+                    const progress = event.payload;
+                    const sentList = domManager.get('sentList');
+                    if (sentList && this.sentSearchInProgress) {
+                        const percent = Math.round((progress.processed / progress.total) * 100);
+                        sentList.innerHTML = `<div class="text-center text-muted" style="padding: 20px;">
+                            <i class="fas fa-spinner fa-spin"></i> Searching... ${percent}% (${progress.processed}/${progress.total} emails processed)
+                            ${this.sentSearchResults.length > 0 ? `<br><small>Found ${this.sentSearchResults.length} match${this.sentSearchResults.length !== 1 ? 'es' : ''} so far</small>` : ''}
+                        </div>`;
+                    }
+                });
+                
+                // Listen for search completion
+                const completedUnlisten = await window.__TAURI__.event.listen('sent-search-completed', async (event) => {
+                    const completion = event.payload;
+                    console.log(`[JS] Sent search completed: ${completion.total_found} total matches`);
+                    
+                    this.sentSearchInProgress = false;
+                    
+                    // Clean up listeners
+                    if (this.sentSearchUnlisten) {
+                        this.sentSearchUnlisten();
+                        this.sentSearchUnlisten = null;
+                    }
+                    progressUnlisten();
+                    completedUnlisten();
+                    
+                    // Load attachments for all search results (same logic as normal sent email loading)
+                    console.log(`[JS] Loading attachments for ${this.sentSearchResults.length} sent search result emails`);
+                    const attachmentPromises = this.sentSearchResults.map(async (email) => {
+                        try {
+                            // Convert email.id to integer - it might be a string
+                            const emailIdInt = parseInt(email.id);
+                            if (isNaN(emailIdInt)) {
+                                console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
+                                // Try to get email by message_id to get the real database ID
+                                if (email.message_id) {
+                                    try {
+                                        const emailData = await TauriService.getDbEmail(email.message_id);
+                                        if (emailData && emailData.id) {
+                                            const realId = parseInt(emailData.id);
+                                            if (!isNaN(realId)) {
+                                                email.attachments = await TauriService.getAttachmentsForEmail(realId);
+                                                console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
+                                                return;
+                                            }
+                                        }
+                                    } catch (e) {
+                                        console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
+                                    }
+                                }
+                                console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
+                                email.attachments = [];
+                                return;
+                            }
+                            
+                            const timeoutPromise = new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
+                            );
+                            email.attachments = await Promise.race([
+                                TauriService.getAttachmentsForEmail(emailIdInt),
+                                timeoutPromise
+                            ]);
+                            console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
+                        } catch (error) {
+                            console.error(`[JS] Failed to load attachments for sent email ${email.id}:`, error);
+                            email.attachments = [];
+                        }
+                    });
+                    
+                    await Promise.all(attachmentPromises);
+                    
+                    appState.setSentEmails(this.sentSearchResults);
+                    await this.renderSentEmails();
+                });
+                
+                console.log('[JS] Starting sent search with query:', searchQuery);
+                // Start the search (this will emit events as results are found)
+                await TauriService.searchSentEmails(searchQuery, userEmail, privateKey);
+                
+            } catch (error) {
+                console.error('Error searching sent emails:', error);
+                notificationService.showError('Search failed: ' + error.message);
+                
+                // Clean up listeners on error
+                if (this.sentSearchUnlisten) {
+                    this.sentSearchUnlisten();
+                    this.sentSearchUnlisten = null;
+                }
+                this.sentSearchInProgress = false;
+                
+                // Restore sent email list on error
+                await this.loadSentEmails('');
+            }
+        }, 500); // 0.5 second delay for search
+    }
+    
+    async updateSentSearchResults() {
+        // Update UI with current sent search results incrementally
+        if (this.sentSearchResults.length > 0 && this.sentSearchInProgress) {
+            // Set emails and render incrementally
+            appState.setSentEmails(this.sentSearchResults);
+            await this.renderSentEmails();
         }
     }
 
@@ -1546,6 +1784,13 @@ class EmailService {
             try {
                 manifest = JSON.parse(decryptedManifestJson);
                 console.log('[JS] Sent manifest parsed successfully:', manifest);
+                console.log('[JS] Manifest has attachments:', manifest.attachments ? manifest.attachments.length : 0);
+                if (manifest.attachments && manifest.attachments.length > 0) {
+                    console.log('[JS] Manifest attachment IDs:', manifest.attachments.map(a => a.id));
+                    manifest.attachments.forEach((att, idx) => {
+                        console.log(`[JS] Manifest attachment ${idx}: id=${att.id}, orig_filename=${att.orig_filename}, orig_mime=${att.orig_mime}`);
+                    });
+                }
             } catch (parseError) {
                 console.log('[JS] Not a sent manifest format, treating as legacy encrypted body');
                 return {
@@ -1571,11 +1816,13 @@ class EmailService {
                 }
             }
             
-            return {
+            const result = {
                 type: 'manifest',
                 body: Utils.fixUtf8Encoding(decryptedBody),
                 manifest: manifest
             };
+            console.log('[JS] Returning manifest result, type:', result.type, 'has manifest:', !!result.manifest, 'has attachments:', result.manifest && result.manifest.attachments ? result.manifest.attachments.length : 0);
+            return result;
             
         } catch (error) {
             console.error('[JS] Sent manifest decryption failed:', error);
@@ -1702,9 +1949,14 @@ class EmailService {
                     showSubject = true;
                 }
 
+                // Add attachment indicator (same style as sent emails)
+                const attachmentCount = email.attachments ? email.attachments.length : 0;
+                const attachmentIndicator = attachmentCount > 0 ? 
+                    `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
+
                 emailElement.innerHTML = `
                     <div class="email-header">
-                        <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)}</div>
+                        <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator}</div>
                         <div class="email-date">${dateDisplay}</div>
                     </div>
                     ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
@@ -1719,20 +1971,164 @@ class EmailService {
     }
 
     // Filter emails with debouncing
-    filterEmails() {
+    async filterEmails() {
         const searchQuery = domManager.getValue('emailSearch')?.trim() || '';
+        
+        // If search query is empty, load all emails normally
+        if (!searchQuery) {
+            // Clean up any existing search listeners
+            if (this.searchUnlisten) {
+                this.searchUnlisten();
+                this.searchUnlisten = null;
+            }
+            await this.loadEmails('');
+            return;
+        }
+        
         // Clear existing timeout
         if (this.searchTimeout) {
             clearTimeout(this.searchTimeout);
         }
+        
+        // Clean up any existing search listeners
+        if (this.searchUnlisten) {
+            this.searchUnlisten();
+            this.searchUnlisten = null;
+        }
+        
         // Set a new timeout to debounce the search
         this.searchTimeout = setTimeout(async () => {
             try {
-                await this.loadEmails(searchQuery);
+                const settings = appState.getSettings();
+                const keypair = appState.getKeypair();
+                const userEmail = settings.email_address ? settings.email_address : null;
+                const privateKey = keypair ? keypair.private_key : null;
+                
+                // Initialize search results accumulator
+                this.searchResults = [];
+                this.searchInProgress = true;
+                
+                // Show searching state
+                const emailList = domManager.get('emailList');
+                if (emailList) {
+                    emailList.innerHTML = '<div class="text-center text-muted" style="padding: 20px;"><i class="fas fa-spinner fa-spin"></i> Searching...</div>';
+                }
+                
+                // Set up event listeners for incremental search results
+                this.searchUnlisten = await window.__TAURI__.event.listen('email-search-result', (event) => {
+                    const email = event.payload;
+                    this.searchResults.push(email);
+                    console.log(`[JS] Search result received: ${this.searchResults.length} emails found so far`);
+                    
+                    // Update UI incrementally
+                    this.updateSearchResults();
+                });
+                
+                // Listen for progress updates
+                const progressUnlisten = await window.__TAURI__.event.listen('email-search-progress', (event) => {
+                    const progress = event.payload;
+                    const emailList = domManager.get('emailList');
+                    if (emailList && this.searchInProgress) {
+                        const percent = Math.round((progress.processed / progress.total) * 100);
+                        emailList.innerHTML = `<div class="text-center text-muted" style="padding: 20px;">
+                            <i class="fas fa-spinner fa-spin"></i> Searching... ${percent}% (${progress.processed}/${progress.total} emails processed)
+                            ${this.searchResults.length > 0 ? `<br><small>Found ${this.searchResults.length} match${this.searchResults.length !== 1 ? 'es' : ''} so far</small>` : ''}
+                        </div>`;
+                    }
+                });
+                
+                // Listen for search completion
+                const completedUnlisten = await window.__TAURI__.event.listen('email-search-completed', async (event) => {
+                    const completion = event.payload;
+                    console.log(`[JS] Search completed: ${completion.total_found} total matches`);
+                    
+                    this.searchInProgress = false;
+                    
+                    // Clean up listeners
+                    if (this.searchUnlisten) {
+                        this.searchUnlisten();
+                        this.searchUnlisten = null;
+                    }
+                    progressUnlisten();
+                    completedUnlisten();
+                    
+                    // Load attachments for all search results (same logic as normal email loading)
+                    console.log(`[JS] Loading attachments for ${this.searchResults.length} search result emails`);
+                    const attachmentPromises = this.searchResults.map(async (email) => {
+                        try {
+                            // Convert email.id to integer - it might be a string
+                            const emailIdInt = parseInt(email.id);
+                            if (isNaN(emailIdInt)) {
+                                console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
+                                // Try to get email by message_id to get the real database ID
+                                if (email.message_id) {
+                                    try {
+                                        const emailData = await TauriService.getDbEmail(email.message_id);
+                                        if (emailData && emailData.id) {
+                                            const realId = parseInt(emailData.id);
+                                            if (!isNaN(realId)) {
+                                                email.attachments = await TauriService.getAttachmentsForEmail(realId);
+                                                console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
+                                                return;
+                                            }
+                                        }
+                                    } catch (e) {
+                                        console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
+                                    }
+                                }
+                                console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
+                                email.attachments = [];
+                                return;
+                            }
+                            
+                            const timeoutPromise = new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
+                            );
+                            email.attachments = await Promise.race([
+                                TauriService.getAttachmentsForEmail(emailIdInt),
+                                timeoutPromise
+                            ]);
+                            console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
+                        } catch (error) {
+                            console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
+                            email.attachments = [];
+                        }
+                    });
+                    
+                    await Promise.all(attachmentPromises);
+                    
+                    appState.setEmails(this.searchResults);
+                    await this.renderEmails();
+                });
+                
+                console.log('[JS] Starting search with query:', searchQuery);
+                // Start the search (this will emit events as results are found)
+                await TauriService.searchEmails(searchQuery, userEmail, privateKey);
+                
             } catch (error) {
-                console.error('Error filtering emails:', error);
+                console.error('Error searching emails:', error);
+                notificationService.showError('Search failed: ' + error.message);
+                
+                // Clean up listeners on error
+                if (this.searchUnlisten) {
+                    this.searchUnlisten();
+                    this.searchUnlisten = null;
+                }
+                this.searchInProgress = false;
+                
+                // Restore email list on error
+                await this.loadEmails('');
             }
-        }, 1500); // 1.5 second delay
+        }, 500); // 0.5 second delay for search
+    }
+    
+    async updateSearchResults() {
+        // Update UI with current search results incrementally
+        if (this.searchResults.length > 0 && this.searchInProgress) {
+            // Set emails and render incrementally
+            appState.setEmails(this.searchResults);
+            await this.renderEmails();
+        }
     }
 
     // Show email detail
@@ -1740,6 +2136,25 @@ class EmailService {
         try {
             const email = appState.getEmails().find(e => e.id === emailId);
             if (!email) return;
+            
+            // Mark email as read if it's unread
+            if (!email.is_read && email.message_id) {
+                (async () => {
+                    try {
+                        await this.markAsRead(email.message_id);
+                        // Update the email object in appState
+                        email.is_read = true;
+                        // Update the UI to remove unread indicator
+                        const emailElement = document.querySelector(`[data-email-id="${emailId}"]`);
+                        if (emailElement) {
+                            emailElement.classList.remove('unread');
+                        }
+                    } catch (error) {
+                        console.error('[JS] Failed to mark email as read:', error);
+                    }
+                })();
+            }
+            
             const emailList = domManager.get('emailList');
             const emailDetailView = document.getElementById('email-detail-view');
             const inboxActions = document.getElementById('inbox-actions');
@@ -1750,18 +2165,21 @@ class EmailService {
             if (inboxTitle) inboxTitle.textContent = 'Email Detail';
             const emailDetailContent = document.getElementById('email-detail-content');
             if (emailDetailContent) {
-                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+                // Use email.body directly instead of cleanedBody to preserve encrypted message format
+                const emailBody = email.body || '';
                 const nostrPubkey = email.nostr_pubkey;
                 console.log('Nostr pubkey for email:', nostrPubkey);
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
-                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                // Match on the original body, not cleaned version
+                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 let decryptedSubject = email.subject;
-                let decryptedBody = cleanedBody;
+                let decryptedBody = emailBody;
                 let originalSubject = email.subject;
                 let decryptionAttempted = false;
                 const keypair = appState.getKeypair();
                 if ((nostrPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
                     (async () => {
+                        let manifestResult = null;
                         try {
                             if (isEncryptedSubject) {
                                 decryptedSubject = await this.decryptNostrMessageWithFallback(email, email.subject, keypair);
@@ -1771,37 +2189,173 @@ class EmailService {
                                 try {
                                     // Try manifest decryption first
                                     console.log('[JS] Attempting manifest decryption for detail view...');
-                                    const manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
-                                                                    console.log('[JS] Detail view manifest result:', manifestResult);
-                                console.log('[JS] Manifest result type:', manifestResult.type);
-                                console.log('[JS] Manifest result body length:', manifestResult.body ? manifestResult.body.length : 'no body');
-                                
-                                if (manifestResult.type === 'manifest') {
-                                    console.log('[JS] Using manifest body for detail view:', manifestResult.body.substring(0, 100));
-                                    decryptedBody = manifestResult.body;
-                                } else if (manifestResult.type === 'legacy') {
-                                    console.log('[JS] Using legacy body for detail view:', manifestResult.body.substring(0, 100));
-                                    decryptedBody = manifestResult.body;
-                                } else {
-                                    // Fallback to legacy decryption
-                                    console.log('[JS] Falling back to legacy decryption for detail view...');
-                                    decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                }
+                                    manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                                    console.log('[JS] Detail view manifest result:', manifestResult);
+                                    console.log('[JS] Manifest result type:', manifestResult.type);
+                                    console.log('[JS] Manifest result body length:', manifestResult.body ? manifestResult.body.length : 'no body');
+                                    
+                                    if (manifestResult.type === 'manifest') {
+                                        console.log('[JS] Using manifest body for detail view:', manifestResult.body.substring(0, 100));
+                                        decryptedBody = manifestResult.body;
+                                    } else if (manifestResult.type === 'legacy') {
+                                        console.log('[JS] Using legacy body for detail view:', manifestResult.body.substring(0, 100));
+                                        decryptedBody = manifestResult.body;
+                                    } else {
+                                        // Fallback to legacy decryption
+                                        console.log('[JS] Falling back to legacy decryption for detail view...');
+                                        decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                    }
                                 } catch (e) {
                                     console.error('[JS] Manifest decryption failed for detail view:', e);
                                     // If manifest fails, try legacy decryption
-                                    decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                    try {
+                                        decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                    } catch (legacyErr) {
+                                        console.error('[JS] Legacy decryption also failed:', legacyErr);
+                                        throw legacyErr;
+                                    }
                                 }
                             }
-                            updateDetail(decryptedSubject, decryptedBody);
+                            await updateDetail(decryptedSubject, decryptedBody, manifestResult);
                         } catch (err) {
-                            updateDetail('Could not decrypt', 'Could not decrypt');
+                            console.error('[JS] Error decrypting email detail:', err);
+                            await updateDetail('Could not decrypt', 'Could not decrypt: ' + (err.message || err), null);
                         }
                     })();
                 } else {
-                    updateDetail(decryptedSubject, decryptedBody);
+                    (async () => {
+                        await updateDetail(decryptedSubject, decryptedBody, null);
+                    })();
                 }
-                function updateDetail(subject, body) {
+                const updateDetail = async (subject, body, cachedManifestResult) => {
+                    // Render attachments - decrypt metadata for display
+                    console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
+                    
+                    // Ensure attachments array exists
+                    if (!email.attachments || !Array.isArray(email.attachments)) {
+                        console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
+                        email.attachments = [];
+                    }
+                    
+                    let attachmentsHtml = '';
+                    if (email.attachments && email.attachments.length > 0) {
+                        // For manifest-encrypted emails, we need to decrypt the manifest to get original metadata
+                        let attachmentDisplayData = [];
+                        
+                        const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
+                        const hasValidManifest = cachedManifestResult && 
+                                               cachedManifestResult.type === 'manifest' && 
+                                               cachedManifestResult.manifest && 
+                                               cachedManifestResult.manifest.attachments &&
+                                               cachedManifestResult.manifest.attachments.length > 0;
+                        
+                        if (hasManifestAttachments || hasValidManifest) {
+                            try {
+                                let manifestResult = cachedManifestResult;
+                                
+                                if (!manifestResult || manifestResult.type !== 'manifest') {
+                                    const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                                    if (encryptedBodyMatch) {
+                                        const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                                        const keypair = appState.getKeypair();
+                                        manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                                    }
+                                }
+                                
+                                if (manifestResult && manifestResult.type === 'manifest' && manifestResult.manifest && manifestResult.manifest.attachments) {
+                                    attachmentDisplayData = email.attachments.map(dbAttachment => {
+                                        const opaqueId = dbAttachment.filename.replace(/\.dat$/, '');
+                                        const manifestAttachment = manifestResult.manifest.attachments.find(ma => ma.id === opaqueId);
+                                        
+                                        if (manifestAttachment) {
+                                            return {
+                                                ...dbAttachment,
+                                                displayName: manifestAttachment.orig_filename,
+                                                encryptedFilename: dbAttachment.filename,
+                                                displaySize: manifestAttachment.orig_size || dbAttachment.size,
+                                                displayMime: manifestAttachment.orig_mime || dbAttachment.content_type || dbAttachment.mime_type
+                                            };
+                                        } else {
+                                            return {
+                                                ...dbAttachment,
+                                                displayName: dbAttachment.filename,
+                                                encryptedFilename: dbAttachment.filename,
+                                                displaySize: dbAttachment.size,
+                                                displayMime: dbAttachment.content_type || dbAttachment.mime_type
+                                            };
+                                        }
+                                    });
+                                } else {
+                                    attachmentDisplayData = email.attachments.map(att => ({
+                                        ...att,
+                                        displayName: att.filename,
+                                        encryptedFilename: att.filename,
+                                        displaySize: att.size,
+                                        displayMime: att.mime_type
+                                    }));
+                                }
+                            } catch (error) {
+                                console.error('Failed to decrypt manifest for attachment display:', error);
+                                attachmentDisplayData = email.attachments.map(att => ({
+                                    ...att,
+                                    displayName: att.filename,
+                                    encryptedFilename: att.filename,
+                                    displaySize: att.size,
+                                    displayMime: att.mime_type
+                                }));
+                            }
+                        } else {
+                            attachmentDisplayData = email.attachments.map(att => ({
+                                ...att,
+                                displayName: att.filename,
+                                encryptedFilename: att.filename,
+                                displaySize: att.size,
+                                displayMime: att.mime_type
+                            }));
+                        }
+                        
+                        attachmentsHtml = `
+                        <div class="email-attachments" id="inbox-email-attachments" style="margin: 15px 0;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                <h4>Attachments (${attachmentDisplayData.length})</h4>
+                                <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllInboxAttachments(${email.id})" title="Download all attachments as ZIP">
+                                    <i class="fas fa-download"></i> Download All
+                                </button>
+                            </div>
+                            <div class="attachment-list">
+                                ${attachmentDisplayData.map(attachment => {
+                                    const sizeFormatted = (attachment.displaySize / 1024).toFixed(2) + ' KB';
+                                    const isEncrypted = attachment.encryption_method === 'manifest_aes';
+                                    // Default to display mode (decrypted/unlocked)
+                                    const statusIcon = isEncrypted ? '🔓' : '📄';
+                                    const statusText = isEncrypted ? 'Decrypted' : 'Plain';
+                                    const encryptedFilename = attachment.encryptedFilename || attachment.filename;
+                                    const decryptedFilename = attachment.displayName;
+                                    
+                                    return `
+                                    <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;" 
+                                         data-encrypted-filename="${Utils.escapeHtml(encryptedFilename)}" 
+                                         data-decrypted-filename="${Utils.escapeHtml(decryptedFilename)}"
+                                         data-is-encrypted="${isEncrypted}">
+                                        <div class="attachment-info" style="display: flex; align-items: center;">
+                                            <i class="fas fa-file" style="margin-right: 10px;"></i>
+                                            <div class="attachment-details">
+                                                <div class="attachment-name" style="font-weight: bold;" data-display-name="${Utils.escapeHtml(decryptedFilename)}">${Utils.escapeHtml(decryptedFilename)}</div>
+                                                <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
+                                                    ${sizeFormatted} • <span class="attachment-status-icon">${statusIcon}</span> <span class="attachment-status-text">${statusText}</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="attachment-actions">
+                                            <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadInboxAttachment(${email.id}, ${attachment.id}, '${Utils.escapeHtml(encryptedFilename)}')">
+                                                <i class="fas fa-download"></i> Download
+                                            </button>
+                                        </div>
+                                    </div>`;
+                                }).join('')}
+                            </div>
+                        </div>`;
+                    }
                     emailDetailContent.innerHTML =
                         `<div class="email-detail">
 <div class="email-detail-header vertical" id="inbox-email-header-info">
@@ -1812,14 +2366,16 @@ class EmailService {
 </div>
 <pre id="inbox-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="inbox-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
-<button id="inbox-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 <pre id="inbox-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
+${attachmentsHtml}
+<button id="inbox-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
                     const toggleRawBtn = document.getElementById('inbox-toggle-raw-btn');
                     const headerInfo = document.getElementById('inbox-email-header-info');
                     const rawHeaderInfo = document.getElementById('inbox-raw-header-info');
                     const bodyInfo = document.getElementById('inbox-email-body-info');
                     const rawBodyInfo = document.getElementById('inbox-raw-body-info');
+                    const attachmentsInfo = document.getElementById('inbox-email-attachments');
                     
                     if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
                         // Remove any existing event listeners by cloning the button
@@ -1838,8 +2394,39 @@ class EmailService {
                                 bodyInfo.style.display = 'none';
                                 rawBodyInfo.style.display = 'block';
                                 newToggleBtn.textContent = 'Show Display Content';
-                                // Only move button if it's not already in the right position
-                                if (newToggleBtn.nextSibling !== rawBodyInfo.nextSibling) {
+                                
+                                // Update attachment filenames and icons to show encrypted versions
+                                if (attachmentsInfo) {
+                                    const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
+                                    attachmentItems.forEach(item => {
+                                        const encryptedFilename = item.getAttribute('data-encrypted-filename');
+                                        const isEncrypted = item.getAttribute('data-is-encrypted') === 'true';
+                                        const nameElement = item.querySelector('.attachment-name');
+                                        const iconElement = item.querySelector('.attachment-status-icon');
+                                        const textElement = item.querySelector('.attachment-status-text');
+                                        
+                                        if (encryptedFilename && nameElement) {
+                                            nameElement.textContent = encryptedFilename;
+                                        }
+                                        
+                                        // Update icon and text to show encrypted state
+                                        if (isEncrypted && iconElement && textElement) {
+                                            iconElement.textContent = '🔒';
+                                            textElement.textContent = 'Encrypted';
+                                        }
+                                    });
+                                }
+                                
+                                // Move attachments after raw body if they exist
+                                if (attachmentsInfo && attachmentsInfo.parentNode) {
+                                    attachmentsInfo.parentNode.removeChild(attachmentsInfo);
+                                    rawBodyInfo.parentNode.insertBefore(attachmentsInfo, rawBodyInfo.nextSibling);
+                                }
+                                
+                                // Move button to bottom
+                                if (attachmentsInfo && attachmentsInfo.parentNode) {
+                                    attachmentsInfo.parentNode.insertBefore(newToggleBtn, attachmentsInfo.nextSibling);
+                                } else {
                                     rawBodyInfo.parentNode.insertBefore(newToggleBtn, rawBodyInfo.nextSibling);
                                 }
                             } else {
@@ -1848,8 +2435,39 @@ class EmailService {
                                 bodyInfo.style.display = 'block';
                                 rawBodyInfo.style.display = 'none';
                                 newToggleBtn.textContent = 'Show Raw Content';
-                                // Only move button if it's not already in the right position
-                                if (newToggleBtn.nextSibling !== bodyInfo.nextSibling) {
+                                
+                                // Update attachment filenames and icons to show decrypted versions
+                                if (attachmentsInfo) {
+                                    const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
+                                    attachmentItems.forEach(item => {
+                                        const decryptedFilename = item.getAttribute('data-decrypted-filename');
+                                        const isEncrypted = item.getAttribute('data-is-encrypted') === 'true';
+                                        const nameElement = item.querySelector('.attachment-name');
+                                        const iconElement = item.querySelector('.attachment-status-icon');
+                                        const textElement = item.querySelector('.attachment-status-text');
+                                        
+                                        if (decryptedFilename && nameElement) {
+                                            nameElement.textContent = decryptedFilename;
+                                        }
+                                        
+                                        // Update icon and text to show decrypted state
+                                        if (isEncrypted && iconElement && textElement) {
+                                            iconElement.textContent = '🔓';
+                                            textElement.textContent = 'Decrypted';
+                                        }
+                                    });
+                                }
+                                
+                                // Move attachments after regular body if they exist
+                                if (attachmentsInfo && attachmentsInfo.parentNode) {
+                                    attachmentsInfo.parentNode.removeChild(attachmentsInfo);
+                                    bodyInfo.parentNode.insertBefore(attachmentsInfo, bodyInfo.nextSibling);
+                                }
+                                
+                                // Move button to bottom
+                                if (attachmentsInfo && attachmentsInfo.parentNode) {
+                                    attachmentsInfo.parentNode.insertBefore(newToggleBtn, attachmentsInfo.nextSibling);
+                                } else {
                                     bodyInfo.parentNode.insertBefore(newToggleBtn, bodyInfo.nextSibling);
                                 }
                             }
@@ -1870,10 +2488,13 @@ class EmailService {
             const emailDetailView = document.getElementById('email-detail-view');
             const inboxActions = document.getElementById('inbox-actions');
             const inboxTitle = document.getElementById('inbox-title');
-            
+
             if (emailList) emailList.style.display = 'block';
             if (emailDetailView) emailDetailView.style.display = 'none';
             if (inboxActions) inboxActions.style.display = 'flex';
+            
+            // Re-render emails to update unread indicators
+            this.renderEmails();
             if (inboxTitle) inboxTitle.textContent = 'Inbox';
             
         } catch (error) {
@@ -2686,59 +3307,133 @@ class EmailService {
         const updateDetail = async (subject, body, cachedManifestResult) => {
             // Render attachments - decrypt metadata for display
             console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
+            console.log(`[JS] Email object:`, email);
+            console.log(`[JS] Email.attachments type:`, typeof email.attachments, Array.isArray(email.attachments));
+            
+            // Ensure attachments array exists
+            if (!email.attachments || !Array.isArray(email.attachments)) {
+                console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
+                email.attachments = [];
+            }
+            
+            // Log attachment details for debugging
+            if (email.attachments && email.attachments.length > 0) {
+                console.log('[JS] Attachment details:');
+                email.attachments.forEach((att, idx) => {
+                    console.log(`[JS]   Attachment ${idx}:`, JSON.stringify({
+                        filename: att.filename,
+                        encryption_method: att.encryption_method,
+                        is_encrypted: att.is_encrypted,
+                        content_type: att.content_type,
+                        size: att.size
+                    }, null, 2));
+                    console.log(`[JS]   Attachment ${idx} all keys:`, Object.keys(att));
+                });
+            }
+            
             let attachmentsHtml = '';
             if (email.attachments && email.attachments.length > 0) {
                 // For manifest-encrypted emails, we need to decrypt the manifest to get original metadata
                 let attachmentDisplayData = [];
                 
-                if (email.attachments.some(att => att.encryption_method === 'manifest_aes')) {
+                console.log('[JS] Checking if attachments are manifest-encrypted...');
+                console.log('[JS] Attachment encryption methods:', email.attachments.map(a => a.encryption_method));
+                const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
+                console.log('[JS] Has manifest attachments:', hasManifestAttachments);
+                console.log('[JS] Cached manifest result:', cachedManifestResult);
+                console.log('[JS] Cached manifest result type:', cachedManifestResult ? cachedManifestResult.type : 'null');
+                
+                // Use manifest if:
+                // 1. Attachments are marked as manifest_aes, OR
+                // 2. We have a cached manifest result with attachments (fallback for attachments not marked correctly)
+                const hasValidManifest = cachedManifestResult && 
+                                       cachedManifestResult.type === 'manifest' && 
+                                       cachedManifestResult.manifest && 
+                                       cachedManifestResult.manifest.attachments &&
+                                       cachedManifestResult.manifest.attachments.length > 0;
+                
+                if (hasManifestAttachments || hasValidManifest) {
+                    console.log('[JS] Using manifest for attachment mapping (hasManifestAttachments:', hasManifestAttachments, ', hasValidManifest:', hasValidManifest, ')');
                     try {
                         // Use cached manifest result if available (already decrypted above)
                         let manifestResult = cachedManifestResult;
+                        console.log('[JS] Initial manifestResult from cache:', manifestResult);
+                        console.log('[JS] manifestResult type:', manifestResult ? manifestResult.type : 'null');
                         
                         // Only decrypt if we don't have a cached result
                         if (!manifestResult || manifestResult.type !== 'manifest') {
+                            console.log('[JS] No valid cached manifest, need to decrypt');
+                            console.log('[JS] No cached manifest, attempting to decrypt...');
+                            console.log('[JS] Email body length:', email.body ? email.body.length : 0);
+                            console.log('[JS] Email body preview:', email.body ? email.body.substring(0, 200) : 'null');
+                            
                             // Extract encrypted content from the body
                             const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                             if (!encryptedBodyMatch) {
-                                throw new Error('No encrypted content found in email body');
+                                console.warn('[JS] No encrypted content found in email body using regex, trying raw body');
+                                // Try using the body directly if it's already base64 encoded
+                                const keypair = appState.getKeypair();
+                                try {
+                                    manifestResult = await this.decryptSentManifestMessage(email, email.body.replace(/\s+/g, ''), keypair);
+                                } catch (e) {
+                                    console.error('[JS] Failed to decrypt with raw body:', e);
+                                    throw new Error('No encrypted content found in email body');
+                                }
+                            } else {
+                                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                                console.log('[JS] Extracted encrypted content, length:', encryptedContent.length);
+                                const keypair = appState.getKeypair();
+                                
+                                // Decrypt the manifest to get original attachment metadata
+                                manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
                             }
-                            const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                            const keypair = appState.getKeypair();
-                            
-                            // Decrypt the manifest to get original attachment metadata
-                            manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
                         }
                         
+                        console.log('[JS] Manifest result:', manifestResult);
+                        console.log('[JS] Manifest type:', manifestResult ? manifestResult.type : 'null');
+                        console.log('[JS] Manifest attachments:', manifestResult && manifestResult.manifest ? manifestResult.manifest.attachments : 'null');
+                        
                         if (manifestResult && manifestResult.type === 'manifest' && manifestResult.manifest && manifestResult.manifest.attachments) {
+                            console.log('[JS] Using manifest to map attachments, manifest has', manifestResult.manifest.attachments.length, 'attachments');
                             // Map database attachments to manifest metadata
                             attachmentDisplayData = email.attachments.map(dbAttachment => {
-                                if (dbAttachment.encryption_method === 'manifest_aes') {
-                                    // Find corresponding manifest entry by opaque ID
-                                    const opaqueId = dbAttachment.filename.replace('.dat', ''); // a1.dat -> a1
-                                    const manifestAttachment = manifestResult.manifest.attachments.find(ma => ma.id === opaqueId);
-                                    
-                                    if (manifestAttachment) {
-                                        return {
-                                            ...dbAttachment,
-                                            displayName: manifestAttachment.orig_filename,
-                                            displaySize: manifestAttachment.orig_size || dbAttachment.size,
-                                            displayMime: manifestAttachment.orig_mime || dbAttachment.mime_type
-                                        };
-                                    }
+                                console.log('[JS] Processing attachment:', dbAttachment.filename, 'encryption_method:', dbAttachment.encryption_method);
+                                
+                                // Try to match attachment with manifest entry by opaque ID
+                                // Extract opaque ID from filename (e.g., "a1.dat" -> "a1")
+                                const opaqueId = dbAttachment.filename.replace(/\.dat$/, ''); // Remove .dat extension
+                                console.log('[JS] Looking for manifest attachment with id:', opaqueId, 'from filename:', dbAttachment.filename);
+                                console.log('[JS] Available manifest attachment IDs:', manifestResult.manifest.attachments.map(a => a.id));
+                                
+                                const manifestAttachment = manifestResult.manifest.attachments.find(ma => ma.id === opaqueId);
+                                
+                                if (manifestAttachment) {
+                                    console.log('[JS] Found manifest attachment:', manifestAttachment);
+                                    return {
+                                        ...dbAttachment,
+                                        displayName: manifestAttachment.orig_filename,
+                                        encryptedFilename: dbAttachment.filename, // Store encrypted filename
+                                        displaySize: manifestAttachment.orig_size || dbAttachment.size,
+                                        displayMime: manifestAttachment.orig_mime || dbAttachment.content_type || dbAttachment.mime_type
+                                    };
+                                } else {
+                                    console.warn('[JS] No manifest attachment found for id:', opaqueId, 'available ids:', manifestResult.manifest.attachments.map(a => a.id));
+                                    // Fallback to database data
+                                    return {
+                                        ...dbAttachment,
+                                        displayName: dbAttachment.filename,
+                                        encryptedFilename: dbAttachment.filename, // Same for non-encrypted
+                                        displaySize: dbAttachment.size,
+                                        displayMime: dbAttachment.content_type || dbAttachment.mime_type
+                                    };
                                 }
-                                return {
-                                    ...dbAttachment,
-                                    displayName: dbAttachment.filename,
-                                    displaySize: dbAttachment.size,
-                                    displayMime: dbAttachment.mime_type
-                                };
                             });
                         } else {
                             // Fallback to database data
                             attachmentDisplayData = email.attachments.map(att => ({
                                 ...att,
                                 displayName: att.filename,
+                                encryptedFilename: att.filename, // Same for non-encrypted
                                 displaySize: att.size,
                                 displayMime: att.mime_type
                             }));
@@ -2749,6 +3444,7 @@ class EmailService {
                         attachmentDisplayData = email.attachments.map(att => ({
                             ...att,
                             displayName: att.filename,
+                            encryptedFilename: att.filename, // Same for non-encrypted
                             displaySize: att.size,
                             displayMime: att.mime_type
                         }));
@@ -2758,13 +3454,14 @@ class EmailService {
                     attachmentDisplayData = email.attachments.map(att => ({
                         ...att,
                         displayName: att.filename,
+                        encryptedFilename: att.filename, // Same for non-encrypted
                         displaySize: att.size,
                         displayMime: att.mime_type
                     }));
                 }
                 
                 attachmentsHtml = `
-                <div class="email-attachments" style="margin: 15px 0;">
+                <div class="email-attachments" id="sent-email-attachments" style="margin: 15px 0;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                         <h4>Attachments (${attachmentDisplayData.length})</h4>
                         <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllSentAttachments(${email.id})" title="Download all attachments as ZIP">
@@ -2775,15 +3472,20 @@ class EmailService {
                         ${attachmentDisplayData.map(attachment => {
                             const sizeFormatted = (attachment.displaySize / 1024).toFixed(2) + ' KB';
                             const isEncrypted = attachment.encryption_method === 'manifest_aes';
-                            const statusIcon = isEncrypted ? '🔓' : '📄';
-                            const statusText = isEncrypted ? 'Decrypted' : 'Plain';
+                            const statusIcon = isEncrypted ? '🔒' : '📄';
+                            const statusText = isEncrypted ? 'Encrypted' : 'Plain';
+                            // Store both encrypted and decrypted filenames as data attributes
+                            const encryptedFilename = attachment.encryptedFilename || attachment.filename;
+                            const decryptedFilename = attachment.displayName;
                             
                             return `
-                            <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;">
+                            <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;" 
+                                 data-encrypted-filename="${Utils.escapeHtml(encryptedFilename)}" 
+                                 data-decrypted-filename="${Utils.escapeHtml(decryptedFilename)}">
                                 <div class="attachment-info" style="display: flex; align-items: center;">
                                     <i class="fas fa-file" style="margin-right: 10px;"></i>
                                     <div class="attachment-details">
-                                        <div class="attachment-name" style="font-weight: bold;">${Utils.escapeHtml(attachment.displayName)}</div>
+                                        <div class="attachment-name" style="font-weight: bold;" data-display-name="${Utils.escapeHtml(decryptedFilename)}">${Utils.escapeHtml(decryptedFilename)}</div>
                                         <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
                                             ${sizeFormatted} • ${statusIcon} ${statusText}
                                         </div>
@@ -2809,10 +3511,10 @@ class EmailService {
 <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
 </div>
 <pre id="sent-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
-${attachmentsHtml}
 <div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
-<button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 <pre id="sent-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
+${attachmentsHtml}
+<button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
             
             const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
@@ -2820,6 +3522,7 @@ ${attachmentsHtml}
             const rawHeaderInfo = document.getElementById('sent-raw-header-info');
             const bodyInfo = document.getElementById('sent-email-body-info');
             const rawBodyInfo = document.getElementById('sent-raw-body-info');
+            const attachmentsInfo = document.getElementById('sent-email-attachments');
             
             if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
                 // Remove any existing event listeners by cloning the button
@@ -2838,8 +3541,31 @@ ${attachmentsHtml}
                         bodyInfo.style.display = 'none';
                         rawBodyInfo.style.display = 'block';
                         newToggleBtn.textContent = 'Show Display Content';
-                        // Only move button if it's not already in the right position
-                        if (newToggleBtn.nextSibling !== rawBodyInfo.nextSibling) {
+                        
+                        // Update attachment filenames to show encrypted versions
+                        if (attachmentsInfo) {
+                            const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
+                            attachmentItems.forEach(item => {
+                                const encryptedFilename = item.getAttribute('data-encrypted-filename');
+                                const nameElement = item.querySelector('.attachment-name');
+                                if (encryptedFilename && nameElement) {
+                                    nameElement.textContent = encryptedFilename;
+                                }
+                            });
+                        }
+                        
+                        // Move attachments after raw body if they exist
+                        if (attachmentsInfo && attachmentsInfo.parentNode) {
+                            // Remove from current position
+                            attachmentsInfo.parentNode.removeChild(attachmentsInfo);
+                            // Insert after raw body
+                            rawBodyInfo.parentNode.insertBefore(attachmentsInfo, rawBodyInfo.nextSibling);
+                        }
+                        
+                        // Move button to bottom (after attachments or raw body)
+                        if (attachmentsInfo && attachmentsInfo.parentNode) {
+                            attachmentsInfo.parentNode.insertBefore(newToggleBtn, attachmentsInfo.nextSibling);
+                        } else {
                             rawBodyInfo.parentNode.insertBefore(newToggleBtn, rawBodyInfo.nextSibling);
                         }
                     } else {
@@ -2848,8 +3574,31 @@ ${attachmentsHtml}
                         bodyInfo.style.display = 'block';
                         rawBodyInfo.style.display = 'none';
                         newToggleBtn.textContent = 'Show Raw Content';
-                        // Only move button if it's not already in the right position
-                        if (newToggleBtn.nextSibling !== bodyInfo.nextSibling) {
+                        
+                        // Update attachment filenames to show decrypted versions
+                        if (attachmentsInfo) {
+                            const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
+                            attachmentItems.forEach(item => {
+                                const decryptedFilename = item.getAttribute('data-decrypted-filename');
+                                const nameElement = item.querySelector('.attachment-name');
+                                if (decryptedFilename && nameElement) {
+                                    nameElement.textContent = decryptedFilename;
+                                }
+                            });
+                        }
+                        
+                        // Move attachments after regular body if they exist
+                        if (attachmentsInfo && attachmentsInfo.parentNode) {
+                            // Remove from current position
+                            attachmentsInfo.parentNode.removeChild(attachmentsInfo);
+                            // Insert after regular body
+                            bodyInfo.parentNode.insertBefore(attachmentsInfo, bodyInfo.nextSibling);
+                        }
+                        
+                        // Move button to bottom (after attachments or regular body)
+                        if (attachmentsInfo && attachmentsInfo.parentNode) {
+                            attachmentsInfo.parentNode.insertBefore(newToggleBtn, attachmentsInfo.nextSibling);
+                        } else {
                             bodyInfo.parentNode.insertBefore(newToggleBtn, bodyInfo.nextSibling);
                         }
                     }
@@ -2953,22 +3702,25 @@ ${attachmentsHtml}
                 return;
             }
             
-            // Check if attachment is encrypted and needs decryption
-            if (attachment.encryption_method === 'manifest_aes') {
-                // For manifest-encrypted attachments, we need to get the manifest first
-                const sentEmails = appState.getSentEmails();
-                console.log(`[JS] Looking for email ID ${emailId} in ${sentEmails.length} sent emails`);
-                console.log(`[JS] Sent email IDs:`, sentEmails.map(e => `${e.id} (${typeof e.id})`));
-                
-                // Convert emailId to number for comparison since it comes as string from onclick
-                const email = sentEmails.find(e => e.id == emailId); // Use == for type coercion
-                if (!email) {
-                    window.notificationService.showError('Email not found');
-                    return;
-                }
+            // Get the email to check for manifest
+            const sentEmails = appState.getSentEmails();
+            const email = sentEmails.find(e => e.id == emailId);
+            if (!email) {
+                window.notificationService.showError('Email not found');
+                return;
+            }
+            
+            // Try to decrypt using manifest if:
+            // 1. Attachment is marked as manifest_aes, OR
+            // 2. Email has encrypted content and we can decrypt the manifest
+            const hasManifestEncryption = attachment.encryption_method === 'manifest_aes';
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            
+            if (hasManifestEncryption || (hasEncryptedContent && attachment.filename.endsWith('.dat'))) {
+                console.log(`[JS] Attempting to decrypt attachment using manifest (hasManifestEncryption: ${hasManifestEncryption}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
                 // Extract encrypted content from email body
-                const encryptedBodyMatch = email.body.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
                     return;
@@ -2990,22 +3742,28 @@ ${attachmentsHtml}
                 }
                 
                 // Find attachment metadata in manifest
-                const attachmentMeta = manifestResult.manifest.attachments.find(a => 
-                    attachment.filename.startsWith(a.id + '.'));
+                // Extract opaque ID from filename (e.g., "a1.dat" -> "a1")
+                const opaqueId = attachment.filename.replace(/\.dat$/, '');
+                console.log(`[JS] Looking for manifest attachment with id: ${opaqueId} from filename: ${attachment.filename}`);
+                const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
                 
                 if (!attachmentMeta) {
+                    console.warn(`[JS] Attachment metadata not found in manifest for id: ${opaqueId}, available ids:`, manifestResult.manifest.attachments.map(a => a.id));
                     window.notificationService.showError('Attachment metadata not found in manifest');
                     return;
                 }
                 
-                // Decrypt attachment data
-                const decryptedData = await this.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
+                console.log(`[JS] Found attachment metadata:`, attachmentMeta);
+                
+                // Decrypt attachment data (attachment.data is base64, need to decode first)
+                const attachmentDataBase64 = attachment.data;
+                const decryptedData = await this.decryptWithAES(attachmentDataBase64, attachmentMeta.key_wrap, true);
                 
                 // Save decrypted attachment to disk using Tauri
                 const filePath = await TauriService.saveAttachmentToDisk(
                     attachmentMeta.orig_filename, 
                     decryptedData, 
-                    attachmentMeta.orig_mime
+                    attachmentMeta.orig_mime || 'application/octet-stream'
                 );
                 
                 console.log(`[JS] Downloaded decrypted attachment: ${attachmentMeta.orig_filename} to ${filePath}`);
@@ -3051,11 +3809,15 @@ ${attachmentsHtml}
             // Prepare attachments for ZIP
             const attachmentsForZip = [];
             
-            // Check if any attachments are manifest-encrypted
+            // Try to decrypt manifest if email has encrypted content
+            // This allows us to decrypt attachments even if they're not marked as manifest_aes
             const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
             let manifestResult = null;
             
-            if (hasManifestAttachments) {
+            if (hasManifestAttachments || (hasEncryptedContent && email.attachments.some(att => att.filename.endsWith('.dat')))) {
+                console.log(`[JS] Attempting to decrypt manifest for ZIP (hasManifestAttachments: ${hasManifestAttachments}, hasEncryptedContent: ${hasEncryptedContent})`);
+                
                 // Extract and decrypt manifest
                 const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 if (!encryptedBodyMatch) {
@@ -3076,19 +3838,272 @@ ${attachmentsHtml}
                     window.notificationService.showError('Cannot decrypt attachments: invalid manifest');
                     return;
                 }
+                
+                console.log(`[JS] Manifest decrypted successfully, has ${manifestResult.manifest.attachments.length} attachments`);
             }
             
-            // Process each attachment
+            // Process each attachment - decrypt if we have a manifest
             for (const attachment of email.attachments) {
-                if (attachment.encryption_method === 'manifest_aes') {
+                const shouldDecrypt = attachment.encryption_method === 'manifest_aes' || 
+                                    (manifestResult && attachment.filename.endsWith('.dat'));
+                
+                if (shouldDecrypt && manifestResult) {
                     // Find attachment metadata in manifest
-                    const opaqueId = attachment.filename.replace('.dat', ''); // a1.dat -> a1
+                    const opaqueId = attachment.filename.replace(/\.dat$/, ''); // a1.dat -> a1
+                    console.log(`[JS] Looking for manifest attachment with id: ${opaqueId} from filename: ${attachment.filename}`);
                     const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
                     
                     if (!attachmentMeta) {
-                        console.warn(`[JS] Skipping attachment ${attachment.filename}: metadata not found in manifest`);
+                        console.warn(`[JS] Skipping attachment ${attachment.filename}: metadata not found in manifest (looking for id: ${opaqueId}, available ids: ${manifestResult.manifest.attachments.map(a => a.id).join(', ')})`);
+                        // Fallback: add as-is if we can't find metadata
+                        attachmentsForZip.push({
+                            filename: attachment.filename,
+                            data: attachment.data
+                        });
                         continue;
                     }
+                    
+                    console.log(`[JS] Found attachment metadata:`, attachmentMeta);
+                    
+                    // Decrypt attachment data (attachment.data is base64)
+                    const decryptedData = await this.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
+                    
+                    attachmentsForZip.push({
+                        filename: attachmentMeta.orig_filename,
+                        data: decryptedData
+                    });
+                    
+                    console.log(`[JS] Added decrypted attachment to ZIP: ${attachmentMeta.orig_filename} (${decryptedData.length} bytes)`);
+                    
+                } else {
+                    // Plain attachment - decode base64 if needed
+                    let attachmentData = attachment.data;
+                    // If data is base64 string, it will be handled by saveAttachmentsAsZip
+                    attachmentsForZip.push({
+                        filename: attachment.filename,
+                        data: attachmentData
+                    });
+                    
+                    console.log(`[JS] Added plain attachment to ZIP: ${attachment.filename}`);
+                }
+            }
+            
+            if (attachmentsForZip.length === 0) {
+                window.notificationService.showError('No attachments could be processed');
+                return;
+            }
+            
+            // Create ZIP filename based on email subject or date
+            let emailSubject = email.subject || 'Email';
+            
+            // If subject looks like encrypted content, use a generic name with timestamp
+            if (emailSubject.length > 50 || /^[A-Za-z0-9+/=]+$/.test(emailSubject)) {
+                const date = new Date(email.date || Date.now());
+                const dateStr = date.toISOString().slice(0, 10); // YYYY-MM-DD
+                emailSubject = `Email Attachments ${dateStr}`;
+            }
+            
+            const cleanSubject = emailSubject.replace(/[^a-zA-Z0-9\s\-_]/g, '').trim();
+            const zipFilename = `${cleanSubject}.zip`;
+            
+            console.log(`[JS] Creating ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
+            
+            // Save as ZIP
+            const zipPath = await TauriService.saveAttachmentsAsZip(zipFilename, attachmentsForZip);
+            
+            console.log(`[JS] Successfully created ZIP file: ${zipPath}`);
+            window.notificationService.showSuccess(`All attachments saved to: ${zipPath}`);
+            
+        } catch (error) {
+            console.error('[JS] Failed to download all attachments:', error);
+            window.notificationService.showError('Failed to download attachments: ' + error.message);
+        }
+    }
+
+    // Download attachment from inbox email
+    async downloadInboxAttachment(emailId, attachmentId, encryptedFilename = null) {
+        try {
+            console.log(`[JS] Downloading attachment ${attachmentId} from inbox email ${emailId}`);
+            
+            const attachment = await TauriService.getAttachment(attachmentId);
+            if (!attachment) {
+                window.notificationService.showError('Attachment not found');
+                return;
+            }
+            
+            // Check if raw content is currently being displayed
+            const rawBodyInfo = document.getElementById('inbox-raw-body-info');
+            const isRawMode = rawBodyInfo && rawBodyInfo.style.display === 'block';
+            
+            // If in raw mode and attachment is encrypted, download the raw encrypted data
+            if (isRawMode && attachment.encryption_method === 'manifest_aes') {
+                console.log(`[JS] Raw mode detected, downloading encrypted attachment: ${attachment.filename}`);
+                const filePath = await TauriService.saveAttachmentToDisk(
+                    encryptedFilename || attachment.filename,
+                    attachment.data,
+                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                );
+                console.log(`[JS] Downloaded raw encrypted attachment: ${attachment.filename} to ${filePath}`);
+                window.notificationService.showSuccess(`Raw attachment saved to: ${filePath}`);
+                return;
+            }
+            
+            // Get the email to check for manifest
+            const emails = appState.getEmails();
+            const email = emails.find(e => e.id == emailId);
+            if (!email) {
+                window.notificationService.showError('Email not found');
+                return;
+            }
+            
+            // Try to decrypt using manifest if:
+            // 1. Attachment is marked as manifest_aes, OR
+            // 2. Email has encrypted content and we can decrypt the manifest
+            const hasManifestEncryption = attachment.encryption_method === 'manifest_aes';
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            
+            if (hasManifestEncryption || (hasEncryptedContent && attachment.filename.endsWith('.dat'))) {
+                console.log(`[JS] Attempting to decrypt attachment using manifest (hasManifestEncryption: ${hasManifestEncryption}, hasEncryptedContent: ${hasEncryptedContent})`);
+                
+                // Extract encrypted content from email body
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                if (!encryptedBodyMatch) {
+                    window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
+                    return;
+                }
+                
+                const keypair = appState.getKeypair();
+                if (!keypair) {
+                    window.notificationService.showError('No keypair available for decryption');
+                    return;
+                }
+                
+                // Decrypt the manifest to get attachment keys (use decryptManifestMessage for inbox)
+                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                const manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                
+                if (manifestResult.type !== 'manifest') {
+                    window.notificationService.showError('Cannot decrypt attachment: invalid manifest');
+                    return;
+                }
+                
+                // Find attachment metadata in manifest
+                const opaqueId = attachment.filename.replace(/\.dat$/, '');
+                console.log(`[JS] Looking for manifest attachment with id: ${opaqueId} from filename: ${attachment.filename}`);
+                const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
+                
+                if (!attachmentMeta) {
+                    console.warn(`[JS] Attachment metadata not found in manifest for id: ${opaqueId}, available ids:`, manifestResult.manifest.attachments.map(a => a.id));
+                    window.notificationService.showError('Attachment metadata not found in manifest');
+                    return;
+                }
+                
+                console.log(`[JS] Found attachment metadata:`, attachmentMeta);
+                
+                // Decrypt attachment data
+                const decryptedData = await this.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
+                
+                // Save decrypted attachment to disk using Tauri
+                const filePath = await TauriService.saveAttachmentToDisk(
+                    attachmentMeta.orig_filename, 
+                    decryptedData, 
+                    attachmentMeta.orig_mime || 'application/octet-stream'
+                );
+                
+                console.log(`[JS] Downloaded decrypted attachment: ${attachmentMeta.orig_filename} to ${filePath}`);
+                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
+                
+            } else {
+                // Plain attachment - save directly to disk using Tauri
+                const filePath = await TauriService.saveAttachmentToDisk(
+                    attachment.filename, 
+                    attachment.data, 
+                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                );
+                
+                console.log(`[JS] Downloaded plain attachment: ${attachment.filename} to ${filePath}`);
+                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
+            }
+            
+        } catch (error) {
+            console.error('[JS] Failed to download attachment:', error);
+            window.notificationService.showError('Failed to download attachment: ' + error.message);
+        }
+    }
+
+    // Download all attachments from inbox email as ZIP
+    async downloadAllInboxAttachments(emailId) {
+        try {
+            console.log(`[JS] Downloading all attachments from inbox email ${emailId} as ZIP`);
+            
+            const emails = appState.getEmails();
+            const email = emails.find(e => e.id == emailId);
+            if (!email) {
+                window.notificationService.showError('Email not found');
+                return;
+            }
+            
+            if (!email.attachments || email.attachments.length === 0) {
+                window.notificationService.showError('No attachments to download');
+                return;
+            }
+            
+            console.log(`[JS] Processing ${email.attachments.length} attachments for ZIP`);
+            
+            // Prepare attachments for ZIP
+            const attachmentsForZip = [];
+            
+            // Try to decrypt manifest if email has encrypted content
+            const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            let manifestResult = null;
+            
+            if (hasManifestAttachments || (hasEncryptedContent && email.attachments.some(att => att.filename.endsWith('.dat')))) {
+                console.log(`[JS] Attempting to decrypt manifest for ZIP (hasManifestAttachments: ${hasManifestAttachments}, hasEncryptedContent: ${hasEncryptedContent})`);
+                
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                if (!encryptedBodyMatch) {
+                    window.notificationService.showError('Cannot decrypt attachments: no encrypted manifest found');
+                    return;
+                }
+                
+                const keypair = appState.getKeypair();
+                if (!keypair) {
+                    window.notificationService.showError('No keypair available for decryption');
+                    return;
+                }
+                
+                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                
+                if (manifestResult.type !== 'manifest') {
+                    window.notificationService.showError('Cannot decrypt attachments: invalid manifest');
+                    return;
+                }
+                
+                console.log(`[JS] Manifest decrypted successfully, has ${manifestResult.manifest.attachments.length} attachments`);
+            }
+            
+            // Process each attachment - decrypt if we have a manifest
+            for (const attachment of email.attachments) {
+                const shouldDecrypt = attachment.encryption_method === 'manifest_aes' || 
+                                    (manifestResult && attachment.filename.endsWith('.dat'));
+                
+                if (shouldDecrypt && manifestResult) {
+                    const opaqueId = attachment.filename.replace(/\.dat$/, '');
+                    console.log(`[JS] Looking for manifest attachment with id: ${opaqueId} from filename: ${attachment.filename}`);
+                    const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
+                    
+                    if (!attachmentMeta) {
+                        console.warn(`[JS] Skipping attachment ${attachment.filename}: metadata not found in manifest (looking for id: ${opaqueId}, available ids: ${manifestResult.manifest.attachments.map(a => a.id).join(', ')})`);
+                        attachmentsForZip.push({
+                            filename: attachment.filename,
+                            data: attachment.data
+                        });
+                        continue;
+                    }
+                    
+                    console.log(`[JS] Found attachment metadata:`, attachmentMeta);
                     
                     // Decrypt attachment data
                     const decryptedData = await this.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
@@ -3098,7 +4113,7 @@ ${attachmentsHtml}
                         data: decryptedData
                     });
                     
-                    console.log(`[JS] Added decrypted attachment to ZIP: ${attachmentMeta.orig_filename}`);
+                    console.log(`[JS] Added decrypted attachment to ZIP: ${attachmentMeta.orig_filename} (${decryptedData.length} bytes)`);
                     
                 } else {
                     // Plain attachment

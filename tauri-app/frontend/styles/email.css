@@ -6,6 +6,10 @@
     padding: 20px;
 }
 
+body.dark-mode .email-list {
+    background-color: #232946;
+}
+
 .email-item {
     padding: 20px;
     border-bottom: 1px solid #e0e0e0;
@@ -52,6 +56,21 @@
 .email-date {
     font-size: 0.875rem;
     color: #6c757d;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.email-attachment-icon {
+    color: #6c757d;
+    font-size: 0.85em;
+    opacity: 0.8;
+}
+
+.attachment-indicator {
+    font-size: 0.9em;
+    margin-left: 6px;
+    opacity: 0.7;
 }
 
 .email-subject {
@@ -195,12 +214,17 @@ body.dark-mode .email-item {
 }
 
 body.dark-mode .email-item.unread {
-    background-color: #181a20;
+    background-color: #232946;
     border-left: 4px solid #667eea;
 }
 
 body.dark-mode .email-item:hover {
     background-color: #181a20;
+}
+
+body.dark-mode .email-attachment-icon {
+    color: #9ca3af;
+    opacity: 0.9;
 }
 
 /* Inbox Search Styles */
@@ -301,11 +325,11 @@ body.dark-mode .email-header-value {
 /* Email list strong styling */
 .email-list-strong {
     font-weight: 600;
-    color: #fff;
+    color: #232946;
 }
 
-body:not(.dark-mode) .email-list-strong {
-    color: #232946;
+body.dark-mode .email-list-strong {
+    color: #fff;
 }
 
 /* Email body display styling */

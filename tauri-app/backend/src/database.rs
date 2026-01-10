@@ -465,42 +465,56 @@ impl Database {
         } else {
             println!("[DB] save_email: Checking if email with message_id {} already exists", email.message_id);
             // Check if email with this message_id already exists (normalized comparison)
-            match self.get_email(&email.message_id) {
-                Ok(Some(existing_email)) => {
-                    // Email already exists, update it instead of creating duplicate
-                    println!("[DB] Email with message_id {} already exists (id: {}), updating instead of creating duplicate", email.message_id, existing_email.id.unwrap_or(0));
-                    drop(conn); // Release lock before recursive call
-                    return self.save_email(&Email {
-                        id: existing_email.id,
-                        ..email.clone()
-                    });
+            // Use inline check to avoid deadlock (don't call get_email which would try to acquire lock again)
+            let normalized_id = Self::normalize_message_id(&email.message_id);
+            let existing_id: Option<i64> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
+                     FROM emails
+                     WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?
+                     ORDER BY received_at DESC
+                     LIMIT 1"
+                )?;
+                
+                let mut rows = stmt.query(params![normalized_id])?;
+                
+                if let Some(row) = rows.next()? {
+                    Some(row.get(0)?)
+                } else {
+                    None
                 }
-                Ok(None) => {
-                    println!("[DB] save_email: Email is new, inserting into database");
-                    println!("[DB] save_email: About to execute INSERT statement");
-                    match conn.execute(
-                        "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        params![
-                            email.message_id, email.from_address, email.to_address, email.subject,
-                            email.body, email.body_plain, email.body_html, email.received_at,
-                            email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                            subject_hash
-                        ],
-                    ) {
-                        Ok(rows_affected) => {
-                            let new_id = conn.last_insert_rowid();
-                            println!("[DB] save_email: Successfully inserted email, rows_affected={}, new_id={}", rows_affected, new_id);
-                            Ok(new_id)
-                        }
-                        Err(e) => {
-                            println!("[DB] save_email: ERROR executing INSERT: {}", e);
-                            Err(e)
-                        }
-                    }
+            };
+            
+            if let Some(existing_id) = existing_id {
+                // Email already exists, update it instead of creating duplicate
+                println!("[DB] Email with message_id {} already exists (id: {:?}), updating instead of creating duplicate", email.message_id, existing_id);
+                drop(conn); // Release lock before recursive call
+                return self.save_email(&Email {
+                    id: Some(existing_id),
+                    ..email.clone()
+                });
+            }
+            
+            // Email is new, insert it
+            println!("[DB] save_email: Email is new, inserting into database");
+            println!("[DB] save_email: About to execute INSERT statement");
+            match conn.execute(
+                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    email.message_id, email.from_address, email.to_address, email.subject,
+                    email.body, email.body_plain, email.body_html, email.received_at,
+                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
+                    subject_hash
+                ],
+            ) {
+                Ok(rows_affected) => {
+                    let new_id = conn.last_insert_rowid();
+                    println!("[DB] save_email: Successfully inserted email, rows_affected={}, new_id={}", rows_affected, new_id);
+                    Ok(new_id)
                 }
                 Err(e) => {
-                    println!("[DB] save_email: ERROR checking if email exists: {}", e);
+                    println!("[DB] save_email: ERROR executing INSERT: {}", e);
                     Err(e)
                 }
             }
@@ -976,37 +990,42 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         
+        // SECURITY: Never store decrypted attachment metadata (original_filename, original_type, original_size)
+        // These fields must always be None - decrypted names are only used for display after manifest decryption
+        // This ensures encrypted attachment filenames remain private even if the database is compromised
+        if attachment.original_filename.is_some() || attachment.original_type.is_some() || attachment.original_size.is_some() {
+            println!("[DB] WARNING: Attempted to save attachment with decrypted metadata - ignoring original_filename/original_type/original_size");
+        }
+        
         if let Some(id) = attachment.id {
             // Update existing attachment
+            // Always set original_filename, original_type, original_size to NULL to prevent storing decrypted data
             conn.execute(
                 "UPDATE attachments SET 
                     email_id = ?, filename = ?, content_type = ?, data = ?, size = ?,
                     is_encrypted = ?, encryption_method = ?, algorithm = ?, 
-                    original_filename = ?, original_type = ?, original_size = ?
+                    original_filename = NULL, original_type = NULL, original_size = NULL
                 WHERE id = ?",
                 params![
                     attachment.email_id, attachment.filename, attachment.content_type, 
                     attachment.data, attachment.size as i64, attachment.is_encrypted,
-                    attachment.encryption_method, attachment.algorithm,
-                    attachment.original_filename, attachment.original_type, 
-                    attachment.original_size.map(|s| s as i64), id
+                    attachment.encryption_method, attachment.algorithm, id
                 ],
             )?;
             Ok(id)
         } else {
             // Insert new attachment
+            // Always set original_filename, original_type, original_size to NULL
             conn.execute(
                 "INSERT INTO attachments (
                     email_id, filename, content_type, data, size, is_encrypted,
                     encryption_method, algorithm, original_filename, original_type, 
                     original_size, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)",
                 params![
                     attachment.email_id, attachment.filename, attachment.content_type,
                     attachment.data, attachment.size as i64, attachment.is_encrypted,
-                    attachment.encryption_method, attachment.algorithm,
-                    attachment.original_filename, attachment.original_type,
-                    attachment.original_size.map(|s| s as i64), now
+                    attachment.encryption_method, attachment.algorithm, now
                 ],
             )?;
             Ok(conn.last_insert_rowid())

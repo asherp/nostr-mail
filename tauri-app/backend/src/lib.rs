@@ -583,72 +583,17 @@ async fn publish_nostr_event(private_key: String, content: String, kind: u16, ta
 }
 
 #[tauri::command]
-async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, _state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] send_email called with {} attachments", attachments.as_ref().map(|a| a.len()).unwrap_or(0));
     
-    // First send the email via SMTP
+    // Send the email via SMTP
+    // Note: We don't save to database here - sent emails will be fetched from the server's sent folder via IMAP sync
+    // This avoids duplicate entries and ensures we have the server's version with proper headers
     email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref())
         .await
         .map_err(|e| e.to_string())?;
     
-    // If sending was successful, save the email to the database
-    if let Some(msg_id) = &message_id {
-        println!("[RUST] send_email: Saving sent email to database with message_id: {}", msg_id);
-        
-        let db = state.get_database().map_err(|e| e.to_string())?;
-        
-        // Create the email record
-        let email_record = crate::database::Email {
-            id: None,
-            message_id: msg_id.clone(),
-            from_address: email_config.email_address.clone(),
-            to_address: to_address.clone(),
-            subject: subject.clone(),
-            body: body.clone(),
-            body_plain: Some(body.clone()),
-            body_html: None,
-            received_at: chrono::Utc::now(),
-            is_nostr_encrypted: nostr_npub.is_some(),
-            nostr_pubkey: if let Some(private_key) = &email_config.private_key {
-                crate::crypto::get_public_key_from_private(private_key).ok()
-            } else {
-                None
-            },
-            raw_headers: None, // We don't have the raw headers here
-            is_draft: false,
-            is_read: true, // Mark sent emails as read
-            updated_at: None,
-            created_at: chrono::Utc::now(),
-        };
-        
-        // Save email with attachments if any
-        if let Some(attachments) = &attachments {
-            if !attachments.is_empty() {
-                db.save_email_with_attachments(&email_record, attachments)
-                    .map_err(|e| {
-                        println!("[RUST] send_email: Failed to save email with attachments: {}", e);
-                        format!("Failed to save sent email to database: {}", e)
-                    })?;
-                println!("[RUST] send_email: Successfully saved sent email with {} attachments to database", attachments.len());
-            } else {
-                db.save_email(&email_record)
-                    .map_err(|e| {
-                        println!("[RUST] send_email: Failed to save email: {}", e);
-                        format!("Failed to save sent email to database: {}", e)
-                    })?;
-                println!("[RUST] send_email: Successfully saved sent email to database");
-            }
-        } else {
-            db.save_email(&email_record)
-                .map_err(|e| {
-                    println!("[RUST] send_email: Failed to save email: {}", e);
-                    format!("Failed to save sent email to database: {}", e)
-                })?;
-            println!("[RUST] send_email: Successfully saved sent email to database");
-        }
-    } else {
-        println!("[RUST] send_email: No message_id provided, skipping database save");
-    }
+    println!("[RUST] send_email: Email sent successfully. It will appear in sent folder after IMAP sync.");
     
     Ok(())
 }
@@ -1581,8 +1526,11 @@ async fn sync_nostr_emails(config: EmailConfig, state: tauri::State<'_, AppState
 
 #[tauri::command]
 async fn sync_sent_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    println!("[RUST] sync_sent_emails command called");
     let db = state.get_database().map_err(|e| e.to_string())?;
-    email::sync_sent_emails_to_db(&config, &db).await.map_err(|e| e.to_string())
+    let result = email::sync_sent_emails_to_db(&config, &db).await.map_err(|e| e.to_string());
+    println!("[RUST] sync_sent_emails command completed with result: {:?}", result);
+    result
 }
 
 #[tauri::command]
@@ -2103,6 +2051,90 @@ fn db_delete_draft(message_id: String, state: tauri::State<AppState>) -> Result<
 }
 
 #[tauri::command]
+async fn db_delete_sent_email(message_id: String, user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] db_delete_sent_email called for message_id: {}", message_id);
+    
+    let db = state.get_database()?;
+    
+    // First, try to delete from the email server
+    // Get the email from database to find the from_address
+    if let Ok(Some(email)) = db.get_email(&message_id) {
+        let from_email = email.from_address.trim().to_lowercase();
+        
+        // Try to find settings that match this email address
+        // We'll need to check settings for all pubkeys, but that's complex
+        // For now, let's try a simpler approach: get all unique pubkeys and check their settings
+        // Actually, let's just try to get settings - if user_email is provided, we can use it to match
+        // But settings are keyed by pubkey, not email...
+        
+        // Simplified approach: Try to construct EmailConfig if we have user_email
+        // The frontend should pass the correct user_email that matches the email's from_address
+        if let Some(ref user_email_param) = user_email {
+            if user_email_param.trim().to_lowercase() == from_email {
+                // Try to get settings from database by querying for email_address setting
+                // Use a helper function to find pubkeys with matching email
+                let pubkeys_vec = match db.find_pubkeys_by_email_setting(user_email_param) {
+                    Ok(p) => p,
+                    Err(_) => vec![],
+                };
+                
+                if !pubkeys_vec.is_empty() {
+                    // Try each pubkey's settings
+                    for pubkey in pubkeys_vec {
+                        if let Ok(all_settings) = db.get_all_settings(&pubkey) {
+                            let email_address = all_settings.get("email_address").cloned();
+                            let password = all_settings.get("password").cloned();
+                            let imap_host = all_settings.get("imap_host").cloned();
+                            let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+                            let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+                            
+                            // Only attempt server deletion if we have the necessary config
+                            if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+                                if email_addr.to_lowercase() == from_email {
+                                    let email_config = crate::types::EmailConfig {
+                                        email_address: email_addr,
+                                        password: pwd,
+                                        smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+                                        smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+                                        imap_host: host,
+                                        imap_port: port,
+                                        use_tls,
+                                        private_key: all_settings.get("nostr_private_key").cloned(),
+                                    };
+                                    
+                                    println!("[RUST] db_delete_sent_email: Attempting to delete from email server");
+                                    // Use tokio::time::timeout to prevent hanging
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(30),
+                                        crate::email::delete_sent_email_from_server(&email_config, &message_id)
+                                    ).await {
+                                        Ok(Ok(_)) => {
+                                            println!("[RUST] db_delete_sent_email: Successfully deleted from email server");
+                                        }
+                                        Ok(Err(e)) => {
+                                            // Log error but continue with local deletion
+                                            println!("[RUST] db_delete_sent_email: Failed to delete from email server: {}, continuing with local deletion", e);
+                                        }
+                                        Err(_) => {
+                                            // Timeout occurred
+                                            println!("[RUST] db_delete_sent_email: Server deletion timed out after 30 seconds, continuing with local deletion");
+                                        }
+                                    }
+                                    break; // Found matching settings, stop searching
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Always delete locally, even if server deletion failed
+    db.delete_sent_email(&message_id, user_email.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn db_mark_as_read(message_id: String, state: tauri::State<AppState>) -> Result<(), String> {
     let db = state.get_database()?;
     db.mark_as_read(&message_id).map_err(|e| e.to_string())
@@ -2113,32 +2145,31 @@ fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String
     println!("[RUST] db_check_dm_matches_email_encrypted called for DM event_id: {}", dm_event_id);
     let db = state.get_database().map_err(|e| e.to_string())?;
     
-    // Get the encrypted DM content from the database using a proper method
-    // We'll need to add this method to the database module
-    let encrypted_dm_content = db.get_dm_encrypted_content_by_event_id(&dm_event_id)
-        .map_err(|e| e.to_string())?;
+    // Get the DM content hash for fast lookup
+    let dm_content_hash = match db.get_dm_content_hash_by_event_id(&dm_event_id)
+        .map_err(|e| e.to_string())? {
+        Some(hash) => hash,
+        None => {
+            println!("[RUST] DM not found or hash not available");
+            return Ok(false);
+        }
+    };
     
-    println!("[RUST] Found encrypted DM content length: {}", encrypted_dm_content.len());
-    println!("[RUST] Encrypted DM content sample: {}", encrypted_dm_content.chars().take(50).collect::<String>());
+    println!("[RUST] DM content hash: {}", dm_content_hash);
     
-    // Get all emails for this user that have encrypted subjects
-    let emails = db.get_emails(None, None, Some(true), None).map_err(|e| e.to_string())?;
-    println!("[RUST] Found {} emails with encrypted subjects", emails.len());
-    
-    for email in emails {
-        println!("[RUST] Checking email ID {} with subject length: {}", email.id.unwrap_or(0), email.subject.len());
-        println!("[RUST] Email subject sample: {}", email.subject.chars().take(50).collect::<String>());
-        
-        // Check if the encrypted email subject matches the encrypted DM content
-        if email.subject == encrypted_dm_content {
+    // Use hash-based lookup instead of scanning all emails
+    match db.find_email_by_subject_hash(&dm_content_hash)
+        .map_err(|e| e.to_string())? {
+        Some(email) => {
             println!("[RUST] Found matching email for DM content. Email ID: {}, Subject length: {}", 
                 email.id.unwrap_or(0), email.subject.len());
-            return Ok(true);
+            Ok(true)
+        },
+        None => {
+            println!("[RUST] No matching email found for DM content hash");
+            Ok(false)
         }
     }
-    
-    println!("[RUST] No matching email found for DM content");
-    Ok(false)
 }
 
 /// Extract encrypted content from ASCII armor
@@ -2165,72 +2196,112 @@ fn extract_encrypted_content_from_armor(body: &str) -> Option<String> {
 }
 
 #[tauri::command]
-fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<String>, String> {
+fn db_get_matching_email_id(dm_event_id: String, state: tauri::State<AppState>) -> Result<Option<i64>, String> {
+    println!("[RUST] db_get_matching_email_id called for DM event_id: {}", dm_event_id);
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    
+    // Get the DM content hash for fast lookup
+    let dm_content_hash = match db.get_dm_content_hash_by_event_id(&dm_event_id)
+        .map_err(|e| e.to_string())? {
+        Some(hash) => hash,
+        None => {
+            println!("[RUST] DM not found or hash not available");
+            return Ok(None);
+        }
+    };
+    
+    println!("[RUST] DM content hash: {}", dm_content_hash);
+    
+    // Use hash-based lookup instead of scanning all emails
+    match db.find_email_by_subject_hash(&dm_content_hash)
+        .map_err(|e| e.to_string())? {
+        Some(email) => {
+            let email_id = email.id;
+            println!("[RUST] Found matching email ID: {:?} for DM event_id: {}", email_id, dm_event_id);
+            Ok(email_id)
+        },
+        None => {
+            println!("[RUST] No matching email found for DM event_id: {}", dm_event_id);
+            Ok(None)
+        }
+    }
+}
+
+#[tauri::command]
+fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<types::MatchingEmailBodyResult>, String> {
     println!("[RUST] db_get_matching_email_body called for DM event_id: {}", dm_event_id);
     let db = state.get_database().map_err(|e| e.to_string())?;
     
-    // Get the encrypted DM content from the database
-    let encrypted_dm_content = db.get_dm_encrypted_content_by_event_id(&dm_event_id)
+    // Get the DM content hash for fast lookup
+    let dm_content_hash = match db.get_dm_content_hash_by_event_id(&dm_event_id)
+        .map_err(|e| e.to_string())? {
+        Some(hash) => hash,
+        None => {
+            println!("[RUST] DM not found or hash not available");
+            return Ok(None);
+        }
+    };
+    
+    println!("[RUST] DM content hash: {}", dm_content_hash);
+    
+    // Use hash-based lookup instead of scanning all emails
+    let email = match db.find_email_by_subject_hash(&dm_content_hash)
+        .map_err(|e| e.to_string())? {
+        Some(email) => email,
+        None => {
+            println!("[RUST] No matching email found for DM content");
+            return Ok(None);
+        }
+    };
+    
+    let email_id = email.id;
+    println!("[RUST] Found matching email for DM content. Email ID: {:?}, Subject length: {}", 
+        email_id, email.subject.len());
+    
+    // Extract recipient email from the email
+    let recipient_email = email.to_address;
+    println!("[RUST] Recipient email: {}", recipient_email);
+    
+    // Find the recipient's pubkey using the email address
+    let recipient_pubkeys = db.find_pubkeys_by_email(&recipient_email)
         .map_err(|e| e.to_string())?;
     
-    println!("[RUST] Found encrypted DM content length: {}", encrypted_dm_content.len());
+    if recipient_pubkeys.is_empty() {
+        println!("[RUST] No pubkeys found for recipient email: {}", recipient_email);
+        return Ok(None);
+    }
     
-    // Get all emails for this user that have encrypted subjects
-    let emails = db.get_emails(None, None, Some(true), None).map_err(|e| e.to_string())?;
-    println!("[RUST] Found {} emails with encrypted subjects", emails.len());
+    // Extract encrypted content from ASCII armor
+    let encrypted_content = match extract_encrypted_content_from_armor(&email.body) {
+        Some(content) => {
+            println!("[RUST] Extracted encrypted content from ASCII armor, length: {}", content.len());
+            content
+        },
+        None => {
+            println!("[RUST] No ASCII armor found in email body, trying raw body");
+            email.body.clone()
+        }
+    };
     
-    for email in emails {
-        // Check if the encrypted email subject matches the encrypted DM content
-        if email.subject == encrypted_dm_content {
-            println!("[RUST] Found matching email for DM content. Email ID: {}, Subject length: {}", 
-                email.id.unwrap_or(0), email.subject.len());
-            
-            // Extract recipient email from the email
-            let recipient_email = email.to_address;
-            println!("[RUST] Recipient email: {}", recipient_email);
-            
-            // Find the recipient's pubkey using the email address
-            let recipient_pubkeys = db.find_pubkeys_by_email(&recipient_email)
-                .map_err(|e| e.to_string())?;
-            
-            if recipient_pubkeys.is_empty() {
-                println!("[RUST] No pubkeys found for recipient email: {}", recipient_email);
-                return Ok(None);
+    // Try to decrypt the email body using each recipient pubkey
+    for recipient_pubkey in recipient_pubkeys {
+        println!("[RUST] Trying to decrypt with recipient pubkey: {}", recipient_pubkey);
+        match nostr::decrypt_dm_content(&private_key, &recipient_pubkey, &encrypted_content) {
+            Ok(decrypted_body) => {
+                println!("[RUST] Successfully decrypted email body with pubkey: {}", recipient_pubkey);
+                return Ok(Some(types::MatchingEmailBodyResult {
+                    body: decrypted_body,
+                    email_id: email_id,
+                }));
+            },
+            Err(e) => {
+                println!("[RUST] Failed to decrypt with pubkey {}: {}", recipient_pubkey, e);
+                // Continue to try the next pubkey
             }
-            
-            // Extract encrypted content from ASCII armor
-            let encrypted_content = match extract_encrypted_content_from_armor(&email.body) {
-                Some(content) => {
-                    println!("[RUST] Extracted encrypted content from ASCII armor, length: {}", content.len());
-                    content
-                },
-                None => {
-                    println!("[RUST] No ASCII armor found in email body, trying raw body");
-                    email.body.clone()
-                }
-            };
-            
-            // Try to decrypt the email body using each recipient pubkey
-            for recipient_pubkey in recipient_pubkeys {
-                println!("[RUST] Trying to decrypt with recipient pubkey: {}", recipient_pubkey);
-                match nostr::decrypt_dm_content(&private_key, &recipient_pubkey, &encrypted_content) {
-                    Ok(decrypted_body) => {
-                        println!("[RUST] Successfully decrypted email body with pubkey: {}", recipient_pubkey);
-                        return Ok(Some(decrypted_body));
-                    },
-                    Err(e) => {
-                        println!("[RUST] Failed to decrypt with pubkey {}: {}", recipient_pubkey, e);
-                        // Continue to try the next pubkey
-                    }
-                }
-            }
-            
-            println!("[RUST] Failed to decrypt email body with any recipient pubkey");
-            return Ok(None);
         }
     }
     
-    println!("[RUST] No matching email found for DM content");
+    println!("[RUST] Failed to decrypt email body with any recipient pubkey");
     Ok(None)
 }
 
@@ -2398,8 +2469,10 @@ pub fn run() {
         db_save_draft,
         db_get_drafts,
         db_delete_draft,
+        db_delete_sent_email,
         db_mark_as_read,
         db_check_dm_matches_email_encrypted,
+        db_get_matching_email_id,
         db_get_matching_email_body,
     ]);
     println!("[RUST] Invoke handler registered successfully");

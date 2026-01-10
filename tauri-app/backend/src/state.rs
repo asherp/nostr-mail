@@ -360,11 +360,19 @@ impl AppState {
     pub async fn update_single_relay(&self, relay_url: &str, is_active: bool) -> Result<(), String> {
         println!("[RUST] Updating single relay: {} (active: {})", relay_url, is_active);
         
-        // Update the relay in local state
+        // Update the relay in local state, or add it if it doesn't exist
         {
             let mut relays_guard = self.relays.lock().unwrap();
             if let Some(relay) = relays_guard.iter_mut().find(|r| r.url == relay_url) {
                 relay.is_active = is_active;
+            } else {
+                // Relay doesn't exist in in-memory state, add it
+                // This can happen when a new relay is added to the database but state hasn't been synced
+                println!("[RUST] Relay {} not found in in-memory state, adding it", relay_url);
+                relays_guard.push(Relay {
+                    url: relay_url.to_string(),
+                    is_active,
+                });
             }
         }
         

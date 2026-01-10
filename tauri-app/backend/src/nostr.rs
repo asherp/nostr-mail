@@ -62,6 +62,7 @@ pub async fn publish_event(
     Ok(event_id.to_hex())
 }
 
+#[allow(dead_code)]
 pub async fn send_direct_message(
     private_key: &str,
     recipient_pubkey: &str,
@@ -125,6 +126,7 @@ pub async fn send_direct_message(
     Ok(event_id.to_hex())
 }
 
+#[allow(dead_code)]
 pub async fn send_direct_message_with_content(
     private_key: &str,
     recipient_pubkey: &str,

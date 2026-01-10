@@ -11,10 +11,25 @@
     border-bottom: 1px solid #e0e0e0;
     cursor: pointer;
     transition: background-color 0.3s ease;
+    position: relative;
 }
 
 .email-item:hover {
     background-color: #f8f9fa;
+}
+
+/* Sent email delete button - hidden by default, shown on hover, positioned on far right */
+.email-item .email-actions {
+    position: absolute;
+    right: 20px;
+    top: 50%;
+    transform: translateY(-50%);
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+
+.email-item:hover .email-actions {
+    opacity: 1;
 }
 
 .email-item.unread {
@@ -182,6 +197,10 @@ body.dark-mode .email-item {
 body.dark-mode .email-item.unread {
     background-color: #181a20;
     border-left: 4px solid #667eea;
+}
+
+body.dark-mode .email-item:hover {
+    background-color: #181a20;
 }
 
 /* Inbox Search Styles */

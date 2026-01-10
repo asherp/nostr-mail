@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use sha2::{Sha256, Digest};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Contact {
@@ -49,6 +50,7 @@ pub struct DirectMessage {
     pub received_at: DateTime<Utc>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserSettings {
     pub id: Option<i64>,
@@ -100,6 +102,13 @@ impl Database {
         Ok(db)
     }
 
+    /// Compute SHA256 hash of encrypted content for fast lookups
+    fn compute_content_hash(content: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     fn init_tables(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         
@@ -123,7 +132,7 @@ impl Database {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS emails (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id TEXT NOT NULL,
+                message_id TEXT NOT NULL UNIQUE,
                 from_address TEXT NOT NULL,
                 to_address TEXT NOT NULL,
                 subject TEXT NOT NULL,
@@ -139,6 +148,12 @@ impl Database {
                 updated_at DATETIME,
                 created_at DATETIME NOT NULL
             )",
+            [],
+        )?;
+        
+        // Add UNIQUE constraint to message_id if it doesn't exist (for existing databases)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_emails_message_id_unique ON emails(message_id)",
             [],
         )?;
 
@@ -234,17 +249,99 @@ impl Database {
             [],
         )?;
 
+        // Migrate: Add hash columns to emails and direct_messages tables if they don't exist
+        Self::migrate_add_hash_columns(&conn)?;
+
         // Create indexes for better performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_pubkey ON contacts(pubkey)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_message_id ON emails(message_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_received_at ON emails(received_at)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_subject_hash ON emails(subject_hash)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_event_id ON direct_messages(event_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_created_at ON direct_messages(created_at)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_content_hash ON direct_messages(content_hash)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_key ON user_settings(key)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_pubkey ON user_settings(pubkey)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_pubkey_key ON user_settings(pubkey, key)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_relays_url ON relays(url)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_email_id ON attachments(email_id)", [])?;
+
+        Ok(())
+    }
+
+    /// Migration: Add hash columns to emails and direct_messages tables
+    fn migrate_add_hash_columns(conn: &Connection) -> Result<()> {
+        // Check if subject_hash column exists in emails table
+        let has_subject_hash = {
+            let mut stmt = conn.prepare("PRAGMA table_info(emails)")?;
+            let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?) // column name
+            })?.collect();
+            columns.map(|cols| cols.contains(&"subject_hash".to_string())).unwrap_or(false)
+        };
+
+        if !has_subject_hash {
+            println!("[DB] Adding subject_hash column to emails table");
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN subject_hash TEXT",
+                [],
+            )?;
+            
+            // Backfill hash for existing encrypted emails
+            println!("[DB] Backfilling subject_hash for existing encrypted emails");
+            let mut stmt = conn.prepare("SELECT id, subject FROM emails WHERE is_nostr_encrypted = 1 AND (subject_hash IS NULL OR subject_hash = '')")?;
+            let rows: Result<Vec<(i64, String)>, _> = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?.collect();
+            
+            if let Ok(rows) = rows {
+                let count = rows.len();
+                for (id, subject) in rows {
+                    let hash = Self::compute_content_hash(&subject);
+                    conn.execute(
+                        "UPDATE emails SET subject_hash = ? WHERE id = ?",
+                        params![hash, id],
+                    )?;
+                }
+                println!("[DB] Backfilled {} email hashes", count);
+            }
+        }
+
+        // Check if content_hash column exists in direct_messages table
+        let has_content_hash = {
+            let mut stmt = conn.prepare("PRAGMA table_info(direct_messages)")?;
+            let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?) // column name
+            })?.collect();
+            columns.map(|cols| cols.contains(&"content_hash".to_string())).unwrap_or(false)
+        };
+
+        if !has_content_hash {
+            println!("[DB] Adding content_hash column to direct_messages table");
+            conn.execute(
+                "ALTER TABLE direct_messages ADD COLUMN content_hash TEXT",
+                [],
+            )?;
+            
+            // Backfill hash for existing DMs
+            println!("[DB] Backfilling content_hash for existing direct messages");
+            let mut stmt = conn.prepare("SELECT id, content FROM direct_messages WHERE content_hash IS NULL OR content_hash = ''")?;
+            let rows: Result<Vec<(i64, String)>, _> = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?.collect();
+            
+            if let Ok(rows) = rows {
+                let count = rows.len();
+                for (id, content) in rows {
+                    let hash = Self::compute_content_hash(&content);
+                    conn.execute(
+                        "UPDATE direct_messages SET content_hash = ? WHERE id = ?",
+                        params![hash, id],
+                    )?;
+                }
+                println!("[DB] Backfilled {} DM hashes", count);
+            }
+        }
 
         Ok(())
     }
@@ -335,47 +432,152 @@ impl Database {
 
     // Email operations
     pub fn save_email(&self, email: &Email) -> Result<i64> {
+        println!("[DB] save_email: Starting save for message_id={}, has_id={}", 
+            email.message_id, email.id.is_some());
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         
+        // Compute hash for encrypted emails
+        let subject_hash = if email.is_nostr_encrypted {
+            Some(Self::compute_content_hash(&email.subject))
+        } else {
+            None
+        };
+
         if let Some(id) = email.id {
+            println!("[DB] save_email: Updating existing email with id={}", id);
             conn.execute(
                 "UPDATE emails SET 
                     message_id = ?, from_address = ?, to_address = ?, subject = ?, 
                     body = ?, body_plain = ?, body_html = ?, received_at = ?, 
-                    is_nostr_encrypted = ?, nostr_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?
+                    is_nostr_encrypted = ?, nostr_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?,
+                    subject_hash = ?
                 WHERE id = ?",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
-                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now, id
+                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
+                    subject_hash, id
                 ],
             )?;
+            println!("[DB] save_email: Successfully updated email id={}", id);
             Ok(id)
         } else {
-            let _id = conn.execute(
-                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    email.message_id, email.from_address, email.to_address, email.subject,
-                    email.body, email.body_plain, email.body_html, email.received_at,
-                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now
-                ],
-            )?;
-            Ok(conn.last_insert_rowid())
+            println!("[DB] save_email: Checking if email with message_id {} already exists", email.message_id);
+            // Check if email with this message_id already exists (normalized comparison)
+            match self.get_email(&email.message_id) {
+                Ok(Some(existing_email)) => {
+                    // Email already exists, update it instead of creating duplicate
+                    println!("[DB] Email with message_id {} already exists (id: {}), updating instead of creating duplicate", email.message_id, existing_email.id.unwrap_or(0));
+                    drop(conn); // Release lock before recursive call
+                    return self.save_email(&Email {
+                        id: existing_email.id,
+                        ..email.clone()
+                    });
+                }
+                Ok(None) => {
+                    println!("[DB] save_email: Email is new, inserting into database");
+                    println!("[DB] save_email: About to execute INSERT statement");
+                    match conn.execute(
+                        "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        params![
+                            email.message_id, email.from_address, email.to_address, email.subject,
+                            email.body, email.body_plain, email.body_html, email.received_at,
+                            email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
+                            subject_hash
+                        ],
+                    ) {
+                        Ok(rows_affected) => {
+                            let new_id = conn.last_insert_rowid();
+                            println!("[DB] save_email: Successfully inserted email, rows_affected={}, new_id={}", rows_affected, new_id);
+                            Ok(new_id)
+                        }
+                        Err(e) => {
+                            println!("[DB] save_email: ERROR executing INSERT: {}", e);
+                            Err(e)
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[DB] save_email: ERROR checking if email exists: {}", e);
+                    Err(e)
+                }
+            }
         }
+    }
+    
+    // Insert email directly without checking for duplicates (faster when we already know it's new)
+    pub fn insert_email_direct(&self, email: &Email) -> Result<i64> {
+        println!("[DB] insert_email_direct: Inserting email directly without duplicate check, message_id={}", email.message_id);
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        
+        // Compute hash for encrypted emails
+        let subject_hash = if email.is_nostr_encrypted {
+            Some(Self::compute_content_hash(&email.subject))
+        } else {
+            None
+        };
+        
+        println!("[DB] insert_email_direct: About to execute INSERT statement");
+        match conn.execute(
+            "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                email.message_id, email.from_address, email.to_address, email.subject,
+                email.body, email.body_plain, email.body_html, email.received_at,
+                email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
+                subject_hash
+            ],
+        ) {
+            Ok(rows_affected) => {
+                let new_id = conn.last_insert_rowid();
+                println!("[DB] insert_email_direct: Successfully inserted email, rows_affected={}, new_id={}", rows_affected, new_id);
+                Ok(new_id)
+            }
+            Err(e) => {
+                println!("[DB] insert_email_direct: ERROR executing INSERT: {}", e);
+                // If it's a unique constraint violation, the email already exists - fall back to save_email
+                if e.to_string().contains("UNIQUE constraint") || e.to_string().contains("unique") {
+                    println!("[DB] insert_email_direct: Unique constraint violation, falling back to save_email");
+                    drop(conn);
+                    return self.save_email(email);
+                }
+                Err(e)
+            }
+        }
+    }
+    
+    // Normalize message_id for comparison (remove angle brackets and whitespace)
+    fn normalize_message_id(message_id: &str) -> String {
+        message_id.trim().trim_start_matches('<').trim_end_matches('>').to_string()
     }
 
     pub fn get_email(&self, message_id: &str) -> Result<Option<Email>> {
+        println!("[DB] get_email: Checking for message_id={}", message_id);
         let conn = self.conn.lock().unwrap();
+        println!("[DB] get_email: Acquired database lock");
+        // Normalize message_id for comparison
+        let normalized_id = Self::normalize_message_id(message_id);
+        println!("[DB] get_email: Normalized message_id={}", normalized_id);
+        
+        // Use SQL query with normalization to find matching email efficiently
+        // SQLite's TRIM and REPLACE can handle the normalization
+        // We'll try multiple formats: exact match, normalized match, and with/without angle brackets
         let mut stmt = conn.prepare(
             "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
-             FROM emails WHERE message_id = ?"
+             FROM emails 
+             WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? 
+             ORDER BY received_at DESC"
         )?;
+        println!("[DB] get_email: Prepared optimized query with normalization");
         
-        let mut rows = stmt.query(params![message_id])?;
+        let mut rows = stmt.query(params![normalized_id])?;
+        
+        // Get the first matching email (most recent if multiple)
         if let Some(row) = rows.next()? {
-            Ok(Some(Email {
+            let email = Email {
                 id: Some(row.get(0)?),
                 message_id: row.get(1)?,
                 from_address: row.get(2)?,
@@ -392,10 +594,13 @@ impl Database {
                 is_read: row.get(13)?,
                 updated_at: row.get(14)?,
                 created_at: row.get(15)?,
-            }))
-        } else {
-            Ok(None)
+            };
+            println!("[DB] get_email: Found matching email, id={:?}", email.id);
+            return Ok(Some(email));
         }
+        
+        println!("[DB] get_email: No matching email found");
+        Ok(None)
     }
 
     pub fn get_emails(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>) -> Result<Vec<Email>> {
@@ -448,6 +653,25 @@ impl Database {
         rows.collect()
     }
 
+    // Normalize Gmail address by removing + aliases (e.g., user+alias@gmail.com -> user@gmail.com)
+    fn normalize_gmail_address(email: &str) -> String {
+        let email_lower = email.trim().to_lowercase();
+        if email_lower.contains("@gmail.com") {
+            if let Some(at_pos) = email_lower.find('@') {
+                let local_part = &email_lower[..at_pos];
+                let domain = &email_lower[at_pos..];
+                // Remove everything after + if present
+                let normalized_local = if let Some(plus_pos) = local_part.find('+') {
+                    &local_part[..plus_pos]
+                } else {
+                    local_part
+                };
+                return format!("{}{}", normalized_local, domain);
+            }
+        }
+        email_lower
+    }
+
     pub fn get_sent_emails(&self, limit: Option<i64>, offset: Option<i64>, user_email: Option<&str>) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.unwrap_or(50);
@@ -458,9 +682,42 @@ impl Database {
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
+        
+        // Always exclude drafts from sent emails
+        where_clauses.push("is_draft = 0");
+        
         if let Some(email) = user_email {
-            where_clauses.push("LOWER(TRIM(from_address)) = LOWER(TRIM(?))");
-            params.push(Box::new(email));
+            // Normalize the user email for Gmail addresses
+            let normalized_user_email = Self::normalize_gmail_address(email);
+            let user_email_lower = email.trim().to_lowercase();
+            println!("[DB] get_sent_emails: user_email={}, normalized={}", email, normalized_user_email);
+            
+            // For Gmail addresses, always match both the original and normalized versions
+            // This handles cases where:
+            // - User receives at apembroke+nostr@gmail.com but sends from apembroke@gmail.com
+            // - User sends from apembroke+nostr@gmail.com but Gmail stores it as apembroke@gmail.com
+            if email.contains("@gmail.com") {
+                if normalized_user_email != user_email_lower {
+                    // User email has a + alias, match both versions
+                    println!("[DB] get_sent_emails: Matching both original ({}) and normalized ({}) Gmail addresses", user_email_lower, normalized_user_email);
+                    where_clauses.push("(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?)))");
+                    params.push(Box::new(user_email_lower.clone()));
+                    params.push(Box::new(normalized_user_email.clone()));
+                } else {
+                    // User email is already normalized (no + alias), but still match both to handle from_address with + aliases
+                    println!("[DB] get_sent_emails: Matching Gmail address {} and normalized version", user_email_lower);
+                    where_clauses.push("(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?)))");
+                    params.push(Box::new(user_email_lower.clone()));
+                    params.push(Box::new(normalized_user_email.clone()));
+                }
+            } else {
+                // Non-Gmail, just match exactly
+                where_clauses.push("LOWER(TRIM(from_address)) = LOWER(TRIM(?))");
+                params.push(Box::new(user_email_lower));
+                println!("[DB] get_sent_emails: Matching non-Gmail email address");
+            }
+        } else {
+            println!("[DB] get_sent_emails: No user_email filter provided, returning all non-draft emails");
         }
         if !where_clauses.is_empty() {
             query.push_str(" WHERE ");
@@ -469,6 +726,8 @@ impl Database {
         query.push_str(" ORDER BY received_at DESC LIMIT ? OFFSET ?");
         params.push(Box::new(limit));
         params.push(Box::new(offset));
+        
+        println!("[DB] get_sent_emails: Executing query: {}", query);
 
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
@@ -491,7 +750,13 @@ impl Database {
                 created_at: row.get(15)?,
             })
         })?;
-        rows.collect()
+        let emails: Vec<Email> = rows.collect::<Result<Vec<_>, _>>()?;
+        println!("[DB] get_sent_emails: Found {} emails matching query", emails.len());
+        for (i, email) in emails.iter().enumerate() {
+            println!("[DB] get_sent_emails: Email {}: id={:?}, from={}, subject={}", 
+                i + 1, email.id, email.from_address, email.subject);
+        }
+        Ok(emails)
     }
 
     pub fn get_latest_nostr_email_received_at(&self) -> Result<Option<DateTime<Utc>>> {
@@ -511,11 +776,24 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         
         if let Some(email) = user_email {
+            // Normalize the user email for Gmail addresses
+            let normalized_user_email = Self::normalize_gmail_address(email);
             // Properly identify sent emails as those where the user is the sender
-            let mut stmt = conn.prepare(
-                "SELECT received_at FROM emails WHERE is_nostr_encrypted = 1 AND LOWER(TRIM(from_address)) = LOWER(TRIM(?)) ORDER BY received_at DESC LIMIT 1"
-            )?;
-            let mut rows = stmt.query(params![email])?;
+            // Match both original and normalized versions for Gmail + aliases
+            let mut stmt = if normalized_user_email != email.trim().to_lowercase() {
+                conn.prepare(
+                    "SELECT received_at FROM emails WHERE is_nostr_encrypted = 1 AND (LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?))) ORDER BY received_at DESC LIMIT 1"
+                )?
+            } else {
+                conn.prepare(
+                    "SELECT received_at FROM emails WHERE is_nostr_encrypted = 1 AND LOWER(TRIM(from_address)) = LOWER(TRIM(?)) ORDER BY received_at DESC LIMIT 1"
+                )?
+            };
+            let mut rows = if normalized_user_email != email.trim().to_lowercase() {
+                stmt.query(params![email, normalized_user_email])?
+            } else {
+                stmt.query(params![email])?
+            };
             if let Some(row) = rows.next()? {
                 Ok(Some(row.get(0)?))
             } else {
@@ -539,25 +817,28 @@ impl Database {
     pub fn save_dm(&self, dm: &DirectMessage) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         
+        // Compute hash for DM content
+        let content_hash = Self::compute_content_hash(&dm.content);
+        
         if let Some(id) = dm.id {
             conn.execute(
                 "UPDATE direct_messages SET 
                     event_id = ?, sender_pubkey = ?, recipient_pubkey = ?, content = ?, 
-                    created_at = ?, received_at = ?
+                    created_at = ?, received_at = ?, content_hash = ?
                 WHERE id = ?",
                 params![
                     dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.created_at, dm.received_at, id
+                    dm.created_at, dm.received_at, content_hash, id
                 ],
             )?;
             Ok(id)
         } else {
             let _id = conn.execute(
-                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at)
-                VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)",
                 params![
                     dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.created_at, dm.received_at
+                    dm.created_at, dm.received_at, content_hash
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -575,12 +856,14 @@ impl Database {
             if rows.next()?.is_some() {
                 continue; // Skip if already exists
             }
+            // Compute hash for DM content
+            let content_hash = Self::compute_content_hash(&dm.content);
             conn.execute(
-                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at)
-                VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)",
                 params![
                     dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.created_at, dm.received_at
+                    dm.created_at, dm.received_at, content_hash
                 ],
             )?;
             inserted += 1;
@@ -636,6 +919,69 @@ impl Database {
         })?;
         
         rows.next().ok_or(rusqlite::Error::QueryReturnedNoRows)?
+    }
+
+    /// Get DM content hash by event_id for fast matching
+    pub fn get_dm_content_hash_by_event_id(&self, event_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT content_hash FROM direct_messages WHERE event_id = ?"
+        )?;
+        let mut rows = stmt.query_map(params![event_id], |row| {
+            Ok(row.get::<_, Option<String>>(0)?)
+        })?;
+        
+        match rows.next() {
+            Some(Ok(Some(hash))) => Ok(Some(hash)),
+            Some(Ok(None)) => {
+                // Hash not set, compute it from content
+                let content = self.get_dm_encrypted_content_by_event_id(event_id)?;
+                let hash = Self::compute_content_hash(&content);
+                // Update the database with the hash
+                conn.execute(
+                    "UPDATE direct_messages SET content_hash = ? WHERE event_id = ?",
+                    params![hash, event_id],
+                )?;
+                Ok(Some(hash))
+            },
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Find email by subject hash (for fast DM-email matching)
+    pub fn find_email_by_subject_hash(&self, subject_hash: &str) -> Result<Option<Email>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
+             FROM emails WHERE subject_hash = ? AND is_nostr_encrypted = 1 LIMIT 1"
+        )?;
+        let mut rows = stmt.query_map(params![subject_hash], |row| {
+            Ok(Email {
+                id: Some(row.get(0)?),
+                message_id: row.get(1)?,
+                from_address: row.get(2)?,
+                to_address: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                body_plain: row.get(6)?,
+                body_html: row.get(7)?,
+                received_at: row.get(8)?,
+                is_nostr_encrypted: row.get(9)?,
+                nostr_pubkey: row.get(10)?,
+                raw_headers: row.get(11)?,
+                is_draft: row.get(12)?,
+                is_read: row.get(13)?,
+                updated_at: row.get(14)?,
+                created_at: row.get(15)?,
+            })
+        })?;
+        
+        match rows.next() {
+            Some(Ok(email)) => Ok(Some(email)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
     }
 
     // Attachment operations
@@ -887,6 +1233,26 @@ impl Database {
         println!("[RUST] Found pubkeys for email '{}': {:?}", email_trimmed, pubkeys);
         Ok(pubkeys)
     }
+    
+    /// Returns a list of pubkeys whose email_address setting matches the given email address (case-insensitive, trimmed)
+    pub fn find_pubkeys_by_email_setting(&self, email: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let email_trimmed = email.trim().to_lowercase();
+        println!("[RUST] Searching for pubkeys with email_address setting: {}", email_trimmed);
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT pubkey FROM user_settings WHERE key = 'email_address' AND LOWER(TRIM(value)) = ?1"
+        )?;
+        let rows = stmt.query_map(params![email_trimmed], |row| {
+            let pubkey: String = row.get(0)?;
+            Ok(pubkey)
+        })?;
+        let mut pubkeys = Vec::new();
+        for row in rows {
+            pubkeys.push(row?);
+        }
+        println!("[RUST] Found pubkeys for email_address setting '{}': {:?}", email_trimmed, pubkeys);
+        Ok(pubkeys)
+    }
 
     pub fn update_email_nostr_pubkey(&self, message_id: &str, nostr_pubkey: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1024,10 +1390,39 @@ impl Database {
 
     pub fn delete_draft(&self, message_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Delete attachments first (CASCADE should handle this, but explicit is safer)
+        if let Ok(Some(email)) = self.get_email(message_id) {
+            if let Some(email_id) = email.id {
+                self.delete_attachments_for_email(email_id)?;
+            }
+        }
         conn.execute(
             "DELETE FROM emails WHERE message_id = ? AND is_draft = 1",
             params![message_id],
         )?;
+        Ok(())
+    }
+    
+    pub fn delete_sent_email(&self, message_id: &str, user_email: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // Delete attachments first
+        if let Ok(Some(email)) = self.get_email(message_id) {
+            if let Some(email_id) = email.id {
+                self.delete_attachments_for_email(email_id)?;
+            }
+        }
+        
+        // Delete the email (only if it's a sent email, not a draft)
+        let mut query = String::from("DELETE FROM emails WHERE message_id = ? AND is_draft = 0");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(message_id)];
+        
+        // Optionally filter by user_email to ensure user can only delete their own sent emails
+        if let Some(email) = user_email {
+            query.push_str(" AND LOWER(TRIM(from_address)) = LOWER(TRIM(?))");
+            params.push(Box::new(email));
+        }
+        
+        conn.execute(&query, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 

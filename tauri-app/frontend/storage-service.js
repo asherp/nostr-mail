@@ -49,7 +49,7 @@ class StorageService {
                 throw new Error(result.error || 'Unknown error');
             }
         }
-    },
+    }
 
     // Contact operations
     async saveContacts(contacts) {

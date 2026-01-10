@@ -19,6 +19,48 @@ use native_tls::TlsConnector;
 use uuid::Uuid;
 use base64::{Engine as _, engine::general_purpose};
 
+/// Decode RFC 2047 encoded header value and fix UTF-8 encoding issues
+/// mailparse should handle RFC 2047 automatically, but this fixes common UTF-8 misinterpretations
+fn decode_header_value(value: &str) -> String {
+    // Fix common UTF-8 encoding issues where UTF-8 bytes are interpreted as Latin-1
+    // These patterns occur when UTF-8 sequences are read as single-byte characters
+    // The pattern "â€™" represents UTF-8 bytes E2 80 99 (right single quotation mark U+2019)
+    // being misinterpreted as three Latin-1 characters
+    
+    let apostrophe = "'";
+    let result = value
+        // Fix right single quotation mark (most common apostrophe issue)
+        .replace("\u{00E2}\u{0080}\u{0099}", apostrophe)  // â€™ -> '
+        .replace("\u{00E2}\u{0080}\u{009C}", "\"")        // â€œ -> "
+        .replace("\u{00E2}\u{0080}\u{009D}", "\"")        // â€ -> "
+        .replace("\u{00E2}\u{0080}\u{0094}", "—")         // â€" -> —
+        .replace("\u{00E2}\u{0080}\u{0093}", "–")         // â€" -> –
+        .replace('\u{FFFD}', apostrophe)                   // Replacement character -> apostrophe
+        // Handle common contractions where â appears before t
+        .replace("doesn\u{00E2}", "doesn't")
+        .replace("won\u{00E2}", "won't")
+        .replace("can\u{00E2}", "can't")
+        .replace("isn\u{00E2}", "isn't")
+        .replace("aren\u{00E2}", "aren't")
+        .replace("wasn\u{00E2}", "wasn't")
+        .replace("weren\u{00E2}", "weren't")
+        .replace("haven\u{00E2}", "haven't")
+        .replace("hasn\u{00E2}", "hasn't")
+        .replace("hadn\u{00E2}", "hadn't")
+        .replace("wouldn\u{00E2}", "wouldn't")
+        .replace("couldn\u{00E2}", "couldn't")
+        .replace("shouldn\u{00E2}", "shouldn't")
+        .replace("mustn\u{00E2}", "mustn't")
+        .replace("mightn\u{00E2}", "mightn't")
+        .replace("needn\u{00E2}", "needn't")
+        .replace("daren\u{00E2}", "daren't")
+        .replace("mayn\u{00E2}", "mayn't")
+        .replace("shan\u{00E2}", "shan't");
+    
+    // Also handle the pattern where â appears before t (common in contractions)
+    result.replace("\u{00E2} t", "'t")
+}
+
 #[derive(Debug, Clone)]
 struct XNostrPubkey(String);
 
@@ -305,6 +347,187 @@ pub async fn send_email(
     }
 }
 
+/// Delete a sent email from the IMAP server by moving it to Trash
+/// For Gmail, moves to [Gmail]/Trash
+/// For other providers, tries common trash folder names
+pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &str) -> Result<()> {
+    use std::net::TcpStream;
+    use native_tls::TlsConnector;
+    
+    let host = &config.imap_host;
+    let port = config.imap_port;
+    let username = &config.email_address;
+    let password = &config.password;
+    let use_tls = config.use_tls;
+    let addr = format!("{}:{}", host, port);
+    let is_gmail = host.contains("gmail.com");
+    
+    println!("[RUST] delete_sent_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
+    
+    // Handle TLS and non-TLS connections separately due to type differences
+    // Use a block to ensure session is dropped/logged out properly
+    let result = if use_tls {
+        let tls = TlsConnector::builder().build()?;
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let tls_stream = tls.connect(host, tcp_stream)?;
+        let client = imap::Client::new(tls_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        
+        let result = delete_sent_email_from_session(&mut session, is_gmail, message_id).await;
+        // Close the session properly - ignore errors on logout
+        let _ = session.logout();
+        println!("[RUST] delete_sent_email_from_server: Session closed");
+        result
+    } else {
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let client = imap::Client::new(tcp_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        
+        let result = delete_sent_email_from_session(&mut session, is_gmail, message_id).await;
+        // Close the session properly - ignore errors on logout
+        let _ = session.logout();
+        println!("[RUST] delete_sent_email_from_server: Session closed");
+        result
+    };
+    
+    result
+}
+
+/// Helper function to delete email from IMAP session (works with both TLS and non-TLS)
+async fn delete_sent_email_from_session(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    is_gmail: bool,
+    message_id: &str,
+) -> Result<()> {
+    
+    // Select the sent folder
+    let sent_folder = if is_gmail {
+        "[Gmail]/Sent Mail"
+    } else {
+        "Sent"
+    };
+    
+    println!("[RUST] delete_sent_email_from_session: Selecting sent folder: {}", sent_folder);
+    
+    // Try to select the sent folder, fallback to common variations
+    let folder_selected = session.select(sent_folder).is_ok() || 
+                         session.select("Sent Mail").is_ok() || 
+                         session.select("Sent Items").is_ok() ||
+                         session.select("Sent").is_ok();
+    
+    if !folder_selected {
+        println!("[RUST] delete_sent_email_from_session: Could not select sent folder, aborting server deletion");
+        return Err(anyhow::anyhow!("Could not select sent folder"));
+    }
+    
+    // Search for the email by Message-ID header
+    // The message_id might be just the UUID or the full <uuid@domain> format
+    // Try both formats to ensure we find it
+    let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+    
+    // Try searching with the full Message-ID format first (with angle brackets)
+    let full_msg_id = if normalized_msg_id.contains('@') {
+        format!("<{}>", normalized_msg_id)
+    } else {
+        // If it's just a UUID, add the @nostr-mail domain
+        format!("<{}@nostr-mail>", normalized_msg_id)
+    };
+    
+    // Try multiple search formats
+    let search_queries = vec![
+        format!("HEADER Message-ID \"{}\"", full_msg_id),
+        format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+        format!("HEADER Message-ID \"{}\"", message_id.trim()),
+    ];
+    
+    let mut matching_messages = std::collections::HashSet::new();
+    for search_query in &search_queries {
+        println!("[RUST] delete_sent_email_from_session: Searching for email with query: {}", search_query);
+        match session.search(search_query) {
+            Ok(results) => {
+                let result_count = results.len();
+                if !results.is_empty() {
+                    matching_messages.extend(results);
+                    println!("[RUST] delete_sent_email_from_session: Found {} matching message(s) with query: {}", result_count, search_query);
+                    break; // Found results, no need to try other formats
+                }
+            }
+            Err(e) => {
+                println!("[RUST] delete_sent_email_from_session: Search query failed: {} - {}", search_query, e);
+            }
+        }
+    }
+    
+    if matching_messages.is_empty() {
+        println!("[RUST] delete_sent_email_from_session: No email found with Message-ID (tried: {}, {}, {})", full_msg_id, normalized_msg_id, message_id.trim());
+        return Err(anyhow::anyhow!("Email not found on server"));
+    }
+    
+    println!("[RUST] delete_sent_email_from_session: Found {} matching message(s)", matching_messages.len());
+    
+    // Get the message sequence number (should be just one)
+    // Convert HashSet to Vec to get the first element
+    let message_seq = *matching_messages.iter().next().ok_or_else(|| anyhow::anyhow!("No message sequence found"))?;
+    
+    // Determine trash folder name
+    let trash_folder = if is_gmail {
+        "[Gmail]/Trash"
+    } else {
+        // Try common trash folder names
+        "Trash"
+    };
+    
+    println!("[RUST] delete_sent_email_from_session: Moving message {} to trash folder: {}", message_seq, trash_folder);
+    
+    // Use MOVE command (mv method) to move the message to trash
+    // This is supported by Gmail and other modern IMAP servers
+    let message_seq_str = format!("{}", message_seq);
+    match session.mv(&message_seq_str, trash_folder) {
+        Ok(_) => {
+            println!("[RUST] delete_sent_email_from_session: Successfully moved email to trash using MOVE command");
+            return Ok(());
+        }
+        Err(e) => {
+            println!("[RUST] delete_sent_email_from_session: MOVE command failed: {}, trying COPY + DELETE", e);
+        }
+    }
+    
+    // Fallback: Use COPY + STORE + EXPUNGE if MOVE is not supported
+    // First, try to copy to trash
+    let copy_result = session.copy(&message_seq_str, trash_folder);
+    match copy_result {
+        Ok(_) => {
+            println!("[RUST] delete_sent_email_from_session: Successfully copied email to trash");
+            // Mark original as deleted
+            session.store(&message_seq_str, "+FLAGS (\\Deleted)")?;
+            // Expunge to actually delete
+            session.expunge()?;
+            println!("[RUST] delete_sent_email_from_session: Successfully deleted email from sent folder");
+            Ok(())
+        }
+        Err(e) => {
+            // If COPY fails, try alternative trash folder names
+            let alternative_trash_folders = if is_gmail {
+                vec!["[Gmail]/Trash"]
+            } else {
+                vec!["Trash", "Deleted", "Deleted Items", "Junk"]
+            };
+            
+            for alt_trash in alternative_trash_folders {
+                println!("[RUST] delete_sent_email_from_session: Trying alternative trash folder: {}", alt_trash);
+                if session.copy(&message_seq_str, alt_trash).is_ok() {
+                    session.store(&message_seq_str, "+FLAGS (\\Deleted)")?;
+                    session.expunge()?;
+                    println!("[RUST] delete_sent_email_from_session: Successfully moved email to {} using COPY", alt_trash);
+                    return Ok(());
+                }
+            }
+            
+            Err(anyhow::anyhow!("Failed to move email to trash: {}", e))
+        }
+    }
+}
+
 /// Test IMAP connection with the given config. Returns Ok(()) if successful, Err otherwise.
 pub async fn test_imap_connection(config: &EmailConfig) -> Result<()> {
     let host = &config.imap_host;
@@ -463,9 +686,10 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     .get_first_value("To")
                     .unwrap_or_else(|| config.email_address.clone());
                 
-                let subject = email.headers
+                let subject_raw = email.headers
                     .get_first_value("Subject")
                     .unwrap_or_else(|| "No Subject".to_string());
+                let subject = decode_header_value(&subject_raw);
                 
                 let date_str = email.headers
                     .get_first_value("Date")
@@ -566,7 +790,8 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
             if let Ok(email) = parse_mail(body) {
                 let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
                 let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
-                let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject_raw = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject = decode_header_value(&subject_raw);
                 let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
                 let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                     .map(|dt| dt.with_timezone(&Utc))
@@ -833,7 +1058,8 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
             if let Ok(email) = parse_mail(body) {
                 let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
                 let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
-                let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject_raw = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject = decode_header_value(&subject_raw);
                 let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
                 let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                     .map(|dt| dt.with_timezone(&Utc))
@@ -931,11 +1157,29 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Selecting sent folder: {}", sent_folder);
     session.select(sent_folder)?;
     
-    // Use more specific search terms to avoid false positives
+    // Calculate cutoff date for filtering
+    let cutoff = Utc::now() - time_window;
+    let cutoff_date_str = cutoff.format("%Y/%m/%d").to_string();
+    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for emails after: {} ({})", cutoff, cutoff_date_str);
+    
+    // Use Gmail's date filtering in X-GM-RAW search to reduce server load
+    // Gmail supports "after:YYYY/MM/DD" syntax in X-GM-RAW searches
+    // Combine with AND to filter by both content and date
+    // Format: X-GM-RAW "content search AND after:YYYY/MM/DD"
+    let date_filter = if time_window < chrono::Duration::days(365 * 5) {
+        // Only add date filter if we're not doing a full sync (5 years)
+        format!(" AND after:{}", cutoff_date_str)
+    } else {
+        String::new()
+    };
+    
+    // Use more specific search terms with date filtering to avoid fetching old emails
+    // Gmail X-GM-RAW syntax: "search term AND after:date"
+    // Note: Gmail searches body content by default, so "BEGIN NOSTR NIP-" should work
     let search_terms = vec![
-        "X-GM-RAW \"BEGIN NOSTR NIP-\"",
-        "X-GM-RAW \"X-Nostr-Pubkey:\"",
-        "X-GM-RAW \"END NOSTR NIP-\"",
+        format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
+        format!("X-GM-RAW \"X-Nostr-Pubkey:{}\"", date_filter),
+        format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
     ];
     
     let mut all_message_numbers: HashSet<u32> = HashSet::new();
@@ -943,7 +1187,7 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
     // Search with each term and collect results
     for search_term in search_terms {
         println!("[RUST] fetch_sent_emails_from_gmail_optimized: Searching with: {}", search_term);
-        match session.search(search_term) {
+        match session.search(&search_term) {
             Ok(messages) => {
                 let count = messages.len();
                 println!("[RUST] fetch_sent_emails_from_gmail_optimized: Found {} messages with search '{}'", count, search_term);
@@ -980,14 +1224,15 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
             if let Ok(email) = parse_mail(body) {
                 let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
                 let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
-                let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject_raw = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject = decode_header_value(&subject_raw);
                 let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
                 let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
                 
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Processing sent email {} - From: {}, Subject: {}, Date: {}", 
-                    email_id, from, subject, date);
+                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Processing sent email {} - From: {}, Subject (raw): {:?}, Subject (decoded): {}, Date: {}", 
+                    email_id, from, subject_raw, subject, date);
                 
                 // Only keep emails within the time window
                 if date < cutoff {
@@ -1025,17 +1270,10 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                 if is_nostr_email {
                     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} is confirmed as Nostr email", email_id);
                     
-                    // Try to decrypt the email content
-                    let (_final_subject, _final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
-                        Ok((dec_subject, dec_body)) => {
-                            println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} decryption completed", email_id);
-                            (dec_subject, dec_body)
-                        }
-                        Err(e) => {
-                            println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} decryption failed: {}, using original content", email_id, e);
-                            (subject.clone(), body_text.clone())
-                        }
-                    };
+                    // For sent emails, don't decrypt during sync - the subject is encrypted with recipient's pubkey
+                    // which we don't have access to here. The frontend will decrypt it when displaying.
+                    // Just save the encrypted content as-is.
+                    let (_final_subject, _final_body) = (subject.clone(), body_text.clone());
                     
                     let email_message = EmailMessage {
                         id: email_id.to_string(),
@@ -1062,7 +1300,8 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
         }
     }
     
-    session.logout()?;
+    // Don't logout here - let the caller handle session cleanup
+    // session.logout()?;
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Successfully processed {} sent Nostr emails", emails.len());
     Ok(emails)
 }
@@ -1249,7 +1488,8 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                     if let Ok(email) = parse_mail(body) {
                         let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
                         let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
-                        let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                        let subject_raw = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject = decode_header_value(&subject_raw);
                         let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
@@ -1323,7 +1563,8 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                     if let Ok(email) = parse_mail(body) {
                         let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
                         let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
-                        let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                        let subject_raw = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject = decode_header_value(&subject_raw);
                         let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
@@ -1407,16 +1648,63 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> any
 } 
 
 pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyhow::Result<usize> {
+    println!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
     // Fetch latest sent email date from DB using the user's email address
     let latest = db.get_latest_sent_email_received_at(Some(&config.email_address))?;
+    println!("[RUST] sync_sent_emails_to_db: Latest sent email date: {:?}", latest);
     // Fetch new sent Nostr emails from IMAP (raw, not decrypted)
+    println!("[RUST] sync_sent_emails_to_db: Fetching emails from IMAP...");
     let raw_sent_emails = fetch_sent_emails_smart_raw(config, latest).await?;
+    println!("[RUST] sync_sent_emails_to_db: Fetched {} emails from IMAP", raw_sent_emails.len());
 
     let mut new_count = 0;
-    for email in raw_sent_emails {
-        // Check if already in DB by message_id
-        if db.get_email(&email.message_id)?.is_none() {
-            // Save raw email to DB
+    println!("[RUST] sync_sent_emails_to_db: Processing {} emails for saving", raw_sent_emails.len());
+    for (idx, email) in raw_sent_emails.iter().enumerate() {
+        println!("[RUST] sync_sent_emails_to_db: Processing email {} of {}: message_id={}, from={}, date={}", 
+            idx + 1, raw_sent_emails.len(), email.message_id, email.from, email.date);
+        // Check if already in DB by message_id (only check, don't save yet)
+        let existing_email = match db.get_email(&email.message_id) {
+            Ok(Some(existing)) => Some(existing),
+            Ok(None) => None,
+            Err(e) => {
+                println!("[RUST] ERROR: Failed to check if email exists: {}", e);
+                return Err(anyhow::anyhow!("Failed to check email {} in DB: {}", email.message_id, e));
+            }
+        };
+        
+        if let Some(existing_email) = existing_email {
+                // Email already exists - update it with IMAP data (but preserve attachments)
+                // Only update fields that might have changed from IMAP, don't overwrite attachment data
+                println!("[RUST] Email with message_id {} already exists (id: {:?}), updating with IMAP data (preserving attachments)", 
+                    email.message_id, existing_email.id);
+                let updated_email = DbEmail {
+                    id: existing_email.id,
+                    message_id: existing_email.message_id.clone(),
+                    from_address: email.from.clone(),
+                    to_address: email.to.clone(),
+                    subject: email.subject.clone(), // Update with IMAP subject (might be more recent)
+                    body: email.body.clone(),       // Update with IMAP body (might be more recent)
+                    body_plain: existing_email.body_plain.clone(), // Preserve decrypted body if exists
+                    body_html: existing_email.body_html.clone(),   // Preserve HTML if exists
+                    received_at: email.date, // Update with IMAP date
+                    is_nostr_encrypted: true,
+                    nostr_pubkey: email.nostr_pubkey.clone(),
+                    raw_headers: Some(email.raw_headers.clone()), // Update with IMAP headers
+                    is_draft: false,
+                    is_read: existing_email.is_read, // Preserve read status
+                    updated_at: Some(chrono::Utc::now()),
+                    created_at: existing_email.created_at, // Preserve original creation time
+                };
+                match db.save_email(&updated_email) {
+                    Ok(id) => println!("[RUST] Updated existing email with IMAP data, id: {}", id),
+                    Err(e) => {
+                        println!("[RUST] ERROR: Failed to update email {}: {}", email.message_id, e);
+                        return Err(anyhow::anyhow!("Failed to update email {}: {}", email.message_id, e));
+                    }
+                }
+        } else {
+            // New email - save raw email to DB directly without checking again
+            println!("[RUST] Email is new, inserting directly to DB (skipping redundant get_email check)");
             let db_email = DbEmail {
                 id: None,
                 message_id: email.message_id.clone(),
@@ -1435,12 +1723,22 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                 updated_at: None,
                 created_at: chrono::Utc::now(),
             };
-            println!("[RUST] Saving sent email to DB: {:?}", db_email);
-            db.save_email(&db_email)?;
-            println!("[RUST] Saved sent email to DB: {:?}", db_email);
-            new_count += 1;
+            println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}", 
+                db_email.message_id, db_email.from_address, db_email.to_address, 
+                db_email.subject.len(), db_email.body.len());
+            match db.insert_email_direct(&db_email) {
+                Ok(id) => {
+                    println!("[RUST] Successfully inserted new sent email to DB with id: {}", id);
+                    new_count += 1;
+                }
+                Err(e) => {
+                    println!("[RUST] ERROR: Failed to insert email to DB: {}", e);
+                    return Err(anyhow::anyhow!("Failed to insert email {} to DB: {}", email.message_id, e));
+                }
+            }
         }
     }
+    println!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved", new_count);
     Ok(new_count)
 } 
 
@@ -1483,7 +1781,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
             // fetch_nostr_emails_from_gmail_optimized returns Vec<EmailMessage>, convert to Vec<RawNostrEmail>
             let email_msgs = fetch_nostr_emails_from_gmail_optimized(&mut session, config, time_window)?;
             email_msgs.into_iter().map(|em| RawNostrEmail {
-                message_id: em.id,
+                message_id: em.message_id.unwrap_or_else(|| em.id.clone()),
                 from: em.from,
                 to: em.to,
                 subject: em.subject,
@@ -1514,7 +1812,8 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                     if let Ok(email) = parse_mail(body) {
                         let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
                         let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
-                        let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                        let subject_raw = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject = decode_header_value(&subject_raw);
                         let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
@@ -1568,7 +1867,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
     let addr = format!("{}:{}", host, port);
     let is_gmail = host.contains("gmail.com");
 
-    let emails = if use_tls {
+    return if use_tls {
         let tls = TlsConnector::builder().build()?;
         let tcp_stream = TcpStream::connect(&addr)?;
         let tls_stream = tls.connect(host, tcp_stream)?;
@@ -1595,7 +1894,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
             session.select("INBOX")?;
         }
         
-        if is_gmail {
+        let emails_result: anyhow::Result<Vec<RawNostrEmail>> = if is_gmail {
             let now = Utc::now();
             let time_window = match latest {
                 Some(dt) => now.signed_duration_since(dt),
@@ -1603,8 +1902,8 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
             };
             // Use the same optimized function but for sent emails
             let email_msgs = fetch_sent_emails_from_gmail_optimized(&mut session, config, time_window)?;
-            email_msgs.into_iter().map(|em| RawNostrEmail {
-                message_id: em.id,
+            Ok(email_msgs.into_iter().map(|em| RawNostrEmail {
+                message_id: em.message_id.unwrap_or_else(|| em.id.clone()),
                 from: em.from,
                 to: em.to,
                 subject: em.subject,
@@ -1612,7 +1911,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                 date: em.date,
                 nostr_pubkey: extract_nostr_pubkey_from_headers(&em.raw_headers),
                 raw_headers: em.raw_headers,
-            }).collect()
+            }).collect())
         } else {
             let since_date = match latest {
                 Some(dt) => dt.format("%d-%b-%Y").to_string(),
@@ -1626,52 +1925,58 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
             let matching_messages = session.search(&search_criteria)?;
             let message_numbers: Vec<u32> = matching_messages.iter().cloned().collect();
             if message_numbers.is_empty() {
-                return Ok(vec![]);
-            }
-            let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
-            let mut emails = Vec::new();
-            for message in messages.iter() {
-                if let Some(body) = message.body() {
-                    if let Ok(email) = parse_mail(body) {
-                        let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
-                        let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
-                        let subject = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
-                        let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
-                        let date = chrono::DateTime::parse_from_rfc2822(&date_str)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now());
-                        let body_text = if let Some(body_part) = email.subparts.first() {
-                            if let Ok(body_content) = body_part.get_body() {
-                                body_content
+                Ok(vec![])
+            } else {
+                let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
+                let mut emails = Vec::new();
+                for message in messages.iter() {
+                    if let Some(body) = message.body() {
+                        if let Ok(email) = parse_mail(body) {
+                            let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
+                            let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
+                            let subject_raw = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
+                let subject = decode_header_value(&subject_raw);
+                            let date_str = email.headers.get_first_value("Date").unwrap_or_else(|| Utc::now().to_rfc2822());
+                            let date = chrono::DateTime::parse_from_rfc2822(&date_str)
+                                .map(|dt| dt.with_timezone(&Utc))
+                                .unwrap_or_else(|_| Utc::now());
+                            let body_text = if let Some(body_part) = email.subparts.first() {
+                                if let Ok(body_content) = body_part.get_body() {
+                                    body_content
+                                } else {
+                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
+                                }
                             } else {
                                 email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            }
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        };
-                        let raw_headers = email.headers.iter()
-                            .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let email_message = RawNostrEmail {
-                            message_id: extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| format!("msg_{}", chrono::Utc::now().timestamp())),
-                            from,
-                            to,
-                            subject,
-                            body: body_text,
-                            date,
-                            nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
-                            raw_headers,
-                        };
-                        emails.push(email_message);
+                            };
+                            let raw_headers = email.headers.iter()
+                                .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let email_message = RawNostrEmail {
+                                message_id: extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| format!("msg_{}", chrono::Utc::now().timestamp())),
+                                from,
+                                to,
+                                subject,
+                                body: body_text,
+                                date,
+                                nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                                raw_headers,
+                            };
+                            emails.push(email_message);
+                        }
                     }
                 }
+                Ok(emails)
             }
-            emails
-        }
+        };
+        
+        // Always logout the session, even if there was an error
+        let _ = session.logout();
+        println!("[RUST] fetch_sent_emails_smart_raw: Session closed");
+        
+        emails_result
     } else {
-        return Err(anyhow::anyhow!("TLS is required for IMAP connections"));
+        Err(anyhow::anyhow!("TLS is required for IMAP connections"))
     };
-
-    Ok(emails)
 } 

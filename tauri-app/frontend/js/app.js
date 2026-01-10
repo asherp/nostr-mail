@@ -63,13 +63,15 @@ NostrMailApp.prototype.init = async function() {
         // await dmService.loadDmContacts(); // TODO: add this back in once we have stored DMs in the DB
         
         // Populate Nostr contact dropdown for compose page
-        emailService.populateNostrContactDropdown();
-        
-        // Initialize attachment functionality
-        emailService.initializeAttachmentListeners();
-        
-        // Try to restore saved contact selection
-        emailService.restoreContactSelection();
+        if (window.emailService) {
+            window.emailService.populateNostrContactDropdown();
+
+            // Initialize attachment functionality
+            window.emailService.initializeAttachmentListeners();
+
+            // Try to restore saved contact selection
+            window.emailService.restoreContactSelection();
+        }
         
         console.log('✅ ========================================');
         console.log('✅   Nostr Mail - Successfully Started!');
@@ -299,18 +301,18 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const sendBtn = domManager.get('sendBtn');
         if (sendBtn) {
             console.log('[JS] Setting up send button event listener');
-            sendBtn.addEventListener('click', () => emailService.sendEmail());
+            sendBtn.addEventListener('click', () => window.emailService?.sendEmail());
         }
         const saveDraftBtn = domManager.get('saveDraftBtn');
         if (saveDraftBtn) {
-            saveDraftBtn.addEventListener('click', () => emailService.saveDraft());
+            saveDraftBtn.addEventListener('click', () => window.emailService?.saveDraft());
         }
         const encryptBtn = domManager.get('encryptBtn');
         if (encryptBtn) {
             console.log('[JS] Setting up encrypt button event listener');
             encryptBtn.dataset.encrypted = 'false';
             // Update DM checkbox visibility on initialization
-            emailService.updateDmCheckboxVisibility();
+            if (window.emailService) window.emailService.updateDmCheckboxVisibility();
             encryptBtn.addEventListener('click', async function handleEncryptClick() {
                 const iconSpan = encryptBtn.querySelector('.encrypt-btn-icon i');
                 const labelSpan = encryptBtn.querySelector('.encrypt-btn-label');
@@ -328,7 +330,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         notificationService.showError('Both subject and message body must be filled to encrypt.');
                         return;
                     }
-                    const didEncrypt = await emailService.encryptEmailFields();
+                    const didEncrypt = await window.emailService.encryptEmailFields();
                     if (didEncrypt) {
                         if (iconSpan) iconSpan.className = 'fas fa-unlock';
                         if (labelSpan) labelSpan.textContent = 'Decrypt';
@@ -337,14 +339,14 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         if (subjectInput) subjectInput.disabled = true;
                         if (messageBodyInput) messageBodyInput.disabled = true;
                         // Update DM checkbox visibility
-                        emailService.updateDmCheckboxVisibility();
+                        if (window.emailService) window.emailService.updateDmCheckboxVisibility();
                     }
                 } else {
                     // Decrypt mode
                     console.log('[JS] Decrypt button clicked');
                     // Get keys and contact
                     const privkey = appState.getKeypair().private_key;
-                    const pubkey = emailService.selectedNostrContact?.pubkey;
+                    const pubkey = window.emailService?.selectedNostrContact?.pubkey;
                     const armoredBody = domManager.getValue('messageBody') || '';
                     const encryptedSubject = domManager.getValue('subject') || '';
                     // Regex for both NIP-04 and NIP-44 armored messages
@@ -366,7 +368,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         if (match) {
                             try {
                                 // Use the new manifest-aware decryption function
-                                await emailService.decryptBodyContent();
+                                await window.emailService.decryptBodyContent();
                                 decryptedAny = true;
                             } catch (err) {
                                 // Fallback to legacy decryption
@@ -390,7 +392,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     
                     // Also decrypt any encrypted attachments
                     try {
-                        await emailService.decryptAllAttachments();
+                        await window.emailService.decryptAllAttachments();
                     } catch (error) {
                         console.error('Failed to decrypt attachments:', error);
                     }
@@ -401,7 +403,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     if (subjectInput) subjectInput.disabled = false;
                     if (messageBodyInput) messageBodyInput.disabled = false;
                     // Update DM checkbox visibility
-                    emailService.updateDmCheckboxVisibility();
+                    if (window.emailService) window.emailService.updateDmCheckboxVisibility();
                 }
             });
         } else {
@@ -412,7 +414,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const previewHeadersBtn = domManager.get('previewHeadersBtn');
         if (previewHeadersBtn) {
             console.log('[JS] Setting up preview headers button event listener');
-            previewHeadersBtn.addEventListener('click', () => emailService.previewEmailHeaders());
+            previewHeadersBtn.addEventListener('click', () => window.emailService?.previewEmailHeaders());
         } else {
             console.error('[JS] Preview headers button not found in DOM');
         }
@@ -421,7 +423,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const nostrContactSelect = domManager.get('nostrContactSelect');
         if (nostrContactSelect) {
             console.log('[JS] Setting up Nostr contact dropdown event listener');
-            nostrContactSelect.addEventListener('change', () => emailService.handleNostrContactSelection());
+            nostrContactSelect.addEventListener('change', () => window.emailService?.handleNostrContactSelection());
         }
         
         // Inbox
@@ -432,8 +434,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 domManager.clear('emailSearch');
                 // Sync and load all emails (no search filter)
                 try {
-                    await emailService.syncInboxEmails();
-                    await emailService.loadEmails();
+                    await window.emailService.syncInboxEmails();
+                    await window.emailService.loadEmails();
                     notificationService.showSuccess('Inbox synced successfully');
                 } catch (error) {
                     console.error('[JS] Error syncing inbox:', error);
@@ -445,13 +447,13 @@ NostrMailApp.prototype.setupEventListeners = function() {
         // Back to inbox button
         const backToInboxBtn = document.getElementById('back-to-inbox');
         if (backToInboxBtn) {
-            backToInboxBtn.addEventListener('click', () => emailService.showEmailList());
+            backToInboxBtn.addEventListener('click', () => window.emailService?.showEmailList());
         }
         
         // Email Search
         const emailSearch = domManager.get('emailSearch');
         if (emailSearch) {
-            emailSearch.addEventListener('input', () => emailService.filterEmails());
+            emailSearch.addEventListener('input', () => window.emailService?.filterEmails());
         }
         
         // DM elements
@@ -462,7 +464,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
         
         const refreshDm = domManager.get('refreshDm');
         if (refreshDm) {
-            refreshDm.addEventListener('click', () => dmService.refreshDmConversations());
+            refreshDm.addEventListener('click', () => window.dmService?.refreshDmConversations());
         }
         
         const dmSearch = domManager.get('dmSearch');
@@ -472,7 +474,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
         
         const dmSearchToggle = domManager.get('dmSearchToggle');
         if (dmSearchToggle) {
-            dmSearchToggle.addEventListener('click', () => dmService.toggleDmSearch());
+            dmSearchToggle.addEventListener('click', () => window.dmService?.toggleDmSearch());
         }
         
         // Contacts elements
@@ -508,7 +510,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
         }
         const testEmailConnectionBtn = domManager.get('testEmailConnectionBtn');
         if (testEmailConnectionBtn) {
-            testEmailConnectionBtn.addEventListener('click', () => emailService.testEmailConnection());
+            testEmailConnectionBtn.addEventListener('click', () => window.emailService?.testEmailConnection());
         }
         // Add this block to wire up the add relay button
         const addRelayBtn = domManager.get('addRelayBtn');
@@ -524,7 +526,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
         // Email provider selection
         const emailProvider = domManager.get('emailProvider');
         if (emailProvider) {
-            emailProvider.addEventListener('change', () => emailService.handleEmailProviderChange());
+            emailProvider.addEventListener('change', () => window.emailService?.handleEmailProviderChange());
         }
         // Toggle private key visibility (eye button)
         const toggleNprivVisibilityBtn = domManager.get('toggleNprivVisibilityBtn');
@@ -739,8 +741,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (refreshSent) {
             refreshSent.addEventListener('click', async () => {
                 try {
-                    await emailService.syncSentEmails();
-                    await emailService.loadSentEmails();
+                    await window.emailService.syncSentEmails();
+                    await window.emailService.loadSentEmails();
                     notificationService.showSuccess('Sent emails synced successfully');
                 } catch (error) {
                     console.error('[JS] Error syncing sent emails:', error);
@@ -750,20 +752,20 @@ NostrMailApp.prototype.setupEventListeners = function() {
         }
         const backToSentBtn = document.getElementById('back-to-sent');
         if (backToSentBtn) {
-            backToSentBtn.addEventListener('click', () => emailService.showSentList());
+            backToSentBtn.addEventListener('click', () => window.emailService?.showSentList());
         }
         
         // Drafts event listeners
         const refreshDrafts = domManager.get('refreshDrafts');
         if (refreshDrafts) {
             refreshDrafts.addEventListener('click', async () => {
-                await emailService.loadDrafts();
+                await window.emailService.loadDrafts();
             });
         }
         
         const backToDraftsBtn = domManager.get('backToDrafts');
         if (backToDraftsBtn) {
-            backToDraftsBtn.addEventListener('click', () => emailService.showDraftsList());
+            backToDraftsBtn.addEventListener('click', () => window.emailService?.showDraftsList());
         }
         
         console.log('Event listeners set up successfully');
@@ -1129,26 +1131,37 @@ NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
 
 // Tab switching
 NostrMailApp.prototype.switchTab = function(tabName) {
-    const tabContents = domManager.get('tabContents');
-    if (tabContents) {
-        tabContents.forEach(tab => {
-            tab.classList.remove('active');
-        });
-    }
-    
-    const newTab = document.getElementById(tabName);
-    if (newTab) {
-        newTab.classList.add('active');
-    }
-    
-    const navItems = domManager.get('navItems');
-    if (navItems) {
-        navItems.forEach(item => {
-            item.classList.remove('active');
-            if (item.dataset.tab === tabName) {
-                item.classList.add('active');
-            }
-        });
+    try {
+        // Prevent switching if a sync/load operation is in progress
+        const refreshSent = domManager.get('refreshSent');
+        if (refreshSent && refreshSent.disabled) {
+            console.log('[JS] Tab switch blocked: sent emails are currently loading');
+            return; // Don't switch tabs while loading
+        }
+        
+        const tabContents = domManager.get('tabContents');
+        if (tabContents) {
+            tabContents.forEach(tab => {
+                tab.classList.remove('active');
+            });
+        }
+        
+        const newTab = document.getElementById(tabName);
+        if (newTab) {
+            newTab.classList.add('active');
+        }
+        
+        const navItems = domManager.get('navItems');
+        if (navItems) {
+            navItems.forEach(item => {
+                item.classList.remove('active');
+                if (item.dataset.tab === tabName) {
+                    item.classList.add('active');
+                }
+            });
+        }
+    } catch (error) {
+        console.error('[JS] Error switching tabs:', error);
     }
 
     if (tabName === 'profile') {
@@ -1168,29 +1181,39 @@ NostrMailApp.prototype.switchTab = function(tabName) {
     }
     if (tabName === 'dm') {
         // Only load DM contacts if they haven't been loaded yet
-        if (!appState.getDmContacts() || appState.getDmContacts().length === 0) {
-            dmService.loadDmContacts();
-        } else {
-            // Just render the existing DM contacts
-            dmService.renderDmContacts();
+        if (window.dmService) {
+            if (!appState.getDmContacts() || appState.getDmContacts().length === 0) {
+                window.dmService.loadDmContacts();
+            } else {
+                // Just render the existing DM contacts
+                window.dmService.renderDmContacts();
+            }
         }
     }
     if (tabName === 'inbox') {
-        emailService.loadEmails();
+        if (window.emailService) {
+            window.emailService.loadEmails();
+        }
     }
     if (tabName === 'sent') {
-        emailService.loadSentEmails();
+        if (window.emailService) {
+            window.emailService.loadSentEmails();
+        }
     }
     if (tabName === 'drafts') {
-        emailService.loadDrafts();
+        if (window.emailService) {
+            window.emailService.loadDrafts();
+        }
     }
     if (tabName === 'compose') {
-        // Clear current draft state when switching to compose (unless we're loading a draft)
-        if (!emailService.currentDraftId) {
-            emailService.clearCurrentDraft();
+        if (window.emailService) {
+            // Clear current draft state when switching to compose (unless we're loading a draft)
+            if (!window.emailService.currentDraftId) {
+                window.emailService.clearCurrentDraft();
+            }
+            // Try to restore contact selection when switching to compose
+            window.emailService.restoreContactSelection();
         }
-        // Try to restore contact selection when switching to compose
-        emailService.restoreContactSelection();
     }
 }
 
@@ -1528,7 +1551,7 @@ NostrMailApp.prototype.testConnection = async function() {
         domManager.setHTML('testConnectionBtn', '<span class="loading"></span> Testing...');
         
         // Try to load emails as a connection test
-        await emailService.loadEmails();
+        await window.emailService.loadEmails();
         notificationService.showSuccess('Connection test successful');
         
     } catch (error) {
@@ -1750,8 +1773,32 @@ NostrMailApp.prototype.addRelay = async function() {
                 domManager.clear('newRelayUrl');
                 await this.loadRelaysFromDatabase();
                 
-                // Re-initialize client to pick up new relay
-                await this.initializeNostrClient();
+                // Add the new relay to the existing client without disconnecting others
+                try {
+                    await TauriService.updateSingleRelay(url, true);
+                    console.log(`[APP] Added new relay: ${url}`);
+                    
+                    // Verify connection status after a short delay
+                    setTimeout(async () => {
+                        try {
+                            const relayStatuses = await TauriService.getRelayStatus();
+                            const status = relayStatuses.find(s => s.url === url);
+                            if (status) {
+                                this.updateSingleRelayStatus(url, status.status);
+                                if (status.status === 'Connected') {
+                                    notificationService.showSuccess(`✅ Successfully connected to ${url}`);
+                                } else if (status.status === 'Disconnected') {
+                                    notificationService.showWarning(`⚠️ Relay added but connection pending: ${url}`);
+                                }
+                            }
+                        } catch (error) {
+                            console.error('Failed to verify relay status:', error);
+                        }
+                    }, 2000);
+                } catch (relayError) {
+                    console.warn(`[APP] Failed to add relay to client: ${relayError}`);
+                    notificationService.showWarning(`Relay saved but connection failed: ${relayError}`);
+                }
             } catch (error) {
                 notificationService.showError('Failed to add relay: ' + error);
             }

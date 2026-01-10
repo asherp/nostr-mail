@@ -52,6 +52,7 @@ pub struct Profile {
     pub fields: HashMap<String, serde_json::Value>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectMessage {
     pub id: String,
@@ -62,6 +63,7 @@ pub struct DirectMessage {
     pub is_valid: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayInfo {
     pub url: String,
@@ -72,6 +74,7 @@ pub struct RelayInfo {
     pub supported_nips: Vec<u16>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub default_relays: Vec<String>,
@@ -135,4 +138,11 @@ pub struct EmailAttachment {
     pub original_filename: Option<String>,
     pub original_type: Option<String>,
     pub original_size: Option<usize>,
+}
+
+/// Result structure for matching email body lookup (includes email ID for fetching attachments)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchingEmailBodyResult {
+    pub body: String,
+    pub email_id: Option<i64>,
 } 

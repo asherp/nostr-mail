@@ -11,6 +11,39 @@ class Utils {
         return div.innerHTML;
     }
 
+    // Fix UTF-8 encoding issues in decrypted text
+    // Handles cases where UTF-8 bytes are misinterpreted as Latin-1
+    static fixUtf8Encoding(text) {
+        if (!text) return text;
+        return text
+            .replace(/\u00E2\u0080\u0099/g, "'")      // Right single quotation mark (U+2019)
+            .replace(/\u00E2\u0080\u009C/g, '"')     // Left double quotation mark (U+201C)
+            .replace(/\u00E2\u0080\u009D/g, '"')     // Right double quotation mark (U+201D)
+            .replace(/\u00E2\u0080\u0094/g, "—")     // Em dash (U+2014)
+            .replace(/\u00E2\u0080\u0093/g, "–")     // En dash (U+2013)
+            .replace(/\uFFFD/g, "'")                 // Replacement character -> apostrophe
+            // Fix common contractions
+            .replace(/doesn\u00E2/g, "doesn't")
+            .replace(/won\u00E2/g, "won't")
+            .replace(/can\u00E2/g, "can't")
+            .replace(/isn\u00E2/g, "isn't")
+            .replace(/aren\u00E2/g, "aren't")
+            .replace(/wasn\u00E2/g, "wasn't")
+            .replace(/weren\u00E2/g, "weren't")
+            .replace(/haven\u00E2/g, "haven't")
+            .replace(/hasn\u00E2/g, "hasn't")
+            .replace(/hadn\u00E2/g, "hadn't")
+            .replace(/wouldn\u00E2/g, "wouldn't")
+            .replace(/couldn\u00E2/g, "couldn't")
+            .replace(/shouldn\u00E2/g, "shouldn't")
+            .replace(/mustn\u00E2/g, "mustn't")
+            .replace(/mightn\u00E2/g, "mightn't")
+            .replace(/needn\u00E2/g, "needn't")
+            .replace(/daren\u00E2/g, "daren't")
+            .replace(/mayn\u00E2/g, "mayn't")
+            .replace(/shan\u00E2/g, "shan't");
+    }
+
     // Helper function to format time ago
     static formatTimeAgo(date) {
         // Ensure date is a Date object (handle both Date objects and date strings from cache)

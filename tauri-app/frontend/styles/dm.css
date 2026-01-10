@@ -353,6 +353,15 @@ body.dark-mode .dm-search-icon {
     font-size: 12px;
 }
 
+.message-meta .email-emoji-clickable {
+    cursor: pointer;
+    transition: opacity 0.2s ease;
+}
+
+.message-meta .email-emoji-clickable:hover {
+    opacity: 1;
+}
+
 .message-sent .message-meta .email-emoji {
     color: rgba(255, 255, 255, 0.9);
 }

@@ -23,10 +23,26 @@ class DatabaseService {
     }
 
     // Contact operations
-    static async saveContact(contact) {
+    static async saveContact(contact, userPubkey = null, isPublic = true) {
         try {
             const id = await window.__TAURI__.core.invoke('db_save_contact', { contact });
             console.log('Contact saved with ID:', id);
+            
+            // Also add the user-contact relationship if userPubkey is provided
+            if (userPubkey && contact.pubkey) {
+                try {
+                    await window.__TAURI__.core.invoke('db_add_user_contact', {
+                        userPubkey: userPubkey,
+                        contactPubkey: contact.pubkey,
+                        isPublic: isPublic
+                    });
+                    console.log(`User-contact relationship added (is_public=${isPublic})`);
+                } catch (relError) {
+                    console.warn('Failed to add user-contact relationship (may already exist):', relError);
+                    // Don't throw - the contact was saved successfully
+                }
+            }
+            
             return id;
         } catch (error) {
             console.error('Failed to save contact:', error);
@@ -44,9 +60,15 @@ class DatabaseService {
         }
     }
 
-    static async getAllContacts() {
+    static async getAllContacts(userPubkey) {
         try {
-            const contacts = await window.__TAURI__.core.invoke('db_get_all_contacts');
+            if (!userPubkey) {
+                console.warn('getAllContacts called without userPubkey, returning empty array');
+                return [];
+            }
+            const contacts = await window.__TAURI__.core.invoke('db_get_all_contacts', {
+                userPubkey: userPubkey
+            });
             return contacts;
         } catch (error) {
             console.error('Failed to get all contacts:', error);
@@ -207,7 +229,8 @@ class DatabaseService {
             body_html: email.bodyHtml || null,
             received_at: email.receivedAt || new Date().toISOString(),
             is_nostr_encrypted: email.isNostrEncrypted || false,
-            nostr_pubkey: email.nostrPubkey || null,
+            sender_pubkey: email.senderPubkey || email.nostrPubkey || null,
+            recipient_pubkey: email.recipientPubkey || null,
             created_at: new Date().toISOString()
         };
     }

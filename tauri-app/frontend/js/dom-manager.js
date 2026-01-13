@@ -76,7 +76,6 @@ class DOMManager {
             // Relays
             relaysList: this.getElement('relay-list'),
             relaySummary: this.getElement('relay-summary'),
-            relayEditToggle: this.getElement('relay-edit-toggle'),
             
             // Live Events
             liveEventsIndicator: this.getElement('live-events-indicator'),
@@ -100,6 +99,8 @@ class DOMManager {
             'use-tls': this.getElement('use-tls'),
             emailFilterPreference: this.getElement('email-filter-preference'),
             'send-matching-dm-preference': this.getElement('send-matching-dm-preference'),
+            syncCutoffDays: this.getElement('sync-cutoff-days'),
+            emailsPerPage: this.getElement('emails-per-page'),
             testEmailConnectionBtn: this.getElement('test-email-connection-btn'),
             copyNprivBtn: this.getElement('copy-npriv-btn'),
             copyEmailPasswordBtn: this.getElement('copy-email-password-btn'),

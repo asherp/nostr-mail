@@ -19,7 +19,8 @@ class ContactsService {
         }
 
         try {
-            const dbContacts = await window.DatabaseService.getAllContacts();
+            const userPubkey = window.appState.getKeypair().public_key;
+            const dbContacts = await window.DatabaseService.getAllContacts(userPubkey);
             // Convert DB format to frontend format if needed
             const contacts = dbContacts.map(contact => ({
                 pubkey: contact.pubkey,
@@ -38,8 +39,9 @@ class ContactsService {
                 picture_loaded: !!contact.picture_data_url
             }));
             window.appState.setContacts(contacts);
+            console.log(`[JS] Contacts loaded from database: ${contacts.length} contacts`);
             this.renderContacts();
-            console.log('[JS] Contacts loaded from database');
+            console.log('[JS] Contacts rendered to UI');
             // Defer image loading so UI is responsive
             this.loadContactImagesProgressively(); // don't await
         } catch (e) {
@@ -91,7 +93,10 @@ class ContactsService {
     // Load contact images progressively
     async loadContactImagesProgressively() {
         const contacts = window.appState.getContacts();
-        if (contacts.length === 0) return;
+        if (contacts.length === 0) {
+            console.log('[JS] loadContactImagesProgressively: No contacts to load images for');
+            return;
+        }
 
         console.log(`[JS] Loading images progressively for ${contacts.length} contacts`);
 
@@ -185,7 +190,10 @@ class ContactsService {
     // Render contacts
     renderContacts(searchQuery = '') {
         const contactsList = window.domManager.get('contactsList');
-        if (!contactsList) return;
+        if (!contactsList) {
+            console.warn('[JS] renderContacts: contactsList DOM element not found');
+            return;
+        }
 
         try {
             contactsList.innerHTML = '';
@@ -200,6 +208,7 @@ class ContactsService {
                 );
             }
 
+            console.log(`[JS] renderContacts: Rendering ${filteredContacts.length} contacts (searchQuery: "${searchQuery}")`);
             if (filteredContacts && filteredContacts.length > 0) {
                 // Sort: contacts with email first
                 filteredContacts.sort((a, b) => {
@@ -341,8 +350,10 @@ class ContactsService {
                     
                     // Update in database
                     try {
+                        const userPubkey = window.appState.getKeypair().public_key;
                         const dbContact = window.DatabaseService.convertContactToDbFormat(updatedContact);
-                        await window.DatabaseService.saveContact(dbContact);
+                        // Keep existing is_public status (default to true if updating)
+                        await window.DatabaseService.saveContact(dbContact, userPubkey, true);
                         console.log('[JS] Updated contact in database:', contact.pubkey);
                     } catch (dbError) {
                         console.warn('[JS] Failed to update contact in database:', dbError);
@@ -914,18 +925,94 @@ class ContactsService {
                 window.notificationService.showInfo('No follows found on the network');
                 return;
             }
-            // 2. Filter out npubs already in the DB
-            const newPubkeys = await window.TauriService.filterNewContacts(followedPubkeys);
+            const userPubkey = window.appState.getKeypair().public_key;
+            
+            // 2. Get existing public contacts from DB
+            const existingPublicPubkeys = await window.__TAURI__.core.invoke('db_get_public_contact_pubkeys', {
+                userPubkey: userPubkey
+            });
+            console.log('[JS] Existing public contacts in DB:', existingPublicPubkeys.length);
+            
+            // Handle case where no follows found on network
+            if (!followedPubkeys || followedPubkeys.length === 0) {
+                // If there were public contacts but now none, convert them all to private
+                if (existingPublicPubkeys.length > 0) {
+                    console.log('[JS] No follows found on network, converting all public contacts to private');
+                    for (const pubkey of existingPublicPubkeys) {
+                        await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                            userPubkey: userPubkey,
+                            contactPubkey: pubkey,
+                            isPublic: false
+                        });
+                    }
+                    const localContacts = await window.DatabaseService.getAllContacts(userPubkey);
+                    window.appState.setContacts(localContacts);
+                    this.renderContacts();
+                    window.notificationService.showInfo(`No follows found on network. ${existingPublicPubkeys.length} contacts converted to private.`);
+                } else {
+                    window.notificationService.showInfo('No follows found on the network');
+                }
+                return;
+            }
+            
+            // 3. Find contacts that were publicly followed but are no longer in the follow list
+            const followedPubkeysSet = new Set(followedPubkeys);
+            const unfollowedPubkeys = existingPublicPubkeys.filter(pubkey => !followedPubkeysSet.has(pubkey));
+            
+            if (unfollowedPubkeys.length > 0) {
+                console.log('[JS] Detected unfollowed contacts (no longer in public follow list):', unfollowedPubkeys);
+                // Convert public follows to private (preserve contact data but mark as private)
+                for (const pubkey of unfollowedPubkeys) {
+                    await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                        userPubkey: userPubkey,
+                        contactPubkey: pubkey,
+                        isPublic: false
+                    });
+                }
+                console.log(`[JS] Converted ${unfollowedPubkeys.length} public contacts to private`);
+            }
+            
+            // 4. Filter out npubs already in the DB for this user
+            const newPubkeys = await window.TauriService.filterNewContacts(userPubkey, followedPubkeys);
             console.log('[JS] New npubs not in DB:', newPubkeys);
-            // 3. Fetch profiles for only new npubs using persistent client
+            
+            // 5. Fetch profiles for only new npubs using persistent client
             let newProfiles = [];
             if (newPubkeys.length > 0) {
+                console.log(`[JS] Calling fetchProfilesPersistent for ${newPubkeys.length} pubkeys...`);
                 newProfiles = await window.TauriService.fetchProfilesPersistent(newPubkeys);
-                console.log('[JS] Fetched new profiles using persistent client:', newProfiles);
+                console.log(`[JS] Fetched new profiles using persistent client: ${newProfiles ? newProfiles.length : 0} profiles`);
+                if (newProfiles && newProfiles.length > 0) {
+                    console.log('[JS] Profile details:', newProfiles.map(p => ({ pubkey: p.pubkey, name: p.fields?.name || p.fields?.display_name || 'no name' })));
+                } else {
+                    console.warn('[JS] fetchProfilesPersistent returned empty or null result');
+                }
             }
-            // 4. Get all local contacts
-            const localContacts = await window.DatabaseService.getAllContacts();
-            // 5. Add new contacts to app state and DB
+            
+            // 6. Get all local contacts for this user (before checking re-follows)
+            const allContacts = await window.DatabaseService.getAllContacts(userPubkey);
+            const allContactPubkeys = new Set(allContacts.map(c => c.pubkey));
+            
+            // 7. Update is_public for contacts that are back in the follow list (were private, now public again)
+            const reFollowedPubkeys = followedPubkeys.filter(pubkey => {
+                // Contact exists in user_contacts but wasn't in the public list (must have been private)
+                return allContactPubkeys.has(pubkey) && !existingPublicPubkeys.includes(pubkey);
+            });
+            if (reFollowedPubkeys.length > 0) {
+                console.log('[JS] Contacts re-added to public follow list:', reFollowedPubkeys);
+                for (const pubkey of reFollowedPubkeys) {
+                    await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                        userPubkey: userPubkey,
+                        contactPubkey: pubkey,
+                        isPublic: true
+                    });
+                }
+            }
+            
+            // 8. Get all local contacts for this user (after updates)
+            const localContacts = await window.DatabaseService.getAllContacts(userPubkey);
+            
+            // 8. Add new contacts to app state and DB
             if (newProfiles.length > 0) {
                 // Create new contact objects
                 const newContacts = newProfiles.map(profile => ({
@@ -941,25 +1028,33 @@ class ContactsService {
                     updated_at: new Date().toISOString()
                 }));
                 // Add to app state
-                const allContacts = [...localContacts, ...newContacts];
-                window.appState.setContacts(allContacts);
+                const updatedContacts = [...localContacts, ...newContacts];
+                window.appState.setContacts(updatedContacts);
                 this.renderContacts();
                 this.loadContactImagesProgressively();
-                // Save new contacts to DB
+                // Save new contacts to DB with user-contact relationship
+                // These are public follows from Nostr, so is_public=true
                 for (const contact of newContacts) {
                     const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
-                    await window.DatabaseService.saveContact(dbContact);
+                    await window.DatabaseService.saveContact(dbContact, userPubkey, true); // is_public=true for public follows
                 }
                 // Refresh compose dropdown to include new contacts
                 if (window.emailService) {
                     window.emailService.populateNostrContactDropdown();
                 }
-                window.notificationService.showSuccess(`Added ${newContacts.length} new contacts`);
+                const message = unfollowedPubkeys.length > 0 
+                    ? `Added ${newContacts.length} new contacts. ${unfollowedPubkeys.length} contacts converted to private.`
+                    : `Added ${newContacts.length} new contacts`;
+                window.notificationService.showSuccess(message);
             } else {
                 // No new contacts, just re-render
                 window.appState.setContacts(localContacts);
                 this.renderContacts();
-                window.notificationService.showInfo('No new contacts found in your follow list');
+                if (unfollowedPubkeys.length > 0) {
+                    window.notificationService.showInfo(`${unfollowedPubkeys.length} contacts converted to private (no longer in public follow list)`);
+                } else {
+                    window.notificationService.showInfo('No new contacts found in your follow list');
+                }
             }
         } catch (error) {
             console.error('Failed to load contacts from network:', error);
@@ -980,10 +1075,11 @@ class ContactsService {
             const privateKey = window.appState.getKeypair().private_key;
             const relays = window.appState.getActiveRelays();
 
-            // Call backend to follow the user on Nostr
+            // Call backend to follow the user on Nostr (public follow)
             await window.TauriService.followUser(privateKey, pubkey, relays);
 
-            // Save the contact locally
+            // Save the contact locally with is_public=true (since we're following publicly on Nostr)
+            const userPubkey = window.appState.getKeypair().public_key;
             const now = new Date().toISOString();
             const contact = {
                 pubkey,
@@ -997,7 +1093,8 @@ class ContactsService {
                 created_at: now,
                 updated_at: now
             };
-            await window.DatabaseService.saveContact(contact);
+            const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
+            await window.DatabaseService.saveContact(dbContact, userPubkey, true); // is_public=true for public follows
 
             // Update app state and UI
             window.appState.addContact(contact);
@@ -1056,8 +1153,10 @@ class ContactsService {
                     contacts[idx] = selectedContact;
                     window.appState.setContacts(contacts);
                     // Save updated contact to the database
+                    const userPubkey = window.appState.getKeypair().public_key;
                     const dbContact = window.DatabaseService.convertContactToDbFormat(selectedContact);
-                    await window.DatabaseService.saveContact(dbContact);
+                    // Keep existing is_public status (default to true if updating)
+                    await window.DatabaseService.saveContact(dbContact, userPubkey, true);
                 }
                 // Re-render the contact detail
                 this.renderContactDetail(selectedContact);

@@ -114,7 +114,8 @@ NostrMailApp.prototype.loadSettings = async function() {
                         use_tls: dbSettings.use_tls === 'true',
                         email_filter: dbSettings.email_filter || 'nostr',
                         send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                        sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 365 // Default to 1 year
+                        sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 365, // Default to 1 year
+                        emails_per_page: parseInt(dbSettings.emails_per_page) || 50 // Default to 50
                     };
                     appState.setSettings(settings);
                     this.populateSettingsForm();
@@ -165,7 +166,8 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 use_tls: dbSettings.use_tls === 'true',
                 email_filter: dbSettings.email_filter || 'nostr',
                 send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 1825 // Default to 5 years
+                sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 1825, // Default to 5 years
+                emails_per_page: parseInt(dbSettings.emails_per_page) || 50 // Default to 50
             };
             
             appState.setSettings(settings);
@@ -216,7 +218,6 @@ NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
         notificationService.showError('Could not load relays from database.');
         
         // Show empty summary on error
-        this.updateRelaySummary([]);
     }
 }
 
@@ -532,11 +533,6 @@ NostrMailApp.prototype.setupEventListeners = function() {
             addRelayBtn.addEventListener('click', () => this.addRelay());
         }
         
-        // Relay edit toggle button
-        const relayEditToggle = domManager.get('relayEditToggle');
-        if (relayEditToggle) {
-            relayEditToggle.addEventListener('click', () => this.toggleRelayEdit());
-        }
         // Email provider selection
         const emailProvider = domManager.get('emailProvider');
         if (emailProvider) {
@@ -1196,6 +1192,7 @@ NostrMailApp.prototype.switchTab = function(tabName) {
     }
     if (tabName === 'settings') {
         this.loadRelaysFromDatabase();
+        this.initializeSettingsAccordion();
     }
     if (tabName === 'contacts') {
         // Only load contacts if they haven't been loaded yet
@@ -1306,7 +1303,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             use_tls: domManager.get('use-tls')?.checked || false,
             email_filter: domManager.getValue('emailFilterPreference') || 'nostr',
             send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false, // Default to true
-            sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 365 // Default to 1 year
+            sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 365, // Default to 1 year
+            emails_per_page: parseInt(domManager.getValue('emailsPerPage')) || 50 // Default to 50
         };
         
         // Keep localStorage as backup
@@ -1366,7 +1364,9 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('imap_port', settings.imap_port.toString());
             settingsMap.set('use_tls', settings.use_tls.toString());
             settingsMap.set('email_filter', settings.email_filter);
+            settingsMap.set('send_matching_dm', settings.send_matching_dm.toString());
             settingsMap.set('sync_cutoff_days', settings.sync_cutoff_days.toString());
+            settingsMap.set('emails_per_page', settings.emails_per_page.toString());
             
             const settingsObj = Object.fromEntries(settingsMap);
             await TauriService.dbSaveSettingsBatch(publicKey, settingsObj);
@@ -1439,7 +1439,9 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'imapPort',
         'use-tls',
         'emailFilterPreference',
-        'send-matching-dm-preference'
+        'send-matching-dm-preference',
+        'syncCutoffDays',
+        'emailsPerPage'
     ];
     
     settingsFields.forEach(fieldId => {
@@ -1491,6 +1493,7 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.get('use-tls').checked = settings.use_tls || false;
         domManager.setValue('emailFilterPreference', settings.email_filter || 'nostr');
         domManager.setValue('syncCutoffDays', settings.sync_cutoff_days || 365);
+        domManager.setValue('emailsPerPage', settings.emails_per_page || 50);
         
         // Set send matching DM preference (default to true if not set)
         const sendMatchingDmPref = domManager.get('send-matching-dm-preference');
@@ -1620,15 +1623,7 @@ NostrMailApp.prototype.renderRelays = async function() {
         console.error('Failed to get relay statuses:', error);
     }
     
-    // Update summary first
-    this.updateRelaySummary(relayStatuses);
-    
-    // Only render the full list if in edit mode
-    const isEditing = relaysList.classList.contains('expanded');
-    if (!isEditing) {
-        return; // Don't render the full list when collapsed
-    }
-    
+    // Always render the full list (no edit mode toggle needed)
     // Clear only the relay items, not the add-relay-section
     const existingRelayItems = relaysList.querySelectorAll('.relay-item');
     existingRelayItems.forEach(item => item.remove());
@@ -1747,12 +1742,10 @@ NostrMailApp.prototype.updateSingleRelayStatus = function(relayUrl, connectionSt
 
 // Sync relay states and auto-disable disconnected ones
 NostrMailApp.prototype.syncDisconnectedRelays = async function() {
-    console.log('[APP] syncDisconnectedRelays called');
     try {
         const updatedRelays = await TauriService.syncRelayStates();
-        console.log('[APP] syncRelayStates returned:', updatedRelays);
         if (updatedRelays.length > 0) {
-            console.log('Auto-disabled disconnected relays:', updatedRelays);
+            console.log('[APP] Auto-disabled disconnected relays:', updatedRelays);
             
             // Update the UI for each disabled relay
             for (const relayUrl of updatedRelays) {
@@ -2025,6 +2018,15 @@ NostrMailApp.prototype.loadProfile = async function() {
         const profile = await TauriService.fetchProfilePersistent(appState.getKeypair().public_key);
 
         if (profile) {
+            // Remove "no profile" message if it exists
+            const profileFieldsList = document.getElementById('profile-fields-list');
+            if (profileFieldsList) {
+                const existingMessage = profileFieldsList.querySelector('.profile-empty-message');
+                if (existingMessage) {
+                    existingMessage.remove();
+                }
+            }
+            
             // If there's a new picture URL, fetch and cache the image as a data URL
             if (profile.fields && profile.fields.picture) {
                 const pictureUrl = profile.fields.picture;
@@ -2057,6 +2059,7 @@ NostrMailApp.prototype.loadProfile = async function() {
             }
             if (profileSpinner) profileSpinner.style.display = 'none';
         } else {
+            console.log('[Profile] No profile found - rendering empty form for user to create profile');
             if (profileSpinner) profileSpinner.style.display = 'none';
             // Show placeholder fields and picture so the user can create a new profile
             const emptyFields = {};
@@ -2065,7 +2068,22 @@ NostrMailApp.prototype.loadProfile = async function() {
                 pubkey: appState.getKeypair().public_key,
                 fields: emptyFields
             };
+            console.log('[Profile] Rendering empty profile with fields:', Object.keys(emptyFields));
             this.renderProfileFromObject(emptyProfile, null);
+            
+            // Show helpful message when no profile exists
+            const profileFieldsList = document.getElementById('profile-fields-list');
+            if (profileFieldsList) {
+                // Check if message already exists to avoid duplicates
+                let existingMessage = profileFieldsList.querySelector('.profile-empty-message');
+                if (!existingMessage) {
+                    existingMessage = document.createElement('div');
+                    existingMessage.className = 'profile-empty-message';
+                    existingMessage.style.cssText = 'background: #e3f2fd; border-left: 4px solid #2196f3; padding: 12px; margin-bottom: 16px; border-radius: 4px;';
+                    existingMessage.innerHTML = '<strong>No profile found.</strong> Fill in the fields below and click "Update Profile" to create your Nostr profile.';
+                    profileFieldsList.insertBefore(existingMessage, profileFieldsList.firstChild);
+                }
+            }
         }
         this.renderProfilePubkey();
         if (Utils.isDevMode()) {
@@ -2077,7 +2095,7 @@ NostrMailApp.prototype.loadProfile = async function() {
                 } else if (profile && profile.fields) {
                     rawJsonBox.value = JSON.stringify(profile.fields, null, 2);
                 } else {
-                    rawJsonBox.value = JSON.stringify(profile, null, 2);
+                    rawJsonBox.value = 'No profile found. This is normal for a new keypair. Fill in the fields above to create your profile.';
                 }
             }
         }
@@ -2373,6 +2391,14 @@ NostrMailApp.prototype.setDarkMode = function(enabled) {
     if (icon) {
         icon.className = enabled ? 'fas fa-sun' : 'fas fa-moon';
     }
+    const text = document.getElementById('dark-mode-text');
+    if (text) {
+        text.textContent = enabled ? 'Disable Dark Mode' : 'Enable Dark Mode';
+    }
+    const label = document.getElementById('theme-label');
+    if (label) {
+        label.textContent = enabled ? 'Dark Mode (Enabled)' : 'Light Mode (Enabled)';
+    }
     localStorage.setItem('darkMode', enabled ? '1' : '0');
 }
 
@@ -2449,10 +2475,21 @@ NostrMailApp.prototype.startRelayStatusUpdates = function() {
             const isOnSettingsPage = settingsTab && settingsTab.classList.contains('active');
             const hasRelays = appState.getRelays().length > 0;
             
-            console.log(`[APP] Periodic update check: settingsPage=${isOnSettingsPage}, hasRelays=${hasRelays}`);
+            // Only log periodically (every 5th check = every 50 seconds) to reduce noise
+            if (this.relayStatusUpdateCount === undefined) {
+                this.relayStatusUpdateCount = 0;
+            }
+            this.relayStatusUpdateCount++;
+            const shouldLog = this.relayStatusUpdateCount % 5 === 0;
+            
+            if (shouldLog) {
+                console.log(`[APP] Periodic update check: settingsPage=${isOnSettingsPage}, hasRelays=${hasRelays}`);
+            }
             
             if (isOnSettingsPage && hasRelays) {
-                console.log('[APP] Running periodic relay status update...');
+                if (shouldLog) {
+                    console.log('[APP] Running periodic relay status update...');
+                }
                 await this.updateRelayStatusOnly();
             }
         } catch (error) {
@@ -2461,36 +2498,6 @@ NostrMailApp.prototype.startRelayStatusUpdates = function() {
     }, 10000); // Changed to 10 seconds as requested
 }
 
-// Toggle relay edit mode (collapse/expand)
-NostrMailApp.prototype.toggleRelayEdit = function() {
-    const relaysList = domManager.get('relaysList');
-    const relayEditToggle = domManager.get('relayEditToggle');
-    
-    if (!relaysList || !relayEditToggle) return;
-    
-    const isCollapsed = relaysList.classList.contains('collapsed');
-    
-    if (isCollapsed) {
-        // Expand - show edit mode
-        relaysList.classList.remove('collapsed');
-        relaysList.classList.add('expanded');
-        relayEditToggle.classList.add('editing');
-        relayEditToggle.innerHTML = '<i class="fas fa-times"></i> Done';
-        
-        // Render the full relay list
-        this.renderRelays();
-    } else {
-        // Collapse - show summary mode
-        relaysList.classList.remove('expanded');
-        relaysList.classList.add('collapsed');
-        relayEditToggle.classList.remove('editing');
-        relayEditToggle.innerHTML = '<i class="fas fa-edit"></i> Edit';
-        
-        // Clear only the relay items to save memory, keep add-relay-section
-        const relayItems = relaysList.querySelectorAll('.relay-item');
-        relayItems.forEach(item => item.remove());
-    }
-}
 
 // Update relay summary display
 NostrMailApp.prototype.updateRelaySummary = function(relayStatuses = []) {
@@ -2593,10 +2600,9 @@ NostrMailApp.prototype.retryRelayConnection = async function(relayId, relayUrl) 
 NostrMailApp.prototype.updateRelayStatusOnly = async function() {
     try {
         const relayStatuses = await TauriService.getRelayStatus();
-        console.log('[APP] Got relay statuses:', relayStatuses);
+        // Only log if there are status changes or errors (reduce noise)
         
         // Always update the summary
-        this.updateRelaySummary(relayStatuses);
         
         // Update each relay's status in the UI (only if expanded)
         const relaysList = domManager.get('relaysList');
@@ -2642,6 +2648,52 @@ NostrMailApp.prototype.stopRelayStatusUpdates = function() {
         this.relayStatusInterval = null;
     }
 }
+
+// Initialize Settings Accordion
+NostrMailApp.prototype.initializeSettingsAccordion = function() {
+    // Prevent duplicate initialization
+    if (this.settingsAccordionInitialized) {
+        return;
+    }
+    this.settingsAccordionInitialized = true;
+    
+    // Load saved collapsed state from localStorage
+    const savedState = localStorage.getItem('settingsSectionsState');
+    const collapsedSections = savedState ? JSON.parse(savedState) : {};
+    
+    // Set up click handlers for all settings section headers
+    const sectionHeaders = document.querySelectorAll('.settings-section-header');
+    sectionHeaders.forEach(header => {
+        const section = header.closest('.settings-section');
+        const sectionId = section.getAttribute('data-section');
+        
+        // Restore saved state
+        if (collapsedSections[sectionId]) {
+            section.classList.add('collapsed');
+        }
+        
+        // Add click handler
+        header.addEventListener('click', (e) => {
+            // Don't toggle if clicking on buttons inside the header (like relay edit button)
+            if (e.target.closest('button')) {
+                return;
+            }
+            
+            const isCollapsed = section.classList.contains('collapsed');
+            
+            if (isCollapsed) {
+                section.classList.remove('collapsed');
+                collapsedSections[sectionId] = false;
+            } else {
+                section.classList.add('collapsed');
+                collapsedSections[sectionId] = true;
+            }
+            
+            // Save state to localStorage
+            localStorage.setItem('settingsSectionsState', JSON.stringify(collapsedSections));
+        });
+    });
+};
 
 // Initialize when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {

@@ -109,6 +109,14 @@ build/
 # Tauri specific
 src-tauri/target/
 
+# Android build artifacts
+backend/gen/android/**/build/
+backend/gen/android/.gradle/
+backend/gen/android/app/build/
+backend/gen/android/buildSrc/build/
+backend/gen/android/*.apk
+backend/gen/android/*.aab
+
 # Local development
 *.local
 

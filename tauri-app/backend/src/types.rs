@@ -31,7 +31,8 @@ pub struct EmailMessage {
     pub date: DateTime<Utc>,
     pub is_read: bool,
     pub raw_headers: String,
-    pub nostr_pubkey: Option<String>,
+    pub sender_pubkey: Option<String>,
+    pub recipient_pubkey: Option<String>,
     pub message_id: Option<String>,
 }
 

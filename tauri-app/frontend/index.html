@@ -70,9 +70,6 @@
                     <i class="fas fa-cog"></i> Settings
                 </button>
             </nav>
-            <button id="dark-mode-toggle" class="icon-button" title="Toggle dark mode" style="margin: 20px auto 10px auto; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; background: none; border: none; color: inherit; cursor: pointer;">
-                <i id="dark-mode-icon" class="fas fa-moon"></i>
-            </button>
         </aside>
 
         <!-- Main Content -->
@@ -329,9 +326,12 @@
                 
                 <div class="settings-form">
                     <!-- Nostr Settings -->
-                    <div class="settings-section">
-                        <h3><i class="fas fa-key"></i> Nostr Settings</h3>
-                        
+                    <div class="settings-section" data-section="nostr">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-key"></i> Nostr Settings</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
                         <div class="form-group">
                             <label for="npriv-key">Private Key (nsec/npriv):</label>
                             <div class="input-with-buttons">
@@ -388,12 +388,16 @@
                                 NIP-44 is the modern, secure encryption standard. NIP-04 is legacy and less secure.
                             </div>
                         </div>
+                        </div>
                     </div>
                     
                     <!-- Email Settings -->
-                    <div class="settings-section">
-                        <h3><i class="fas fa-envelope"></i> Email Settings</h3>
-                        
+                    <div class="settings-section" data-section="email">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-envelope"></i> Email Settings</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
                         <div class="form-group">
                             <label for="email-provider">Email Provider:</label>
                             <select id="email-provider">
@@ -475,27 +479,29 @@
                             <small class="form-text text-muted">How far back in time to sync emails when setting up on a new device. Default: 365 days (1 year). Set to 0 to sync all emails.</small>
                         </div>
                         
+                        <div class="form-group">
+                            <label for="emails-per-page">Emails Per Page:</label>
+                            <input type="number" id="emails-per-page" placeholder="50" min="10" max="500" value="50">
+                            <small class="form-text text-muted">Number of emails to display per page in the inbox. Default: 50.</small>
+                        </div>
+                        
                         <div class="form-actions">
                             <button id="test-email-connection-btn" class="btn btn-secondary">
                                 <i class="fas fa-envelope"></i> Test Email Connection
                             </button>
                         </div>
+                        </div>
                     </div>
                     
                     <!-- Relay Settings -->
-                    <div class="settings-section">
+                    <div class="settings-section" data-section="relay">
                         <div class="settings-section-header">
                             <h3><i class="fas fa-network-wired"></i> Relay Settings</h3>
-                            <div class="relay-summary-container">
-                                <span id="relay-summary" class="relay-summary">Loading...</span>
-                                <button id="relay-edit-toggle" class="btn btn-secondary btn-small relay-edit-btn">
-                                    <i class="fas fa-edit"></i> Edit
-                                </button>
-                            </div>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
                         </div>
-                        
+                        <div class="settings-section-content">
                         <div class="form-group">
-                            <div id="relay-list" class="relay-list collapsed">
+                            <div id="relay-list" class="relay-list expanded">
                                 <!-- Relays will be populated here -->
                                 <div class="add-relay-section">
                                     <div class="form-group">
@@ -509,6 +515,30 @@
                                     </div>
                                 </div>
                             </div>
+                        </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Appearance Settings -->
+                    <div class="settings-section" data-section="appearance">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-palette"></i> Appearance</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
+                        <div class="form-group">
+                            <label>Theme:</label>
+                            <div class="input-with-button">
+                                <div style="display: flex; align-items: center; gap: 12px;">
+                                    <span id="theme-label">Dark Mode</span>
+                                    <button id="dark-mode-toggle" class="btn btn-secondary" title="Toggle dark mode" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
+                                        <i id="dark-mode-icon" class="fas fa-moon"></i>
+                                        <span id="dark-mode-text">Enable Dark Mode</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <small class="form-text text-muted">Switch between light and dark theme</small>
+                        </div>
                         </div>
                     </div>
                 </div>

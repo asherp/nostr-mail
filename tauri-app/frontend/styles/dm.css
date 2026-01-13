@@ -105,7 +105,7 @@ body.dark-mode .dm-search-icon {
 }
 
 .dm-contact-item.active {
-    background-color: var(--primary-color);
+    background-color: #667eea;
     color: white;
 }
 
@@ -134,6 +134,10 @@ body.dark-mode .dm-search-icon {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.dm-contact-item.active .dm-contact-name {
+    color: white;
 }
 
 .dm-contact-time {

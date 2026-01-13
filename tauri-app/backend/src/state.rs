@@ -39,18 +39,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let default_relays = vec![
-            Relay {
-                url: "wss://nostr-pub.wellorder.net".to_string(),
-                is_active: true,
-            },
-            Relay {
-                url: "wss://relay.damus.io".to_string(),
-                is_active: true,
-            },
-        ];
+        // Start with empty relays - will be loaded from database when available
         Self {
-            relays: Arc::new(Mutex::new(default_relays)),
+            relays: Arc::new(Mutex::new(Vec::new())),
             image_cache: Arc::new(Mutex::new(HashMap::new())),
             database: Arc::new(Mutex::new(None)),
             nostr_client: Arc::new(Mutex::new(None)),
@@ -83,41 +74,25 @@ impl AppState {
         // Create new client
         let client = Client::new(keys.clone());
         
-        // Load relays from database first (don't rely on in-memory state)
-        let db_relays = match self.get_database() {
-            Ok(db) => {
-                match db.get_all_relays() {
-                    Ok(relays) => {
-                        println!("[RUST] Loaded {} relays from database for client init", relays.len());
-                        // Convert DbRelay to Relay and update in-memory state
-                        let state_relays: Vec<Relay> = relays.iter().map(|db_relay| Relay {
-                            url: db_relay.url.clone(),
-                            is_active: db_relay.is_active,
-                        }).collect();
-                        
-                        // Update in-memory state
-                        *self.relays.lock().unwrap() = state_relays.clone();
-                        
-                        state_relays
-                    },
-                    Err(e) => {
-                        println!("[RUST] Failed to load relays from database: {}, using in-memory state", e);
-                        self.relays.lock().unwrap().clone()
-                    }
-                }
-            },
-            Err(e) => {
-                println!("[RUST] Database not available: {}, using in-memory state", e);
-                self.relays.lock().unwrap().clone()
-            }
-        };
+        // Load relays from database (required - no fallback)
+        let db = self.get_database()?;
+        let db_relays = db.get_all_relays()
+            .map_err(|e| format!("Failed to load relays from database: {}", e))?;
         
-        // Use the loaded relays (either from DB or in-memory fallback)
-        let relays = db_relays;
+        println!("[RUST] Loaded {} relays from database for client init", db_relays.len());
+        
+        // Convert DbRelay to Relay and update in-memory state
+        let state_relays: Vec<Relay> = db_relays.iter().map(|db_relay| Relay {
+            url: db_relay.url.clone(),
+            is_active: db_relay.is_active,
+        }).collect();
+        
+        // Update in-memory state
+        *self.relays.lock().unwrap() = state_relays.clone();
         
         // Add active relays to client
         let mut added_relays = false;
-        for relay in relays.iter().filter(|r| r.is_active) {
+        for relay in state_relays.iter().filter(|r| r.is_active) {
             match client.add_relay(&relay.url).await {
                 Ok(_) => {
                     println!("[RUST] Added relay: {}", relay.url);
@@ -129,11 +104,9 @@ impl AppState {
             }
         }
         
-        // Add default relays if no active relays were added
+        // Require at least one relay to be added
         if !added_relays {
-            println!("[RUST] No active relays found, using defaults");
-            client.add_relay("wss://nostr-pub.wellorder.net").await.map_err(|e| e.to_string())?;
-            client.add_relay("wss://relay.damus.io").await.map_err(|e| e.to_string())?;
+            return Err("No active relays found in database. Please add relays in settings.".to_string());
         }
         
         // Connect to relays
@@ -281,23 +254,15 @@ impl AppState {
             client.disconnect().await;
             
             // Add new active relays
-            let mut added_relays = false;
             for relay in new_relays.iter().filter(|r| r.is_active) {
                 match client.add_relay(&relay.url).await {
                     Ok(_) => {
                         println!("[RUST] Added relay: {}", relay.url);
-                        added_relays = true;
                     },
                     Err(e) => {
                         println!("[RUST] Failed to add relay {}: {}", relay.url, e);
                     }
                 }
-            }
-            
-            // Add defaults if no active relays
-            if !added_relays {
-                client.add_relay("wss://nostr-pub.wellorder.net").await.map_err(|e| e.to_string())?;
-                client.add_relay("wss://relay.damus.io").await.map_err(|e| e.to_string())?;
             }
             
             // Reconnect

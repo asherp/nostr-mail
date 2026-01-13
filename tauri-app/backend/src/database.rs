@@ -31,7 +31,8 @@ pub struct Email {
     pub body_html: Option<String>,
     pub received_at: DateTime<Utc>,
     pub is_nostr_encrypted: bool,
-    pub nostr_pubkey: Option<String>,
+    pub sender_pubkey: Option<String>,
+    pub recipient_pubkey: Option<String>,
     pub raw_headers: Option<String>,
     pub is_draft: bool,
     pub is_read: bool,
@@ -99,7 +100,43 @@ impl Database {
         conn.pragma_update(None, "journal_mode", &"WAL")?;
         let db = Database { conn: Arc::new(Mutex::new(conn)) };
         db.init_tables()?;
+        db.seed_default_relays()?;
         Ok(db)
+    }
+    
+    /// Seed default relays if the relays table is empty
+    fn seed_default_relays(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        
+        // Check if relays table is empty
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM relays", [], |row| row.get(0))?;
+        
+        if count == 0 {
+            println!("[DB] Seeding default relays...");
+            let now = Utc::now();
+            let default_relays = vec![
+                ("wss://nostr-pub.wellorder.net", true),
+                ("wss://nostr.mom", true),
+                ("wss://purplepage.es", true),
+                ("wss://relay.damus.io", true),
+                ("wss://relay.nostr.band", true),
+                ("wss://relay.primal.net", true),
+                ("wss://relay.weloveit.info", true),
+            ];
+            
+            for (url, is_active) in default_relays {
+                conn.execute(
+                    "INSERT OR IGNORE INTO relays (url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    params![url, is_active, now, now],
+                )?;
+                println!("[DB] Seeded relay: {} (active: {})", url, is_active);
+            }
+            println!("[DB] Default relays seeded successfully");
+        } else {
+            println!("[DB] Relays table already contains {} relay(s), skipping seed", count);
+        }
+        
+        Ok(())
     }
 
     /// Compute SHA256 hash of encrypted content for fast lookups
@@ -128,6 +165,20 @@ impl Database {
             [],
         )?;
 
+        // User contacts junction table - tracks which users follow which contacts
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS user_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_pubkey TEXT NOT NULL,
+                contact_pubkey TEXT NOT NULL,
+                is_public BOOLEAN NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL,
+                UNIQUE(user_pubkey, contact_pubkey),
+                FOREIGN KEY (contact_pubkey) REFERENCES contacts(pubkey) ON DELETE CASCADE
+            )",
+            [],
+        )?;
+
         // Emails table
         conn.execute(
             "CREATE TABLE IF NOT EXISTS emails (
@@ -141,7 +192,8 @@ impl Database {
                 body_html TEXT,
                 received_at DATETIME NOT NULL,
                 is_nostr_encrypted BOOLEAN NOT NULL DEFAULT 0,
-                nostr_pubkey TEXT,
+                sender_pubkey TEXT,
+                recipient_pubkey TEXT,
                 raw_headers TEXT,
                 is_draft BOOLEAN NOT NULL DEFAULT 0,
                 is_read BOOLEAN NOT NULL DEFAULT 0,
@@ -150,6 +202,7 @@ impl Database {
             )",
             [],
         )?;
+        
         
         // Add UNIQUE constraint to message_id if it doesn't exist (for existing databases)
         conn.execute(
@@ -252,8 +305,17 @@ impl Database {
         // Migrate: Add hash columns to emails and direct_messages tables if they don't exist
         Self::migrate_add_hash_columns(&conn)?;
 
+        // Migrate: Add user_contacts junction table if it doesn't exist
+        Self::migrate_add_user_contacts_table(&conn)?;
+        
+        // Migrate: Convert nostr_pubkey to sender_pubkey and recipient_pubkey
+        Self::migrate_email_pubkey_columns(&conn)?;
+
         // Create indexes for better performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_pubkey ON contacts(pubkey)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_contacts_user_pubkey ON user_contacts(user_pubkey)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_contacts_contact_pubkey ON user_contacts(contact_pubkey)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_contacts_user_contact ON user_contacts(user_pubkey, contact_pubkey)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_message_id ON emails(message_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_received_at ON emails(received_at)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_subject_hash ON emails(subject_hash)", [])?;
@@ -346,6 +408,150 @@ impl Database {
         Ok(())
     }
 
+    /// Migration: Add user_contacts junction table if it doesn't exist
+    fn migrate_add_user_contacts_table(conn: &Connection) -> Result<()> {
+        // Check if user_contacts table exists
+        let table_exists = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='user_contacts'"
+            )?;
+            let mut rows = stmt.query([])?;
+            rows.next()?.is_some()
+        };
+
+        if !table_exists {
+            println!("[DB] Creating user_contacts junction table");
+            conn.execute(
+                "CREATE TABLE user_contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_pubkey TEXT NOT NULL,
+                    contact_pubkey TEXT NOT NULL,
+                    is_public BOOLEAN NOT NULL DEFAULT 1,
+                    created_at DATETIME NOT NULL,
+                    UNIQUE(user_pubkey, contact_pubkey),
+                    FOREIGN KEY (contact_pubkey) REFERENCES contacts(pubkey) ON DELETE CASCADE
+                )",
+                [],
+            )?;
+
+            // Create indexes
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_contacts_user_pubkey ON user_contacts(user_pubkey)", [])?;
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_contacts_contact_pubkey ON user_contacts(contact_pubkey)", [])?;
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_contacts_user_contact ON user_contacts(user_pubkey, contact_pubkey)", [])?;
+
+            // For existing databases, migrate all existing contacts to user_contacts
+            // We'll create entries for all contacts with an empty user_pubkey as a fallback
+            // This ensures existing contacts are still visible until users are properly associated
+            println!("[DB] Note: Existing contacts will need to be associated with users via user_contacts table");
+        } else {
+            // Migration: Add is_public column if it doesn't exist
+            let has_is_public = {
+                let mut stmt = conn.prepare("PRAGMA table_info(user_contacts)")?;
+                let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                    Ok(row.get::<_, String>(1)?) // column name
+                })?.collect();
+                columns.map(|cols| cols.contains(&"is_public".to_string())).unwrap_or(false)
+            };
+
+            if !has_is_public {
+                println!("[DB] Adding is_public column to user_contacts table");
+                conn.execute(
+                    "ALTER TABLE user_contacts ADD COLUMN is_public BOOLEAN NOT NULL DEFAULT 1",
+                    [],
+                )?;
+                println!("[DB] Migration complete: is_public column added to user_contacts");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Migration: Convert nostr_pubkey to sender_pubkey and recipient_pubkey
+    fn migrate_email_pubkey_columns(conn: &Connection) -> Result<()> {
+        // Check if sender_pubkey column exists
+        let has_sender_pubkey = {
+            let mut stmt = conn.prepare("PRAGMA table_info(emails)")?;
+            let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?) // column name
+            })?.collect();
+            columns.map(|cols| cols.contains(&"sender_pubkey".to_string())).unwrap_or(false)
+        };
+
+        if !has_sender_pubkey {
+            println!("[DB] Migrating email pubkey columns: adding sender_pubkey and recipient_pubkey");
+            
+            // Add new columns
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN sender_pubkey TEXT",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN recipient_pubkey TEXT",
+                [],
+            )?;
+            
+            // Migrate existing nostr_pubkey data to sender_pubkey
+            // For inbox emails (is_draft = 0), nostr_pubkey is the sender's pubkey
+            // For sent emails, we'd need to determine recipient_pubkey from contacts
+            // For now, migrate all nostr_pubkey values to sender_pubkey
+            println!("[DB] Migrating existing nostr_pubkey values to sender_pubkey");
+            conn.execute(
+                "UPDATE emails SET sender_pubkey = nostr_pubkey WHERE nostr_pubkey IS NOT NULL AND nostr_pubkey != ''",
+                [],
+            )?;
+            
+            // Drop the old nostr_pubkey column (SQLite doesn't support DROP COLUMN directly)
+            // Instead, we'll create a new table and copy data
+            println!("[DB] Removing old nostr_pubkey column");
+            conn.execute(
+                "CREATE TABLE emails_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE,
+                    from_address TEXT NOT NULL,
+                    to_address TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    body_plain TEXT,
+                    body_html TEXT,
+                    received_at DATETIME NOT NULL,
+                    is_nostr_encrypted BOOLEAN NOT NULL DEFAULT 0,
+                    sender_pubkey TEXT,
+                    recipient_pubkey TEXT,
+                    raw_headers TEXT,
+                    is_draft BOOLEAN NOT NULL DEFAULT 0,
+                    is_read BOOLEAN NOT NULL DEFAULT 0,
+                    updated_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    subject_hash TEXT
+                )",
+                [],
+            )?;
+            
+            // Copy data from old table to new table
+            conn.execute(
+                "INSERT INTO emails_new SELECT 
+                    id, message_id, from_address, to_address, subject, body, body_plain, body_html,
+                    received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
+                    is_draft, is_read, updated_at, created_at, subject_hash
+                FROM emails",
+                [],
+            )?;
+            
+            // Drop old table and rename new table
+            conn.execute("DROP TABLE emails", [])?;
+            conn.execute("ALTER TABLE emails_new RENAME TO emails", [])?;
+            
+            // Recreate indexes
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_emails_message_id_unique ON emails(message_id)", [])?;
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_message_id ON emails(message_id)", [])?;
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_received_at ON emails(received_at)", [])?;
+            
+            println!("[DB] Migration complete: email pubkey columns migrated");
+        }
+
+        Ok(())
+    }
+
     // Contact operations
     pub fn save_contact(&self, contact: &Contact) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
@@ -375,6 +581,60 @@ impl Database {
         }
     }
 
+    /// Add a user-contact relationship (user follows contact)
+    pub fn add_user_contact(&self, user_pubkey: &str, contact_pubkey: &str, is_public: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "INSERT OR REPLACE INTO user_contacts (user_pubkey, contact_pubkey, is_public, created_at)
+            VALUES (?, ?, ?, ?)",
+            params![user_pubkey, contact_pubkey, is_public, now],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a user-contact relationship (user unfollows contact)
+    pub fn remove_user_contact(&self, user_pubkey: &str, contact_pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM user_contacts WHERE user_pubkey = ? AND contact_pubkey = ?",
+            params![user_pubkey, contact_pubkey],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a user follows a contact
+    pub fn user_follows_contact(&self, user_pubkey: &str, contact_pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM user_contacts WHERE user_pubkey = ? AND contact_pubkey = ? LIMIT 1"
+        )?;
+        let mut rows = stmt.query(params![user_pubkey, contact_pubkey])?;
+        Ok(rows.next()?.is_some())
+    }
+
+    /// Get all public contact pubkeys for a user
+    pub fn get_public_contact_pubkeys(&self, user_pubkey: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT contact_pubkey FROM user_contacts WHERE user_pubkey = ? AND is_public = 1"
+        )?;
+        let rows = stmt.query_map(params![user_pubkey], |row| {
+            Ok(row.get::<_, String>(0)?)
+        })?;
+        rows.collect()
+    }
+
+    /// Update is_public status for a user-contact relationship
+    pub fn update_user_contact_public_status(&self, user_pubkey: &str, contact_pubkey: &str, is_public: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE user_contacts SET is_public = ? WHERE user_pubkey = ? AND contact_pubkey = ?",
+            params![is_public, user_pubkey, contact_pubkey],
+        )?;
+        Ok(())
+    }
+
     pub fn get_contact(&self, pubkey: &str) -> Result<Option<Contact>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -400,14 +660,17 @@ impl Database {
         }
     }
 
-    pub fn get_all_contacts(&self) -> Result<Vec<Contact>> {
+    pub fn get_all_contacts(&self, user_pubkey: &str) -> Result<Vec<Contact>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, pubkey, name, email, picture_url, picture_data_url, about, created_at, updated_at
-             FROM contacts ORDER BY name COLLATE NOCASE"
+            "SELECT c.id, c.pubkey, c.name, c.email, c.picture_url, c.picture_data_url, c.about, c.created_at, c.updated_at
+             FROM contacts c
+             INNER JOIN user_contacts uc ON c.pubkey = uc.contact_pubkey
+             WHERE uc.user_pubkey = ?
+             ORDER BY c.name COLLATE NOCASE"
         )?;
         
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![user_pubkey], |row| {
             Ok(Contact {
                 id: Some(row.get(0)?),
                 pubkey: row.get(1)?,
@@ -450,13 +713,13 @@ impl Database {
                 "UPDATE emails SET 
                     message_id = ?, from_address = ?, to_address = ?, subject = ?, 
                     body = ?, body_plain = ?, body_html = ?, received_at = ?, 
-                    is_nostr_encrypted = ?, nostr_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?,
+                    is_nostr_encrypted = ?, sender_pubkey = ?, recipient_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?,
                     subject_hash = ?
                 WHERE id = ?",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
-                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
+                    email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
                     subject_hash, id
                 ],
             )?;
@@ -469,7 +732,7 @@ impl Database {
             let normalized_id = Self::normalize_message_id(&email.message_id);
             let existing_id: Option<i64> = {
                 let mut stmt = conn.prepare(
-                    "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
+                    "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
                      FROM emails
                      WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?
                      ORDER BY received_at DESC
@@ -499,12 +762,12 @@ impl Database {
             println!("[DB] save_email: Email is new, inserting into database");
             println!("[DB] save_email: About to execute INSERT statement");
             match conn.execute(
-                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
-                    email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
+                    email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
                     subject_hash
                 ],
             ) {
@@ -536,12 +799,12 @@ impl Database {
         
         println!("[DB] insert_email_direct: About to execute INSERT statement");
         match conn.execute(
-            "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 email.message_id, email.from_address, email.to_address, email.subject,
                 email.body, email.body_plain, email.body_html, email.received_at,
-                email.is_nostr_encrypted, email.nostr_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
+                email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
                 subject_hash
             ],
         ) {
@@ -580,7 +843,7 @@ impl Database {
         // SQLite's TRIM and REPLACE can handle the normalization
         // We'll try multiple formats: exact match, normalized match, and with/without angle brackets
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
              FROM emails 
              WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? 
              ORDER BY received_at DESC"
@@ -602,12 +865,13 @@ impl Database {
                 body_html: row.get(7)?,
                 received_at: row.get(8)?,
                 is_nostr_encrypted: row.get(9)?,
-                nostr_pubkey: row.get(10)?,
-                raw_headers: row.get(11)?,
-                is_draft: row.get(12)?,
-                is_read: row.get(13)?,
-                updated_at: row.get(14)?,
-                created_at: row.get(15)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
             };
             println!("[DB] get_email: Found matching email, id={:?}", email.id);
             return Ok(Some(email));
@@ -623,7 +887,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
@@ -656,12 +920,13 @@ impl Database {
                 body_html: row.get(7)?,
                 received_at: row.get(8)?,
                 is_nostr_encrypted: row.get(9)?,
-                nostr_pubkey: row.get(10)?,
-                raw_headers: row.get(11)?,
-                is_draft: row.get(12)?,
-                is_read: row.get(13)?,
-                updated_at: row.get(14)?,
-                created_at: row.get(15)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
             })
         })?;
         rows.collect()
@@ -692,7 +957,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
@@ -748,12 +1013,13 @@ impl Database {
                 body_html: row.get(7)?,
                 received_at: row.get(8)?,
                 is_nostr_encrypted: row.get(9)?,
-                nostr_pubkey: row.get(10)?,
-                raw_headers: row.get(11)?,
-                is_draft: row.get(12)?,
-                is_read: row.get(13)?,
-                updated_at: row.get(14)?,
-                created_at: row.get(15)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
             })
         })?;
         let emails: Vec<Email> = rows.collect::<Result<Vec<_>, _>>()?;
@@ -954,7 +1220,7 @@ impl Database {
     pub fn find_email_by_subject_hash(&self, subject_hash: &str) -> Result<Option<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
              FROM emails WHERE subject_hash = ? AND is_nostr_encrypted = 1 LIMIT 1"
         )?;
         let mut rows = stmt.query_map(params![subject_hash], |row| {
@@ -969,12 +1235,13 @@ impl Database {
                 body_html: row.get(7)?,
                 received_at: row.get(8)?,
                 is_nostr_encrypted: row.get(9)?,
-                nostr_pubkey: row.get(10)?,
-                raw_headers: row.get(11)?,
-                is_draft: row.get(12)?,
-                is_read: row.get(13)?,
-                updated_at: row.get(14)?,
-                created_at: row.get(15)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
             })
         })?;
         
@@ -1260,22 +1527,42 @@ impl Database {
         Ok(pubkeys)
     }
 
-    pub fn update_email_nostr_pubkey(&self, message_id: &str, nostr_pubkey: &str) -> Result<()> {
+    pub fn update_email_sender_pubkey(&self, message_id: &str, sender_pubkey: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        println!("[RUST] Updating nostr_pubkey for message_id {} to {}", message_id, nostr_pubkey);
+        println!("[RUST] Updating sender_pubkey for message_id {} to {}", message_id, sender_pubkey);
         let rows = conn.execute(
-            "UPDATE emails SET nostr_pubkey = ?1 WHERE message_id = ?2",
-            params![nostr_pubkey, message_id],
+            "UPDATE emails SET sender_pubkey = ?1 WHERE message_id = ?2",
+            params![sender_pubkey, message_id],
         )?;
-        println!("[RUST] Rows affected by nostr_pubkey update: {}", rows);
+        println!("[RUST] Rows affected by sender_pubkey update: {}", rows);
         Ok(())
     }
 
-    pub fn update_email_nostr_pubkey_by_id(&self, id: i64, nostr_pubkey: &str) -> Result<()> {
+    pub fn update_email_sender_pubkey_by_id(&self, id: i64, sender_pubkey: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE emails SET nostr_pubkey = ? WHERE id = ?",
-            params![nostr_pubkey, id],
+            "UPDATE emails SET sender_pubkey = ? WHERE id = ?",
+            params![sender_pubkey, id],
+        )?;
+        Ok(())
+    }
+    
+    pub fn update_email_recipient_pubkey(&self, message_id: &str, recipient_pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        println!("[RUST] Updating recipient_pubkey for message_id {} to {}", message_id, recipient_pubkey);
+        let rows = conn.execute(
+            "UPDATE emails SET recipient_pubkey = ?1 WHERE message_id = ?2",
+            params![recipient_pubkey, message_id],
+        )?;
+        println!("[RUST] Rows affected by recipient_pubkey update: {}", rows);
+        Ok(())
+    }
+
+    pub fn update_email_recipient_pubkey_by_id(&self, id: i64, recipient_pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE emails SET recipient_pubkey = ? WHERE id = ?",
+            params![recipient_pubkey, id],
         )?;
         Ok(())
     }
@@ -1283,7 +1570,7 @@ impl Database {
     pub fn find_emails_by_message_id(&self, message_id: &str) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at
              FROM emails WHERE message_id = ? ORDER BY received_at DESC"
         )?;
         
@@ -1299,12 +1586,13 @@ impl Database {
                 body_html: row.get(7)?,
                 received_at: row.get(8)?,
                 is_nostr_encrypted: row.get(9)?,
-                nostr_pubkey: row.get(10)?,
-                raw_headers: row.get(11)?,
-                is_draft: row.get(12)?,
-                is_read: row.get(13)?,
-                updated_at: row.get(14)?,
-                created_at: row.get(15)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
             })
         })?;
         
@@ -1325,25 +1613,25 @@ impl Database {
                 "UPDATE emails SET 
                     message_id = ?, from_address = ?, to_address = ?, subject = ?, 
                     body = ?, body_plain = ?, body_html = ?, received_at = ?, 
-                    is_nostr_encrypted = ?, nostr_pubkey = ?, raw_headers = ?, 
+                    is_nostr_encrypted = ?, sender_pubkey = ?, recipient_pubkey = ?, raw_headers = ?, 
                     is_draft = ?, is_read = ?, updated_at = ?
                 WHERE id = ?",
                 params![
                     draft.message_id, draft.from_address, draft.to_address, draft.subject,
                     draft.body, draft.body_plain, draft.body_html, draft.received_at,
-                    draft.is_nostr_encrypted, draft.nostr_pubkey, draft.raw_headers,
+                    draft.is_nostr_encrypted, draft.sender_pubkey, draft.recipient_pubkey, draft.raw_headers,
                     true, draft.is_read, now, id
                 ],
             )?;
             Ok(id)
         } else {
             let _id = conn.execute(
-                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     draft.message_id, draft.from_address, draft.to_address, draft.subject,
                     draft.body, draft.body_plain, draft.body_html, draft.received_at,
-                    draft.is_nostr_encrypted, draft.nostr_pubkey, draft.raw_headers,
+                    draft.is_nostr_encrypted, draft.sender_pubkey, draft.recipient_pubkey, draft.raw_headers,
                     true, draft.is_read, now
                 ],
             )?;
@@ -1351,10 +1639,13 @@ impl Database {
         }
     }
 
-    pub fn get_drafts(&self, user_email: Option<&str>) -> Result<Vec<Email>> {
+    pub fn get_drafts(&self, limit: Option<i64>, offset: Option<i64>, user_email: Option<&str>) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
+        let limit = limit.unwrap_or(50);
+        let offset = offset.unwrap_or(0);
+        
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, nostr_pubkey, raw_headers, is_draft, is_read, updated_at, created_at FROM emails WHERE is_draft = 1"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at FROM emails WHERE is_draft = 1"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         
@@ -1363,7 +1654,9 @@ impl Database {
             params.push(Box::new(email));
         }
         
-        query.push_str(" ORDER BY updated_at DESC, created_at DESC");
+        query.push_str(" ORDER BY updated_at DESC, created_at DESC LIMIT ? OFFSET ?");
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
         
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
@@ -1378,12 +1671,13 @@ impl Database {
                 body_html: row.get(7)?,
                 received_at: row.get(8)?,
                 is_nostr_encrypted: row.get(9)?,
-                nostr_pubkey: row.get(10)?,
-                raw_headers: row.get(11)?,
-                is_draft: row.get(12)?,
-                is_read: row.get(13)?,
-                updated_at: row.get(14)?,
-                created_at: row.get(15)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
             })
         })?;
         

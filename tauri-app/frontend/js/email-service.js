@@ -23,6 +23,14 @@ class EmailService {
         this.currentDraftDbId = null; // Track the database ID of the current draft
         this.currentMessageId = null; // Store the UUID for reuse
         this.attachments = []; // Store attachment objects with encryption state
+        this.inboxOffset = 0; // Track pagination offset for inbox emails
+        this.inboxPageSize = 50; // Number of emails per page (will be updated from settings)
+        this.sentOffset = 0; // Track pagination offset for sent emails
+        this.draftsOffset = 0; // Track pagination offset for drafts
+        this.searchOffset = 0; // Track pagination offset for search results
+        this.sentSearchOffset = 0; // Track pagination offset for sent search results
+        this.searchHasMore = false; // Track if there are more search results
+        this.sentSearchHasMore = false; // Track if there are more sent search results
     }
 
     // Populate Nostr contact dropdown with contacts that have email addresses
@@ -553,7 +561,8 @@ class EmailService {
             
             // Create a mock email object for the decryption function
             const mockEmail = {
-                nostr_pubkey: pubkey
+                sender_pubkey: pubkey,
+                nostr_pubkey: pubkey // Fallback for backward compatibility
             };
             
             // Try manifest decryption first
@@ -1139,14 +1148,25 @@ class EmailService {
     }
 
     // Load emails
-    async loadEmails(searchQuery = '') {
+    async loadEmails(searchQuery = '', append = false) {
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
         }
         try {
-            domManager.disable('refreshInbox');
-            domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
+            if (!append) {
+                // Reset offset when loading fresh (not appending)
+                this.inboxOffset = 0;
+                domManager.disable('refreshInbox');
+                domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
+            } else {
+                // Show loading state on Load More button
+                const loadMoreBtn = document.getElementById('load-more-emails');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = true;
+                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
+                }
+            }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
             const emailConfig = {
@@ -1162,15 +1182,18 @@ class EmailService {
             // Read filter preference from settings
             const emailFilter = settings.email_filter || 'nostr';
             const onlyNostr = emailFilter === 'nostr';
+            // Get page size from settings (default to 50)
+            const pageSize = settings.emails_per_page || 50;
             // Always pass the user's email address for filtering (only as recipient)
             const userEmail = settings.email_address ? settings.email_address : null;
             console.log('[JS] getDbEmails userEmail:', userEmail);
             console.log('[JS] Email filter preference:', emailFilter, 'onlyNostr:', onlyNostr);
+            console.log('[JS] Loading emails with offset:', this.inboxOffset, 'pageSize:', pageSize);
             let emails;
             if (onlyNostr) {
-                emails = await TauriService.getDbEmails(50, 0, true, userEmail);
+                emails = await TauriService.getDbEmails(pageSize, this.inboxOffset, true, userEmail);
             } else {
-                emails = await TauriService.getDbEmails(50, 0, false, userEmail);
+                emails = await TauriService.getDbEmails(pageSize, this.inboxOffset, false, userEmail);
             }
             
             // Load attachments for each email in parallel with timeout
@@ -1218,31 +1241,88 @@ class EmailService {
             
             await Promise.all(attachmentPromises);
             
-            appState.setEmails(emails);
-            this.renderEmails();
+            if (append) {
+                // Append new emails to existing ones
+                const existingEmails = appState.getEmails();
+                appState.setEmails([...existingEmails, ...emails]);
+            } else {
+                // Replace emails (fresh load)
+                appState.setEmails(emails);
+            }
+            
+            // Update offset for next load
+            this.inboxOffset += emails.length;
+            
+            // Show Load More button if we got a full page of results
+            this.renderEmails(emails.length === pageSize);
         } catch (error) {
             console.error('Failed to load emails:', error);
             notificationService.showError('Failed to load emails: ' + error);
         } finally {
-            domManager.enable('refreshInbox');
-            domManager.setHTML('refreshInbox', '<i class="fas fa-sync"></i> Refresh');
+            if (!append) {
+                domManager.enable('refreshInbox');
+                domManager.setHTML('refreshInbox', '<i class="fas fa-sync"></i> Refresh');
+            } else {
+                const loadMoreBtn = document.getElementById('load-more-emails');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = false;
+                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                }
+            }
+        }
+    }
+
+    // Load more emails (pagination)
+    async loadMoreEmails() {
+        const searchQuery = domManager.getValue('emailSearch')?.trim() || '';
+        if (searchQuery) {
+            // Load more search results
+            await this.filterEmails(true);
+        } else {
+            // Load more regular emails
+            await this.loadEmails('', true);
+        }
+    }
+    
+    async loadMoreSentEmails() {
+        const searchQuery = domManager.getValue('sentSearch')?.trim() || '';
+        if (searchQuery) {
+            // Load more sent search results
+            await this.filterSentEmails(true);
+        } else {
+            // Load more regular sent emails
+            await this.loadSentEmails('', true);
         }
     }
 
     // Load sent emails
-    async loadSentEmails(searchQuery = '') {
+    async loadSentEmails(searchQuery = '', append = false) {
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
         }
         try {
-            domManager.disable('refreshSent');
-            domManager.setHTML('refreshSent', '<span class="loading"></span> Loading...');
+            if (!append) {
+                // Reset offset when loading fresh (not appending)
+                this.sentOffset = 0;
+                domManager.disable('refreshSent');
+                domManager.setHTML('refreshSent', '<span class="loading"></span> Loading...');
+            } else {
+                // Show loading state on Load More button
+                const loadMoreBtn = document.getElementById('load-more-sent-emails');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = true;
+                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
+                }
+            }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
             const userEmail = settings.email_address ? settings.email_address : null;
+            // Get page size from settings (default to 50)
+            const pageSize = settings.emails_per_page || 50;
+            console.log('[JS] Loading sent emails with offset:', this.sentOffset, 'pageSize:', pageSize);
             // Fetch sent emails (where user is sender)
-            let emails = await TauriService.getDbSentEmails(50, 0, userEmail);
+            let emails = await TauriService.getDbSentEmails(pageSize, this.sentOffset, userEmail);
             
             // Load attachments for each email in parallel with timeout
             console.log(`[JS] Loading attachments for ${emails.length} sent emails`);
@@ -1288,15 +1368,40 @@ class EmailService {
             });
             await Promise.allSettled(attachmentPromises);
             
-            appState.setSentEmails(emails);
-            this.renderSentEmails();
+            if (append) {
+                // Append new emails to existing ones
+                const existingEmails = appState.getSentEmails();
+                appState.setSentEmails([...existingEmails, ...emails]);
+            } else {
+                // Replace emails (fresh load)
+                appState.setSentEmails(emails);
+            }
+            
+            // Update offset for next load
+            this.sentOffset += emails.length;
+            
+            // Show Load More button if we got a full page of results
+            this.renderSentEmails(emails.length === pageSize);
         } catch (error) {
             console.error('Failed to load sent emails:', error);
             notificationService.showError('Failed to load sent emails: ' + error);
         } finally {
-            domManager.enable('refreshSent');
-            domManager.setHTML('refreshSent', '<i class="fas fa-sync"></i> Refresh');
+            if (!append) {
+                domManager.enable('refreshSent');
+                domManager.setHTML('refreshSent', '<i class="fas fa-sync"></i> Refresh');
+            } else {
+                const loadMoreBtn = document.getElementById('load-more-sent-emails');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = false;
+                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                }
+            }
         }
+    }
+
+    // Load more sent emails (pagination)
+    async loadMoreSentEmails() {
+        await this.loadSentEmails('', true);
     }
 
     // Sync and reload emails
@@ -1336,7 +1441,7 @@ class EmailService {
         }
     }
 
-    async filterSentEmails() {
+    async filterSentEmails(append = false) {
         const searchQuery = domManager.getValue('sentSearch')?.trim() || '';
         
         // If search query is empty, load all sent emails normally
@@ -1369,8 +1474,11 @@ class EmailService {
                 const userEmail = settings.email_address ? settings.email_address : null;
                 const privateKey = keypair ? keypair.private_key : null;
                 
-                // Initialize search results accumulator
-                this.sentSearchResults = [];
+                // Initialize search results accumulator (or keep existing if appending)
+                if (!append) {
+                    this.sentSearchResults = [];
+                    this.sentSearchOffset = 0;
+                }
                 this.sentSearchInProgress = true;
                 
                 // Show searching state
@@ -1405,7 +1513,12 @@ class EmailService {
                 // Listen for search completion
                 const completedUnlisten = await window.__TAURI__.event.listen('sent-search-completed', async (event) => {
                     const completion = event.payload;
-                    console.log(`[JS] Sent search completed: ${completion.total_found} total matches`);
+                    console.log(`[JS] Sent search completed: ${completion.total_found} total matches, has_more: ${completion.has_more}`);
+                    
+                    // Update has_more flag
+                    if (completion.has_more !== undefined) {
+                        this.sentSearchHasMore = completion.has_more;
+                    }
                     
                     this.sentSearchInProgress = false;
                     
@@ -1463,12 +1576,29 @@ class EmailService {
                     await Promise.all(attachmentPromises);
                     
                     appState.setSentEmails(this.sentSearchResults);
-                    await this.renderSentEmails();
+                    await this.renderSentEmails(this.sentSearchHasMore);
                 });
                 
-                console.log('[JS] Starting sent search with query:', searchQuery);
+                // Reset search offset for new search
+                if (!append) {
+                    this.sentSearchOffset = 0;
+                    this.sentSearchResults = [];
+                }
+                
+                // Get page size from settings (already retrieved above)
+                const pageSize = settings.emails_per_page || 50;
+                
+                console.log('[JS] Starting sent search with query:', searchQuery, 'limit:', pageSize, 'offset:', this.sentSearchOffset);
                 // Start the search (this will emit events as results are found)
-                await TauriService.searchSentEmails(searchQuery, userEmail, privateKey);
+                const result = await TauriService.searchSentEmails(searchQuery, userEmail, privateKey, pageSize, this.sentSearchOffset);
+                console.log('[JS] Sent search result:', result);
+                
+                // Update offset for next page
+                if (result && Array.isArray(result) && result.length === 2) {
+                    const [count, hasMore] = result;
+                    this.sentSearchHasMore = hasMore;
+                    this.sentSearchOffset += count;
+                }
                 
             } catch (error) {
                 console.error('Error searching sent emails:', error);
@@ -1515,14 +1645,15 @@ class EmailService {
             // First decrypt the manifest using NIP encryption
             let decryptedManifestJson;
             
-            // Try with header pubkey first
-            if (email.nostr_pubkey) {
+            // Try with sender pubkey first (for inbox emails)
+            const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+            if (senderPubkey) {
                 try {
-                    console.log('[JS] Decrypting with header pubkey...');
+                    console.log('[JS] Decrypting with sender pubkey...');
                     console.log('[JS] privateKey:', keypair.private_key ? 'present' : 'missing');
-                    console.log('[JS] senderPubkey:', email.nostr_pubkey);
+                    console.log('[JS] senderPubkey:', senderPubkey);
                     console.log('[JS] encryptedContent:', encryptedContent ? encryptedContent.substring(0, 50) + '...' : 'missing');
-                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, email.nostr_pubkey, encryptedContent);
+                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, senderPubkey, encryptedContent);
                 } catch (e) {
                     console.log('[JS] Failed with header pubkey:', e.message);
                 }
@@ -1651,20 +1782,28 @@ class EmailService {
     // Fallback decryption method for Nostr messages
     async decryptNostrMessageWithFallback(email, encryptedContent, keypair) {
         console.log('[JS] Fallback decryption called for email:', email.from || email.from_address);
-        // 1. Try the pubkey from the header/field first
-        if (email.nostr_pubkey) {
+        // 1. Try the sender pubkey from the header/field first (for inbox emails)
+        // For inbox emails, sender_pubkey should always be available from headers
+        const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+        if (senderPubkey) {
             try {
-                const decrypted = await TauriService.decryptDmContent(keypair.private_key, email.nostr_pubkey, encryptedContent);
+                const decrypted = await TauriService.decryptDmContent(keypair.private_key, senderPubkey, encryptedContent);
                 if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
                     // Fix UTF-8 encoding issues in decrypted text
                     return Utils.fixUtf8Encoding(decrypted);
                 }
+                // If decryption failed, it means our private key couldn't decrypt with this sender's pubkey
+                // This is expected if the email wasn't encrypted for us
+                return "Unable to decrypt: Your private key could not decrypt this message. The email may not have been encrypted for your keypair.";
             } catch (e) {
-                // continue to fallback
+                // Decryption error - our private key couldn't decrypt
+                console.error('[JS] Decryption failed with sender pubkey:', e);
+                return "Unable to decrypt: Your private key could not decrypt this message. The email may not have been encrypted for your keypair.";
             }
         }
 
         // 2. Fallback: search DB for pubkeys matching sender email
+        // This is only reached if sender_pubkey wasn't in headers (shouldn't happen for inbox emails)
         const senderEmail = email.from || email.from_address;
         if (!senderEmail) return "Unable to decrypt: sender address not found";
 
@@ -1677,23 +1816,25 @@ class EmailService {
         }
 
         if (!pubkeys || pubkeys.length === 0) {
-            return "Unable to decrypt: sender pubkey not found";
+            // For inbox emails, sender_pubkey should be in headers, so this is unexpected
+            return "Unable to decrypt: sender pubkey not found in headers or contacts. Your private key may not be able to decrypt this message.";
         }
 
-        // 3. Try each pubkey
+        // 3. Try each pubkey from contacts
         for (const pubkey of pubkeys) {
             try {
                 const decrypted = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
                 if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
-                    // Update the email's nostr_pubkey in the DB for future use
+                    // Update the email's sender_pubkey in the DB for future use
                     try {
-                        await window.__TAURI__.core.invoke('db_update_email_nostr_pubkey_by_id', {
+                        await window.__TAURI__.core.invoke('db_update_email_sender_pubkey_by_id', {
                             id: Number(email.id),
-                            nostrPubkey: pubkey
+                            senderPubkey: pubkey
                         });
-                        email.nostr_pubkey = pubkey; // <-- Add this line
+                        email.sender_pubkey = pubkey; // Update local copy
+                        email.nostr_pubkey = pubkey; // Keep for backward compatibility
                     } catch (err) {
-                        console.warn('Failed to update nostr_pubkey in DB:', err);
+                        console.warn('Failed to update sender_pubkey in DB:', err);
                     }
                     // Fix UTF-8 encoding issues in decrypted text
                     return Utils.fixUtf8Encoding(decrypted);
@@ -1702,8 +1843,8 @@ class EmailService {
                 // try next
             }
         }
-
-        return "Unable to decrypt: tried all candidate pubkeys";
+        // All pubkeys tried, decryption failed with our private key
+        return "Unable to decrypt: Your private key could not decrypt this message with any of the sender's pubkeys. The email may not have been encrypted for your keypair.";
     }
 
     // Decrypt manifest-based message for sent emails (using recipient pubkey)
@@ -1711,67 +1852,85 @@ class EmailService {
         console.log('[JS] Attempting sent manifest decryption for email:', email.to || email.to_address);
         
         try {
-            // For sent emails, we need the recipient's pubkey
-            const recipientEmail = email.to || email.to_address;
-            if (!recipientEmail) {
-                throw new Error('Recipient address not found');
-            }
-            
-            // Normalize Gmail addresses (remove + aliases)
-            const normalizeGmail = (email) => {
-                const lower = email.trim().toLowerCase();
-                if (lower.includes('@gmail.com')) {
-                    const [local, domain] = lower.split('@');
-                    const normalizedLocal = local.split('+')[0];
-                    return `${normalizedLocal}@${domain}`;
-                }
-                return lower;
-            };
-            
-            const normalizedEmail = normalizeGmail(recipientEmail);
-            console.log('[JS] Normalized recipient email:', normalizedEmail, 'from:', recipientEmail);
-            
-            let pubkeys = [];
-            try {
-                // Try both original and normalized email
-                const emailVariants = [recipientEmail, normalizedEmail].filter((e, i, arr) => arr.indexOf(e) === i);
-                for (const emailVariant of emailVariants) {
-                    try {
-                        const found = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: emailVariant });
-                        if (found && found.length > 0) {
-                            pubkeys.push(...found);
-                            console.log('[JS] Found pubkeys for', emailVariant, ':', found);
-                        }
-                    } catch (e) {
-                        console.log('[JS] No pubkeys found for', emailVariant);
-                    }
-                }
-                // Remove duplicates
-                pubkeys = [...new Set(pubkeys)];
-            } catch (e) {
-                console.error('[JS] Error searching contacts:', e);
-                throw new Error('Error searching contacts: ' + e.message);
-            }
-            
-            if (!pubkeys || pubkeys.length === 0) {
-                throw new Error('Recipient not found in contacts. Email: ' + recipientEmail + ' (normalized: ' + normalizedEmail + ')');
-            }
-            
-            console.log('[JS] Found', pubkeys.length, 'pubkey(s) for recipient');
-            
             let decryptedManifestJson;
+            let foundPubkey = false;
             
-            // Try each recipient pubkey
-            for (const pubkey of pubkeys) {
+            // Try recipient_pubkey from email first (if available)
+            const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+            if (recipientPubkey) {
                 try {
-                    console.log('[JS] Trying recipient pubkey:', pubkey);
-                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
+                    console.log('[JS] Trying recipient_pubkey from email:', recipientPubkey);
+                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, recipientPubkey, encryptedContent);
                     if (decryptedManifestJson && !decryptedManifestJson.startsWith('Unable to decrypt')) {
-                        break;
+                        foundPubkey = true;
                     }
                 } catch (e) {
-                    console.log('[JS] Failed with pubkey:', pubkey, e.message);
-                    continue;
+                    console.log('[JS] Failed with recipient_pubkey from email, falling back to contact lookup:', e);
+                }
+            }
+            
+            // Fallback: For sent emails, we need the recipient's pubkey from contacts
+            if (!foundPubkey) {
+                const recipientEmail = email.to || email.to_address;
+                if (!recipientEmail) {
+                    throw new Error('Recipient address not found');
+                }
+                
+                // Normalize Gmail addresses (remove + aliases)
+                const normalizeGmail = (email) => {
+                    const lower = email.trim().toLowerCase();
+                    if (lower.includes('@gmail.com')) {
+                        const [local, domain] = lower.split('@');
+                        const normalizedLocal = local.split('+')[0];
+                        return `${normalizedLocal}@${domain}`;
+                    }
+                    return lower;
+                };
+                
+                const normalizedEmail = normalizeGmail(recipientEmail);
+                console.log('[JS] Normalized recipient email:', normalizedEmail, 'from:', recipientEmail);
+                
+                let pubkeys = [];
+                try {
+                    // Try both original and normalized email
+                    const emailVariants = [recipientEmail, normalizedEmail].filter((e, i, arr) => arr.indexOf(e) === i);
+                    for (const emailVariant of emailVariants) {
+                        try {
+                            const found = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: emailVariant });
+                            if (found && found.length > 0) {
+                                pubkeys.push(...found);
+                                console.log('[JS] Found pubkeys for', emailVariant, ':', found);
+                            }
+                        } catch (e) {
+                            console.log('[JS] No pubkeys found for', emailVariant);
+                        }
+                    }
+                    // Remove duplicates
+                    pubkeys = [...new Set(pubkeys)];
+                } catch (e) {
+                    console.error('[JS] Error searching contacts:', e);
+                    throw new Error('Error searching contacts: ' + e.message);
+                }
+                
+                if (!pubkeys || pubkeys.length === 0) {
+                    throw new Error('Recipient not found in contacts. Email: ' + recipientEmail + ' (normalized: ' + normalizedEmail + ')');
+                }
+                
+                console.log('[JS] Found', pubkeys.length, 'pubkey(s) for recipient');
+                
+                // Try each recipient pubkey
+                for (const pubkey of pubkeys) {
+                    try {
+                        console.log('[JS] Trying recipient pubkey:', pubkey);
+                        decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
+                        if (decryptedManifestJson && !decryptedManifestJson.startsWith('Unable to decrypt')) {
+                            foundPubkey = true;
+                            break;
+                        }
+                    } catch (e) {
+                        console.log('[JS] Failed with pubkey:', pubkey, e.message);
+                        continue;
+                    }
                 }
             }
             
@@ -1832,7 +1991,20 @@ class EmailService {
 
     // Decrypt Nostr message for sent emails (using recipient pubkey from contacts DB)
     async decryptNostrSentMessageWithFallback(email, encryptedContent, keypair) {
-        // Always look up the recipient's pubkey using the to address
+        // Try recipient_pubkey from email first (if available)
+        const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+        if (recipientPubkey) {
+            try {
+                const decrypted = await TauriService.decryptDmContent(keypair.private_key, recipientPubkey, encryptedContent);
+                if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
+                    return Utils.fixUtf8Encoding(decrypted);
+                }
+            } catch (e) {
+                // Fall through to lookup from contacts
+            }
+        }
+        
+        // Fallback: look up the recipient's pubkey using the to address
         const recipientEmail = email.to || email.to_address;
         if (!recipientEmail) return "Unable to decrypt: recipient address not found";
         let pubkeys = [];
@@ -1858,16 +2030,27 @@ class EmailService {
         return "Unable to decrypt: tried all candidate pubkeys";
     }
 
-    async renderEmails() {
+    async renderEmails(showLoadMore = false) {
         const emailList = domManager.get('emailList');
         if (!emailList) return;
         try {
-            emailList.innerHTML = '';
+            // Remove existing Load More button if it exists
+            const existingLoadMoreBtn = document.getElementById('load-more-emails');
+            if (existingLoadMoreBtn) {
+                existingLoadMoreBtn.remove();
+            }
+            
+            // Get all emails from state
             const emails = appState.getEmails();
+            
             if (emails.length === 0) {
                 emailList.innerHTML = '<div class="text-center text-muted">No emails found</div>';
                 return;
             }
+            
+            // Always re-render all emails (simpler approach)
+            emailList.innerHTML = '';
+            
             for (const email of emails) {
                 console.log('Inbox preview nostr_pubkey for email', email.id, ':', email.nostr_pubkey);
                 const emailElement = document.createElement('div');
@@ -1886,7 +2069,7 @@ class EmailService {
                     dateDisplay = emailDate.toLocaleDateString();
                 }
                 // Determine preview text
-                let previewText = 'Could not decrypt';
+                let previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
                 let showSubject = false;
                 let previewSubject = email.subject;
 
@@ -1901,8 +2084,12 @@ class EmailService {
                         if (Utils.isLikelyEncryptedContent(email.subject)) {
                             try {
                                 previewSubject = await this.decryptNostrMessageWithFallback(email, email.subject, keypair);
+                                // Check if decryption returned an error message
+                                if (previewSubject && (previewSubject.startsWith('Unable to decrypt') || previewSubject.includes('Unable to decrypt'))) {
+                                    previewSubject = 'Unable to decrypt';
+                                }
                             } catch (e) {
-                                previewSubject = 'Could not decrypt';
+                                previewSubject = 'Unable to decrypt';
                             }
                         }
                         // Decrypt body - try manifest format first, then fallback to legacy
@@ -1927,18 +2114,28 @@ class EmailService {
                                     // Fallback to legacy decryption
                                     console.log('[JS] Falling back to legacy decryption for preview...');
                                     const decrypted = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                    previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                    showSubject = true;
+                                    // Check if decryption returned an error message
+                                    if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
+                                        previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                    } else {
+                                        previewText = Utils.escapeHtml(decrypted.substring(0, 100));
+                                        showSubject = true;
+                                    }
                                 }
                             } catch (e) {
                                 console.error('[JS] Manifest decryption failed for preview:', e);
                                 // If manifest fails, try legacy decryption
                                 try {
                                     const decrypted = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                    previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                    showSubject = true;
+                                    // Check if decryption returned an error message
+                                    if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
+                                        previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                    } else {
+                                        previewText = Utils.escapeHtml(decrypted.substring(0, 100));
+                                        showSubject = true;
+                                    }
                                 } catch (legacyError) {
-                                    previewText = 'Could not decrypt';
+                                    previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
                                 }
                             }
                         }
@@ -1965,13 +2162,24 @@ class EmailService {
                 emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
                 emailList.appendChild(emailElement);
             }
+            
+            // Add Load More button if there might be more emails
+            if (showLoadMore) {
+                const loadMoreBtn = document.createElement('button');
+                loadMoreBtn.id = 'load-more-emails';
+                loadMoreBtn.className = 'btn btn-secondary';
+                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
+                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                loadMoreBtn.addEventListener('click', () => this.loadMoreEmails());
+                emailList.appendChild(loadMoreBtn);
+            }
         } catch (error) {
             console.error('Error rendering emails:', error);
         }
     }
 
     // Filter emails with debouncing
-    async filterEmails() {
+    async filterEmails(append = false) {
         const searchQuery = domManager.getValue('emailSearch')?.trim() || '';
         
         // If search query is empty, load all emails normally
@@ -2004,8 +2212,11 @@ class EmailService {
                 const userEmail = settings.email_address ? settings.email_address : null;
                 const privateKey = keypair ? keypair.private_key : null;
                 
-                // Initialize search results accumulator
-                this.searchResults = [];
+                // Initialize search results accumulator (or keep existing if appending)
+                if (!append) {
+                    this.searchResults = [];
+                    this.searchOffset = 0;
+                }
                 this.searchInProgress = true;
                 
                 // Show searching state
@@ -2040,7 +2251,12 @@ class EmailService {
                 // Listen for search completion
                 const completedUnlisten = await window.__TAURI__.event.listen('email-search-completed', async (event) => {
                     const completion = event.payload;
-                    console.log(`[JS] Search completed: ${completion.total_found} total matches`);
+                    console.log(`[JS] Search completed: ${completion.total_found} total matches, has_more: ${completion.has_more}`);
+                    
+                    // Update has_more flag
+                    if (completion.has_more !== undefined) {
+                        this.searchHasMore = completion.has_more;
+                    }
                     
                     this.searchInProgress = false;
                     
@@ -2098,12 +2314,29 @@ class EmailService {
                     await Promise.all(attachmentPromises);
                     
                     appState.setEmails(this.searchResults);
-                    await this.renderEmails();
+                    await this.renderEmails(this.searchHasMore);
                 });
                 
-                console.log('[JS] Starting search with query:', searchQuery);
+                // Reset search offset for new search
+                if (!append) {
+                    this.searchOffset = 0;
+                    this.searchResults = [];
+                }
+                
+                // Get page size from settings (already retrieved above)
+                const pageSize = settings.emails_per_page || 50;
+                
+                console.log('[JS] Starting search with query:', searchQuery, 'limit:', pageSize, 'offset:', this.searchOffset);
                 // Start the search (this will emit events as results are found)
-                await TauriService.searchEmails(searchQuery, userEmail, privateKey);
+                const result = await TauriService.searchEmails(searchQuery, userEmail, privateKey, pageSize, this.searchOffset);
+                console.log('[JS] Search result:', result);
+                
+                // Update offset for next page
+                if (result && Array.isArray(result) && result.length === 2) {
+                    const [count, hasMore] = result;
+                    this.searchHasMore = hasMore;
+                    this.searchOffset += count;
+                }
                 
             } catch (error) {
                 console.error('Error searching emails:', error);
@@ -2167,8 +2400,8 @@ class EmailService {
             if (emailDetailContent) {
                 // Use email.body directly instead of cleanedBody to preserve encrypted message format
                 const emailBody = email.body || '';
-                const nostrPubkey = email.nostr_pubkey;
-                console.log('Nostr pubkey for email:', nostrPubkey);
+                const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+                console.log('Sender pubkey for email:', senderPubkey);
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
                 // Match on the original body, not cleaned version
                 const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
@@ -2177,12 +2410,16 @@ class EmailService {
                 let originalSubject = email.subject;
                 let decryptionAttempted = false;
                 const keypair = appState.getKeypair();
-                if ((nostrPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+                if ((senderPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
                     (async () => {
                         let manifestResult = null;
                         try {
                             if (isEncryptedSubject) {
                                 decryptedSubject = await this.decryptNostrMessageWithFallback(email, email.subject, keypair);
+                                // Check if decryption returned an error message
+                                if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
+                                    decryptedSubject = 'Unable to decrypt';
+                                }
                             }
                             if (encryptedBodyMatch) {
                                 const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
@@ -2204,22 +2441,34 @@ class EmailService {
                                         // Fallback to legacy decryption
                                         console.log('[JS] Falling back to legacy decryption for detail view...');
                                         decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                        // Check if decryption returned an error message
+                                        if (decryptedBody && (decryptedBody.startsWith('Unable to decrypt') || decryptedBody.includes('Unable to decrypt'))) {
+                                            decryptedSubject = 'Unable to decrypt';
+                                            decryptedBody = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                        }
                                     }
                                 } catch (e) {
                                     console.error('[JS] Manifest decryption failed for detail view:', e);
                                     // If manifest fails, try legacy decryption
                                     try {
                                         decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                        // Check if decryption returned an error message
+                                        if (decryptedBody && (decryptedBody.startsWith('Unable to decrypt') || decryptedBody.includes('Unable to decrypt'))) {
+                                            decryptedSubject = 'Unable to decrypt';
+                                            decryptedBody = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                        }
                                     } catch (legacyErr) {
                                         console.error('[JS] Legacy decryption also failed:', legacyErr);
-                                        throw legacyErr;
+                                        decryptedSubject = 'Unable to decrypt';
+                                        decryptedBody = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
                                     }
                                 }
                             }
                             await updateDetail(decryptedSubject, decryptedBody, manifestResult);
                         } catch (err) {
                             console.error('[JS] Error decrypting email detail:', err);
-                            await updateDetail('Could not decrypt', 'Could not decrypt: ' + (err.message || err), null);
+                            // For inbox emails, decryption failure means our private key couldn't decrypt
+                            await updateDetail('Unable to decrypt', 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.', null);
                         }
                     })();
                 } else {
@@ -2577,7 +2826,8 @@ ${attachmentsHtml}
             body_html: null,
             received_at: new Date().toISOString(),
             is_nostr_encrypted: this.selectedNostrContact ? true : false,
-            nostr_pubkey: this.selectedNostrContact ? this.selectedNostrContact.pubkey : null,
+            sender_pubkey: null, // Will be set when sending
+            recipient_pubkey: this.selectedNostrContact ? this.selectedNostrContact.pubkey : null,
             raw_headers: null,
             is_draft: true,
             is_read: false,
@@ -2608,18 +2858,6 @@ ${attachmentsHtml}
         } catch (error) {
             console.error('Error saving draft:', error);
             notificationService.showError('Failed to save draft: ' + error);
-        }
-    }
-
-    async loadDrafts() {
-        try {
-            const userEmail = appState.getSettings().email_address;
-            const drafts = await TauriService.getDrafts(userEmail);
-            console.log('Loaded drafts:', drafts);
-            return drafts;
-        } catch (error) {
-            console.error('Error loading drafts:', error);
-            return [];
         }
     }
 
@@ -2727,26 +2965,48 @@ ${attachmentsHtml}
                 email: emailConfig.email_address
             });
             
-            // Test both IMAP and SMTP connections
+            // Helper function to add timeout to a promise
+            const withTimeout = (promise, timeoutMs, name) => {
+                return Promise.race([
+                    promise,
+                    new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error(`${name} test timed out after ${timeoutMs/1000} seconds`)), timeoutMs)
+                    )
+                ]);
+            };
+            
+            // Test both IMAP and SMTP connections with 30-second timeout each
             const results = await Promise.allSettled([
-                TauriService.testImapConnection(emailConfig),
-                TauriService.testSmtpConnection(emailConfig)
+                withTimeout(TauriService.testImapConnection(emailConfig), 30000, 'IMAP'),
+                withTimeout(TauriService.testSmtpConnection(emailConfig), 30000, 'SMTP')
             ]);
             
             const imapResult = results[0];
             const smtpResult = results[1];
             
+            // Extract error messages, handling both Error objects and strings
+            const getErrorMessage = (result) => {
+                if (result.status === 'rejected') {
+                    if (result.reason instanceof Error) {
+                        return result.reason.message || result.reason.toString();
+                    }
+                    return result.reason || 'Unknown error';
+                }
+                return null;
+            };
+            
+            const imapError = getErrorMessage(imapResult);
+            const smtpError = getErrorMessage(smtpResult);
+            
             // Check results and provide comprehensive feedback
             if (imapResult.status === 'fulfilled' && smtpResult.status === 'fulfilled') {
                 notificationService.showSuccess('✅ Email connection test successful!\n\n• IMAP: Connected and authenticated\n• SMTP: Connected and authenticated\n\nYour email settings are working correctly.');
             } else if (imapResult.status === 'fulfilled' && smtpResult.status === 'rejected') {
-                notificationService.showError(`⚠️ Partial success:\n\n✅ IMAP: Connected and authenticated\n❌ SMTP: ${smtpResult.reason}\n\nYou can receive emails but may have issues sending them.`);
+                notificationService.showError(`⚠️ Partial success:\n\n✅ IMAP: Connected and authenticated\n❌ SMTP: ${smtpError}\n\nYou can receive emails but may have issues sending them.`);
             } else if (imapResult.status === 'rejected' && smtpResult.status === 'fulfilled') {
-                notificationService.showError(`⚠️ Partial success:\n\n❌ IMAP: ${imapResult.reason}\n✅ SMTP: Connected and authenticated\n\nYou can send emails but may have issues receiving them.`);
+                notificationService.showError(`⚠️ Partial success:\n\n❌ IMAP: ${imapError}\n✅ SMTP: Connected and authenticated\n\nYou can send emails but may have issues receiving them.`);
             } else {
-                const imapError = imapResult.status === 'rejected' ? imapResult.reason : 'Unknown error';
-                const smtpError = smtpResult.status === 'rejected' ? smtpResult.reason : 'Unknown error';
-                notificationService.showError(`❌ Email connection test failed:\n\n• IMAP: ${imapError}\n• SMTP: ${smtpError}\n\nPlease check your email settings and try again.`);
+                notificationService.showError(`❌ Email connection test failed:\n\n• IMAP: ${imapError || 'Unknown error'}\n• SMTP: ${smtpError || 'Unknown error'}\n\nPlease check your email settings and try again.`);
             }
             
         } catch (error) {
@@ -3077,19 +3337,30 @@ ${attachmentsHtml}
     }
 
     // Render sent emails
-    async renderSentEmails() {
+    async renderSentEmails(showLoadMore = false) {
         const sentList = domManager.get('sentList');
         if (!sentList) {
             console.error('[JS] renderSentEmails: sentList element not found');
             return;
         }
         try {
-            sentList.innerHTML = '';
+            // Remove existing Load More button if it exists
+            const existingLoadMoreBtn = document.getElementById('load-more-sent-emails');
+            if (existingLoadMoreBtn) {
+                existingLoadMoreBtn.remove();
+            }
+            
+            // Get all emails from state
             const emails = appState.getSentEmails();
+            
             if (!emails || emails.length === 0) {
                 sentList.innerHTML = '<div class="text-center text-muted">No sent emails found</div>';
                 return;
             }
+            
+            // Always re-render all emails (simpler approach)
+            sentList.innerHTML = '';
+            
             console.log(`[JS] renderSentEmails: Rendering ${emails.length} sent emails`);
             
             // Process emails in parallel with timeout protection
@@ -3116,6 +3387,17 @@ ${attachmentsHtml}
                 if (result.status === 'fulfilled' && result.value) {
                     sentList.appendChild(result.value);
                 }
+            }
+            
+            // Add Load More button if there might be more emails
+            if (showLoadMore) {
+                const loadMoreBtn = document.createElement('button');
+                loadMoreBtn.id = 'load-more-sent-emails';
+                loadMoreBtn.className = 'btn btn-secondary';
+                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
+                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                loadMoreBtn.addEventListener('click', () => this.loadMoreSentEmails());
+                sentList.appendChild(loadMoreBtn);
             }
             
             console.log(`[JS] renderSentEmails: Successfully rendered ${renderedItems.filter(r => r.status === 'fulfilled').length} emails`);
@@ -3302,6 +3584,36 @@ ${attachmentsHtml}
     // Internal method to load sent email detail (separated for async handling)
     async _loadSentEmailDetail(email, sentDetailContent) {
         if (!sentDetailContent) return;
+        
+        // Check if recipient_pubkey is missing and email is encrypted
+        const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
+        const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
+        const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+        const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+        const isEncrypted = isEncryptedSubject || encryptedBodyMatch;
+        
+        // If encrypted but no recipient_pubkey, show modal to enter it
+        if (isEncrypted && !recipientPubkey && appState.getKeypair()) {
+            const userEnteredPubkey = await this._showRecipientPubkeyModal(email);
+            if (userEnteredPubkey) {
+                // Try decryption with the entered pubkey
+                const decryptionSuccess = await this._tryDecryptWithRecipientPubkey(email, userEnteredPubkey);
+                if (decryptionSuccess) {
+                    // Update email object and reload detail
+                    email.recipient_pubkey = userEnteredPubkey;
+                    // Reload the detail view with the updated pubkey
+                    await this._loadSentEmailDetail(email, sentDetailContent);
+                    return;
+                } else {
+                    // Decryption failed, show error and continue with normal flow
+                    window.notificationService.showError('Decryption failed with the provided pubkey. Please verify the pubkey is correct.');
+                }
+            } else {
+                // User cancelled, show encrypted content
+                sentDetailContent.innerHTML = '<div class="error">Cannot decrypt: Recipient pubkey not available. Please enter the recipient\'s pubkey to decrypt this email.</div>';
+                return;
+            }
+        }
         
         // Define updateDetail function first (before it's called)
         const updateDetail = async (subject, body, cachedManifestResult) => {
@@ -3609,7 +3921,8 @@ ${attachmentsHtml}
             // Now execute the decryption and update
             try {
                 const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-                const nostrPubkey = email.nostr_pubkey;
+                // For sent emails, use recipient_pubkey for decryption
+                const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
                 // Use generic NIP-X regex (same as inbox)
                 const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
@@ -3628,7 +3941,7 @@ ${attachmentsHtml}
                     ]);
                 };
                 
-                if ((nostrPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+                if ((recipientPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
                     try {
                         // Decrypt subject if it looks encrypted (ASCII armor not required)
                         if (isEncryptedSubject) {
@@ -3687,6 +4000,181 @@ ${attachmentsHtml}
             if (sentDetailContent) {
                 sentDetailContent.innerHTML = '<div class="error">Error loading email: ' + error.message + '</div>';
             }
+        }
+    }
+    
+    // Show modal to enter recipient pubkey for sent email
+    async _showRecipientPubkeyModal(email) {
+        return new Promise((resolve) => {
+            const modalContent = `
+                <div style="padding: 20px;">
+                    <p>This sent email is encrypted but the recipient's pubkey is not available.</p>
+                    <p><strong>To:</strong> ${Utils.escapeHtml(email.to || email.to_address)}</p>
+                    <p><strong>Subject:</strong> ${Utils.escapeHtml(email.subject)}</p>
+                    <div class="form-group" style="margin-top: 20px;">
+                        <label for="recipient-pubkey-input">Enter recipient's Nostr pubkey:</label>
+                        <input type="text" id="recipient-pubkey-input" class="form-control" placeholder="npub1..." style="margin-top: 8px;">
+                        <small class="form-text text-muted">The pubkey will be saved if decryption is successful.</small>
+                    </div>
+                    <div style="margin-top: 20px; display: flex; gap: 10px; justify-content: flex-end;">
+                        <button id="cancel-recipient-pubkey" class="btn btn-secondary">Cancel</button>
+                        <button id="submit-recipient-pubkey" class="btn btn-primary">Try Decryption</button>
+                    </div>
+                </div>
+            `;
+            
+            window.app.showModal('Enter Recipient Pubkey', modalContent);
+            
+            const input = document.getElementById('recipient-pubkey-input');
+            const submitBtn = document.getElementById('submit-recipient-pubkey');
+            const cancelBtn = document.getElementById('cancel-recipient-pubkey');
+            
+            const cleanup = () => {
+                submitBtn.removeEventListener('click', submitHandler);
+                cancelBtn.removeEventListener('click', cancelHandler);
+                if (input) input.removeEventListener('keypress', keyHandler);
+            };
+            
+            const submitHandler = () => {
+                const pubkey = input ? input.value.trim() : '';
+                if (pubkey) {
+                    cleanup();
+                    window.app.hideModal();
+                    resolve(pubkey);
+                } else {
+                    window.notificationService.showError('Please enter a pubkey');
+                }
+            };
+            
+            const cancelHandler = () => {
+                cleanup();
+                window.app.hideModal();
+                resolve(null);
+            };
+            
+            const keyHandler = (e) => {
+                if (e.key === 'Enter') {
+                    submitHandler();
+                }
+            };
+            
+            submitBtn.addEventListener('click', submitHandler);
+            cancelBtn.addEventListener('click', cancelHandler);
+            if (input) {
+                input.addEventListener('keypress', keyHandler);
+                input.focus();
+            }
+        });
+    }
+    
+    // Try decryption with provided recipient pubkey
+    async _tryDecryptWithRecipientPubkey(email, recipientPubkey) {
+        try {
+            const keypair = appState.getKeypair();
+            if (!keypair) {
+                window.notificationService.showError('No keypair available');
+                return false;
+            }
+            
+            // Create a test email object with the recipient pubkey
+            const testEmail = {
+                ...email,
+                recipient_pubkey: recipientPubkey
+            };
+            
+            // Try to decrypt the subject first (quick test)
+            const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
+            if (isEncryptedSubject) {
+                try {
+                    const decryptedSubject = await this.decryptNostrSentMessageWithFallback(testEmail, email.subject, keypair);
+                    if (decryptedSubject && !decryptedSubject.startsWith('Unable to decrypt')) {
+                        // Subject decryption successful, try body too
+                        const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+                        const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                        
+                        if (encryptedBodyMatch) {
+                            const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                            try {
+                                const manifestResult = await this.decryptSentManifestMessage(testEmail, encryptedContent, keypair);
+                                if (manifestResult && manifestResult.type !== 'error') {
+                                    // Both subject and body decrypted successfully
+                                    // Save to database
+                                    await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                                    window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                                    return true;
+                                }
+                            } catch (e) {
+                                // Try legacy decryption
+                                const decryptedBody = await this.decryptNostrSentMessageWithFallback(testEmail, encryptedContent, keypair);
+                                if (decryptedBody && !decryptedBody.startsWith('Unable to decrypt')) {
+                                    await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                                    window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                                    return true;
+                                }
+                            }
+                        } else {
+                            // No encrypted body, subject decryption is enough
+                            await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                            window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                            return true;
+                        }
+                    }
+                } catch (e) {
+                    console.error('[JS] Subject decryption test failed:', e);
+                }
+            } else {
+                // Subject not encrypted, try body
+                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                
+                if (encryptedBodyMatch) {
+                    const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                    try {
+                        const manifestResult = await this.decryptSentManifestMessage(testEmail, encryptedContent, keypair);
+                        if (manifestResult && manifestResult.type !== 'error') {
+                            await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                            window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                            return true;
+                        }
+                    } catch (e) {
+                        const decryptedBody = await this.decryptNostrSentMessageWithFallback(testEmail, encryptedContent, keypair);
+                        if (decryptedBody && !decryptedBody.startsWith('Unable to decrypt')) {
+                            await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                            window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                            return true;
+                        }
+                    }
+                }
+            }
+            
+            return false;
+        } catch (error) {
+            console.error('[JS] Error trying decryption with recipient pubkey:', error);
+            return false;
+        }
+    }
+    
+    // Save recipient pubkey to database
+    async _saveRecipientPubkeyToDb(email, recipientPubkey) {
+        try {
+            if (email.id) {
+                // Try to update by ID first (more reliable)
+                await TauriService.updateEmailRecipientPubkeyById(Number(email.id), recipientPubkey);
+            } else if (email.message_id) {
+                // Fallback to message_id
+                await TauriService.updateEmailRecipientPubkey(email.message_id, recipientPubkey);
+            }
+            
+            // Update the email in appState
+            const sentEmails = appState.getSentEmails();
+            const emailIndex = sentEmails.findIndex(e => e.id === email.id || e.message_id === email.message_id);
+            if (emailIndex !== -1) {
+                sentEmails[emailIndex].recipient_pubkey = recipientPubkey;
+                appState.setSentEmails(sentEmails);
+            }
+        } catch (error) {
+            console.error('[JS] Error saving recipient pubkey to DB:', error);
+            throw error;
         }
     }
 
@@ -4175,41 +4663,92 @@ ${attachmentsHtml}
     }
 
     // Load drafts
-    async loadDrafts() {
+    async loadDrafts(append = false) {
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
         }
         try {
-            domManager.disable('refreshDrafts');
-            domManager.setHTML('refreshDrafts', '<span class="loading"></span> Loading...');
+            if (!append) {
+                // Reset offset when loading fresh (not appending)
+                this.draftsOffset = 0;
+                domManager.disable('refreshDrafts');
+                domManager.setHTML('refreshDrafts', '<span class="loading"></span> Loading...');
+            } else {
+                // Show loading state on Load More button
+                const loadMoreBtn = document.getElementById('load-more-drafts');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = true;
+                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
+                }
+            }
             const settings = appState.getSettings();
             const userEmail = settings.email_address ? settings.email_address : null;
+            // Get page size from settings (default to 50)
+            const pageSize = settings.emails_per_page || 50;
             console.log('[JS] loadDrafts userEmail:', userEmail);
+            console.log('[JS] Loading drafts with offset:', this.draftsOffset, 'pageSize:', pageSize);
             
-            const drafts = await TauriService.getDrafts(userEmail);
-            appState.setDrafts(drafts);
-            this.renderDrafts();
+            const drafts = await TauriService.getDrafts(pageSize, this.draftsOffset, userEmail);
+            
+            if (append) {
+                // Append new drafts to existing ones
+                const existingDrafts = appState.getDrafts();
+                appState.setDrafts([...existingDrafts, ...drafts]);
+            } else {
+                // Replace drafts (fresh load)
+                appState.setDrafts(drafts);
+            }
+            
+            // Update offset for next load
+            this.draftsOffset += drafts.length;
+            
+            // Show Load More button if we got a full page of results
+            this.renderDrafts(drafts.length === pageSize);
         } catch (error) {
             console.error('Failed to load drafts:', error);
             notificationService.showError('Failed to load drafts: ' + error);
         } finally {
-            domManager.enable('refreshDrafts');
-            domManager.setHTML('refreshDrafts', '<i class="fas fa-sync"></i> Refresh');
+            if (!append) {
+                domManager.enable('refreshDrafts');
+                domManager.setHTML('refreshDrafts', '<i class="fas fa-sync"></i> Refresh');
+            } else {
+                const loadMoreBtn = document.getElementById('load-more-drafts');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = false;
+                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                }
+            }
         }
     }
 
+    // Load more drafts (pagination)
+    async loadMoreDrafts() {
+        await this.loadDrafts(true);
+    }
+
     // Render drafts
-    async renderDrafts() {
+    async renderDrafts(showLoadMore = false) {
         const draftsList = domManager.get('draftsList');
         if (!draftsList) return;
         try {
-            draftsList.innerHTML = '';
+            // Remove existing Load More button if it exists
+            const existingLoadMoreBtn = document.getElementById('load-more-drafts');
+            if (existingLoadMoreBtn) {
+                existingLoadMoreBtn.remove();
+            }
+            
+            // Get all drafts from state
             const drafts = appState.getDrafts();
+            
             if (!drafts || drafts.length === 0) {
                 draftsList.innerHTML = '<div class="text-center text-muted">No drafts found</div>';
                 return;
             }
+            
+            // Always re-render all drafts (simpler approach)
+            draftsList.innerHTML = '';
+            
             for (const draft of drafts) {
                 const draftElement = document.createElement('div');
                 draftElement.className = 'email-item';
@@ -4292,6 +4831,17 @@ ${attachmentsHtml}
                 draftElement.addEventListener('click', () => this.loadDraftToCompose(draft));
                 draftsList.appendChild(draftElement);
             }
+            
+            // Add Load More button if there might be more drafts
+            if (showLoadMore) {
+                const loadMoreBtn = document.createElement('button');
+                loadMoreBtn.id = 'load-more-drafts';
+                loadMoreBtn.className = 'btn btn-secondary';
+                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
+                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                loadMoreBtn.addEventListener('click', () => this.loadMoreDrafts());
+                draftsList.appendChild(loadMoreBtn);
+            }
         } catch (error) {
             console.error('Error rendering drafts:', error);
         }
@@ -4320,9 +4870,10 @@ ${attachmentsHtml}
                 domManager.setValue('messageBody', draft.body || '');
                 
                 // If this was an encrypted draft, restore the Nostr contact selection
-                if (draft.is_nostr_encrypted && draft.nostr_pubkey) {
+                const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey; // Fallback for backward compatibility
+                if (draft.is_nostr_encrypted && draftRecipientPubkey) {
                     const contacts = appState.getContacts();
-                    const contact = contacts.find(c => c.pubkey === draft.nostr_pubkey);
+                    const contact = contacts.find(c => c.pubkey === draftRecipientPubkey);
                     if (contact) {
                         this.selectedNostrContact = contact;
                         // Update the Nostr contact dropdown
@@ -4405,14 +4956,15 @@ ${attachmentsHtml}
             const draftsDetailContent = domManager.get('draftsDetailContent');
             if (draftsDetailContent) {
                 const cleanedBody = draft.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-                const nostrPubkey = draft.nostr_pubkey;
+                // For drafts, use recipient_pubkey for decryption (drafts are emails we're preparing to send)
+                const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey; // Fallback for backward compatibility
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(draft.subject);
                 const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 let decryptedSubject = draft.subject;
                 let decryptedBody = cleanedBody;
                 const keypair = appState.getKeypair();
                 
-                if ((nostrPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+                if ((draftRecipientPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
                     (async () => {
                         try {
                             if (isEncryptedSubject) {

@@ -358,11 +358,11 @@ const TauriService = {
     getDbEmails: async function(limit = 50, offset = 0, nostrOnly = true, userEmail = null) {
         return await this.invoke('db_get_emails', { limit, offset, nostrOnly, userEmail: userEmail });
     },
-    searchEmails: async function(searchQuery, userEmail = null, privateKey = null) {
-        return await this.invoke('db_search_emails', { searchQuery, userEmail, privateKey });
+    searchEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
+        return await this.invoke('db_search_emails', { searchQuery, userEmail, privateKey, limit, offset });
     },
-    searchSentEmails: async function(searchQuery, userEmail = null, privateKey = null) {
-        return await this.invoke('db_search_sent_emails', { searchQuery, userEmail, privateKey });
+    searchSentEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
+        return await this.invoke('db_search_sent_emails', { searchQuery, userEmail, privateKey, limit, offset });
     },
     getDbSentEmails: async function(limit = 50, offset = 0, userEmail = null) {
         return await this.invoke('db_get_sent_emails', { limit, offset, userEmail: userEmail });
@@ -373,8 +373,8 @@ const TauriService = {
     decryptDmContent: async function(privateKey, senderPubkey, encryptedContent) {
         return await this.invoke('decrypt_dm_content', { privateKey, senderPubkey, encryptedContent });
     },
-    filterNewContacts: async function(pubkeys) {
-        return await this.invoke('db_filter_new_contacts', { pubkeys });
+    filterNewContacts: async function(userPubkey, pubkeys) {
+        return await this.invoke('db_filter_new_contacts', { userPubkey, pubkeys });
     },
     
     // Attachment functions
@@ -419,8 +419,8 @@ const TauriService = {
         return await this.invoke('db_save_draft', { draft });
     },
 
-    getDrafts: async function(userEmail) {
-        return await this.invoke('db_get_drafts', { userEmail });
+    getDrafts: async function(limit = 50, offset = 0, userEmail = null) {
+        return await this.invoke('db_get_drafts', { limit, offset, userEmail: userEmail });
     },
 
     deleteDraft: async function(messageId) {
@@ -463,6 +463,15 @@ const TauriService = {
     
     dbSaveSettingsBatch: async function(pubkey, settings) {
         return await this.invoke('db_save_settings_batch', { pubkey, settings });
+    },
+    
+    // Update email recipient pubkey
+    updateEmailRecipientPubkey: async function(messageId, recipientPubkey) {
+        return await this.invoke('db_update_email_recipient_pubkey', { messageId, recipientPubkey });
+    },
+    
+    updateEmailRecipientPubkeyById: async function(id, recipientPubkey) {
+        return await this.invoke('db_update_email_recipient_pubkey_by_id', { id, recipientPubkey });
     }
 };
 window.TauriService = TauriService; 

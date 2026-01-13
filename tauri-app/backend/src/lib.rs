@@ -41,7 +41,8 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         date: email.received_at,
         is_read: email.is_read,
         raw_headers: raw_headers.clone(),
-        nostr_pubkey: email.nostr_pubkey.clone(),
+        sender_pubkey: email.sender_pubkey.clone(),
+        recipient_pubkey: email.recipient_pubkey.clone(),
         message_id: Some(email.message_id.clone()),
     }
 }
@@ -226,18 +227,93 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
     
     println!("[RUST] Using persistent client to fetch profile for: {}", pubkey);
     
+    // Check relay connection status before fetching
+    // Wait for at least one relay to be connected (up to 10 seconds)
+    let max_wait_time = std::time::Duration::from_secs(10);
+    let start_time = std::time::Instant::now();
+    let check_interval = std::time::Duration::from_millis(500);
+    
+    let mut connected_relays = client.relays().await;
+    println!("[RUST] Checking relay status before profile fetch...");
+    println!("[RUST] Initial relays in client: {}", connected_relays.len());
+    
+    // Wait for at least one relay to connect
+    while connected_relays.is_empty() && start_time.elapsed() < max_wait_time {
+        println!("[RUST] No relays connected yet, waiting... ({:?} elapsed)", start_time.elapsed());
+        tokio::time::sleep(check_interval).await;
+        connected_relays = client.relays().await;
+    }
+    
+    if connected_relays.is_empty() {
+        println!("[RUST] WARNING: No relays connected after waiting! Profile fetch will likely fail.");
+        return Err("No relays connected. Please check your relay configuration and network connection.".to_string());
+    } else {
+        println!("[RUST] Connected to {} relay(s):", connected_relays.len());
+        for (url, _) in connected_relays.iter() {
+            println!("[RUST]   ✓ {}", url);
+        }
+        
+        // Give relays a moment to be fully ready for queries
+        // WebSocket connections may be established but not ready to receive queries immediately
+        println!("[RUST] Waiting 2 seconds for relays to be fully ready...");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    
     // Create filter for single profile
     let profile_filter = Filter::new()
         .author(public_key)
         .kind(Kind::from(0)) // Profile events are kind 0
         .limit(1);
-        
-    let profile_events = client
-        .fetch_events(profile_filter, Duration::from_secs(30))
-        .await
-        .map_err(|e| e.to_string())?;
     
+    println!("[RUST] Fetching profile events with 15s timeout...");
+    let fetch_start = std::time::Instant::now();
+    let profile_events = client
+        .fetch_events(profile_filter, Duration::from_secs(15))
+        .await
+        .map_err(|e| {
+            println!("[RUST] ERROR during fetch_events: {}", e);
+            e.to_string()
+        })?;
+    let fetch_duration = fetch_start.elapsed();
+    println!("[RUST] Fetch completed in {:?}", fetch_duration);
     println!("[RUST] Found {} profile events using persistent client", profile_events.len());
+    
+    // Log if timeout was reached (suggests relays aren't responding)
+    if fetch_duration.as_secs() >= 14 {
+        println!("[RUST] WARNING: Fetch took nearly full timeout duration. Relays may not be responding to queries.");
+        println!("[RUST] Attempting fallback: using fresh client connection to query relays directly...");
+        
+        // Fallback: Try using a fresh client connection
+        let db = state.get_database().map_err(|e| format!("Failed to get database: {}", e))?;
+        let db_relays = db.get_all_relays()
+            .map_err(|e| format!("Failed to load relays from database: {}", e))?;
+        let relay_urls: Vec<String> = db_relays.iter()
+            .filter(|r| r.is_active)
+            .map(|r| r.url.clone())
+            .collect();
+        
+        if !relay_urls.is_empty() {
+            println!("[RUST] Fallback: Querying {} relays with fresh connection", relay_urls.len());
+            match nostr::fetch_events(&pubkey, Some(0), &relay_urls).await {
+                Ok(events) => {
+                    println!("[RUST] Fallback found {} profile events", events.len());
+                    if let Some(latest_event) = events.into_iter().max_by_key(|e| e.created_at) {
+                        let profile = nostr::parse_profile_from_event(&latest_event)
+                            .map_err(|e| format!("Failed to parse profile: {}", e))?;
+                        println!("[RUST] Fallback successfully retrieved profile!");
+                        return Ok(Some(ProfileResult {
+                            pubkey: pubkey.clone(),
+                            fields: profile.fields,
+                            raw_content: latest_event.content,
+                        }));
+                    }
+                },
+                Err(e) => {
+                    println!("[RUST] Fallback also failed: {}", e);
+                }
+            }
+        }
+    }
     
     // Find latest profile event
     if let Some(latest_event) = profile_events.into_iter().max_by_key(|e| e.created_at) {
@@ -362,8 +438,6 @@ async fn update_single_relay(relay_url: String, is_active: bool, state: tauri::S
 
 #[tauri::command]
 async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    println!("[RUST] sync_relay_states called - auto-disabling disconnected relays");
-    
     let client_option = {
         let client_guard = state.nostr_client.lock().unwrap();
         client_guard.clone()
@@ -373,18 +447,10 @@ async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
     
     if let Some(client) = client_option {
         let connected_relays = client.relays().await;
-        println!("[RUST] Currently connected relays: {} relays", connected_relays.len());
-        for (url, _) in connected_relays.iter() {
-            println!("[RUST]   Connected: {}", url);
-        }
         
         // Get current relay configuration from database (not just in-memory state)
         let db = state.get_database().map_err(|e| e.to_string())?;
         let all_db_relays = db.get_all_relays().map_err(|e| e.to_string())?;
-        println!("[RUST] Database relays: {} total", all_db_relays.len());
-        for db_relay in all_db_relays.iter() {
-            println!("[RUST]   DB relay: {} (active: {})", db_relay.url, db_relay.is_active);
-        }
         
         let mut relays_to_update = Vec::new();
         for db_relay in all_db_relays.iter() {
@@ -392,7 +458,6 @@ async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
                 let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == db_relay.url);
                 if !is_connected {
                     // This relay is marked as active but not actually connected
-                    println!("[RUST] Found disconnected active relay: {}", db_relay.url);
                     relays_to_update.push(db_relay.url.clone());
                 }
             }
@@ -400,16 +465,11 @@ async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
         
         // Update disconnected relays to inactive
         for relay_url in relays_to_update {
-            println!("[RUST] Auto-disabling disconnected relay: {}", relay_url);
-            
             // Update in-memory state (if relay exists there)
             {
                 let mut relays_guard = state.relays.lock().unwrap();
                 if let Some(relay) = relays_guard.iter_mut().find(|r| r.url == relay_url) {
                     relay.is_active = false;
-                    println!("[RUST] Updated in-memory state for relay: {}", relay_url);
-                } else {
-                    println!("[RUST] Relay {} not found in in-memory state (database-only relay)", relay_url);
                 }
             }
             
@@ -431,6 +491,11 @@ async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
             }
             
             updated_relays.push(relay_url);
+        }
+        
+        // Only log when relays are actually updated
+        if !updated_relays.is_empty() {
+            println!("[RUST] sync_relay_states: Auto-disabled {} disconnected relay(s): {:?}", updated_relays.len(), updated_relays);
         }
     }
     
@@ -760,6 +825,7 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
     let mut results = Vec::new();
     
     // Process each requested pubkey
+    println!("[RUST] Processing {} requested pubkeys...", pubkeys.len());
     for (i, pubkey_str) in pubkeys.iter().enumerate() {
         let public_key = &public_keys[i];
         
@@ -799,6 +865,7 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         }
     }
     
+    println!("[RUST] fetch_profiles_persistent returning {} profiles", results.len());
     Ok(results)
 }
 
@@ -986,9 +1053,14 @@ fn set_conversations(conversations: Vec<Conversation>) -> Result<(), String> {
 
 #[tauri::command]
 async fn test_imap_connection(email_config: EmailConfig) -> Result<(), String> {
+    println!("[RUST] test_imap_connection called for: {}@{}:{}", 
+        email_config.email_address, email_config.imap_host, email_config.imap_port);
     email::test_imap_connection(&email_config)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            println!("[RUST] test_imap_connection failed: {}", e);
+            e.to_string()
+        })
 }
 
 #[tauri::command]
@@ -1024,17 +1096,56 @@ fn generate_qr_code(data: String, _size: Option<u32>) -> Result<String, String> 
     Ok(data_url)
 }
 
+/// Get the app data directory path, handling Android-specific paths
+fn get_app_data_dir() -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "android")]
+    {
+        // On Android, apps can write to their internal files directory
+        // Path: /data/data/<package_name>/files/
+        // Package name: com.nostr.mail
+        // Android apps have write access to this directory by default
+        
+        let app_files_dir = std::path::PathBuf::from("/data/data/com.nostr.mail/files");
+        let app_data_dir = app_files_dir.join("nostr-mail");
+        
+        // The files directory should exist, but create it if it doesn't
+        // (This shouldn't fail as Android creates it automatically)
+        std::fs::create_dir_all(&app_files_dir)
+            .map_err(|e| format!("Cannot access app files directory {:?}: {}", app_files_dir, e))?;
+        
+        Ok(app_data_dir)
+    }
+    
+    #[cfg(not(target_os = "android"))]
+    {
+        // On desktop platforms, use dirs crate
+        dirs::data_dir()
+            .ok_or_else(|| "Could not get app data directory".to_string())
+            .map(|d| d.join("nostr-mail"))
+    }
+}
+
 #[tauri::command]
 fn init_database(state: tauri::State<AppState>) -> Result<(), String> {
     println!("[RUST] init_database called");
-    // Use dirs crate for app data directory
-    let app_dir = dirs::data_dir()
-        .ok_or_else(|| "Could not get app data directory".to_string())?
-        .join("nostr-mail");
-    std::fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
+    
+    // Get app data directory
+    let app_dir = get_app_data_dir()
+        .map_err(|e| format!("Failed to get app data directory: {}", e))?;
+    println!("[RUST] App data directory: {:?}", app_dir);
+    
+    // Create directory if it doesn't exist
+    std::fs::create_dir_all(&app_dir)
+        .map_err(|e| format!("Failed to create app data directory {:?}: {} (check permissions)", app_dir, e))?;
+    println!("[RUST] App data directory created/verified: {:?}", app_dir);
+    
+    // Construct database path
     let db_path = app_dir.join("nostr_mail.db");
     println!("[RUST] Database path: {:?}", db_path);
+    
+    // Initialize database
     state.init_database(&db_path)
+        .map_err(|e| format!("Failed to initialize database at {:?}: {} (check file permissions and disk space)", db_path, e))
 }
 
 // Database commands for contacts
@@ -1053,10 +1164,10 @@ fn db_get_contact(pubkey: String, state: tauri::State<AppState>) -> Result<Optio
 }
 
 #[tauri::command]
-fn db_get_all_contacts(state: tauri::State<AppState>) -> Result<Vec<DbContact>, String> {
-    println!("[RUST] db_get_all_contacts called");
+fn db_get_all_contacts(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<DbContact>, String> {
+    println!("[RUST] db_get_all_contacts called for user_pubkey: {}", user_pubkey);
     let db = state.get_database()?;
-    db.get_all_contacts().map_err(|e| e.to_string())
+    db.get_all_contacts(&user_pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1067,15 +1178,43 @@ fn db_delete_contact(pubkey: String, state: tauri::State<AppState>) -> Result<()
 }
 
 #[tauri::command]
+fn db_add_user_contact(user_pubkey: String, contact_pubkey: String, is_public: bool, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_add_user_contact called: user={}, contact={}, is_public={}", user_pubkey, contact_pubkey, is_public);
+    let db = state.get_database()?;
+    db.add_user_contact(&user_pubkey, &contact_pubkey, is_public).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_remove_user_contact(user_pubkey: String, contact_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_remove_user_contact called: user={}, contact={}", user_pubkey, contact_pubkey);
+    let db = state.get_database()?;
+    db.remove_user_contact(&user_pubkey, &contact_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_public_contact_pubkeys(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    println!("[RUST] db_get_public_contact_pubkeys called for user: {}", user_pubkey);
+    let db = state.get_database()?;
+    db.get_public_contact_pubkeys(&user_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_update_user_contact_public_status(user_pubkey: String, contact_pubkey: String, is_public: bool, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_update_user_contact_public_status called: user={}, contact={}, is_public={}", user_pubkey, contact_pubkey, is_public);
+    let db = state.get_database()?;
+    db.update_user_contact_public_status(&user_pubkey, &contact_pubkey, is_public).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn db_find_pubkeys_by_email(email: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     let db = state.get_database()?;
     db.find_pubkeys_by_email(&email).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn db_filter_new_contacts(pubkeys: Vec<String>, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+fn db_filter_new_contacts(user_pubkey: String, pubkeys: Vec<String>, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     let db = state.get_database()?;
-    let existing: std::collections::HashSet<String> = db.get_all_contacts()
+    let existing: std::collections::HashSet<String> = db.get_all_contacts(&user_pubkey)
         .map_err(|e| e.to_string())?
         .into_iter()
         .map(|c| c.pubkey)
@@ -1122,10 +1261,14 @@ async fn db_search_emails(
     search_query: String, 
     user_email: Option<String>, 
     private_key: Option<String>, 
+    limit: Option<i64>,
+    offset: Option<i64>,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>
-) -> Result<usize, String> {
-    println!("[RUST] db_search_emails called with query: '{}'", search_query);
+) -> Result<(usize, bool), String> {
+    let page_size = limit.unwrap_or(50) as usize;
+    let skip_count = offset.unwrap_or(0) as usize;
+    println!("[RUST] db_search_emails called with query: '{}', limit: {}, offset: {}", search_query, page_size, skip_count);
     let db = state.get_database()?;
     
     // Emit search started event
@@ -1133,12 +1276,13 @@ async fn db_search_emails(
         println!("[RUST] Failed to emit search-started event: {}", e);
     }
     
-    // Get all emails (or a large limit) - we'll filter after decryption
-    let all_emails = db.get_emails(Some(10000), Some(0), Some(true), user_email.as_deref())
-        .map_err(|e| e.to_string())?;
-    
+    // Process emails in batches - fetch more than we need since we filter after decryption
+    let batch_size = (page_size * 3).max(100); // Fetch 3x the page size or at least 100
+    let mut db_offset: i64 = 0;
     let search_query_lower = search_query.to_lowercase();
     let mut match_count = 0;
+    let mut skipped_count = 0;
+    let mut has_more = false;
     
     // Create email config for decryption
     let email_config = crate::types::EmailConfig {
@@ -1152,19 +1296,34 @@ async fn db_search_emails(
         private_key,
     };
     
-    for (index, email) in all_emails.iter().enumerate() {
-        // Emit progress update every 10 emails
-        if index % 10 == 0 {
-            let progress = serde_json::json!({
-                "processed": index,
-                "total": all_emails.len()
-            });
-            if let Err(e) = app_handle.emit("email-search-progress", &progress) {
-                println!("[RUST] Failed to emit search-progress event: {}", e);
-            }
-            // Yield to allow UI updates
-            tokio::task::yield_now().await;
+    // Process emails in batches until we have enough results
+    loop {
+        let batch_emails = db.get_emails(Some(batch_size as i64), Some(db_offset), Some(true), user_email.as_deref())
+            .map_err(|e| e.to_string())?;
+        
+        if batch_emails.is_empty() {
+            break; // No more emails to process
         }
+        
+        for (index, email) in batch_emails.iter().enumerate() {
+            // Emit progress update every 10 emails
+            let processed = db_offset + index as i64;
+            if processed % 10 == 0 {
+                let progress = serde_json::json!({
+                    "processed": processed,
+                });
+                if let Err(e) = app_handle.emit("email-search-progress", &progress) {
+                    println!("[RUST] Failed to emit search-progress event: {}", e);
+                }
+                // Yield to allow UI updates
+                tokio::task::yield_now().await;
+            }
+            
+            // Stop if we've found enough results
+            if match_count >= page_size {
+                has_more = true; // There might be more results
+                break;
+            }
         
         // Decrypt subject and body
         let raw_headers = email.raw_headers.as_deref().unwrap_or("");
@@ -1246,43 +1405,77 @@ async fn db_search_emails(
                 email.id.unwrap_or(0), search_query, from_matches, to_matches, subject_matches, body_matches, attachment_matches);
         }
         
-        if matches {
-            // Create EmailMessage with same format as normal emails (encrypted content, frontend will decrypt)
-            // Use map_db_email_to_email_message to ensure consistent format
-            let email_message = map_db_email_to_email_message(&email);
-            
-            // Emit this matching email immediately
-            if let Err(e) = app_handle.emit("email-search-result", &email_message) {
-                println!("[RUST] Failed to emit search-result event: {}", e);
+            if matches {
+                // Skip results until we reach the offset
+                if skipped_count < skip_count {
+                    skipped_count += 1;
+                    continue;
+                }
+                
+                // Create EmailMessage with same format as normal emails (encrypted content, frontend will decrypt)
+                // Use map_db_email_to_email_message to ensure consistent format
+                let email_message = map_db_email_to_email_message(&email);
+                
+                // Emit this matching email immediately
+                if let Err(e) = app_handle.emit("email-search-result", &email_message) {
+                    println!("[RUST] Failed to emit search-result event: {}", e);
+                }
+                
+                match_count += 1;
+                
+                // Stop if we've found enough results
+                if match_count >= page_size {
+                    has_more = true; // There might be more results
+                    break;
+                }
             }
-            
-            match_count += 1;
         }
+        
+        // If we've found enough results or processed all emails, stop
+        if match_count >= page_size || batch_emails.len() < batch_size {
+            break;
+        }
+        
+        db_offset += batch_size as i64;
     }
     
     // Emit search completed event
     let completion = serde_json::json!({
-        "total_found": match_count
+        "total_found": match_count,
+        "has_more": has_more
     });
     if let Err(e) = app_handle.emit("email-search-completed", &completion) {
         println!("[RUST] Failed to emit search-completed event: {}", e);
     }
     
-    println!("[RUST] Search found {} matching emails", match_count);
-    Ok(match_count)
+    println!("[RUST] Search found {} matching emails (has_more: {})", match_count, has_more);
+    Ok((match_count, has_more))
 }
 
 #[tauri::command]
-fn db_update_email_nostr_pubkey(message_id: String, nostr_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
+fn db_update_email_sender_pubkey(message_id: String, sender_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
     let db = state.get_database()?;
-    db.update_email_nostr_pubkey(&message_id, &nostr_pubkey).map_err(|e| e.to_string())
+    db.update_email_sender_pubkey(&message_id, &sender_pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn db_update_email_nostr_pubkey_by_id(id: i64, nostr_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
-    println!("[RUST] db_update_email_nostr_pubkey_by_id called");
+fn db_update_email_sender_pubkey_by_id(id: i64, sender_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_update_email_sender_pubkey_by_id called");
     let db = state.get_database().map_err(|e| e.to_string())?;
-    db.update_email_nostr_pubkey_by_id(id, &nostr_pubkey).map_err(|e| e.to_string())
+    db.update_email_sender_pubkey_by_id(id, &sender_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_update_email_recipient_pubkey(message_id: String, recipient_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let db = state.get_database()?;
+    db.update_email_recipient_pubkey(&message_id, &recipient_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_update_email_recipient_pubkey_by_id(id: i64, recipient_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_update_email_recipient_pubkey_by_id called");
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    db.update_email_recipient_pubkey_by_id(id, &recipient_pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1307,10 +1500,14 @@ async fn db_search_sent_emails(
     search_query: String, 
     user_email: Option<String>, 
     private_key: Option<String>, 
+    limit: Option<i64>,
+    offset: Option<i64>,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>
-) -> Result<usize, String> {
-    println!("[RUST] db_search_sent_emails called with query: '{}'", search_query);
+) -> Result<(usize, bool), String> {
+    let page_size = limit.unwrap_or(50) as usize;
+    let skip_count = offset.unwrap_or(0) as usize;
+    println!("[RUST] db_search_sent_emails called with query: '{}', limit: {}, offset: {}", search_query, page_size, skip_count);
     let db = state.get_database()?;
     
     // Emit search started event
@@ -1318,12 +1515,13 @@ async fn db_search_sent_emails(
         println!("[RUST] Failed to emit sent-search-started event: {}", e);
     }
     
-    // Get all sent emails (or a large limit) - we'll filter after decryption
-    let all_emails = db.get_sent_emails(Some(10000), Some(0), user_email.as_deref())
-        .map_err(|e| e.to_string())?;
-    
+    // Process emails in batches - fetch more than we need since we filter after decryption
+    let batch_size = (page_size * 3).max(100); // Fetch 3x the page size or at least 100
+    let mut db_offset: i64 = 0;
     let search_query_lower = search_query.to_lowercase();
     let mut match_count = 0;
+    let mut skipped_count = 0;
+    let mut has_more = false;
     
     // Create email config for decryption
     let email_config = crate::types::EmailConfig {
@@ -1337,21 +1535,36 @@ async fn db_search_sent_emails(
         private_key,
     };
     
-    for (index, email) in all_emails.iter().enumerate() {
-        // Emit progress update every 10 emails
-        if index % 10 == 0 {
-            let progress = serde_json::json!({
-                "processed": index,
-                "total": all_emails.len()
-            });
-            if let Err(e) = app_handle.emit("sent-search-progress", &progress) {
-                println!("[RUST] Failed to emit sent-search-progress event: {}", e);
-            }
-            // Yield to allow UI updates
-            tokio::task::yield_now().await;
+    // Process emails in batches until we have enough results
+    loop {
+        let batch_emails = db.get_sent_emails(Some(batch_size as i64), Some(db_offset), user_email.as_deref())
+            .map_err(|e| e.to_string())?;
+        
+        if batch_emails.is_empty() {
+            break; // No more emails to process
         }
         
-        // For sent emails, decrypt using recipient's pubkey
+        for (index, email) in batch_emails.iter().enumerate() {
+            // Emit progress update every 10 emails
+            let processed = db_offset + index as i64;
+            if processed % 10 == 0 {
+                let progress = serde_json::json!({
+                    "processed": processed,
+                });
+                if let Err(e) = app_handle.emit("sent-search-progress", &progress) {
+                    println!("[RUST] Failed to emit sent-search-progress event: {}", e);
+                }
+                // Yield to allow UI updates
+                tokio::task::yield_now().await;
+            }
+            
+            // Stop if we've found enough results
+            if match_count >= page_size {
+                has_more = true; // There might be more results
+                break;
+            }
+            
+            // For sent emails, decrypt using recipient's pubkey (sent emails are encrypted with recipient's public key)
         let raw_headers = email.raw_headers.as_deref().unwrap_or("");
         let (decrypted_subject, decrypted_body) = if email.is_nostr_encrypted && email_config.private_key.is_some() {
             // For sent emails, we need the recipient's pubkey to decrypt
@@ -1424,26 +1637,80 @@ async fn db_search_sent_emails(
             
             // Fallback to sender pubkey decryption (for inbox emails or if recipient pubkey not found)
             if decrypted_body_result.is_none() {
+                println!("[RUST] No recipient pubkey decryption succeeded, trying fallback sender pubkey decryption for email {}", email.id.unwrap_or(0));
                 match email::decrypt_nostr_email_content(&email_config, raw_headers, &email.subject, &email.body) {
                     Ok((subj, body)) => {
+                        println!("[RUST] Fallback sender pubkey decryption succeeded for email {}", email.id.unwrap_or(0));
                         decrypted_subject_result = subj;
                         decrypted_body_result = Some(body);
                     }
                     Err(e) => {
-                        println!("[RUST] Failed to decrypt sent email {}: {}", email.id.unwrap_or(0), e);
+                        println!("[RUST] Failed to decrypt sent email {} with fallback: {}", email.id.unwrap_or(0), e);
+                        println!("[RUST] Using encrypted body for search (search may not find decrypted content)");
                         decrypted_body_result = Some(email.body.clone());
                     }
                 }
             } else {
-                // Subject decryption (try with sender pubkey from header)
+                println!("[RUST] Successfully decrypted sent email {} body with recipient pubkey", email.id.unwrap_or(0));
+                
+                // Subject decryption - try with recipient pubkeys first, then fallback to sender pubkey
                 if email::is_likely_encrypted_content(&email.subject) {
-                    if let Some(sender_pubkey) = email.nostr_pubkey.as_ref() {
-                        if let Ok(decrypted) = crypto::decrypt_message(
-                            email_config.private_key.as_ref().unwrap(),
-                            sender_pubkey,
-                            &email.subject
-                        ) {
-                            decrypted_subject_result = decrypted;
+                    let mut subject_decrypted = false;
+                    
+                    // Try recipient pubkeys first (same as body)
+                    if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email(recipient_email) {
+                        let normalized_email = if recipient_email.contains("@gmail.com") {
+                            let parts: Vec<&str> = recipient_email.split('@').collect();
+                            if parts.len() == 2 {
+                                let local = parts[0].split('+').next().unwrap_or(parts[0]);
+                                format!("{}@{}", local, parts[1]).to_lowercase()
+                            } else {
+                                recipient_email.to_lowercase()
+                            }
+                        } else {
+                            recipient_email.to_lowercase()
+                        };
+                        
+                        let mut all_pubkeys = recipient_pubkeys;
+                        if normalized_email != recipient_email.to_lowercase() {
+                            if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email(&normalized_email) {
+                                all_pubkeys.extend(normalized_pubkeys);
+                            }
+                        }
+                        all_pubkeys.dedup();
+                        
+                        // Extract encrypted content from subject
+                        let encrypted_subject_content = match extract_encrypted_content_from_armor(&email.subject) {
+                            Some(content) => content,
+                            None => email.subject.clone()
+                        };
+                        
+                        for recipient_pubkey in &all_pubkeys {
+                            match nostr::decrypt_dm_content(
+                                email_config.private_key.as_ref().unwrap(),
+                                recipient_pubkey,
+                                &encrypted_subject_content
+                            ) {
+                                Ok(decrypted) => {
+                                    decrypted_subject_result = decrypted;
+                                    subject_decrypted = true;
+                                    break;
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    
+                    // Fallback to sender pubkey if recipient pubkey decryption failed
+                    if !subject_decrypted {
+                        if let Some(sender_pubkey) = email.sender_pubkey.as_ref() {
+                            if let Ok(decrypted) = crypto::decrypt_message(
+                                email_config.private_key.as_ref().unwrap(),
+                                sender_pubkey,
+                                &email.subject
+                            ) {
+                                decrypted_subject_result = decrypted;
+                            }
                         }
                     }
                 }
@@ -1502,37 +1769,104 @@ async fn db_search_sent_emails(
             }
         }
         
-        // Search in: from, to, subject, body, attachment filenames (both encrypted and decrypted)
-        let matches = email.from_address.to_lowercase().contains(&search_query_lower) ||
-                     email.to_address.to_lowercase().contains(&search_query_lower) ||
-                     decrypted_subject.to_lowercase().contains(&search_query_lower) ||
-                     decrypted_body.to_lowercase().contains(&search_query_lower) ||
-                     attachment_filenames.iter().any(|f| f.contains(&search_query_lower));
+        // Check if decrypted body is a manifest JSON - if so, we need to extract the actual body text
+        // For manifest format, the body is encrypted with AES in manifest.body.ciphertext
+        // For now, we'll search the JSON structure itself (which includes attachment metadata)
+        // TODO: Decrypt manifest.body.ciphertext with AES to search actual body text
+        let mut searchable_body = decrypted_body.clone();
+        let mut is_manifest = false;
         
-        if matches {
-            // Create EmailMessage with same format as normal emails (encrypted content, frontend will decrypt)
-            // Use map_db_email_to_email_message to ensure consistent format
-            let email_message = map_db_email_to_email_message(&email);
-            
-            // Emit this matching email immediately
-            if let Err(e) = app_handle.emit("sent-search-result", &email_message) {
-                println!("[RUST] Failed to emit sent-search-result event: {}", e);
+        // Try to detect if this is a manifest JSON
+        if decrypted_body.trim_start().starts_with('{') {
+            if let Ok(manifest_json) = serde_json::from_str::<serde_json::Value>(&decrypted_body) {
+                if let Some(manifest_obj) = manifest_json.as_object() {
+                    // Check if it has the manifest structure
+                    if manifest_obj.contains_key("body") && manifest_obj.contains_key("attachments") {
+                        is_manifest = true;
+                        println!("[RUST] Sent email {} has manifest format body", email.id.unwrap_or(0));
+                        
+                        // For manifest format, search within the JSON structure
+                        // The actual body text is in manifest.body.ciphertext but needs AES decryption
+                        // For now, search the JSON string itself (includes attachment filenames which are already extracted)
+                        // Also check if search query appears in any JSON values
+                        let json_string = serde_json::to_string(&manifest_json).unwrap_or_default();
+                        searchable_body = json_string;
+                        
+                        // Also check if the search query appears in any string values in the manifest
+                        if let Some(body_obj) = manifest_obj.get("body").and_then(|v| v.as_object()) {
+                            // Search in ciphertext (base64 encoded, might contain search terms)
+                            if let Some(ciphertext) = body_obj.get("ciphertext").and_then(|v| v.as_str()) {
+                                if ciphertext.to_lowercase().contains(&search_query_lower) {
+                                    println!("[RUST] Search query found in manifest ciphertext");
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            
-            match_count += 1;
         }
+        
+        // Search in: from, to, subject, body, attachment filenames (both encrypted and decrypted)
+        let from_matches = email.from_address.to_lowercase().contains(&search_query_lower);
+        let to_matches = email.to_address.to_lowercase().contains(&search_query_lower);
+        let subject_matches = decrypted_subject.to_lowercase().contains(&search_query_lower);
+        let body_matches = searchable_body.to_lowercase().contains(&search_query_lower);
+        let attachment_matches = attachment_filenames.iter().any(|f| f.contains(&search_query_lower));
+        
+        let matches = from_matches || to_matches || subject_matches || body_matches || attachment_matches;
+        
+        // Always log search details for debugging
+        println!("[RUST] Sent email {} search for '{}': from={}, to={}, subject={}, body={}, attachments={}, is_manifest={}", 
+            email.id.unwrap_or(0), search_query, from_matches, to_matches, subject_matches, body_matches, attachment_matches, is_manifest);
+        println!("[RUST] Decrypted subject: {}", decrypted_subject.chars().take(100).collect::<String>());
+        println!("[RUST] Decrypted body (first 200 chars): {}", searchable_body.chars().take(200).collect::<String>());
+        
+            if matches {
+                // Skip results until we reach the offset
+                if skipped_count < skip_count {
+                    skipped_count += 1;
+                    continue;
+                }
+                
+                println!("[RUST] ✓ Sent email {} MATCHES search query '{}'", email.id.unwrap_or(0), search_query);
+                // Create EmailMessage with same format as normal emails (encrypted content, frontend will decrypt)
+                // Use map_db_email_to_email_message to ensure consistent format
+                let email_message = map_db_email_to_email_message(&email);
+                
+                // Emit this matching email immediately
+                if let Err(e) = app_handle.emit("sent-search-result", &email_message) {
+                    println!("[RUST] Failed to emit sent-search-result event: {}", e);
+                }
+                
+                match_count += 1;
+                
+                // Stop if we've found enough results
+                if match_count >= page_size {
+                    has_more = true; // There might be more results
+                    break;
+                }
+            }
+        }
+        
+        // If we've found enough results or processed all emails, stop
+        if match_count >= page_size || batch_emails.len() < batch_size {
+            break;
+        }
+        
+        db_offset += batch_size as i64;
     }
     
     // Emit search completed event
     let completion = serde_json::json!({
-        "total_found": match_count
+        "total_found": match_count,
+        "has_more": has_more
     });
     if let Err(e) = app_handle.emit("sent-search-completed", &completion) {
         println!("[RUST] Failed to emit sent-search-completed event: {}", e);
     }
     
-    println!("[RUST] Sent search found {} matching emails", match_count);
-    Ok(match_count)
+    println!("[RUST] Sent search found {} matching emails (has_more: {})", match_count, has_more);
+    Ok((match_count, has_more))
 }
 
 // Database commands for direct messages
@@ -2376,15 +2710,39 @@ async fn handle_live_direct_message(
 async fn handle_live_profile_update(
     event: &nostr_sdk::Event,
     app_handle: &tauri::AppHandle,
-    _state: &AppState,
+    state: &AppState,
     user_pubkey: &PublicKey,
 ) -> Result<(), String> {
     println!("[RUST] Processing live profile update: {}", event.id.to_hex());
     
-    // Only process profile updates for the current user
-    if event.pubkey != *user_pubkey {
-        println!("[RUST] Ignoring profile update from different user");
-        return Ok(());
+    let event_pubkey = event.pubkey;
+    let is_current_user = event_pubkey == *user_pubkey;
+    
+    // Check if this is a contact's profile update (not current user)
+    if !is_current_user {
+        // Check if this pubkey is in the user's contacts
+        let db = match state.get_database() {
+            Ok(db) => db,
+            Err(e) => {
+                println!("[RUST] Failed to get database to check contact: {}", e);
+                return Ok(()); // Silently ignore if DB unavailable
+            }
+        };
+        
+        let event_pubkey_str = event_pubkey.to_bech32().unwrap_or_else(|_| event_pubkey.to_hex());
+        match db.user_follows_contact(&user_pubkey.to_bech32().unwrap_or_else(|_| user_pubkey.to_hex()), &event_pubkey_str) {
+            Ok(true) => {
+                println!("[RUST] Processing profile update for contact: {}", event_pubkey_str);
+            },
+            Ok(false) => {
+                println!("[RUST] Ignoring profile update from non-contact user");
+                return Ok(());
+            },
+            Err(e) => {
+                println!("[RUST] Error checking if contact: {}", e);
+                return Ok(());
+            }
+        }
     }
     
     // Parse profile content
@@ -2393,17 +2751,22 @@ async fn handle_live_profile_update(
     
     // Emit event to frontend
     let profile_payload = serde_json::json!({
-        "pubkey": event.pubkey.to_bech32().unwrap_or_default(),
+        "pubkey": event_pubkey.to_bech32().unwrap_or_default(),
         "fields": fields,
         "created_at": event.created_at.as_u64(),
         "raw_content": event.content,
-        "is_live": true
+        "is_live": true,
+        "is_current_user": is_current_user
     });
     
     if let Err(e) = app_handle.emit("profile-updated", &profile_payload) {
         println!("[RUST] Failed to emit profile-updated event: {}", e);
     } else {
-        println!("[RUST] Emitted profile-updated event");
+        if is_current_user {
+            println!("[RUST] Emitted profile-updated event for current user");
+        } else {
+            println!("[RUST] Emitted profile-updated event for contact");
+        }
     }
     
     Ok(())
@@ -2417,9 +2780,9 @@ fn db_save_draft(draft: DbEmail, state: tauri::State<AppState>) -> Result<i64, S
 }
 
 #[tauri::command]
-fn db_get_drafts(user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<DbEmail>, String> {
+fn db_get_drafts(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<DbEmail>, String> {
     let db = state.get_database()?;
-    db.get_drafts(user_email.as_deref()).map_err(|e| e.to_string())
+    db.get_drafts(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2690,25 +3053,20 @@ pub fn run() {
 
     // Create AppState and initialize the database
     let app_state = AppState::new();
-    // Use dirs crate for app data directory
-    let app_dir = dirs::data_dir()
-        .ok_or_else(|| "Could not get app data directory".to_string())
-        .map(|d| d.join("nostr-mail"));
-    match app_dir {
+    // Use platform-specific app data directory
+    match get_app_data_dir() {
         Ok(app_dir) => {
+            println!("[RUST] App data directory: {:?}", app_dir);
             if let Err(e) = std::fs::create_dir_all(&app_dir) {
-                println!("[RUST] Failed to create app data directory: {}", e);
+                println!("[RUST] Failed to create app data directory {:?}: {}", app_dir, e);
             } else {
                 let db_path = app_dir.join("nostr_mail.db");
+                println!("[RUST] Initializing database at: {:?}", db_path);
                 match app_state.init_database(&db_path) {
                     Ok(()) => {
-                        match app_state.get_database() {
-                            Ok(db) => match db.get_all_contacts() {
-                                Ok(contacts) => println!("[RUST] Database contains {} contacts at startup", contacts.len()),
-                                Err(e) => println!("[RUST] Failed to get contacts from database at startup: {}", e),
-                            },
-                            Err(e) => println!("[RUST] Database not initialized at startup: {}", e),
-                        }
+                        // Database initialized successfully
+                        // Contacts will be loaded per-user when needed
+                        println!("[RUST] Database initialized successfully");
                     },
                     Err(e) => println!("[RUST] Failed to initialize database at startup: {}", e),
                 }
@@ -2801,14 +3159,20 @@ pub fn run() {
         db_get_contact,
         db_get_all_contacts,
         db_delete_contact,
+        db_add_user_contact,
+        db_remove_user_contact,
+        db_get_public_contact_pubkeys,
+        db_update_user_contact_public_status,
         db_find_pubkeys_by_email,
         db_filter_new_contacts,
         db_save_email,
         db_get_email,
         db_get_emails,
         db_search_emails,
-        db_update_email_nostr_pubkey,
-        db_update_email_nostr_pubkey_by_id,
+        db_update_email_sender_pubkey,
+        db_update_email_sender_pubkey_by_id,
+        db_update_email_recipient_pubkey,
+        db_update_email_recipient_pubkey_by_id,
         db_find_emails_by_message_id,
         db_get_sent_emails,
         db_search_sent_emails,
@@ -2871,17 +3235,14 @@ pub fn run() {
 
 pub async fn init_app_state() -> AppState {
     let app_state = AppState::new();
-    let app_dir = dirs::data_dir()
-        .ok_or_else(|| "Could not get app data directory".to_string())
-        .map(|d| d.join("nostr-mail"));
-    match app_dir {
+    match get_app_data_dir() {
         Ok(app_dir) => {
             if let Err(e) = std::fs::create_dir_all(&app_dir) {
-                println!("[RUST] Failed to create app data directory: {}", e);
+                println!("[RUST] Failed to create app data directory {:?}: {}", app_dir, e);
             } else {
                 let db_path = app_dir.join("nostr_mail.db");
                 if let Err(e) = app_state.init_database(&db_path) {
-                    println!("[RUST] Failed to initialize database: {}", e);
+                    println!("[RUST] Failed to initialize database at {:?}: {}", db_path, e);
                 }
             }
         },
@@ -2913,9 +3274,9 @@ pub async fn http_init_database(_app_state: std::sync::Arc<AppState>) -> Result<
     Ok(())
 }
 
-pub async fn http_db_get_all_contacts(app_state: std::sync::Arc<AppState>) -> Result<Vec<DbContact>, String> {
+pub async fn http_db_get_all_contacts(user_pubkey: String, app_state: std::sync::Arc<AppState>) -> Result<Vec<DbContact>, String> {
     let db = app_state.get_database()?;
-    db.get_all_contacts().map_err(|e| e.to_string())
+    db.get_all_contacts(&user_pubkey).map_err(|e| e.to_string())
 }
 
 pub async fn http_db_get_all_relays(app_state: std::sync::Arc<AppState>) -> Result<Vec<DbRelay>, String> {

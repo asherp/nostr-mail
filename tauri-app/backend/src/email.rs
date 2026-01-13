@@ -15,9 +15,56 @@ use tokio::time::timeout;
 use std::time::Duration;
 use crate::types::EmailMessage;
 use std::net::TcpStream;
+#[cfg(not(target_os = "android"))]
 use native_tls::TlsConnector;
+#[cfg(target_os = "android")]
+use rustls::{ClientConfig, ClientConnection, RootCertStore, pki_types::ServerName};
+#[cfg(target_os = "android")]
+use std::sync::Arc;
 use uuid::Uuid;
 use base64::{Engine as _, engine::general_purpose};
+
+/// Macro to create a TLS-wrapped IMAP client connection
+/// Uses native-tls on desktop and rustls on Android
+#[cfg(not(target_os = "android"))]
+macro_rules! create_imap_tls_client {
+    ($host:expr, $addr:expr) => {{
+        let tls = TlsConnector::builder().build()?;
+        let tcp_stream = TcpStream::connect($addr)?;
+        let tls_stream: native_tls::TlsStream<TcpStream> = tls.connect($host, tcp_stream)?;
+        Ok::<imap::Client<native_tls::TlsStream<TcpStream>>, anyhow::Error>(imap::Client::new(tls_stream))
+    }};
+}
+
+#[cfg(target_os = "android")]
+macro_rules! create_imap_tls_client {
+    ($host:expr, $addr:expr) => {{
+        // Initialize rustls crypto provider if not already initialized (required for rustls 0.23+)
+        {
+            use std::sync::Once;
+            static INIT: Once = Once::new();
+            INIT.call_once(|| {
+                // Try to install default provider, but don't fail if already installed
+                let _ = rustls::crypto::ring::default_provider().install_default();
+            });
+        }
+        
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        
+        let server_name = ServerName::try_from($host.to_string())
+            .map_err(|_| anyhow::anyhow!("Invalid server name"))?;
+        
+        let tcp_stream = TcpStream::connect($addr)?;
+        let client = ClientConnection::new(Arc::new(config), server_name)?;
+        let tls_stream = rustls::StreamOwned::new(client, tcp_stream);
+        Ok::<imap::Client<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>, anyhow::Error>(imap::Client::new(tls_stream))
+    }};
+}
 
 /// Decode RFC 2047 encoded header value and fix UTF-8 encoding issues
 /// mailparse should handle RFC 2047 automatically, but this fixes common UTF-8 misinterpretations
@@ -313,37 +360,38 @@ pub async fn send_email(
         mailer_clone.send(&email_clone)
     });
     
-    let result = timeout(Duration::from_secs(60), send_future).await;
-    
-    match result {
-        Ok(Ok(Ok(_))) => {
-            println!("[RUST] send_email: Email sent successfully");
-            Ok(format!("Email sent successfully to {}", to_address))
-        },
-        Ok(Ok(Err(e))) => {
-            println!("[RUST] send_email: Failed to send email: {}", e);
-            // Provide more helpful error messages for common issues
-            let error_msg = if e.to_string().to_lowercase().contains("authentication") {
-                "Authentication failed. For Gmail, make sure you're using an App Password, not your regular password."
-            } else if e.to_string().to_lowercase().contains("connection") || e.to_string().to_lowercase().contains("host") {
-                "SMTP client error. Check your SMTP host and port settings."
-            } else if e.is_transient() {
-                "Temporary SMTP error. Please try again."
-            } else if e.is_permanent() {
-                "Permanent SMTP error. Check your email configuration."
-            } else {
-                &format!("SMTP error: {}", e)
-            };
-            Err(anyhow::anyhow!("Failed to send email: {}", error_msg))
-        },
-        Ok(Err(e)) => {
-            println!("[RUST] send_email: Task join error: {}", e);
-            Err(anyhow::anyhow!("Task join error: {}", e))
+    match timeout(Duration::from_secs(60), send_future).await {
+        Ok(join_res) => match join_res {
+            Ok(send_res) => match send_res {
+                Ok(_) => {
+                    println!("[RUST] send_email: Email sent successfully");
+                    Ok(format!("Email sent successfully to {}", to_address))
+                }
+                Err(e) => {
+                    println!("[RUST] send_email: Failed to send email: {}", e);
+                    let error_msg = if e.to_string().to_lowercase().contains("authentication") {
+                        "Authentication failed. For Gmail, make sure you're using an App Password, not your regular password.".to_string()
+                    } else if e.to_string().to_lowercase().contains("connection") || e.to_string().to_lowercase().contains("host") {
+                        "SMTP client error. Check your SMTP host and port settings.".to_string()
+                    } else if e.is_transient() {
+                        "Temporary SMTP error. Please try again.".to_string()
+                    } else if e.is_permanent() {
+                        "Permanent SMTP error. Check your email configuration.".to_string()
+                    } else {
+                        format!("SMTP error: {}", e)
+                    };
+                    Err(anyhow::anyhow!("Failed to send email: {}", error_msg))
+                }
+            },
+            Err(e) => {
+                println!("[RUST] send_email: Task join error: {}", e);
+                Err(anyhow::anyhow!("Task join error: {}", e))
+            }
         },
         Err(_) => {
             println!("[RUST] send_email: SMTP send operation timed out after 60 seconds");
             Err(anyhow::anyhow!("SMTP send operation timed out after 60 seconds. Check your internet connection and SMTP settings."))
-        },
+        }
     }
 }
 
@@ -352,7 +400,6 @@ pub async fn send_email(
 /// For other providers, tries common trash folder names
 pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &str) -> Result<()> {
     use std::net::TcpStream;
-    use native_tls::TlsConnector;
     
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -367,10 +414,7 @@ pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &st
     // Handle TLS and non-TLS connections separately due to type differences
     // Use a block to ensure session is dropped/logged out properly
     let result = if use_tls {
-        let tls = TlsConnector::builder().build()?;
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let tls_stream = tls.connect(host, tcp_stream)?;
-        let client = imap::Client::new(tls_stream);
+        let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         
         let result = delete_sent_email_from_session(&mut session, is_gmail, message_id).await;
@@ -542,10 +586,7 @@ pub async fn test_imap_connection(config: &EmailConfig) -> Result<()> {
     println!("[RUST] Host: {}, Port: {}, Use TLS: {}", host, port, use_tls);
 
     if use_tls {
-        let tls = TlsConnector::builder().build()?;
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let tls_stream = tls.connect(host, tcp_stream)?;
-        let client = imap::Client::new(tls_stream);
+        let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         session.logout()?;
     } else {
@@ -577,10 +618,7 @@ pub async fn fetch_emails(config: &EmailConfig, limit: usize, search_query: Opti
     let latest_24h = Some(Utc::now() - Duration::hours(24));
     
     let emails = if use_tls {
-        let tls = TlsConnector::builder().build()?;
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let tls_stream = tls.connect(host, tcp_stream)?;
-        let client = imap::Client::new(tls_stream);
+        let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         if use_gmail_optimization {
             let (emails_result, _attachments) = fetch_nostr_emails_from_gmail_optimized(&mut session, config, latest_24h, None)?;
@@ -743,6 +781,7 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     (subject.clone(), body_text.clone())
                 };
 
+                let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                 let email_message = EmailMessage {
                     id: email_id.to_string(),
                     from,
@@ -753,7 +792,8 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     date,
                     is_read: true, // We'll assume all fetched emails are read for now
                     raw_headers: raw_headers.clone(),
-                    nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                    sender_pubkey: sender_pubkey.clone(),
+                    recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     message_id: extract_message_id_from_headers(&raw_headers),
                 };
 
@@ -832,6 +872,7 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     (subject.clone(), body_text.clone())
                 };
                 
+                let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                 let email_message = EmailMessage {
                     id: _email_id.to_string(),
                     from,
@@ -842,7 +883,8 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     date,
                     is_read: true,
                     raw_headers: raw_headers.clone(),
-                    nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                    sender_pubkey: sender_pubkey.clone(),
+                    recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     message_id: extract_message_id_from_headers(&raw_headers),
                 };
                 emails.push(email_message);
@@ -883,37 +925,38 @@ pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
         mailer_clone.test_connection()
     });
     
-    let result = timeout(Duration::from_secs(30), test_future).await;
-    
-    match result {
-        Ok(Ok(Ok(_))) => {
-            println!("[RUST] test_smtp_connection: SMTP connection test successful");
-            Ok(())
-        },
-        Ok(Ok(Err(e))) => {
-            println!("[RUST] test_smtp_connection: SMTP connection test failed: {}", e);
-            // Provide more helpful error messages for common issues
-            let error_msg = if e.to_string().to_lowercase().contains("authentication") {
-                "Authentication failed. For Gmail, make sure you're using an App Password, not your regular password."
-            } else if e.to_string().to_lowercase().contains("connection") || e.to_string().to_lowercase().contains("host") {
-                "SMTP client error. Check your SMTP host and port settings."
-            } else if e.is_transient() {
-                "Temporary SMTP error. Please try again."
-            } else if e.is_permanent() {
-                "Permanent SMTP error. Check your email configuration."
-            } else {
-                &format!("SMTP connection error: {}", e)
-            };
-            Err(anyhow::anyhow!("SMTP connection failed: {}", error_msg))
-        },
-        Ok(Err(e)) => {
-            println!("[RUST] test_smtp_connection: Task join error: {}", e);
-            Err(anyhow::anyhow!("SMTP connection join error: {}", e))
+    match timeout(Duration::from_secs(30), test_future).await {
+        Ok(join_res) => match join_res {
+            Ok(test_res) => match test_res {
+                Ok(_) => {
+                    println!("[RUST] test_smtp_connection: SMTP connection test successful");
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("[RUST] test_smtp_connection: SMTP connection test failed: {}", e);
+                    let error_msg = if e.to_string().to_lowercase().contains("authentication") {
+                        "Authentication failed. For Gmail, make sure you're using an App Password, not your regular password.".to_string()
+                    } else if e.to_string().to_lowercase().contains("connection") || e.to_string().to_lowercase().contains("host") {
+                        "SMTP client error. Check your SMTP host and port settings.".to_string()
+                    } else if e.is_transient() {
+                        "Temporary SMTP error. Please try again.".to_string()
+                    } else if e.is_permanent() {
+                        "Permanent SMTP error. Check your email configuration.".to_string()
+                    } else {
+                        format!("SMTP connection error: {}", e)
+                    };
+                    Err(anyhow::anyhow!("SMTP connection failed: {}", error_msg))
+                }
+            },
+            Err(e) => {
+                println!("[RUST] test_smtp_connection: Task join error: {}", e);
+                Err(anyhow::anyhow!("SMTP connection join error: {}", e))
+            }
         },
         Err(_) => {
             println!("[RUST] test_smtp_connection: SMTP connection test timed out after 30 seconds");
             Err(anyhow::anyhow!("SMTP connection test timed out after 30 seconds. Check your internet connection and SMTP settings."))
-        },
+        }
     }
 }
 
@@ -935,10 +978,7 @@ pub async fn fetch_nostr_emails_last_24h(config: &EmailConfig) -> Result<Vec<Ema
     let latest_24h = Some(Utc::now() - Duration::hours(24));
     
     let emails = if use_tls {
-        let tls = TlsConnector::builder().build()?;
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let tls_stream = tls.connect(host, tcp_stream)?;
-        let client = imap::Client::new(tls_stream);
+        let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         if is_gmail {
             let (emails_result, _attachments) = fetch_nostr_emails_from_gmail_optimized(&mut session, config, latest_24h, None)?;
@@ -975,10 +1015,7 @@ pub async fn fetch_nostr_emails_last_24h(config: &EmailConfig) -> Result<Vec<Ema
         // Calculate latest timestamp for 7 days ago
         let latest_7d = Some(Utc::now() - Duration::days(7));
         let fallback_emails = if use_tls {
-            let tls = TlsConnector::builder().build()?;
-            let tcp_stream = TcpStream::connect(&addr)?;
-            let tls_stream = tls.connect(host, tcp_stream)?;
-            let client = imap::Client::new(tls_stream);
+            let client = create_imap_tls_client!(host, &addr)?;
             let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
             let (emails_result, _attachments) = fetch_nostr_emails_from_gmail_optimized(&mut session, config, latest_7d, None)?;
             emails_result
@@ -1250,6 +1287,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         }
                     };
                     
+                    let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                     let email_message = EmailMessage {
                         id: email_id.to_string(),
                         from,
@@ -1260,7 +1298,8 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         date,
                         is_read: true,
                         raw_headers: raw_headers.clone(),
-                        nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                        sender_pubkey: sender_pubkey.clone(),
+                        recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                         message_id: Some(message_id),
                     };
                     emails.push(email_message);
@@ -1511,7 +1550,8 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                         date,
                         is_read: true,
                         raw_headers: raw_headers.clone(),
-                        nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                        sender_pubkey: extract_nostr_pubkey_from_headers(&raw_headers), // Sent emails include sender's pubkey in headers
+                        recipient_pubkey: None, // Will be populated during sync if contact exists
                         message_id: extract_message_id_from_headers(&raw_headers),
                     };
                     
@@ -1831,10 +1871,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
     // 3. If None, fetch all Nostr emails from IMAP (no date filter)
     // 4. If Some(date), fetch Nostr emails from IMAP since that date
     let (email_msgs, _attachments_map) = if use_tls {
-        let tls = TlsConnector::builder().build()?;
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let tls_stream = tls.connect(host, tcp_stream)?;
-        let client = imap::Client::new(tls_stream);
+        let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         if is_gmail {
             // For Gmail, pass latest timestamp directly (or None for all emails)
@@ -1892,7 +1929,8 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 date,
                                 is_read: true,
                                 raw_headers: raw_headers.clone(),
-                                nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                                sender_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                                recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                                 message_id: extract_message_id_from_headers(&raw_headers),
                             };
                             emails.push(email_message);
@@ -1952,6 +1990,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                     Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
                                     Err(_) => (subject.clone(), body_text.clone()),
                                 };
+                                let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                                 let email_message = EmailMessage {
                                     id: _email_id.to_string(),
                                     from,
@@ -1962,7 +2001,8 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                     date,
                                     is_read: true,
                                     raw_headers: raw_headers.clone(),
-                                    nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                                    sender_pubkey: sender_pubkey.clone(),
+                                    recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                                     message_id: extract_message_id_from_headers(&raw_headers),
                                 };
                                 emails.push(email_message);
@@ -2033,7 +2073,8 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> any
                 body_html: None,
                 received_at: email.date,
                 is_nostr_encrypted: true,
-                nostr_pubkey: email.nostr_pubkey.clone(),
+                sender_pubkey: email.sender_pubkey.clone(),
+                recipient_pubkey: email.recipient_pubkey.clone(),
                 raw_headers: Some(email.raw_headers.clone()),
                 is_draft: false,
                 is_read: existing_email.is_read, // Preserve read status
@@ -2044,6 +2085,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> any
             println!("[RUST] Updated existing email in DB: message_id={}", email.message_id);
         } else {
             // Save raw email to DB
+            // For inbox emails, sender_pubkey comes from headers (already extracted)
             let db_email = DbEmail {
                 id: None,
                 message_id: email.message_id.clone(),
@@ -2055,7 +2097,8 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> any
                 body_html: None,
                 received_at: email.date,
                 is_nostr_encrypted: true,
-                nostr_pubkey: email.nostr_pubkey.clone(),
+                sender_pubkey: email.sender_pubkey.clone(),
+                recipient_pubkey: email.recipient_pubkey.clone(),
                 raw_headers: Some(email.raw_headers.clone()),
                 is_draft: false,
                 is_read: false,
@@ -2155,7 +2198,8 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                     body_html: existing_email.body_html.clone(),   // Preserve HTML if exists
                     received_at: email.date, // Update with IMAP date
                     is_nostr_encrypted: true,
-                    nostr_pubkey: email.nostr_pubkey.clone(),
+                    sender_pubkey: email.sender_pubkey.clone(),
+                    recipient_pubkey: email.recipient_pubkey.clone(),
                     raw_headers: Some(email.raw_headers.clone()), // Update with IMAP headers
                     is_draft: false,
                     is_read: existing_email.is_read, // Preserve read status
@@ -2172,6 +2216,9 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
         } else {
             // New email - save raw email to DB directly without checking again
             println!("[RUST] Email is new, inserting directly to DB (skipping redundant get_email check)");
+            // For sent emails, try to find recipient_pubkey from contacts
+            let recipient_pubkey = db.find_pubkeys_by_email(&email.to).ok()
+                .and_then(|pubkeys| pubkeys.first().cloned());
             let db_email = DbEmail {
                 id: None,
                 message_id: email.message_id.clone(),
@@ -2183,7 +2230,8 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                 body_html: None,
                 received_at: email.date,
                 is_nostr_encrypted: true,
-                nostr_pubkey: email.nostr_pubkey.clone(),
+                sender_pubkey: email.sender_pubkey.clone(),
+                recipient_pubkey: recipient_pubkey.or(email.recipient_pubkey.clone()),
                 raw_headers: Some(email.raw_headers.clone()),
                 is_draft: false,
                 is_read: false,
@@ -2265,7 +2313,8 @@ pub struct RawNostrEmail {
     pub subject: String,
     pub body: String,
     pub date: chrono::DateTime<chrono::Utc>,
-    pub nostr_pubkey: Option<String>,
+    pub sender_pubkey: Option<String>,
+    pub recipient_pubkey: Option<String>,
     pub raw_headers: String,
     pub attachments: Vec<crate::database::Attachment>, // Attachments extracted from email (in encrypted form)
 }
@@ -2284,10 +2333,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
     let is_gmail = host.contains("gmail.com");
 
     let emails = if use_tls {
-        let tls = TlsConnector::builder().build()?;
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let tls_stream = tls.connect(host, tcp_stream)?;
-        let client = imap::Client::new(tls_stream);
+        let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         if is_gmail {
             // fetch_nostr_emails_from_gmail_optimized returns emails and attachments, convert to Vec<RawNostrEmail>
@@ -2307,7 +2353,8 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                     subject: em.subject,
                     body: em.body,
                     date: em.date,
-                    nostr_pubkey: extract_nostr_pubkey_from_headers(&em.raw_headers),
+                    sender_pubkey: em.sender_pubkey.clone(),
+                    recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     raw_headers: em.raw_headers,
                     attachments,
                 }
@@ -2365,7 +2412,8 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                             subject,
                             body: body_text,
                             date,
-                            nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                            sender_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                            recipient_pubkey: None, // Will be populated during sync if contact exists
                             raw_headers,
                             attachments: extracted_attachments,
                         };
@@ -2396,10 +2444,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
     let is_gmail = host.contains("gmail.com");
 
     return if use_tls {
-        let tls = TlsConnector::builder().build()?;
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let tls_stream = tls.connect(host, tcp_stream)?;
-        let client = imap::Client::new(tls_stream);
+        let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         
         // Select the sent folder instead of INBOX
@@ -2442,6 +2487,10 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 att.filename, att.size, att.is_encrypted);
                         }
                     }
+                    // For sent emails, extract sender_pubkey from headers (it's included when we send)
+                    // and try to find recipient_pubkey from contacts
+                    let sender_pubkey = extract_nostr_pubkey_from_headers(&em.raw_headers);
+                    let recipient_pubkey = None; // Will be populated during sync if contact exists
                     raw_emails.push(RawNostrEmail {
                         message_id: msg_id.clone(),
                         from: em.from,
@@ -2449,7 +2498,8 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                         subject: em.subject,
                         body: em.body,
                         date: em.date,
-                        nostr_pubkey: extract_nostr_pubkey_from_headers(&em.raw_headers),
+                        sender_pubkey: sender_pubkey,
+                        recipient_pubkey: recipient_pubkey,
                         raw_headers: em.raw_headers,
                         attachments,
                     });
@@ -2497,6 +2547,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
                                 .collect::<Vec<_>>()
                                 .join("\n");
+                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                             let email_message = RawNostrEmail {
                                 message_id: extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| format!("msg_{}", chrono::Utc::now().timestamp())),
                                 from,
@@ -2504,7 +2555,8 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 subject,
                                 body: body_text,
                                 date,
-                                nostr_pubkey: extract_nostr_pubkey_from_headers(&raw_headers),
+                                sender_pubkey: sender_pubkey.clone(),
+                                recipient_pubkey: None, // Will be populated during sync if contact exists
                                 raw_headers,
                                 attachments: vec![], // Will be extracted during sync
                             };

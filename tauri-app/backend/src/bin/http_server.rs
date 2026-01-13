@@ -105,7 +105,18 @@ async fn invoke_handler(
             }
         },
         "db_get_all_contacts" => {
-            match nostr_mail_lib::http_db_get_all_contacts(app_state.clone()).await {
+            let user_pubkey = match request.args.get("userPubkey")
+                .and_then(|v| v.as_str()) {
+                Some(pk) => pk.to_string(),
+                None => {
+                    return Json(InvokeResponse {
+                        success: false,
+                        data: None,
+                        error: Some("Missing userPubkey parameter".to_string()),
+                    });
+                }
+            };
+            match nostr_mail_lib::http_db_get_all_contacts(user_pubkey, app_state.clone()).await {
                 Ok(contacts) => Ok(serde_json::to_value(contacts).unwrap()),
                 Err(e) => Err(e),
             }

@@ -16,17 +16,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0-beta", features = [] }
-tauri-plugin-opener = "2.0.0-beta"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 nostr-sdk = { version = "0.42.0", features = ["nip04", "nip44", "nip59"] }
 anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
-lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
-imap = "2.4.1"
-native-tls = "0.2"
-reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 mime_guess = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -44,11 +38,31 @@ rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 urlencoding = "2"
 dirs = "5"
 zip = "2.1"
-tauri-plugin-dialog = "2.0.0-beta"
-axum = { version = "0.7", features = ["json"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
 sha2 = "0.10"
+
+# Android-specific dependencies (use rustls instead of native-tls)
+[target.'cfg(target_os = "android")'.dependencies]
+tauri = { version = "2.0.0-beta", features = ["rustls-tls"] }
+tauri-plugin-opener = { version = "2.0.0-beta", default-features = false }
+tauri-plugin-dialog = { version = "2.0.0-beta", default-features = false }
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls", "builder", "ring", "webpki-roots", "smtp-transport"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+rustls = { version = "0.23", features = ["ring"] }
+webpki-roots = "1.0"
+
+# Non-Android dependencies (use native-tls)
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tauri = { version = "2.0.0-beta", features = ["rustls-tls"] }
+tauri-plugin-opener = "2.0.0-beta"
+tauri-plugin-dialog = "2.0.0-beta"
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
+native-tls = "0.2"
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+imap = "2.4.1"
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem

@@ -7,6 +7,112 @@
     overflow-y: auto;
 }
 
+/* Settings Accordion Styles */
+.settings-form .settings-section {
+    margin-bottom: 20px;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    overflow: hidden;
+    background: white;
+    transition: box-shadow 0.2s ease;
+}
+
+.settings-form .settings-section:hover {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+.settings-form .settings-section-header {
+    padding: 16px 20px;
+    background: #f8f9fa;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    user-select: none;
+    transition: background-color 0.2s ease;
+    border-bottom: 1px solid #e0e0e0;
+    margin-bottom: 0;
+}
+
+.settings-form .settings-section-header:hover {
+    background: #e9ecef;
+}
+
+.settings-form .settings-section-header h3 {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #333;
+    flex-grow: 1;
+}
+
+.settings-section-toggle {
+    transition: transform 0.3s ease;
+    color: #666;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+    margin-left: 12px;
+}
+
+.settings-form .settings-section.collapsed .settings-section-toggle {
+    transform: rotate(-90deg);
+}
+
+.settings-section-content {
+    padding: 20px;
+    display: block;
+    overflow: hidden;
+}
+
+.settings-form .settings-section.collapsed .settings-section-content {
+    display: none;
+}
+
+.settings-form .settings-section:not(.collapsed) .settings-section-content {
+    animation: slideDown 0.3s ease-out;
+}
+
+@keyframes slideDown {
+    from {
+        opacity: 0;
+        max-height: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+    }
+    to {
+        opacity: 1;
+        max-height: 5000px;
+        padding-top: 20px;
+        padding-bottom: 20px;
+    }
+}
+
+/* Dark mode styles for settings sections */
+body.dark-mode .settings-form .settings-section {
+    background: #232946;
+    border-color: #181a20;
+}
+
+body.dark-mode .settings-form .settings-section-header {
+    background: #181a20;
+    border-bottom-color: #232946;
+}
+
+body.dark-mode .settings-form .settings-section-header:hover {
+    background: #232946;
+}
+
+body.dark-mode .settings-form .settings-section-header h3 {
+    color: #e0e0e0;
+}
+
+body.dark-mode .settings-section-toggle {
+    color: #a0a0a0;
+}
+
 .form-group {
     margin-bottom: var(--spacing-lg);
 }

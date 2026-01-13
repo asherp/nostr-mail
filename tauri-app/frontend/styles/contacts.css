@@ -356,6 +356,137 @@ body.dark-mode .contacts-search-icon {
     color: #666;
 }
 
+/* Privacy toggle styles */
+.contact-privacy-icon {
+    margin-right: 8px;
+    font-size: 14px;
+    color: #6c757d;
+}
+
+.contact-item.active .contact-privacy-icon {
+    color: white;
+}
+
+.privacy-toggle-section {
+    margin-bottom: 25px;
+    padding: 20px;
+    background-color: #f8f9fa;
+    border-radius: 8px;
+    border: 1px solid #e0e0e0;
+}
+
+.privacy-toggle-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+
+.privacy-toggle-icon {
+    font-size: 1.2rem;
+    color: #667eea;
+}
+
+.privacy-toggle-title {
+    font-weight: 600;
+    font-size: 1rem;
+    color: #333;
+}
+
+.privacy-toggle-container {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.privacy-toggle {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.privacy-toggle input[type="checkbox"] {
+    display: none;
+}
+
+.privacy-toggle-slider {
+    position: relative;
+    width: 50px;
+    height: 26px;
+    background-color: #ccc;
+    border-radius: 26px;
+    transition: background-color 0.3s ease;
+}
+
+.privacy-toggle input[type="checkbox"]:checked + .privacy-toggle-slider {
+    background-color: #667eea;
+}
+
+.privacy-toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background-color: white;
+    top: 3px;
+    left: 3px;
+    transition: transform 0.3s ease;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.privacy-toggle input[type="checkbox"]:checked + .privacy-toggle-slider::before {
+    transform: translateX(24px);
+}
+
+.privacy-toggle-label {
+    font-weight: 600;
+    color: #333;
+    font-size: 0.95rem;
+}
+
+.privacy-toggle-description {
+    font-size: 0.9rem;
+    color: #6c757d;
+    margin-left: 62px;
+}
+
+/* Dark mode support for privacy toggle */
+body.dark-mode .privacy-toggle-section {
+    background-color: #181a20;
+    border-color: #232946;
+}
+
+body.dark-mode .privacy-toggle-title {
+    color: #e0e0e0;
+}
+
+body.dark-mode .privacy-toggle-label {
+    color: #e0e0e0;
+}
+
+body.dark-mode .privacy-toggle-slider {
+    background-color: #444;
+}
+
+body.dark-mode .privacy-toggle input[type="checkbox"]:checked + .privacy-toggle-slider {
+    background-color: #667eea;
+}
+
+body.dark-mode .privacy-toggle-description {
+    color: #a0a0a0;
+}
+
+body.dark-mode .contact-privacy-icon {
+    color: #a0a0a0;
+}
+
+body.dark-mode .contact-item.active .contact-privacy-icon {
+    color: white;
+}
+
 /* Responsive design for contacts */
 @media (max-width: 768px) {
     .contacts-container {

@@ -27,6 +27,7 @@ class ContactsService {
                 name: contact.name,
                 picture: contact.picture_url || contact.picture || '',
                 email: contact.email || null,
+                is_public: contact.is_public !== undefined ? contact.is_public : true, // Default to public if not set
                 fields: {
                     name: contact.name,
                     display_name: contact.display_name || contact.name,
@@ -249,12 +250,18 @@ class ContactsService {
                         console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
                     }
 
+                    // Add privacy indicator icon
+                    const privacyIcon = contact.is_public === false 
+                        ? '<i class="fas fa-lock contact-privacy-icon" title="Private contact"></i>'
+                        : '<i class="fas fa-globe contact-privacy-icon" title="Public contact"></i>';
+                    
                     contactElement.innerHTML = `
                         <img class="${avatarClass}" src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
                         <div class="contact-info">
                             <div class="contact-name">${contact.name}</div>
                         </div>
                         <div class="contact-actions">
+                            ${privacyIcon}
                             ${emailIcon}
                         </div>
                     `;
@@ -410,6 +417,30 @@ class ContactsService {
                 avatarSrc = contact.picture;
             }
             
+            // Privacy toggle
+            const isPublic = contact.is_public !== undefined ? contact.is_public : true;
+            const privacyToggleHTML = `
+                <div class="privacy-toggle-section">
+                    <div class="privacy-toggle-header">
+                        <span class="privacy-toggle-icon">${isPublic ? '<i class="fas fa-globe"></i>' : '<i class="fas fa-lock"></i>'}</span>
+                        <span class="privacy-toggle-title">Privacy</span>
+                    </div>
+                    <div class="privacy-toggle-container">
+                        <label class="privacy-toggle" id="privacy-toggle-${contact.pubkey}">
+                            <input type="checkbox" ${isPublic ? 'checked' : ''} 
+                                   onchange="window.contactsService.toggleContactPrivacy('${contact.pubkey}', this.checked, this)">
+                            <span class="privacy-toggle-slider"></span>
+                            <span class="privacy-toggle-label" id="privacy-label-${contact.pubkey}">${isPublic ? 'Public' : 'Private'}</span>
+                        </label>
+                        <span class="privacy-toggle-description" id="privacy-desc-${contact.pubkey}">
+                            ${isPublic 
+                                ? 'Visible in your public follow list' 
+                                : 'Not in your public follow list'}
+                        </span>
+                    </div>
+                </div>
+            `;
+            
             // Always render avatar as an <img> tag
             let avatarElement = `
                 <div class="contact-detail-header">
@@ -481,6 +512,8 @@ class ContactsService {
             const detailHTML = `
                 <div class="contact-detail-content">
                     ${avatarElement}
+                    
+                    ${privacyToggleHTML}
                     
                     <div class="contact-detail-section">
                         <h4>Profile Information</h4>
@@ -1247,6 +1280,86 @@ class ContactsService {
         
         const searchQuery = searchInput.value.trim().toLowerCase();
         this.renderContacts(searchQuery);
+    }
+
+    // Toggle contact privacy status
+    async toggleContactPrivacy(contactPubkey, isPublic, checkboxElement) {
+        try {
+            if (!window.appState.hasKeypair()) {
+                window.notificationService.showError('No keypair available');
+                // Revert checkbox if error
+                if (checkboxElement) checkboxElement.checked = !isPublic;
+                return;
+            }
+
+            const userPubkey = window.appState.getKeypair().public_key;
+            const privateKey = window.appState.getKeypair().private_key;
+            const relays = window.appState.getActiveRelays();
+            
+            // Update in database
+            await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                userPubkey: userPubkey,
+                contactPubkey: contactPubkey,
+                isPublic: isPublic
+            });
+
+            // Publish the updated follow list to Nostr (always publish to keep it in sync)
+            try {
+                console.log('[JS] Publishing updated follow list to Nostr...');
+                await window.TauriService.publishFollowList(privateKey, userPubkey, relays);
+                console.log('[JS] Successfully published follow list');
+            } catch (publishError) {
+                console.error('[JS] Failed to publish follow list:', publishError);
+                // Don't fail the whole operation, but warn the user
+                window.notificationService.showWarning('Contact updated but failed to publish follow list: ' + publishError);
+            }
+
+            // Update in app state
+            const contacts = window.appState.getContacts();
+            const contactIndex = contacts.findIndex(c => c.pubkey === contactPubkey);
+            if (contactIndex !== -1) {
+                contacts[contactIndex].is_public = isPublic;
+                window.appState.setContacts(contacts);
+                
+                // Update the selected contact if it's the one being toggled
+                const selectedContact = window.appState.getSelectedContact();
+                if (selectedContact && selectedContact.pubkey === contactPubkey) {
+                    selectedContact.is_public = isPublic;
+                    window.appState.setSelectedContact(selectedContact);
+                    
+                    // Update the label, description, and icon text immediately
+                    const labelElement = document.getElementById(`privacy-label-${contactPubkey}`);
+                    const descElement = document.getElementById(`privacy-desc-${contactPubkey}`);
+                    const toggleSection = document.querySelector(`#privacy-toggle-${contactPubkey}`)?.closest('.privacy-toggle-section');
+                    const iconElement = toggleSection?.querySelector('.privacy-toggle-icon');
+                    
+                    if (labelElement) {
+                        labelElement.textContent = isPublic ? 'Public' : 'Private';
+                    }
+                    if (descElement) {
+                        descElement.textContent = isPublic 
+                            ? 'Visible in your public follow list' 
+                            : 'Not in your public follow list';
+                    }
+                    if (iconElement) {
+                        iconElement.innerHTML = isPublic ? '<i class="fas fa-globe"></i>' : '<i class="fas fa-lock"></i>';
+                    }
+                }
+                
+                // Re-render the contacts list to update the privacy icon
+                this.renderContacts();
+                
+                const message = isPublic 
+                    ? 'Contact is now public and follow list published' 
+                    : 'Contact is now private and follow list updated';
+                window.notificationService.showSuccess(message);
+            }
+        } catch (error) {
+            console.error('Error toggling contact privacy:', error);
+            window.notificationService.showError('Failed to update contact privacy: ' + error);
+            // Revert checkbox if error
+            if (checkboxElement) checkboxElement.checked = !isPublic;
+        }
     }
 }
 

@@ -2189,6 +2189,42 @@ async fn follow_user(private_key: String, pubkey_to_follow: String, relays: Vec<
 }
 
 #[tauri::command]
+async fn publish_follow_list(private_key: String, user_pubkey: String, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] publish_follow_list called for user: {}", user_pubkey);
+    
+    // Get all public contacts from database
+    let db = state.get_database()?;
+    let public_pubkeys = db.get_public_contact_pubkeys(&user_pubkey)
+        .map_err(|e| format!("Failed to get public contacts: {}", e))?;
+    
+    println!("[RUST] Found {} public contacts to publish", public_pubkeys.len());
+    
+    if public_pubkeys.is_empty() {
+        println!("[RUST] No public contacts to publish");
+        // Still publish an empty list to clear the follow list
+    }
+    
+    // Create tags for the follow event (kind 3)
+    let tags: Vec<Vec<String>> = public_pubkeys.iter()
+        .map(|pubkey: &String| vec!["p".to_string(), pubkey.clone()])
+        .collect();
+    
+    // Empty content for follow events
+    let content = "".to_string();
+    
+    // Publish the follow event with the complete list
+    nostr::publish_event(&private_key, &content, 3, tags, &relays)
+        .await
+        .map(|_| {
+            println!("[RUST] Successfully published follow event with {} public contacts", public_pubkeys.len());
+        })
+        .map_err(|e| {
+            println!("[RUST] Failed to publish follow event: {}", e);
+            e.to_string()
+        })
+}
+
+#[tauri::command]
 fn encrypt_nip04_message(private_key: String, public_key: String, message: String) -> Result<String, String> {
     println!("[RUST] encrypt_nip04_message called");
     crypto::encrypt_message(&private_key, &public_key, &message, Some("nip04")).map_err(|e| e.to_string())
@@ -3193,6 +3229,7 @@ pub fn run() {
         db_get_database_size,
         db_clear_all_data,
         follow_user,
+        publish_follow_list,
         encrypt_nip04_message,
         encrypt_nip04_message_legacy,
         encrypt_message_with_algorithm,

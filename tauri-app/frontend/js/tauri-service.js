@@ -167,6 +167,9 @@ const TauriService = {
     followUser: async function(privateKey, pubkeyToFollow, relays) {
         return await this.invoke('follow_user', { privateKey, pubkeyToFollow, relays });
     },
+    publishFollowList: async function(privateKey, userPubkey, relays) {
+        return await this.invoke('publish_follow_list', { privateKey, userPubkey, relays });
+    },
     updateProfile: async function(privateKey, fields, relays) {
         return await this.invoke('update_profile', { privateKey, fields, relays });
     },

@@ -895,7 +895,75 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         return Ok(vec![]);
     }
     
-    // Get the persistent client
+    // Check database first for existing contacts
+    let db = state.get_database()?;
+    let mut results = Vec::new();
+    let mut pubkeys_to_fetch = Vec::new();
+    let mut public_keys_to_fetch = Vec::new();
+    
+    println!("[RUST] Checking database for existing contacts...");
+    for pubkey_str in &pubkeys {
+        match db.get_contact(pubkey_str) {
+            Ok(Some(contact)) => {
+                // Check if contact has profile data (name, email, picture_url, or about)
+                let has_profile_data = contact.name.is_some() 
+                    || contact.email.is_some() 
+                    || contact.picture_url.is_some() 
+                    || contact.about.is_some();
+                
+                if has_profile_data {
+                    // Convert Contact to ProfileResult
+                    let mut fields = std::collections::HashMap::new();
+                    if let Some(name) = &contact.name {
+                        fields.insert("name".to_string(), serde_json::Value::String(name.clone()));
+                        fields.insert("display_name".to_string(), serde_json::Value::String(name.clone()));
+                    }
+                    if let Some(email) = &contact.email {
+                        fields.insert("email".to_string(), serde_json::Value::String(email.clone()));
+                    }
+                    if let Some(picture) = &contact.picture_url {
+                        fields.insert("picture".to_string(), serde_json::Value::String(picture.clone()));
+                    }
+                    if let Some(about) = &contact.about {
+                        fields.insert("about".to_string(), serde_json::Value::String(about.clone()));
+                    }
+                    
+                    // Create raw_content JSON from fields
+                    let raw_content = serde_json::to_string(&fields)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    
+                    results.push(ProfileResult {
+                        pubkey: pubkey_str.clone(),
+                        fields: fields,
+                        raw_content: raw_content,
+                    });
+                    
+                    println!("[RUST] Using cached profile from database for: {}", pubkey_str);
+                    continue;
+                }
+            },
+            Ok(None) => {
+                // Contact doesn't exist in database
+            },
+            Err(e) => {
+                println!("[RUST] Error checking database for {}: {}", pubkey_str, e);
+            }
+        }
+        
+        // Need to fetch this profile from relays
+        pubkeys_to_fetch.push(pubkey_str.clone());
+    }
+    
+    println!("[RUST] Found {} profiles in database, need to fetch {} from relays", 
+        results.len(), pubkeys_to_fetch.len());
+    
+    // If all profiles were found in database, return early
+    if pubkeys_to_fetch.is_empty() {
+        println!("[RUST] All profiles found in database, skipping relay fetch");
+        return Ok(results);
+    }
+    
+    // Get the persistent client for fetching remaining profiles
     let client = {
         let client_guard = state.nostr_client.lock().unwrap();
         match client_guard.as_ref() {
@@ -904,8 +972,8 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         }
     };
     
-    // Parse all pubkeys
-    let public_keys: Result<Vec<PublicKey>, String> = pubkeys.iter()
+    // Parse pubkeys that need fetching
+    let parsed_keys: Result<Vec<PublicKey>, String> = pubkeys_to_fetch.iter()
         .map(|pubkey_str| {
             PublicKey::from_bech32(pubkey_str)
                 .or_else(|_| PublicKey::from_hex(pubkey_str))
@@ -913,13 +981,14 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         })
         .collect();
     
-    let public_keys = public_keys?;
+    let parsed_keys = parsed_keys?;
+    public_keys_to_fetch = parsed_keys;
     
-    println!("[RUST] Using persistent client to fetch {} profiles", public_keys.len());
+    println!("[RUST] Fetching {} profiles from relays", public_keys_to_fetch.len());
     
-    // Fetch profiles for all pubkeys in one request using persistent client
+    // Fetch profiles for remaining pubkeys in one request using persistent client
     let profiles_filter = Filter::new()
-        .authors(public_keys.clone())
+        .authors(public_keys_to_fetch.clone())
         .kind(Kind::from(0)) // Profile events are kind 0
         .limit(1000); // Allow for multiple profiles
         
@@ -928,14 +997,11 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         .await
         .map_err(|e| e.to_string())?;
     
-    println!("[RUST] Found {} profile events using persistent client", profile_events.len());
+    println!("[RUST] Found {} profile events from relays", profile_events.len());
     
-    let mut results = Vec::new();
-    
-    // Process each requested pubkey
-    println!("[RUST] Processing {} requested pubkeys...", pubkeys.len());
-    for (i, pubkey_str) in pubkeys.iter().enumerate() {
-        let public_key = &public_keys[i];
+    // Process each pubkey that needed fetching
+    for (i, pubkey_str) in pubkeys_to_fetch.iter().enumerate() {
+        let public_key = &public_keys_to_fetch[i];
         
         // Find the latest profile event for this pubkey
         let latest_event = profile_events.iter()
@@ -952,7 +1018,7 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
                         raw_content: event.content.clone(),
                     });
                     
-                    println!("[RUST] Found profile for: {}", pubkey_str);
+                    println!("[RUST] Fetched profile from relay for: {}", pubkey_str);
                 },
                 Err(e) => {
                     println!("[RUST] Failed to parse profile JSON for {}: {}", pubkey_str, e);
@@ -964,7 +1030,7 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
                 }
             }
         } else {
-            println!("[RUST] No profile found for pubkey: {}", pubkey_str);
+            println!("[RUST] No profile found in relay for pubkey: {}", pubkey_str);
             results.push(ProfileResult {
                 pubkey: pubkey_str.clone(),
                 fields: std::collections::HashMap::new(),
@@ -973,7 +1039,8 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         }
     }
     
-    println!("[RUST] fetch_profiles_persistent returning {} profiles", results.len());
+    println!("[RUST] fetch_profiles_persistent returning {} profiles ({} from DB, {} from relays)", 
+        results.len(), results.len() - pubkeys_to_fetch.len(), pubkeys_to_fetch.len());
     Ok(results)
 }
 

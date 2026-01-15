@@ -58,6 +58,11 @@ NostrMailApp.prototype.init = async function() {
         console.log('📬 Loading initial data...');
         // Load contacts first so DM contacts can access cached profile photos
         await contactsService.loadContacts();
+        
+        // Ensure default nostr-mail contact is added for this user
+        console.log('📇 Ensuring default nostr-mail contact...');
+        await this.ensureDefaultContact();
+        
         // NOTE: We do NOT load emails here. Emails are only loaded when the inbox tab is clicked.
         // await emailService.loadEmails(); // <-- Remove or comment out this line so emails are not loaded on startup
         // await dmService.loadDmContacts(); // TODO: add this back in once we have stored DMs in the DB
@@ -433,6 +438,83 @@ NostrMailApp.prototype.initializeNostrClient = async function() {
     } catch (error) {
         console.error('[APP] Failed to initialize Nostr client:', error);
         notificationService.showError('Failed to initialize Nostr client: ' + error);
+    }
+}
+
+// Ensure the default nostr-mail contact is added for this user
+NostrMailApp.prototype.ensureDefaultContact = async function() {
+    const DEFAULT_CONTACT_PUBKEY = 'npub1agg7melcvmue7vwj2wqdh2666454xv5vsdu7n2tmkv73fl0a0tsq7asr9j';
+    
+    try {
+        const keypair = appState.getKeypair();
+        if (!keypair || !keypair.public_key) {
+            console.warn('[APP] No keypair available, skipping default contact check');
+            return;
+        }
+        
+        const userPubkey = keypair.public_key;
+        console.log('[APP] Checking for default nostr-mail contact for user:', userPubkey.substring(0, 20) + '...');
+        
+        // Check if the default contact already exists for this user
+        const userContacts = await window.DatabaseService.getAllContacts(userPubkey);
+        const hasDefaultContact = userContacts.some(contact => contact.pubkey === DEFAULT_CONTACT_PUBKEY);
+        
+        if (hasDefaultContact) {
+            console.log('[APP] Default nostr-mail contact already exists for this user');
+            return;
+        }
+        
+        console.log('[APP] Default nostr-mail contact not found, fetching profile...');
+        
+        // Fetch the profile from Nostr relays
+        const profileResult = await window.TauriService.fetchProfilePersistent(DEFAULT_CONTACT_PUBKEY);
+        
+        if (!profileResult) {
+            console.warn('[APP] Could not fetch default nostr-mail profile, skipping');
+            return;
+        }
+        
+        console.log('[APP] Successfully fetched default nostr-mail profile');
+        
+        // Extract profile information
+        const profile = profileResult;
+        const profileName = profile.fields?.name || profile.fields?.display_name || 'nostr-mail';
+        const email = profile.fields?.email || null;
+        
+        // Create contact object in the same format as confirmFollowContact
+        const now = new Date().toISOString();
+        const contact = {
+            pubkey: DEFAULT_CONTACT_PUBKEY,
+            name: profileName,
+            email: email,
+            picture: profile.fields?.picture || '',
+            fields: profile.fields || {},
+            picture_data_url: null,
+            picture_loaded: false,
+            picture_loading: false,
+            created_at: now,
+            updated_at: now
+        };
+        
+        // Convert to database format and save as private contact
+        const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
+        await window.DatabaseService.saveContact(dbContact, userPubkey, false); // isPublic = false
+        
+        // Update app state and refresh UI
+        window.appState.addContact(contact);
+        if (window.contactsService) {
+            window.contactsService.renderContacts();
+        }
+        
+        // Refresh compose dropdown to include new contact
+        if (window.emailService) {
+            window.emailService.populateNostrContactDropdown();
+        }
+        
+        console.log('[APP] ✅ Default nostr-mail contact added privately for user');
+    } catch (error) {
+        // Don't block startup if this fails - just log the error
+        console.error('[APP] Failed to ensure default contact:', error);
     }
 }
 
@@ -928,6 +1010,13 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                         appState.setKeypair(keypair);
                                         localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
                                         
+                                        // Clear contacts from appState since they belong to the old user
+                                        appState.setContacts([]);
+                                        // Immediately clear the contacts UI if visible
+                                        if (window.contactsService) {
+                                            window.contactsService.renderContacts();
+                                        }
+                                        
                                         // Load settings for the new pubkey
                                         await this.loadSettingsForPubkey(publicKey);
                                         
@@ -1075,6 +1164,13 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     // Reinitialize the persistent Nostr client with the new keypair
                     console.log('[APP] New keypair generated, reinitializing persistent Nostr client');
                     await app.initializeNostrClient();
+                    
+                    // Clear contacts from appState since they belong to the old user
+                    appState.setContacts([]);
+                    // Immediately clear the contacts UI if visible
+                    if (window.contactsService) {
+                        window.contactsService.renderContacts();
+                    }
                     
                     // Reload the currently active page to reflect the new keypair
                     await app.reloadActivePage();
@@ -1268,6 +1364,44 @@ NostrMailApp.prototype.handleLiveProfileUpdate = function(profileData) {
         if (isCurrentUser && isOnProfileTab) {
             console.log('[LiveEvents] Updating profile UI for live update');
             
+            // Compare with current profile to detect actual changes
+            const currentFields = this.editableProfileFields || {};
+            const newFields = profileData.fields || {};
+            
+            // Check if any fields actually changed
+            let hasChanges = false;
+            const fieldsToCheck = ['name', 'display_name', 'about', 'picture', 'email', 'website', 'banner', 'nip05'];
+            
+            // Check if any field changed
+            for (const field of fieldsToCheck) {
+                const currentValue = currentFields[field] || '';
+                const newValue = newFields[field] || '';
+                if (String(currentValue).trim() !== String(newValue).trim()) {
+                    hasChanges = true;
+                    console.log(`[LiveEvents] Profile field '${field}' changed: '${currentValue}' -> '${newValue}'`);
+                    break;
+                }
+            }
+            
+            // Also check if any new fields were added or removed
+            const currentKeys = new Set(Object.keys(currentFields));
+            const newKeys = new Set(Object.keys(newFields));
+            if (currentKeys.size !== newKeys.size) {
+                hasChanges = true;
+                console.log('[LiveEvents] Profile fields count changed');
+            } else {
+                // Check if any field values differ (including fields not in fieldsToCheck)
+                for (const key of newKeys) {
+                    const currentValue = currentFields[key] || '';
+                    const newValue = newFields[key] || '';
+                    if (String(currentValue).trim() !== String(newValue).trim()) {
+                        hasChanges = true;
+                        console.log(`[LiveEvents] Profile field '${key}' changed: '${currentValue}' -> '${newValue}'`);
+                        break;
+                    }
+                }
+            }
+            
             // Update profile UI with new data
             const updatedProfile = {
                 pubkey: profileData.pubkey,
@@ -1281,8 +1415,12 @@ NostrMailApp.prototype.handleLiveProfileUpdate = function(profileData) {
             // Update localStorage cache
             this.updateProfileCache(updatedProfile);
             
-            // Show notification
-            notificationService.showInfo('Profile updated from another device');
+            // Only show notification if something actually changed
+            if (hasChanges) {
+                notificationService.showInfo('Profile updated from another device');
+            } else {
+                console.log('[LiveEvents] Profile update received but no changes detected');
+            }
         }
         
         // Update contact profile if this person is in contacts
@@ -1531,6 +1669,113 @@ NostrMailApp.prototype.reloadActivePage = async function() {
     }
 };
 
+// Check email settings when switching to compose tab
+NostrMailApp.prototype.checkEmailSettingsForCompose = function() {
+    const hasEmailSettings = appState.hasEmailSettingsConfigured();
+    const warningBanner = document.getElementById('compose-email-settings-warning');
+    const headerSettingsLink = document.getElementById('compose-header-settings-link');
+    const sendBtn = domManager.get('sendBtn');
+    
+    // Helper function to navigate to settings
+    const goToSettings = () => {
+        const settingsTab = document.querySelector('[data-tab="settings"]');
+        if (settingsTab) {
+            settingsTab.click();
+        }
+    };
+    
+    if (!hasEmailSettings) {
+        // Add link in tab header if it doesn't exist
+        if (!headerSettingsLink) {
+            const composeTab = document.getElementById('compose');
+            if (composeTab) {
+                const tabHeader = composeTab.querySelector('.tab-header');
+                if (tabHeader) {
+                    // Create or get actions container
+                    let actionsContainer = tabHeader.querySelector('.compose-actions');
+                    if (!actionsContainer) {
+                        actionsContainer = document.createElement('div');
+                        actionsContainer.className = 'compose-actions';
+                        tabHeader.appendChild(actionsContainer);
+                    }
+                    
+                    const link = document.createElement('a');
+                    link.id = 'compose-header-settings-link';
+                    link.href = '#';
+                    link.className = 'btn btn-primary';
+                    link.style.cssText = 'text-decoration: none;';
+                    link.innerHTML = '<i class="fas fa-cog"></i> Configure Email Settings';
+                    link.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        goToSettings();
+                    });
+                    actionsContainer.appendChild(link);
+                }
+            }
+        } else {
+            // Show existing header link
+            headerSettingsLink.style.display = 'inline-block';
+        }
+        
+        // Show warning banner if it doesn't exist
+        if (!warningBanner) {
+            const composeTab = document.getElementById('compose');
+            if (composeTab) {
+                const tabHeader = composeTab.querySelector('.tab-header');
+                if (tabHeader) {
+                    const banner = document.createElement('div');
+                    banner.id = 'compose-email-settings-warning';
+                    banner.className = 'alert alert-warning';
+                    banner.style.cssText = 'margin: 16px; padding: 12px; border-radius: 4px; background-color: #fff3cd; border: 1px solid #ffc107; color: #856404;';
+                    banner.innerHTML = `
+                        <strong><i class="fas fa-exclamation-triangle"></i> Email Settings Not Configured</strong>
+                        <p style="margin: 8px 0 0 0;">Please configure your email settings before sending emails. <a href="#" id="compose-banner-settings-link" style="color: #856404; text-decoration: underline; font-weight: bold;">Configure settings now</a></p>
+                    `;
+                    tabHeader.insertAdjacentElement('afterend', banner);
+                    
+                    // Add click handler for banner link
+                    const bannerLink = document.getElementById('compose-banner-settings-link');
+                    if (bannerLink) {
+                        bannerLink.addEventListener('click', (e) => {
+                            e.preventDefault();
+                            goToSettings();
+                        });
+                    }
+                }
+            }
+        } else {
+            // Show existing banner
+            warningBanner.style.display = 'block';
+        }
+        
+        // Disable send button
+        if (sendBtn) {
+            sendBtn.disabled = true;
+            sendBtn.title = 'Please configure email settings before sending';
+            sendBtn.style.opacity = '0.6';
+            sendBtn.style.cursor = 'not-allowed';
+        }
+    } else {
+        // Hide header link if settings are configured
+        if (headerSettingsLink) {
+            headerSettingsLink.style.display = 'none';
+        }
+        
+        // Hide warning banner if settings are configured
+        if (warningBanner) {
+            warningBanner.style.display = 'none';
+        }
+        
+        // Enable send button
+        if (sendBtn) {
+            sendBtn.disabled = false;
+            sendBtn.title = '';
+            sendBtn.style.opacity = '1';
+            sendBtn.style.cursor = 'pointer';
+        }
+    }
+}
+
 // Update compose page buttons based on settings
 NostrMailApp.prototype.updateComposeButtons = function() {
     const settings = appState.getSettings();
@@ -1635,13 +1880,9 @@ NostrMailApp.prototype.switchTab = function(tabName) {
         this.initializeSettingsAccordion();
     }
     if (tabName === 'contacts') {
-        // Only load contacts if they haven't been loaded yet
-        if (!appState.getContacts() || appState.getContacts().length === 0) {
-            contactsService.loadContacts();
-        } else {
-            // Just render the existing contacts
-            contactsService.renderContacts();
-        }
+        // Always reload contacts when switching to contacts tab to ensure they match the current user
+        // This handles the case where a new keypair was generated but contacts tab wasn't active
+        contactsService.loadContacts();
     }
     if (tabName === 'dm') {
         // Only load DM contacts if they haven't been loaded yet
@@ -1670,6 +1911,9 @@ NostrMailApp.prototype.switchTab = function(tabName) {
         }
     }
     if (tabName === 'compose') {
+        // Check if email settings are configured
+        this.checkEmailSettingsForCompose();
+        
         if (window.emailService) {
             // Clear current draft state when switching to compose (unless we're loading a draft)
             if (!window.emailService.currentDraftId) {
@@ -1731,6 +1975,28 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             return false;
         }
         
+        // Validate email address format if provided
+        const emailAddress = domManager.getValue('emailAddress')?.trim() || '';
+        if (emailAddress) {
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(emailAddress)) {
+                this.showSettingsStatus('error', 'Invalid email address format. Please enter a valid email address (e.g., user@example.com)');
+                // Highlight the email field
+                const emailInput = domManager.get('emailAddress');
+                if (emailInput) {
+                    emailInput.classList.add('invalid');
+                    emailInput.style.borderColor = '#dc3545';
+                    emailInput.focus();
+                    const errorMessage = document.getElementById('email-address-error');
+                    if (errorMessage) {
+                        errorMessage.textContent = 'Please enter a valid email address (e.g., user@example.com)';
+                        errorMessage.style.display = 'block';
+                    }
+                }
+                return false;
+            }
+        }
+        
         // Ensure we have a valid keypair before saving settings
         // Settings must be saved under the public key, so each keypair has its own settings
         let publicKey = null;
@@ -1778,6 +2044,13 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 // Reinitialize the persistent Nostr client with the new keypair
                 console.log('[APP] Keypair changed, reinitializing persistent Nostr client');
                 await this.initializeNostrClient();
+                
+                // Clear contacts from appState since they belong to the old user
+                appState.setContacts([]);
+                // Immediately clear the contacts UI if visible
+                if (window.contactsService) {
+                    window.contactsService.renderContacts();
+                }
                 
                 // Reload the currently active page to reflect the new keypair
                 await this.reloadActivePage();
@@ -1925,6 +2198,11 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             // Update last loaded pubkey tracker after successful save
             appState.setLastLoadedPubkey(publicKey);
             
+            // Update compose page warning if on compose tab
+            if (document.querySelector('.tab-content#compose.active')) {
+                this.checkEmailSettingsForCompose();
+            }
+            
             this.showSettingsStatus('success', 'Settings saved automatically');
             // Toast notification is shown in showSettingsStatus for better visibility
         } catch (error) {
@@ -2046,9 +2324,81 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         });
     }
     
+    // Add email validation
+    this.setupEmailValidation();
+    
     // Store flag for populateSettingsForm to use
     this._isPopulatingForm = () => isPopulatingForm;
     this._setPopulatingForm = (value) => { isPopulatingForm = value; };
+}
+
+// Setup email address validation
+NostrMailApp.prototype.setupEmailValidation = function() {
+    const emailInput = domManager.get('emailAddress');
+    if (!emailInput) return;
+    
+    // Email validation regex pattern
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    
+    // Create error message element
+    let errorMessage = document.getElementById('email-address-error');
+    if (!errorMessage) {
+        errorMessage = document.createElement('div');
+        errorMessage.id = 'email-address-error';
+        errorMessage.className = 'form-error';
+        errorMessage.style.cssText = 'color: #dc3545; font-size: 0.875rem; margin-top: 4px; display: none;';
+        emailInput.parentNode.appendChild(errorMessage);
+    }
+    
+    // Validation function
+    const validateEmail = () => {
+        const email = emailInput.value.trim();
+        
+        // Clear previous validation state
+        emailInput.classList.remove('invalid', 'valid');
+        errorMessage.style.display = 'none';
+        
+        // Skip validation if field is empty (required validation happens on save)
+        if (!email) {
+            return true; // Allow empty for now, will be validated on save
+        }
+        
+        // Validate email format
+        if (!emailRegex.test(email)) {
+            emailInput.classList.add('invalid');
+            errorMessage.textContent = 'Please enter a valid email address (e.g., user@example.com)';
+            errorMessage.style.display = 'block';
+            emailInput.style.borderColor = '#dc3545';
+            return false;
+        } else {
+            emailInput.classList.add('valid');
+            errorMessage.style.display = 'none';
+            emailInput.style.borderColor = '#28a745';
+            return true;
+        }
+    };
+    
+    // Validate on input (real-time)
+    emailInput.addEventListener('input', () => {
+        // Only validate if field has content
+        if (emailInput.value.trim()) {
+            validateEmail();
+        } else {
+            // Clear validation state when empty
+            emailInput.classList.remove('invalid', 'valid');
+            errorMessage.style.display = 'none';
+            emailInput.style.borderColor = '';
+        }
+    });
+    
+    // Validate on blur (when user leaves field)
+    emailInput.addEventListener('blur', validateEmail);
+    
+    // Validate on form submission
+    const settingsForm = emailInput.closest('form') || document.querySelector('.settings-section');
+    if (settingsForm) {
+        // We'll validate in saveSettings function
+    }
 }
 
 NostrMailApp.prototype.populateSettingsForm = async function() {
@@ -2603,6 +2953,19 @@ NostrMailApp.prototype.loadProfile = async function() {
             const profileDict = JSON.parse(cached);
             cachedProfile = profileDict[currentPubkey];
             cachedPictureDataUrl = localStorage.getItem('nostr_mail_profile_picture');
+            
+            // Also check database cache for picture (faster and more reliable)
+            if (!cachedPictureDataUrl && currentPubkey) {
+                try {
+                    cachedPictureDataUrl = await TauriService.getCachedProfileImage(currentPubkey);
+                    if (cachedPictureDataUrl) {
+                        localStorage.setItem('nostr_mail_profile_picture', cachedPictureDataUrl);
+                    }
+                } catch (e) {
+                    console.warn('[Profile] Error checking database cache for picture:', e);
+                }
+            }
+            
             if (cachedProfile) {
                 console.log('[Profile] Rendering cached profile for pubkey', currentPubkey);
                 if (profileSpinner) profileSpinner.style.display = 'none';
@@ -2660,24 +3023,52 @@ NostrMailApp.prototype.loadProfile = async function() {
                 }
             }
             
-            // If there's a new picture URL, fetch and cache the image as a data URL
+            // Render profile immediately (fields and avatar URL)
+            // This allows the browser to start loading the image while we fetch/cache the data URL
+            this.renderProfileFromObject(profile, null);
+            
+            // If there's a picture URL, fetch and cache it in the background
             if (profile.fields && profile.fields.picture) {
                 const pictureUrl = profile.fields.picture;
-                try {
-                    const dataUrl = await TauriService.fetchImage(pictureUrl);
-                    if (dataUrl) {
-                        localStorage.setItem('nostr_mail_profile_picture', dataUrl);
-                        this.renderProfileFromObject(profile, dataUrl);
-                    } else {
-                        localStorage.removeItem('nostr_mail_profile_picture');
-                        this.renderProfileFromObject(profile, null);
+                const currentPubkey = appState.getKeypair().public_key;
+                
+                // Fetch and cache in background (don't block rendering)
+                (async () => {
+                    try {
+                        // Check database cache first (fast)
+                        let dataUrl = await TauriService.getCachedProfileImage(currentPubkey);
+                        
+                        // If not in cache, fetch it
+                        if (!dataUrl) {
+                            dataUrl = await TauriService.fetchImage(pictureUrl);
+                            if (dataUrl) {
+                                // Cache it for next time
+                                await TauriService.cacheProfileImage(currentPubkey, dataUrl);
+                            }
+                        }
+                        
+                        // Update avatar with cached/fetched data URL if available
+                        if (dataUrl) {
+                            localStorage.setItem('nostr_mail_profile_picture', dataUrl);
+                            const profilePicture = document.getElementById('profile-picture');
+                            if (profilePicture && profilePicture.src !== dataUrl) {
+                                // Only update if still showing the same profile (check current pubkey)
+                                const currentlyDisplayedPubkey = appState.getKeypair()?.public_key;
+                                if (currentlyDisplayedPubkey === currentPubkey) {
+                                    profilePicture.src = dataUrl;
+                                    console.log('[Profile] Updated avatar with cached/fetched data URL');
+                                } else {
+                                    console.log('[Profile] Profile switched, skipping avatar update');
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('[Profile] Failed to fetch/cache profile picture:', e);
+                        // Avatar already rendered with URL, so this is fine
                     }
-                } catch (e) {
-                    this.renderProfileFromObject(profile, null);
-                }
+                })();
             } else {
                 localStorage.removeItem('nostr_mail_profile_picture');
-                this.renderProfileFromObject(profile, null);
             }
             // Cache the profile in localStorage
             const pubkey = appState.getKeypair() && appState.getKeypair().public_key;

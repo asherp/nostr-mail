@@ -177,6 +177,18 @@ class AppState {
         return !!this.settings;
     }
 
+    hasEmailSettingsConfigured() {
+        if (!this.settings) {
+            return false;
+        }
+        // Check if required email settings are configured
+        const emailAddress = this.settings.email_address?.trim();
+        const password = this.settings.password?.trim();
+        const smtpHost = this.settings.smtp_host?.trim();
+        
+        return !!(emailAddress && password && smtpHost);
+    }
+
     hasActiveRelays() {
         return this.getActiveRelays().length > 0;
     }

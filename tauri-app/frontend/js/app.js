@@ -69,8 +69,7 @@ NostrMailApp.prototype.init = async function() {
             // Initialize attachment functionality
             window.emailService.initializeAttachmentListeners();
 
-            // Try to restore saved contact selection
-            window.emailService.restoreContactSelection();
+            // Don't restore contact selection on startup - start with empty selection
         }
         
         console.log('✅ ========================================');

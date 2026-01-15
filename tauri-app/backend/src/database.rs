@@ -1041,7 +1041,10 @@ impl Database {
         rows.collect()
     }
 
-    // Normalize Gmail address by removing + aliases (e.g., user+alias@gmail.com -> user@gmail.com)
+    // Normalize Gmail address by removing + aliases and dots (Gmail ignores dots)
+    // e.g., user+alias@gmail.com -> user@gmail.com
+    // e.g., user.name@gmail.com -> username@gmail.com
+    // e.g., user.name+alias@gmail.com -> username@gmail.com
     fn normalize_gmail_address(email: &str) -> String {
         let email_lower = email.trim().to_lowercase();
         if email_lower.contains("@gmail.com") {
@@ -1054,6 +1057,8 @@ impl Database {
                 } else {
                     local_part
                 };
+                // Remove dots from local part (Gmail ignores them)
+                let normalized_local = normalized_local.replace(".", "");
                 return format!("{}{}", normalized_local, domain);
             }
         }
@@ -1079,22 +1084,38 @@ impl Database {
             let normalized_user_email = Self::normalize_gmail_address(email);
             let user_email_lower = email.trim().to_lowercase();
             
-            // For Gmail addresses, always match both the original and normalized versions
+            // For Gmail addresses, normalize both sides for comparison
             // This handles cases where:
-            // - User receives at apembroke+nostr@gmail.com but sends from apembroke@gmail.com
-            // - User sends from apembroke+nostr@gmail.com but Gmail stores it as apembroke@gmail.com
+            // - User receives at asherp.nostr+mail@gmail.com but sends from asherpnostr@gmail.com
+            // - Gmail treats dots as equivalent, so asherp.nostr@gmail.com = asherpnostr@gmail.com
             if email.contains("@gmail.com") {
-                if normalized_user_email != user_email_lower {
-                    // User email has a + alias, match both versions
-                    where_clauses.push("(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?)))");
-                    params.push(Box::new(user_email_lower.clone()));
-                    params.push(Box::new(normalized_user_email.clone()));
+                // For Gmail, normalize both sides for comparison
+                // Gmail treats dots as equivalent and may strip + aliases when sending
+                // Create a version without + alias for comparison (Gmail may strip it)
+                let user_email_no_plus = if let Some(plus_pos) = user_email_lower.find('+') {
+                    if let Some(at_pos) = user_email_lower.find('@') {
+                        format!("{}@{}", &user_email_lower[..plus_pos], &user_email_lower[at_pos+1..])
+                    } else {
+                        user_email_lower.clone()
+                    }
                 } else {
-                    // User email is already normalized (no + alias), but still match both to handle from_address with + aliases
-                    where_clauses.push("(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?)))");
-                    params.push(Box::new(user_email_lower.clone()));
-                    params.push(Box::new(normalized_user_email.clone()));
-                }
+                    user_email_lower.clone()
+                };
+                let normalized_user_email_no_plus = Self::normalize_gmail_address(&user_email_no_plus);
+                
+                // Compare:
+                // 1. Exact match (original user email)
+                // 2. Normalized match (both user email and from_address normalized: dots and + removed)
+                // 3. Normalized match without + alias (in case Gmail stripped it)
+                // SQL normalizes from_address by: removing dots, removing + alias, then comparing
+                where_clauses.push(
+                    "(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR \
+                     (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ? OR \
+                     (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ?)"
+                );
+                params.push(Box::new(user_email_lower.clone()));
+                params.push(Box::new(normalized_user_email.clone()));
+                params.push(Box::new(normalized_user_email_no_plus.clone()));
             } else {
                 // Non-Gmail, just match exactly
                 where_clauses.push("LOWER(TRIM(from_address)) = LOWER(TRIM(?))");

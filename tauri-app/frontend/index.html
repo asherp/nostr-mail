@@ -87,7 +87,9 @@
                             <option value="">Select a Nostr contact with email...</option>
                         </select>
                         <input type="email" id="to-address" placeholder="recipient@example.com">
-                        <small id="to-helper-text" class="form-text text-muted">Select a Nostr contact to auto-fill and encrypt, or enter an email address manually.</small>
+                        <div id="selected-recipient-pubkey" class="selected-pubkey-display" style="display: none;">
+                            <strong>Recipient pubkey:</strong> <span id="recipient-pubkey-value"></span>
+                        </div>
                     </div>
                     
                     <div class="form-group">
@@ -465,6 +467,21 @@
                             </div>
                         </div>
                         
+                        <div class="form-actions">
+                            <button id="test-email-connection-btn" class="btn btn-secondary">
+                                <i class="fas fa-envelope"></i> Test Email Connection
+                            </button>
+                        </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Advanced -->
+                    <div class="settings-section" data-section="preferences">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-sliders-h"></i> Advanced</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
                         <div class="form-group">
                             <label for="email-filter-preference">Inbox Filter:</label>
                             <select id="email-filter-preference">
@@ -549,12 +566,6 @@
                             <label for="emails-per-page">Emails Per Page:</label>
                             <input type="number" id="emails-per-page" placeholder="50" min="10" max="500" value="50">
                             <small class="form-text text-muted">Number of emails to display per page in the inbox. Default: 50.</small>
-                        </div>
-                        
-                        <div class="form-actions">
-                            <button id="test-email-connection-btn" class="btn btn-secondary">
-                                <i class="fas fa-envelope"></i> Test Email Connection
-                            </button>
                         </div>
                         </div>
                     </div>

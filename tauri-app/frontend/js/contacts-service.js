@@ -1315,13 +1315,48 @@ class ContactsService {
             composeTab.click();
         }
         
-        // Fill in the email address
-        const toAddressInput = window.domManager.get('toAddress');
-        if (toAddressInput) {
-            toAddressInput.value = email;
-        }
+        // Find the contact by email address
+        const contacts = window.appState.getContacts();
+        const contact = contacts.find(c => c.email && c.email.toLowerCase() === email.toLowerCase());
         
-        window.notificationService.showSuccess(`Email address filled in: ${email}`);
+        // Wait a moment for the tab to switch, then fill in the form
+        setTimeout(() => {
+            // Fill in the email address
+            const toAddressInput = window.domManager.get('toAddress');
+            if (toAddressInput) {
+                toAddressInput.value = email;
+            }
+            
+            // If contact found, set it as selected for encryption
+            if (contact && window.emailService) {
+                window.emailService.selectedNostrContact = contact;
+                
+                // Update the Nostr contact dropdown
+                const dropdown = window.domManager.get('nostrContactSelect');
+                if (dropdown) {
+                    dropdown.value = contact.pubkey;
+                }
+                
+                // Display the recipient pubkey
+                const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                const pubkeyValue = document.getElementById('recipient-pubkey-value');
+                if (pubkeyDisplay && pubkeyValue) {
+                    pubkeyValue.textContent = contact.pubkey;
+                    pubkeyDisplay.style.display = 'block';
+                }
+                
+                // Update the UI to show it's an encrypted email
+                if (toAddressInput) {
+                    const isDarkMode = document.body.classList.contains('dark-mode');
+                    toAddressInput.style.borderColor = '#667eea';
+                    toAddressInput.style.backgroundColor = isDarkMode ? '#1a1f3a' : '#f8f9ff';
+                }
+                
+                window.notificationService.showSuccess(`Email address and recipient pubkey filled in for ${contact.name}`);
+            } else {
+                window.notificationService.showSuccess(`Email address filled in: ${email}`);
+            }
+        }, 100);
     }
 
     // Refresh contacts from network (called by refresh button)

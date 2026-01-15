@@ -573,4 +573,38 @@ body.dark-mode .toggle-settings-item:hover {
 .toggle-settings-item .form-text {
     margin-top: 8px;
     margin-bottom: 0;
+}
+
+/* Selected recipient pubkey display */
+.selected-pubkey-display {
+    margin-top: 8px;
+    padding: 8px 12px;
+    background-color: #f8f9fa;
+    border-radius: 4px;
+    font-size: 0.875rem;
+    border: 1px solid #e0e0e0;
+}
+
+.selected-pubkey-display strong {
+    color: #495057;
+    margin-right: 8px;
+}
+
+.selected-pubkey-display span {
+    color: #667eea;
+    font-family: 'Courier New', monospace;
+    word-break: break-all;
+}
+
+body.dark-mode .selected-pubkey-display {
+    background-color: #181a20;
+    border-color: #232946;
+}
+
+body.dark-mode .selected-pubkey-display strong {
+    color: #e0e0e0;
+}
+
+body.dark-mode .selected-pubkey-display span {
+    color: #8b9aff;
 } 

@@ -259,11 +259,16 @@ body.dark-mode .email-detail-body {
 
 .email-sender-header {
     display: flex;
-    align-items: center;
+    flex-direction: column;
     gap: 16px;
-    padding-bottom: 20px;
     margin-bottom: 20px;
     border-bottom: 1px solid #e5e7eb;
+}
+
+.email-sender-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
 }
 
 .email-sender-avatar {

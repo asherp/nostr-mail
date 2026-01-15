@@ -33,13 +33,16 @@ class EmailService {
         this.sentSearchHasMore = false; // Track if there are more sent search results
     }
 
+    // Get appropriate background color for Nostr contact input based on dark mode
+    getNostrContactInputBackgroundColor() {
+        const isDarkMode = document.body.classList.contains('dark-mode');
+        return isDarkMode ? '#1a1f3a' : '#f8f9ff';
+    }
+
     // Populate Nostr contact dropdown with contacts that have email addresses
     populateNostrContactDropdown() {
         const dropdown = domManager.get('nostrContactSelect');
         if (!dropdown) return;
-
-        // Store the currently selected value
-        const prevValue = dropdown.value;
 
         // Clear existing options except the first one
         dropdown.innerHTML = '<option value="">Select a Nostr contact with email...</option>';
@@ -66,18 +69,16 @@ class EmailService {
         // Add contacts to dropdown
         contactsWithEmail.forEach(contact => {
             const option = document.createElement('option');
-            // Format: Name — email (email lighter if possible)
+            // Just show the username since email and pubkey are displayed separately
             option.value = contact.pubkey;
-            option.textContent = `${contact.name} — ${contact.email}`;
+            option.textContent = contact.name || 'Unknown';
             option.dataset.email = contact.email;
             option.dataset.name = contact.name;
             dropdown.appendChild(option);
         });
 
-        // Restore the selection if it still exists
-        if (prevValue && Array.from(dropdown.options).some(opt => opt.value === prevValue)) {
-            dropdown.value = prevValue;
-        }
+        // Reset dropdown to empty selection (don't restore previous selection)
+        dropdown.value = '';
 
         console.log(`[JS] Populated Nostr contact dropdown with ${contactsWithEmail.length} contacts`);
     }
@@ -726,6 +727,8 @@ class EmailService {
         const select = domManager.get('nostrContactSelect');
         const selectedValue = select.value;
         const sendMatchingDmGroup = document.querySelector('.checkbox-group');
+        const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+        const pubkeyValue = document.getElementById('recipient-pubkey-value');
         
         if (selectedValue && selectedValue !== '') {
             // Find the selected contact
@@ -736,6 +739,17 @@ class EmailService {
                 console.log('[JS] Selected Nostr contact:', this.selectedNostrContact.name);
                 // Auto-fill the email address
                 domManager.setValue('toAddress', this.selectedNostrContact.email);
+                // Display the recipient pubkey
+                if (pubkeyDisplay && pubkeyValue) {
+                    pubkeyValue.textContent = this.selectedNostrContact.pubkey;
+                    pubkeyDisplay.style.display = 'block';
+                }
+                // Style the toAddress input for Nostr encryption
+                const toAddressInput = domManager.get('toAddress');
+                if (toAddressInput) {
+                    toAddressInput.style.borderColor = '#667eea';
+                    toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
+                }
                 // Save the contact selection for later restoration
                 this.saveContactSelection();
                 // Update DM checkbox visibility based on encryption state
@@ -743,6 +757,16 @@ class EmailService {
             }
         } else {
             this.selectedNostrContact = null;
+            // Hide the pubkey display
+            if (pubkeyDisplay) {
+                pubkeyDisplay.style.display = 'none';
+            }
+            // Reset the toAddress input styling
+            const toAddressInput = domManager.get('toAddress');
+            if (toAddressInput) {
+                toAddressInput.style.borderColor = '';
+                toAddressInput.style.backgroundColor = '';
+            }
             // Clear saved contact selection when none is selected
             this.clearSavedContactSelection();
             // Hide the send matching DM checkbox when no Nostr contact is selected
@@ -795,6 +819,11 @@ class EmailService {
         this.updateDmCheckboxVisibility();
         // Reset encrypt button state
         this.resetEncryptButtonState();
+        // Hide pubkey display
+        const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+        if (pubkeyDisplay) {
+            pubkeyDisplay.style.display = 'none';
+        }
     }
     
     // Clear signature when body state changes (encrypt/decrypt)
@@ -866,6 +895,49 @@ class EmailService {
             return;
         }
         
+        // Get settings early - needed for autoencrypt check
+        const settings = appState.getSettings();
+        
+        // Check if content is encrypted but no recipient pubkey is selected
+        const encryptBtn = domManager.get('encryptBtn');
+        const isEncrypted = encryptBtn && encryptBtn.dataset.encrypted === 'true';
+        const isEncryptedContent = Utils.isLikelyEncryptedContent(subject) || Utils.isLikelyEncryptedContent(body) || 
+                                   (body && body.includes('BEGIN NOSTR NIP-'));
+        
+        if ((isEncrypted || isEncryptedContent) && !this.selectedNostrContact) {
+            notificationService.showError('Encrypted content requires a recipient pubkey. Please select a Nostr contact.');
+            return;
+        }
+        
+        // Check if autoencrypt is enabled - if so, require recipient pubkey
+        const autoEncrypt = settings && settings.automatically_encrypt !== false; // Default to true
+        if (autoEncrypt && !this.selectedNostrContact) {
+            // Try to find contact by email address
+            const contacts = appState.getContacts();
+            const contactByEmail = contacts.find(c => c.email && c.email.toLowerCase() === toAddress.toLowerCase());
+            
+            if (contactByEmail) {
+                // Found contact by email, set it as selected
+                this.selectedNostrContact = contactByEmail;
+                const dropdown = domManager.get('nostrContactSelect');
+                if (dropdown) {
+                    dropdown.value = contactByEmail.pubkey;
+                }
+                // Display the recipient pubkey
+                const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                const pubkeyValue = document.getElementById('recipient-pubkey-value');
+                if (pubkeyDisplay && pubkeyValue) {
+                    pubkeyValue.textContent = contactByEmail.pubkey;
+                    pubkeyDisplay.style.display = 'block';
+                }
+                console.log('[JS] Auto-found contact by email for autoencrypt:', contactByEmail.name);
+            } else {
+                // No contact found - block sending when autoencrypt is enabled
+                notificationService.showError('Autoencrypt is enabled but no recipient pubkey found. Please select a Nostr contact with the recipient\'s email address, or disable autoencrypt to send unencrypted emails.');
+                return;
+            }
+        }
+        
         // Warn about attachments not being supported yet
         if (this.attachments && this.attachments.length > 0) {
             notificationService.showWarning(`Warning: ${this.attachments.length} attachment(s) will not be sent. Attachment support is coming soon.`);
@@ -878,7 +950,7 @@ class EmailService {
         console.log('[JS] Using message ID:', messageId);
         
         // Check if using Gmail or Yahoo and warn about App Password
-        const settings = appState.getSettings();
+        // (settings already retrieved above)
         if (settings.smtp_host === 'smtp.gmail.com') {
             console.log('[JS] Gmail detected, checking for App Password warning');
             const isGmailAddress = settings.email_address?.includes('@gmail.com');
@@ -993,6 +1065,12 @@ class EmailService {
             domManager.setValue('nostrContactSelect', '');
             this.selectedNostrContact = null;
             
+            // Hide pubkey display
+            const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+            if (pubkeyDisplay) {
+                pubkeyDisplay.style.display = 'none';
+            }
+            
             // Clear attachments
             this.clearAttachments();
             
@@ -1051,6 +1129,33 @@ class EmailService {
                 useTls = true;
             }
             
+            // Check if autoencrypt is enabled - if so, encrypt before previewing headers
+            const autoEncrypt = settings && settings.automatically_encrypt !== false; // Default to true
+            let previewSubject = subject;
+            let previewBody = body;
+            let nostrNpub = null;
+            
+            // Try to find contact if autoencrypt is enabled
+            let contactForEncryption = this.selectedNostrContact;
+            if (autoEncrypt && !contactForEncryption) {
+                const contacts = appState.getContacts();
+                const contactByEmail = contacts.find(c => c.email && c.email.toLowerCase() === toAddress.toLowerCase());
+                if (contactByEmail) {
+                    contactForEncryption = contactByEmail;
+                }
+            }
+            
+            // Encrypt in memory if autoencrypt is enabled and contact is found
+            // This does NOT modify the DOM fields - only encrypts for preview
+            if (autoEncrypt && contactForEncryption) {
+                console.log('[JS] Auto-encrypt enabled for header preview, encrypting in memory...');
+                const encrypted = await this.encryptEmailFieldsInMemory(subject, body, contactForEncryption);
+                previewSubject = encrypted.encryptedSubject;
+                previewBody = encrypted.encryptedBody;
+                nostrNpub = contactForEncryption.pubkey;
+                console.log('[JS] Encrypted for header preview (in memory only)');
+            }
+            
             // Check if we should sign the email (for preview)
             // Sign if auto-sign is enabled OR if user manually signed
             const autoSign = settings && settings.automatically_sign !== false; // Default to true
@@ -1071,7 +1176,7 @@ class EmailService {
             };
             
             // Construct headers (sender's pubkey will be extracted from private_key in backend)
-            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, subject, body, null, messageId);
+            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId);
             
             // Debug: Log what headers we actually received
             console.log('[JS] Headers received from backend:');
@@ -2915,11 +3020,14 @@ class EmailService {
                     const senderName = senderContact ? (senderContact.name || senderContact.display_name || email.from) : email.from;
                     const timeAgo = Utils.formatTimeAgo(new Date(email.date));
                     
-                    // Update page header (just back button, no subject)
+                    // Update page header (back button and reply button)
                     if (emailDetailHeader) {
                         emailDetailHeader.innerHTML = `
                             <button id="back-to-inbox" class="btn btn-secondary">
                                 <i class="fas fa-arrow-left"></i> Back to Inbox
+                            </button>
+                            <button id="reply-to-email" class="btn btn-primary" style="margin-left: 10px;">
+                                <i class="fas fa-reply"></i> Reply
                             </button>
                         `;
                         // Re-attach back button event listener
@@ -2935,6 +3043,13 @@ class EmailService {
                                 }
                             });
                         }
+                        // Attach reply button event listener
+                        const replyBtn = emailDetailHeader.querySelector('#reply-to-email');
+                        if (replyBtn) {
+                            replyBtn.addEventListener('click', () => {
+                                this.replyToEmail(email, subject, body);
+                            });
+                        }
                     }
                     
                     emailDetailContent.innerHTML =
@@ -2942,6 +3057,7 @@ class EmailService {
 <h2 class="email-detail-subject">${Utils.escapeHtml(subject)}</h2>
 <div class="email-detail-card">
 <div class="email-sender-header">
+<div class="email-sender-row">
 <img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
 <div class="email-sender-info">
 <div class="email-sender-name-row">
@@ -2959,6 +3075,7 @@ ${signatureIndicator}
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
 </div>
 </details>
+</div>
 <pre id="inbox-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="inbox-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
 <pre id="inbox-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}</pre>
@@ -3145,6 +3262,137 @@ ${attachmentsHtml}
             }
         } catch (error) {
             console.error('Error showing email detail:', error);
+        }
+    }
+
+    // Reply to email - navigate to compose with pre-filled fields
+    replyToEmail(email, decryptedSubject, decryptedBody) {
+        try {
+            // Get the sender's email address (the "from" field)
+            const replyTo = email.from || '';
+            
+            // Format the subject with "Re: " prefix (avoid duplicate "Re:")
+            let replySubject = decryptedSubject || email.subject || '';
+            if (!replySubject.startsWith('Re:') && !replySubject.startsWith('re:')) {
+                replySubject = 'Re: ' + replySubject;
+            }
+            
+            // Format the body with quoted original message
+            // Split by lines and add > prefix to each line
+            const originalBody = decryptedBody || email.body || '';
+            let replyBody = '';
+            
+            if (originalBody.trim()) {
+                const quotedBody = originalBody
+                    .split('\n')
+                    .map(line => '> ' + line)
+                    .join('\n');
+                
+                // Add a blank line before the quoted text
+                replyBody = '\n\n' + quotedBody;
+            }
+            
+            // Navigate to compose tab
+            if (window.app && window.app.switchTab) {
+                window.app.switchTab('compose');
+            } else {
+                // Fallback: click the compose tab button
+                const composeTab = document.querySelector('[data-tab="compose"]');
+                if (composeTab) {
+                    composeTab.click();
+                }
+            }
+            
+            // Wait a moment for the tab to switch, then fill in the form fields
+            setTimeout(() => {
+                domManager.setValue('toAddress', replyTo);
+                domManager.setValue('subject', replySubject);
+                domManager.setValue('messageBody', replyBody);
+                
+                // Get the sender's pubkey (recipient when replying)
+                let senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                const pubkeyValue = document.getElementById('recipient-pubkey-value');
+                
+                // If no pubkey in email, try to look it up by email address
+                if (!senderPubkey && replyTo) {
+                    try {
+                        const contacts = appState.getContacts();
+                        const senderContact = contacts.find(contact => 
+                            contact.email && contact.email.toLowerCase() === replyTo.toLowerCase()
+                        );
+                        if (senderContact && senderContact.pubkey) {
+                            senderPubkey = senderContact.pubkey;
+                        }
+                    } catch (e) {
+                        console.log('[JS] Could not look up pubkey by email:', e);
+                    }
+                }
+                
+                if (senderPubkey) {
+                    // Try to find the contact by pubkey
+                    const contacts = appState.getContacts();
+                    const senderContact = contacts.find(contact => contact.pubkey === senderPubkey);
+                    
+                    if (senderContact) {
+                        // Set as selected Nostr contact
+                        this.selectedNostrContact = senderContact;
+                        domManager.setValue('nostrContactSelect', senderPubkey);
+                        
+                        // Display the recipient pubkey
+                        if (pubkeyDisplay && pubkeyValue) {
+                            pubkeyValue.textContent = senderPubkey;
+                            pubkeyDisplay.style.display = 'block';
+                        }
+                        
+                        // Style the toAddress input for Nostr encryption
+                        const toAddressInput = domManager.get('toAddress');
+                        if (toAddressInput) {
+                            toAddressInput.style.borderColor = '#667eea';
+                            toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
+                        }
+                    } else {
+                        // Pubkey exists but contact not found - still display it
+                        this.selectedNostrContact = null;
+                        domManager.setValue('nostrContactSelect', '');
+                        
+                        // Display the recipient pubkey even if contact not found
+                        if (pubkeyDisplay && pubkeyValue) {
+                            pubkeyValue.textContent = senderPubkey;
+                            pubkeyDisplay.style.display = 'block';
+                        }
+                        
+                        // Style the toAddress input for Nostr encryption
+                        const toAddressInput = domManager.get('toAddress');
+                        if (toAddressInput) {
+                            toAddressInput.style.borderColor = '#667eea';
+                            toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
+                        }
+                    }
+                } else {
+                    // No pubkey available - clear any selected Nostr contact
+                    domManager.setValue('nostrContactSelect', '');
+                    this.selectedNostrContact = null;
+                    
+                    // Hide the pubkey display
+                    if (pubkeyDisplay) {
+                        pubkeyDisplay.style.display = 'none';
+                    }
+                    
+                    // Reset the toAddress input styling
+                    const toAddressInput = domManager.get('toAddress');
+                    if (toAddressInput) {
+                        toAddressInput.style.borderColor = '';
+                        toAddressInput.style.backgroundColor = '';
+                        toAddressInput.classList.remove('hidden');
+                    }
+                }
+            }, 100);
+        } catch (error) {
+            console.error('Error replying to email:', error);
+            if (window.notificationService) {
+                window.notificationService.showError('Failed to open reply: ' + error.message);
+            }
         }
     }
 
@@ -3741,6 +3989,64 @@ ${attachmentsHtml}
         }
     }
 
+    // Encrypt email fields in memory without modifying DOM (for preview purposes)
+    async encryptEmailFieldsInMemory(subject, body, contact) {
+        console.log('[JS] encryptEmailFieldsInMemory called');
+        
+        if (!contact) {
+            console.log('[JS] No contact provided for encryption');
+            return { encryptedSubject: subject, encryptedBody: body };
+        }
+        
+        if (!appState.hasKeypair()) {
+            console.log('[JS] No keypair available');
+            return { encryptedSubject: subject, encryptedBody: body };
+        }
+        
+        const privkey = appState.getKeypair().private_key;
+        const pubkey = contact.pubkey;
+        console.log('[JS] Using privkey:', privkey.substring(0, 20) + '...');
+        console.log('[JS] Using pubkey:', pubkey);
+        
+        // Get the selected encryption algorithm
+        const settings = appState.getSettings();
+        const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+        console.log('[JS] Using encryption algorithm:', encryptionAlgorithm);
+        
+        try {
+            // Encrypt subject
+            let encryptedSubject = subject;
+            if (subject) {
+                console.log('[JS] Encrypting subject in memory...');
+                encryptedSubject = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, subject, encryptionAlgorithm);
+                console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
+            }
+            
+            // Encrypt body directly with NIP and wrap in ASCII armor
+            let encryptedBody = body;
+            if (body) {
+                console.log('[JS] Encrypting body in memory...');
+                encryptedBody = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, body, encryptionAlgorithm);
+                console.log('[JS] Body encrypted:', encryptedBody.substring(0, 50) + '...');
+                
+                // Add ASCII armor around the encrypted body
+                const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
+                const armoredBody = [
+                    `-----BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE-----`,
+                    encryptedBody.trim(),
+                    `-----END NOSTR ${armorType} ENCRYPTED MESSAGE-----`
+                ].join('\n');
+                encryptedBody = armoredBody.trim();
+            }
+            
+            return { encryptedSubject, encryptedBody };
+        } catch (error) {
+            console.error('[JS] Encryption error in memory:', error);
+            // Return original values on error
+            return { encryptedSubject: subject, encryptedBody: body };
+        }
+    }
+
     // Generate a UUID for message IDs
     generateUUID() {
         return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -4022,13 +4328,57 @@ ${attachmentsHtml}
             transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
         }
 
+        // Get recipient contact for avatar (similar to inbox getting sender contact)
+        const recipientEmail = email.to;
+        const contacts = appState.getContacts();
+        let recipientContact = null;
+        
+        if (recipientEmail) {
+            // Normalize Gmail addresses (remove + aliases)
+            const normalizeGmail = (email) => {
+                const lower = email.trim().toLowerCase();
+                if (lower.includes('@gmail.com')) {
+                    const [local, domain] = lower.split('@');
+                    const normalizedLocal = local.split('+')[0];
+                    return `${normalizedLocal}@${domain}`;
+                }
+                return lower;
+            };
+            
+            const normalizedEmail = normalizeGmail(recipientEmail);
+            // Try both original and normalized email
+            recipientContact = contacts.find(c => {
+                if (!c.email) return false;
+                const contactEmail = c.email.trim().toLowerCase();
+                return contactEmail === recipientEmail.toLowerCase() || contactEmail === normalizedEmail;
+            });
+        }
+        
+        // Avatar fallback logic (same as inbox)
+        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+        let avatarSrc = defaultAvatar;
+        let avatarClass = 'contact-avatar';
+        const isValidDataUrl = recipientContact && recipientContact.picture_data_url && recipientContact.picture_data_url.startsWith('data:image') && recipientContact.picture_data_url !== 'data:application/octet-stream;base64,';
+        if (recipientContact && recipientContact.picture_loading) {
+            avatarClass += ' loading';
+        } else if (isValidDataUrl) {
+            avatarSrc = recipientContact.picture_data_url;
+        } else if (recipientContact && recipientContact.picture_data_url && !isValidDataUrl && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        } else if (recipientContact && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        }
+
         emailElement.innerHTML = `
-            <div class="email-header">
-                <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
-                <div class="email-date">${dateDisplay}</div>
+            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.to)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <div class="email-content">
+                <div class="email-header">
+                    <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
+                    <div class="email-date">${dateDisplay}</div>
+                </div>
+                ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
+                <div class="email-preview">${previewText}</div>
             </div>
-            ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
-            <div class="email-preview">${previewText}</div>
             <div class="email-actions">
                 <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteSentEmailFromList('${email.message_id}')">
                     <i class="fas fa-trash"></i>
@@ -4111,13 +4461,57 @@ ${attachmentsHtml}
         const attachmentIndicator = attachmentCount > 0 ? 
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
+        // Get recipient contact for avatar (similar to inbox getting sender contact)
+        const recipientEmail = email.to;
+        const contacts = appState.getContacts();
+        let recipientContact = null;
+        
+        if (recipientEmail) {
+            // Normalize Gmail addresses (remove + aliases)
+            const normalizeGmail = (email) => {
+                const lower = email.trim().toLowerCase();
+                if (lower.includes('@gmail.com')) {
+                    const [local, domain] = lower.split('@');
+                    const normalizedLocal = local.split('+')[0];
+                    return `${normalizedLocal}@${domain}`;
+                }
+                return lower;
+            };
+            
+            const normalizedEmail = normalizeGmail(recipientEmail);
+            // Try both original and normalized email
+            recipientContact = contacts.find(c => {
+                if (!c.email) return false;
+                const contactEmail = c.email.trim().toLowerCase();
+                return contactEmail === recipientEmail.toLowerCase() || contactEmail === normalizedEmail;
+            });
+        }
+        
+        // Avatar fallback logic (same as inbox)
+        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+        let avatarSrc = defaultAvatar;
+        let avatarClass = 'contact-avatar';
+        const isValidDataUrl = recipientContact && recipientContact.picture_data_url && recipientContact.picture_data_url.startsWith('data:image') && recipientContact.picture_data_url !== 'data:application/octet-stream;base64,';
+        if (recipientContact && recipientContact.picture_loading) {
+            avatarClass += ' loading';
+        } else if (isValidDataUrl) {
+            avatarSrc = recipientContact.picture_data_url;
+        } else if (recipientContact && recipientContact.picture_data_url && !isValidDataUrl && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        } else if (recipientContact && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        }
+
         emailElement.innerHTML = `
-            <div class="email-header">
-                <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator}</div>
-                <div class="email-date">${dateDisplay}</div>
+            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.to)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <div class="email-content">
+                <div class="email-header">
+                    <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator}</div>
+                    <div class="email-date">${dateDisplay}</div>
+                </div>
+                <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
+                <div class="email-preview">${Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '')}</div>
             </div>
-            <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
-            <div class="email-preview">${Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '')}</div>
             <div class="email-actions">
                 <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteSentEmailFromList('${email.message_id}')">
                     <i class="fas fa-trash"></i>
@@ -4295,6 +4689,7 @@ ${attachmentsHtml}
 <h2 class="email-detail-subject">${Utils.escapeHtml(email.subject)}</h2>
 <div class="email-detail-card">
 <div class="email-sender-header">
+<div class="email-sender-row">
 <img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
 <div class="email-sender-info">
 <div class="email-sender-name-row">
@@ -4304,7 +4699,6 @@ ${signatureIndicator}
 <div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
 </div>
 </div>
-<div class="error" style="margin-bottom: 15px;">Cannot decrypt: Recipient pubkey not found in contacts. The email could not be decrypted with any known contact pubkey.</div>
 <details class="email-metadata-details">
 <summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
 <div class="email-detail-header vertical" id="sent-email-header-info">
@@ -4313,6 +4707,8 @@ ${signatureIndicator}
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
 </div>
 </details>
+</div>
+<div class="error" style="margin-bottom: 15px;">Cannot decrypt: Recipient pubkey not found in contacts. The email could not be decrypted with any known contact pubkey.</div>
 <pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(rawHeaders)}</pre>
 <div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(rawBody).replace(/\n/g, '<br>')}</div>
 <pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(rawBody)}</pre>
@@ -4726,6 +5122,7 @@ ${signatureIndicator}
 <h2 class="email-detail-subject">${Utils.escapeHtml(subject)}</h2>
 <div class="email-detail-card">
 <div class="email-sender-header">
+<div class="email-sender-row">
 <img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
 <div class="email-sender-info">
 <div class="email-sender-name-row">
@@ -4743,6 +5140,7 @@ ${signatureIndicator}
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
 </div>
 </details>
+</div>
 <pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
 <pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}</pre>
@@ -5930,11 +6328,18 @@ ${attachmentsHtml}
                         if (dropdown) {
                             dropdown.value = contact.pubkey;
                         }
+                        // Display the recipient pubkey
+                        const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                        const pubkeyValue = document.getElementById('recipient-pubkey-value');
+                        if (pubkeyDisplay && pubkeyValue) {
+                            pubkeyValue.textContent = contact.pubkey;
+                            pubkeyDisplay.style.display = 'block';
+                        }
                         // Update the UI to show it's an encrypted email
                         const toAddressInput = domManager.get('toAddress');
                         if (toAddressInput) {
                             toAddressInput.style.borderColor = '#667eea';
-                            toAddressInput.style.backgroundColor = '#f8f9ff';
+                            toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
                             toAddressInput.classList.add('hidden');
                         }
                     }
@@ -5965,6 +6370,12 @@ ${attachmentsHtml}
                     domManager.setValue('messageBody', '');
                     domManager.setValue('nostrContactSelect', '');
                     this.selectedNostrContact = null;
+                    
+                    // Hide pubkey display
+                    const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                    if (pubkeyDisplay) {
+                        pubkeyDisplay.style.display = 'none';
+                    }
                     
                     // Reset the UI for Nostr contact selection
                     const toAddressInput = domManager.get('toAddress');

@@ -1319,6 +1319,12 @@ fn db_find_pubkeys_by_email(email: String, state: tauri::State<AppState>) -> Res
 }
 
 #[tauri::command]
+fn db_find_pubkeys_by_email_including_dms(email: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.get_database()?;
+    db.find_pubkeys_by_email_including_dms(&email).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn db_filter_new_contacts(user_pubkey: String, pubkeys: Vec<String>, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     let db = state.get_database()?;
     let existing: std::collections::HashSet<String> = db.get_all_contacts(&user_pubkey)
@@ -1686,10 +1692,10 @@ async fn db_search_sent_emails(
             let mut decrypted_body_result = None;
             let mut decrypted_subject_result = email.subject.clone();
             
-            // Try to find recipient pubkeys
+            // Try to find recipient pubkeys (including DMs)
             println!("[RUST] Searching for recipient pubkeys for email: {}", recipient_email);
-            if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email(recipient_email) {
-                println!("[RUST] Found {} recipient pubkey(s) for {}", recipient_pubkeys.len(), recipient_email);
+            if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email_including_dms(recipient_email) {
+                println!("[RUST] Found {} recipient pubkey(s) for {} (including DMs)", recipient_pubkeys.len(), recipient_email);
                 // Also try normalized Gmail address
                 let normalized_email = if recipient_email.contains("@gmail.com") {
                     let parts: Vec<&str> = recipient_email.split('@').collect();
@@ -1706,8 +1712,8 @@ async fn db_search_sent_emails(
                 let mut all_pubkeys = recipient_pubkeys;
                 if normalized_email != recipient_email.to_lowercase() {
                     println!("[RUST] Also searching for normalized email: {}", normalized_email);
-                    if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email(&normalized_email) {
-                        println!("[RUST] Found {} pubkey(s) for normalized email", normalized_pubkeys.len());
+                    if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email_including_dms(&normalized_email) {
+                        println!("[RUST] Found {} pubkey(s) for normalized email (including DMs)", normalized_pubkeys.len());
                         all_pubkeys.extend(normalized_pubkeys);
                     }
                 }
@@ -1737,6 +1743,20 @@ async fn db_search_sent_emails(
                     ) {
                         Ok(decrypted) => {
                             println!("[RUST] Successfully decrypted sent email body with recipient pubkey, length: {}", decrypted.len());
+                            // Save the recipient pubkey to database for future use
+                            if !email.message_id.is_empty() {
+                                if let Err(e) = db.update_email_recipient_pubkey(&email.message_id, recipient_pubkey) {
+                                    println!("[RUST] Warning: Failed to save recipient pubkey to database: {}", e);
+                                } else {
+                                    println!("[RUST] Saved recipient pubkey {} to database for email {}", recipient_pubkey, email.message_id);
+                                }
+                            } else if let Some(email_id) = email.id {
+                                if let Err(e) = db.update_email_recipient_pubkey_by_id(email_id, recipient_pubkey) {
+                                    println!("[RUST] Warning: Failed to save recipient pubkey to database: {}", e);
+                                } else {
+                                    println!("[RUST] Saved recipient pubkey {} to database for email id {}", recipient_pubkey, email_id);
+                                }
+                            }
                             decrypted_body_result = Some(decrypted);
                             break;
                         }
@@ -1836,8 +1856,8 @@ async fn db_search_sent_emails(
                 if email::is_likely_encrypted_content(&email.subject) {
                     let mut subject_decrypted = false;
                     
-                    // Try recipient pubkeys first (same as body)
-                    if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email(recipient_email) {
+                    // Try recipient pubkeys first (same as body, including DMs)
+                    if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email_including_dms(recipient_email) {
                         let normalized_email = if recipient_email.contains("@gmail.com") {
                             let parts: Vec<&str> = recipient_email.split('@').collect();
                             if parts.len() == 2 {
@@ -1852,7 +1872,7 @@ async fn db_search_sent_emails(
                         
                         let mut all_pubkeys = recipient_pubkeys;
                         if normalized_email != recipient_email.to_lowercase() {
-                            if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email(&normalized_email) {
+                            if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email_including_dms(&normalized_email) {
                                 all_pubkeys.extend(normalized_pubkeys);
                             }
                         }
@@ -3312,9 +3332,9 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pu
         if let Some(ref recipient_pubkey) = email.recipient_pubkey {
             pubkeys.push(recipient_pubkey.clone());
         }
-        // Also try looking up by email addresses
+        // Also try looking up by email addresses (including DMs for recipient, contacts only for sender)
         let sender_pubkeys = db.find_pubkeys_by_email(&email.from_address).map_err(|e| e.to_string())?;
-        let recipient_pubkeys = db.find_pubkeys_by_email(&email.to_address).map_err(|e| e.to_string())?;
+        let recipient_pubkeys = db.find_pubkeys_by_email_including_dms(&email.to_address).map_err(|e| e.to_string())?;
         pubkeys.extend(sender_pubkeys);
         pubkeys.extend(recipient_pubkeys);
         pubkeys
@@ -3480,6 +3500,7 @@ pub fn run() {
         db_get_public_contact_pubkeys,
         db_update_user_contact_public_status,
         db_find_pubkeys_by_email,
+        db_find_pubkeys_by_email_including_dms,
         db_filter_new_contacts,
         db_save_email,
         db_get_email,

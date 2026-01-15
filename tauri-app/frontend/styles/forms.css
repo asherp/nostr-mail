@@ -456,4 +456,121 @@ body.dark-mode .attachment-item {
 
 body.dark-mode .attachment-item.encrypted {
     background: rgba(40, 167, 69, 0.1);
+}
+
+/* Toggle Switch Styles for Settings */
+.toggle-setting {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 15px;
+    margin-bottom: 8px;
+}
+
+.toggle-setting > label:first-child {
+    flex: 1;
+    margin: 0;
+    font-weight: 500;
+    color: #555;
+    cursor: pointer;
+}
+
+body.dark-mode .toggle-setting > label:first-child {
+    color: #e0e0e0;
+}
+
+.toggle-switch {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.toggle-switch input[type="checkbox"] {
+    width: 40px;
+    height: 20px;
+    -webkit-appearance: none;
+    appearance: none;
+    background-color: #ccc;
+    border-radius: 20px;
+    position: relative;
+    cursor: pointer;
+    transition: background-color 0.3s;
+    margin: 0;
+}
+
+.toggle-switch input[type="checkbox"]::before {
+    content: '';
+    width: 16px;
+    height: 16px;
+    background-color: white;
+    border-radius: 50%;
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    transition: transform 0.3s;
+}
+
+.toggle-switch input[type="checkbox"]:checked {
+    background-color: #667eea;
+}
+
+.toggle-switch input[type="checkbox"]:checked::before {
+    transform: translateX(20px);
+}
+
+body.dark-mode .toggle-switch input[type="checkbox"] {
+    background-color: #495057;
+}
+
+body.dark-mode .toggle-switch input[type="checkbox"]:checked {
+    background-color: #667eea;
+}
+
+/* Toggle Settings List */
+.toggle-settings-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    overflow: hidden;
+    background: white;
+}
+
+body.dark-mode .toggle-settings-list {
+    border-color: #232946;
+    background: #232946;
+}
+
+.toggle-settings-item {
+    padding: 16px 20px;
+    border-bottom: 1px solid #e0e0e0;
+    transition: background-color 0.2s ease;
+}
+
+.toggle-settings-item:last-child {
+    border-bottom: none;
+}
+
+.toggle-settings-item:hover {
+    background-color: #f8f9fa;
+}
+
+body.dark-mode .toggle-settings-item {
+    border-bottom-color: #181a20;
+}
+
+body.dark-mode .toggle-settings-item:hover {
+    background-color: #181a20;
+}
+
+.toggle-settings-item .toggle-setting {
+    margin-bottom: 8px;
+}
+
+.toggle-settings-item .form-text {
+    margin-top: 8px;
+    margin-bottom: 0;
 } 

@@ -116,10 +116,15 @@ NostrMailApp.prototype.loadSettings = async function() {
                         send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
                         sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 365, // Default to 1 year
                         emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
-                        require_signature: dbSettings.require_signature !== 'false' // Default to true if not set
+                        require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
+                        hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
+                        automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
+                        automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
+                        hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false' // Default to true if not set
                     };
                     appState.setSettings(settings);
                     this.populateSettingsForm();
+                    this.updateComposeButtons();
                     // Also update localStorage as backup
                     localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
                     return;
@@ -136,6 +141,7 @@ NostrMailApp.prototype.loadSettings = async function() {
             const settings = JSON.parse(stored);
             appState.setSettings(settings);
             this.populateSettingsForm();
+            this.updateComposeButtons();
         }
     } catch (error) {
         console.error('Error loading settings:', error);
@@ -218,11 +224,16 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
                 sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 1825, // Default to 5 years
                 emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
-                require_signature: dbSettings.require_signature !== 'false' // Default to true if not set
+                require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
+                hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
+                automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
+                automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
+                hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false' // Default to true if not set
             };
             
             appState.setSettings(settings);
             this.populateSettingsForm();
+            this.updateComposeButtons();
             // Update localStorage as backup
             localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
             console.log('[APP] Settings loaded for pubkey:', pubkey);
@@ -1427,6 +1438,67 @@ NostrMailApp.prototype.reloadActivePage = async function() {
     }
 };
 
+// Update compose page buttons based on settings
+NostrMailApp.prototype.updateComposeButtons = function() {
+    const settings = appState.getSettings();
+    if (!settings) return;
+    
+    const encryptBtn = domManager.get('encryptBtn');
+    const signBtn = domManager.get('signBtn');
+    const sendBtn = domManager.get('sendBtn');
+    
+    if (!sendBtn) return;
+    
+    // Get settings (default to true if not set)
+    const autoEncrypt = settings.automatically_encrypt !== false;
+    const autoSign = settings.automatically_sign !== false;
+    
+    // Hide/show encrypt button
+    if (encryptBtn) {
+        encryptBtn.style.display = autoEncrypt ? 'none' : 'inline-block';
+    }
+    
+    // Hide/show sign button
+    if (signBtn) {
+        signBtn.style.display = autoSign ? 'none' : 'inline-block';
+    }
+    
+    // Update send button icons
+    let icons = [];
+    let tooltipParts = [];
+    
+    // Add encrypt icon if auto encrypt is enabled
+    if (autoEncrypt) {
+        icons.push('<i class="fas fa-lock"></i>');
+        tooltipParts.push('encrypt');
+    }
+    
+    // Add sign icon if auto sign is enabled
+    if (autoSign) {
+        icons.push('<i class="fas fa-pen"></i>');
+        tooltipParts.push('sign');
+    }
+    
+    // Always include the paper plane icon last
+    icons.push('<i class="fas fa-paper-plane"></i>');
+    tooltipParts.push('send');
+    
+    // Build tooltip text
+    let tooltipText = 'Will ';
+    if (tooltipParts.length === 1) {
+        tooltipText += tooltipParts[0];
+    } else if (tooltipParts.length === 2) {
+        tooltipText += tooltipParts[0] + ' and ' + tooltipParts[1];
+    } else {
+        tooltipText += tooltipParts.slice(0, -1).join(', ') + ', and ' + tooltipParts[tooltipParts.length - 1];
+    }
+    tooltipText += ' email';
+    
+    // Update the button content (preserve the button element and event listeners)
+    sendBtn.innerHTML = icons.join(' ') + ' Send';
+    sendBtn.title = tooltipText;
+}
+
 // Tab switching
 NostrMailApp.prototype.switchTab = function(tabName) {
     try {
@@ -1513,6 +1585,8 @@ NostrMailApp.prototype.switchTab = function(tabName) {
             // Try to restore contact selection when switching to compose
             window.emailService.restoreContactSelection();
         }
+        // Update compose buttons based on settings
+        this.updateComposeButtons();
     }
 }
 
@@ -1671,10 +1745,25 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 send_matching_dm: (loadedSettings && loadedSettings.send_matching_dm !== undefined) ? loadedSettings.send_matching_dm : (domManager.get('send-matching-dm-preference')?.checked !== false),
                 sync_cutoff_days: (loadedSettings && loadedSettings.sync_cutoff_days) ? loadedSettings.sync_cutoff_days : (parseInt(domManager.getValue('syncCutoffDays')) || 365),
                 emails_per_page: (loadedSettings && loadedSettings.emails_per_page) ? loadedSettings.emails_per_page : (parseInt(domManager.getValue('emailsPerPage')) || 50),
-                require_signature: (loadedSettings && loadedSettings.require_signature !== undefined) ? loadedSettings.require_signature : (domManager.get('require-signature-preference')?.checked !== false)
+                require_signature: (loadedSettings && loadedSettings.require_signature !== undefined) ? loadedSettings.require_signature : (domManager.get('require-signature-preference')?.checked !== false),
+                hide_undecryptable_emails: (loadedSettings && loadedSettings.hide_undecryptable_emails !== undefined) ? loadedSettings.hide_undecryptable_emails : (domManager.get('hide-undecryptable-emails-preference')?.checked !== false),
+                automatically_encrypt: (loadedSettings && loadedSettings.automatically_encrypt !== undefined) ? loadedSettings.automatically_encrypt : (domManager.get('automatically-encrypt-preference')?.checked !== false),
+                automatically_sign: (loadedSettings && loadedSettings.automatically_sign !== undefined) ? loadedSettings.automatically_sign : (domManager.get('automatically-sign-preference')?.checked !== false),
+                hide_unsigned_messages: (loadedSettings && loadedSettings.hide_unsigned_messages !== undefined) ? loadedSettings.hide_unsigned_messages : (domManager.get('hide-unsigned-messages-preference')?.checked !== false)
             };
         } else {
             // Use form values (normal case)
+            // Ensure auto-sign is enabled if auto-encrypt is enabled
+            const autoEncryptPref = domManager.get('automatically-encrypt-preference');
+            const autoSignPref = domManager.get('automatically-sign-preference');
+            const autoEncryptEnabled = autoEncryptPref?.checked !== false; // Default to true
+            
+            // If auto-encrypt is enabled, also enable auto-sign
+            if (autoEncryptEnabled && autoSignPref && !autoSignPref.checked) {
+                autoSignPref.checked = true;
+                console.log('[JS] Auto-encrypt is enabled, enabling auto-sign as well');
+            }
+            
             settings = {
                 npriv_key: nprivKey || currentKeypair.private_key,
                 encryption_algorithm: domManager.getValue('encryptionAlgorithm') || 'nip44',
@@ -1689,7 +1778,11 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false, // Default to true
                 sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 365, // Default to 1 year
                 emails_per_page: parseInt(domManager.getValue('emailsPerPage')) || 50, // Default to 50
-                require_signature: domManager.get('require-signature-preference')?.checked !== false // Default to true
+                require_signature: domManager.get('require-signature-preference')?.checked !== false, // Default to true
+                hide_undecryptable_emails: domManager.get('hide-undecryptable-emails-preference')?.checked !== false, // Default to true
+                automatically_encrypt: autoEncryptEnabled,
+                automatically_sign: autoSignPref?.checked !== false, // Default to true (will be true if auto-encrypt is enabled)
+                hide_unsigned_messages: domManager.get('hide-unsigned-messages-preference')?.checked !== false // Default to true
             };
         }
         
@@ -1724,6 +1817,10 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('sync_cutoff_days', settings.sync_cutoff_days.toString());
             settingsMap.set('emails_per_page', settings.emails_per_page.toString());
             settingsMap.set('require_signature', settings.require_signature.toString());
+            settingsMap.set('hide_undecryptable_emails', (settings.hide_undecryptable_emails || false).toString());
+            settingsMap.set('automatically_encrypt', (settings.automatically_encrypt !== undefined ? settings.automatically_encrypt : true).toString());
+            settingsMap.set('automatically_sign', (settings.automatically_sign !== undefined ? settings.automatically_sign : true).toString());
+            settingsMap.set('hide_unsigned_messages', (settings.hide_unsigned_messages !== undefined ? settings.hide_unsigned_messages : true).toString());
             
             const settingsObj = Object.fromEntries(settingsMap);
             // Get private key for encryption
@@ -1746,6 +1843,10 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
         
         await this.saveRelays();
         this.saveRelaysToLocalStorage();
+        
+        // Update compose buttons based on new settings
+        this.updateComposeButtons();
+        
         return true;
     } catch (error) {
         console.error('Error saving settings:', error);
@@ -1803,6 +1904,11 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'use-tls',
         'emailFilterPreference',
         'send-matching-dm-preference',
+        'require-signature-preference',
+        'hide-undecryptable-emails-preference',
+        'automatically-encrypt-preference',
+        'automatically-sign-preference',
+        'hide-unsigned-messages-preference',
         'syncCutoffDays',
         'emailsPerPage'
     ];
@@ -1819,6 +1925,24 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
             }
         }
     });
+    
+    // Special handling: When auto-encrypt is enabled, also enable auto-sign
+    const autoEncryptPref = domManager.get('automatically-encrypt-preference');
+    const autoSignPref = domManager.get('automatically-sign-preference');
+    
+    if (autoEncryptPref && autoSignPref) {
+        autoEncryptPref.addEventListener('change', (e) => {
+            // When auto-encrypt is enabled, also enable auto-sign
+            if (e.target.checked) {
+                autoSignPref.checked = true;
+                console.log('[JS] Auto-encrypt enabled, also enabling auto-sign');
+                // Trigger save after enabling auto-sign
+                debouncedSave();
+            }
+            // Note: We don't disable auto-sign when auto-encrypt is disabled
+            // User can still have auto-sign enabled independently
+        });
+    }
     
     // Also listen for email provider changes (which may auto-fill other fields)
     const emailProvider = domManager.get('emailProvider');
@@ -1872,6 +1996,42 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         if (requireSignaturePref) {
             requireSignaturePref.checked = settings.require_signature !== false;
         }
+        
+        // Set hide undecryptable emails preference (default to true if not set)
+        const hideUndecryptablePref = domManager.get('hide-undecryptable-emails-preference');
+        if (hideUndecryptablePref) {
+            hideUndecryptablePref.checked = settings.hide_undecryptable_emails !== false;
+        }
+        
+        // Set automatically encrypt preference (default to true if not set)
+        const automaticallyEncryptPref = domManager.get('automatically-encrypt-preference');
+        let autoEncryptEnabled = false;
+        if (automaticallyEncryptPref) {
+            autoEncryptEnabled = settings.automatically_encrypt !== false;
+            automaticallyEncryptPref.checked = autoEncryptEnabled;
+        }
+        
+        // Set automatically sign preference (default to true if not set)
+        // If auto-encrypt is enabled, also enable auto-sign
+        const automaticallySignPref = domManager.get('automatically-sign-preference');
+        if (automaticallySignPref) {
+            const autoSignEnabled = settings.automatically_sign !== false;
+            // Enable auto-sign if auto-encrypt is enabled OR if it was already enabled
+            automaticallySignPref.checked = autoEncryptEnabled || autoSignEnabled;
+            
+            if (autoEncryptEnabled && !autoSignEnabled) {
+                console.log('[JS] Auto-encrypt is enabled, enabling auto-sign as well');
+            }
+        }
+        
+        // Set hide unsigned messages preference (default to true if not set)
+        const hideUnsignedMessagesPref = domManager.get('hide-unsigned-messages-preference');
+        if (hideUnsignedMessagesPref) {
+            hideUnsignedMessagesPref.checked = settings.hide_unsigned_messages !== false;
+        }
+        
+        // Update compose buttons based on settings
+        this.updateComposeButtons();
         
         // Detect and set the email provider based on saved settings
         const emailProvider = domManager.get('emailProvider');

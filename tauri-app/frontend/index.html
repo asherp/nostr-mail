@@ -457,11 +457,12 @@
                         </div>
                         
                         <div class="form-group">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="use-tls" checked>
-                                <span class="checkmark"></span>
-                                Use TLS/SSL
-                            </label>
+                            <div class="toggle-setting">
+                                <label for="use-tls">Use TLS/SSL</label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="use-tls" checked>
+                                </label>
+                            </div>
                         </div>
                         
                         <div class="form-group">
@@ -474,21 +475,68 @@
                         </div>
                         
                         <div class="form-group">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="send-matching-dm-preference" checked>
-                                <span class="checkmark"></span>
-                                Send Matching DM
-                            </label>
-                            <small class="form-text text-muted">Automatically send a direct message with the same subject line when sending encrypted emails to Nostr contacts</small>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="require-signature-preference" checked>
-                                <span class="checkmark"></span>
-                                Require Signatures
-                            </label>
-                            <small class="form-text text-muted">Only accept emails with valid Nostr signatures. Emails without signatures will be ignored.</small>
+                            <label>Email Preferences:</label>
+                            <ul class="toggle-settings-list">
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="send-matching-dm-preference">Send Matching DM</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="send-matching-dm-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Automatically send a direct message with the same subject line when sending encrypted emails to Nostr contacts</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="require-signature-preference">Require Signatures</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="require-signature-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Only accept emails with valid Nostr signatures. Emails without signatures will be ignored.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="hide-undecryptable-emails-preference">Hide Undecryptable Emails</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="hide-undecryptable-emails-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Hide emails that cannot be decrypted with your private key from the inbox view.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="automatically-encrypt-preference">Automatically Encrypt</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="automatically-encrypt-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Automatically encrypt outgoing emails when composing.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="automatically-sign-preference">Automatically Sign</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="automatically-sign-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Automatically sign outgoing emails with your Nostr key.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="hide-unsigned-messages-preference">Hide Unverified</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="hide-unsigned-messages-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Hide messages with missing or unverified signatures.</small>
+                                </li>
+                            </ul>
                         </div>
                         
                         <div class="form-group">

@@ -916,6 +916,15 @@ class EmailService {
                 email: settings.email_address
             });
             
+            // Check if we should sign the email
+            // Sign if auto-sign is enabled OR if user manually signed
+            const autoSign = settings && settings.automatically_sign !== false; // Default to true
+            const signBtn = domManager.get('signBtn');
+            const isManuallySigned = signBtn && signBtn.dataset.signed === 'true';
+            const shouldSign = autoSign || isManuallySigned;
+            
+            console.log('[JS] Signing check:', { autoSign, isManuallySigned, shouldSign });
+            
             const emailConfig = {
                 email_address: settings.email_address,
                 password: settings.password,
@@ -924,7 +933,8 @@ class EmailService {
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
                 use_tls: useTls,
-                private_key: appState.getKeypair() ? appState.getKeypair().private_key : null
+                // Only include private key if we should sign
+                private_key: shouldSign && appState.getKeypair() ? appState.getKeypair().private_key : null
             };
             
             // If a Nostr contact is selected, send encrypted email
@@ -1041,6 +1051,13 @@ class EmailService {
                 useTls = true;
             }
             
+            // Check if we should sign the email (for preview)
+            // Sign if auto-sign is enabled OR if user manually signed
+            const autoSign = settings && settings.automatically_sign !== false; // Default to true
+            const signBtn = domManager.get('signBtn');
+            const isManuallySigned = signBtn && signBtn.dataset.signed === 'true';
+            const shouldSign = autoSign || isManuallySigned;
+            
             const emailConfig = {
                 email_address: settings.email_address,
                 password: settings.password,
@@ -1049,7 +1066,8 @@ class EmailService {
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
                 use_tls: useTls,
-                private_key: appState.getKeypair() ? appState.getKeypair().private_key : null
+                // Only include private key if we should sign
+                private_key: shouldSign && appState.getKeypair() ? appState.getKeypair().private_key : null
             };
             
             // Construct headers (sender's pubkey will be extracted from private_key in backend)
@@ -1137,12 +1155,50 @@ class EmailService {
             // Check if user wants to send a matching DM (from settings)
             const settings = appState.getSettings();
             const shouldSendDm = settings && settings.send_matching_dm !== false; // Default to true
+            const autoEncrypt = settings && settings.automatically_encrypt !== false; // Default to true
             
             // Check if email is actually encrypted by examining the content
             // Subject should be encrypted (base64-like) or body should have NIP encryption markers
-            const isSubjectEncrypted = window.Utils && window.Utils.isLikelyEncryptedContent(subject);
-            const isBodyEncrypted = body.includes('BEGIN NOSTR NIP-') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
-            const isEmailEncrypted = isSubjectEncrypted || isBodyEncrypted;
+            let isSubjectEncrypted = window.Utils && window.Utils.isLikelyEncryptedContent(subject);
+            let isBodyEncrypted = body.includes('BEGIN NOSTR NIP-') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
+            let isEmailEncrypted = isSubjectEncrypted || isBodyEncrypted;
+            
+            // Auto-encrypt if enabled and email is not already encrypted
+            if (autoEncrypt && !isEmailEncrypted) {
+                console.log('[JS] Auto-encrypt enabled, encrypting email before sending...');
+                // Temporarily set selected contact for encryption
+                const originalContact = this.selectedNostrContact;
+                this.selectedNostrContact = contact;
+                
+                // Encrypt the email fields
+                const didEncrypt = await this.encryptEmailFields();
+                if (didEncrypt) {
+                    // Get the encrypted values from DOM
+                    subject = domManager.getValue('subject') || subject;
+                    body = domManager.getValue('messageBody') || body;
+                    isSubjectEncrypted = window.Utils && window.Utils.isLikelyEncryptedContent(subject);
+                    isBodyEncrypted = body.includes('BEGIN NOSTR NIP-') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
+                    isEmailEncrypted = isSubjectEncrypted || isBodyEncrypted;
+                    console.log('[JS] Auto-encryption completed, email is now encrypted:', isEmailEncrypted);
+                    
+                    if (!isEmailEncrypted) {
+                        console.error('[JS] Auto-encryption completed but email is still not encrypted');
+                        notificationService.showError('Failed to auto-encrypt email. Email will not be sent.');
+                        // Restore original contact selection
+                        this.selectedNostrContact = originalContact;
+                        return; // Don't send unencrypted email
+                    }
+                } else {
+                    console.error('[JS] Auto-encryption failed, not sending email');
+                    notificationService.showError('Failed to auto-encrypt email. Please encrypt manually or check your settings.');
+                    // Restore original contact selection
+                    this.selectedNostrContact = originalContact;
+                    return; // Don't send unencrypted email
+                }
+                
+                // Restore original contact selection
+                this.selectedNostrContact = originalContact;
+            }
             
             console.log('[JS] Email encryption check:', { 
                 isSubjectEncrypted, 
@@ -2046,22 +2102,41 @@ class EmailService {
             }
         }
         
-        // Fallback: look up the recipient's pubkey using the to address
+        // Fallback: look up the recipient's pubkey using the to address (checking both contacts and DMs)
         const recipientEmail = email.to || email.to_address;
         if (!recipientEmail) return "Unable to decrypt: recipient address not found";
         let pubkeys = [];
         try {
-            pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
+            // First try the new function that includes DMs
+            pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email_including_dms', { email: recipientEmail });
+            // If that fails or returns empty, fall back to contacts only
+            if (!pubkeys || pubkeys.length === 0) {
+                pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
+            }
         } catch (e) {
-            return "Unable to decrypt: error searching contacts";
+            console.error('[JS] Error searching for recipient pubkeys:', e);
+            // Try fallback to contacts only
+            try {
+                pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
+            } catch (fallbackError) {
+                return "Unable to decrypt: error searching contacts and DMs";
+            }
         }
         if (!pubkeys || pubkeys.length === 0) {
-            return "Unable to decrypt: recipient pubkey not found";
+            return "Unable to decrypt: recipient pubkey not found in contacts or DMs";
         }
         for (const pubkey of pubkeys) {
             try {
                 const decrypted = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
                 if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
+                    // Successfully decrypted - save the recipient pubkey to database for future use
+                    try {
+                        await this._saveRecipientPubkeyToDb(email, pubkey);
+                        console.log(`[JS] Saved recipient pubkey ${pubkey.substring(0, 16)}... to database for email ${email.id || email.message_id}`);
+                    } catch (saveError) {
+                        console.warn('[JS] Failed to save recipient pubkey to database:', saveError);
+                        // Continue anyway - decryption was successful
+                    }
                     // Fix UTF-8 encoding issues in decrypted text
                     return Utils.fixUtf8Encoding(decrypted);
                 }
@@ -2090,8 +2165,15 @@ class EmailService {
                 return;
             }
             
+            // Check if we should hide undecryptable emails
+            const settings = appState.getSettings();
+            const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+            const hideUnverified = settings && settings.hide_unsigned_messages === true;
+            
             // Always re-render all emails (simpler approach)
             emailList.innerHTML = '';
+            
+            let renderedCount = 0;
             
             for (const email of emails) {
                 console.log('Inbox preview nostr_pubkey for email', email.id, ':', email.nostr_pubkey);
@@ -2188,6 +2270,25 @@ class EmailService {
                     showSubject = true;
                 }
 
+                // Check if email is decryptable (for filtering)
+                // Only hide if the body cannot be decrypted (subject decryption failure is less critical)
+                const isDecryptable = !previewText.includes('Unable to decrypt') && 
+                                    !previewText.includes('Your private key could not decrypt this message') &&
+                                    !previewText.includes('could not decrypt') &&
+                                    !previewText.includes('Could not decrypt') &&
+                                    previewText !== 'Unable to decrypt: no keypair';
+                
+                // Skip rendering if we should hide undecryptable emails and this email can't be decrypted
+                if (hideUndecryptable && !isDecryptable) {
+                    continue;
+                }
+                
+                // Skip rendering if we should hide unverified messages and this email doesn't have a valid signature
+                // Hide emails where signature_valid is not true (i.e., false, null, or undefined)
+                if (hideUnverified && email.signature_valid !== true) {
+                    continue;
+                }
+
                 // Add attachment indicator (same style as sent emails)
                 const attachmentCount = email.attachments ? email.attachments.length : 0;
                 const attachmentIndicator = attachmentCount > 0 ? 
@@ -2261,6 +2362,22 @@ class EmailService {
                 
                 emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
                 emailList.appendChild(emailElement);
+                renderedCount++;
+            }
+            
+            // Show message if no emails were rendered (possibly all filtered out)
+            if (renderedCount === 0) {
+                const settings = appState.getSettings();
+                const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+                const hideUnverified = settings && settings.hide_unsigned_messages === true;
+                if (hideUndecryptable && emails.length > 0) {
+                    emailList.innerHTML = '<div class="text-center text-muted">No decryptable emails found. All emails are encrypted for a different keypair.</div>';
+                } else if (hideUnverified && emails.length > 0) {
+                    emailList.innerHTML = '<div class="text-center text-muted">No verified emails found. All emails have missing or invalid signatures.</div>';
+                } else {
+                    emailList.innerHTML = '<div class="text-center text-muted">No emails found</div>';
+                }
+                return;
             }
             
             // Add Load More button if there might be more emails
@@ -3085,7 +3202,15 @@ ${attachmentsHtml}
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
                 use_tls: settings.use_tls,
-                private_key: appState.getKeypair() ? appState.getKeypair().private_key : null
+                // Only include private key if we should sign (check auto-sign setting or manual sign)
+                private_key: (() => {
+                    const settings = appState.getSettings();
+                    const autoSign = settings && settings.automatically_sign !== false;
+                    const signBtn = domManager.get('signBtn');
+                    const isManuallySigned = signBtn && signBtn.dataset.signed === 'true';
+                    const shouldSign = autoSign || isManuallySigned;
+                    return shouldSign && appState.getKeypair() ? appState.getKeypair().private_key : null;
+                })()
             };
             
             console.log('[JS] Testing email connections with config:', {
@@ -3498,8 +3623,20 @@ ${attachmentsHtml}
             
             console.log(`[JS] renderSentEmails: Rendering ${emails.length} sent emails`);
             
+            // Check if we should hide unverified messages
+            const settings = appState.getSettings();
+            const hideUnverified = settings && settings.hide_unsigned_messages === true;
+            
             // Process emails in parallel with timeout protection
-            const emailPromises = emails.map(async (email) => {
+            const emailPromises = emails
+                .filter(email => {
+                    // Filter out unverified emails if hideUnverified is enabled
+                    if (hideUnverified && email.signature_valid !== true) {
+                        return false;
+                    }
+                    return true;
+                })
+                .map(async (email) => {
                 try {
                     // Add timeout to prevent hanging on decryption
                     const timeoutPromise = new Promise((_, reject) => 
@@ -3517,11 +3654,28 @@ ${attachmentsHtml}
             // Wait for all emails to be rendered (with timeout protection)
             const renderedItems = await Promise.allSettled(emailPromises);
             
-            // Add all successfully rendered items to the list
+            // Add all successfully rendered items to the list (filter out null results)
+            let renderedCount = 0;
             for (const result of renderedItems) {
                 if (result.status === 'fulfilled' && result.value) {
                     sentList.appendChild(result.value);
+                    renderedCount++;
                 }
+            }
+            
+            // Show message if no emails were rendered (possibly all filtered out)
+            if (renderedCount === 0) {
+                const settings = appState.getSettings();
+                const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+                const hideUnverified = settings && settings.hide_unsigned_messages === true;
+                if (hideUndecryptable && emails.length > 0) {
+                    sentList.innerHTML = '<div class="text-center text-muted">No decryptable emails found. All emails are encrypted for a different keypair.</div>';
+                } else if (hideUnverified && emails.length > 0) {
+                    sentList.innerHTML = '<div class="text-center text-muted">No verified emails found. All emails have missing or invalid signatures.</div>';
+                } else {
+                    sentList.innerHTML = '<div class="text-center text-muted">No sent emails found</div>';
+                }
+                return;
             }
             
             // Add Load More button if there might be more emails
@@ -3572,16 +3726,24 @@ ${attachmentsHtml}
             if (!keypair) {
                 previewText = 'Unable to decrypt: no keypair';
             } else {
-                // Decrypt subject if it looks encrypted (ASCII armor not required)
-                if (Utils.isLikelyEncryptedContent(email.subject)) {
-                    try {
-                        previewSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
-                    } catch (e) {
-                        previewSubject = 'Could not decrypt';
-                    }
-                }
-                // Decrypt body - try manifest format first, then fallback to legacy
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                        // Decrypt subject if it looks encrypted (ASCII armor not required)
+                        if (Utils.isLikelyEncryptedContent(email.subject)) {
+                            try {
+                                const decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
+                                // Check if decryption returned an error message
+                                if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
+                                    previewSubject = 'Could not decrypt';
+                                } else if (decryptedSubject) {
+                                    previewSubject = decryptedSubject;
+                                } else {
+                                    previewSubject = 'Could not decrypt';
+                                }
+                            } catch (e) {
+                                previewSubject = 'Could not decrypt';
+                            }
+                        }
+                        // Decrypt body - try manifest format first, then fallback to legacy
+                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 if (encryptedBodyMatch) {
                     const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
                     try {
@@ -3596,15 +3758,29 @@ ${attachmentsHtml}
                         } else {
                             // Fallback to legacy decryption
                             const decrypted = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
-                            previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                            showSubject = true;
+                            // Check if decryption returned an error message
+                            if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
+                                previewText = 'Could not decrypt';
+                            } else if (decrypted) {
+                                previewText = Utils.escapeHtml(decrypted.substring(0, 100));
+                                showSubject = true;
+                            } else {
+                                previewText = 'Could not decrypt';
+                            }
                         }
                     } catch (e) {
                         // If manifest fails, try legacy decryption
                         try {
                             const decrypted = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
-                            previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                            showSubject = true;
+                            // Check if decryption returned an error message
+                            if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
+                                previewText = 'Could not decrypt';
+                            } else if (decrypted) {
+                                previewText = Utils.escapeHtml(decrypted.substring(0, 100));
+                                showSubject = true;
+                            } else {
+                                previewText = 'Could not decrypt';
+                            }
                         } catch (legacyError) {
                             previewText = 'Could not decrypt';
                         }
@@ -3614,15 +3790,41 @@ ${attachmentsHtml}
         } else {
             // If subject looks like encrypted base64, try to decrypt (no ASCII armor required)
             if (Utils.isLikelyEncryptedContent(email.subject)) {
-                try {
-                    previewSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
-                } catch (e) {
-                    previewSubject = 'Could not decrypt';
+                const keypair = appState.getKeypair();
+                if (keypair) {
+                    try {
+                        const decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
+                        // Check if decryption returned an error message
+                        if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
+                            previewSubject = 'Could not decrypt';
+                        } else if (decryptedSubject) {
+                            previewSubject = decryptedSubject;
+                        } else {
+                            previewSubject = 'Could not decrypt';
+                        }
+                    } catch (e) {
+                        previewSubject = 'Could not decrypt';
+                    }
                 }
             }
             previewText = Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
             if (email.body && email.body.length > 100) previewText += '...';
             showSubject = true;
+        }
+        
+        // Check if email is decryptable (for filtering)
+        const settings = appState.getSettings();
+        const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+        const isDecryptable = !previewText.includes('Unable to decrypt') && 
+                            !previewText.includes('Your private key could not decrypt this message') &&
+                            !previewText.includes('could not decrypt') &&
+                            !previewText.includes('Could not decrypt') &&
+                            previewText !== 'Unable to decrypt: no keypair' &&
+                            previewSubject !== 'Could not decrypt';
+        
+        // Return null if we should hide undecryptable emails and this email can't be decrypted
+        if (hideUndecryptable && !isDecryptable) {
+            return null;
         }
         
         // Add attachment indicator
@@ -3632,9 +3834,10 @@ ${attachmentsHtml}
 
         // Add signature verification indicator
         let signatureIndicator = '';
-        if (email.signature_valid === true) {
+        // Check signature_valid - handle both boolean and null/undefined cases
+        if (email.signature_valid === true || email.signature_valid === 1) {
             signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
-        } else if (email.signature_valid === false) {
+        } else if (email.signature_valid === false || email.signature_valid === 0) {
             signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
         }
 
@@ -3813,11 +4016,21 @@ ${attachmentsHtml}
                 console.log(`[JS] _loadSentEmailDetail: No pubkey found for email ${email.id}`);
                 const rawBody = email.raw_body || email.body || '';
                 const rawHeaders = email.raw_headers || '';
+                
+                // Add signature verification indicator
+                let signatureIndicator = '';
+                // Check signature_valid - handle both boolean and null/undefined cases
+                if (email.signature_valid === true || email.signature_valid === 1) {
+                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+                } else if (email.signature_valid === false || email.signature_valid === 0) {
+                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+                }
+                
                 sentDetailContent.innerHTML =
                     `<div class="email-detail">
 <div class="error" style="margin-bottom: 15px;">Cannot decrypt: Recipient pubkey not found in contacts. The email could not be decrypted with any known contact pubkey.</div>
 <div class="email-detail-header vertical" id="sent-email-header-info">
-<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)} ${signatureIndicator}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
 <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(email.subject)}</span></div>
@@ -4071,10 +4284,19 @@ ${attachmentsHtml}
                 </div>`;
             }
             
+            // Add signature verification indicator
+            let signatureIndicator = '';
+            // Check signature_valid - handle both boolean and null/undefined cases
+            if (email.signature_valid === true || email.signature_valid === 1) {
+                signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+            } else if (email.signature_valid === false || email.signature_valid === 0) {
+                signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+            }
+            
             sentDetailContent.innerHTML =
                 `<div class="email-detail">
 <div class="email-detail-header vertical" id="sent-email-header-info">
-<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)} ${signatureIndicator}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
 <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>

@@ -1622,6 +1622,54 @@ impl Database {
         println!("[RUST] Found pubkeys for email_address setting '{}': {:?}", email_trimmed, pubkeys);
         Ok(pubkeys)
     }
+    
+    /// Find pubkeys by email, including all DM participants
+    /// This searches both contacts table by email and includes all unique pubkeys from DMs
+    pub fn find_pubkeys_by_email_including_dms(&self, email: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let email_trimmed = email.trim().to_lowercase();
+        println!("[RUST] Searching for pubkeys with email (including all DMs): {}", email_trimmed);
+        
+        let mut pubkeys = std::collections::HashSet::new();
+        
+        // 1. Search contacts table by email
+        let mut stmt = conn.prepare(
+            "SELECT pubkey FROM contacts WHERE LOWER(TRIM(email)) = ?1"
+        )?;
+        let rows = stmt.query_map(params![email_trimmed], |row| {
+            let pubkey: String = row.get(0)?;
+            Ok(pubkey)
+        })?;
+        for row in rows {
+            if let Ok(pubkey) = row {
+                pubkeys.insert(pubkey);
+            }
+        }
+        
+        // 2. Get ALL unique pubkeys from DMs (regardless of email address setting)
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT dm_pubkey
+             FROM (
+               SELECT sender_pubkey as dm_pubkey FROM direct_messages
+               UNION
+               SELECT recipient_pubkey as dm_pubkey FROM direct_messages
+             ) dm_pubkeys
+             WHERE dm_pubkey != ''"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let pubkey: String = row.get(0)?;
+            Ok(pubkey)
+        })?;
+        for row in rows {
+            if let Ok(pubkey) = row {
+                pubkeys.insert(pubkey);
+            }
+        }
+        
+        let result: Vec<String> = pubkeys.into_iter().collect();
+        println!("[RUST] Found pubkeys for email '{}' (including all DMs): {:?}", email_trimmed, result);
+        Ok(result)
+    }
 
     pub fn update_email_sender_pubkey(&self, message_id: &str, sender_pubkey: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();

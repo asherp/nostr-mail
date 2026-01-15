@@ -62,6 +62,7 @@ pub async fn publish_event(
     Ok(event_id.to_hex())
 }
 
+#[allow(dead_code)]
 pub async fn send_direct_message(
     private_key: &str,
     recipient_pubkey: &str,
@@ -125,6 +126,7 @@ pub async fn send_direct_message(
     Ok(event_id.to_hex())
 }
 
+#[allow(dead_code)]
 pub async fn send_direct_message_with_content(
     private_key: &str,
     recipient_pubkey: &str,
@@ -344,6 +346,13 @@ pub async fn fetch_events(
     kind: Option<u16>,
     relays: &[String],
 ) -> Result<Vec<NostrEvent>> {
+    // Initialize rustls crypto provider if on Android (required for rustls 0.23+)
+    #[cfg(target_os = "android")]
+    {
+        // Try to install default provider, but don't fail if already installed
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    
     let keys = Keys::generate();
     let client = Client::new(keys);
     

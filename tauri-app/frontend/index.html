@@ -70,9 +70,6 @@
                     <i class="fas fa-cog"></i> Settings
                 </button>
             </nav>
-            <button id="dark-mode-toggle" class="icon-button" title="Toggle dark mode" style="margin: 20px auto 10px auto; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; background: none; border: none; color: inherit; cursor: pointer;">
-                <i id="dark-mode-icon" class="fas fa-moon"></i>
-            </button>
         </aside>
 
         <!-- Main Content -->
@@ -90,7 +87,9 @@
                             <option value="">Select a Nostr contact with email...</option>
                         </select>
                         <input type="email" id="to-address" placeholder="recipient@example.com">
-                        <small id="to-helper-text" class="form-text text-muted">Select a Nostr contact to auto-fill and encrypt, or enter an email address manually.</small>
+                        <div id="selected-recipient-pubkey" class="selected-pubkey-display" style="display: none;">
+                            <strong>Recipient pubkey:</strong> <span id="recipient-pubkey-value"></span>
+                        </div>
                     </div>
                     
                     <div class="form-group">
@@ -123,6 +122,10 @@
                         <button id="encrypt-btn" class="btn btn-secondary" type="button">
                             <span class="encrypt-btn-icon"><i class="fas fa-lock"></i></span>
                             <span class="encrypt-btn-label">Encrypt</span>
+                        </button>
+                        <button id="sign-btn" class="btn btn-secondary" type="button">
+                            <span class="sign-btn-icon"><i class="fas fa-pen"></i></span>
+                            <span class="sign-btn-label">Sign</span>
                         </button>
                         <button id="preview-headers-btn" class="btn btn-secondary" type="button">
                             <i class="fas fa-eye"></i> Preview Headers
@@ -175,6 +178,10 @@
                 <div class="tab-header">
                     <h2 id="sent-title">Sent</h2>
                     <div class="inbox-actions" id="sent-actions">
+                        <div class="email-search-container">
+                            <input type="text" id="sent-search" placeholder="Search sent emails..." class="email-search-input">
+                            <i class="fas fa-search email-search-icon"></i>
+                        </div>
                         <button id="refresh-sent" class="btn btn-secondary">
                             <i class="fas fa-sync"></i> Refresh
                         </button>
@@ -298,6 +305,11 @@
             <div class="tab-content" id="profile">
                 <div class="tab-header">
                     <h2>Profile</h2>
+                    <div class="profile-actions">
+                        <button id="refresh-profile" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
                 </div>
                 <div id="profile-loading-spinner" style="display:none;text-align:center;margin:16px 0;">
                     <i class="fas fa-spinner fa-spin" style="font-size:2em;"></i>
@@ -325,9 +337,12 @@
                 
                 <div class="settings-form">
                     <!-- Nostr Settings -->
-                    <div class="settings-section">
-                        <h3><i class="fas fa-key"></i> Nostr Settings</h3>
-                        
+                    <div class="settings-section" data-section="nostr">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-key"></i> Nostr Settings</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
                         <div class="form-group">
                             <label for="npriv-key">Private Key (nsec/npriv):</label>
                             <div class="input-with-buttons">
@@ -373,23 +388,16 @@
                                 <i class="fas fa-key"></i> Generate New Keypair
                             </button>
                         </div>
-                        
-                        <div class="form-group">
-                            <label for="encryption-algorithm">Encryption Algorithm:</label>
-                            <select id="encryption-algorithm">
-                                <option value="nip44">NIP-44 (Recommended)</option>
-                                <option value="nip04">NIP-04 (Legacy)</option>
-                            </select>
-                            <div class="form-text">
-                                NIP-44 is the modern, secure encryption standard. NIP-04 is legacy and less secure.
-                            </div>
                         </div>
                     </div>
                     
                     <!-- Email Settings -->
-                    <div class="settings-section">
-                        <h3><i class="fas fa-envelope"></i> Email Settings</h3>
-                        
+                    <div class="settings-section" data-section="email">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-envelope"></i> Email Settings</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
                         <div class="form-group">
                             <label for="email-provider">Email Provider:</label>
                             <select id="email-provider">
@@ -440,11 +448,38 @@
                         </div>
                         
                         <div class="form-group">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="use-tls" checked>
-                                <span class="checkmark"></span>
-                                Use TLS/SSL
-                            </label>
+                            <div class="toggle-setting">
+                                <label for="use-tls">Use TLS/SSL</label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="use-tls" checked>
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="form-actions">
+                            <button id="test-email-connection-btn" class="btn btn-secondary">
+                                <i class="fas fa-envelope"></i> Test Email Connection
+                            </button>
+                        </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Advanced -->
+                    <div class="settings-section" data-section="preferences">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-sliders-h"></i> Advanced</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
+                        <div class="form-group">
+                            <label for="encryption-algorithm">Encryption Algorithm:</label>
+                            <select id="encryption-algorithm">
+                                <option value="nip44">NIP-44 (Recommended)</option>
+                                <option value="nip04">NIP-04 (Legacy)</option>
+                            </select>
+                            <div class="form-text">
+                                NIP-44 is the modern, secure encryption standard. NIP-04 is legacy and less secure.
+                            </div>
                         </div>
                         
                         <div class="form-group">
@@ -457,35 +492,93 @@
                         </div>
                         
                         <div class="form-group">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="send-matching-dm-preference" checked>
-                                <span class="checkmark"></span>
-                                Send Matching DM
-                            </label>
-                            <small class="form-text text-muted">Automatically send a direct message with the same subject line when sending encrypted emails to Nostr contacts</small>
+                            <label>Email Preferences:</label>
+                            <ul class="toggle-settings-list">
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="send-matching-dm-preference">Send Matching DM</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="send-matching-dm-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Automatically send a direct message with the same subject line when sending encrypted emails to Nostr contacts</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="require-signature-preference">Require Signatures</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="require-signature-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Only accept emails with valid Nostr signatures. Emails without signatures will be ignored.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="hide-undecryptable-emails-preference">Hide Undecryptable Emails</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="hide-undecryptable-emails-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Hide emails that cannot be decrypted with your private key from the inbox view.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="automatically-encrypt-preference">Automatically Encrypt</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="automatically-encrypt-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Automatically encrypt outgoing emails when composing.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="automatically-sign-preference">Automatically Sign</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="automatically-sign-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Automatically sign outgoing emails with your Nostr key.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="hide-unsigned-messages-preference">Hide Unverified</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="hide-unsigned-messages-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Hide messages with missing or unverified signatures.</small>
+                                </li>
+                            </ul>
                         </div>
                         
-                        <div class="form-actions">
-                            <button id="test-email-connection-btn" class="btn btn-secondary">
-                                <i class="fas fa-envelope"></i> Test Email Connection
-                            </button>
+                        <div class="form-group">
+                            <label for="sync-cutoff-days">Sync Cutoff (Days):</label>
+                            <input type="number" id="sync-cutoff-days" placeholder="365" min="1" max="36500" value="365">
+                            <small class="form-text text-muted">How far back in time to sync emails when setting up on a new device. Default: 365 days (1 year). Set to 0 to sync all emails.</small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="emails-per-page">Emails Per Page:</label>
+                            <input type="number" id="emails-per-page" placeholder="50" min="10" max="500" value="50">
+                            <small class="form-text text-muted">Number of emails to display per page in the inbox. Default: 50.</small>
+                        </div>
                         </div>
                     </div>
                     
                     <!-- Relay Settings -->
-                    <div class="settings-section">
+                    <div class="settings-section" data-section="relay">
                         <div class="settings-section-header">
                             <h3><i class="fas fa-network-wired"></i> Relay Settings</h3>
-                            <div class="relay-summary-container">
-                                <span id="relay-summary" class="relay-summary">Loading...</span>
-                                <button id="relay-edit-toggle" class="btn btn-secondary btn-small relay-edit-btn">
-                                    <i class="fas fa-edit"></i> Edit
-                                </button>
-                            </div>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
                         </div>
-                        
+                        <div class="settings-section-content">
                         <div class="form-group">
-                            <div id="relay-list" class="relay-list collapsed">
+                            <div id="relay-list" class="relay-list expanded">
                                 <!-- Relays will be populated here -->
                                 <div class="add-relay-section">
                                     <div class="form-group">
@@ -499,6 +592,30 @@
                                     </div>
                                 </div>
                             </div>
+                        </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Appearance Settings -->
+                    <div class="settings-section" data-section="appearance">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-palette"></i> Appearance</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
+                        <div class="form-group">
+                            <label>Theme:</label>
+                            <div class="input-with-button">
+                                <div style="display: flex; align-items: center; gap: 12px;">
+                                    <span id="theme-label">Dark Mode</span>
+                                    <button id="dark-mode-toggle" class="btn btn-secondary" title="Toggle dark mode" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
+                                        <i id="dark-mode-icon" class="fas fa-moon"></i>
+                                        <span id="dark-mode-text">Enable Dark Mode</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <small class="form-text text-muted">Switch between light and dark theme</small>
+                        </div>
                         </div>
                     </div>
                 </div>

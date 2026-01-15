@@ -1,3 +1,13 @@
+* when changing email addresses, app has trouble decrypting emails in db
+* mac build instructions
+* building on a mac for android, you'll need:
+    java (from adoptium)
+    make, which you can get from xcode command line tools:
+        xcode-select --install
+    cmake (from cmake.org)
+    set the following env varibles
+     ANDROID_HOME=/path/to/user/Library/Android/sdk\nexport ANDROID_SDK_ROOT=$ANDROID_HOME\nexport ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.13846066\nexport ANDROID_NDK_ROOT=$ANDROID_NDK_HOME\nexport PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin:$PATH"
+
 * encrypted attachments, manifest
 * NIP-44 may fail if email body is too long, so witch to mainfest style if/when that happens
 * live updates

@@ -23,6 +23,15 @@
     max-height: 50px;
 }
 
+/* Email item avatars should be similar size to DM avatars */
+.email-item .contact-avatar {
+    width: 50px;
+    height: 50px;
+    max-width: 50px;
+    max-height: 50px;
+    flex-shrink: 0;
+}
+
 /* Profile picture styling */
 .profile-picture {
     width: 120px;

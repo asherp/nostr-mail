@@ -29,6 +29,7 @@ class DOMManager {
             previewHeadersBtn: this.getElement('preview-headers-btn'),
             nostrContactSelect: this.getElement('nostr-contact-select'),
             encryptBtn: this.getElement('encrypt-btn'),
+            signBtn: this.getElement('sign-btn'),
             
             // Inbox
             emailList: this.getElement('email-list'),
@@ -37,6 +38,7 @@ class DOMManager {
             // Sent
             refreshSent: this.getElement('refresh-sent'),
             sentList: this.getElement('sent-list'),
+            sentSearch: this.getElement('sent-search'),
             backToSent: this.getElement('back-to-sent'),
             sentDetailView: this.getElement('sent-detail-view'),
             sentDetailContent: this.getElement('sent-detail-content'),
@@ -71,11 +73,11 @@ class DOMManager {
             
             // Profile (do not look for display-name, about, email, nip05)
             updateProfileBtn: this.getElement('update-profile-btn'),
+            refreshProfile: this.getElement('refresh-profile'),
             
             // Relays
             relaysList: this.getElement('relay-list'),
             relaySummary: this.getElement('relay-summary'),
-            relayEditToggle: this.getElement('relay-edit-toggle'),
             
             // Live Events
             liveEventsIndicator: this.getElement('live-events-indicator'),
@@ -99,6 +101,13 @@ class DOMManager {
             'use-tls': this.getElement('use-tls'),
             emailFilterPreference: this.getElement('email-filter-preference'),
             'send-matching-dm-preference': this.getElement('send-matching-dm-preference'),
+            'require-signature-preference': this.getElement('require-signature-preference'),
+            'hide-undecryptable-emails-preference': this.getElement('hide-undecryptable-emails-preference'),
+            'automatically-encrypt-preference': this.getElement('automatically-encrypt-preference'),
+            'automatically-sign-preference': this.getElement('automatically-sign-preference'),
+            'hide-unsigned-messages-preference': this.getElement('hide-unsigned-messages-preference'),
+            syncCutoffDays: this.getElement('sync-cutoff-days'),
+            emailsPerPage: this.getElement('emails-per-page'),
             testEmailConnectionBtn: this.getElement('test-email-connection-btn'),
             copyNprivBtn: this.getElement('copy-npriv-btn'),
             copyEmailPasswordBtn: this.getElement('copy-email-password-btn'),

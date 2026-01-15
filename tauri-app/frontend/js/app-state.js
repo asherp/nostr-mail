@@ -16,6 +16,7 @@ class AppState {
         this.nprivKey = null;
         this.relays = [];
         this.contacts_total = null;
+        this.lastLoadedPubkey = null;
     }
 
     // Contact management
@@ -121,6 +122,14 @@ class AppState {
         return this.keypair;
     }
 
+    setLastLoadedPubkey(pubkey) {
+        this.lastLoadedPubkey = pubkey;
+    }
+
+    getLastLoadedPubkey() {
+        return this.lastLoadedPubkey;
+    }
+
     setNprivKey(nprivKey) {
         this.nprivKey = nprivKey;
     }
@@ -166,6 +175,18 @@ class AppState {
 
     hasSettings() {
         return !!this.settings;
+    }
+
+    hasEmailSettingsConfigured() {
+        if (!this.settings) {
+            return false;
+        }
+        // Check if required email settings are configured
+        const emailAddress = this.settings.email_address?.trim();
+        const password = this.settings.password?.trim();
+        const smtpHost = this.settings.smtp_host?.trim();
+        
+        return !!(emailAddress && password && smtpHost);
     }
 
     hasActiveRelays() {

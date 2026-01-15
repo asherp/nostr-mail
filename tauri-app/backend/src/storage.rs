@@ -135,6 +135,12 @@ impl Storage {
             let home = std::env::var("HOME")?;
             Ok(PathBuf::from(home).join(".config/nostr-mail"))
         }
+
+        #[cfg(target_os = "android")]
+        {
+            let base = std::env::var("HOME").unwrap_or_else(|_| "/data/data".to_string());
+            Ok(PathBuf::from(base).join("nostr-mail"))
+        }
     }
     
     pub fn load_data(&self) -> Result<StorageData> {

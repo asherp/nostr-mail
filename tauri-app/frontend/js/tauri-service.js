@@ -92,6 +92,15 @@ const TauriService = {
     getPublicKeyFromPrivate: async function(privateKey) {
         return await this.invoke('get_public_key_from_private', { privateKey });
     },
+    signData: async function(privateKey, data) {
+        return await this.invoke('sign_data', { privateKey, data });
+    },
+    verifySignature: async function(publicKey, signature, data) {
+        return await this.invoke('verify_signature', { publicKey, signature, data });
+    },
+    recheckEmailSignature: async function(messageId) {
+        return await this.invoke('recheck_email_signature', { messageId });
+    },
     encryptNip44Message: async function(privateKey, publicKey, message) {
         return await this.invoke('encrypt_nip04_message', { privateKey, publicKey, message });
     },
@@ -167,6 +176,9 @@ const TauriService = {
     followUser: async function(privateKey, pubkeyToFollow, relays) {
         return await this.invoke('follow_user', { privateKey, pubkeyToFollow, relays });
     },
+    publishFollowList: async function(privateKey, userPubkey, relays) {
+        return await this.invoke('publish_follow_list', { privateKey, userPubkey, relays });
+    },
     updateProfile: async function(privateKey, fields, relays) {
         return await this.invoke('update_profile', { privateKey, fields, relays });
     },
@@ -203,8 +215,8 @@ const TauriService = {
         }
         return await this.invoke('construct_email_headers', args);
     },
-    fetchEmails: async function(emailConfig, limit, searchQuery, onlyNostr = true) {
-        return await this.invoke('fetch_emails', { emailConfig, limit, searchQuery, onlyNostr });
+    fetchEmails: async function(emailConfig, limit, searchQuery, onlyNostr = true, requireSignature = null) {
+        return await this.invoke('fetch_emails', { emailConfig, limit, searchQuery, onlyNostr, requireSignature });
     },
     testImapConnection: async function(emailConfig) {
         return await this.invoke('test_imap_connection', { emailConfig });
@@ -358,14 +370,23 @@ const TauriService = {
     getDbEmails: async function(limit = 50, offset = 0, nostrOnly = true, userEmail = null) {
         return await this.invoke('db_get_emails', { limit, offset, nostrOnly, userEmail: userEmail });
     },
+    searchEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
+        return await this.invoke('db_search_emails', { searchQuery, userEmail, privateKey, limit, offset });
+    },
+    searchSentEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
+        return await this.invoke('db_search_sent_emails', { searchQuery, userEmail, privateKey, limit, offset });
+    },
     getDbSentEmails: async function(limit = 50, offset = 0, userEmail = null) {
         return await this.invoke('db_get_sent_emails', { limit, offset, userEmail: userEmail });
+    },
+    getDbEmail: async function(messageId) {
+        return await this.invoke('db_get_email', { messageId: messageId });
     },
     decryptDmContent: async function(privateKey, senderPubkey, encryptedContent) {
         return await this.invoke('decrypt_dm_content', { privateKey, senderPubkey, encryptedContent });
     },
-    filterNewContacts: async function(pubkeys) {
-        return await this.invoke('db_filter_new_contacts', { pubkeys });
+    filterNewContacts: async function(userPubkey, pubkeys) {
+        return await this.invoke('db_filter_new_contacts', { userPubkey, pubkeys });
     },
     
     // Attachment functions
@@ -410,12 +431,16 @@ const TauriService = {
         return await this.invoke('db_save_draft', { draft });
     },
 
-    getDrafts: async function(userEmail) {
-        return await this.invoke('db_get_drafts', { userEmail });
+    getDrafts: async function(limit = 50, offset = 0, userEmail = null) {
+        return await this.invoke('db_get_drafts', { limit, offset, userEmail: userEmail });
     },
 
     deleteDraft: async function(messageId) {
         return await this.invoke('db_delete_draft', { messageId });
+    },
+    
+    deleteSentEmail: async function(messageId, userEmail) {
+        return await this.invoke('db_delete_sent_email', { messageId, userEmail });
     },
 
     markAsRead: async function(messageId) {
@@ -444,12 +469,21 @@ const TauriService = {
         return await this.invoke('db_get_setting', { pubkey, key });
     },
     
-    dbGetAllSettings: async function(pubkey) {
-        return await this.invoke('db_get_all_settings', { pubkey });
+    dbGetAllSettings: async function(pubkey, privateKey) {
+        return await this.invoke('db_get_all_settings', { pubkey, privateKey });
     },
     
-    dbSaveSettingsBatch: async function(pubkey, settings) {
-        return await this.invoke('db_save_settings_batch', { pubkey, settings });
+    dbSaveSettingsBatch: async function(pubkey, settings, privateKey) {
+        return await this.invoke('db_save_settings_batch', { pubkey, settings, privateKey });
+    },
+    
+    // Update email recipient pubkey
+    updateEmailRecipientPubkey: async function(messageId, recipientPubkey) {
+        return await this.invoke('db_update_email_recipient_pubkey', { messageId, recipientPubkey });
+    },
+    
+    updateEmailRecipientPubkeyById: async function(id, recipientPubkey) {
+        return await this.invoke('db_update_email_recipient_pubkey_by_id', { id, recipientPubkey });
     }
 };
 window.TauriService = TauriService; 

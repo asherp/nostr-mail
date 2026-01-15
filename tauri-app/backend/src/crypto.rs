@@ -1,6 +1,11 @@
 use anyhow::Result;
 use nostr_sdk::prelude::*;
 use crate::types::KeyPair;
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Key, Nonce,
+};
+use sha2::{Sha256, Digest};
 
 pub fn generate_keypair() -> Result<KeyPair> {
     // Generate a proper secp256k1 keypair using nostr-sdk
@@ -88,6 +93,146 @@ pub fn validate_public_key(public_key: &str) -> Result<bool> {
             Ok(false)
         }
     }
+}
+
+/// Sign arbitrary data (email body) using nostr schnorr signature
+pub fn sign_data(private_key: &str, data: &str) -> Result<String> {
+    use ::secp256k1::{Message, Secp256k1, SecretKey as SecpSecretKey, Keypair, rand::rngs::OsRng};
+    use sha2::{Sha256, Digest};
+    
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let secp = Secp256k1::new();
+    
+    // Convert nostr SecretKey to secp256k1 SecretKey
+    // SecretKey has secret_bytes() method that returns [u8; 32]
+    let secp_secret_key = SecpSecretKey::from_slice(&secret_key.secret_bytes())?;
+    
+    // Hash the data using SHA256
+    let mut hasher = Sha256::new();
+    hasher.update(data.as_bytes());
+    let message_hash = hasher.finalize();
+    let message = Message::from_digest_slice(&message_hash)?;
+    
+    // Create a keypair from the secret key and sign the message
+    let keypair = Keypair::from_secret_key(&secp, &secp_secret_key);
+    let mut rng = OsRng;
+    let signature = secp.sign_schnorr_with_rng(&message, &keypair, &mut rng);
+    
+    // Return signature as hex string (schnorr signatures are 64 bytes)
+    Ok(hex::encode(signature.as_ref()))
+}
+
+/// Verify a signature for arbitrary data (email body)
+pub fn verify_signature(public_key: &str, signature: &str, data: &str) -> Result<bool> {
+    use ::secp256k1::{Message, Secp256k1, XOnlyPublicKey};
+    use sha2::{Sha256, Digest};
+    
+    let pubkey = PublicKey::from_bech32(public_key)?;
+    let secp = Secp256k1::verification_only();
+    
+    // Parse signature from hex (schnorr signatures are 64 bytes = 128 hex chars)
+    let sig_bytes = hex::decode(signature).map_err(|e| anyhow::anyhow!("Invalid hex signature: {}", e))?;
+    if sig_bytes.len() != 64 {
+        return Ok(false);
+    }
+    let sig = ::secp256k1::schnorr::Signature::from_slice(&sig_bytes)?;
+    
+    // Hash the data using SHA256
+    let mut hasher = Sha256::new();
+    hasher.update(data.as_bytes());
+    let message_hash = hasher.finalize();
+    let message = Message::from_digest_slice(&message_hash)?;
+    
+    // Get the XOnlyPublicKey from nostr PublicKey
+    // PublicKey.to_hex() returns the 64-character hex string of the XOnlyPublicKey
+    let pubkey_hex = pubkey.to_hex();
+    let pubkey_bytes = hex::decode(&pubkey_hex).map_err(|e| anyhow::anyhow!("Invalid pubkey hex: {}", e))?;
+    if pubkey_bytes.len() != 32 {
+        return Ok(false);
+    }
+    let xonly_pubkey = XOnlyPublicKey::from_slice(&pubkey_bytes)?;
+    
+    // Verify the signature using XOnlyPublicKey directly
+    match secp.verify_schnorr(&sig, &message, &xonly_pubkey) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Derive a symmetric encryption key from a private key
+/// Uses SHA256 to derive a 32-byte key from the private key bytes
+fn derive_encryption_key(private_key: &str) -> Result<[u8; 32]> {
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let secret_bytes = secret_key.secret_bytes();
+    
+    // Use SHA256 to derive a key from the private key bytes
+    // Add a context string to ensure this key is only used for settings encryption
+    let mut hasher = Sha256::new();
+    hasher.update(b"nostr-mail-settings-encryption-v1:");
+    hasher.update(&secret_bytes);
+    let hash = hasher.finalize();
+    
+    // Convert hash to fixed-size array
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&hash);
+    Ok(key)
+}
+
+/// Encrypt sensitive data using a key derived from the user's private key
+/// This allows the user to encrypt their own data using their own keypair
+pub fn encrypt_setting_value(private_key: &str, value: &str) -> Result<String> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    
+    // Derive encryption key from private key
+    let key_bytes = derive_encryption_key(private_key)?;
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    
+    // Generate a random nonce
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    
+    // Encrypt the value
+    let ciphertext = cipher.encrypt(&nonce, value.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+    
+    // Combine nonce and ciphertext, encode as base64
+    let mut combined = nonce.to_vec();
+    combined.extend_from_slice(&ciphertext);
+    
+    Ok(base64::encode(&combined))
+}
+
+/// Decrypt sensitive data using a key derived from the user's private key
+pub fn decrypt_setting_value(private_key: &str, encrypted_value: &str) -> Result<String> {
+    if encrypted_value.is_empty() {
+        return Ok(String::new());
+    }
+    
+    // Decode base64
+    let combined = base64::decode(encrypted_value)
+        .map_err(|e| anyhow::anyhow!("Base64 decode failed: {}", e))?;
+    
+    if combined.len() < 12 {
+        return Err(anyhow::anyhow!("Encrypted value too short"));
+    }
+    
+    // Extract nonce (first 12 bytes) and ciphertext (rest)
+    let nonce = Nonce::from_slice(&combined[0..12]);
+    let ciphertext = &combined[12..];
+    
+    // Derive encryption key from private key
+    let key_bytes = derive_encryption_key(private_key)?;
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    
+    // Decrypt the value
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+    
+    String::from_utf8(plaintext)
+        .map_err(|e| anyhow::anyhow!("UTF-8 decode failed: {}", e))
 }
 
 #[cfg(test)]

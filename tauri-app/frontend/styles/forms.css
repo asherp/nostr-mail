@@ -7,6 +7,112 @@
     overflow-y: auto;
 }
 
+/* Settings Accordion Styles */
+.settings-form .settings-section {
+    margin-bottom: 20px;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    overflow: hidden;
+    background: white;
+    transition: box-shadow 0.2s ease;
+}
+
+.settings-form .settings-section:hover {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+.settings-form .settings-section-header {
+    padding: 16px 20px;
+    background: #f8f9fa;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    user-select: none;
+    transition: background-color 0.2s ease;
+    border-bottom: 1px solid #e0e0e0;
+    margin-bottom: 0;
+}
+
+.settings-form .settings-section-header:hover {
+    background: #e9ecef;
+}
+
+.settings-form .settings-section-header h3 {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #333;
+    flex-grow: 1;
+}
+
+.settings-section-toggle {
+    transition: transform 0.3s ease;
+    color: #666;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+    margin-left: 12px;
+}
+
+.settings-form .settings-section.collapsed .settings-section-toggle {
+    transform: rotate(-90deg);
+}
+
+.settings-section-content {
+    padding: 20px;
+    display: block;
+    overflow: hidden;
+}
+
+.settings-form .settings-section.collapsed .settings-section-content {
+    display: none;
+}
+
+.settings-form .settings-section:not(.collapsed) .settings-section-content {
+    animation: slideDown 0.3s ease-out;
+}
+
+@keyframes slideDown {
+    from {
+        opacity: 0;
+        max-height: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+    }
+    to {
+        opacity: 1;
+        max-height: 5000px;
+        padding-top: 20px;
+        padding-bottom: 20px;
+    }
+}
+
+/* Dark mode styles for settings sections */
+body.dark-mode .settings-form .settings-section {
+    background: #232946;
+    border-color: #181a20;
+}
+
+body.dark-mode .settings-form .settings-section-header {
+    background: #181a20;
+    border-bottom-color: #232946;
+}
+
+body.dark-mode .settings-form .settings-section-header:hover {
+    background: #232946;
+}
+
+body.dark-mode .settings-form .settings-section-header h3 {
+    color: #e0e0e0;
+}
+
+body.dark-mode .settings-section-toggle {
+    color: #a0a0a0;
+}
+
 .form-group {
     margin-bottom: var(--spacing-lg);
 }
@@ -350,4 +456,155 @@ body.dark-mode .attachment-item {
 
 body.dark-mode .attachment-item.encrypted {
     background: rgba(40, 167, 69, 0.1);
+}
+
+/* Toggle Switch Styles for Settings */
+.toggle-setting {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 15px;
+    margin-bottom: 8px;
+}
+
+.toggle-setting > label:first-child {
+    flex: 1;
+    margin: 0;
+    font-weight: 500;
+    color: #555;
+    cursor: pointer;
+}
+
+body.dark-mode .toggle-setting > label:first-child {
+    color: #e0e0e0;
+}
+
+.toggle-switch {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.toggle-switch input[type="checkbox"] {
+    width: 40px;
+    height: 20px;
+    -webkit-appearance: none;
+    appearance: none;
+    background-color: #ccc;
+    border-radius: 20px;
+    position: relative;
+    cursor: pointer;
+    transition: background-color 0.3s;
+    margin: 0;
+}
+
+.toggle-switch input[type="checkbox"]::before {
+    content: '';
+    width: 16px;
+    height: 16px;
+    background-color: white;
+    border-radius: 50%;
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    transition: transform 0.3s;
+}
+
+.toggle-switch input[type="checkbox"]:checked {
+    background-color: #667eea;
+}
+
+.toggle-switch input[type="checkbox"]:checked::before {
+    transform: translateX(20px);
+}
+
+body.dark-mode .toggle-switch input[type="checkbox"] {
+    background-color: #495057;
+}
+
+body.dark-mode .toggle-switch input[type="checkbox"]:checked {
+    background-color: #667eea;
+}
+
+/* Toggle Settings List */
+.toggle-settings-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    overflow: hidden;
+    background: white;
+}
+
+body.dark-mode .toggle-settings-list {
+    border-color: #232946;
+    background: #232946;
+}
+
+.toggle-settings-item {
+    padding: 16px 20px;
+    border-bottom: 1px solid #e0e0e0;
+    transition: background-color 0.2s ease;
+}
+
+.toggle-settings-item:last-child {
+    border-bottom: none;
+}
+
+.toggle-settings-item:hover {
+    background-color: #f8f9fa;
+}
+
+body.dark-mode .toggle-settings-item {
+    border-bottom-color: #181a20;
+}
+
+body.dark-mode .toggle-settings-item:hover {
+    background-color: #181a20;
+}
+
+.toggle-settings-item .toggle-setting {
+    margin-bottom: 8px;
+}
+
+.toggle-settings-item .form-text {
+    margin-top: 8px;
+    margin-bottom: 0;
+}
+
+/* Selected recipient pubkey display */
+.selected-pubkey-display {
+    margin-top: 8px;
+    padding: 8px 12px;
+    background-color: #f8f9fa;
+    border-radius: 4px;
+    font-size: 0.875rem;
+    border: 1px solid #e0e0e0;
+}
+
+.selected-pubkey-display strong {
+    color: #495057;
+    margin-right: 8px;
+}
+
+.selected-pubkey-display span {
+    color: #667eea;
+    font-family: 'Courier New', monospace;
+    word-break: break-all;
+}
+
+body.dark-mode .selected-pubkey-display {
+    background-color: #181a20;
+    border-color: #232946;
+}
+
+body.dark-mode .selected-pubkey-display strong {
+    color: #e0e0e0;
+}
+
+body.dark-mode .selected-pubkey-display span {
+    color: #8b9aff;
 } 

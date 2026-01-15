@@ -144,4 +144,27 @@ body.dark-mode .draft-actions .btn-danger.btn-small {
 body.dark-mode .draft-actions .btn-danger.btn-small:hover {
     background-color: #a71e2a;
     border-color: #a71e2a;
+}
+
+/* Sign button signed state */
+#sign-btn.signed {
+    background-color: #d4edda;
+    color: #155724;
+    border-color: #c3e6cb;
+}
+
+#sign-btn.signed:hover {
+    background-color: #c3e6cb;
+    color: #155724;
+}
+
+body.dark-mode #sign-btn.signed {
+    background-color: #28a74533;
+    color: #28a745;
+    border-color: #28a74566;
+}
+
+body.dark-mode #sign-btn.signed:hover {
+    background-color: #28a7454d;
+    color: #28a745;
 } 

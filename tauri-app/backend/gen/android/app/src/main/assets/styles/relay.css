@@ -1,0 +1,347 @@
+/* Relay Management Styles */
+
+/* Relay Item */
+.relay-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 15px;
+    background-color: #f0f0f0;
+    border-radius: 8px;
+    border: 1px solid #e0e0e0;
+    margin-bottom: 8px;
+}
+
+body.dark-mode .relay-item {
+    background-color: #2c313a;
+    border-color: #3a404a;
+}
+
+.relay-item-info {
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+    margin-right: 15px;
+}
+
+.relay-item-url {
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.95rem;
+    margin-bottom: 4px;
+}
+
+.relay-status {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.8rem;
+    font-weight: 500;
+}
+
+.relay-status-text {
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Status Colors */
+.status-connected {
+    color: #28a745;
+}
+
+.status-connected .fa-circle {
+    color: #28a745;
+    animation: pulse-green 2s infinite;
+}
+
+.status-disconnected {
+    color: #dc3545;
+}
+
+.status-disconnected .fa-circle {
+    color: #dc3545;
+}
+
+.status-disabled {
+    color: #6c757d;
+}
+
+.status-disabled .fa-circle {
+    color: #6c757d;
+}
+
+.status-unknown {
+    color: #ffc107;
+}
+
+.status-unknown .fa-question-circle {
+    color: #ffc107;
+}
+
+.status-connecting {
+    color: #17a2b8;
+}
+
+.status-connecting .fa-spinner {
+    color: #17a2b8;
+}
+
+.status-disconnecting {
+    color: #fd7e14;
+}
+
+.status-disconnecting .fa-spinner {
+    color: #fd7e14;
+}
+
+/* Dark mode status colors */
+body.dark-mode .status-connected {
+    color: #20c997;
+}
+
+body.dark-mode .status-connected .fa-circle {
+    color: #20c997;
+}
+
+body.dark-mode .status-disconnected {
+    color: #fd7e14;
+}
+
+body.dark-mode .status-disconnected .fa-circle {
+    color: #fd7e14;
+}
+
+/* Dark mode connecting/disconnecting states */
+body.dark-mode .status-connecting {
+    color: #17a2b8;
+}
+
+body.dark-mode .status-connecting .fa-spinner {
+    color: #17a2b8;
+}
+
+body.dark-mode .status-disconnecting {
+    color: #fd7e14;
+}
+
+body.dark-mode .status-disconnecting .fa-spinner {
+    color: #fd7e14;
+}
+
+/* Pulse animation for connected status */
+@keyframes pulse-green {
+    0% { opacity: 1; }
+    50% { opacity: 0.5; }
+    100% { opacity: 1; }
+}
+
+.relay-item-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.relay-item-actions .toggle-switch {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+}
+
+.relay-item-actions input[type="checkbox"] {
+    width: 40px;
+    height: 20px;
+    -webkit-appearance: none;
+    appearance: none;
+    background-color: #ccc;
+    border-radius: 20px;
+    position: relative;
+    cursor: pointer;
+    transition: background-color 0.3s;
+}
+
+.relay-item-actions input[type="checkbox"]::before {
+    content: '';
+    width: 16px;
+    height: 16px;
+    background-color: white;
+    border-radius: 50%;
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    transition: transform 0.3s;
+}
+
+.relay-item-actions input[type="checkbox"]:checked {
+    background-color: #667eea;
+}
+
+.relay-item-actions input[type="checkbox"]:checked::before {
+    transform: translateX(20px);
+}
+
+/* Retry button styling */
+.retry-btn {
+    background-color: #17a2b8 !important;
+    border-color: #17a2b8 !important;
+    color: white !important;
+    padding: 4px 8px !important;
+    font-size: 0.8rem !important;
+    border-radius: 4px !important;
+    transition: all 0.3s ease;
+}
+
+.retry-btn:hover {
+    background-color: #138496 !important;
+    border-color: #138496 !important;
+    transform: scale(1.05);
+}
+
+.retry-btn:active {
+    transform: scale(0.95);
+}
+
+body.dark-mode .retry-btn {
+    background-color: #20c997 !important;
+    border-color: #20c997 !important;
+}
+
+body.dark-mode .retry-btn:hover {
+    background-color: #1ac88a !important;
+    border-color: #1ac88a !important;
+}
+
+/* Settings Section Header */
+.settings-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+.settings-section-header h3 {
+    margin: 0;
+    flex-grow: 1;
+}
+
+/* Collapsible Relay Section */
+.relay-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.relay-summary-container {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.relay-summary {
+    font-size: 0.9rem;
+    color: #666;
+    font-weight: 500;
+    padding: 4px 8px;
+    background-color: #f8f9fa;
+    border-radius: 4px;
+    border: 1px solid #e9ecef;
+}
+
+body.dark-mode .relay-summary {
+    color: #adb5bd;
+    background-color: #343a40;
+    border-color: #495057;
+}
+
+.relay-edit-btn {
+    font-size: 0.8rem !important;
+    padding: 4px 8px !important;
+    background-color: #6c757d !important;
+    border-color: #6c757d !important;
+    color: white !important;
+    transition: all 0.3s ease;
+}
+
+.relay-edit-btn:hover {
+    background-color: #545b62 !important;
+    border-color: #545b62 !important;
+    transform: translateY(-1px);
+}
+
+.relay-edit-btn.editing {
+    background-color: #dc3545 !important;
+    border-color: #dc3545 !important;
+}
+
+.relay-edit-btn.editing:hover {
+    background-color: #c82333 !important;
+    border-color: #c82333 !important;
+}
+
+/* Collapsed state */
+.relay-list.collapsed {
+    display: none;
+}
+
+.relay-list.expanded {
+    display: block;
+    animation: slideDown 0.3s ease-out;
+}
+
+@keyframes slideDown {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Connected/Disconnected indicators in summary */
+.relay-status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 4px;
+}
+
+.relay-status-dot.connected {
+    background-color: #28a745;
+}
+
+.relay-status-dot.disconnected {
+    background-color: #dc3545;
+}
+
+.relay-status-dot.disabled {
+    background-color: #6c757d;
+}
+
+/* Add Relay Section within collapsible area */
+.add-relay-section {
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid #e9ecef;
+}
+
+body.dark-mode .add-relay-section {
+    border-top-color: #495057;
+}
+
+.add-relay-section .form-group {
+    margin-bottom: 0;
+}
+
+.add-relay-section label {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #495057;
+    margin-bottom: 8px;
+}
+
+body.dark-mode .add-relay-section label {
+    color: #adb5bd;
+} 

@@ -322,27 +322,42 @@ class DMService {
         // Check if messages are already cached
         const cachedMessages = window.appState.getDmMessages(contactPubkey);
         if (cachedMessages && cachedMessages.length > 0) {
-            console.log(`[JS] Using cached messages for ${contactPubkey}`);
-            // Even with cached messages, we need to check for email matches
-            const messagesWithEmailMatches = await Promise.all(cachedMessages.map(async (msg) => {
-                // Check if this DM content matches an encrypted email subject
-                console.log(`[JS] Checking email match for cached message: ${msg.content.substring(0, 50)}...`);
-                const hasEmailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
-                    dmEventId: msg.event_id,
-                    userPubkey: myPubkey,
-                    contactPubkey: contactPubkey
-                });
-                console.log(`[JS] Email match result for cached message: ${hasEmailMatch}`);
+            try {
+                console.log(`[JS] Using cached messages for ${contactPubkey}`);
+                // Even with cached messages, we need to check for email matches
+                const messagesWithEmailMatches = await Promise.all(cachedMessages.map(async (msg) => {
+                    // Check if this DM content matches an encrypted email subject (only if event_id exists)
+                    let hasEmailMatch = false;
+                    if (msg.event_id) {
+                        try {
+                            const contentPreview = msg.content ? msg.content.substring(0, 50) : '(no content)';
+                            console.log(`[JS] Checking email match for cached message: ${contentPreview}...`);
+                            hasEmailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
+                                dmEventId: msg.event_id,
+                                userPubkey: myPubkey,
+                                contactPubkey: contactPubkey
+                            });
+                            console.log(`[JS] Email match result for cached message: ${hasEmailMatch}`);
+                        } catch (error) {
+                            console.error(`[JS] Error checking email match for cached message:`, error);
+                            hasEmailMatch = false;
+                        }
+                    }
+                    
+                    return {
+                        ...msg,
+                        event_id: msg.event_id || null,
+                        hasEmailMatch: hasEmailMatch
+                    };
+                }));
                 
-                return {
-                    ...msg,
-                    hasEmailMatch: hasEmailMatch
-                };
-            }));
-            
-            window.appState.setDmMessages(contactPubkey, messagesWithEmailMatches);
-            this.renderDmMessages(contactPubkey);
-            return;
+                window.appState.setDmMessages(contactPubkey, messagesWithEmailMatches);
+                this.renderDmMessages(contactPubkey);
+                return;
+            } catch (error) {
+                console.error(`[JS] Error processing cached messages:`, error);
+                // Fall through to fetch fresh messages
+            }
         }
         
         try {
@@ -353,20 +368,36 @@ class DMService {
                 contactPubkey: contactPubkey
             });
             
+            if (!messages || !Array.isArray(messages)) {
+                console.error('[JS] Invalid messages response:', messages);
+                window.notificationService.showError('Failed to load messages: invalid response');
+                return;
+            }
+            
             // Check for email matches for each message
             const formattedMessages = await Promise.all(messages.map(async (msg) => {
-                // Check if this DM content matches an encrypted email subject
-                console.log(`[JS] Checking email match for message: ${msg.content.substring(0, 50)}...`);
-                const hasEmailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
-                    dmEventId: msg.event_id,
-                    userPubkey: myPubkey,
-                    contactPubkey: contactPubkey
-                });
-                console.log(`[JS] Email match result for message: ${hasEmailMatch}`);
+                // Check if this DM content matches an encrypted email subject (only if event_id exists)
+                let hasEmailMatch = false;
+                if (msg.event_id) {
+                    try {
+                        const contentPreview = msg.content ? msg.content.substring(0, 50) : '(no content)';
+                        console.log(`[JS] Checking email match for message: ${contentPreview}...`);
+                        hasEmailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
+                            dmEventId: msg.event_id,
+                            userPubkey: myPubkey,
+                            contactPubkey: contactPubkey
+                        });
+                        console.log(`[JS] Email match result for message: ${hasEmailMatch}`);
+                    } catch (error) {
+                        console.error(`[JS] Error checking email match for message:`, error);
+                        hasEmailMatch = false;
+                    }
+                }
                 
                 return {
                     id: msg.id,
-                    content: msg.content,
+                    event_id: msg.event_id || null,
+                    content: msg.content || '',
                     created_at: msg.created_at || msg.timestamp,
                     sender_pubkey: msg.sender_pubkey,
                     is_sent: msg.sender_pubkey === myPubkey,
@@ -433,7 +464,7 @@ class DMService {
                 headerElement.className = 'conversation-header';
                 headerElement.innerHTML = `
                     <div class="conversation-contact-info">
-                        <img class="contact-avatar" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';">
+                        <img class="contact-avatar" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';" style="cursor: pointer;" data-pubkey="${contactPubkey}">
                         <div class="conversation-contact-details">
                             <div class="conversation-contact-name">${contact ? contact.name : contactPubkey}</div>
                             <div class="conversation-contact-pubkey">${contactPubkey}</div>
@@ -441,6 +472,14 @@ class DMService {
                     </div>
                 `;
                 dmMessages.appendChild(headerElement);
+                
+                // Add click handler to avatar to navigate to contacts page
+                const avatarElement = headerElement.querySelector('.contact-avatar');
+                if (avatarElement) {
+                    avatarElement.addEventListener('click', () => {
+                        this.navigateToContact(contactPubkey);
+                    });
+                }
                 
                 // Create messages container
                 const messagesContainer = document.createElement('div');
@@ -454,7 +493,11 @@ class DMService {
                 const myPubkey = window.appState.getKeypair()?.public_key;
                 sortedMessages.forEach((message, index) => {
                     const isMe = message.sender_pubkey === myPubkey;
-                    console.log(`[DM DEBUG] sender_pubkey:`, message.sender_pubkey, '| myPubkey:', myPubkey, '| isMe:', isMe);
+                    // Ensure is_sent is set correctly
+                    if (message.is_sent === undefined) {
+                        message.is_sent = isMe;
+                    }
+                    console.log(`[DM DEBUG] sender_pubkey: ${message.sender_pubkey} | myPubkey: ${myPubkey} | isMe: ${isMe} | message.is_sent: ${message.is_sent}`);
                     console.log(`[JS] Rendering message ${index}:`, message);
                     // Determine if this message is from me
                     const messageElement = document.createElement('div');
@@ -505,7 +548,7 @@ class DMService {
                         if (message.confirmed) {
                             // Double checkmark for confirmed messages
                             statusIcon = '<i class="fas fa-check-double message-status confirmed"></i>';
-                        } else if (message.id && !message.id.startsWith('temp_')) {
+                        } else if (message.id && !String(message.id).startsWith('temp_')) {
                             // Single checkmark for sent but not yet confirmed
                             statusIcon = '<i class="fas fa-check message-status sent"></i>';
                         } else {
@@ -536,7 +579,7 @@ class DMService {
                                 <div class="message-meta">
                                     <div class="message-time">${dateTimeDisplay}</div>
                                     ${statusIcon}
-                                    <span class="email-emoji"><i class="fas fa-envelope"></i></span>
+                                    <span class="email-emoji email-emoji-clickable" style="cursor: pointer;" title="${isMe ? 'Click to view sent email' : 'Click to view received email'}"><i class="fas fa-envelope"></i></span>
                                 </div>
                             </div>
                         `;
@@ -559,6 +602,122 @@ class DMService {
                                     }
                                 }
                             });
+                        }
+                        
+                        // Handle email icon click - navigate to email (sent or inbox)
+                        if (message.hasEmailMatch && message.event_id) {
+                            const emailIcon = messageElement.querySelector('.email-emoji-clickable');
+                            console.log(`[JS] DM: Looking for clickable email icon, found:`, emailIcon, '| event_id:', message.event_id, '| isMe:', isMe);
+                            if (emailIcon) {
+                                emailIcon.addEventListener('click', async (event) => {
+                                    event.stopPropagation();
+                                    event.preventDefault();
+                                    console.log(`[JS] DM: Email icon clicked for message with event_id:`, message.event_id, '| isMe:', isMe);
+                                    try {
+                                        // Find the matching email ID and message_id
+                                        const emailResult = await window.__TAURI__.core.invoke('db_get_matching_email_id', {
+                                            dmEventId: message.event_id
+                                        });
+                                        
+                                        console.log(`[JS] DM: Found matching email result:`, emailResult);
+                                        
+                                        if (emailResult && emailResult.email_id && emailResult.message_id) {
+                                            const emailId = emailResult.email_id;
+                                            const messageId = emailResult.message_id;
+                                            
+                                            if (isMe) {
+                                                // Sent message - navigate to sent tab
+                                                // Switch to sent tab first
+                                                if (window.app && window.app.switchTab) {
+                                                    window.app.switchTab('sent');
+                                                } else {
+                                                    console.error('[JS] DM: window.app.switchTab not available');
+                                                    return;
+                                                }
+                                                
+                                                // Ensure sent emails are loaded
+                                                if (!appState.getSentEmails() || appState.getSentEmails().length === 0) {
+                                                    await window.emailService.loadSentEmails();
+                                                }
+                                                
+                                                // Check if email exists in appState, if not fetch it
+                                                let email = appState.getSentEmails().find(e => e.id == emailId || e.id === emailId.toString());
+                                                if (!email) {
+                                                    console.log(`[JS] DM: Email ${emailId} not in appState, fetching from database`);
+                                                    const dbEmail = await window.TauriService.getDbEmail(messageId);
+                                                    if (dbEmail) {
+                                                        // Convert DbEmail to EmailMessage format and add to appState
+                                                        const emailMessage = window.DatabaseService.convertDbEmailToEmailMessage(dbEmail);
+                                                        const sentEmails = appState.getSentEmails();
+                                                        sentEmails.push(emailMessage);
+                                                        appState.setSentEmails(sentEmails);
+                                                        email = emailMessage;
+                                                    }
+                                                }
+                                                
+                                                // Wait a bit for tab switch to complete, then show the email detail
+                                                setTimeout(() => {
+                                                    if (email) {
+                                                        // Use the email's ID (which might be string) for showSentDetail
+                                                        window.emailService.showSentDetail(email.id);
+                                                        console.log(`[JS] DM: Navigated to sent email ${email.id}`);
+                                                    } else {
+                                                        window.notificationService.showError('Email not found');
+                                                    }
+                                                }, 100);
+                                            } else {
+                                                // Received message - navigate to inbox tab
+                                                // Switch to inbox tab first
+                                                if (window.app && window.app.switchTab) {
+                                                    window.app.switchTab('inbox');
+                                                } else {
+                                                    console.error('[JS] DM: window.app.switchTab not available');
+                                                    return;
+                                                }
+                                                
+                                                // Ensure inbox emails are loaded
+                                                if (!appState.getEmails() || appState.getEmails().length === 0) {
+                                                    await window.emailService.loadEmails();
+                                                }
+                                                
+                                                // Check if email exists in appState, if not fetch it
+                                                let email = appState.getEmails().find(e => e.id == emailId || e.id === emailId.toString());
+                                                if (!email) {
+                                                    console.log(`[JS] DM: Email ${emailId} not in appState, fetching from database`);
+                                                    const dbEmail = await window.TauriService.getDbEmail(messageId);
+                                                    if (dbEmail) {
+                                                        // Convert DbEmail to EmailMessage format and add to appState
+                                                        const emailMessage = window.DatabaseService.convertDbEmailToEmailMessage(dbEmail);
+                                                        const emails = appState.getEmails();
+                                                        emails.push(emailMessage);
+                                                        appState.setEmails(emails);
+                                                        email = emailMessage;
+                                                    }
+                                                }
+                                                
+                                                // Wait a bit for tab switch to complete, then show the email detail
+                                                setTimeout(() => {
+                                                    if (email) {
+                                                        // Use the email's ID (which might be string) for showEmailDetail
+                                                        window.emailService.showEmailDetail(email.id);
+                                                        console.log(`[JS] DM: Navigated to inbox email ${email.id}`);
+                                                    } else {
+                                                        window.notificationService.showError('Email not found');
+                                                    }
+                                                }, 100);
+                                            }
+                                        } else {
+                                            window.notificationService.showError('Email not found');
+                                        }
+                                    } catch (error) {
+                                        console.error('[JS] DM: Failed to navigate to email:', error);
+                                        window.notificationService.showError('Failed to find email: ' + error.message);
+                                    }
+                                });
+                                console.log(`[JS] DM: Click handler attached to email icon`);
+                            } else {
+                                console.warn(`[JS] DM: Email icon not found. Element classes:`, messageElement.className);
+                            }
                         }
                     } else {
                         // For regular messages, use normal message structure
@@ -874,6 +1033,15 @@ class DMService {
     // Refresh DM conversations
     async refreshDmConversations() {
         console.log('[JS] Refreshing DM conversations...');
+        
+        // Show loading state on refresh button
+        const refreshBtn = window.domManager.get('refreshDm');
+        const originalRefreshBtnHTML = refreshBtn ? refreshBtn.innerHTML : null;
+        if (refreshBtn) {
+            refreshBtn.disabled = true;
+            refreshBtn.innerHTML = '<span class="loading"></span> Refreshing...';
+        }
+        
         // Show loading notification
         window.notificationService.showInfo('Syncing DMs from network...');
         try {
@@ -882,10 +1050,20 @@ class DMService {
             const relays = window.appState.getActiveRelays();
             if (!privateKey) {
                 window.notificationService.showError('No private key available for DM sync');
+                // Reset refresh button
+                if (refreshBtn && originalRefreshBtnHTML) {
+                    refreshBtn.disabled = false;
+                    refreshBtn.innerHTML = originalRefreshBtnHTML;
+                }
                 return;
             }
             if (!relays || relays.length === 0) {
                 window.notificationService.showError('No active relays configured');
+                // Reset refresh button
+                if (refreshBtn && originalRefreshBtnHTML) {
+                    refreshBtn.disabled = false;
+                    refreshBtn.innerHTML = originalRefreshBtnHTML;
+                }
                 return;
             }
             await window.__TAURI__.core.invoke('sync_direct_messages_with_network', {
@@ -896,6 +1074,12 @@ class DMService {
         } catch (error) {
             console.error('Failed to sync DMs from network:', error);
             window.notificationService.showError('Failed to sync DMs from network');
+            // Reset refresh button on error
+            if (refreshBtn && originalRefreshBtnHTML) {
+                refreshBtn.disabled = false;
+                refreshBtn.innerHTML = originalRefreshBtnHTML;
+            }
+            return;
         }
         // Clear DM cache from backend storage
         try {
@@ -925,10 +1109,37 @@ class DMService {
             }
             // Reload conversations
             await this.loadDmContacts();
+            
+            // Clear the spinner in dmMessages - it will be populated by loadDmMessages if a contact is selected
+            const selectedContact = window.appState.getSelectedDmContact();
+            if (!selectedContact && dmMessages) {
+                // No contact selected, show placeholder
+                dmMessages.innerHTML = `
+                    <div class="text-center text-muted" style="padding: 2rem;">
+                        <i class="fas fa-comments" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
+                        <p>Select a conversation to view messages</p>
+                    </div>
+                `;
+            } else if (selectedContact && dmMessages) {
+                // Contact is selected, reload messages to clear spinner
+                await this.loadDmMessages(selectedContact.pubkey);
+            }
+            
+            // Reset refresh button
+            if (refreshBtn && originalRefreshBtnHTML) {
+                refreshBtn.disabled = false;
+                refreshBtn.innerHTML = originalRefreshBtnHTML;
+            }
+            
             window.notificationService.showSuccess('Conversations refreshed');
         } catch (error) {
             console.error('Failed to refresh DM conversations:', error);
             window.notificationService.showError('Failed to refresh conversations');
+            // Reset refresh button on error
+            if (refreshBtn && originalRefreshBtnHTML) {
+                refreshBtn.disabled = false;
+                refreshBtn.innerHTML = originalRefreshBtnHTML;
+            }
         }
     }
 
@@ -984,6 +1195,44 @@ class DMService {
         this.loadDmMessages(pubkey);
     }
 
+    // Navigate to contacts page and select contact if it exists
+    navigateToContact(pubkey) {
+        try {
+            // Switch to contacts tab
+            const contactsTab = document.querySelector('[data-tab="contacts"]');
+            if (contactsTab) {
+                contactsTab.click();
+            }
+            
+            // Wait a bit for the tab to switch and contacts to render
+            setTimeout(() => {
+                // Find the contact in the contacts list
+                const contacts = window.appState.getContacts() || [];
+                const contact = contacts.find(c => c.pubkey === pubkey);
+                
+                if (contact) {
+                    // Select the contact
+                    if (window.contactsService && typeof window.contactsService.selectContact === 'function') {
+                        window.contactsService.selectContact(contact);
+                    } else {
+                        console.warn('ContactsService not available');
+                    }
+                } else {
+                    // Contact not found in contacts list - open add contact modal with pubkey pre-filled
+                    if (window.contactsService && typeof window.contactsService.showAddContactModal === 'function') {
+                        window.contactsService.showAddContactModal(pubkey);
+                    } else {
+                        console.warn('ContactsService not available');
+                        window.notificationService.showInfo('Contact not found in your contacts list');
+                    }
+                }
+            }, 100);
+        } catch (error) {
+            console.error('Error navigating to contact:', error);
+            window.notificationService.showError('Failed to navigate to contact');
+        }
+    }
+
     // Load email body into expandable element
     async loadEmailBody(message, expandableElement, contactPubkey) {
         // Check if content is already loaded
@@ -1003,7 +1252,7 @@ class DMService {
             const privateKey = window.appState.getKeypair().private_key;
             const userPubkey = window.appState.getKeypair().public_key;
             
-            const emailBody = await window.__TAURI__.core.invoke('db_get_matching_email_body', {
+            const emailResult = await window.__TAURI__.core.invoke('db_get_matching_email_body', {
                 dmEventId: message.event_id,
                 privateKey: privateKey,
                 userPubkey: userPubkey,
@@ -1013,11 +1262,131 @@ class DMService {
             // Remove loading state
             expandableElement.removeChild(loadingDiv);
             
-            if (emailBody) {
+            if (emailResult && emailResult.body) {
+                // Check if the emailBody is a manifest JSON (starts with { and contains "body" and "ciphertext")
+                let finalBody = emailResult.body;
+                let manifest = null;
+                try {
+                    const parsed = JSON.parse(emailResult.body);
+                    if (parsed.body && parsed.body.ciphertext && parsed.body.key_wrap) {
+                        console.log('[JS] DM: Detected manifest format, decrypting body...');
+                        // This is a manifest - extract and decrypt the body
+                        manifest = parsed;
+                        const bodyKey = manifest.body.key_wrap;
+                        const encryptedBodyData = manifest.body.ciphertext;
+                        
+                        // Use emailService's decryptWithAES method
+                        if (window.emailService && typeof window.emailService.decryptWithAES === 'function') {
+                            try {
+                                const decryptedBodyBase64 = await window.emailService.decryptWithAES(encryptedBodyData, bodyKey);
+                                finalBody = atob(decryptedBodyBase64);
+                                console.log('[JS] DM: Successfully decrypted manifest body');
+                            } catch (aesError) {
+                                console.error('[JS] DM: AES decryption failed:', aesError);
+                                finalBody = `[AES Decryption Failed: ${aesError.message}]`;
+                            }
+                        } else {
+                            console.error('[JS] DM: emailService.decryptWithAES not available');
+                            finalBody = '[Manifest detected but AES decryption not available]';
+                        }
+                    }
+                } catch (parseError) {
+                    // Not JSON, use as-is (legacy format)
+                    console.log('[JS] DM: Not a manifest format, using body as-is');
+                }
+                
+                // Display email body
                 const emailDiv = document.createElement('div');
                 emailDiv.className = 'email-body-content-text';
-                emailDiv.textContent = emailBody;
+                emailDiv.textContent = finalBody;
                 expandableElement.appendChild(emailDiv);
+                
+                // Display attachments if email_id is available
+                if (emailResult.email_id) {
+                    try {
+                        const attachments = await TauriService.getAttachmentsForEmail(emailResult.email_id);
+                        console.log(`[JS] DM: Found ${attachments.length} attachments for email ${emailResult.email_id}`);
+                        
+                        if (attachments && attachments.length > 0) {
+                            // Build attachment display data
+                            let attachmentDisplayData = [];
+                            
+                            if (manifest && manifest.attachments) {
+                                // Map database attachments to manifest metadata
+                                attachmentDisplayData = attachments.map(dbAttachment => {
+                                    if (dbAttachment.encryption_method === 'manifest_aes') {
+                                        // Find corresponding manifest entry by opaque ID
+                                        const opaqueId = dbAttachment.filename.replace('.dat', ''); // a1.dat -> a1
+                                        const manifestAttachment = manifest.attachments.find(ma => ma.id === opaqueId);
+                                        
+                                        if (manifestAttachment) {
+                                            return {
+                                                ...dbAttachment,
+                                                displayName: manifestAttachment.orig_filename,
+                                                displaySize: manifestAttachment.orig_size || dbAttachment.size,
+                                                displayMime: manifestAttachment.orig_mime || dbAttachment.mime_type
+                                            };
+                                        }
+                                    }
+                                    return {
+                                        ...dbAttachment,
+                                        displayName: dbAttachment.filename,
+                                        displaySize: dbAttachment.size,
+                                        displayMime: dbAttachment.mime_type
+                                    };
+                                });
+                            } else {
+                                // Plain attachments - use database data directly
+                                attachmentDisplayData = attachments.map(att => ({
+                                    ...att,
+                                    displayName: att.filename,
+                                    displaySize: att.size,
+                                    displayMime: att.mime_type
+                                }));
+                            }
+                            
+                            // Create attachments HTML
+                            const attachmentsHtml = `
+                                <div class="email-attachments" style="margin: 15px 0;">
+                                    <h4 style="margin-bottom: 10px;">Attachments (${attachmentDisplayData.length})</h4>
+                                    <div class="attachment-list">
+                                        ${attachmentDisplayData.map(attachment => {
+                                            const sizeFormatted = (attachment.displaySize / 1024).toFixed(2) + ' KB';
+                                            const isEncrypted = attachment.encryption_method === 'manifest_aes';
+                                            const statusIcon = isEncrypted ? '🔒' : '📄';
+                                            const statusText = isEncrypted ? 'Encrypted' : 'Plain';
+                                            
+                                            return `
+                                            <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;">
+                                                <div class="attachment-info" style="display: flex; align-items: center;">
+                                                    <i class="fas fa-file" style="margin-right: 10px;"></i>
+                                                    <div class="attachment-details">
+                                                        <div class="attachment-name" style="font-weight: bold;">${window.Utils.escapeHtml(attachment.displayName)}</div>
+                                                        <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
+                                                            ${sizeFormatted} • ${statusIcon} ${statusText}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                <div class="attachment-actions">
+                                                    <button class="btn btn-sm btn-outline-primary" onclick="dmService.downloadDmAttachment(${attachment.id}, ${emailResult.email_id})">
+                                                        <i class="fas fa-download"></i> Download
+                                                    </button>
+                                                </div>
+                                            </div>`;
+                                        }).join('')}
+                                    </div>
+                                </div>
+                            `;
+                            
+                            const attachmentsDiv = document.createElement('div');
+                            attachmentsDiv.innerHTML = attachmentsHtml;
+                            expandableElement.appendChild(attachmentsDiv);
+                        }
+                    } catch (attachmentError) {
+                        console.error('[JS] DM: Failed to load attachments:', attachmentError);
+                        // Don't show error to user, just log it
+                    }
+                }
             } else {
                 const noEmailDiv = document.createElement('div');
                 noEmailDiv.style.cssText = 'padding: 6px; color: #888; text-align: center; font-size: 12px;';
@@ -1034,6 +1403,113 @@ class DMService {
             errorDiv.style.cssText = 'padding: 6px; color: #dc3545; text-align: center; font-size: 12px;';
             errorDiv.textContent = 'Failed to load email body';
             expandableElement.appendChild(errorDiv);
+        }
+    }
+
+    // Download attachment from DM conversation email
+    async downloadDmAttachment(attachmentId, emailId) {
+        try {
+            console.log(`[JS] DM: Downloading attachment ${attachmentId} from email ${emailId}`);
+            
+            const attachment = await TauriService.getAttachment(attachmentId);
+            if (!attachment) {
+                window.notificationService.showError('Attachment not found');
+                return;
+            }
+            
+            // Check if attachment is encrypted and needs decryption
+            if (attachment.encryption_method === 'manifest_aes') {
+                // For manifest-encrypted attachments, we need to get the email and decrypt the manifest
+                // Try to find email in inbox or sent emails
+                let email = null;
+                const inboxEmails = appState.getEmails() || [];
+                const sentEmails = appState.getSentEmails() || [];
+                email = inboxEmails.find(e => e.id == emailId) || sentEmails.find(e => e.id == emailId);
+                
+                if (!email) {
+                    // Email not in cache - we need the email body to decrypt the manifest
+                    // For now, show an error. In the future, we could fetch the email from backend
+                    window.notificationService.showError('Email not found in cache. Please refresh the email list to download attachments.');
+                    return;
+                }
+                
+                // Extract encrypted content from email body
+                const encryptedBodyMatch = email.body.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                if (!encryptedBodyMatch) {
+                    window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
+                    return;
+                }
+                
+                const keypair = appState.getKeypair();
+                if (!keypair) {
+                    window.notificationService.showError('No keypair available for decryption');
+                    return;
+                }
+                
+                // Decrypt the manifest to get attachment keys
+                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                
+                // Try to decrypt manifest (for received emails, use sender's pubkey; for sent emails, use recipient's pubkey)
+                let manifestResult;
+                try {
+                    // Check if this is a sent or received email
+                    const settings = appState.getSettings();
+                    const userEmail = settings?.email_address;
+                    const isSentEmail = (email.from_address && email.from_address === userEmail) || (email.from && email.from === userEmail);
+                    
+                    if (isSentEmail) {
+                        manifestResult = await window.emailService.decryptSentManifestMessage(email, encryptedContent, keypair);
+                    } else {
+                        manifestResult = await window.emailService.decryptManifestMessage(email, encryptedContent, keypair);
+                    }
+                } catch (e) {
+                    console.error('[JS] DM: Failed to decrypt manifest:', e);
+                    window.notificationService.showError('Failed to decrypt manifest: ' + e.message);
+                    return;
+                }
+                
+                if (manifestResult.type !== 'manifest') {
+                    window.notificationService.showError('Cannot decrypt attachment: invalid manifest');
+                    return;
+                }
+                
+                // Find attachment metadata in manifest
+                const opaqueId = attachment.filename.replace('.dat', '');
+                const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
+                
+                if (!attachmentMeta) {
+                    window.notificationService.showError('Attachment metadata not found in manifest');
+                    return;
+                }
+                
+                // Decrypt attachment data
+                const decryptedData = await window.emailService.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
+                
+                // Save decrypted attachment to disk using Tauri
+                const filePath = await TauriService.saveAttachmentToDisk(
+                    attachmentMeta.orig_filename || attachmentMeta.orig_mime?.split('/')[1] || 'attachment',
+                    decryptedData,
+                    attachmentMeta.orig_mime || attachment.mime_type || 'application/octet-stream'
+                );
+                
+                console.log(`[JS] DM: Downloaded decrypted attachment: ${attachmentMeta.orig_filename} to ${filePath}`);
+                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
+                
+            } else {
+                // Plain attachment - save directly to disk using Tauri
+                const filePath = await TauriService.saveAttachmentToDisk(
+                    attachment.filename,
+                    attachment.data,
+                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                );
+                
+                console.log(`[JS] DM: Downloaded plain attachment: ${attachment.filename} to ${filePath}`);
+                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
+            }
+            
+        } catch (error) {
+            console.error('[JS] DM: Failed to download attachment:', error);
+            window.notificationService.showError('Failed to download attachment: ' + error.message);
         }
     }
 }

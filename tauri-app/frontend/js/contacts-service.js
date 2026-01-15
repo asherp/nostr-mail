@@ -19,13 +19,15 @@ class ContactsService {
         }
 
         try {
-            const dbContacts = await window.DatabaseService.getAllContacts();
+            const userPubkey = window.appState.getKeypair().public_key;
+            const dbContacts = await window.DatabaseService.getAllContacts(userPubkey);
             // Convert DB format to frontend format if needed
             const contacts = dbContacts.map(contact => ({
                 pubkey: contact.pubkey,
                 name: contact.name,
                 picture: contact.picture_url || contact.picture || '',
                 email: contact.email || null,
+                is_public: contact.is_public !== undefined ? contact.is_public : true, // Default to public if not set
                 fields: {
                     name: contact.name,
                     display_name: contact.display_name || contact.name,
@@ -37,9 +39,55 @@ class ContactsService {
                 picture_loading: false,
                 picture_loaded: !!contact.picture_data_url
             }));
+            
+            // Add user's own profile to contacts list as private
+            // This allows sent emails to find the user's avatar/profile
+            try {
+                const userProfile = await window.DatabaseService.getContact(userPubkey);
+                if (userProfile) {
+                    // Check if user is already in contacts (shouldn't be, but check anyway)
+                    const existingUserContact = contacts.find(c => c.pubkey === userPubkey);
+                    if (!existingUserContact) {
+                        // Get profile picture from cache if available
+                        let pictureDataUrl = userProfile.picture_data_url || null;
+                        if (!pictureDataUrl) {
+                            const cachedPictureDataUrl = localStorage.getItem('nostr_mail_profile_picture');
+                            if (cachedPictureDataUrl && cachedPictureDataUrl.startsWith('data:image')) {
+                                pictureDataUrl = cachedPictureDataUrl;
+                            }
+                        }
+                        
+                        const userContact = {
+                            pubkey: userPubkey,
+                            name: userProfile.name || userProfile.display_name || 'Me',
+                            picture: userProfile.picture_url || userProfile.picture || '',
+                            email: userProfile.email || null,
+                            is_public: false, // Private - user's own profile
+                            fields: {
+                                name: userProfile.name || 'Me',
+                                display_name: userProfile.display_name || userProfile.name || 'Me',
+                                picture: userProfile.picture_url || userProfile.picture || '',
+                                about: userProfile.about || '',
+                                email: userProfile.email || ''
+                            },
+                            picture_data_url: pictureDataUrl,
+                            picture_loading: false,
+                            picture_loaded: !!pictureDataUrl
+                        };
+                        contacts.unshift(userContact); // Add at the beginning
+                        console.log(`[JS] Added user's own profile to contacts list (private)`);
+                    }
+                } else {
+                    console.log(`[JS] User profile not found in database, skipping self-contact addition`);
+                }
+            } catch (e) {
+                console.warn(`[JS] Failed to add user's own profile to contacts:`, e);
+            }
+            
             window.appState.setContacts(contacts);
+            console.log(`[JS] Contacts loaded from database: ${contacts.length} contacts`);
             this.renderContacts();
-            console.log('[JS] Contacts loaded from database');
+            console.log('[JS] Contacts rendered to UI');
             // Defer image loading so UI is responsive
             this.loadContactImagesProgressively(); // don't await
         } catch (e) {
@@ -91,7 +139,10 @@ class ContactsService {
     // Load contact images progressively
     async loadContactImagesProgressively() {
         const contacts = window.appState.getContacts();
-        if (contacts.length === 0) return;
+        if (contacts.length === 0) {
+            console.log('[JS] loadContactImagesProgressively: No contacts to load images for');
+            return;
+        }
 
         console.log(`[JS] Loading images progressively for ${contacts.length} contacts`);
 
@@ -185,7 +236,10 @@ class ContactsService {
     // Render contacts
     renderContacts(searchQuery = '') {
         const contactsList = window.domManager.get('contactsList');
-        if (!contactsList) return;
+        if (!contactsList) {
+            console.warn('[JS] renderContacts: contactsList DOM element not found');
+            return;
+        }
 
         try {
             contactsList.innerHTML = '';
@@ -200,6 +254,7 @@ class ContactsService {
                 );
             }
 
+            console.log(`[JS] renderContacts: Rendering ${filteredContacts.length} contacts (searchQuery: "${searchQuery}")`);
             if (filteredContacts && filteredContacts.length > 0) {
                 // Sort: contacts with email first
                 filteredContacts.sort((a, b) => {
@@ -240,12 +295,18 @@ class ContactsService {
                         console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
                     }
 
+                    // Add privacy indicator icon
+                    const privacyIcon = contact.is_public === false 
+                        ? '<i class="fas fa-lock contact-privacy-icon" title="Private contact"></i>'
+                        : '<i class="fas fa-globe contact-privacy-icon" title="Public contact"></i>';
+                    
                     contactElement.innerHTML = `
                         <img class="${avatarClass}" src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
                         <div class="contact-info">
                             <div class="contact-name">${contact.name}</div>
                         </div>
                         <div class="contact-actions">
+                            ${privacyIcon}
                             ${emailIcon}
                         </div>
                     `;
@@ -341,11 +402,18 @@ class ContactsService {
                     
                     // Update in database
                     try {
+                        const userPubkey = window.appState.getKeypair().public_key;
                         const dbContact = window.DatabaseService.convertContactToDbFormat(updatedContact);
-                        await window.DatabaseService.saveContact(dbContact);
+                        // Keep existing is_public status (default to true if updating)
+                        await window.DatabaseService.saveContact(dbContact, userPubkey, true);
                         console.log('[JS] Updated contact in database:', contact.pubkey);
                     } catch (dbError) {
                         console.warn('[JS] Failed to update contact in database:', dbError);
+                    }
+                    
+                    // Refresh compose dropdown in case email was added/updated
+                    if (window.emailService) {
+                        window.emailService.populateNostrContactDropdown();
                     }
                     
                     // Only update UI if this contact is still selected
@@ -393,6 +461,24 @@ class ContactsService {
             } else if (contact.picture) {
                 avatarSrc = contact.picture;
             }
+            
+            // Privacy toggle
+            const isPublic = contact.is_public !== undefined ? contact.is_public : true;
+            const privacyToggleHTML = `
+                <div class="privacy-toggle-container">
+                    <label class="privacy-toggle" id="privacy-toggle-${contact.pubkey}">
+                        <input type="checkbox" ${isPublic ? 'checked' : ''} 
+                               onchange="window.contactsService.toggleContactPrivacy('${contact.pubkey}', this.checked, this)">
+                        <span class="privacy-toggle-slider"></span>
+                        <span class="privacy-toggle-label" id="privacy-label-${contact.pubkey}">${isPublic ? 'Public' : 'Private'}</span>
+                    </label>
+                    <span class="privacy-toggle-description" id="privacy-desc-${contact.pubkey}">
+                        ${isPublic 
+                            ? 'Visible in your public follow list' 
+                            : 'Not in your public follow list'}
+                    </span>
+                </div>
+            `;
             
             // Always render avatar as an <img> tag
             let avatarElement = `
@@ -472,17 +558,20 @@ class ContactsService {
                     </div>
                     
                     <div class="contact-detail-actions">
-                        ${contact.email ? `
-                        <button class="btn btn-primary" onclick="window.contactsService.sendEmailToContact('${contact.email}')">
-                            <i class="fas fa-envelope"></i> Send Email
-                        </button>
-                        ` : ''}
-                        <button class="btn btn-secondary" onclick="window.contactsService.sendDirectMessageToContact('${contact.pubkey}')">
-                            <i class="fas fa-comments"></i> Send DM
-                        </button>
-                        <button class="btn btn-secondary" onclick="window.contactsService.copyContactPubkey('${contact.pubkey}')">
-                            <i class="fas fa-copy"></i> Copy Public Key
-                        </button>
+                        ${privacyToggleHTML}
+                        <div class="contact-detail-actions-buttons">
+                            ${contact.email ? `
+                            <button class="btn btn-primary" onclick="window.contactsService.sendEmailToContact('${contact.email}')">
+                                <i class="fas fa-envelope"></i> Send Email
+                            </button>
+                            ` : ''}
+                            <button class="btn btn-secondary" onclick="window.contactsService.sendDirectMessageToContact('${contact.pubkey}')">
+                                <i class="fas fa-comments"></i> Send DM
+                            </button>
+                            <button class="btn btn-secondary" onclick="window.contactsService.copyContactPubkey('${contact.pubkey}')">
+                                <i class="fas fa-copy"></i> Copy Public Key
+                            </button>
+                        </div>
                     </div>
                 </div>
             `;
@@ -501,7 +590,7 @@ class ContactsService {
     }
 
     // Show add contact form
-    showAddContactModal() {
+    showAddContactModal(pubkey = '') {
         try {
             // Switch to contacts tab and show the add contact form in the detail panel
             const contactsTab = document.querySelector('[data-tab="contacts"]');
@@ -521,13 +610,13 @@ class ContactsService {
                 contactsDetail.innerHTML = `
                     <div class="add-contact-form">
                         <h3>Add New Contact</h3>
-                        <p class="form-help">Enter a Nostr public key (npub) to fetch their profile and follow them</p>
+                        <p class="form-help">Enter a Nostr public key (npub) to fetch their profile</p>
                         
                         <form id="add-contact-form">
                             <div class="form-group">
                                 <label for="contact-pubkey">Public Key (npub):</label>
                                 <div class="input-with-button">
-                                    <input type="text" id="contact-pubkey" placeholder="npub1..." required>
+                                    <input type="text" id="contact-pubkey" placeholder="npub1..." value="${pubkey}" required>
                                     <button type="button" id="scan-qr-btn" class="btn btn-secondary">
                                         <i class="fas fa-qrcode"></i> Scan QR
                                     </button>
@@ -551,6 +640,18 @@ class ContactsService {
                 }
                 if (scanBtn) {
                     scanBtn.addEventListener('click', () => this.scanQRCode());
+                }
+                
+                // If pubkey is provided, automatically submit the form after a short delay
+                if (pubkey) {
+                    setTimeout(() => {
+                        const pubkeyInput = document.getElementById('contact-pubkey');
+                        if (pubkeyInput && pubkeyInput.value) {
+                            // Optionally auto-submit, or just leave it filled for user to review
+                            // Uncomment the next line to auto-submit:
+                            // form.dispatchEvent(new Event('submit'));
+                        }
+                    }, 100);
                 }
             }
         } catch (error) {
@@ -722,6 +823,19 @@ class ContactsService {
         }
     }
 
+    // Helper function to update follow button text based on privacy toggle
+    updateFollowButtonText(button, isPublic, contactExists) {
+        if (contactExists) {
+            button.innerHTML = '<i class="fas fa-sync"></i> Update Follow Status';
+        } else {
+            if (isPublic) {
+                button.innerHTML = '<i class="fas fa-user-plus"></i> Follow and Add Contact Publicly';
+            } else {
+                button.innerHTML = '<i class="fas fa-user-plus"></i> Add Contact Privately';
+            }
+        }
+    }
+
     // Show profile for adding (not following yet)
     showProfileForAdding(pubkey, profile) {
         const contactsDetail = window.domManager.get('contactsDetail');
@@ -752,22 +866,131 @@ class ContactsService {
             // Add a follow button to the actions
             const actionsDiv = contactsDetail.querySelector('.contact-detail-actions');
             if (actionsDiv) {
-                // Remove any existing follow button
+                // Remove any existing follow button and checkbox
                 const existingFollowBtn = actionsDiv.querySelector('.follow-btn');
                 if (existingFollowBtn) {
                     existingFollowBtn.remove();
                 }
+                const existingFollowSection = actionsDiv.querySelector('.follow-section');
+                if (existingFollowSection) {
+                    existingFollowSection.remove();
+                }
                 
-                // Add follow button at the beginning
+                // Check if contact already exists in user's contacts
+                const existingContacts = window.appState.getContacts() || [];
+                const contactExists = existingContacts.some(c => c.pubkey === pubkey);
+                
+                // Create follow section
+                const followSection = document.createElement('div');
+                followSection.className = 'follow-section';
+                followSection.style.marginBottom = '1rem';
+                followSection.style.padding = '1rem';
+                followSection.style.border = '1px solid var(--border-color, #333)';
+                followSection.style.borderRadius = '8px';
+                followSection.style.backgroundColor = 'var(--card-bg, rgba(255,255,255,0.05))';
+                
+                // Create follow button first so it can be referenced in checkbox handler
                 const followBtn = document.createElement('button');
                 followBtn.className = 'btn btn-primary follow-btn';
-                followBtn.innerHTML = '<i class="fas fa-user-plus"></i> Follow & Add Contact';
+                followBtn.style.width = '100%';
+                
+                // Only show checkbox if contact already exists (allows toggling public/private)
+                if (contactExists) {
+                    // Find the existing contact to get its current is_public status
+                    const existingContact = existingContacts.find(c => c.pubkey === pubkey);
+                    const currentIsPublic = existingContact?.is_public !== undefined ? existingContact.is_public : true;
+                    
+                    // Add checkbox for public/private follow
+                    const checkboxContainer = document.createElement('div');
+                    checkboxContainer.style.marginBottom = '0.75rem';
+                    checkboxContainer.style.display = 'flex';
+                    checkboxContainer.style.alignItems = 'center';
+                    checkboxContainer.style.gap = '0.5rem';
+                    
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.id = 'follow-public-checkbox';
+                    checkbox.checked = currentIsPublic;
+                    checkbox.style.cursor = 'pointer';
+                    
+                    const checkboxLabel = document.createElement('label');
+                    checkboxLabel.htmlFor = 'follow-public-checkbox';
+                    checkboxLabel.style.cursor = 'pointer';
+                    checkboxLabel.style.display = 'flex';
+                    checkboxLabel.style.alignItems = 'center';
+                    checkboxLabel.style.gap = '0.5rem';
+                    checkboxLabel.innerHTML = currentIsPublic ? `
+                        <i class="fas fa-globe" style="color: #4CAF50;"></i>
+                        <span>Public follow (visible in your follow list)</span>
+                    ` : `
+                        <i class="fas fa-lock" style="color: #FF9800;"></i>
+                        <span>Private follow (not in your follow list)</span>
+                    `;
+                    
+                    // Update label and button text when checkbox changes
+                    const updateButtonText = () => {
+                        const isPublic = checkbox.checked;
+                        this.updateFollowButtonText(followBtn, isPublic, contactExists);
+                    };
+                    
+                    checkbox.addEventListener('change', () => {
+                        if (checkbox.checked) {
+                            checkboxLabel.innerHTML = `
+                                <i class="fas fa-globe" style="color: #4CAF50;"></i>
+                                <span>Public follow (visible in your follow list)</span>
+                            `;
+                        } else {
+                            checkboxLabel.innerHTML = `
+                                <i class="fas fa-lock" style="color: #FF9800;"></i>
+                                <span>Private follow (not in your follow list)</span>
+                            `;
+                        }
+                        updateButtonText();
+                    });
+                    
+                    checkboxContainer.appendChild(checkbox);
+                    checkboxContainer.appendChild(checkboxLabel);
+                    followSection.appendChild(checkboxContainer);
+                    
+                    // Set initial button text based on checkbox state
+                    this.updateFollowButtonText(followBtn, currentIsPublic, contactExists);
+                } else {
+                    // For new contacts, default to public
+                    this.updateFollowButtonText(followBtn, true, contactExists);
+                }
+                
                 followBtn.addEventListener('click', () => {
-                    this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '');
+                    // Check both the follow section checkbox (if exists) and the privacy toggle
+                    const followCheckbox = followSection.querySelector('#follow-public-checkbox');
+                    const privacyToggle = document.querySelector(`#privacy-toggle-${pubkey} input[type="checkbox"]`);
+                    const isPublic = contactExists 
+                        ? (followCheckbox?.checked ?? privacyToggle?.checked ?? true)
+                        : (privacyToggle?.checked ?? true); // For new contacts, use privacy toggle
+                    this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '', isPublic);
                 });
                 
+                followSection.appendChild(followBtn);
+                
                 // Insert at the beginning of actions
-                actionsDiv.insertBefore(followBtn, actionsDiv.firstChild);
+                actionsDiv.insertBefore(followSection, actionsDiv.firstChild);
+                
+                // For new contacts, connect the follow button to the privacy toggle
+                if (!contactExists) {
+                    const privacyToggle = document.querySelector(`#privacy-toggle-${pubkey} input[type="checkbox"]`);
+                    if (privacyToggle) {
+                        // Update button text when privacy toggle changes
+                        const updateFollowButtonFromToggle = () => {
+                            const isPublic = privacyToggle.checked;
+                            this.updateFollowButtonText(followBtn, isPublic, contactExists);
+                        };
+                        
+                        // Set initial button text based on privacy toggle state
+                        updateFollowButtonFromToggle();
+                        
+                        // Listen to privacy toggle changes
+                        privacyToggle.addEventListener('change', updateFollowButtonFromToggle);
+                    }
+                }
             }
             
             // Try to load and cache the profile picture (but don't re-render the entire profile)
@@ -786,13 +1009,120 @@ class ContactsService {
                         if (actionsDiv2) {
                             const existingFollowBtn2 = actionsDiv2.querySelector('.follow-btn');
                             if (existingFollowBtn2) existingFollowBtn2.remove();
+                            const existingFollowSection2 = actionsDiv2.querySelector('.follow-section');
+                            if (existingFollowSection2) existingFollowSection2.remove();
+                            
+                            // Check if contact already exists in user's contacts
+                            const existingContacts = window.appState.getContacts() || [];
+                            const contactExists = existingContacts.some(c => c.pubkey === pubkey);
+                            
+                            // Create follow section
+                            const followSection2 = document.createElement('div');
+                            followSection2.className = 'follow-section';
+                            followSection2.style.marginBottom = '1rem';
+                            followSection2.style.padding = '1rem';
+                            followSection2.style.border = '1px solid var(--border-color, #333)';
+                            followSection2.style.borderRadius = '8px';
+                            followSection2.style.backgroundColor = 'var(--card-bg, rgba(255,255,255,0.05))';
+                            
+                            // Create follow button first so it can be referenced in checkbox handler
                             const followBtn2 = document.createElement('button');
                             followBtn2.className = 'btn btn-primary follow-btn';
-                            followBtn2.innerHTML = '<i class="fas fa-user-plus"></i> Follow & Add Contact';
+                            followBtn2.style.width = '100%';
+                            
+                            // Only show checkbox if contact already exists
+                            if (contactExists) {
+                                const existingContact = existingContacts.find(c => c.pubkey === pubkey);
+                                const currentIsPublic = existingContact?.is_public !== undefined ? existingContact.is_public : true;
+                                
+                                const checkboxContainer2 = document.createElement('div');
+                                checkboxContainer2.style.marginBottom = '0.75rem';
+                                checkboxContainer2.style.display = 'flex';
+                                checkboxContainer2.style.alignItems = 'center';
+                                checkboxContainer2.style.gap = '0.5rem';
+                                
+                                const checkbox2 = document.createElement('input');
+                                checkbox2.type = 'checkbox';
+                                checkbox2.id = 'follow-public-checkbox-2';
+                                checkbox2.checked = currentIsPublic;
+                                checkbox2.style.cursor = 'pointer';
+                                
+                                const checkboxLabel2 = document.createElement('label');
+                                checkboxLabel2.htmlFor = 'follow-public-checkbox-2';
+                                checkboxLabel2.style.cursor = 'pointer';
+                                checkboxLabel2.style.display = 'flex';
+                                checkboxLabel2.style.alignItems = 'center';
+                                checkboxLabel2.style.gap = '0.5rem';
+                                checkboxLabel2.innerHTML = currentIsPublic ? `
+                                    <i class="fas fa-globe" style="color: #4CAF50;"></i>
+                                    <span>Public follow (visible in your follow list)</span>
+                                ` : `
+                                    <i class="fas fa-lock" style="color: #FF9800;"></i>
+                                    <span>Private follow (not in your follow list)</span>
+                                `;
+                                
+                                // Update label and button text when checkbox changes
+                                const updateButtonText2 = () => {
+                                    const isPublic = checkbox2.checked;
+                                    this.updateFollowButtonText(followBtn2, isPublic, contactExists);
+                                };
+                                
+                                checkbox2.addEventListener('change', () => {
+                                    if (checkbox2.checked) {
+                                        checkboxLabel2.innerHTML = `
+                                            <i class="fas fa-globe" style="color: #4CAF50;"></i>
+                                            <span>Public follow (visible in your follow list)</span>
+                                        `;
+                                    } else {
+                                        checkboxLabel2.innerHTML = `
+                                            <i class="fas fa-lock" style="color: #FF9800;"></i>
+                                            <span>Private follow (not in your follow list)</span>
+                                        `;
+                                    }
+                                    updateButtonText2();
+                                });
+                                
+                                checkboxContainer2.appendChild(checkbox2);
+                                checkboxContainer2.appendChild(checkboxLabel2);
+                                followSection2.appendChild(checkboxContainer2);
+                                
+                                // Set initial button text based on checkbox state
+                                this.updateFollowButtonText(followBtn2, currentIsPublic, contactExists);
+                            } else {
+                                // For new contacts, default to public
+                                this.updateFollowButtonText(followBtn2, true, contactExists);
+                            }
+                            
                             followBtn2.addEventListener('click', () => {
-                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '');
+                                // Check both the follow section checkbox (if exists) and the privacy toggle
+                                const followCheckbox = followSection2.querySelector('#follow-public-checkbox-2');
+                                const privacyToggle = document.querySelector(`#privacy-toggle-${pubkey} input[type="checkbox"]`);
+                                const isPublic = contactExists 
+                                    ? (followCheckbox?.checked ?? privacyToggle?.checked ?? true)
+                                    : (privacyToggle?.checked ?? true); // For new contacts, use privacy toggle
+                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '', isPublic);
                             });
-                            actionsDiv2.insertBefore(followBtn2, actionsDiv2.firstChild);
+                            
+                            followSection2.appendChild(followBtn2);
+                            actionsDiv2.insertBefore(followSection2, actionsDiv2.firstChild);
+                            
+                            // For new contacts, connect the follow button to the privacy toggle
+                            if (!contactExists) {
+                                const privacyToggle = document.querySelector(`#privacy-toggle-${pubkey} input[type="checkbox"]`);
+                                if (privacyToggle) {
+                                    // Update button text when privacy toggle changes
+                                    const updateFollowButtonFromToggle = () => {
+                                        const isPublic = privacyToggle.checked;
+                                        this.updateFollowButtonText(followBtn2, isPublic, contactExists);
+                                    };
+                                    
+                                    // Set initial button text based on privacy toggle state
+                                    updateFollowButtonFromToggle();
+                                    
+                                    // Listen to privacy toggle changes
+                                    privacyToggle.addEventListener('change', updateFollowButtonFromToggle);
+                                }
+                            }
                         }
                     } else {
                         // Fallback: use the raw URL as the picture
@@ -806,13 +1136,120 @@ class ContactsService {
                         if (actionsDiv2) {
                             const existingFollowBtn2 = actionsDiv2.querySelector('.follow-btn');
                             if (existingFollowBtn2) existingFollowBtn2.remove();
+                            const existingFollowSection2 = actionsDiv2.querySelector('.follow-section');
+                            if (existingFollowSection2) existingFollowSection2.remove();
+                            
+                            // Check if contact already exists in user's contacts
+                            const existingContacts = window.appState.getContacts() || [];
+                            const contactExists = existingContacts.some(c => c.pubkey === pubkey);
+                            
+                            // Create follow section
+                            const followSection2 = document.createElement('div');
+                            followSection2.className = 'follow-section';
+                            followSection2.style.marginBottom = '1rem';
+                            followSection2.style.padding = '1rem';
+                            followSection2.style.border = '1px solid var(--border-color, #333)';
+                            followSection2.style.borderRadius = '8px';
+                            followSection2.style.backgroundColor = 'var(--card-bg, rgba(255,255,255,0.05))';
+                            
+                            // Create follow button first so it can be referenced in checkbox handler
                             const followBtn2 = document.createElement('button');
                             followBtn2.className = 'btn btn-primary follow-btn';
-                            followBtn2.innerHTML = '<i class="fas fa-user-plus"></i> Follow & Add Contact';
+                            followBtn2.style.width = '100%';
+                            
+                            // Only show checkbox if contact already exists
+                            if (contactExists) {
+                                const existingContact = existingContacts.find(c => c.pubkey === pubkey);
+                                const currentIsPublic = existingContact?.is_public !== undefined ? existingContact.is_public : true;
+                                
+                                const checkboxContainer2 = document.createElement('div');
+                                checkboxContainer2.style.marginBottom = '0.75rem';
+                                checkboxContainer2.style.display = 'flex';
+                                checkboxContainer2.style.alignItems = 'center';
+                                checkboxContainer2.style.gap = '0.5rem';
+                                
+                                const checkbox2 = document.createElement('input');
+                                checkbox2.type = 'checkbox';
+                                checkbox2.id = 'follow-public-checkbox-3';
+                                checkbox2.checked = currentIsPublic;
+                                checkbox2.style.cursor = 'pointer';
+                                
+                                const checkboxLabel2 = document.createElement('label');
+                                checkboxLabel2.htmlFor = 'follow-public-checkbox-3';
+                                checkboxLabel2.style.cursor = 'pointer';
+                                checkboxLabel2.style.display = 'flex';
+                                checkboxLabel2.style.alignItems = 'center';
+                                checkboxLabel2.style.gap = '0.5rem';
+                                checkboxLabel2.innerHTML = currentIsPublic ? `
+                                    <i class="fas fa-globe" style="color: #4CAF50;"></i>
+                                    <span>Public follow (visible in your follow list)</span>
+                                ` : `
+                                    <i class="fas fa-lock" style="color: #FF9800;"></i>
+                                    <span>Private follow (not in your follow list)</span>
+                                `;
+                                
+                                // Update label and button text when checkbox changes
+                                const updateButtonText3 = () => {
+                                    const isPublic = checkbox2.checked;
+                                    this.updateFollowButtonText(followBtn2, isPublic, contactExists);
+                                };
+                                
+                                checkbox2.addEventListener('change', () => {
+                                    if (checkbox2.checked) {
+                                        checkboxLabel2.innerHTML = `
+                                            <i class="fas fa-globe" style="color: #4CAF50;"></i>
+                                            <span>Public follow (visible in your follow list)</span>
+                                        `;
+                                    } else {
+                                        checkboxLabel2.innerHTML = `
+                                            <i class="fas fa-lock" style="color: #FF9800;"></i>
+                                            <span>Private follow (not in your follow list)</span>
+                                        `;
+                                    }
+                                    updateButtonText3();
+                                });
+                                
+                                checkboxContainer2.appendChild(checkbox2);
+                                checkboxContainer2.appendChild(checkboxLabel2);
+                                followSection2.appendChild(checkboxContainer2);
+                                
+                                // Set initial button text based on checkbox state
+                                this.updateFollowButtonText(followBtn2, currentIsPublic, contactExists);
+                            } else {
+                                // For new contacts, default to public
+                                this.updateFollowButtonText(followBtn2, true, contactExists);
+                            }
+                            
                             followBtn2.addEventListener('click', () => {
-                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '');
+                                // Check both the follow section checkbox (if exists) and the privacy toggle
+                                const followCheckbox = followSection2.querySelector('#follow-public-checkbox-3');
+                                const privacyToggle = document.querySelector(`#privacy-toggle-${pubkey} input[type="checkbox"]`);
+                                const isPublic = contactExists 
+                                    ? (followCheckbox?.checked ?? privacyToggle?.checked ?? true)
+                                    : (privacyToggle?.checked ?? true); // For new contacts, use privacy toggle
+                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '', isPublic);
                             });
-                            actionsDiv2.insertBefore(followBtn2, actionsDiv2.firstChild);
+                            
+                            followSection2.appendChild(followBtn2);
+                            actionsDiv2.insertBefore(followSection2, actionsDiv2.firstChild);
+                            
+                            // For new contacts, connect the follow button to the privacy toggle
+                            if (!contactExists) {
+                                const privacyToggle = document.querySelector(`#privacy-toggle-${pubkey} input[type="checkbox"]`);
+                                if (privacyToggle) {
+                                    // Update button text when privacy toggle changes
+                                    const updateFollowButtonFromToggle = () => {
+                                        const isPublic = privacyToggle.checked;
+                                        this.updateFollowButtonText(followBtn2, isPublic, contactExists);
+                                    };
+                                    
+                                    // Set initial button text based on privacy toggle state
+                                    updateFollowButtonFromToggle();
+                                    
+                                    // Listen to privacy toggle changes
+                                    privacyToggle.addEventListener('change', updateFollowButtonFromToggle);
+                                }
+                            }
                         }
                     }
                 }).catch(e => {
@@ -878,13 +1315,48 @@ class ContactsService {
             composeTab.click();
         }
         
-        // Fill in the email address
-        const toAddressInput = window.domManager.get('toAddress');
-        if (toAddressInput) {
-            toAddressInput.value = email;
-        }
+        // Find the contact by email address
+        const contacts = window.appState.getContacts();
+        const contact = contacts.find(c => c.email && c.email.toLowerCase() === email.toLowerCase());
         
-        window.notificationService.showSuccess(`Email address filled in: ${email}`);
+        // Wait a moment for the tab to switch, then fill in the form
+        setTimeout(() => {
+            // Fill in the email address
+            const toAddressInput = window.domManager.get('toAddress');
+            if (toAddressInput) {
+                toAddressInput.value = email;
+            }
+            
+            // If contact found, set it as selected for encryption
+            if (contact && window.emailService) {
+                window.emailService.selectedNostrContact = contact;
+                
+                // Update the Nostr contact dropdown
+                const dropdown = window.domManager.get('nostrContactSelect');
+                if (dropdown) {
+                    dropdown.value = contact.pubkey;
+                }
+                
+                // Display the recipient pubkey
+                const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                const pubkeyValue = document.getElementById('recipient-pubkey-value');
+                if (pubkeyDisplay && pubkeyValue) {
+                    pubkeyValue.textContent = contact.pubkey;
+                    pubkeyDisplay.style.display = 'block';
+                }
+                
+                // Update the UI to show it's an encrypted email
+                if (toAddressInput) {
+                    const isDarkMode = document.body.classList.contains('dark-mode');
+                    toAddressInput.style.borderColor = '#667eea';
+                    toAddressInput.style.backgroundColor = isDarkMode ? '#1a1f3a' : '#f8f9ff';
+                }
+                
+                window.notificationService.showSuccess(`Email address and recipient pubkey filled in for ${contact.name}`);
+            } else {
+                window.notificationService.showSuccess(`Email address filled in: ${email}`);
+            }
+        }, 100);
     }
 
     // Refresh contacts from network (called by refresh button)
@@ -909,18 +1381,94 @@ class ContactsService {
                 window.notificationService.showInfo('No follows found on the network');
                 return;
             }
-            // 2. Filter out npubs already in the DB
-            const newPubkeys = await window.TauriService.filterNewContacts(followedPubkeys);
+            const userPubkey = window.appState.getKeypair().public_key;
+            
+            // 2. Get existing public contacts from DB
+            const existingPublicPubkeys = await window.__TAURI__.core.invoke('db_get_public_contact_pubkeys', {
+                userPubkey: userPubkey
+            });
+            console.log('[JS] Existing public contacts in DB:', existingPublicPubkeys.length);
+            
+            // Handle case where no follows found on network
+            if (!followedPubkeys || followedPubkeys.length === 0) {
+                // If there were public contacts but now none, convert them all to private
+                if (existingPublicPubkeys.length > 0) {
+                    console.log('[JS] No follows found on network, converting all public contacts to private');
+                    for (const pubkey of existingPublicPubkeys) {
+                        await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                            userPubkey: userPubkey,
+                            contactPubkey: pubkey,
+                            isPublic: false
+                        });
+                    }
+                    const localContacts = await window.DatabaseService.getAllContacts(userPubkey);
+                    window.appState.setContacts(localContacts);
+                    this.renderContacts();
+                    window.notificationService.showInfo(`No follows found on network. ${existingPublicPubkeys.length} contacts converted to private.`);
+                } else {
+                    window.notificationService.showInfo('No follows found on the network');
+                }
+                return;
+            }
+            
+            // 3. Find contacts that were publicly followed but are no longer in the follow list
+            const followedPubkeysSet = new Set(followedPubkeys);
+            const unfollowedPubkeys = existingPublicPubkeys.filter(pubkey => !followedPubkeysSet.has(pubkey));
+            
+            if (unfollowedPubkeys.length > 0) {
+                console.log('[JS] Detected unfollowed contacts (no longer in public follow list):', unfollowedPubkeys);
+                // Convert public follows to private (preserve contact data but mark as private)
+                for (const pubkey of unfollowedPubkeys) {
+                    await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                        userPubkey: userPubkey,
+                        contactPubkey: pubkey,
+                        isPublic: false
+                    });
+                }
+                console.log(`[JS] Converted ${unfollowedPubkeys.length} public contacts to private`);
+            }
+            
+            // 4. Filter out npubs already in the DB for this user
+            const newPubkeys = await window.TauriService.filterNewContacts(userPubkey, followedPubkeys);
             console.log('[JS] New npubs not in DB:', newPubkeys);
-            // 3. Fetch profiles for only new npubs using persistent client
+            
+            // 5. Fetch profiles for only new npubs using persistent client
             let newProfiles = [];
             if (newPubkeys.length > 0) {
+                console.log(`[JS] Calling fetchProfilesPersistent for ${newPubkeys.length} pubkeys...`);
                 newProfiles = await window.TauriService.fetchProfilesPersistent(newPubkeys);
-                console.log('[JS] Fetched new profiles using persistent client:', newProfiles);
+                console.log(`[JS] Fetched new profiles using persistent client: ${newProfiles ? newProfiles.length : 0} profiles`);
+                if (newProfiles && newProfiles.length > 0) {
+                    console.log('[JS] Profile details:', newProfiles.map(p => ({ pubkey: p.pubkey, name: p.fields?.name || p.fields?.display_name || 'no name' })));
+                } else {
+                    console.warn('[JS] fetchProfilesPersistent returned empty or null result');
+                }
             }
-            // 4. Get all local contacts
-            const localContacts = await window.DatabaseService.getAllContacts();
-            // 5. Add new contacts to app state and DB
+            
+            // 6. Get all local contacts for this user (before checking re-follows)
+            const allContacts = await window.DatabaseService.getAllContacts(userPubkey);
+            const allContactPubkeys = new Set(allContacts.map(c => c.pubkey));
+            
+            // 7. Update is_public for contacts that are back in the follow list (were private, now public again)
+            const reFollowedPubkeys = followedPubkeys.filter(pubkey => {
+                // Contact exists in user_contacts but wasn't in the public list (must have been private)
+                return allContactPubkeys.has(pubkey) && !existingPublicPubkeys.includes(pubkey);
+            });
+            if (reFollowedPubkeys.length > 0) {
+                console.log('[JS] Contacts re-added to public follow list:', reFollowedPubkeys);
+                for (const pubkey of reFollowedPubkeys) {
+                    await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                        userPubkey: userPubkey,
+                        contactPubkey: pubkey,
+                        isPublic: true
+                    });
+                }
+            }
+            
+            // 8. Get all local contacts for this user (after updates)
+            const localContacts = await window.DatabaseService.getAllContacts(userPubkey);
+            
+            // 8. Add new contacts to app state and DB
             if (newProfiles.length > 0) {
                 // Create new contact objects
                 const newContacts = newProfiles.map(profile => ({
@@ -936,21 +1484,33 @@ class ContactsService {
                     updated_at: new Date().toISOString()
                 }));
                 // Add to app state
-                const allContacts = [...localContacts, ...newContacts];
-                window.appState.setContacts(allContacts);
+                const updatedContacts = [...localContacts, ...newContacts];
+                window.appState.setContacts(updatedContacts);
                 this.renderContacts();
                 this.loadContactImagesProgressively();
-                // Save new contacts to DB
+                // Save new contacts to DB with user-contact relationship
+                // These are public follows from Nostr, so is_public=true
                 for (const contact of newContacts) {
                     const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
-                    await window.DatabaseService.saveContact(dbContact);
+                    await window.DatabaseService.saveContact(dbContact, userPubkey, true); // is_public=true for public follows
                 }
-                window.notificationService.showSuccess(`Added ${newContacts.length} new contacts`);
+                // Refresh compose dropdown to include new contacts
+                if (window.emailService) {
+                    window.emailService.populateNostrContactDropdown();
+                }
+                const message = unfollowedPubkeys.length > 0 
+                    ? `Added ${newContacts.length} new contacts. ${unfollowedPubkeys.length} contacts converted to private.`
+                    : `Added ${newContacts.length} new contacts`;
+                window.notificationService.showSuccess(message);
             } else {
                 // No new contacts, just re-render
                 window.appState.setContacts(localContacts);
                 this.renderContacts();
-                window.notificationService.showInfo('No new contacts found in your follow list');
+                if (unfollowedPubkeys.length > 0) {
+                    window.notificationService.showInfo(`${unfollowedPubkeys.length} contacts converted to private (no longer in public follow list)`);
+                } else {
+                    window.notificationService.showInfo('No new contacts found in your follow list');
+                }
             }
         } catch (error) {
             console.error('Failed to load contacts from network:', error);
@@ -958,10 +1518,11 @@ class ContactsService {
         }
     }
 
-    async confirmFollowContact(pubkey, profile, profileName, email) {
+    async confirmFollowContact(pubkey, profile, profileName, email, isPublic = true) {
         // Show a confirmation dialog
+        const followType = isPublic ? 'publicly' : 'privately';
         const confirmed = await window.notificationService.showConfirmation(
-            `Do you want to follow nostr user ${pubkey} ?`,
+            `Do you want to ${followType} follow nostr user ${pubkey}?`,
             'Confirm Follow'
         );
         if (!confirmed) return;
@@ -970,11 +1531,14 @@ class ContactsService {
             // Get your private key and relays
             const privateKey = window.appState.getKeypair().private_key;
             const relays = window.appState.getActiveRelays();
+            const userPubkey = window.appState.getKeypair().public_key;
 
-            // Call backend to follow the user on Nostr
-            await window.TauriService.followUser(privateKey, pubkey, relays);
+            // Only call backend to follow the user on Nostr if it's a public follow
+            if (isPublic) {
+                await window.TauriService.followUser(privateKey, pubkey, relays);
+            }
 
-            // Save the contact locally
+            // Save the contact locally with the appropriate is_public flag
             const now = new Date().toISOString();
             const contact = {
                 pubkey,
@@ -988,12 +1552,18 @@ class ContactsService {
                 created_at: now,
                 updated_at: now
             };
-            await window.DatabaseService.saveContact(contact);
+            const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
+            await window.DatabaseService.saveContact(dbContact, userPubkey, isPublic);
 
             // Update app state and UI
             window.appState.addContact(contact);
             this.renderContacts();
-            window.notificationService.showSuccess(`You are now following ${profileName}!`);
+            // Refresh compose dropdown to include new contact
+            if (window.emailService) {
+                window.emailService.populateNostrContactDropdown();
+            }
+            const followTypeMsg = isPublic ? 'publicly' : 'privately';
+            window.notificationService.showSuccess(`You are now ${followTypeMsg} following ${profileName}!`);
         } catch (error) {
             window.notificationService.showError('Failed to follow and add contact: ' + error);
         }
@@ -1043,13 +1613,19 @@ class ContactsService {
                     contacts[idx] = selectedContact;
                     window.appState.setContacts(contacts);
                     // Save updated contact to the database
+                    const userPubkey = window.appState.getKeypair().public_key;
                     const dbContact = window.DatabaseService.convertContactToDbFormat(selectedContact);
-                    await window.DatabaseService.saveContact(dbContact);
+                    // Keep existing is_public status (default to true if updating)
+                    await window.DatabaseService.saveContact(dbContact, userPubkey, true);
                 }
                 // Re-render the contact detail
                 this.renderContactDetail(selectedContact);
                 // Also re-render the contacts list to update the contact item
                 this.renderContacts();
+                // Refresh compose dropdown in case email was added/updated
+                if (window.emailService) {
+                    window.emailService.populateNostrContactDropdown();
+                }
             }
         } catch (error) {
             console.error('Failed to refresh selected contact profile:', error);
@@ -1080,6 +1656,11 @@ class ContactsService {
                 const selectedContact = this.getSelectedContact();
                 if (selectedContact && selectedContact.pubkey === pubkey) {
                     this.renderContactDetail(contact);
+                }
+                
+                // Refresh compose dropdown in case email was added/updated
+                if (window.emailService) {
+                    window.emailService.populateNostrContactDropdown();
                 }
             }
         } catch (error) {
@@ -1126,6 +1707,81 @@ class ContactsService {
         
         const searchQuery = searchInput.value.trim().toLowerCase();
         this.renderContacts(searchQuery);
+    }
+
+    // Toggle contact privacy status
+    async toggleContactPrivacy(contactPubkey, isPublic, checkboxElement) {
+        try {
+            if (!window.appState.hasKeypair()) {
+                window.notificationService.showError('No keypair available');
+                // Revert checkbox if error
+                if (checkboxElement) checkboxElement.checked = !isPublic;
+                return;
+            }
+
+            const userPubkey = window.appState.getKeypair().public_key;
+            const privateKey = window.appState.getKeypair().private_key;
+            const relays = window.appState.getActiveRelays();
+            
+            // Update in database
+            await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                userPubkey: userPubkey,
+                contactPubkey: contactPubkey,
+                isPublic: isPublic
+            });
+
+            // Publish the updated follow list to Nostr (always publish to keep it in sync)
+            try {
+                console.log('[JS] Publishing updated follow list to Nostr...');
+                await window.TauriService.publishFollowList(privateKey, userPubkey, relays);
+                console.log('[JS] Successfully published follow list');
+            } catch (publishError) {
+                console.error('[JS] Failed to publish follow list:', publishError);
+                // Don't fail the whole operation, but warn the user
+                window.notificationService.showWarning('Contact updated but failed to publish follow list: ' + publishError);
+            }
+
+            // Update in app state
+            const contacts = window.appState.getContacts();
+            const contactIndex = contacts.findIndex(c => c.pubkey === contactPubkey);
+            if (contactIndex !== -1) {
+                contacts[contactIndex].is_public = isPublic;
+                window.appState.setContacts(contacts);
+                
+                // Update the selected contact if it's the one being toggled
+                const selectedContact = window.appState.getSelectedContact();
+                if (selectedContact && selectedContact.pubkey === contactPubkey) {
+                    selectedContact.is_public = isPublic;
+                    window.appState.setSelectedContact(selectedContact);
+                    
+                    // Update the label and description text immediately
+                    const labelElement = document.getElementById(`privacy-label-${contactPubkey}`);
+                    const descElement = document.getElementById(`privacy-desc-${contactPubkey}`);
+                    
+                    if (labelElement) {
+                        labelElement.textContent = isPublic ? 'Public' : 'Private';
+                    }
+                    if (descElement) {
+                        descElement.textContent = isPublic 
+                            ? 'Visible in your public follow list' 
+                            : 'Not in your public follow list';
+                    }
+                }
+                
+                // Re-render the contacts list to update the privacy icon
+                this.renderContacts();
+                
+                const message = isPublic 
+                    ? 'Contact is now public and follow list published' 
+                    : 'Contact is now private and follow list updated';
+                window.notificationService.showSuccess(message);
+            }
+        } catch (error) {
+            console.error('Error toggling contact privacy:', error);
+            window.notificationService.showError('Failed to update contact privacy: ' + error);
+            // Revert checkbox if error
+            if (checkboxElement) checkboxElement.checked = !isPublic;
+        }
     }
 }
 

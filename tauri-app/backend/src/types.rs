@@ -31,8 +31,11 @@ pub struct EmailMessage {
     pub date: DateTime<Utc>,
     pub is_read: bool,
     pub raw_headers: String,
-    pub nostr_pubkey: Option<String>,
+    pub sender_pubkey: Option<String>,
+    pub recipient_pubkey: Option<String>,
     pub message_id: Option<String>,
+    pub signature_valid: Option<bool>,
+    pub transport_auth_verified: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +55,7 @@ pub struct Profile {
     pub fields: HashMap<String, serde_json::Value>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectMessage {
     pub id: String,
@@ -62,6 +66,7 @@ pub struct DirectMessage {
     pub is_valid: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayInfo {
     pub url: String,
@@ -72,6 +77,7 @@ pub struct RelayInfo {
     pub supported_nips: Vec<u16>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub default_relays: Vec<String>,
@@ -135,4 +141,37 @@ pub struct EmailAttachment {
     pub original_filename: Option<String>,
     pub original_type: Option<String>,
     pub original_size: Option<usize>,
+}
+
+/// Result structure for matching email body lookup (includes email ID for fetching attachments)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchingEmailBodyResult {
+    pub body: String,
+    pub email_id: Option<i64>,
+}
+
+/// Result structure for matching email ID lookup (includes both ID and message_id)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchingEmailIdResult {
+    pub email_id: Option<i64>,
+    pub message_id: String,
+}
+
+/// Transport authentication method used for verification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TransportAuthMethod {
+    #[serde(rename = "dmarc")]
+    Dmarc,
+    #[serde(rename = "dkim")]
+    Dkim,
+    #[serde(rename = "none")]
+    None,
+}
+
+/// Verdict from transport authentication verification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportAuthVerdict {
+    pub transport_verified: bool,
+    pub method: TransportAuthMethod,
+    pub reason: String,
 } 

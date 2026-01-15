@@ -98,6 +98,13 @@
     color: #333;
 }
 
+/* Profile Actions */
+.profile-actions {
+    display: flex;
+    gap: var(--spacing-sm);
+    flex-wrap: wrap;
+}
+
 /* Dark mode navigation styles */
 body.dark-mode .sidebar {
     background: linear-gradient(135deg, #232946 0%, #121629 100%);

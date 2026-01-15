@@ -9,6 +9,13 @@
 class EmailService {
     constructor() {
         this.searchTimeout = null;
+        this.searchUnlisten = null;
+        this.searchResults = [];
+        this.searchInProgress = false;
+        this.sentSearchTimeout = null;
+        this.sentSearchUnlisten = null;
+        this.sentSearchResults = [];
+        this.sentSearchInProgress = false;
         this.selectedNostrContact = null;
         this.plaintextSubject = ''; // Store plaintext subject
         this.plaintextBody = ''; // Store plaintext body
@@ -16,15 +23,26 @@ class EmailService {
         this.currentDraftDbId = null; // Track the database ID of the current draft
         this.currentMessageId = null; // Store the UUID for reuse
         this.attachments = []; // Store attachment objects with encryption state
+        this.inboxOffset = 0; // Track pagination offset for inbox emails
+        this.inboxPageSize = 50; // Number of emails per page (will be updated from settings)
+        this.sentOffset = 0; // Track pagination offset for sent emails
+        this.draftsOffset = 0; // Track pagination offset for drafts
+        this.searchOffset = 0; // Track pagination offset for search results
+        this.sentSearchOffset = 0; // Track pagination offset for sent search results
+        this.searchHasMore = false; // Track if there are more search results
+        this.sentSearchHasMore = false; // Track if there are more sent search results
+    }
+
+    // Get appropriate background color for Nostr contact input based on dark mode
+    getNostrContactInputBackgroundColor() {
+        const isDarkMode = document.body.classList.contains('dark-mode');
+        return isDarkMode ? '#1a1f3a' : '#f8f9ff';
     }
 
     // Populate Nostr contact dropdown with contacts that have email addresses
     populateNostrContactDropdown() {
         const dropdown = domManager.get('nostrContactSelect');
         if (!dropdown) return;
-
-        // Store the currently selected value
-        const prevValue = dropdown.value;
 
         // Clear existing options except the first one
         dropdown.innerHTML = '<option value="">Select a Nostr contact with email...</option>';
@@ -51,18 +69,16 @@ class EmailService {
         // Add contacts to dropdown
         contactsWithEmail.forEach(contact => {
             const option = document.createElement('option');
-            // Format: Name — email (email lighter if possible)
+            // Just show the username since email and pubkey are displayed separately
             option.value = contact.pubkey;
-            option.textContent = `${contact.name} — ${contact.email}`;
+            option.textContent = contact.name || 'Unknown';
             option.dataset.email = contact.email;
             option.dataset.name = contact.name;
             dropdown.appendChild(option);
         });
 
-        // Restore the selection if it still exists
-        if (prevValue && Array.from(dropdown.options).some(opt => opt.value === prevValue)) {
-            dropdown.value = prevValue;
-        }
+        // Reset dropdown to empty selection (don't restore previous selection)
+        dropdown.value = '';
 
         console.log(`[JS] Populated Nostr contact dropdown with ${contactsWithEmail.length} contacts`);
     }
@@ -339,7 +355,15 @@ class EmailService {
         // Export the key as raw bytes and convert to base64
         const keyBuffer = await window.crypto.subtle.exportKey('raw', key);
         const keyArray = new Uint8Array(keyBuffer);
-        return btoa(String.fromCharCode(...keyArray));
+        // Convert Uint8Array to base64 without using spread operator (avoids stack overflow)
+        // Use chunked approach for large arrays
+        const CHUNK_SIZE = 8192; // Process in 8KB chunks
+        let binaryString = '';
+        for (let i = 0; i < keyArray.length; i += CHUNK_SIZE) {
+            const chunk = keyArray.slice(i, i + CHUNK_SIZE);
+            binaryString += String.fromCharCode.apply(null, chunk);
+        }
+        return btoa(binaryString);
     }
     
     // Calculate SHA256 hash of data
@@ -415,7 +439,15 @@ class EmailService {
             combined.set(new Uint8Array(encryptedBuffer), iv.length);
             
             // Return as base64
-            return btoa(String.fromCharCode(...combined));
+            // Convert Uint8Array to base64 without using spread operator (avoids stack overflow for large files)
+            // Use chunked approach for large arrays
+            const CHUNK_SIZE = 8192; // Process in 8KB chunks
+            let binaryString = '';
+            for (let i = 0; i < combined.length; i += CHUNK_SIZE) {
+                const chunk = combined.slice(i, i + CHUNK_SIZE);
+                binaryString += String.fromCharCode.apply(null, chunk);
+            }
+            return btoa(binaryString);
             
         } catch (error) {
             console.error('AES encryption failed:', error);
@@ -469,7 +501,15 @@ class EmailService {
             }
             
             // Return as base64
-            return btoa(String.fromCharCode(...decryptedArray));
+            // Convert Uint8Array to base64 without using spread operator (avoids stack overflow for large files)
+            // Use chunked approach for large arrays
+            const CHUNK_SIZE = 8192; // Process in 8KB chunks
+            let binaryString = '';
+            for (let i = 0; i < decryptedArray.length; i += CHUNK_SIZE) {
+                const chunk = decryptedArray.slice(i, i + CHUNK_SIZE);
+                binaryString += String.fromCharCode.apply(null, chunk);
+            }
+            return btoa(binaryString);
             
         } catch (error) {
             console.error('AES decryption failed:', error);
@@ -522,7 +562,8 @@ class EmailService {
             
             // Create a mock email object for the decryption function
             const mockEmail = {
-                nostr_pubkey: pubkey
+                sender_pubkey: pubkey,
+                nostr_pubkey: pubkey // Fallback for backward compatibility
             };
             
             // Try manifest decryption first
@@ -532,10 +573,14 @@ class EmailService {
                 console.log('[JS] Successfully decrypted manifest body');
                 domManager.setValue('messageBody', manifestResult.body);
                 window.notificationService.showSuccess('Body decrypted successfully');
+                // Clear signature when decrypting (body state changed)
+                this.clearSignature();
             } else if (manifestResult.type === 'legacy') {
                 console.log('[JS] Successfully decrypted legacy body');
                 domManager.setValue('messageBody', manifestResult.body);
                 window.notificationService.showSuccess('Body decrypted successfully');
+                // Clear signature when decrypting (body state changed)
+                this.clearSignature();
             }
             
         } catch (error) {
@@ -682,6 +727,8 @@ class EmailService {
         const select = domManager.get('nostrContactSelect');
         const selectedValue = select.value;
         const sendMatchingDmGroup = document.querySelector('.checkbox-group');
+        const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+        const pubkeyValue = document.getElementById('recipient-pubkey-value');
         
         if (selectedValue && selectedValue !== '') {
             // Find the selected contact
@@ -692,6 +739,17 @@ class EmailService {
                 console.log('[JS] Selected Nostr contact:', this.selectedNostrContact.name);
                 // Auto-fill the email address
                 domManager.setValue('toAddress', this.selectedNostrContact.email);
+                // Display the recipient pubkey
+                if (pubkeyDisplay && pubkeyValue) {
+                    pubkeyValue.textContent = this.selectedNostrContact.pubkey;
+                    pubkeyDisplay.style.display = 'block';
+                }
+                // Style the toAddress input for Nostr encryption
+                const toAddressInput = domManager.get('toAddress');
+                if (toAddressInput) {
+                    toAddressInput.style.borderColor = '#667eea';
+                    toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
+                }
                 // Save the contact selection for later restoration
                 this.saveContactSelection();
                 // Update DM checkbox visibility based on encryption state
@@ -699,6 +757,16 @@ class EmailService {
             }
         } else {
             this.selectedNostrContact = null;
+            // Hide the pubkey display
+            if (pubkeyDisplay) {
+                pubkeyDisplay.style.display = 'none';
+            }
+            // Reset the toAddress input styling
+            const toAddressInput = domManager.get('toAddress');
+            if (toAddressInput) {
+                toAddressInput.style.borderColor = '';
+                toAddressInput.style.backgroundColor = '';
+            }
             // Clear saved contact selection when none is selected
             this.clearSavedContactSelection();
             // Hide the send matching DM checkbox when no Nostr contact is selected
@@ -751,6 +819,29 @@ class EmailService {
         this.updateDmCheckboxVisibility();
         // Reset encrypt button state
         this.resetEncryptButtonState();
+        // Hide pubkey display
+        const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+        if (pubkeyDisplay) {
+            pubkeyDisplay.style.display = 'none';
+        }
+    }
+    
+    // Clear signature when body state changes (encrypt/decrypt)
+    clearSignature() {
+        const signBtn = document.getElementById('sign-btn');
+        if (signBtn) {
+            const iconSpan = signBtn.querySelector('.sign-btn-icon i');
+            const labelSpan = signBtn.querySelector('.sign-btn-label');
+            
+            signBtn.dataset.signed = 'false';
+            delete signBtn.dataset.signature;
+            
+            if (iconSpan) iconSpan.className = 'fas fa-pen';
+            if (labelSpan) labelSpan.textContent = 'Sign';
+            signBtn.classList.remove('signed');
+            
+            console.log('[JS] Signature cleared due to body state change');
+        }
     }
     
     // Reset encrypt button state
@@ -804,6 +895,49 @@ class EmailService {
             return;
         }
         
+        // Get settings early - needed for autoencrypt check
+        const settings = appState.getSettings();
+        
+        // Check if content is encrypted but no recipient pubkey is selected
+        const encryptBtn = domManager.get('encryptBtn');
+        const isEncrypted = encryptBtn && encryptBtn.dataset.encrypted === 'true';
+        const isEncryptedContent = Utils.isLikelyEncryptedContent(subject) || Utils.isLikelyEncryptedContent(body) || 
+                                   (body && body.includes('BEGIN NOSTR NIP-'));
+        
+        if ((isEncrypted || isEncryptedContent) && !this.selectedNostrContact) {
+            notificationService.showError('Encrypted content requires a recipient pubkey. Please select a Nostr contact.');
+            return;
+        }
+        
+        // Check if autoencrypt is enabled - if so, require recipient pubkey
+        const autoEncrypt = settings && settings.automatically_encrypt !== false; // Default to true
+        if (autoEncrypt && !this.selectedNostrContact) {
+            // Try to find contact by email address
+            const contacts = appState.getContacts();
+            const contactByEmail = contacts.find(c => c.email && c.email.toLowerCase() === toAddress.toLowerCase());
+            
+            if (contactByEmail) {
+                // Found contact by email, set it as selected
+                this.selectedNostrContact = contactByEmail;
+                const dropdown = domManager.get('nostrContactSelect');
+                if (dropdown) {
+                    dropdown.value = contactByEmail.pubkey;
+                }
+                // Display the recipient pubkey
+                const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                const pubkeyValue = document.getElementById('recipient-pubkey-value');
+                if (pubkeyDisplay && pubkeyValue) {
+                    pubkeyValue.textContent = contactByEmail.pubkey;
+                    pubkeyDisplay.style.display = 'block';
+                }
+                console.log('[JS] Auto-found contact by email for autoencrypt:', contactByEmail.name);
+            } else {
+                // No contact found - block sending when autoencrypt is enabled
+                notificationService.showError('Autoencrypt is enabled but no recipient pubkey found. Please select a Nostr contact with the recipient\'s email address, or disable autoencrypt to send unencrypted emails.');
+                return;
+            }
+        }
+        
         // Warn about attachments not being supported yet
         if (this.attachments && this.attachments.length > 0) {
             notificationService.showWarning(`Warning: ${this.attachments.length} attachment(s) will not be sent. Attachment support is coming soon.`);
@@ -816,7 +950,7 @@ class EmailService {
         console.log('[JS] Using message ID:', messageId);
         
         // Check if using Gmail or Yahoo and warn about App Password
-        const settings = appState.getSettings();
+        // (settings already retrieved above)
         if (settings.smtp_host === 'smtp.gmail.com') {
             console.log('[JS] Gmail detected, checking for App Password warning');
             const isGmailAddress = settings.email_address?.includes('@gmail.com');
@@ -854,6 +988,15 @@ class EmailService {
                 email: settings.email_address
             });
             
+            // Check if we should sign the email
+            // Sign if auto-sign is enabled OR if user manually signed
+            const autoSign = settings && settings.automatically_sign !== false; // Default to true
+            const signBtn = domManager.get('signBtn');
+            const isManuallySigned = signBtn && signBtn.dataset.signed === 'true';
+            const shouldSign = autoSign || isManuallySigned;
+            
+            console.log('[JS] Signing check:', { autoSign, isManuallySigned, shouldSign });
+            
             const emailConfig = {
                 email_address: settings.email_address,
                 password: settings.password,
@@ -862,7 +1005,8 @@ class EmailService {
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
                 use_tls: useTls,
-                private_key: appState.getKeypair() ? appState.getKeypair().private_key : null
+                // Only include private key if we should sign
+                private_key: shouldSign && appState.getKeypair() ? appState.getKeypair().private_key : null
             };
             
             // If a Nostr contact is selected, send encrypted email
@@ -895,13 +1039,37 @@ class EmailService {
             }
             
             console.log('[JS] Email sent successfully');
-            
+
+            // Trigger a sync of sent emails in the background (non-blocking)
+            // Note: The email is not saved to DB immediately - it will be fetched from the server via IMAP sync
+            // Run sync in background without blocking UI - use setTimeout to defer it
+            setTimeout(async () => {
+                try {
+                    // Add timeout wrapper to prevent hanging
+                    const syncPromise = this.syncSentEmails();
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Sync timeout after 30 seconds')), 30000)
+                    );
+                    await Promise.race([syncPromise, timeoutPromise]);
+                    console.log('[JS] Synced sent emails after sending');
+                } catch (syncError) {
+                    console.warn('[JS] Failed to sync sent emails after sending (non-critical):', syncError);
+                    // Don't show error to user - sync will happen on next refresh anyway
+                }
+            }, 100); // Defer by 100ms to let UI update first
+
             // Clear form
             domManager.clear('toAddress');
             domManager.clear('subject');
             domManager.clear('messageBody');
             domManager.setValue('nostrContactSelect', '');
             this.selectedNostrContact = null;
+            
+            // Hide pubkey display
+            const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+            if (pubkeyDisplay) {
+                pubkeyDisplay.style.display = 'none';
+            }
             
             // Clear attachments
             this.clearAttachments();
@@ -961,6 +1129,40 @@ class EmailService {
                 useTls = true;
             }
             
+            // Check if autoencrypt is enabled - if so, encrypt before previewing headers
+            const autoEncrypt = settings && settings.automatically_encrypt !== false; // Default to true
+            let previewSubject = subject;
+            let previewBody = body;
+            let nostrNpub = null;
+            
+            // Try to find contact if autoencrypt is enabled
+            let contactForEncryption = this.selectedNostrContact;
+            if (autoEncrypt && !contactForEncryption) {
+                const contacts = appState.getContacts();
+                const contactByEmail = contacts.find(c => c.email && c.email.toLowerCase() === toAddress.toLowerCase());
+                if (contactByEmail) {
+                    contactForEncryption = contactByEmail;
+                }
+            }
+            
+            // Encrypt in memory if autoencrypt is enabled and contact is found
+            // This does NOT modify the DOM fields - only encrypts for preview
+            if (autoEncrypt && contactForEncryption) {
+                console.log('[JS] Auto-encrypt enabled for header preview, encrypting in memory...');
+                const encrypted = await this.encryptEmailFieldsInMemory(subject, body, contactForEncryption);
+                previewSubject = encrypted.encryptedSubject;
+                previewBody = encrypted.encryptedBody;
+                nostrNpub = contactForEncryption.pubkey;
+                console.log('[JS] Encrypted for header preview (in memory only)');
+            }
+            
+            // Check if we should sign the email (for preview)
+            // Sign if auto-sign is enabled OR if user manually signed
+            const autoSign = settings && settings.automatically_sign !== false; // Default to true
+            const signBtn = domManager.get('signBtn');
+            const isManuallySigned = signBtn && signBtn.dataset.signed === 'true';
+            const shouldSign = autoSign || isManuallySigned;
+            
             const emailConfig = {
                 email_address: settings.email_address,
                 password: settings.password,
@@ -969,11 +1171,12 @@ class EmailService {
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
                 use_tls: useTls,
-                private_key: appState.getKeypair() ? appState.getKeypair().private_key : null
+                // Only include private key if we should sign
+                private_key: shouldSign && appState.getKeypair() ? appState.getKeypair().private_key : null
             };
             
             // Construct headers (sender's pubkey will be extracted from private_key in backend)
-            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, subject, body, null, messageId);
+            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId);
             
             // Debug: Log what headers we actually received
             console.log('[JS] Headers received from backend:');
@@ -1053,28 +1256,86 @@ class EmailService {
         try {
             const keypair = appState.getKeypair();
             const activeRelays = appState.getActiveRelays();
-            const encryptBtn = domManager.get('encryptBtn');
             
             // Check if user wants to send a matching DM (from settings)
             const settings = appState.getSettings();
             const shouldSendDm = settings && settings.send_matching_dm !== false; // Default to true
+            const autoEncrypt = settings && settings.automatically_encrypt !== false; // Default to true
             
-            // Only send DM if setting is enabled and encrypt button is in encrypted state
-            if (shouldSendDm && encryptBtn && encryptBtn.dataset.encrypted === 'true') {
+            // Check if email is actually encrypted by examining the content
+            // Subject should be encrypted (base64-like) or body should have NIP encryption markers
+            let isSubjectEncrypted = window.Utils && window.Utils.isLikelyEncryptedContent(subject);
+            let isBodyEncrypted = body.includes('BEGIN NOSTR NIP-') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
+            let isEmailEncrypted = isSubjectEncrypted || isBodyEncrypted;
+            
+            // Auto-encrypt if enabled and email is not already encrypted
+            if (autoEncrypt && !isEmailEncrypted) {
+                console.log('[JS] Auto-encrypt enabled, encrypting email before sending...');
+                // Temporarily set selected contact for encryption
+                const originalContact = this.selectedNostrContact;
+                this.selectedNostrContact = contact;
+                
+                // Encrypt the email fields
+                const didEncrypt = await this.encryptEmailFields();
+                if (didEncrypt) {
+                    // Get the encrypted values from DOM
+                    subject = domManager.getValue('subject') || subject;
+                    body = domManager.getValue('messageBody') || body;
+                    isSubjectEncrypted = window.Utils && window.Utils.isLikelyEncryptedContent(subject);
+                    isBodyEncrypted = body.includes('BEGIN NOSTR NIP-') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
+                    isEmailEncrypted = isSubjectEncrypted || isBodyEncrypted;
+                    console.log('[JS] Auto-encryption completed, email is now encrypted:', isEmailEncrypted);
+                    
+                    if (!isEmailEncrypted) {
+                        console.error('[JS] Auto-encryption completed but email is still not encrypted');
+                        notificationService.showError('Failed to auto-encrypt email. Email will not be sent.');
+                        // Restore original contact selection
+                        this.selectedNostrContact = originalContact;
+                        return; // Don't send unencrypted email
+                    }
+                } else {
+                    console.error('[JS] Auto-encryption failed, not sending email');
+                    notificationService.showError('Failed to auto-encrypt email. Please encrypt manually or check your settings.');
+                    // Restore original contact selection
+                    this.selectedNostrContact = originalContact;
+                    return; // Don't send unencrypted email
+                }
+                
+                // Restore original contact selection
+                this.selectedNostrContact = originalContact;
+            }
+            
+            console.log('[JS] Email encryption check:', { 
+                isSubjectEncrypted, 
+                isBodyEncrypted, 
+                isEmailEncrypted,
+                shouldSendDm,
+                subjectPreview: subject.substring(0, 50),
+                bodyPreview: body.substring(0, 50)
+            });
+            
+            // Only send DM if setting is enabled and email is actually encrypted
+            if (shouldSendDm && isEmailEncrypted) {
                 console.log('[JS] Sending matching DM to contact:', contact.name);
                 // Use the encrypted subject for the DM to match the email subject blob
                 // Since we know the subject is already encrypted, we'll pass it as encrypted content
-                const dmResult = await TauriService.sendEncryptedDirectMessage(
-                    keypair.private_key,
-                    contact.pubkey,
-                    subject, // This is already encrypted content
-                    activeRelays
-                );
-                console.log('[JS] DM sent successfully, event ID:', dmResult);
-            } else if (shouldSendDm) {
-                console.warn('[JS] Encrypt button not in encrypted state, DM will NOT be sent for security reasons.');
+                try {
+                    const dmResult = await TauriService.sendEncryptedDirectMessage(
+                        keypair.private_key,
+                        contact.pubkey,
+                        subject, // This is already encrypted content
+                        activeRelays
+                    );
+                    console.log('[JS] DM sent successfully, event ID:', dmResult);
+                    notificationService.showSuccess(`DM sent successfully (event ID: ${dmResult.substring(0, 16)}...)`);
+                } catch (dmError) {
+                    console.error('[JS] Failed to send DM:', dmError);
+                    notificationService.showError('Email sent but DM failed: ' + dmError);
+                }
+            } else if (shouldSendDm && !isEmailEncrypted) {
+                console.warn('[JS] Email is not encrypted, DM will NOT be sent for security reasons.');
                 notificationService.showInfo('No DM sent: Email is not encrypted.');
-            } else {
+            } else if (!shouldSendDm) {
                 console.log('[JS] Send matching DM setting is disabled, skipping DM.');
             }
             
@@ -1090,14 +1351,25 @@ class EmailService {
     }
 
     // Load emails
-    async loadEmails(searchQuery = '') {
+    async loadEmails(searchQuery = '', append = false) {
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
         }
         try {
-            domManager.disable('refreshInbox');
-            domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
+            if (!append) {
+                // Reset offset when loading fresh (not appending)
+                this.inboxOffset = 0;
+                domManager.disable('refreshInbox');
+                domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
+            } else {
+                // Show loading state on Load More button
+                const loadMoreBtn = document.getElementById('load-more-emails');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = true;
+                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
+                }
+            }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
             const emailConfig = {
@@ -1113,63 +1385,226 @@ class EmailService {
             // Read filter preference from settings
             const emailFilter = settings.email_filter || 'nostr';
             const onlyNostr = emailFilter === 'nostr';
+            // Get page size from settings (default to 50)
+            const pageSize = settings.emails_per_page || 50;
             // Always pass the user's email address for filtering (only as recipient)
             const userEmail = settings.email_address ? settings.email_address : null;
             console.log('[JS] getDbEmails userEmail:', userEmail);
             console.log('[JS] Email filter preference:', emailFilter, 'onlyNostr:', onlyNostr);
+            console.log('[JS] Loading emails with offset:', this.inboxOffset, 'pageSize:', pageSize);
             let emails;
             if (onlyNostr) {
-                emails = await TauriService.getDbEmails(50, 0, true, userEmail);
+                emails = await TauriService.getDbEmails(pageSize, this.inboxOffset, true, userEmail);
             } else {
-                emails = await TauriService.getDbEmails(50, 0, false, userEmail);
+                emails = await TauriService.getDbEmails(pageSize, this.inboxOffset, false, userEmail);
             }
-            appState.setEmails(emails);
-            this.renderEmails();
+            
+            // Load attachments for each email in parallel with timeout
+            console.log(`[JS] Loading attachments for ${emails.length} inbox emails`);
+            const attachmentPromises = emails.map(async (email) => {
+                try {
+                    // Convert email.id to integer - it might be a string
+                    const emailIdInt = parseInt(email.id);
+                    if (isNaN(emailIdInt)) {
+                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
+                        // Try to get email by message_id to get the real database ID
+                        if (email.message_id) {
+                            try {
+                                const emailData = await TauriService.getDbEmail(email.message_id);
+                                if (emailData && emailData.id) {
+                                    const realId = parseInt(emailData.id);
+                                    if (!isNaN(realId)) {
+                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
+                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
+                                        return;
+                                    }
+                                }
+                            } catch (e) {
+                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
+                            }
+                        }
+                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
+                        email.attachments = [];
+                        return;
+                    }
+                    
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
+                    );
+                    email.attachments = await Promise.race([
+                        TauriService.getAttachmentsForEmail(emailIdInt),
+                        timeoutPromise
+                    ]);
+                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
+                } catch (error) {
+                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
+                    email.attachments = [];
+                }
+            });
+            
+            await Promise.all(attachmentPromises);
+            
+            if (append) {
+                // Append new emails to existing ones
+                const existingEmails = appState.getEmails();
+                appState.setEmails([...existingEmails, ...emails]);
+            } else {
+                // Replace emails (fresh load)
+                appState.setEmails(emails);
+            }
+            
+            // Update offset for next load
+            this.inboxOffset += emails.length;
+            
+            // Show Load More button if we got a full page of results
+            this.renderEmails(emails.length === pageSize);
         } catch (error) {
             console.error('Failed to load emails:', error);
             notificationService.showError('Failed to load emails: ' + error);
         } finally {
-            domManager.enable('refreshInbox');
-            domManager.setHTML('refreshInbox', '<i class="fas fa-sync"></i> Refresh');
+            if (!append) {
+                domManager.enable('refreshInbox');
+                domManager.setHTML('refreshInbox', '<i class="fas fa-sync"></i> Refresh');
+            } else {
+                const loadMoreBtn = document.getElementById('load-more-emails');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = false;
+                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                }
+            }
+        }
+    }
+
+    // Load more emails (pagination)
+    async loadMoreEmails() {
+        const searchQuery = domManager.getValue('emailSearch')?.trim() || '';
+        if (searchQuery) {
+            // Load more search results
+            await this.filterEmails(true);
+        } else {
+            // Load more regular emails
+            await this.loadEmails('', true);
+        }
+    }
+    
+    async loadMoreSentEmails() {
+        const searchQuery = domManager.getValue('sentSearch')?.trim() || '';
+        if (searchQuery) {
+            // Load more sent search results
+            await this.filterSentEmails(true);
+        } else {
+            // Load more regular sent emails
+            await this.loadSentEmails('', true);
         }
     }
 
     // Load sent emails
-    async loadSentEmails() {
+    async loadSentEmails(searchQuery = '', append = false) {
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
         }
         try {
-            domManager.disable('refreshSent');
-            domManager.setHTML('refreshSent', '<span class="loading"></span> Loading...');
+            if (!append) {
+                // Reset offset when loading fresh (not appending)
+                this.sentOffset = 0;
+                domManager.disable('refreshSent');
+                domManager.setHTML('refreshSent', '<span class="loading"></span> Loading...');
+            } else {
+                // Show loading state on Load More button
+                const loadMoreBtn = document.getElementById('load-more-sent-emails');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = true;
+                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
+                }
+            }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
             const userEmail = settings.email_address ? settings.email_address : null;
+            // Get page size from settings (default to 50)
+            const pageSize = settings.emails_per_page || 50;
+            console.log('[JS] Loading sent emails with offset:', this.sentOffset, 'pageSize:', pageSize);
             // Fetch sent emails (where user is sender)
-            let emails = await TauriService.getDbSentEmails(50, 0, userEmail);
+            let emails = await TauriService.getDbSentEmails(pageSize, this.sentOffset, userEmail);
             
-            // Load attachments for each email
+            // Load attachments for each email in parallel with timeout
             console.log(`[JS] Loading attachments for ${emails.length} sent emails`);
-            for (const email of emails) {
+            const attachmentPromises = emails.map(async (email) => {
                 try {
-                    email.attachments = await TauriService.getAttachmentsForEmail(email.id);
-                    console.log(`[JS] Email ${email.id} has ${email.attachments.length} attachments:`, email.attachments);
+                    // Convert email.id to integer - it might be a string
+                    const emailIdInt = parseInt(email.id);
+                    if (isNaN(emailIdInt)) {
+                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
+                        // Try to get email by message_id to get the real database ID
+                        if (email.message_id) {
+                            try {
+                                const emailData = await TauriService.getDbEmail(email.message_id);
+                                if (emailData && emailData.id) {
+                                    const realId = parseInt(emailData.id);
+                                    if (!isNaN(realId)) {
+                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
+                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
+                                        return;
+                                    }
+                                }
+                            } catch (e) {
+                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
+                            }
+                        }
+                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
+                        email.attachments = [];
+                        return;
+                    }
+                    
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
+                    );
+                    email.attachments = await Promise.race([
+                        TauriService.getAttachmentsForEmail(emailIdInt),
+                        timeoutPromise
+                    ]);
+                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
                 } catch (error) {
-                    console.error(`Failed to load attachments for email ${email.id}:`, error);
+                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
                     email.attachments = [];
                 }
+            });
+            await Promise.allSettled(attachmentPromises);
+            
+            if (append) {
+                // Append new emails to existing ones
+                const existingEmails = appState.getSentEmails();
+                appState.setSentEmails([...existingEmails, ...emails]);
+            } else {
+                // Replace emails (fresh load)
+                appState.setSentEmails(emails);
             }
             
-            appState.setSentEmails(emails);
-            this.renderSentEmails();
+            // Update offset for next load
+            this.sentOffset += emails.length;
+            
+            // Show Load More button if we got a full page of results
+            this.renderSentEmails(emails.length === pageSize);
         } catch (error) {
             console.error('Failed to load sent emails:', error);
             notificationService.showError('Failed to load sent emails: ' + error);
         } finally {
-            domManager.enable('refreshSent');
-            domManager.setHTML('refreshSent', '<i class="fas fa-sync"></i> Refresh');
+            if (!append) {
+                domManager.enable('refreshSent');
+                domManager.setHTML('refreshSent', '<i class="fas fa-sync"></i> Refresh');
+            } else {
+                const loadMoreBtn = document.getElementById('load-more-sent-emails');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = false;
+                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                }
+            }
         }
+    }
+
+    // Load more sent emails (pagination)
+    async loadMoreSentEmails() {
+        await this.loadSentEmails('', true);
     }
 
     // Sync and reload emails
@@ -1209,6 +1644,191 @@ class EmailService {
         }
     }
 
+    async filterSentEmails(append = false) {
+        const searchQuery = domManager.getValue('sentSearch')?.trim() || '';
+        
+        // If search query is empty, load all sent emails normally
+        if (!searchQuery) {
+            // Clean up any existing search listeners
+            if (this.sentSearchUnlisten) {
+                this.sentSearchUnlisten();
+                this.sentSearchUnlisten = null;
+            }
+            await this.loadSentEmails('');
+            return;
+        }
+        
+        // Clear existing timeout
+        if (this.sentSearchTimeout) {
+            clearTimeout(this.sentSearchTimeout);
+        }
+        
+        // Clean up any existing search listeners
+        if (this.sentSearchUnlisten) {
+            this.sentSearchUnlisten();
+            this.sentSearchUnlisten = null;
+        }
+        
+        // Set a new timeout to debounce the search
+        this.sentSearchTimeout = setTimeout(async () => {
+            try {
+                const settings = appState.getSettings();
+                const keypair = appState.getKeypair();
+                const userEmail = settings.email_address ? settings.email_address : null;
+                const privateKey = keypair ? keypair.private_key : null;
+                
+                // Initialize search results accumulator (or keep existing if appending)
+                if (!append) {
+                    this.sentSearchResults = [];
+                    this.sentSearchOffset = 0;
+                }
+                this.sentSearchInProgress = true;
+                
+                // Show searching state
+                const sentList = domManager.get('sentList');
+                if (sentList) {
+                    sentList.innerHTML = '<div class="text-center text-muted" style="padding: 20px;"><i class="fas fa-spinner fa-spin"></i> Searching...</div>';
+                }
+                
+                // Set up event listeners for incremental search results
+                this.sentSearchUnlisten = await window.__TAURI__.event.listen('sent-search-result', (event) => {
+                    const email = event.payload;
+                    this.sentSearchResults.push(email);
+                    console.log(`[JS] Sent search result received: ${this.sentSearchResults.length} emails found so far`);
+                    
+                    // Update UI incrementally
+                    this.updateSentSearchResults();
+                });
+                
+                // Listen for progress updates
+                const progressUnlisten = await window.__TAURI__.event.listen('sent-search-progress', (event) => {
+                    const progress = event.payload;
+                    const sentList = domManager.get('sentList');
+                    if (sentList && this.sentSearchInProgress) {
+                        const percent = Math.round((progress.processed / progress.total) * 100);
+                        sentList.innerHTML = `<div class="text-center text-muted" style="padding: 20px;">
+                            <i class="fas fa-spinner fa-spin"></i> Searching... ${percent}% (${progress.processed}/${progress.total} emails processed)
+                            ${this.sentSearchResults.length > 0 ? `<br><small>Found ${this.sentSearchResults.length} match${this.sentSearchResults.length !== 1 ? 'es' : ''} so far</small>` : ''}
+                        </div>`;
+                    }
+                });
+                
+                // Listen for search completion
+                const completedUnlisten = await window.__TAURI__.event.listen('sent-search-completed', async (event) => {
+                    const completion = event.payload;
+                    console.log(`[JS] Sent search completed: ${completion.total_found} total matches, has_more: ${completion.has_more}`);
+                    
+                    // Update has_more flag
+                    if (completion.has_more !== undefined) {
+                        this.sentSearchHasMore = completion.has_more;
+                    }
+                    
+                    this.sentSearchInProgress = false;
+                    
+                    // Clean up listeners
+                    if (this.sentSearchUnlisten) {
+                        this.sentSearchUnlisten();
+                        this.sentSearchUnlisten = null;
+                    }
+                    progressUnlisten();
+                    completedUnlisten();
+                    
+                    // Load attachments for all search results (same logic as normal sent email loading)
+                    console.log(`[JS] Loading attachments for ${this.sentSearchResults.length} sent search result emails`);
+                    const attachmentPromises = this.sentSearchResults.map(async (email) => {
+                        try {
+                            // Convert email.id to integer - it might be a string
+                            const emailIdInt = parseInt(email.id);
+                            if (isNaN(emailIdInt)) {
+                                console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
+                                // Try to get email by message_id to get the real database ID
+                                if (email.message_id) {
+                                    try {
+                                        const emailData = await TauriService.getDbEmail(email.message_id);
+                                        if (emailData && emailData.id) {
+                                            const realId = parseInt(emailData.id);
+                                            if (!isNaN(realId)) {
+                                                email.attachments = await TauriService.getAttachmentsForEmail(realId);
+                                                console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
+                                                return;
+                                            }
+                                        }
+                                    } catch (e) {
+                                        console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
+                                    }
+                                }
+                                console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
+                                email.attachments = [];
+                                return;
+                            }
+                            
+                            const timeoutPromise = new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
+                            );
+                            email.attachments = await Promise.race([
+                                TauriService.getAttachmentsForEmail(emailIdInt),
+                                timeoutPromise
+                            ]);
+                            console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
+                        } catch (error) {
+                            console.error(`[JS] Failed to load attachments for sent email ${email.id}:`, error);
+                            email.attachments = [];
+                        }
+                    });
+                    
+                    await Promise.all(attachmentPromises);
+                    
+                    appState.setSentEmails(this.sentSearchResults);
+                    await this.renderSentEmails(this.sentSearchHasMore);
+                });
+                
+                // Reset search offset for new search
+                if (!append) {
+                    this.sentSearchOffset = 0;
+                    this.sentSearchResults = [];
+                }
+                
+                // Get page size from settings (already retrieved above)
+                const pageSize = settings.emails_per_page || 50;
+                
+                console.log('[JS] Starting sent search with query:', searchQuery, 'limit:', pageSize, 'offset:', this.sentSearchOffset);
+                // Start the search (this will emit events as results are found)
+                const result = await TauriService.searchSentEmails(searchQuery, userEmail, privateKey, pageSize, this.sentSearchOffset);
+                console.log('[JS] Sent search result:', result);
+                
+                // Update offset for next page
+                if (result && Array.isArray(result) && result.length === 2) {
+                    const [count, hasMore] = result;
+                    this.sentSearchHasMore = hasMore;
+                    this.sentSearchOffset += count;
+                }
+                
+            } catch (error) {
+                console.error('Error searching sent emails:', error);
+                notificationService.showError('Search failed: ' + error.message);
+                
+                // Clean up listeners on error
+                if (this.sentSearchUnlisten) {
+                    this.sentSearchUnlisten();
+                    this.sentSearchUnlisten = null;
+                }
+                this.sentSearchInProgress = false;
+                
+                // Restore sent email list on error
+                await this.loadSentEmails('');
+            }
+        }, 500); // 0.5 second delay for search
+    }
+    
+    async updateSentSearchResults() {
+        // Update UI with current sent search results incrementally
+        if (this.sentSearchResults.length > 0 && this.sentSearchInProgress) {
+            // Set emails and render incrementally
+            appState.setSentEmails(this.sentSearchResults);
+            await this.renderSentEmails();
+        }
+    }
+
     async syncAllEmails() {
         try {
             const [inboxCount, sentCount] = await TauriService.syncAllEmails();
@@ -1228,14 +1848,15 @@ class EmailService {
             // First decrypt the manifest using NIP encryption
             let decryptedManifestJson;
             
-            // Try with header pubkey first
-            if (email.nostr_pubkey) {
+            // Try with sender pubkey first (for inbox emails)
+            const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+            if (senderPubkey) {
                 try {
-                    console.log('[JS] Decrypting with header pubkey...');
+                    console.log('[JS] Decrypting with sender pubkey...');
                     console.log('[JS] privateKey:', keypair.private_key ? 'present' : 'missing');
-                    console.log('[JS] senderPubkey:', email.nostr_pubkey);
+                    console.log('[JS] senderPubkey:', senderPubkey);
                     console.log('[JS] encryptedContent:', encryptedContent ? encryptedContent.substring(0, 50) + '...' : 'missing');
-                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, email.nostr_pubkey, encryptedContent);
+                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, senderPubkey, encryptedContent);
                 } catch (e) {
                     console.log('[JS] Failed with header pubkey:', e.message);
                 }
@@ -1253,10 +1874,10 @@ class EmailService {
                 console.log('[JS] Manifest parsed successfully:', manifest);
             } catch (parseError) {
                 console.log('[JS] Not a manifest format, treating as legacy encrypted body');
-                // Return the decrypted content as legacy format
+                // Return the decrypted content as legacy format (with UTF-8 fixes)
                 return {
                     type: 'legacy',
-                    body: decryptedManifestJson
+                    body: Utils.fixUtf8Encoding(decryptedManifestJson)
                 };
             }
             
@@ -1306,7 +1927,7 @@ class EmailService {
             
             return {
                 type: 'manifest',
-                body: decryptedBody,
+                body: Utils.fixUtf8Encoding(decryptedBody),
                 manifest: manifest
             };
             
@@ -1364,19 +1985,28 @@ class EmailService {
     // Fallback decryption method for Nostr messages
     async decryptNostrMessageWithFallback(email, encryptedContent, keypair) {
         console.log('[JS] Fallback decryption called for email:', email.from || email.from_address);
-        // 1. Try the pubkey from the header/field first
-        if (email.nostr_pubkey) {
+        // 1. Try the sender pubkey from the header/field first (for inbox emails)
+        // For inbox emails, sender_pubkey should always be available from headers
+        const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+        if (senderPubkey) {
             try {
-                const decrypted = await TauriService.decryptDmContent(keypair.private_key, email.nostr_pubkey, encryptedContent);
+                const decrypted = await TauriService.decryptDmContent(keypair.private_key, senderPubkey, encryptedContent);
                 if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
-                    return decrypted;
+                    // Fix UTF-8 encoding issues in decrypted text
+                    return Utils.fixUtf8Encoding(decrypted);
                 }
+                // If decryption failed, it means our private key couldn't decrypt with this sender's pubkey
+                // This is expected if the email wasn't encrypted for us
+                return "Unable to decrypt: Your private key could not decrypt this message. The email may not have been encrypted for your keypair.";
             } catch (e) {
-                // continue to fallback
+                // Decryption error - our private key couldn't decrypt
+                console.error('[JS] Decryption failed with sender pubkey:', e);
+                return "Unable to decrypt: Your private key could not decrypt this message. The email may not have been encrypted for your keypair.";
             }
         }
 
         // 2. Fallback: search DB for pubkeys matching sender email
+        // This is only reached if sender_pubkey wasn't in headers (shouldn't happen for inbox emails)
         const senderEmail = email.from || email.from_address;
         if (!senderEmail) return "Unable to decrypt: sender address not found";
 
@@ -1389,32 +2019,35 @@ class EmailService {
         }
 
         if (!pubkeys || pubkeys.length === 0) {
-            return "Unable to decrypt: sender pubkey not found";
+            // For inbox emails, sender_pubkey should be in headers, so this is unexpected
+            return "Unable to decrypt: sender pubkey not found in headers or contacts. Your private key may not be able to decrypt this message.";
         }
 
-        // 3. Try each pubkey
+        // 3. Try each pubkey from contacts
         for (const pubkey of pubkeys) {
             try {
                 const decrypted = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
                 if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
-                    // Update the email's nostr_pubkey in the DB for future use
+                    // Update the email's sender_pubkey in the DB for future use
                     try {
-                        await window.__TAURI__.core.invoke('db_update_email_nostr_pubkey_by_id', {
+                        await window.__TAURI__.core.invoke('db_update_email_sender_pubkey_by_id', {
                             id: Number(email.id),
-                            nostrPubkey: pubkey
+                            senderPubkey: pubkey
                         });
-                        email.nostr_pubkey = pubkey; // <-- Add this line
+                        email.sender_pubkey = pubkey; // Update local copy
+                        email.nostr_pubkey = pubkey; // Keep for backward compatibility
                     } catch (err) {
-                        console.warn('Failed to update nostr_pubkey in DB:', err);
+                        console.warn('Failed to update sender_pubkey in DB:', err);
                     }
-                    return decrypted;
+                    // Fix UTF-8 encoding issues in decrypted text
+                    return Utils.fixUtf8Encoding(decrypted);
                 }
             } catch (e) {
                 // try next
             }
         }
-
-        return "Unable to decrypt: tried all candidate pubkeys";
+        // All pubkeys tried, decryption failed with our private key
+        return "Unable to decrypt: Your private key could not decrypt this message with any of the sender's pubkeys. The email may not have been encrypted for your keypair.";
     }
 
     // Decrypt manifest-based message for sent emails (using recipient pubkey)
@@ -1422,36 +2055,85 @@ class EmailService {
         console.log('[JS] Attempting sent manifest decryption for email:', email.to || email.to_address);
         
         try {
-            // For sent emails, we need the recipient's pubkey
-            const recipientEmail = email.to || email.to_address;
-            if (!recipientEmail) {
-                throw new Error('Recipient address not found');
-            }
-            
-            let pubkeys = [];
-            try {
-                pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
-            } catch (e) {
-                throw new Error('Error searching contacts');
-            }
-            
-            if (!pubkeys || pubkeys.length === 0) {
-                throw new Error('Recipient not found in contacts');
-            }
-            
             let decryptedManifestJson;
+            let foundPubkey = false;
             
-            // Try each recipient pubkey
-            for (const pubkey of pubkeys) {
+            // Try recipient_pubkey from email first (if available)
+            const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+            if (recipientPubkey) {
                 try {
-                    console.log('[JS] Trying recipient pubkey:', pubkey);
-                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
+                    console.log('[JS] Trying recipient_pubkey from email:', recipientPubkey);
+                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, recipientPubkey, encryptedContent);
                     if (decryptedManifestJson && !decryptedManifestJson.startsWith('Unable to decrypt')) {
-                        break;
+                        foundPubkey = true;
                     }
                 } catch (e) {
-                    console.log('[JS] Failed with pubkey:', pubkey, e.message);
-                    continue;
+                    console.log('[JS] Failed with recipient_pubkey from email, falling back to contact lookup:', e);
+                }
+            }
+            
+            // Fallback: For sent emails, we need the recipient's pubkey from contacts
+            if (!foundPubkey) {
+                const recipientEmail = email.to || email.to_address;
+                if (!recipientEmail) {
+                    throw new Error('Recipient address not found');
+                }
+                
+                // Normalize Gmail addresses (remove + aliases)
+                const normalizeGmail = (email) => {
+                    const lower = email.trim().toLowerCase();
+                    if (lower.includes('@gmail.com')) {
+                        const [local, domain] = lower.split('@');
+                        const normalizedLocal = local.split('+')[0];
+                        return `${normalizedLocal}@${domain}`;
+                    }
+                    return lower;
+                };
+                
+                const normalizedEmail = normalizeGmail(recipientEmail);
+                console.log('[JS] Normalized recipient email:', normalizedEmail, 'from:', recipientEmail);
+                
+                let pubkeys = [];
+                try {
+                    // Try both original and normalized email
+                    const emailVariants = [recipientEmail, normalizedEmail].filter((e, i, arr) => arr.indexOf(e) === i);
+                    for (const emailVariant of emailVariants) {
+                        try {
+                            const found = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: emailVariant });
+                            if (found && found.length > 0) {
+                                pubkeys.push(...found);
+                                console.log('[JS] Found pubkeys for', emailVariant, ':', found);
+                            }
+                        } catch (e) {
+                            console.log('[JS] No pubkeys found for', emailVariant);
+                        }
+                    }
+                    // Remove duplicates
+                    pubkeys = [...new Set(pubkeys)];
+                } catch (e) {
+                    console.error('[JS] Error searching contacts:', e);
+                    throw new Error('Error searching contacts: ' + e.message);
+                }
+                
+                if (!pubkeys || pubkeys.length === 0) {
+                    throw new Error('Recipient not found in contacts. Email: ' + recipientEmail + ' (normalized: ' + normalizedEmail + ')');
+                }
+                
+                console.log('[JS] Found', pubkeys.length, 'pubkey(s) for recipient');
+                
+                // Try each recipient pubkey
+                for (const pubkey of pubkeys) {
+                    try {
+                        console.log('[JS] Trying recipient pubkey:', pubkey);
+                        decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
+                        if (decryptedManifestJson && !decryptedManifestJson.startsWith('Unable to decrypt')) {
+                            foundPubkey = true;
+                            break;
+                        }
+                    } catch (e) {
+                        console.log('[JS] Failed with pubkey:', pubkey, e.message);
+                        continue;
+                    }
                 }
             }
             
@@ -1464,11 +2146,18 @@ class EmailService {
             try {
                 manifest = JSON.parse(decryptedManifestJson);
                 console.log('[JS] Sent manifest parsed successfully:', manifest);
+                console.log('[JS] Manifest has attachments:', manifest.attachments ? manifest.attachments.length : 0);
+                if (manifest.attachments && manifest.attachments.length > 0) {
+                    console.log('[JS] Manifest attachment IDs:', manifest.attachments.map(a => a.id));
+                    manifest.attachments.forEach((att, idx) => {
+                        console.log(`[JS] Manifest attachment ${idx}: id=${att.id}, orig_filename=${att.orig_filename}, orig_mime=${att.orig_mime}`);
+                    });
+                }
             } catch (parseError) {
                 console.log('[JS] Not a sent manifest format, treating as legacy encrypted body');
                 return {
                     type: 'legacy',
-                    body: decryptedManifestJson
+                    body: Utils.fixUtf8Encoding(decryptedManifestJson)
                 };
             }
             
@@ -1489,11 +2178,13 @@ class EmailService {
                 }
             }
             
-            return {
+            const result = {
                 type: 'manifest',
-                body: decryptedBody,
+                body: Utils.fixUtf8Encoding(decryptedBody),
                 manifest: manifest
             };
+            console.log('[JS] Returning manifest result, type:', result.type, 'has manifest:', !!result.manifest, 'has attachments:', result.manifest && result.manifest.attachments ? result.manifest.attachments.length : 0);
+            return result;
             
         } catch (error) {
             console.error('[JS] Sent manifest decryption failed:', error);
@@ -1503,23 +2194,56 @@ class EmailService {
 
     // Decrypt Nostr message for sent emails (using recipient pubkey from contacts DB)
     async decryptNostrSentMessageWithFallback(email, encryptedContent, keypair) {
-        // Always look up the recipient's pubkey using the to address
+        // Try recipient_pubkey from email first (if available)
+        const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+        if (recipientPubkey) {
+            try {
+                const decrypted = await TauriService.decryptDmContent(keypair.private_key, recipientPubkey, encryptedContent);
+                if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
+                    return Utils.fixUtf8Encoding(decrypted);
+                }
+            } catch (e) {
+                // Fall through to lookup from contacts
+            }
+        }
+        
+        // Fallback: look up the recipient's pubkey using the to address (checking both contacts and DMs)
         const recipientEmail = email.to || email.to_address;
         if (!recipientEmail) return "Unable to decrypt: recipient address not found";
         let pubkeys = [];
         try {
-            pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
+            // First try the new function that includes DMs
+            pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email_including_dms', { email: recipientEmail });
+            // If that fails or returns empty, fall back to contacts only
+            if (!pubkeys || pubkeys.length === 0) {
+                pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
+            }
         } catch (e) {
-            return "Unable to decrypt: error searching contacts";
+            console.error('[JS] Error searching for recipient pubkeys:', e);
+            // Try fallback to contacts only
+            try {
+                pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
+            } catch (fallbackError) {
+                return "Unable to decrypt: error searching contacts and DMs";
+            }
         }
         if (!pubkeys || pubkeys.length === 0) {
-            return "Unable to decrypt: recipient pubkey not found";
+            return "Unable to decrypt: recipient pubkey not found in contacts or DMs";
         }
         for (const pubkey of pubkeys) {
             try {
                 const decrypted = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
                 if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
-                    return decrypted;
+                    // Successfully decrypted - save the recipient pubkey to database for future use
+                    try {
+                        await this._saveRecipientPubkeyToDb(email, pubkey);
+                        console.log(`[JS] Saved recipient pubkey ${pubkey.substring(0, 16)}... to database for email ${email.id || email.message_id}`);
+                    } catch (saveError) {
+                        console.warn('[JS] Failed to save recipient pubkey to database:', saveError);
+                        // Continue anyway - decryption was successful
+                    }
+                    // Fix UTF-8 encoding issues in decrypted text
+                    return Utils.fixUtf8Encoding(decrypted);
                 }
             } catch (e) {
                 // try next
@@ -1528,16 +2252,34 @@ class EmailService {
         return "Unable to decrypt: tried all candidate pubkeys";
     }
 
-    async renderEmails() {
+    async renderEmails(showLoadMore = false) {
         const emailList = domManager.get('emailList');
         if (!emailList) return;
         try {
-            emailList.innerHTML = '';
+            // Remove existing Load More button if it exists
+            const existingLoadMoreBtn = document.getElementById('load-more-emails');
+            if (existingLoadMoreBtn) {
+                existingLoadMoreBtn.remove();
+            }
+            
+            // Get all emails from state
             const emails = appState.getEmails();
+            
             if (emails.length === 0) {
                 emailList.innerHTML = '<div class="text-center text-muted">No emails found</div>';
                 return;
             }
+            
+            // Check if we should hide undecryptable emails
+            const settings = appState.getSettings();
+            const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+            const hideUnverified = settings && settings.hide_unsigned_messages === true;
+            
+            // Always re-render all emails (simpler approach)
+            emailList.innerHTML = '';
+            
+            let renderedCount = 0;
+            
             for (const email of emails) {
                 console.log('Inbox preview nostr_pubkey for email', email.id, ':', email.nostr_pubkey);
                 const emailElement = document.createElement('div');
@@ -1556,7 +2298,7 @@ class EmailService {
                     dateDisplay = emailDate.toLocaleDateString();
                 }
                 // Determine preview text
-                let previewText = 'Could not decrypt';
+                let previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
                 let showSubject = false;
                 let previewSubject = email.subject;
 
@@ -1571,8 +2313,12 @@ class EmailService {
                         if (Utils.isLikelyEncryptedContent(email.subject)) {
                             try {
                                 previewSubject = await this.decryptNostrMessageWithFallback(email, email.subject, keypair);
+                                // Check if decryption returned an error message
+                                if (previewSubject && (previewSubject.startsWith('Unable to decrypt') || previewSubject.includes('Unable to decrypt'))) {
+                                    previewSubject = 'Unable to decrypt';
+                                }
                             } catch (e) {
-                                previewSubject = 'Could not decrypt';
+                                previewSubject = 'Unable to decrypt';
                             }
                         }
                         // Decrypt body - try manifest format first, then fallback to legacy
@@ -1597,18 +2343,28 @@ class EmailService {
                                     // Fallback to legacy decryption
                                     console.log('[JS] Falling back to legacy decryption for preview...');
                                     const decrypted = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                    previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                    showSubject = true;
+                                    // Check if decryption returned an error message
+                                    if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
+                                        previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                    } else {
+                                        previewText = Utils.escapeHtml(decrypted.substring(0, 100));
+                                        showSubject = true;
+                                    }
                                 }
                             } catch (e) {
                                 console.error('[JS] Manifest decryption failed for preview:', e);
                                 // If manifest fails, try legacy decryption
                                 try {
                                     const decrypted = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                    previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                    showSubject = true;
+                                    // Check if decryption returned an error message
+                                    if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
+                                        previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                    } else {
+                                        previewText = Utils.escapeHtml(decrypted.substring(0, 100));
+                                        showSubject = true;
+                                    }
                                 } catch (legacyError) {
-                                    previewText = 'Could not decrypt';
+                                    previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
                                 }
                             }
                         }
@@ -1619,16 +2375,181 @@ class EmailService {
                     showSubject = true;
                 }
 
+                // Check if email is decryptable (for filtering)
+                // Only hide if the body cannot be decrypted (subject decryption failure is less critical)
+                const isDecryptable = !previewText.includes('Unable to decrypt') && 
+                                    !previewText.includes('Your private key could not decrypt this message') &&
+                                    !previewText.includes('could not decrypt') &&
+                                    !previewText.includes('Could not decrypt') &&
+                                    previewText !== 'Unable to decrypt: no keypair';
+                
+                // Skip rendering if we should hide undecryptable emails and this email can't be decrypted
+                if (hideUndecryptable && !isDecryptable) {
+                    continue;
+                }
+                
+                // Skip rendering if we should hide unverified messages and this email doesn't have a valid signature
+                // Hide emails where signature_valid is not true (i.e., false, null, or undefined)
+                if (hideUnverified && email.signature_valid !== true) {
+                    continue;
+                }
+
+                // Add attachment indicator (same style as sent emails)
+                const attachmentCount = email.attachments ? email.attachments.length : 0;
+                const attachmentIndicator = attachmentCount > 0 ? 
+                    `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
+
+                // Add signature verification indicator
+                let signatureIndicator = '';
+                if (email.signature_valid === true) {
+                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                } else if (email.signature_valid === false) {
+                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+                }
+
+                // Add transport authentication indicator
+                let transportAuthIndicator = '';
+                if (email.transport_auth_verified === true) {
+                    transportAuthIndicator = `<span class="transport-auth-indicator verified" title="Email transport authentication verified (DMARC/DKIM/SPF)"><i class="fas fa-envelope"></i> Email Verified</span>`;
+                } else if (email.transport_auth_verified === false) {
+                    transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
+                }
+
+                // Get sender contact for avatar
+                const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                const contacts = appState.getContacts();
+                let senderContact = senderPubkey ? contacts.find(c => c.pubkey === senderPubkey) : null;
+                
+                // If not found by pubkey, try to find by email address
+                if (!senderContact) {
+                    const senderEmail = email.from || email.from_address;
+                    if (senderEmail) {
+                        // Normalize Gmail addresses (remove + aliases)
+                        const normalizeGmail = (email) => {
+                            const lower = email.trim().toLowerCase();
+                            if (lower.includes('@gmail.com')) {
+                                const [local, domain] = lower.split('@');
+                                const normalizedLocal = local.split('+')[0];
+                                return `${normalizedLocal}@${domain}`;
+                            }
+                            return lower;
+                        };
+                        
+                        const normalizedEmail = normalizeGmail(senderEmail);
+                        // Try both original and normalized email
+                        senderContact = contacts.find(c => {
+                            if (!c.email) return false;
+                            const contactEmail = c.email.trim().toLowerCase();
+                            return contactEmail === senderEmail.toLowerCase() || contactEmail === normalizedEmail;
+                        });
+                    }
+                }
+                
+                // Avatar fallback logic (copied from dm-service.js)
+                const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+                let avatarSrc = defaultAvatar;
+                let avatarClass = 'contact-avatar';
+                const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+                if (senderContact && senderContact.picture_loading) {
+                    avatarClass += ' loading';
+                } else if (isValidDataUrl) {
+                    avatarSrc = senderContact.picture_data_url;
+                } else if (senderContact && senderContact.picture_data_url && !isValidDataUrl && senderContact.picture) {
+                    avatarSrc = senderContact.picture;
+                } else if (senderContact && senderContact.picture) {
+                    avatarSrc = senderContact.picture;
+                }
+
                 emailElement.innerHTML = `
-                    <div class="email-header">
-                        <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)}</div>
-                        <div class="email-date">${dateDisplay}</div>
+                    <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.from)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+                    <div class="email-content">
+                        <div class="email-header">
+                            <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
+                            <div class="email-date">${dateDisplay}</div>
+                        </div>
+                        ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
+                        <div class="email-preview">${previewText}</div>
                     </div>
-                    ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
-                    <div class="email-preview">${previewText}</div>
                 `;
+                
+                // Add hover and click handlers for invalid signature indicator
+                if (email.signature_valid === false) {
+                    const sigIndicator = emailElement.querySelector('.signature-indicator.invalid');
+                    if (sigIndicator) {
+                        const originalText = sigIndicator.textContent;
+                        sigIndicator.addEventListener('mouseenter', () => {
+                            sigIndicator.textContent = 'recheck signature?';
+                        });
+                        sigIndicator.addEventListener('mouseleave', () => {
+                            sigIndicator.textContent = originalText;
+                        });
+                        sigIndicator.addEventListener('click', async (e) => {
+                            e.stopPropagation(); // Prevent email detail from opening
+                            const messageId = sigIndicator.dataset.messageId;
+                            if (messageId) {
+                                sigIndicator.textContent = 'checking...';
+                                sigIndicator.style.opacity = '0.7';
+                                try {
+                                    const result = await TauriService.recheckEmailSignature(messageId);
+                                    if (result === true) {
+                                        // Update the email object
+                                        email.signature_valid = true;
+                                        // Re-render this email item
+                                        sigIndicator.className = 'signature-indicator verified';
+                                        sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
+                                        sigIndicator.title = 'Verified Nostr signature';
+                                        sigIndicator.removeAttribute('data-message-id');
+                                        // Remove hover handlers
+                                        sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                        notificationService.showSuccess('Signature verified successfully!');
+                                    } else if (result === false) {
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showError('Signature is still invalid');
+                                    } else {
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showWarning('Could not verify signature (missing pubkey or signature)');
+                                    }
+                                } catch (error) {
+                                    console.error('[JS] Failed to recheck signature:', error);
+                                    sigIndicator.textContent = originalText;
+                                    notificationService.showError('Failed to recheck signature: ' + error);
+                                } finally {
+                                    sigIndicator.style.opacity = '1';
+                                }
+                            }
+                        });
+                    }
+                }
+                
                 emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
                 emailList.appendChild(emailElement);
+                renderedCount++;
+            }
+            
+            // Show message if no emails were rendered (possibly all filtered out)
+            if (renderedCount === 0) {
+                const settings = appState.getSettings();
+                const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+                const hideUnverified = settings && settings.hide_unsigned_messages === true;
+                if (hideUndecryptable && emails.length > 0) {
+                    emailList.innerHTML = '<div class="text-center text-muted">No decryptable emails found. All emails are encrypted for a different keypair.</div>';
+                } else if (hideUnverified && emails.length > 0) {
+                    emailList.innerHTML = '<div class="text-center text-muted">No verified emails found. All emails have missing or invalid signatures.</div>';
+                } else {
+                    emailList.innerHTML = '<div class="text-center text-muted">No emails found</div>';
+                }
+                return;
+            }
+            
+            // Add Load More button if there might be more emails
+            if (showLoadMore) {
+                const loadMoreBtn = document.createElement('button');
+                loadMoreBtn.id = 'load-more-emails';
+                loadMoreBtn.className = 'btn btn-secondary';
+                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
+                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                loadMoreBtn.addEventListener('click', () => this.loadMoreEmails());
+                emailList.appendChild(loadMoreBtn);
             }
         } catch (error) {
             console.error('Error rendering emails:', error);
@@ -1636,20 +2557,189 @@ class EmailService {
     }
 
     // Filter emails with debouncing
-    filterEmails() {
+    async filterEmails(append = false) {
         const searchQuery = domManager.getValue('emailSearch')?.trim() || '';
+        
+        // If search query is empty, load all emails normally
+        if (!searchQuery) {
+            // Clean up any existing search listeners
+            if (this.searchUnlisten) {
+                this.searchUnlisten();
+                this.searchUnlisten = null;
+            }
+            await this.loadEmails('');
+            return;
+        }
+        
         // Clear existing timeout
         if (this.searchTimeout) {
             clearTimeout(this.searchTimeout);
         }
+        
+        // Clean up any existing search listeners
+        if (this.searchUnlisten) {
+            this.searchUnlisten();
+            this.searchUnlisten = null;
+        }
+        
         // Set a new timeout to debounce the search
         this.searchTimeout = setTimeout(async () => {
             try {
-                await this.loadEmails(searchQuery);
+                const settings = appState.getSettings();
+                const keypair = appState.getKeypair();
+                const userEmail = settings.email_address ? settings.email_address : null;
+                const privateKey = keypair ? keypair.private_key : null;
+                
+                // Initialize search results accumulator (or keep existing if appending)
+                if (!append) {
+                    this.searchResults = [];
+                    this.searchOffset = 0;
+                }
+                this.searchInProgress = true;
+                
+                // Show searching state
+                const emailList = domManager.get('emailList');
+                if (emailList) {
+                    emailList.innerHTML = '<div class="text-center text-muted" style="padding: 20px;"><i class="fas fa-spinner fa-spin"></i> Searching...</div>';
+                }
+                
+                // Set up event listeners for incremental search results
+                this.searchUnlisten = await window.__TAURI__.event.listen('email-search-result', (event) => {
+                    const email = event.payload;
+                    this.searchResults.push(email);
+                    console.log(`[JS] Search result received: ${this.searchResults.length} emails found so far`);
+                    
+                    // Update UI incrementally
+                    this.updateSearchResults();
+                });
+                
+                // Listen for progress updates
+                const progressUnlisten = await window.__TAURI__.event.listen('email-search-progress', (event) => {
+                    const progress = event.payload;
+                    const emailList = domManager.get('emailList');
+                    if (emailList && this.searchInProgress) {
+                        const percent = Math.round((progress.processed / progress.total) * 100);
+                        emailList.innerHTML = `<div class="text-center text-muted" style="padding: 20px;">
+                            <i class="fas fa-spinner fa-spin"></i> Searching... ${percent}% (${progress.processed}/${progress.total} emails processed)
+                            ${this.searchResults.length > 0 ? `<br><small>Found ${this.searchResults.length} match${this.searchResults.length !== 1 ? 'es' : ''} so far</small>` : ''}
+                        </div>`;
+                    }
+                });
+                
+                // Listen for search completion
+                const completedUnlisten = await window.__TAURI__.event.listen('email-search-completed', async (event) => {
+                    const completion = event.payload;
+                    console.log(`[JS] Search completed: ${completion.total_found} total matches, has_more: ${completion.has_more}`);
+                    
+                    // Update has_more flag
+                    if (completion.has_more !== undefined) {
+                        this.searchHasMore = completion.has_more;
+                    }
+                    
+                    this.searchInProgress = false;
+                    
+                    // Clean up listeners
+                    if (this.searchUnlisten) {
+                        this.searchUnlisten();
+                        this.searchUnlisten = null;
+                    }
+                    progressUnlisten();
+                    completedUnlisten();
+                    
+                    // Load attachments for all search results (same logic as normal email loading)
+                    console.log(`[JS] Loading attachments for ${this.searchResults.length} search result emails`);
+                    const attachmentPromises = this.searchResults.map(async (email) => {
+                        try {
+                            // Convert email.id to integer - it might be a string
+                            const emailIdInt = parseInt(email.id);
+                            if (isNaN(emailIdInt)) {
+                                console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
+                                // Try to get email by message_id to get the real database ID
+                                if (email.message_id) {
+                                    try {
+                                        const emailData = await TauriService.getDbEmail(email.message_id);
+                                        if (emailData && emailData.id) {
+                                            const realId = parseInt(emailData.id);
+                                            if (!isNaN(realId)) {
+                                                email.attachments = await TauriService.getAttachmentsForEmail(realId);
+                                                console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
+                                                return;
+                                            }
+                                        }
+                                    } catch (e) {
+                                        console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
+                                    }
+                                }
+                                console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
+                                email.attachments = [];
+                                return;
+                            }
+                            
+                            const timeoutPromise = new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
+                            );
+                            email.attachments = await Promise.race([
+                                TauriService.getAttachmentsForEmail(emailIdInt),
+                                timeoutPromise
+                            ]);
+                            console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
+                        } catch (error) {
+                            console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
+                            email.attachments = [];
+                        }
+                    });
+                    
+                    await Promise.all(attachmentPromises);
+                    
+                    appState.setEmails(this.searchResults);
+                    await this.renderEmails(this.searchHasMore);
+                });
+                
+                // Reset search offset for new search
+                if (!append) {
+                    this.searchOffset = 0;
+                    this.searchResults = [];
+                }
+                
+                // Get page size from settings (already retrieved above)
+                const pageSize = settings.emails_per_page || 50;
+                
+                console.log('[JS] Starting search with query:', searchQuery, 'limit:', pageSize, 'offset:', this.searchOffset);
+                // Start the search (this will emit events as results are found)
+                const result = await TauriService.searchEmails(searchQuery, userEmail, privateKey, pageSize, this.searchOffset);
+                console.log('[JS] Search result:', result);
+                
+                // Update offset for next page
+                if (result && Array.isArray(result) && result.length === 2) {
+                    const [count, hasMore] = result;
+                    this.searchHasMore = hasMore;
+                    this.searchOffset += count;
+                }
+                
             } catch (error) {
-                console.error('Error filtering emails:', error);
+                console.error('Error searching emails:', error);
+                notificationService.showError('Search failed: ' + error.message);
+                
+                // Clean up listeners on error
+                if (this.searchUnlisten) {
+                    this.searchUnlisten();
+                    this.searchUnlisten = null;
+                }
+                this.searchInProgress = false;
+                
+                // Restore email list on error
+                await this.loadEmails('');
             }
-        }, 1500); // 1.5 second delay
+        }, 500); // 0.5 second delay for search
+    }
+    
+    async updateSearchResults() {
+        // Update UI with current search results incrementally
+        if (this.searchResults.length > 0 && this.searchInProgress) {
+            // Set emails and render incrementally
+            appState.setEmails(this.searchResults);
+            await this.renderEmails();
+        }
     }
 
     // Show email detail
@@ -1657,86 +2747,394 @@ class EmailService {
         try {
             const email = appState.getEmails().find(e => e.id === emailId);
             if (!email) return;
+            
+            // Mark email as read if it's unread
+            if (!email.is_read && email.message_id) {
+                (async () => {
+                    try {
+                        await this.markAsRead(email.message_id);
+                        // Update the email object in appState
+                        email.is_read = true;
+                        // Update the UI to remove unread indicator
+                        const emailElement = document.querySelector(`[data-email-id="${emailId}"]`);
+                        if (emailElement) {
+                            emailElement.classList.remove('unread');
+                        }
+                    } catch (error) {
+                        console.error('[JS] Failed to mark email as read:', error);
+                    }
+                })();
+            }
+            
             const emailList = domManager.get('emailList');
             const emailDetailView = document.getElementById('email-detail-view');
+            const emailDetailHeader = emailDetailView ? emailDetailView.querySelector('.email-detail-header') : null;
             const inboxActions = document.getElementById('inbox-actions');
             const inboxTitle = document.getElementById('inbox-title');
             if (emailList) emailList.style.display = 'none';
             if (emailDetailView) emailDetailView.style.display = 'flex';
             if (inboxActions) inboxActions.style.display = 'none';
-            if (inboxTitle) inboxTitle.textContent = 'Email Detail';
+            if (inboxTitle) inboxTitle.style.display = 'none';
             const emailDetailContent = document.getElementById('email-detail-content');
             if (emailDetailContent) {
-                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-                const nostrPubkey = email.nostr_pubkey;
-                console.log('Nostr pubkey for email:', nostrPubkey);
+                // Use email.body directly instead of cleanedBody to preserve encrypted message format
+                const emailBody = email.body || '';
+                const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+                console.log('Sender pubkey for email:', senderPubkey);
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
-                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                // Match on the original body, not cleaned version
+                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 let decryptedSubject = email.subject;
-                let decryptedBody = cleanedBody;
+                let decryptedBody = emailBody;
                 let originalSubject = email.subject;
                 let decryptionAttempted = false;
                 const keypair = appState.getKeypair();
-                if ((nostrPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+                if ((senderPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
                     (async () => {
+                        let manifestResult = null;
                         try {
                             if (isEncryptedSubject) {
                                 decryptedSubject = await this.decryptNostrMessageWithFallback(email, email.subject, keypair);
+                                // Check if decryption returned an error message
+                                if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
+                                    decryptedSubject = 'Unable to decrypt';
+                                }
                             }
                             if (encryptedBodyMatch) {
                                 const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
                                 try {
                                     // Try manifest decryption first
                                     console.log('[JS] Attempting manifest decryption for detail view...');
-                                    const manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
-                                                                    console.log('[JS] Detail view manifest result:', manifestResult);
-                                console.log('[JS] Manifest result type:', manifestResult.type);
-                                console.log('[JS] Manifest result body length:', manifestResult.body ? manifestResult.body.length : 'no body');
-                                
-                                if (manifestResult.type === 'manifest') {
-                                    console.log('[JS] Using manifest body for detail view:', manifestResult.body.substring(0, 100));
-                                    decryptedBody = manifestResult.body;
-                                } else if (manifestResult.type === 'legacy') {
-                                    console.log('[JS] Using legacy body for detail view:', manifestResult.body.substring(0, 100));
-                                    decryptedBody = manifestResult.body;
-                                } else {
-                                    // Fallback to legacy decryption
-                                    console.log('[JS] Falling back to legacy decryption for detail view...');
-                                    decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                }
+                                    manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                                    console.log('[JS] Detail view manifest result:', manifestResult);
+                                    console.log('[JS] Manifest result type:', manifestResult.type);
+                                    console.log('[JS] Manifest result body length:', manifestResult.body ? manifestResult.body.length : 'no body');
+                                    
+                                    if (manifestResult.type === 'manifest') {
+                                        console.log('[JS] Using manifest body for detail view:', manifestResult.body.substring(0, 100));
+                                        decryptedBody = manifestResult.body;
+                                    } else if (manifestResult.type === 'legacy') {
+                                        console.log('[JS] Using legacy body for detail view:', manifestResult.body.substring(0, 100));
+                                        decryptedBody = manifestResult.body;
+                                    } else {
+                                        // Fallback to legacy decryption
+                                        console.log('[JS] Falling back to legacy decryption for detail view...');
+                                        decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                        // Check if decryption returned an error message
+                                        if (decryptedBody && (decryptedBody.startsWith('Unable to decrypt') || decryptedBody.includes('Unable to decrypt'))) {
+                                            decryptedSubject = 'Unable to decrypt';
+                                            decryptedBody = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                        }
+                                    }
                                 } catch (e) {
                                     console.error('[JS] Manifest decryption failed for detail view:', e);
                                     // If manifest fails, try legacy decryption
-                                    decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                    try {
+                                        decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                        // Check if decryption returned an error message
+                                        if (decryptedBody && (decryptedBody.startsWith('Unable to decrypt') || decryptedBody.includes('Unable to decrypt'))) {
+                                            decryptedSubject = 'Unable to decrypt';
+                                            decryptedBody = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                        }
+                                    } catch (legacyErr) {
+                                        console.error('[JS] Legacy decryption also failed:', legacyErr);
+                                        decryptedSubject = 'Unable to decrypt';
+                                        decryptedBody = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                    }
                                 }
                             }
-                            updateDetail(decryptedSubject, decryptedBody);
+                            await updateDetail(decryptedSubject, decryptedBody, manifestResult);
                         } catch (err) {
-                            updateDetail('Could not decrypt', 'Could not decrypt');
+                            console.error('[JS] Error decrypting email detail:', err);
+                            // For inbox emails, decryption failure means our private key couldn't decrypt
+                            await updateDetail('Unable to decrypt', 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.', null);
                         }
                     })();
                 } else {
-                    updateDetail(decryptedSubject, decryptedBody);
+                    (async () => {
+                        await updateDetail(decryptedSubject, decryptedBody, null);
+                    })();
                 }
-                function updateDetail(subject, body) {
+                const updateDetail = async (subject, body, cachedManifestResult) => {
+                    // Render attachments - decrypt metadata for display
+                    console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
+                    
+                    // Ensure attachments array exists
+                    if (!email.attachments || !Array.isArray(email.attachments)) {
+                        console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
+                        email.attachments = [];
+                    }
+                    
+                    let attachmentsHtml = '';
+                    if (email.attachments && email.attachments.length > 0) {
+                        // For manifest-encrypted emails, we need to decrypt the manifest to get original metadata
+                        let attachmentDisplayData = [];
+                        
+                        const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
+                        const hasValidManifest = cachedManifestResult && 
+                                               cachedManifestResult.type === 'manifest' && 
+                                               cachedManifestResult.manifest && 
+                                               cachedManifestResult.manifest.attachments &&
+                                               cachedManifestResult.manifest.attachments.length > 0;
+                        
+                        if (hasManifestAttachments || hasValidManifest) {
+                            try {
+                                let manifestResult = cachedManifestResult;
+                                
+                                if (!manifestResult || manifestResult.type !== 'manifest') {
+                                    const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                                    if (encryptedBodyMatch) {
+                                        const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                                        const keypair = appState.getKeypair();
+                                        manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                                    }
+                                }
+                                
+                                if (manifestResult && manifestResult.type === 'manifest' && manifestResult.manifest && manifestResult.manifest.attachments) {
+                                    attachmentDisplayData = email.attachments.map(dbAttachment => {
+                                        const opaqueId = dbAttachment.filename.replace(/\.dat$/, '');
+                                        const manifestAttachment = manifestResult.manifest.attachments.find(ma => ma.id === opaqueId);
+                                        
+                                        if (manifestAttachment) {
+                                            return {
+                                                ...dbAttachment,
+                                                displayName: manifestAttachment.orig_filename,
+                                                encryptedFilename: dbAttachment.filename,
+                                                displaySize: manifestAttachment.orig_size || dbAttachment.size,
+                                                encryptedSize: manifestAttachment.cipher_size || dbAttachment.size,
+                                                displayMime: manifestAttachment.orig_mime || dbAttachment.content_type || dbAttachment.mime_type
+                                            };
+                                        } else {
+                                            return {
+                                                ...dbAttachment,
+                                                displayName: dbAttachment.filename,
+                                                encryptedFilename: dbAttachment.filename,
+                                                displaySize: dbAttachment.size,
+                                                encryptedSize: dbAttachment.size,
+                                                displayMime: dbAttachment.content_type || dbAttachment.mime_type
+                                            };
+                                        }
+                                    });
+                                } else {
+                                    attachmentDisplayData = email.attachments.map(att => ({
+                                        ...att,
+                                        displayName: att.filename,
+                                        encryptedFilename: att.filename,
+                                        displaySize: att.size,
+                                        encryptedSize: att.size,
+                                        displayMime: att.mime_type
+                                    }));
+                                }
+                            } catch (error) {
+                                console.error('Failed to decrypt manifest for attachment display:', error);
+                                attachmentDisplayData = email.attachments.map(att => ({
+                                    ...att,
+                                    displayName: att.filename,
+                                    encryptedFilename: att.filename,
+                                    displaySize: att.size,
+                                    encryptedSize: att.size,
+                                    displayMime: att.mime_type
+                                }));
+                            }
+                        } else {
+                            attachmentDisplayData = email.attachments.map(att => ({
+                                ...att,
+                                displayName: att.filename,
+                                encryptedFilename: att.filename,
+                                displaySize: att.size,
+                                encryptedSize: att.size,
+                                displayMime: att.mime_type
+                            }));
+                        }
+                        
+                        attachmentsHtml = `
+                        <div class="email-attachments" id="inbox-email-attachments" style="margin: 15px 0;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                <h4>Attachments (${attachmentDisplayData.length})</h4>
+                                <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllInboxAttachments(${email.id})" title="Download all attachments as ZIP">
+                                    <i class="fas fa-download"></i> Download All
+                                </button>
+                            </div>
+                            <div class="attachment-list">
+                                ${attachmentDisplayData.map(attachment => {
+                                    const sizeFormatted = (attachment.displaySize / 1024).toFixed(2) + ' KB';
+                                    const isEncrypted = attachment.encryption_method === 'manifest_aes';
+                                    // Default to display mode (decrypted/unlocked)
+                                    const statusIcon = isEncrypted ? '🔓' : '📄';
+                                    const statusText = isEncrypted ? 'Decrypted' : 'Plain';
+                                    const encryptedFilename = attachment.encryptedFilename || attachment.filename;
+                                    const decryptedFilename = attachment.displayName;
+                                    
+                                    return `
+                                    <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;" 
+                                         data-encrypted-filename="${Utils.escapeHtml(encryptedFilename)}" 
+                                         data-decrypted-filename="${Utils.escapeHtml(decryptedFilename)}"
+                                         data-encrypted-size="${attachment.encryptedSize || attachment.displaySize}"
+                                         data-decrypted-size="${attachment.displaySize}"
+                                         data-is-encrypted="${isEncrypted}">
+                                        <div class="attachment-info" style="display: flex; align-items: center;">
+                                            <i class="fas fa-file" style="margin-right: 10px;"></i>
+                                            <div class="attachment-details">
+                                                <div class="attachment-name" style="font-weight: bold;" data-display-name="${Utils.escapeHtml(decryptedFilename)}">${Utils.escapeHtml(decryptedFilename)}</div>
+                                                <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
+                                                    <span class="attachment-size">${sizeFormatted}</span> • <span class="attachment-status-icon">${statusIcon}</span> <span class="attachment-status-text">${statusText}</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="attachment-actions">
+                                            <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadInboxAttachment(${email.id}, ${attachment.id}, '${Utils.escapeHtml(encryptedFilename)}')">
+                                                <i class="fas fa-download"></i> Download
+                                            </button>
+                                        </div>
+                                    </div>`;
+                                }).join('')}
+                            </div>
+                        </div>`;
+                    }
+                    
+                    // Add signature verification indicator
+                    let signatureIndicator = '';
+                    if (email.signature_valid === true) {
+                        signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                    } else if (email.signature_valid === false) {
+                        signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+                    }
+                    
+                    // Get sender info for header
+                    const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                    const contacts = appState.getContacts();
+                    const senderContact = senderPubkey ? contacts.find(c => c.pubkey === senderPubkey) : null;
+                    
+                    // Avatar logic (same as dm-service.js)
+                    const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+                    let avatarSrc = defaultAvatar;
+                    const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+                    if (senderContact && !senderContact.picture_loading) {
+                        if (isValidDataUrl) {
+                            avatarSrc = senderContact.picture_data_url;
+                        } else if (senderContact.picture) {
+                            avatarSrc = senderContact.picture;
+                        }
+                    }
+                    
+                    const senderName = senderContact ? (senderContact.name || senderContact.display_name || email.from) : email.from;
+                    const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+                    
+                    // Update page header (back button and reply button)
+                    if (emailDetailHeader) {
+                        emailDetailHeader.innerHTML = `
+                            <button id="back-to-inbox" class="btn btn-secondary">
+                                <i class="fas fa-arrow-left"></i> Back to Inbox
+                            </button>
+                            <button id="reply-to-email" class="btn btn-primary" style="margin-left: 10px;">
+                                <i class="fas fa-reply"></i> Reply
+                            </button>
+                        `;
+                        // Re-attach back button event listener
+                        const backBtn = emailDetailHeader.querySelector('#back-to-inbox');
+                        if (backBtn) {
+                            backBtn.addEventListener('click', () => {
+                                if (emailList) emailList.style.display = 'block';
+                                if (emailDetailView) emailDetailView.style.display = 'none';
+                                if (inboxActions) inboxActions.style.display = 'flex';
+                                if (inboxTitle) {
+                                    inboxTitle.textContent = 'Inbox';
+                                    inboxTitle.style.display = '';
+                                }
+                            });
+                        }
+                        // Attach reply button event listener
+                        const replyBtn = emailDetailHeader.querySelector('#reply-to-email');
+                        if (replyBtn) {
+                            replyBtn.addEventListener('click', () => {
+                                this.replyToEmail(email, subject, body);
+                            });
+                        }
+                    }
+                    
                     emailDetailContent.innerHTML =
                         `<div class="email-detail">
+<h2 class="email-detail-subject">${Utils.escapeHtml(subject)}</h2>
+<div class="email-detail-card">
+<div class="email-sender-header">
+<div class="email-sender-row">
+<img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
+${signatureIndicator}
+</div>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
+<details class="email-metadata-details">
+<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
 <div class="email-detail-header vertical" id="inbox-email-header-info">
 <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
-<div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
 </div>
-<pre id="inbox-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+</details>
+</div>
+<pre id="inbox-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="inbox-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
+<pre id="inbox-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}</pre>
+${attachmentsHtml}
+</div>
 <button id="inbox-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
-<pre id="inbox-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
 </div>`;
                     const toggleRawBtn = document.getElementById('inbox-toggle-raw-btn');
                     const headerInfo = document.getElementById('inbox-email-header-info');
                     const rawHeaderInfo = document.getElementById('inbox-raw-header-info');
                     const bodyInfo = document.getElementById('inbox-email-body-info');
                     const rawBodyInfo = document.getElementById('inbox-raw-body-info');
+                    const attachmentsInfo = document.getElementById('inbox-email-attachments');
+                    
+                    // Add event listeners for invalid signature indicator in sender header
+                    if (email.signature_valid === false) {
+                        const sigIndicator = emailDetailContent.querySelector('.email-sender-header .signature-indicator.invalid');
+                        if (sigIndicator) {
+                            const originalText = sigIndicator.textContent;
+                            sigIndicator.addEventListener('mouseenter', () => {
+                                sigIndicator.textContent = 'recheck signature?';
+                            });
+                            sigIndicator.addEventListener('mouseleave', () => {
+                                sigIndicator.textContent = originalText;
+                            });
+                            sigIndicator.addEventListener('click', async (e) => {
+                                e.stopPropagation();
+                                const messageId = sigIndicator.dataset.messageId;
+                                if (messageId) {
+                                    sigIndicator.textContent = 'checking...';
+                                    sigIndicator.style.opacity = '0.7';
+                                    try {
+                                        const result = await TauriService.recheckEmailSignature(messageId);
+                                        if (result === true) {
+                                            email.signature_valid = true;
+                                            sigIndicator.className = 'signature-indicator verified';
+                                            sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
+                                            sigIndicator.title = 'Verified Nostr signature';
+                                            sigIndicator.removeAttribute('data-message-id');
+                                            sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                            notificationService.showSuccess('Signature verified successfully!');
+                                        } else if (result === false) {
+                                            sigIndicator.textContent = originalText;
+                                            notificationService.showError('Signature is still invalid.');
+                                        } else {
+                                            sigIndicator.textContent = originalText;
+                                            notificationService.showError('Could not verify signature.');
+                                        }
+                                    } catch (error) {
+                                        console.error('[JS] Failed to recheck signature:', error);
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showError('Failed to recheck signature: ' + error);
+                                    } finally {
+                                        sigIndicator.style.opacity = '1';
+                                    }
+                                }
+                            });
+                        }
+                    }
                     
                     if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
                         // Remove any existing event listeners by cloning the button
@@ -1755,9 +3153,53 @@ class EmailService {
                                 bodyInfo.style.display = 'none';
                                 rawBodyInfo.style.display = 'block';
                                 newToggleBtn.textContent = 'Show Display Content';
-                                // Only move button if it's not already in the right position
-                                if (newToggleBtn.nextSibling !== rawBodyInfo.nextSibling) {
-                                    rawBodyInfo.parentNode.insertBefore(newToggleBtn, rawBodyInfo.nextSibling);
+                                
+                                // Hide metadata details when showing raw content
+                                const metadataDetails = headerInfo.closest('.email-metadata-details');
+                                if (metadataDetails) {
+                                    metadataDetails.style.display = 'none';
+                                }
+                                
+                                // Update attachment filenames, sizes, and icons to show encrypted versions
+                                if (attachmentsInfo) {
+                                    const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
+                                    attachmentItems.forEach(item => {
+                                        const encryptedFilename = item.getAttribute('data-encrypted-filename');
+                                        const encryptedSize = item.getAttribute('data-encrypted-size');
+                                        const isEncrypted = item.getAttribute('data-is-encrypted') === 'true';
+                                        const nameElement = item.querySelector('.attachment-name');
+                                        const sizeElement = item.querySelector('.attachment-size');
+                                        const iconElement = item.querySelector('.attachment-status-icon');
+                                        const textElement = item.querySelector('.attachment-status-text');
+                                        
+                                        if (encryptedFilename && nameElement) {
+                                            nameElement.textContent = encryptedFilename;
+                                        }
+                                        
+                                        // Update size to show encrypted size
+                                        if (encryptedSize && sizeElement) {
+                                            const sizeFormatted = (parseFloat(encryptedSize) / 1024).toFixed(2) + ' KB';
+                                            sizeElement.textContent = sizeFormatted;
+                                        }
+                                        
+                                        // Update icon and text to show encrypted state
+                                        if (isEncrypted && iconElement && textElement) {
+                                            iconElement.textContent = '🔒';
+                                            textElement.textContent = 'Encrypted';
+                                        }
+                                    });
+                                }
+                                
+                                // Move attachments after raw body if they exist
+                                if (attachmentsInfo && attachmentsInfo.parentNode) {
+                                    attachmentsInfo.parentNode.removeChild(attachmentsInfo);
+                                    rawBodyInfo.parentNode.insertBefore(attachmentsInfo, rawBodyInfo.nextSibling);
+                                }
+                                
+                                // Move button outside the card (after the card closes)
+                                const emailDetailCard = headerInfo.closest('.email-detail-card');
+                                if (emailDetailCard && emailDetailCard.parentNode) {
+                                    emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
                                 }
                             } else {
                                 headerInfo.classList.remove('hidden-header');
@@ -1765,9 +3207,53 @@ class EmailService {
                                 bodyInfo.style.display = 'block';
                                 rawBodyInfo.style.display = 'none';
                                 newToggleBtn.textContent = 'Show Raw Content';
-                                // Only move button if it's not already in the right position
-                                if (newToggleBtn.nextSibling !== bodyInfo.nextSibling) {
-                                    bodyInfo.parentNode.insertBefore(newToggleBtn, bodyInfo.nextSibling);
+                                
+                                // Show metadata details when showing display content
+                                const metadataDetails = headerInfo.closest('.email-metadata-details');
+                                if (metadataDetails) {
+                                    metadataDetails.style.display = '';
+                                }
+                                
+                                // Update attachment filenames, sizes, and icons to show decrypted versions
+                                if (attachmentsInfo) {
+                                    const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
+                                    attachmentItems.forEach(item => {
+                                        const decryptedFilename = item.getAttribute('data-decrypted-filename');
+                                        const decryptedSize = item.getAttribute('data-decrypted-size');
+                                        const isEncrypted = item.getAttribute('data-is-encrypted') === 'true';
+                                        const nameElement = item.querySelector('.attachment-name');
+                                        const sizeElement = item.querySelector('.attachment-size');
+                                        const iconElement = item.querySelector('.attachment-status-icon');
+                                        const textElement = item.querySelector('.attachment-status-text');
+                                        
+                                        if (decryptedFilename && nameElement) {
+                                            nameElement.textContent = decryptedFilename;
+                                        }
+                                        
+                                        // Update size to show decrypted size
+                                        if (decryptedSize && sizeElement) {
+                                            const sizeFormatted = (parseFloat(decryptedSize) / 1024).toFixed(2) + ' KB';
+                                            sizeElement.textContent = sizeFormatted;
+                                        }
+                                        
+                                        // Update icon and text to show decrypted state
+                                        if (isEncrypted && iconElement && textElement) {
+                                            iconElement.textContent = '🔓';
+                                            textElement.textContent = 'Decrypted';
+                                        }
+                                    });
+                                }
+                                
+                                // Move attachments after regular body if they exist
+                                if (attachmentsInfo && attachmentsInfo.parentNode) {
+                                    attachmentsInfo.parentNode.removeChild(attachmentsInfo);
+                                    bodyInfo.parentNode.insertBefore(attachmentsInfo, bodyInfo.nextSibling);
+                                }
+                                
+                                // Keep button outside the card (after the card closes)
+                                const emailDetailCard = headerInfo.closest('.email-detail-card');
+                                if (emailDetailCard && emailDetailCard.parentNode) {
+                                    emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
                                 }
                             }
                         });
@@ -1779,6 +3265,137 @@ class EmailService {
         }
     }
 
+    // Reply to email - navigate to compose with pre-filled fields
+    replyToEmail(email, decryptedSubject, decryptedBody) {
+        try {
+            // Get the sender's email address (the "from" field)
+            const replyTo = email.from || '';
+            
+            // Format the subject with "Re: " prefix (avoid duplicate "Re:")
+            let replySubject = decryptedSubject || email.subject || '';
+            if (!replySubject.startsWith('Re:') && !replySubject.startsWith('re:')) {
+                replySubject = 'Re: ' + replySubject;
+            }
+            
+            // Format the body with quoted original message
+            // Split by lines and add > prefix to each line
+            const originalBody = decryptedBody || email.body || '';
+            let replyBody = '';
+            
+            if (originalBody.trim()) {
+                const quotedBody = originalBody
+                    .split('\n')
+                    .map(line => '> ' + line)
+                    .join('\n');
+                
+                // Add a blank line before the quoted text
+                replyBody = '\n\n' + quotedBody;
+            }
+            
+            // Navigate to compose tab
+            if (window.app && window.app.switchTab) {
+                window.app.switchTab('compose');
+            } else {
+                // Fallback: click the compose tab button
+                const composeTab = document.querySelector('[data-tab="compose"]');
+                if (composeTab) {
+                    composeTab.click();
+                }
+            }
+            
+            // Wait a moment for the tab to switch, then fill in the form fields
+            setTimeout(() => {
+                domManager.setValue('toAddress', replyTo);
+                domManager.setValue('subject', replySubject);
+                domManager.setValue('messageBody', replyBody);
+                
+                // Get the sender's pubkey (recipient when replying)
+                let senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                const pubkeyValue = document.getElementById('recipient-pubkey-value');
+                
+                // If no pubkey in email, try to look it up by email address
+                if (!senderPubkey && replyTo) {
+                    try {
+                        const contacts = appState.getContacts();
+                        const senderContact = contacts.find(contact => 
+                            contact.email && contact.email.toLowerCase() === replyTo.toLowerCase()
+                        );
+                        if (senderContact && senderContact.pubkey) {
+                            senderPubkey = senderContact.pubkey;
+                        }
+                    } catch (e) {
+                        console.log('[JS] Could not look up pubkey by email:', e);
+                    }
+                }
+                
+                if (senderPubkey) {
+                    // Try to find the contact by pubkey
+                    const contacts = appState.getContacts();
+                    const senderContact = contacts.find(contact => contact.pubkey === senderPubkey);
+                    
+                    if (senderContact) {
+                        // Set as selected Nostr contact
+                        this.selectedNostrContact = senderContact;
+                        domManager.setValue('nostrContactSelect', senderPubkey);
+                        
+                        // Display the recipient pubkey
+                        if (pubkeyDisplay && pubkeyValue) {
+                            pubkeyValue.textContent = senderPubkey;
+                            pubkeyDisplay.style.display = 'block';
+                        }
+                        
+                        // Style the toAddress input for Nostr encryption
+                        const toAddressInput = domManager.get('toAddress');
+                        if (toAddressInput) {
+                            toAddressInput.style.borderColor = '#667eea';
+                            toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
+                        }
+                    } else {
+                        // Pubkey exists but contact not found - still display it
+                        this.selectedNostrContact = null;
+                        domManager.setValue('nostrContactSelect', '');
+                        
+                        // Display the recipient pubkey even if contact not found
+                        if (pubkeyDisplay && pubkeyValue) {
+                            pubkeyValue.textContent = senderPubkey;
+                            pubkeyDisplay.style.display = 'block';
+                        }
+                        
+                        // Style the toAddress input for Nostr encryption
+                        const toAddressInput = domManager.get('toAddress');
+                        if (toAddressInput) {
+                            toAddressInput.style.borderColor = '#667eea';
+                            toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
+                        }
+                    }
+                } else {
+                    // No pubkey available - clear any selected Nostr contact
+                    domManager.setValue('nostrContactSelect', '');
+                    this.selectedNostrContact = null;
+                    
+                    // Hide the pubkey display
+                    if (pubkeyDisplay) {
+                        pubkeyDisplay.style.display = 'none';
+                    }
+                    
+                    // Reset the toAddress input styling
+                    const toAddressInput = domManager.get('toAddress');
+                    if (toAddressInput) {
+                        toAddressInput.style.borderColor = '';
+                        toAddressInput.style.backgroundColor = '';
+                        toAddressInput.classList.remove('hidden');
+                    }
+                }
+            }, 100);
+        } catch (error) {
+            console.error('Error replying to email:', error);
+            if (window.notificationService) {
+                window.notificationService.showError('Failed to open reply: ' + error.message);
+            }
+        }
+    }
+
     // Show email list
     showEmailList() {
         try {
@@ -1787,11 +3404,17 @@ class EmailService {
             const emailDetailView = document.getElementById('email-detail-view');
             const inboxActions = document.getElementById('inbox-actions');
             const inboxTitle = document.getElementById('inbox-title');
-            
+
             if (emailList) emailList.style.display = 'block';
             if (emailDetailView) emailDetailView.style.display = 'none';
             if (inboxActions) inboxActions.style.display = 'flex';
-            if (inboxTitle) inboxTitle.textContent = 'Inbox';
+            
+            // Re-render emails to update unread indicators
+            this.renderEmails();
+            if (inboxTitle) {
+                inboxTitle.textContent = 'Inbox';
+                inboxTitle.style.display = '';
+            }
             
         } catch (error) {
             console.error('Error showing email list:', error);
@@ -1873,7 +3496,8 @@ class EmailService {
             body_html: null,
             received_at: new Date().toISOString(),
             is_nostr_encrypted: this.selectedNostrContact ? true : false,
-            nostr_pubkey: this.selectedNostrContact ? this.selectedNostrContact.pubkey : null,
+            sender_pubkey: null, // Will be set when sending
+            recipient_pubkey: this.selectedNostrContact ? this.selectedNostrContact.pubkey : null,
             raw_headers: null,
             is_draft: true,
             is_read: false,
@@ -1907,15 +3531,32 @@ class EmailService {
         }
     }
 
-    async loadDrafts() {
+    async deleteSentEmail(messageId) {
         try {
-            const userEmail = appState.getSettings().email_address;
-            const drafts = await TauriService.getDrafts(userEmail);
-            console.log('Loaded drafts:', drafts);
-            return drafts;
+            const settings = appState.getSettings();
+            const userEmail = settings?.email_address || null;
+            // Pass the message_id and user_email to backend
+            // Backend will handle server deletion if EmailConfig can be constructed
+            await TauriService.deleteSentEmail(messageId, userEmail);
         } catch (error) {
-            console.error('Error loading drafts:', error);
-            return [];
+            console.error('Error deleting sent email:', error);
+            throw error;
+        }
+    }
+
+    // Delete sent email from the sent list
+    async deleteSentEmailFromList(messageId) {
+        try {
+            if (confirm('Are you sure you want to delete this sent email?')) {
+                await this.deleteSentEmail(messageId);
+                notificationService.showSuccess('Sent email deleted successfully!');
+                
+                // Reload the sent emails list to reflect the deletion
+                await this.loadSentEmails();
+            }
+        } catch (error) {
+            console.error('Error deleting sent email:', error);
+            notificationService.showError('Failed to delete sent email: ' + error);
         }
     }
 
@@ -1982,7 +3623,15 @@ class EmailService {
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
                 use_tls: settings.use_tls,
-                private_key: appState.getKeypair() ? appState.getKeypair().private_key : null
+                // Only include private key if we should sign (check auto-sign setting or manual sign)
+                private_key: (() => {
+                    const settings = appState.getSettings();
+                    const autoSign = settings && settings.automatically_sign !== false;
+                    const signBtn = domManager.get('signBtn');
+                    const isManuallySigned = signBtn && signBtn.dataset.signed === 'true';
+                    const shouldSign = autoSign || isManuallySigned;
+                    return shouldSign && appState.getKeypair() ? appState.getKeypair().private_key : null;
+                })()
             };
             
             console.log('[JS] Testing email connections with config:', {
@@ -1994,26 +3643,48 @@ class EmailService {
                 email: emailConfig.email_address
             });
             
-            // Test both IMAP and SMTP connections
+            // Helper function to add timeout to a promise
+            const withTimeout = (promise, timeoutMs, name) => {
+                return Promise.race([
+                    promise,
+                    new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error(`${name} test timed out after ${timeoutMs/1000} seconds`)), timeoutMs)
+                    )
+                ]);
+            };
+            
+            // Test both IMAP and SMTP connections with 30-second timeout each
             const results = await Promise.allSettled([
-                TauriService.testImapConnection(emailConfig),
-                TauriService.testSmtpConnection(emailConfig)
+                withTimeout(TauriService.testImapConnection(emailConfig), 30000, 'IMAP'),
+                withTimeout(TauriService.testSmtpConnection(emailConfig), 30000, 'SMTP')
             ]);
             
             const imapResult = results[0];
             const smtpResult = results[1];
             
+            // Extract error messages, handling both Error objects and strings
+            const getErrorMessage = (result) => {
+                if (result.status === 'rejected') {
+                    if (result.reason instanceof Error) {
+                        return result.reason.message || result.reason.toString();
+                    }
+                    return result.reason || 'Unknown error';
+                }
+                return null;
+            };
+            
+            const imapError = getErrorMessage(imapResult);
+            const smtpError = getErrorMessage(smtpResult);
+            
             // Check results and provide comprehensive feedback
             if (imapResult.status === 'fulfilled' && smtpResult.status === 'fulfilled') {
                 notificationService.showSuccess('✅ Email connection test successful!\n\n• IMAP: Connected and authenticated\n• SMTP: Connected and authenticated\n\nYour email settings are working correctly.');
             } else if (imapResult.status === 'fulfilled' && smtpResult.status === 'rejected') {
-                notificationService.showError(`⚠️ Partial success:\n\n✅ IMAP: Connected and authenticated\n❌ SMTP: ${smtpResult.reason}\n\nYou can receive emails but may have issues sending them.`);
+                notificationService.showError(`⚠️ Partial success:\n\n✅ IMAP: Connected and authenticated\n❌ SMTP: ${smtpError}\n\nYou can receive emails but may have issues sending them.`);
             } else if (imapResult.status === 'rejected' && smtpResult.status === 'fulfilled') {
-                notificationService.showError(`⚠️ Partial success:\n\n❌ IMAP: ${imapResult.reason}\n✅ SMTP: Connected and authenticated\n\nYou can send emails but may have issues receiving them.`);
+                notificationService.showError(`⚠️ Partial success:\n\n❌ IMAP: ${imapError}\n✅ SMTP: Connected and authenticated\n\nYou can send emails but may have issues receiving them.`);
             } else {
-                const imapError = imapResult.status === 'rejected' ? imapResult.reason : 'Unknown error';
-                const smtpError = smtpResult.status === 'rejected' ? smtpResult.reason : 'Unknown error';
-                notificationService.showError(`❌ Email connection test failed:\n\n• IMAP: ${imapError}\n• SMTP: ${smtpError}\n\nPlease check your email settings and try again.`);
+                notificationService.showError(`❌ Email connection test failed:\n\n• IMAP: ${imapError || 'Unknown error'}\n• SMTP: ${smtpError || 'Unknown error'}\n\nPlease check your email settings and try again.`);
             }
             
         } catch (error) {
@@ -2175,7 +3846,9 @@ class EmailService {
                 if (body) {
                     console.log('[JS] Encrypting body with AES...');
                     const bodyAesKey = await this.generateSymmetricKey();
-                    const encryptedBodyData = await this.encryptWithAES(btoa(body), bodyAesKey);
+                    // Convert UTF-8 string to base64 properly (handles multi-byte characters)
+                    const bodyBase64 = btoa(unescape(encodeURIComponent(body)));
+                    const encryptedBodyData = await this.encryptWithAES(bodyBase64, bodyAesKey);
                     const bodySha256 = await this.calculateSHA256(encryptedBodyData);
                     
                     manifest.body = {
@@ -2262,6 +3935,9 @@ class EmailService {
                 
                 domManager.setValue('messageBody', armoredManifest.trim());
                 
+                // Clear signature when encrypting (body state changed)
+                this.clearSignature();
+                
                 // Update attachment list display
                 this.renderAttachmentList();
                 
@@ -2313,6 +3989,64 @@ class EmailService {
         }
     }
 
+    // Encrypt email fields in memory without modifying DOM (for preview purposes)
+    async encryptEmailFieldsInMemory(subject, body, contact) {
+        console.log('[JS] encryptEmailFieldsInMemory called');
+        
+        if (!contact) {
+            console.log('[JS] No contact provided for encryption');
+            return { encryptedSubject: subject, encryptedBody: body };
+        }
+        
+        if (!appState.hasKeypair()) {
+            console.log('[JS] No keypair available');
+            return { encryptedSubject: subject, encryptedBody: body };
+        }
+        
+        const privkey = appState.getKeypair().private_key;
+        const pubkey = contact.pubkey;
+        console.log('[JS] Using privkey:', privkey.substring(0, 20) + '...');
+        console.log('[JS] Using pubkey:', pubkey);
+        
+        // Get the selected encryption algorithm
+        const settings = appState.getSettings();
+        const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+        console.log('[JS] Using encryption algorithm:', encryptionAlgorithm);
+        
+        try {
+            // Encrypt subject
+            let encryptedSubject = subject;
+            if (subject) {
+                console.log('[JS] Encrypting subject in memory...');
+                encryptedSubject = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, subject, encryptionAlgorithm);
+                console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
+            }
+            
+            // Encrypt body directly with NIP and wrap in ASCII armor
+            let encryptedBody = body;
+            if (body) {
+                console.log('[JS] Encrypting body in memory...');
+                encryptedBody = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, body, encryptionAlgorithm);
+                console.log('[JS] Body encrypted:', encryptedBody.substring(0, 50) + '...');
+                
+                // Add ASCII armor around the encrypted body
+                const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
+                const armoredBody = [
+                    `-----BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE-----`,
+                    encryptedBody.trim(),
+                    `-----END NOSTR ${armorType} ENCRYPTED MESSAGE-----`
+                ].join('\n');
+                encryptedBody = armoredBody.trim();
+            }
+            
+            return { encryptedSubject, encryptedBody };
+        } catch (error) {
+            console.error('[JS] Encryption error in memory:', error);
+            // Return original values on error
+            return { encryptedSubject: subject, encryptedBody: body };
+        }
+    }
+
     // Generate a UUID for message IDs
     generateUUID() {
         return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -2342,115 +4076,450 @@ class EmailService {
     }
 
     // Render sent emails
-    async renderSentEmails() {
+    async renderSentEmails(showLoadMore = false) {
         const sentList = domManager.get('sentList');
-        if (!sentList) return;
+        if (!sentList) {
+            console.error('[JS] renderSentEmails: sentList element not found');
+            return;
+        }
         try {
-            sentList.innerHTML = '';
+            // Remove existing Load More button if it exists
+            const existingLoadMoreBtn = document.getElementById('load-more-sent-emails');
+            if (existingLoadMoreBtn) {
+                existingLoadMoreBtn.remove();
+            }
+            
+            // Get all emails from state
             const emails = appState.getSentEmails();
+            
             if (!emails || emails.length === 0) {
                 sentList.innerHTML = '<div class="text-center text-muted">No sent emails found</div>';
                 return;
             }
-            for (const email of emails) {
-                const emailElement = document.createElement('div');
-                emailElement.className = 'email-item';
-                emailElement.dataset.emailId = email.id;
-                // Format the date
-                const emailDate = new Date(email.date);
-                const now = new Date();
-                const diffInHours = (now - emailDate) / (1000 * 60 * 60);
-                let dateDisplay;
-                if (diffInHours < 24) {
-                    dateDisplay = emailDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                } else if (diffInHours < 168) {
-                    dateDisplay = emailDate.toLocaleDateString([], { weekday: 'short' });
-                } else {
-                    dateDisplay = emailDate.toLocaleDateString();
+            
+            // Always re-render all emails (simpler approach)
+            sentList.innerHTML = '';
+            
+            console.log(`[JS] renderSentEmails: Rendering ${emails.length} sent emails`);
+            
+            // Check if we should hide unverified messages
+            const settings = appState.getSettings();
+            const hideUnverified = settings && settings.hide_unsigned_messages === true;
+            
+            // Process emails in parallel with timeout protection
+            const emailPromises = emails
+                .filter(email => {
+                    // Filter out unverified emails if hideUnverified is enabled
+                    if (hideUnverified && email.signature_valid !== true) {
+                        return false;
+                    }
+                    return true;
+                })
+                .map(async (email) => {
+                try {
+                    // Add timeout to prevent hanging on decryption
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Decryption timeout')), 5000)
+                    );
+                    const renderPromise = this.renderSentEmailItem(email);
+                    return await Promise.race([renderPromise, timeoutPromise]);
+                } catch (error) {
+                    console.error(`[JS] Error rendering email ${email.id}:`, error);
+                    // Return a basic email item even if rendering fails
+                    return this.renderSentEmailItemBasic(email);
                 }
-                let previewText = email.body ? Utils.escapeHtml(email.body.substring(0, 100)) : '';
-                let showSubject = true;
-                let previewSubject = email.subject;
-                
-                // Detect any NOSTR NIP-X ENCRYPTED MESSAGE (same as inbox)
-                const armorRegex = /-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/;
-                if (email.body && armorRegex.test(email.body)) {
-                    const keypair = appState.getKeypair();
-                    if (!keypair) {
-                        previewText = 'Unable to decrypt: no keypair';
-                    } else {
+            });
+            
+            // Wait for all emails to be rendered (with timeout protection)
+            const renderedItems = await Promise.allSettled(emailPromises);
+            
+            // Add all successfully rendered items to the list (filter out null results)
+            let renderedCount = 0;
+            for (const result of renderedItems) {
+                if (result.status === 'fulfilled' && result.value) {
+                    sentList.appendChild(result.value);
+                    renderedCount++;
+                }
+            }
+            
+            // Show message if no emails were rendered (possibly all filtered out)
+            if (renderedCount === 0) {
+                const settings = appState.getSettings();
+                const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+                const hideUnverified = settings && settings.hide_unsigned_messages === true;
+                if (hideUndecryptable && emails.length > 0) {
+                    sentList.innerHTML = '<div class="text-center text-muted">No decryptable emails found. All emails are encrypted for a different keypair.</div>';
+                } else if (hideUnverified && emails.length > 0) {
+                    sentList.innerHTML = '<div class="text-center text-muted">No verified emails found. All emails have missing or invalid signatures.</div>';
+                } else {
+                    sentList.innerHTML = '<div class="text-center text-muted">No sent emails found</div>';
+                }
+                return;
+            }
+            
+            // Add Load More button if there might be more emails
+            if (showLoadMore) {
+                const loadMoreBtn = document.createElement('button');
+                loadMoreBtn.id = 'load-more-sent-emails';
+                loadMoreBtn.className = 'btn btn-secondary';
+                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
+                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                loadMoreBtn.addEventListener('click', () => this.loadMoreSentEmails());
+                sentList.appendChild(loadMoreBtn);
+            }
+            
+            console.log(`[JS] renderSentEmails: Successfully rendered ${renderedItems.filter(r => r.status === 'fulfilled').length} emails`);
+        } catch (error) {
+            console.error('[JS] Error in renderSentEmails:', error);
+            sentList.innerHTML = '<div class="text-center text-muted">Error loading sent emails</div>';
+        }
+    }
+    
+    // Render a single sent email item (with decryption)
+    async renderSentEmailItem(email) {
+        const emailElement = document.createElement('div');
+        emailElement.className = 'email-item';
+        emailElement.dataset.emailId = email.id;
+        
+        // Format the date
+        const emailDate = new Date(email.date);
+        const now = new Date();
+        const diffInHours = (now - emailDate) / (1000 * 60 * 60);
+        let dateDisplay;
+        if (diffInHours < 24) {
+            dateDisplay = emailDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } else if (diffInHours < 168) {
+            dateDisplay = emailDate.toLocaleDateString([], { weekday: 'short' });
+        } else {
+            dateDisplay = emailDate.toLocaleDateString();
+        }
+        
+        let previewText = email.body ? Utils.escapeHtml(email.body.substring(0, 100)) : '';
+        let showSubject = true;
+        let previewSubject = email.subject;
+        
+        // Detect any NOSTR NIP-X ENCRYPTED MESSAGE (same as inbox)
+        const armorRegex = /-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/;
+        if (email.body && armorRegex.test(email.body)) {
+            const keypair = appState.getKeypair();
+            if (!keypair) {
+                previewText = 'Unable to decrypt: no keypair';
+            } else {
                         // Decrypt subject if it looks encrypted (ASCII armor not required)
                         if (Utils.isLikelyEncryptedContent(email.subject)) {
                             try {
-                                previewSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
+                                const decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
+                                // Check if decryption returned an error message
+                                if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
+                                    previewSubject = 'Could not decrypt';
+                                } else if (decryptedSubject) {
+                                    previewSubject = decryptedSubject;
+                                } else {
+                                    previewSubject = 'Could not decrypt';
+                                }
                             } catch (e) {
                                 previewSubject = 'Could not decrypt';
                             }
                         }
                         // Decrypt body - try manifest format first, then fallback to legacy
                         const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
-                        if (encryptedBodyMatch) {
-                            const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                            try {
-                                // Try sent manifest decryption first
-                                const manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
-                                if (manifestResult.type === 'manifest') {
-                                    previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
-                                    showSubject = true;
-                                } else if (manifestResult.type === 'legacy') {
-                                    previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
-                                    showSubject = true;
-                                } else {
-                                    // Fallback to legacy decryption
-                                    const decrypted = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
-                                    previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                    showSubject = true;
-                                }
-                            } catch (e) {
-                                // If manifest fails, try legacy decryption
-                                try {
-                                    const decrypted = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
-                                    previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                    showSubject = true;
-                                } catch (legacyError) {
-                                    previewText = 'Could not decrypt';
-                                }
+                if (encryptedBodyMatch) {
+                    const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                    try {
+                        // Try sent manifest decryption first
+                        const manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
+                        if (manifestResult.type === 'manifest') {
+                            previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
+                            showSubject = true;
+                        } else if (manifestResult.type === 'legacy') {
+                            previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
+                            showSubject = true;
+                        } else {
+                            // Fallback to legacy decryption
+                            const decrypted = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
+                            // Check if decryption returned an error message
+                            if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
+                                previewText = 'Could not decrypt';
+                            } else if (decrypted) {
+                                previewText = Utils.escapeHtml(decrypted.substring(0, 100));
+                                showSubject = true;
+                            } else {
+                                previewText = 'Could not decrypt';
                             }
                         }
-                    }
-                } else {
-                    // If subject looks like encrypted base64, try to decrypt (no ASCII armor required)
-                    if (Utils.isLikelyEncryptedContent(email.subject)) {
+                    } catch (e) {
+                        // If manifest fails, try legacy decryption
                         try {
-                            previewSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
-                        } catch (e) {
-                            previewSubject = 'Could not decrypt';
+                            const decrypted = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
+                            // Check if decryption returned an error message
+                            if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
+                                previewText = 'Could not decrypt';
+                            } else if (decrypted) {
+                                previewText = Utils.escapeHtml(decrypted.substring(0, 100));
+                                showSubject = true;
+                            } else {
+                                previewText = 'Could not decrypt';
+                            }
+                        } catch (legacyError) {
+                            previewText = 'Could not decrypt';
                         }
                     }
-                    previewText = Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
-                    if (email.body && email.body.length > 100) previewText += '...';
-                    showSubject = true;
                 }
-                // Add attachment indicator
-                const attachmentCount = email.attachments ? email.attachments.length : 0;
-                console.log(`[JS] Rendering email ${email.id}: ${attachmentCount} attachments`, email.attachments);
-                const attachmentIndicator = attachmentCount > 0 ? 
-                    `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
-
-                emailElement.innerHTML = `
-                    <div class="email-header">
-                        <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator}</div>
-                        <div class="email-date">${dateDisplay}</div>
-                    </div>
-                    ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
-                    <div class="email-preview">${previewText}</div>
-                `;
-                emailElement.addEventListener('click', () => this.showSentDetail(email.id));
-                sentList.appendChild(emailElement);
             }
-        } catch (error) {
-            console.error('Error rendering sent emails:', error);
+        } else {
+            // If subject looks like encrypted base64, try to decrypt (no ASCII armor required)
+            if (Utils.isLikelyEncryptedContent(email.subject)) {
+                const keypair = appState.getKeypair();
+                if (keypair) {
+                    try {
+                        const decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
+                        // Check if decryption returned an error message
+                        if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
+                            previewSubject = 'Could not decrypt';
+                        } else if (decryptedSubject) {
+                            previewSubject = decryptedSubject;
+                        } else {
+                            previewSubject = 'Could not decrypt';
+                        }
+                    } catch (e) {
+                        previewSubject = 'Could not decrypt';
+                    }
+                }
+            }
+            previewText = Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
+            if (email.body && email.body.length > 100) previewText += '...';
+            showSubject = true;
         }
+        
+        // Check if email is decryptable (for filtering)
+        const settings = appState.getSettings();
+        const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+        const isDecryptable = !previewText.includes('Unable to decrypt') && 
+                            !previewText.includes('Your private key could not decrypt this message') &&
+                            !previewText.includes('could not decrypt') &&
+                            !previewText.includes('Could not decrypt') &&
+                            previewText !== 'Unable to decrypt: no keypair' &&
+                            previewSubject !== 'Could not decrypt';
+        
+        // Return null if we should hide undecryptable emails and this email can't be decrypted
+        if (hideUndecryptable && !isDecryptable) {
+            return null;
+        }
+        
+        // Add attachment indicator
+        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        const attachmentIndicator = attachmentCount > 0 ? 
+            `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
+
+        // Add signature verification indicator
+        let signatureIndicator = '';
+        // Check signature_valid - handle both boolean and null/undefined cases
+        if (email.signature_valid === true || email.signature_valid === 1) {
+            signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+        } else if (email.signature_valid === false || email.signature_valid === 0) {
+            signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+        }
+
+        // Add transport authentication indicator
+        let transportAuthIndicator = '';
+        if (email.transport_auth_verified === true || email.transport_auth_verified === 1) {
+            transportAuthIndicator = `<span class="transport-auth-indicator verified" title="Email transport authentication verified (DMARC/DKIM/SPF)"><i class="fas fa-envelope"></i> Email Verified</span>`;
+        } else if (email.transport_auth_verified === false || email.transport_auth_verified === 0) {
+            transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
+        }
+
+        // Get recipient contact for avatar (similar to inbox getting sender contact)
+        const recipientEmail = email.to;
+        const contacts = appState.getContacts();
+        let recipientContact = null;
+        
+        if (recipientEmail) {
+            // Normalize Gmail addresses (remove + aliases)
+            const normalizeGmail = (email) => {
+                const lower = email.trim().toLowerCase();
+                if (lower.includes('@gmail.com')) {
+                    const [local, domain] = lower.split('@');
+                    const normalizedLocal = local.split('+')[0];
+                    return `${normalizedLocal}@${domain}`;
+                }
+                return lower;
+            };
+            
+            const normalizedEmail = normalizeGmail(recipientEmail);
+            // Try both original and normalized email
+            recipientContact = contacts.find(c => {
+                if (!c.email) return false;
+                const contactEmail = c.email.trim().toLowerCase();
+                return contactEmail === recipientEmail.toLowerCase() || contactEmail === normalizedEmail;
+            });
+        }
+        
+        // Avatar fallback logic (same as inbox)
+        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+        let avatarSrc = defaultAvatar;
+        let avatarClass = 'contact-avatar';
+        const isValidDataUrl = recipientContact && recipientContact.picture_data_url && recipientContact.picture_data_url.startsWith('data:image') && recipientContact.picture_data_url !== 'data:application/octet-stream;base64,';
+        if (recipientContact && recipientContact.picture_loading) {
+            avatarClass += ' loading';
+        } else if (isValidDataUrl) {
+            avatarSrc = recipientContact.picture_data_url;
+        } else if (recipientContact && recipientContact.picture_data_url && !isValidDataUrl && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        } else if (recipientContact && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        }
+
+        emailElement.innerHTML = `
+            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.to)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <div class="email-content">
+                <div class="email-header">
+                    <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
+                    <div class="email-date">${dateDisplay}</div>
+                </div>
+                ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
+                <div class="email-preview">${previewText}</div>
+            </div>
+            <div class="email-actions">
+                <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteSentEmailFromList('${email.message_id}')">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+        `;
+        
+        // Add hover and click handlers for invalid signature indicator
+        if (email.signature_valid === false) {
+            const sigIndicator = emailElement.querySelector('.signature-indicator.invalid');
+            if (sigIndicator) {
+                const originalText = sigIndicator.textContent;
+                sigIndicator.addEventListener('mouseenter', () => {
+                    sigIndicator.textContent = 'recheck signature?';
+                });
+                sigIndicator.addEventListener('mouseleave', () => {
+                    sigIndicator.textContent = originalText;
+                });
+                sigIndicator.addEventListener('click', async (e) => {
+                    e.stopPropagation(); // Prevent email detail from opening
+                    const messageId = sigIndicator.dataset.messageId;
+                    if (messageId) {
+                        sigIndicator.textContent = 'checking...';
+                        sigIndicator.style.opacity = '0.7';
+                        try {
+                            const result = await TauriService.recheckEmailSignature(messageId);
+                            if (result === true) {
+                                // Update the email object
+                                email.signature_valid = true;
+                                // Re-render this email item
+                                sigIndicator.className = 'signature-indicator verified';
+                                sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
+                                sigIndicator.title = 'Verified Nostr signature';
+                                sigIndicator.removeAttribute('data-message-id');
+                                // Remove hover handlers
+                                sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                notificationService.showSuccess('Signature verified successfully!');
+                            } else if (result === false) {
+                                sigIndicator.textContent = originalText;
+                                notificationService.showError('Signature is still invalid');
+                            } else {
+                                sigIndicator.textContent = originalText;
+                                notificationService.showWarning('Could not verify signature (missing pubkey or signature)');
+                            }
+                        } catch (error) {
+                            console.error('[JS] Failed to recheck signature:', error);
+                            sigIndicator.textContent = originalText;
+                            notificationService.showError('Failed to recheck signature: ' + error);
+                        } finally {
+                            sigIndicator.style.opacity = '1';
+                        }
+                    }
+                });
+            }
+        }
+        emailElement.addEventListener('click', () => this.showSentDetail(email.id));
+        return emailElement;
+    }
+    
+    // Render a basic sent email item (without decryption, used as fallback)
+    renderSentEmailItemBasic(email) {
+        const emailElement = document.createElement('div');
+        emailElement.className = 'email-item';
+        emailElement.dataset.emailId = email.id;
+        
+        // Format the date
+        const emailDate = new Date(email.date);
+        const now = new Date();
+        const diffInHours = (now - emailDate) / (1000 * 60 * 60);
+        let dateDisplay;
+        if (diffInHours < 24) {
+            dateDisplay = emailDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } else if (diffInHours < 168) {
+            dateDisplay = emailDate.toLocaleDateString([], { weekday: 'short' });
+        } else {
+            dateDisplay = emailDate.toLocaleDateString();
+        }
+        
+        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        const attachmentIndicator = attachmentCount > 0 ? 
+            `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
+
+        // Get recipient contact for avatar (similar to inbox getting sender contact)
+        const recipientEmail = email.to;
+        const contacts = appState.getContacts();
+        let recipientContact = null;
+        
+        if (recipientEmail) {
+            // Normalize Gmail addresses (remove + aliases)
+            const normalizeGmail = (email) => {
+                const lower = email.trim().toLowerCase();
+                if (lower.includes('@gmail.com')) {
+                    const [local, domain] = lower.split('@');
+                    const normalizedLocal = local.split('+')[0];
+                    return `${normalizedLocal}@${domain}`;
+                }
+                return lower;
+            };
+            
+            const normalizedEmail = normalizeGmail(recipientEmail);
+            // Try both original and normalized email
+            recipientContact = contacts.find(c => {
+                if (!c.email) return false;
+                const contactEmail = c.email.trim().toLowerCase();
+                return contactEmail === recipientEmail.toLowerCase() || contactEmail === normalizedEmail;
+            });
+        }
+        
+        // Avatar fallback logic (same as inbox)
+        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+        let avatarSrc = defaultAvatar;
+        let avatarClass = 'contact-avatar';
+        const isValidDataUrl = recipientContact && recipientContact.picture_data_url && recipientContact.picture_data_url.startsWith('data:image') && recipientContact.picture_data_url !== 'data:application/octet-stream;base64,';
+        if (recipientContact && recipientContact.picture_loading) {
+            avatarClass += ' loading';
+        } else if (isValidDataUrl) {
+            avatarSrc = recipientContact.picture_data_url;
+        } else if (recipientContact && recipientContact.picture_data_url && !isValidDataUrl && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        } else if (recipientContact && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        }
+
+        emailElement.innerHTML = `
+            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.to)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <div class="email-content">
+                <div class="email-header">
+                    <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator}</div>
+                    <div class="email-date">${dateDisplay}</div>
+                </div>
+                <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
+                <div class="email-preview">${Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '')}</div>
+            </div>
+            <div class="email-actions">
+                <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteSentEmailFromList('${email.message_id}')">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+        `;
+        emailElement.addEventListener('click', () => this.showSentDetail(email.id));
+        return emailElement;
     }
 
     // Show sent email detail
@@ -2465,218 +4534,1091 @@ class EmailService {
             if (sentList) sentList.style.display = 'none';
             if (sentDetailView) sentDetailView.style.display = 'flex';
             if (sentActions) sentActions.style.display = 'none';
-            if (sentTitle) sentTitle.textContent = 'Sent Email Detail';
+            if (sentTitle) sentTitle.style.display = 'none';
             const sentDetailContent = domManager.get('sentDetailContent');
+            
+            // Show loading state immediately to prevent freeze
             if (sentDetailContent) {
-                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-                const nostrPubkey = email.nostr_pubkey;
-                const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
-                // Use generic NIP-X regex (same as inbox)
-                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
-                let decryptedSubject = email.subject;
-                let decryptedBody = cleanedBody;
-                const keypair = appState.getKeypair();
-                if ((nostrPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
-                    (async () => {
-                        try {
-                            // Decrypt subject if it looks encrypted (ASCII armor not required)
-                            if (isEncryptedSubject) {
-                                decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
-                            }
-                            if (encryptedBodyMatch) {
-                                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                                try {
-                                    // Try sent manifest decryption first
-                                    const manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
-                                    if (manifestResult.type === 'manifest') {
-                                        decryptedBody = manifestResult.body;
-                                    } else if (manifestResult.type === 'legacy') {
-                                        decryptedBody = manifestResult.body;
-                                    } else {
-                                        // Fallback to legacy decryption
-                                        decryptedBody = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
-                                    }
-                                } catch (e) {
-                                    // If manifest fails, try legacy decryption
-                                    decryptedBody = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
-                                }
-                            }
-                            await updateDetail(decryptedSubject, decryptedBody);
-                        } catch (err) {
-                            await updateDetail('Could not decrypt', 'Could not decrypt');
-                        }
-                    })();
-                } else {
-                    updateDetail(decryptedSubject, decryptedBody);
+                sentDetailContent.innerHTML = '<div class="loading-spinner"><i class="fas fa-spinner fa-spin"></i> Loading email...</div>';
+            }
+            
+            // Use setTimeout to allow UI to update before starting decryption
+            setTimeout(() => {
+                this._loadSentEmailDetail(email, sentDetailContent);
+            }, 10);
+        } catch (error) {
+            console.error('Error showing sent email detail:', error);
+        }
+    }
+    
+    // Internal method to load sent email detail (separated for async handling)
+    async _loadSentEmailDetail(email, sentDetailContent) {
+        if (!sentDetailContent) return;
+        
+        // Refresh email from appState to ensure we have the latest recipient_pubkey
+        const freshEmail = appState.getSentEmails().find(e => e.id === email.id || e.message_id === email.message_id);
+        if (freshEmail) {
+            // Update the email object with fresh data
+            Object.assign(email, freshEmail);
+        }
+        
+        // Check if recipient_pubkey is missing and email is encrypted
+        // Note: We specifically check for recipient_pubkey, not nostr_pubkey (which might be sender's pubkey)
+        const hasRecipientPubkey = !!(email.recipient_pubkey);
+        const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
+        const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+        const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+        const isEncrypted = isEncryptedSubject || encryptedBodyMatch;
+        
+        console.log(`[JS] _loadSentEmailDetail: Email ${email.id}, encrypted: ${isEncrypted}, hasRecipientPubkey: ${hasRecipientPubkey}, recipient_pubkey: ${email.recipient_pubkey || 'none'}`);
+        
+        // If encrypted but no recipient_pubkey, automatically search through all contacts
+        if (isEncrypted && !hasRecipientPubkey && appState.getKeypair()) {
+            console.log(`[JS] _loadSentEmailDetail: Starting contact search for email ${email.id}`);
+            const foundPubkey = await this._searchContactsForRecipientPubkey(email);
+            if (foundPubkey) {
+                console.log(`[JS] _loadSentEmailDetail: Found pubkey for email ${email.id}, reloading detail`);
+                // Refresh email from appState after saving (pubkey was saved in _searchContactsForRecipientPubkey)
+                const updatedEmail = appState.getSentEmails().find(e => e.id === email.id || e.message_id === email.message_id);
+                if (updatedEmail) {
+                    Object.assign(email, updatedEmail);
                 }
-                async function updateDetail(subject, body) {
-                    // Render attachments - decrypt metadata for display
-                    console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
-                    let attachmentsHtml = '';
-                    if (email.attachments && email.attachments.length > 0) {
-                        // For manifest-encrypted emails, we need to decrypt the manifest to get original metadata
-                        let attachmentDisplayData = [];
-                        
-                        if (email.attachments.some(att => att.encryption_method === 'manifest_aes')) {
-                            try {
-                                // Extract encrypted content from the body
-                                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
-                                if (!encryptedBodyMatch) {
-                                    throw new Error('No encrypted content found in email body');
-                                }
-                                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                                const keypair = appState.getKeypair();
-                                
-                                // Decrypt the manifest to get original attachment metadata
-                                const manifestResult = await emailService.decryptSentManifestMessage(email, encryptedContent, keypair);
-                                if (manifestResult.type === 'manifest' && manifestResult.manifest && manifestResult.manifest.attachments) {
-                                    // Map database attachments to manifest metadata
-                                    attachmentDisplayData = email.attachments.map(dbAttachment => {
-                                        if (dbAttachment.encryption_method === 'manifest_aes') {
-                                            // Find corresponding manifest entry by opaque ID
-                                            const opaqueId = dbAttachment.filename.replace('.dat', ''); // a1.dat -> a1
-                                            const manifestAttachment = manifestResult.manifest.attachments.find(ma => ma.id === opaqueId);
-                                            
-                                            if (manifestAttachment) {
-                                                return {
-                                                    ...dbAttachment,
-                                                    displayName: manifestAttachment.orig_filename,
-                                                    displaySize: manifestAttachment.orig_size || dbAttachment.size,
-                                                    displayMime: manifestAttachment.orig_mime || dbAttachment.mime_type
-                                                };
-                                            }
-                                        }
-                                        return {
-                                            ...dbAttachment,
-                                            displayName: dbAttachment.filename,
-                                            displaySize: dbAttachment.size,
-                                            displayMime: dbAttachment.mime_type
-                                        };
-                                    });
-                                } else {
-                                    // Fallback to database data
-                                    attachmentDisplayData = email.attachments.map(att => ({
-                                        ...att,
-                                        displayName: att.filename,
-                                        displaySize: att.size,
-                                        displayMime: att.mime_type
-                                    }));
-                                }
-                            } catch (error) {
-                                console.error('Failed to decrypt manifest for attachment display:', error);
-                                // Fallback to database data
-                                attachmentDisplayData = email.attachments.map(att => ({
-                                    ...att,
-                                    displayName: att.filename,
-                                    displaySize: att.size,
-                                    displayMime: att.mime_type
-                                }));
+                // Reload the detail view with the updated pubkey
+                await this._loadSentEmailDetail(email, sentDetailContent);
+                return;
+            } else {
+                // No matching pubkey found, show error but still allow viewing raw content
+                console.log(`[JS] _loadSentEmailDetail: No pubkey found for email ${email.id}`);
+                const rawBody = email.raw_body || email.body || '';
+                const rawHeaders = email.raw_headers || '';
+                
+                // Add signature verification indicator
+                let signatureIndicator = '';
+                // Check signature_valid - handle both boolean and null/undefined cases
+                if (email.signature_valid === true || email.signature_valid === 1) {
+                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                } else if (email.signature_valid === false || email.signature_valid === 0) {
+                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+                }
+                
+                // Get sender info (for sent emails, sender is us)
+                // IMPORTANT: For sent emails, we are the sender, so we must use OUR pubkey, not email.recipient_pubkey
+                // Always use profile cache directly (same as loadProfile) to ensure we get our own profile
+                const myKeypair = appState.getKeypair();
+                const myPubkey = myKeypair ? myKeypair.public_key : null;
+                let senderContact = null;
+                
+                // Debug: Log what pubkeys we have to ensure we're using the right one
+                console.log(`[Sent Email Detail Error] Our pubkey: ${myPubkey ? myPubkey.substring(0, 16) + '...' : 'null'}`);
+                console.log(`[Sent Email Detail Error] Email sender_pubkey: ${email.sender_pubkey || 'null'}`);
+                console.log(`[Sent Email Detail Error] Email recipient_pubkey: ${email.recipient_pubkey || 'null'}`);
+                
+                if (myPubkey) {
+                    // Look up our profile in contacts list (user's profile is now added privately)
+                    const contacts = appState.getContacts();
+                    senderContact = contacts.find(c => c.pubkey === myPubkey) || null;
+                    if (senderContact) {
+                        console.log(`[Sent Email Detail Error] Found our profile in contacts - name: ${senderContact.name}`);
+                    } else {
+                        // Fallback to database lookup
+                        console.log(`[Sent Email Detail Error] Not found in contacts, trying database lookup`);
+                        try {
+                            const ourProfile = await DatabaseService.getContact(myPubkey);
+                            if (ourProfile) {
+                                console.log(`[Sent Email Detail Error] Found our profile in database - name: ${ourProfile.name}`);
+                                senderContact = {
+                                    pubkey: myPubkey,
+                                    name: ourProfile.name || ourProfile.display_name,
+                                    display_name: ourProfile.display_name,
+                                    picture: ourProfile.picture_url || ourProfile.picture,
+                                    picture_data_url: ourProfile.picture_data_url
+                                };
                             }
-                        } else {
-                            // Plain attachments - use database data directly
-                            attachmentDisplayData = email.attachments.map(att => ({
-                                ...att,
-                                displayName: att.filename,
-                                displaySize: att.size,
-                                displayMime: att.mime_type
-                            }));
+                        } catch (e) {
+                            console.error(`[Sent Email Detail Error] Error fetching our profile from database:`, e);
                         }
-                        
-                        attachmentsHtml = `
-                        <div class="email-attachments" style="margin: 15px 0;">
-                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                                <h4>Attachments (${attachmentDisplayData.length})</h4>
-                                <button class="btn btn-sm btn-outline-success" onclick="emailService.downloadAllSentAttachments(${email.id})" title="Download all attachments as ZIP">
-                                    <i class="fas fa-download"></i> Download All
-                                </button>
-                            </div>
-                            <div class="attachment-list">
-                                ${attachmentDisplayData.map(attachment => {
-                                    const sizeFormatted = (attachment.displaySize / 1024).toFixed(2) + ' KB';
-                                    const isEncrypted = attachment.encryption_method === 'manifest_aes';
-                                    const statusIcon = isEncrypted ? '🔓' : '📄';
-                                    const statusText = isEncrypted ? 'Decrypted' : 'Plain';
-                                    
-                                    return `
-                                    <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;">
-                                        <div class="attachment-info" style="display: flex; align-items: center;">
-                                            <i class="fas fa-file" style="margin-right: 10px;"></i>
-                                            <div class="attachment-details">
-                                                <div class="attachment-name" style="font-weight: bold;">${Utils.escapeHtml(attachment.displayName)}</div>
-                                                <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
-                                                    ${sizeFormatted} • ${statusIcon} ${statusText}
-                                                </div>
-                                            </div>
-                                        </div>
-                                        <div class="attachment-actions">
-                                            <button class="btn btn-sm btn-outline-primary" onclick="emailService.downloadSentAttachment(${email.id}, ${attachment.id})">
-                                                <i class="fas fa-download"></i> Download
-                                            </button>
-                                        </div>
-                                    </div>`;
-                                }).join('')}
-                            </div>
-                        </div>`;
                     }
-                    
-                    sentDetailContent.innerHTML =
-                        `<div class="email-detail">
+                } else {
+                    console.log(`[Sent Email Detail Error] No pubkey available`);
+                }
+                
+                // Avatar logic
+                const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+                let avatarSrc = defaultAvatar;
+                const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+                if (senderContact && !senderContact.picture_loading) {
+                    if (isValidDataUrl) {
+                        avatarSrc = senderContact.picture_data_url;
+                    } else if (senderContact.picture) {
+                        avatarSrc = senderContact.picture;
+                    }
+                }
+                
+                const senderName = senderContact ? (senderContact.name || senderContact.display_name || email.from) : email.from;
+                const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+                
+                // Update page header (just back button, no subject)
+                const sentDetailView = domManager.get('sentDetailView');
+                const sentDetailHeader = sentDetailView ? sentDetailView.querySelector('.email-detail-header') : null;
+                if (sentDetailHeader) {
+                    sentDetailHeader.innerHTML = `
+                        <button id="back-to-sent" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Sent
+                        </button>
+                    `;
+                    // Re-attach back button event listener
+                    const backBtn = sentDetailHeader.querySelector('#back-to-sent');
+                    if (backBtn) {
+                        backBtn.addEventListener('click', () => {
+                            const sentList = domManager.get('sentList');
+                            const sentActions = domManager.get('sentActions');
+                            const sentTitle = domManager.get('sentTitle');
+                            if (sentList) sentList.style.display = 'block';
+                            if (sentDetailView) sentDetailView.style.display = 'none';
+                            if (sentActions) sentActions.style.display = 'flex';
+                            if (sentTitle) {
+                                sentTitle.textContent = 'Sent';
+                                sentTitle.style.display = '';
+                            }
+                        });
+                    }
+                }
+                
+                sentDetailContent.innerHTML =
+                    `<div class="email-detail">
+<h2 class="email-detail-subject">${Utils.escapeHtml(email.subject)}</h2>
+<div class="email-detail-card">
+<div class="email-sender-header">
+<div class="email-sender-row">
+<img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
+${signatureIndicator}
+</div>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
+<details class="email-metadata-details">
+<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
 <div class="email-detail-header vertical" id="sent-email-header-info">
 <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
-<div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
 </div>
-<pre id="sent-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
-${attachmentsHtml}
-<div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
+</details>
+</div>
+<div class="error" style="margin-bottom: 15px;">Cannot decrypt: Recipient pubkey not found in contacts. The email could not be decrypted with any known contact pubkey.</div>
+<pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(rawHeaders)}</pre>
+<div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(rawBody).replace(/\n/g, '<br>')}</div>
+<pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(rawBody)}</pre>
+</div>
 <button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
-<pre id="sent-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
 </div>`;
-                    const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
-                    const headerInfo = document.getElementById('sent-email-header-info');
-                    const rawHeaderInfo = document.getElementById('sent-raw-header-info');
-                    const bodyInfo = document.getElementById('sent-email-body-info');
-                    const rawBodyInfo = document.getElementById('sent-raw-body-info');
-                    
-                    if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
-                        // Remove any existing event listeners by cloning the button
-                        const newToggleBtn = toggleRawBtn.cloneNode(true);
-                        toggleRawBtn.parentNode.replaceChild(newToggleBtn, toggleRawBtn);
-                        
-                        let showingRaw = false;
-                        newToggleBtn.addEventListener('click', (event) => {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            
-                            showingRaw = !showingRaw;
-                            if (showingRaw) {
-                                headerInfo.classList.add('hidden-header');
-                                rawHeaderInfo.style.display = 'block';
-                                bodyInfo.style.display = 'none';
-                                rawBodyInfo.style.display = 'block';
-                                newToggleBtn.textContent = 'Show Display Content';
-                                // Only move button if it's not already in the right position
-                                if (newToggleBtn.nextSibling !== rawBodyInfo.nextSibling) {
-                                    rawBodyInfo.parentNode.insertBefore(newToggleBtn, rawBodyInfo.nextSibling);
-                                }
-                            } else {
-                                headerInfo.classList.remove('hidden-header');
-                                rawHeaderInfo.style.display = 'none';
-                                bodyInfo.style.display = 'block';
-                                rawBodyInfo.style.display = 'none';
-                                newToggleBtn.textContent = 'Show Raw Content';
-                                // Only move button if it's not already in the right position
-                                if (newToggleBtn.nextSibling !== bodyInfo.nextSibling) {
-                                    bodyInfo.parentNode.insertBefore(newToggleBtn, bodyInfo.nextSibling);
+                
+                // Add event listeners for invalid signature indicator in sender header
+                if (email.signature_valid === false) {
+                    const sigIndicator = sentDetailContent.querySelector('.email-sender-header .signature-indicator.invalid');
+                    if (sigIndicator) {
+                        const originalText = sigIndicator.textContent;
+                        sigIndicator.addEventListener('mouseenter', () => {
+                            sigIndicator.textContent = 'recheck signature?';
+                        });
+                        sigIndicator.addEventListener('mouseleave', () => {
+                            sigIndicator.textContent = originalText;
+                        });
+                        sigIndicator.addEventListener('click', async (e) => {
+                            e.stopPropagation();
+                            const messageId = sigIndicator.dataset.messageId;
+                            if (messageId) {
+                                sigIndicator.textContent = 'checking...';
+                                sigIndicator.style.opacity = '0.7';
+                                try {
+                                    const result = await TauriService.recheckEmailSignature(messageId);
+                                    if (result === true) {
+                                        email.signature_valid = true;
+                                        sigIndicator.className = 'signature-indicator verified';
+                                        sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
+                                        sigIndicator.title = 'Verified Nostr signature';
+                                        sigIndicator.removeAttribute('data-message-id');
+                                        sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                        notificationService.showSuccess('Signature verified successfully!');
+                                    } else if (result === false) {
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showError('Signature is still invalid.');
+                                    } else {
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showError('Could not verify signature.');
+                                    }
+                                } catch (error) {
+                                    console.error('[JS] Failed to recheck signature:', error);
+                                    sigIndicator.textContent = originalText;
+                                    notificationService.showError('Failed to recheck signature: ' + error);
+                                } finally {
+                                    sigIndicator.style.opacity = '1';
                                 }
                             }
                         });
                     }
                 }
+                
+                // Set up the toggle button for raw content
+                const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
+                const headerInfo = document.getElementById('sent-email-header-info');
+                const rawHeaderInfo = document.getElementById('sent-raw-header-info');
+                const bodyInfo = document.getElementById('sent-email-body-info');
+                const rawBodyInfo = document.getElementById('sent-raw-body-info');
+                
+                if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
+                    // Remove any existing event listeners by cloning the button
+                    const newToggleBtn = toggleRawBtn.cloneNode(true);
+                    toggleRawBtn.parentNode.replaceChild(newToggleBtn, toggleRawBtn);
+                    
+                    let showingRaw = false;
+                    newToggleBtn.addEventListener('click', (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        
+                        showingRaw = !showingRaw;
+                        if (showingRaw) {
+                            headerInfo.classList.add('hidden-header');
+                            rawHeaderInfo.style.display = 'block';
+                            bodyInfo.style.display = 'none';
+                            rawBodyInfo.style.display = 'block';
+                            newToggleBtn.textContent = 'Show Display Content';
+                            
+                            // Hide metadata details when showing raw content
+                            const metadataDetails = headerInfo.closest('.email-metadata-details');
+                            if (metadataDetails) {
+                                metadataDetails.style.display = 'none';
+                            }
+                        } else {
+                            headerInfo.classList.remove('hidden-header');
+                            rawHeaderInfo.style.display = 'none';
+                            bodyInfo.style.display = 'block';
+                            rawBodyInfo.style.display = 'none';
+                            newToggleBtn.textContent = 'Show Raw Content';
+                            
+                            // Show metadata details when showing display content
+                            const metadataDetails = headerInfo.closest('.email-metadata-details');
+                            if (metadataDetails) {
+                                metadataDetails.style.display = '';
+                            }
+                        }
+                    });
+                }
+                return;
+            }
+        }
+        
+        // Define updateDetail function first (before it's called)
+        const updateDetail = async (subject, body, cachedManifestResult) => {
+            // Render attachments - decrypt metadata for display
+            console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
+            console.log(`[JS] Email object:`, email);
+            console.log(`[JS] Email.attachments type:`, typeof email.attachments, Array.isArray(email.attachments));
+            
+            // Ensure attachments array exists
+            if (!email.attachments || !Array.isArray(email.attachments)) {
+                console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
+                email.attachments = [];
+            }
+            
+            // Log attachment details for debugging
+            if (email.attachments && email.attachments.length > 0) {
+                console.log('[JS] Attachment details:');
+                email.attachments.forEach((att, idx) => {
+                    console.log(`[JS]   Attachment ${idx}:`, JSON.stringify({
+                        filename: att.filename,
+                        encryption_method: att.encryption_method,
+                        is_encrypted: att.is_encrypted,
+                        content_type: att.content_type,
+                        size: att.size
+                    }, null, 2));
+                    console.log(`[JS]   Attachment ${idx} all keys:`, Object.keys(att));
+                });
+            }
+            
+            let attachmentsHtml = '';
+            if (email.attachments && email.attachments.length > 0) {
+                // For manifest-encrypted emails, we need to decrypt the manifest to get original metadata
+                let attachmentDisplayData = [];
+                
+                console.log('[JS] Checking if attachments are manifest-encrypted...');
+                console.log('[JS] Attachment encryption methods:', email.attachments.map(a => a.encryption_method));
+                const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
+                console.log('[JS] Has manifest attachments:', hasManifestAttachments);
+                console.log('[JS] Cached manifest result:', cachedManifestResult);
+                console.log('[JS] Cached manifest result type:', cachedManifestResult ? cachedManifestResult.type : 'null');
+                
+                // Use manifest if:
+                // 1. Attachments are marked as manifest_aes, OR
+                // 2. We have a cached manifest result with attachments (fallback for attachments not marked correctly)
+                const hasValidManifest = cachedManifestResult && 
+                                       cachedManifestResult.type === 'manifest' && 
+                                       cachedManifestResult.manifest && 
+                                       cachedManifestResult.manifest.attachments &&
+                                       cachedManifestResult.manifest.attachments.length > 0;
+                
+                if (hasManifestAttachments || hasValidManifest) {
+                    console.log('[JS] Using manifest for attachment mapping (hasManifestAttachments:', hasManifestAttachments, ', hasValidManifest:', hasValidManifest, ')');
+                    try {
+                        // Use cached manifest result if available (already decrypted above)
+                        let manifestResult = cachedManifestResult;
+                        console.log('[JS] Initial manifestResult from cache:', manifestResult);
+                        console.log('[JS] manifestResult type:', manifestResult ? manifestResult.type : 'null');
+                        
+                        // Only decrypt if we don't have a cached result
+                        if (!manifestResult || manifestResult.type !== 'manifest') {
+                            console.log('[JS] No valid cached manifest, need to decrypt');
+                            console.log('[JS] No cached manifest, attempting to decrypt...');
+                            console.log('[JS] Email body length:', email.body ? email.body.length : 0);
+                            console.log('[JS] Email body preview:', email.body ? email.body.substring(0, 200) : 'null');
+                            
+                            // Extract encrypted content from the body
+                            const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                            if (!encryptedBodyMatch) {
+                                console.warn('[JS] No encrypted content found in email body using regex, trying raw body');
+                                // Try using the body directly if it's already base64 encoded
+                                const keypair = appState.getKeypair();
+                                try {
+                                    manifestResult = await this.decryptSentManifestMessage(email, email.body.replace(/\s+/g, ''), keypair);
+                                } catch (e) {
+                                    console.error('[JS] Failed to decrypt with raw body:', e);
+                                    throw new Error('No encrypted content found in email body');
+                                }
+                            } else {
+                                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                                console.log('[JS] Extracted encrypted content, length:', encryptedContent.length);
+                                const keypair = appState.getKeypair();
+                                
+                                // Decrypt the manifest to get original attachment metadata
+                                manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
+                            }
+                        }
+                        
+                        console.log('[JS] Manifest result:', manifestResult);
+                        console.log('[JS] Manifest type:', manifestResult ? manifestResult.type : 'null');
+                        console.log('[JS] Manifest attachments:', manifestResult && manifestResult.manifest ? manifestResult.manifest.attachments : 'null');
+                        
+                        if (manifestResult && manifestResult.type === 'manifest' && manifestResult.manifest && manifestResult.manifest.attachments) {
+                            console.log('[JS] Using manifest to map attachments, manifest has', manifestResult.manifest.attachments.length, 'attachments');
+                            // Map database attachments to manifest metadata
+                            attachmentDisplayData = email.attachments.map(dbAttachment => {
+                                console.log('[JS] Processing attachment:', dbAttachment.filename, 'encryption_method:', dbAttachment.encryption_method);
+                                
+                                // Try to match attachment with manifest entry by opaque ID
+                                // Extract opaque ID from filename (e.g., "a1.dat" -> "a1")
+                                const opaqueId = dbAttachment.filename.replace(/\.dat$/, ''); // Remove .dat extension
+                                console.log('[JS] Looking for manifest attachment with id:', opaqueId, 'from filename:', dbAttachment.filename);
+                                console.log('[JS] Available manifest attachment IDs:', manifestResult.manifest.attachments.map(a => a.id));
+                                
+                                const manifestAttachment = manifestResult.manifest.attachments.find(ma => ma.id === opaqueId);
+                                
+                                if (manifestAttachment) {
+                                    console.log('[JS] Found manifest attachment:', manifestAttachment);
+                                    return {
+                                        ...dbAttachment,
+                                        displayName: manifestAttachment.orig_filename,
+                                        encryptedFilename: dbAttachment.filename, // Store encrypted filename
+                                        displaySize: manifestAttachment.orig_size || dbAttachment.size,
+                                        encryptedSize: manifestAttachment.cipher_size || dbAttachment.size,
+                                        displayMime: manifestAttachment.orig_mime || dbAttachment.content_type || dbAttachment.mime_type
+                                    };
+                                } else {
+                                    console.warn('[JS] No manifest attachment found for id:', opaqueId, 'available ids:', manifestResult.manifest.attachments.map(a => a.id));
+                                    // Fallback to database data
+                                    return {
+                                        ...dbAttachment,
+                                        displayName: dbAttachment.filename,
+                                        encryptedFilename: dbAttachment.filename, // Same for non-encrypted
+                                        displaySize: dbAttachment.size,
+                                        encryptedSize: dbAttachment.size,
+                                        displayMime: dbAttachment.content_type || dbAttachment.mime_type
+                                    };
+                                }
+                            });
+                        } else {
+                            // Fallback to database data
+                            attachmentDisplayData = email.attachments.map(att => ({
+                                ...att,
+                                displayName: att.filename,
+                                encryptedFilename: att.filename, // Same for non-encrypted
+                                displaySize: att.size,
+                                encryptedSize: att.size,
+                                displayMime: att.mime_type
+                            }));
+                        }
+                    } catch (error) {
+                        console.error('Failed to decrypt manifest for attachment display:', error);
+                        // Fallback to database data
+                        attachmentDisplayData = email.attachments.map(att => ({
+                            ...att,
+                            displayName: att.filename,
+                            encryptedFilename: att.filename, // Same for non-encrypted
+                            displaySize: att.size,
+                            encryptedSize: att.size,
+                            displayMime: att.mime_type
+                        }));
+                    }
+                } else {
+                    // Plain attachments - use database data directly
+                    attachmentDisplayData = email.attachments.map(att => ({
+                        ...att,
+                        displayName: att.filename,
+                        encryptedFilename: att.filename, // Same for non-encrypted
+                        displaySize: att.size,
+                        encryptedSize: att.size,
+                        displayMime: att.mime_type
+                    }));
+                }
+                
+                attachmentsHtml = `
+                <div class="email-attachments" id="sent-email-attachments" style="margin: 15px 0;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4>Attachments (${attachmentDisplayData.length})</h4>
+                        <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllSentAttachments(${email.id})" title="Download all attachments as ZIP">
+                            <i class="fas fa-download"></i> Download All
+                        </button>
+                    </div>
+                    <div class="attachment-list">
+                        ${attachmentDisplayData.map(attachment => {
+                            const sizeFormatted = (attachment.displaySize / 1024).toFixed(2) + ' KB';
+                            const isEncrypted = attachment.encryption_method === 'manifest_aes';
+                            const statusIcon = isEncrypted ? '🔒' : '📄';
+                            const statusText = isEncrypted ? 'Encrypted' : 'Plain';
+                            // Store both encrypted and decrypted filenames as data attributes
+                            const encryptedFilename = attachment.encryptedFilename || attachment.filename;
+                            const decryptedFilename = attachment.displayName;
+                            
+                            return `
+                            <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;" 
+                                 data-encrypted-filename="${Utils.escapeHtml(encryptedFilename)}" 
+                                 data-decrypted-filename="${Utils.escapeHtml(decryptedFilename)}"
+                                 data-encrypted-size="${attachment.encryptedSize || attachment.displaySize}"
+                                 data-decrypted-size="${attachment.displaySize}">
+                                <div class="attachment-info" style="display: flex; align-items: center;">
+                                    <i class="fas fa-file" style="margin-right: 10px;"></i>
+                                    <div class="attachment-details">
+                                        <div class="attachment-name" style="font-weight: bold;" data-display-name="${Utils.escapeHtml(decryptedFilename)}">${Utils.escapeHtml(decryptedFilename)}</div>
+                                        <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
+                                            <span class="attachment-size">${sizeFormatted}</span> • ${statusIcon} ${statusText}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="attachment-actions">
+                                    <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadSentAttachment(${email.id}, ${attachment.id})">
+                                        <i class="fas fa-download"></i> Download
+                                    </button>
+                                </div>
+                            </div>`;
+                        }).join('')}
+                    </div>
+                </div>`;
+            }
+            
+            // Add signature verification indicator
+            let signatureIndicator = '';
+            // Check signature_valid - handle both boolean and null/undefined cases
+            if (email.signature_valid === true || email.signature_valid === 1) {
+                signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+            } else if (email.signature_valid === false || email.signature_valid === 0) {
+                signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+            }
+            
+            // Get sender info (for sent emails, sender is us)
+            // IMPORTANT: For sent emails, we are the sender, so we must use OUR pubkey, not email.recipient_pubkey
+            // Always use profile cache directly (same as loadProfile) to ensure we get our own profile
+            const myKeypair = appState.getKeypair();
+            const myPubkey = myKeypair ? myKeypair.public_key : null;
+            let senderContact = null;
+            
+            // Debug: Log what pubkeys we have to ensure we're using the right one
+            console.log(`[Sent Email Detail] Our pubkey: ${myPubkey ? myPubkey.substring(0, 16) + '...' : 'null'}`);
+            console.log(`[Sent Email Detail] Email sender_pubkey: ${email.sender_pubkey || 'null'}`);
+            console.log(`[Sent Email Detail] Email recipient_pubkey: ${email.recipient_pubkey || 'null'}`);
+            
+            // CRITICAL: Ensure we never accidentally use recipient_pubkey for avatar lookup
+            if (myPubkey && email.recipient_pubkey && myPubkey === email.recipient_pubkey) {
+                console.error(`[Sent Email Detail] ERROR: Our pubkey matches recipient_pubkey! This should not happen for sent emails.`);
+            }
+            
+            if (myPubkey) {
+                // First try to get from profile cache (same logic as loadProfile)
+                const cachedProfiles = localStorage.getItem('nostr_mail_profiles');
+                if (cachedProfiles) {
+                    try {
+                        const profileDict = JSON.parse(cachedProfiles);
+                        const cachedProfile = profileDict[myPubkey];
+                        if (cachedProfile) {
+                            console.log(`[Sent Email Detail] Found cached profile for our pubkey`);
+                            // Get picture data URL - check if it's for our pubkey
+                            // Note: nostr_mail_profile_picture is a single value, so we need to verify it's for current profile
+                            const cachedPictureDataUrl = localStorage.getItem('nostr_mail_profile_picture');
+                            senderContact = {
+                                pubkey: myPubkey,
+                                name: cachedProfile.fields?.name || cachedProfile.fields?.display_name || cachedProfile.name,
+                                display_name: cachedProfile.fields?.display_name || cachedProfile.display_name,
+                                picture: cachedProfile.fields?.picture || cachedProfile.picture,
+                                picture_data_url: cachedPictureDataUrl
+                            };
+                            console.log(`[Sent Email Detail] Using profile cache - name: ${senderContact.name}, picture: ${senderContact.picture ? 'yes' : 'no'}`);
+                        } else {
+                            console.log(`[Sent Email Detail] No cached profile found for our pubkey`);
+                        }
+                    } catch (e) {
+                        console.error('Error parsing cached profiles:', e);
+                    }
+                }
+                
+                // Fallback: Look up our profile in contacts list (user's profile is now added privately)
+                // If not found, fall back to database lookup
+                if (!senderContact) {
+                    console.log(`[Sent Email Detail] Falling back to contacts lookup`);
+                    const contacts = appState.getContacts();
+                    senderContact = contacts.find(c => c.pubkey === myPubkey) || null;
+                    if (senderContact) {
+                        console.log(`[Sent Email Detail] Found our profile in contacts - name: ${senderContact.name}`);
+                    } else {
+                        console.log(`[Sent Email Detail] Not found in contacts, trying database lookup`);
+                        try {
+                            const ourProfile = await DatabaseService.getContact(myPubkey);
+                            if (ourProfile) {
+                                console.log(`[Sent Email Detail] Found our profile in database - name: ${ourProfile.name}`);
+                                senderContact = {
+                                    pubkey: myPubkey,
+                                    name: ourProfile.name || ourProfile.display_name,
+                                    display_name: ourProfile.display_name,
+                                    picture: ourProfile.picture_url || ourProfile.picture,
+                                    picture_data_url: ourProfile.picture_data_url
+                                };
+                            }
+                        } catch (e) {
+                            console.error(`[Sent Email Detail] Error fetching our profile from database:`, e);
+                        }
+                    }
+                }
+            } else {
+                console.log(`[Sent Email Detail] No pubkey available`);
+            }
+            
+            // Avatar logic
+            const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+            let avatarSrc = defaultAvatar;
+            const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+            if (senderContact && !senderContact.picture_loading) {
+                if (isValidDataUrl) {
+                    avatarSrc = senderContact.picture_data_url;
+                } else if (senderContact.picture) {
+                    avatarSrc = senderContact.picture;
+                }
+            }
+            
+            const senderName = senderContact ? (senderContact.name || senderContact.display_name || email.from) : email.from;
+            const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+            
+            sentDetailContent.innerHTML =
+                `<div class="email-detail">
+<h2 class="email-detail-subject">${Utils.escapeHtml(subject)}</h2>
+<div class="email-detail-card">
+<div class="email-sender-header">
+<div class="email-sender-row">
+<img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
+${signatureIndicator}
+</div>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
+<details class="email-metadata-details">
+<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
+<div class="email-detail-header vertical" id="sent-email-header-info">
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
+<div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
+<div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+</div>
+</details>
+</div>
+<pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+<div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
+<pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}</pre>
+${attachmentsHtml}
+</div>
+<button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
+</div>`;
+            
+            // Add event listeners for invalid signature indicator in sender header
+            if (email.signature_valid === false) {
+                const sigIndicator = sentDetailContent.querySelector('.email-sender-header .signature-indicator.invalid');
+                if (sigIndicator) {
+                    const originalText = sigIndicator.textContent;
+                    sigIndicator.addEventListener('mouseenter', () => {
+                        sigIndicator.textContent = 'recheck signature?';
+                    });
+                    sigIndicator.addEventListener('mouseleave', () => {
+                        sigIndicator.textContent = originalText;
+                    });
+                    sigIndicator.addEventListener('click', async (e) => {
+                        e.stopPropagation();
+                        const messageId = sigIndicator.dataset.messageId;
+                        if (messageId) {
+                            sigIndicator.textContent = 'checking...';
+                            sigIndicator.style.opacity = '0.7';
+                            try {
+                                const result = await TauriService.recheckEmailSignature(messageId);
+                                if (result === true) {
+                                    email.signature_valid = true;
+                                    sigIndicator.className = 'signature-indicator verified';
+                                    sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
+                                    sigIndicator.title = 'Verified Nostr signature';
+                                    sigIndicator.removeAttribute('data-message-id');
+                                    sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                    notificationService.showSuccess('Signature verified successfully!');
+                                } else if (result === false) {
+                                    sigIndicator.textContent = originalText;
+                                    notificationService.showError('Signature is still invalid.');
+                                } else {
+                                    sigIndicator.textContent = originalText;
+                                    notificationService.showError('Could not verify signature.');
+                                }
+                            } catch (error) {
+                                console.error('[JS] Failed to recheck signature:', error);
+                                sigIndicator.textContent = originalText;
+                                notificationService.showError('Failed to recheck signature: ' + error);
+                            } finally {
+                                sigIndicator.style.opacity = '1';
+                            }
+                        }
+                    });
+                }
+            }
+            
+            const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
+            const headerInfo = document.getElementById('sent-email-header-info');
+            const rawHeaderInfo = document.getElementById('sent-raw-header-info');
+            const bodyInfo = document.getElementById('sent-email-body-info');
+            const rawBodyInfo = document.getElementById('sent-raw-body-info');
+            const attachmentsInfo = document.getElementById('sent-email-attachments');
+            
+            if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
+                // Remove any existing event listeners by cloning the button
+                const newToggleBtn = toggleRawBtn.cloneNode(true);
+                toggleRawBtn.parentNode.replaceChild(newToggleBtn, toggleRawBtn);
+                
+                let showingRaw = false;
+                newToggleBtn.addEventListener('click', (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    
+                    showingRaw = !showingRaw;
+                    if (showingRaw) {
+                        headerInfo.classList.add('hidden-header');
+                        rawHeaderInfo.style.display = 'block';
+                        bodyInfo.style.display = 'none';
+                        rawBodyInfo.style.display = 'block';
+                        newToggleBtn.textContent = 'Show Display Content';
+                        
+                        // Hide metadata details when showing raw content
+                        const metadataDetails = headerInfo.closest('.email-metadata-details');
+                        if (metadataDetails) {
+                            metadataDetails.style.display = 'none';
+                        }
+                        
+                        // Update attachment filenames and sizes to show encrypted versions
+                        if (attachmentsInfo) {
+                            const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
+                            attachmentItems.forEach(item => {
+                                const encryptedFilename = item.getAttribute('data-encrypted-filename');
+                                const encryptedSize = item.getAttribute('data-encrypted-size');
+                                const nameElement = item.querySelector('.attachment-name');
+                                const sizeElement = item.querySelector('.attachment-size');
+                                
+                                if (encryptedFilename && nameElement) {
+                                    nameElement.textContent = encryptedFilename;
+                                }
+                                
+                                // Update size to show encrypted size
+                                if (encryptedSize && sizeElement) {
+                                    const sizeFormatted = (parseFloat(encryptedSize) / 1024).toFixed(2) + ' KB';
+                                    sizeElement.textContent = sizeFormatted;
+                                }
+                            });
+                        }
+                        
+                        // Move attachments after raw body if they exist
+                        if (attachmentsInfo && attachmentsInfo.parentNode) {
+                            // Remove from current position
+                            attachmentsInfo.parentNode.removeChild(attachmentsInfo);
+                            // Insert after raw body
+                            rawBodyInfo.parentNode.insertBefore(attachmentsInfo, rawBodyInfo.nextSibling);
+                        }
+                        
+                        // Keep button outside the card (after the card closes)
+                        const emailDetailCard = headerInfo.closest('.email-detail-card');
+                        if (emailDetailCard && emailDetailCard.parentNode) {
+                            emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
+                        }
+                    } else {
+                        headerInfo.classList.remove('hidden-header');
+                        rawHeaderInfo.style.display = 'none';
+                        bodyInfo.style.display = 'block';
+                        rawBodyInfo.style.display = 'none';
+                        newToggleBtn.textContent = 'Show Raw Content';
+                        
+                        // Show metadata details when showing display content
+                        const metadataDetails = headerInfo.closest('.email-metadata-details');
+                        if (metadataDetails) {
+                            metadataDetails.style.display = '';
+                        }
+                        
+                        // Update attachment filenames and sizes to show decrypted versions
+                        if (attachmentsInfo) {
+                            const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
+                            attachmentItems.forEach(item => {
+                                const decryptedFilename = item.getAttribute('data-decrypted-filename');
+                                const decryptedSize = item.getAttribute('data-decrypted-size');
+                                const nameElement = item.querySelector('.attachment-name');
+                                const sizeElement = item.querySelector('.attachment-size');
+                                
+                                if (decryptedFilename && nameElement) {
+                                    nameElement.textContent = decryptedFilename;
+                                }
+                                
+                                // Update size to show decrypted size
+                                if (decryptedSize && sizeElement) {
+                                    const sizeFormatted = (parseFloat(decryptedSize) / 1024).toFixed(2) + ' KB';
+                                    sizeElement.textContent = sizeFormatted;
+                                }
+                            });
+                        }
+                        
+                        // Move attachments after regular body if they exist
+                        if (attachmentsInfo && attachmentsInfo.parentNode) {
+                            // Remove from current position
+                            attachmentsInfo.parentNode.removeChild(attachmentsInfo);
+                            // Insert after regular body
+                            bodyInfo.parentNode.insertBefore(attachmentsInfo, bodyInfo.nextSibling);
+                        }
+                        
+                        // Keep button outside the card (after the card closes)
+                        const emailDetailCard = headerInfo.closest('.email-detail-card');
+                        if (emailDetailCard && emailDetailCard.parentNode) {
+                            emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
+                        }
+                    }
+                });
+            }
+        }; // End of updateDetail function
+            
+            // Now execute the decryption and update
+            try {
+                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+                // For sent emails, use recipient_pubkey for decryption
+                const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
+                const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
+                // Use generic NIP-X regex (same as inbox)
+                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                
+                let decryptedSubject = email.subject;
+                let decryptedBody = cleanedBody;
+                const keypair = appState.getKeypair();
+                
+                // Add timeout wrapper to prevent hanging
+                const decryptWithTimeout = async (promise, timeoutMs = 30000) => {
+                    return Promise.race([
+                        promise,
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('Decryption timeout after ' + timeoutMs + 'ms')), timeoutMs)
+                        )
+                    ]);
+                };
+                
+                if ((recipientPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+                    try {
+                        // Decrypt subject if it looks encrypted (ASCII armor not required)
+                        if (isEncryptedSubject) {
+                            console.log('[JS] Decrypting subject...');
+                            decryptedSubject = await decryptWithTimeout(
+                                this.decryptNostrSentMessageWithFallback(email, email.subject, keypair),
+                                10000 // 10 second timeout for subject
+                            );
+                        }
+                        let manifestResult = null;
+                        if (encryptedBodyMatch) {
+                            const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                            try {
+                                console.log('[JS] Decrypting manifest...');
+                                // Try sent manifest decryption first - decrypt once and reuse for attachments
+                                manifestResult = await decryptWithTimeout(
+                                    this.decryptSentManifestMessage(email, encryptedContent, keypair),
+                                    30000 // 30 second timeout for manifest
+                                );
+                                if (manifestResult.type === 'manifest') {
+                                    decryptedBody = manifestResult.body;
+                                } else if (manifestResult.type === 'legacy') {
+                                    decryptedBody = manifestResult.body;
+                                } else {
+                                    // Fallback to legacy decryption
+                                    decryptedBody = await decryptWithTimeout(
+                                        this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair),
+                                        10000
+                                    );
+                                }
+                            } catch (e) {
+                                console.error('[JS] Failed to decrypt manifest:', e);
+                                // If manifest fails, try legacy decryption
+                                try {
+                                    decryptedBody = await decryptWithTimeout(
+                                        this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair),
+                                        10000
+                                    );
+                                } catch (legacyErr) {
+                                    console.error('[JS] Legacy decryption also failed:', legacyErr);
+                                    decryptedBody = '[Decryption failed: ' + legacyErr.message + ']';
+                                }
+                            }
+                        }
+                        // Pass manifestResult to updateDetail to avoid re-decrypting
+                        await updateDetail(decryptedSubject, decryptedBody, manifestResult);
+                    } catch (err) {
+                        console.error('[JS] Error decrypting sent email:', err);
+                        await updateDetail('Could not decrypt', 'Could not decrypt: ' + err.message, null);
+                    }
+                } else {
+                    await updateDetail(decryptedSubject, decryptedBody, null);
+                }
+            } catch (error) {
+            console.error('Error loading sent email detail:', error);
+            if (sentDetailContent) {
+                sentDetailContent.innerHTML = '<div class="error">Error loading email: ' + error.message + '</div>';
+            }
+        }
+    }
+    
+    // Show modal to enter recipient pubkey for sent email
+    async _showRecipientPubkeyModal(email) {
+        return new Promise((resolve) => {
+            const modalContent = `
+                <div style="padding: 20px;">
+                    <p>This sent email is encrypted but the recipient's pubkey is not available.</p>
+                    <p><strong>To:</strong> ${Utils.escapeHtml(email.to || email.to_address)}</p>
+                    <p><strong>Subject:</strong> ${Utils.escapeHtml(email.subject)}</p>
+                    <div class="form-group" style="margin-top: 20px;">
+                        <label for="recipient-pubkey-input">Enter recipient's Nostr pubkey:</label>
+                        <input type="text" id="recipient-pubkey-input" class="form-control" placeholder="npub1..." style="margin-top: 8px;">
+                        <small class="form-text text-muted">The pubkey will be saved if decryption is successful.</small>
+                    </div>
+                    <div style="margin-top: 20px; display: flex; gap: 10px; justify-content: flex-end;">
+                        <button id="cancel-recipient-pubkey" class="btn btn-secondary">Cancel</button>
+                        <button id="submit-recipient-pubkey" class="btn btn-primary">Try Decryption</button>
+                    </div>
+                </div>
+            `;
+            
+            window.app.showModal('Enter Recipient Pubkey', modalContent);
+            
+            const input = document.getElementById('recipient-pubkey-input');
+            const submitBtn = document.getElementById('submit-recipient-pubkey');
+            const cancelBtn = document.getElementById('cancel-recipient-pubkey');
+            
+            const cleanup = () => {
+                submitBtn.removeEventListener('click', submitHandler);
+                cancelBtn.removeEventListener('click', cancelHandler);
+                if (input) input.removeEventListener('keypress', keyHandler);
+            };
+            
+            const submitHandler = () => {
+                const pubkey = input ? input.value.trim() : '';
+                if (pubkey) {
+                    cleanup();
+                    window.app.hideModal();
+                    resolve(pubkey);
+                } else {
+                    window.notificationService.showError('Please enter a pubkey');
+                }
+            };
+            
+            const cancelHandler = () => {
+                cleanup();
+                window.app.hideModal();
+                resolve(null);
+            };
+            
+            const keyHandler = (e) => {
+                if (e.key === 'Enter') {
+                    submitHandler();
+                }
+            };
+            
+            submitBtn.addEventListener('click', submitHandler);
+            cancelBtn.addEventListener('click', cancelHandler);
+            if (input) {
+                input.addEventListener('keypress', keyHandler);
+                input.focus();
+            }
+        });
+    }
+    
+    // Try decryption with provided recipient pubkey
+    async _tryDecryptWithRecipientPubkey(email, recipientPubkey) {
+        try {
+            const keypair = appState.getKeypair();
+            if (!keypair) {
+                window.notificationService.showError('No keypair available');
+                return false;
+            }
+            
+            // Create a test email object with the recipient pubkey
+            const testEmail = {
+                ...email,
+                recipient_pubkey: recipientPubkey
+            };
+            
+            // Try to decrypt the subject first (quick test)
+            const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
+            if (isEncryptedSubject) {
+                try {
+                    const decryptedSubject = await this.decryptNostrSentMessageWithFallback(testEmail, email.subject, keypair);
+                    if (decryptedSubject && !decryptedSubject.startsWith('Unable to decrypt')) {
+                        // Subject decryption successful, try body too
+                        const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+                        const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                        
+                        if (encryptedBodyMatch) {
+                            const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                            try {
+                                const manifestResult = await this.decryptSentManifestMessage(testEmail, encryptedContent, keypair);
+                                if (manifestResult && manifestResult.type !== 'error') {
+                                    // Both subject and body decrypted successfully
+                                    // Save to database
+                                    await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                                    window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                                    return true;
+                                }
+                            } catch (e) {
+                                // Try legacy decryption
+                                const decryptedBody = await this.decryptNostrSentMessageWithFallback(testEmail, encryptedContent, keypair);
+                                if (decryptedBody && !decryptedBody.startsWith('Unable to decrypt')) {
+                                    await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                                    window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                                    return true;
+                                }
+                            }
+                        } else {
+                            // No encrypted body, subject decryption is enough
+                            await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                            window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                            return true;
+                        }
+                    }
+                } catch (e) {
+                    console.error('[JS] Subject decryption test failed:', e);
+                }
+            } else {
+                // Subject not encrypted, try body
+                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                
+                if (encryptedBodyMatch) {
+                    const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                    try {
+                        const manifestResult = await this.decryptSentManifestMessage(testEmail, encryptedContent, keypair);
+                        if (manifestResult && manifestResult.type !== 'error') {
+                            await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                            window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                            return true;
+                        }
+                    } catch (e) {
+                        const decryptedBody = await this.decryptNostrSentMessageWithFallback(testEmail, encryptedContent, keypair);
+                        if (decryptedBody && !decryptedBody.startsWith('Unable to decrypt')) {
+                            await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                            window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+                            return true;
+                        }
+                    }
+                }
+            }
+            
+            return false;
+        } catch (error) {
+            console.error('[JS] Error trying decryption with recipient pubkey:', error);
+            return false;
+        }
+    }
+    
+    // Search through all contacts to find the recipient pubkey that can decrypt this email
+    async _searchContactsForRecipientPubkey(email) {
+        const keypair = appState.getKeypair();
+        if (!keypair) {
+            window.notificationService.showError('No keypair available');
+            return null;
+        }
+        
+        // Show toast notification
+        window.notificationService.showInfo('searching for recipient key...');
+        
+        // Get all contacts
+        const contacts = appState.getContacts();
+        if (!contacts || contacts.length === 0) {
+            window.notificationService.showError('No contacts available to search');
+            return null;
+        }
+        
+        console.log(`[JS] Searching through ${contacts.length} contacts for recipient pubkey...`);
+        
+        // Try each contact's pubkey
+        for (const contact of contacts) {
+            if (!contact.pubkey) {
+                continue;
+            }
+            
+            try {
+                console.log(`[JS] Trying contact pubkey: ${contact.pubkey.substring(0, 16)}...`);
+                const success = await this._tryDecryptWithRecipientPubkey(email, contact.pubkey);
+                if (success) {
+                    console.log(`[JS] Successfully decrypted with contact pubkey: ${contact.pubkey.substring(0, 16)}...`);
+                    // Ensure the email in appState is updated (should already be done in _saveRecipientPubkeyToDb)
+                    const updatedEmail = appState.getSentEmails().find(e => e.id === email.id || e.message_id === email.message_id);
+                    if (updatedEmail && updatedEmail.recipient_pubkey === contact.pubkey) {
+                        console.log(`[JS] Verified recipient_pubkey saved to appState for email ${email.id}`);
+                    }
+                    window.notificationService.showSuccess(`Found recipient key! Decryption successful.`);
+                    return contact.pubkey;
+                }
+            } catch (e) {
+                // Continue to next contact
+                console.log(`[JS] Failed to decrypt with contact pubkey ${contact.pubkey.substring(0, 16)}...:`, e);
+            }
+        }
+        
+        console.log('[JS] No matching recipient pubkey found in contacts');
+        window.notificationService.showError('Could not find recipient key in contacts');
+        return null;
+    }
+    
+    // Save recipient pubkey to database
+    async _saveRecipientPubkeyToDb(email, recipientPubkey) {
+        try {
+            if (email.id) {
+                // Try to update by ID first (more reliable)
+                await TauriService.updateEmailRecipientPubkeyById(Number(email.id), recipientPubkey);
+            } else if (email.message_id) {
+                // Fallback to message_id
+                await TauriService.updateEmailRecipientPubkey(email.message_id, recipientPubkey);
+            }
+            
+            // Update the email in appState
+            const sentEmails = appState.getSentEmails();
+            const emailIndex = sentEmails.findIndex(e => e.id === email.id || e.message_id === email.message_id);
+            if (emailIndex !== -1) {
+                sentEmails[emailIndex].recipient_pubkey = recipientPubkey;
+                appState.setSentEmails(sentEmails);
             }
         } catch (error) {
-            console.error('Error showing sent email detail:', error);
+            console.error('[JS] Error saving recipient pubkey to DB:', error);
+            throw error;
         }
     }
 
@@ -2692,22 +5634,25 @@ ${attachmentsHtml}
                 return;
             }
             
-            // Check if attachment is encrypted and needs decryption
-            if (attachment.encryption_method === 'manifest_aes') {
-                // For manifest-encrypted attachments, we need to get the manifest first
-                const sentEmails = appState.getSentEmails();
-                console.log(`[JS] Looking for email ID ${emailId} in ${sentEmails.length} sent emails`);
-                console.log(`[JS] Sent email IDs:`, sentEmails.map(e => `${e.id} (${typeof e.id})`));
-                
-                // Convert emailId to number for comparison since it comes as string from onclick
-                const email = sentEmails.find(e => e.id == emailId); // Use == for type coercion
-                if (!email) {
-                    window.notificationService.showError('Email not found');
-                    return;
-                }
+            // Get the email to check for manifest
+            const sentEmails = appState.getSentEmails();
+            const email = sentEmails.find(e => e.id == emailId);
+            if (!email) {
+                window.notificationService.showError('Email not found');
+                return;
+            }
+            
+            // Try to decrypt using manifest if:
+            // 1. Attachment is marked as manifest_aes, OR
+            // 2. Email has encrypted content and we can decrypt the manifest
+            const hasManifestEncryption = attachment.encryption_method === 'manifest_aes';
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            
+            if (hasManifestEncryption || (hasEncryptedContent && attachment.filename.endsWith('.dat'))) {
+                console.log(`[JS] Attempting to decrypt attachment using manifest (hasManifestEncryption: ${hasManifestEncryption}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
                 // Extract encrypted content from email body
-                const encryptedBodyMatch = email.body.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
                     return;
@@ -2729,22 +5674,28 @@ ${attachmentsHtml}
                 }
                 
                 // Find attachment metadata in manifest
-                const attachmentMeta = manifestResult.manifest.attachments.find(a => 
-                    attachment.filename.startsWith(a.id + '.'));
+                // Extract opaque ID from filename (e.g., "a1.dat" -> "a1")
+                const opaqueId = attachment.filename.replace(/\.dat$/, '');
+                console.log(`[JS] Looking for manifest attachment with id: ${opaqueId} from filename: ${attachment.filename}`);
+                const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
                 
                 if (!attachmentMeta) {
+                    console.warn(`[JS] Attachment metadata not found in manifest for id: ${opaqueId}, available ids:`, manifestResult.manifest.attachments.map(a => a.id));
                     window.notificationService.showError('Attachment metadata not found in manifest');
                     return;
                 }
                 
-                // Decrypt attachment data
-                const decryptedData = await this.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
+                console.log(`[JS] Found attachment metadata:`, attachmentMeta);
+                
+                // Decrypt attachment data (attachment.data is base64, need to decode first)
+                const attachmentDataBase64 = attachment.data;
+                const decryptedData = await this.decryptWithAES(attachmentDataBase64, attachmentMeta.key_wrap, true);
                 
                 // Save decrypted attachment to disk using Tauri
                 const filePath = await TauriService.saveAttachmentToDisk(
                     attachmentMeta.orig_filename, 
                     decryptedData, 
-                    attachmentMeta.orig_mime
+                    attachmentMeta.orig_mime || 'application/octet-stream'
                 );
                 
                 console.log(`[JS] Downloaded decrypted attachment: ${attachmentMeta.orig_filename} to ${filePath}`);
@@ -2790,11 +5741,15 @@ ${attachmentsHtml}
             // Prepare attachments for ZIP
             const attachmentsForZip = [];
             
-            // Check if any attachments are manifest-encrypted
+            // Try to decrypt manifest if email has encrypted content
+            // This allows us to decrypt attachments even if they're not marked as manifest_aes
             const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
             let manifestResult = null;
             
-            if (hasManifestAttachments) {
+            if (hasManifestAttachments || (hasEncryptedContent && email.attachments.some(att => att.filename.endsWith('.dat')))) {
+                console.log(`[JS] Attempting to decrypt manifest for ZIP (hasManifestAttachments: ${hasManifestAttachments}, hasEncryptedContent: ${hasEncryptedContent})`);
+                
                 // Extract and decrypt manifest
                 const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 if (!encryptedBodyMatch) {
@@ -2815,19 +5770,272 @@ ${attachmentsHtml}
                     window.notificationService.showError('Cannot decrypt attachments: invalid manifest');
                     return;
                 }
+                
+                console.log(`[JS] Manifest decrypted successfully, has ${manifestResult.manifest.attachments.length} attachments`);
             }
             
-            // Process each attachment
+            // Process each attachment - decrypt if we have a manifest
             for (const attachment of email.attachments) {
-                if (attachment.encryption_method === 'manifest_aes') {
+                const shouldDecrypt = attachment.encryption_method === 'manifest_aes' || 
+                                    (manifestResult && attachment.filename.endsWith('.dat'));
+                
+                if (shouldDecrypt && manifestResult) {
                     // Find attachment metadata in manifest
-                    const opaqueId = attachment.filename.replace('.dat', ''); // a1.dat -> a1
+                    const opaqueId = attachment.filename.replace(/\.dat$/, ''); // a1.dat -> a1
+                    console.log(`[JS] Looking for manifest attachment with id: ${opaqueId} from filename: ${attachment.filename}`);
                     const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
                     
                     if (!attachmentMeta) {
-                        console.warn(`[JS] Skipping attachment ${attachment.filename}: metadata not found in manifest`);
+                        console.warn(`[JS] Skipping attachment ${attachment.filename}: metadata not found in manifest (looking for id: ${opaqueId}, available ids: ${manifestResult.manifest.attachments.map(a => a.id).join(', ')})`);
+                        // Fallback: add as-is if we can't find metadata
+                        attachmentsForZip.push({
+                            filename: attachment.filename,
+                            data: attachment.data
+                        });
                         continue;
                     }
+                    
+                    console.log(`[JS] Found attachment metadata:`, attachmentMeta);
+                    
+                    // Decrypt attachment data (attachment.data is base64)
+                    const decryptedData = await this.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
+                    
+                    attachmentsForZip.push({
+                        filename: attachmentMeta.orig_filename,
+                        data: decryptedData
+                    });
+                    
+                    console.log(`[JS] Added decrypted attachment to ZIP: ${attachmentMeta.orig_filename} (${decryptedData.length} bytes)`);
+                    
+                } else {
+                    // Plain attachment - decode base64 if needed
+                    let attachmentData = attachment.data;
+                    // If data is base64 string, it will be handled by saveAttachmentsAsZip
+                    attachmentsForZip.push({
+                        filename: attachment.filename,
+                        data: attachmentData
+                    });
+                    
+                    console.log(`[JS] Added plain attachment to ZIP: ${attachment.filename}`);
+                }
+            }
+            
+            if (attachmentsForZip.length === 0) {
+                window.notificationService.showError('No attachments could be processed');
+                return;
+            }
+            
+            // Create ZIP filename based on email subject or date
+            let emailSubject = email.subject || 'Email';
+            
+            // If subject looks like encrypted content, use a generic name with timestamp
+            if (emailSubject.length > 50 || /^[A-Za-z0-9+/=]+$/.test(emailSubject)) {
+                const date = new Date(email.date || Date.now());
+                const dateStr = date.toISOString().slice(0, 10); // YYYY-MM-DD
+                emailSubject = `Email Attachments ${dateStr}`;
+            }
+            
+            const cleanSubject = emailSubject.replace(/[^a-zA-Z0-9\s\-_]/g, '').trim();
+            const zipFilename = `${cleanSubject}.zip`;
+            
+            console.log(`[JS] Creating ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
+            
+            // Save as ZIP
+            const zipPath = await TauriService.saveAttachmentsAsZip(zipFilename, attachmentsForZip);
+            
+            console.log(`[JS] Successfully created ZIP file: ${zipPath}`);
+            window.notificationService.showSuccess(`All attachments saved to: ${zipPath}`);
+            
+        } catch (error) {
+            console.error('[JS] Failed to download all attachments:', error);
+            window.notificationService.showError('Failed to download attachments: ' + error.message);
+        }
+    }
+
+    // Download attachment from inbox email
+    async downloadInboxAttachment(emailId, attachmentId, encryptedFilename = null) {
+        try {
+            console.log(`[JS] Downloading attachment ${attachmentId} from inbox email ${emailId}`);
+            
+            const attachment = await TauriService.getAttachment(attachmentId);
+            if (!attachment) {
+                window.notificationService.showError('Attachment not found');
+                return;
+            }
+            
+            // Check if raw content is currently being displayed
+            const rawBodyInfo = document.getElementById('inbox-raw-body-info');
+            const isRawMode = rawBodyInfo && rawBodyInfo.style.display === 'block';
+            
+            // If in raw mode and attachment is encrypted, download the raw encrypted data
+            if (isRawMode && attachment.encryption_method === 'manifest_aes') {
+                console.log(`[JS] Raw mode detected, downloading encrypted attachment: ${attachment.filename}`);
+                const filePath = await TauriService.saveAttachmentToDisk(
+                    encryptedFilename || attachment.filename,
+                    attachment.data,
+                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                );
+                console.log(`[JS] Downloaded raw encrypted attachment: ${attachment.filename} to ${filePath}`);
+                window.notificationService.showSuccess(`Raw attachment saved to: ${filePath}`);
+                return;
+            }
+            
+            // Get the email to check for manifest
+            const emails = appState.getEmails();
+            const email = emails.find(e => e.id == emailId);
+            if (!email) {
+                window.notificationService.showError('Email not found');
+                return;
+            }
+            
+            // Try to decrypt using manifest if:
+            // 1. Attachment is marked as manifest_aes, OR
+            // 2. Email has encrypted content and we can decrypt the manifest
+            const hasManifestEncryption = attachment.encryption_method === 'manifest_aes';
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            
+            if (hasManifestEncryption || (hasEncryptedContent && attachment.filename.endsWith('.dat'))) {
+                console.log(`[JS] Attempting to decrypt attachment using manifest (hasManifestEncryption: ${hasManifestEncryption}, hasEncryptedContent: ${hasEncryptedContent})`);
+                
+                // Extract encrypted content from email body
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                if (!encryptedBodyMatch) {
+                    window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
+                    return;
+                }
+                
+                const keypair = appState.getKeypair();
+                if (!keypair) {
+                    window.notificationService.showError('No keypair available for decryption');
+                    return;
+                }
+                
+                // Decrypt the manifest to get attachment keys (use decryptManifestMessage for inbox)
+                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                const manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                
+                if (manifestResult.type !== 'manifest') {
+                    window.notificationService.showError('Cannot decrypt attachment: invalid manifest');
+                    return;
+                }
+                
+                // Find attachment metadata in manifest
+                const opaqueId = attachment.filename.replace(/\.dat$/, '');
+                console.log(`[JS] Looking for manifest attachment with id: ${opaqueId} from filename: ${attachment.filename}`);
+                const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
+                
+                if (!attachmentMeta) {
+                    console.warn(`[JS] Attachment metadata not found in manifest for id: ${opaqueId}, available ids:`, manifestResult.manifest.attachments.map(a => a.id));
+                    window.notificationService.showError('Attachment metadata not found in manifest');
+                    return;
+                }
+                
+                console.log(`[JS] Found attachment metadata:`, attachmentMeta);
+                
+                // Decrypt attachment data
+                const decryptedData = await this.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
+                
+                // Save decrypted attachment to disk using Tauri
+                const filePath = await TauriService.saveAttachmentToDisk(
+                    attachmentMeta.orig_filename, 
+                    decryptedData, 
+                    attachmentMeta.orig_mime || 'application/octet-stream'
+                );
+                
+                console.log(`[JS] Downloaded decrypted attachment: ${attachmentMeta.orig_filename} to ${filePath}`);
+                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
+                
+            } else {
+                // Plain attachment - save directly to disk using Tauri
+                const filePath = await TauriService.saveAttachmentToDisk(
+                    attachment.filename, 
+                    attachment.data, 
+                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                );
+                
+                console.log(`[JS] Downloaded plain attachment: ${attachment.filename} to ${filePath}`);
+                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
+            }
+            
+        } catch (error) {
+            console.error('[JS] Failed to download attachment:', error);
+            window.notificationService.showError('Failed to download attachment: ' + error.message);
+        }
+    }
+
+    // Download all attachments from inbox email as ZIP
+    async downloadAllInboxAttachments(emailId) {
+        try {
+            console.log(`[JS] Downloading all attachments from inbox email ${emailId} as ZIP`);
+            
+            const emails = appState.getEmails();
+            const email = emails.find(e => e.id == emailId);
+            if (!email) {
+                window.notificationService.showError('Email not found');
+                return;
+            }
+            
+            if (!email.attachments || email.attachments.length === 0) {
+                window.notificationService.showError('No attachments to download');
+                return;
+            }
+            
+            console.log(`[JS] Processing ${email.attachments.length} attachments for ZIP`);
+            
+            // Prepare attachments for ZIP
+            const attachmentsForZip = [];
+            
+            // Try to decrypt manifest if email has encrypted content
+            const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            let manifestResult = null;
+            
+            if (hasManifestAttachments || (hasEncryptedContent && email.attachments.some(att => att.filename.endsWith('.dat')))) {
+                console.log(`[JS] Attempting to decrypt manifest for ZIP (hasManifestAttachments: ${hasManifestAttachments}, hasEncryptedContent: ${hasEncryptedContent})`);
+                
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                if (!encryptedBodyMatch) {
+                    window.notificationService.showError('Cannot decrypt attachments: no encrypted manifest found');
+                    return;
+                }
+                
+                const keypair = appState.getKeypair();
+                if (!keypair) {
+                    window.notificationService.showError('No keypair available for decryption');
+                    return;
+                }
+                
+                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                
+                if (manifestResult.type !== 'manifest') {
+                    window.notificationService.showError('Cannot decrypt attachments: invalid manifest');
+                    return;
+                }
+                
+                console.log(`[JS] Manifest decrypted successfully, has ${manifestResult.manifest.attachments.length} attachments`);
+            }
+            
+            // Process each attachment - decrypt if we have a manifest
+            for (const attachment of email.attachments) {
+                const shouldDecrypt = attachment.encryption_method === 'manifest_aes' || 
+                                    (manifestResult && attachment.filename.endsWith('.dat'));
+                
+                if (shouldDecrypt && manifestResult) {
+                    const opaqueId = attachment.filename.replace(/\.dat$/, '');
+                    console.log(`[JS] Looking for manifest attachment with id: ${opaqueId} from filename: ${attachment.filename}`);
+                    const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
+                    
+                    if (!attachmentMeta) {
+                        console.warn(`[JS] Skipping attachment ${attachment.filename}: metadata not found in manifest (looking for id: ${opaqueId}, available ids: ${manifestResult.manifest.attachments.map(a => a.id).join(', ')})`);
+                        attachmentsForZip.push({
+                            filename: attachment.filename,
+                            data: attachment.data
+                        });
+                        continue;
+                    }
+                    
+                    console.log(`[JS] Found attachment metadata:`, attachmentMeta);
                     
                     // Decrypt attachment data
                     const decryptedData = await this.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
@@ -2837,7 +6045,7 @@ ${attachmentsHtml}
                         data: decryptedData
                     });
                     
-                    console.log(`[JS] Added decrypted attachment to ZIP: ${attachmentMeta.orig_filename}`);
+                    console.log(`[JS] Added decrypted attachment to ZIP: ${attachmentMeta.orig_filename} (${decryptedData.length} bytes)`);
                     
                 } else {
                     // Plain attachment
@@ -2892,48 +6100,102 @@ ${attachmentsHtml}
             if (sentList) sentList.style.display = 'block';
             if (sentDetailView) sentDetailView.style.display = 'none';
             if (sentActions) sentActions.style.display = 'flex';
-            if (sentTitle) sentTitle.textContent = 'Sent';
+            if (sentTitle) {
+                sentTitle.textContent = 'Sent';
+                sentTitle.style.display = '';
+            }
         } catch (error) {
             console.error('Error showing sent email list:', error);
         }
     }
 
     // Load drafts
-    async loadDrafts() {
+    async loadDrafts(append = false) {
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
         }
         try {
-            domManager.disable('refreshDrafts');
-            domManager.setHTML('refreshDrafts', '<span class="loading"></span> Loading...');
+            if (!append) {
+                // Reset offset when loading fresh (not appending)
+                this.draftsOffset = 0;
+                domManager.disable('refreshDrafts');
+                domManager.setHTML('refreshDrafts', '<span class="loading"></span> Loading...');
+            } else {
+                // Show loading state on Load More button
+                const loadMoreBtn = document.getElementById('load-more-drafts');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = true;
+                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
+                }
+            }
             const settings = appState.getSettings();
             const userEmail = settings.email_address ? settings.email_address : null;
+            // Get page size from settings (default to 50)
+            const pageSize = settings.emails_per_page || 50;
             console.log('[JS] loadDrafts userEmail:', userEmail);
+            console.log('[JS] Loading drafts with offset:', this.draftsOffset, 'pageSize:', pageSize);
             
-            const drafts = await TauriService.getDrafts(userEmail);
-            appState.setDrafts(drafts);
-            this.renderDrafts();
+            const drafts = await TauriService.getDrafts(pageSize, this.draftsOffset, userEmail);
+            
+            if (append) {
+                // Append new drafts to existing ones
+                const existingDrafts = appState.getDrafts();
+                appState.setDrafts([...existingDrafts, ...drafts]);
+            } else {
+                // Replace drafts (fresh load)
+                appState.setDrafts(drafts);
+            }
+            
+            // Update offset for next load
+            this.draftsOffset += drafts.length;
+            
+            // Show Load More button if we got a full page of results
+            this.renderDrafts(drafts.length === pageSize);
         } catch (error) {
             console.error('Failed to load drafts:', error);
             notificationService.showError('Failed to load drafts: ' + error);
         } finally {
-            domManager.enable('refreshDrafts');
-            domManager.setHTML('refreshDrafts', '<i class="fas fa-sync"></i> Refresh');
+            if (!append) {
+                domManager.enable('refreshDrafts');
+                domManager.setHTML('refreshDrafts', '<i class="fas fa-sync"></i> Refresh');
+            } else {
+                const loadMoreBtn = document.getElementById('load-more-drafts');
+                if (loadMoreBtn) {
+                    loadMoreBtn.disabled = false;
+                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                }
+            }
         }
     }
 
+    // Load more drafts (pagination)
+    async loadMoreDrafts() {
+        await this.loadDrafts(true);
+    }
+
     // Render drafts
-    async renderDrafts() {
+    async renderDrafts(showLoadMore = false) {
         const draftsList = domManager.get('draftsList');
         if (!draftsList) return;
         try {
-            draftsList.innerHTML = '';
+            // Remove existing Load More button if it exists
+            const existingLoadMoreBtn = document.getElementById('load-more-drafts');
+            if (existingLoadMoreBtn) {
+                existingLoadMoreBtn.remove();
+            }
+            
+            // Get all drafts from state
             const drafts = appState.getDrafts();
+            
             if (!drafts || drafts.length === 0) {
                 draftsList.innerHTML = '<div class="text-center text-muted">No drafts found</div>';
                 return;
             }
+            
+            // Always re-render all drafts (simpler approach)
+            draftsList.innerHTML = '';
+            
             for (const draft of drafts) {
                 const draftElement = document.createElement('div');
                 draftElement.className = 'email-item';
@@ -3016,6 +6278,17 @@ ${attachmentsHtml}
                 draftElement.addEventListener('click', () => this.loadDraftToCompose(draft));
                 draftsList.appendChild(draftElement);
             }
+            
+            // Add Load More button if there might be more drafts
+            if (showLoadMore) {
+                const loadMoreBtn = document.createElement('button');
+                loadMoreBtn.id = 'load-more-drafts';
+                loadMoreBtn.className = 'btn btn-secondary';
+                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
+                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
+                loadMoreBtn.addEventListener('click', () => this.loadMoreDrafts());
+                draftsList.appendChild(loadMoreBtn);
+            }
         } catch (error) {
             console.error('Error rendering drafts:', error);
         }
@@ -3044,9 +6317,10 @@ ${attachmentsHtml}
                 domManager.setValue('messageBody', draft.body || '');
                 
                 // If this was an encrypted draft, restore the Nostr contact selection
-                if (draft.is_nostr_encrypted && draft.nostr_pubkey) {
+                const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey; // Fallback for backward compatibility
+                if (draft.is_nostr_encrypted && draftRecipientPubkey) {
                     const contacts = appState.getContacts();
-                    const contact = contacts.find(c => c.pubkey === draft.nostr_pubkey);
+                    const contact = contacts.find(c => c.pubkey === draftRecipientPubkey);
                     if (contact) {
                         this.selectedNostrContact = contact;
                         // Update the Nostr contact dropdown
@@ -3054,11 +6328,18 @@ ${attachmentsHtml}
                         if (dropdown) {
                             dropdown.value = contact.pubkey;
                         }
+                        // Display the recipient pubkey
+                        const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                        const pubkeyValue = document.getElementById('recipient-pubkey-value');
+                        if (pubkeyDisplay && pubkeyValue) {
+                            pubkeyValue.textContent = contact.pubkey;
+                            pubkeyDisplay.style.display = 'block';
+                        }
                         // Update the UI to show it's an encrypted email
                         const toAddressInput = domManager.get('toAddress');
                         if (toAddressInput) {
                             toAddressInput.style.borderColor = '#667eea';
-                            toAddressInput.style.backgroundColor = '#f8f9ff';
+                            toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
                             toAddressInput.classList.add('hidden');
                         }
                     }
@@ -3089,6 +6370,12 @@ ${attachmentsHtml}
                     domManager.setValue('messageBody', '');
                     domManager.setValue('nostrContactSelect', '');
                     this.selectedNostrContact = null;
+                    
+                    // Hide pubkey display
+                    const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
+                    if (pubkeyDisplay) {
+                        pubkeyDisplay.style.display = 'none';
+                    }
                     
                     // Reset the UI for Nostr contact selection
                     const toAddressInput = domManager.get('toAddress');
@@ -3129,14 +6416,15 @@ ${attachmentsHtml}
             const draftsDetailContent = domManager.get('draftsDetailContent');
             if (draftsDetailContent) {
                 const cleanedBody = draft.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-                const nostrPubkey = draft.nostr_pubkey;
+                // For drafts, use recipient_pubkey for decryption (drafts are emails we're preparing to send)
+                const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey; // Fallback for backward compatibility
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(draft.subject);
                 const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
                 let decryptedSubject = draft.subject;
                 let decryptedBody = cleanedBody;
                 const keypair = appState.getKeypair();
                 
-                if ((nostrPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+                if ((draftRecipientPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
                     (async () => {
                         try {
                             if (isEncryptedSubject) {

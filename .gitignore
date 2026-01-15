@@ -1,3 +1,14 @@
 .env
 .ipynb_checkpoints/
 hourly-outputs/
+site/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# macOS
+.DS_Store

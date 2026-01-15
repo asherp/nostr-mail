@@ -1,3 +1,4 @@
+* when changing email addresses, app has trouble decrypting emails in db
 * mac build instructions
 * building on a mac for android, you'll need:
     java (from adoptium)

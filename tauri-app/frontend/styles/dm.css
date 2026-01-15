@@ -291,7 +291,7 @@ body.dark-mode .dm-search-icon {
 }
 
 .message-sent .message-content {
-    background: var(--primary-color);
+    background: #667eea;
     color: white;
 }
 

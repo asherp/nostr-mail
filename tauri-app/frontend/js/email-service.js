@@ -2607,12 +2607,13 @@ class EmailService {
             
             const emailList = domManager.get('emailList');
             const emailDetailView = document.getElementById('email-detail-view');
+            const emailDetailHeader = emailDetailView ? emailDetailView.querySelector('.email-detail-header') : null;
             const inboxActions = document.getElementById('inbox-actions');
             const inboxTitle = document.getElementById('inbox-title');
             if (emailList) emailList.style.display = 'none';
             if (emailDetailView) emailDetailView.style.display = 'flex';
             if (inboxActions) inboxActions.style.display = 'none';
-            if (inboxTitle) inboxTitle.textContent = 'Email Detail';
+            if (inboxTitle) inboxTitle.style.display = 'none';
             const emailDetailContent = document.getElementById('email-detail-content');
             if (emailDetailContent) {
                 // Use email.body directly instead of cleanedBody to preserve encrypted message format
@@ -2838,18 +2839,75 @@ class EmailService {
                         signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
                     }
                     
+                    // Get sender info for header
+                    const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                    const contacts = appState.getContacts();
+                    const senderContact = senderPubkey ? contacts.find(c => c.pubkey === senderPubkey) : null;
+                    
+                    // Avatar logic (same as dm-service.js)
+                    const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+                    let avatarSrc = defaultAvatar;
+                    const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+                    if (senderContact && !senderContact.picture_loading) {
+                        if (isValidDataUrl) {
+                            avatarSrc = senderContact.picture_data_url;
+                        } else if (senderContact.picture) {
+                            avatarSrc = senderContact.picture;
+                        }
+                    }
+                    
+                    const senderName = senderContact ? (senderContact.name || senderContact.display_name || email.from) : email.from;
+                    const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+                    
+                    // Update page header (just back button, no subject)
+                    if (emailDetailHeader) {
+                        emailDetailHeader.innerHTML = `
+                            <button id="back-to-inbox" class="btn btn-secondary">
+                                <i class="fas fa-arrow-left"></i> Back to Inbox
+                            </button>
+                        `;
+                        // Re-attach back button event listener
+                        const backBtn = emailDetailHeader.querySelector('#back-to-inbox');
+                        if (backBtn) {
+                            backBtn.addEventListener('click', () => {
+                                if (emailList) emailList.style.display = 'block';
+                                if (emailDetailView) emailDetailView.style.display = 'none';
+                                if (inboxActions) inboxActions.style.display = 'flex';
+                                if (inboxTitle) {
+                                    inboxTitle.textContent = 'Inbox';
+                                    inboxTitle.style.display = '';
+                                }
+                            });
+                        }
+                    }
+                    
                     emailDetailContent.innerHTML =
                         `<div class="email-detail">
+<h2 class="email-detail-subject">${Utils.escapeHtml(subject)}</h2>
+<div class="email-detail-card">
+<div class="email-sender-header">
+<img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
+${signatureIndicator}
+</div>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
+<details class="email-metadata-details">
+<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
 <div class="email-detail-header vertical" id="inbox-email-header-info">
-<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)} ${signatureIndicator}</span></div>
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
-<div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
 </div>
-<pre id="inbox-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+</details>
+<pre id="inbox-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="inbox-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
-<pre id="inbox-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
+<pre id="inbox-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}</pre>
 ${attachmentsHtml}
+</div>
 <button id="inbox-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
                     const toggleRawBtn = document.getElementById('inbox-toggle-raw-btn');
@@ -2858,6 +2916,52 @@ ${attachmentsHtml}
                     const bodyInfo = document.getElementById('inbox-email-body-info');
                     const rawBodyInfo = document.getElementById('inbox-raw-body-info');
                     const attachmentsInfo = document.getElementById('inbox-email-attachments');
+                    
+                    // Add event listeners for invalid signature indicator in sender header
+                    if (email.signature_valid === false) {
+                        const sigIndicator = emailDetailContent.querySelector('.email-sender-header .signature-indicator.invalid');
+                        if (sigIndicator) {
+                            const originalText = sigIndicator.textContent;
+                            sigIndicator.addEventListener('mouseenter', () => {
+                                sigIndicator.textContent = 'recheck signature?';
+                            });
+                            sigIndicator.addEventListener('mouseleave', () => {
+                                sigIndicator.textContent = originalText;
+                            });
+                            sigIndicator.addEventListener('click', async (e) => {
+                                e.stopPropagation();
+                                const messageId = sigIndicator.dataset.messageId;
+                                if (messageId) {
+                                    sigIndicator.textContent = 'checking...';
+                                    sigIndicator.style.opacity = '0.7';
+                                    try {
+                                        const result = await TauriService.recheckEmailSignature(messageId);
+                                        if (result === true) {
+                                            email.signature_valid = true;
+                                            sigIndicator.className = 'signature-indicator verified';
+                                            sigIndicator.textContent = '✓ Verified';
+                                            sigIndicator.title = 'Verified Nostr signature';
+                                            sigIndicator.removeAttribute('data-message-id');
+                                            sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                            notificationService.showSuccess('Signature verified successfully!');
+                                        } else if (result === false) {
+                                            sigIndicator.textContent = originalText;
+                                            notificationService.showError('Signature is still invalid.');
+                                        } else {
+                                            sigIndicator.textContent = originalText;
+                                            notificationService.showError('Could not verify signature.');
+                                        }
+                                    } catch (error) {
+                                        console.error('[JS] Failed to recheck signature:', error);
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showError('Failed to recheck signature: ' + error);
+                                    } finally {
+                                        sigIndicator.style.opacity = '1';
+                                    }
+                                }
+                            });
+                        }
+                    }
                     
                     if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
                         // Remove any existing event listeners by cloning the button
@@ -2876,6 +2980,12 @@ ${attachmentsHtml}
                                 bodyInfo.style.display = 'none';
                                 rawBodyInfo.style.display = 'block';
                                 newToggleBtn.textContent = 'Show Display Content';
+                                
+                                // Hide metadata details when showing raw content
+                                const metadataDetails = headerInfo.closest('.email-metadata-details');
+                                if (metadataDetails) {
+                                    metadataDetails.style.display = 'none';
+                                }
                                 
                                 // Update attachment filenames, sizes, and icons to show encrypted versions
                                 if (attachmentsInfo) {
@@ -2913,11 +3023,10 @@ ${attachmentsHtml}
                                     rawBodyInfo.parentNode.insertBefore(attachmentsInfo, rawBodyInfo.nextSibling);
                                 }
                                 
-                                // Move button to bottom
-                                if (attachmentsInfo && attachmentsInfo.parentNode) {
-                                    attachmentsInfo.parentNode.insertBefore(newToggleBtn, attachmentsInfo.nextSibling);
-                                } else {
-                                    rawBodyInfo.parentNode.insertBefore(newToggleBtn, rawBodyInfo.nextSibling);
+                                // Move button outside the card (after the card closes)
+                                const emailDetailCard = headerInfo.closest('.email-detail-card');
+                                if (emailDetailCard && emailDetailCard.parentNode) {
+                                    emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
                                 }
                             } else {
                                 headerInfo.classList.remove('hidden-header');
@@ -2925,6 +3034,12 @@ ${attachmentsHtml}
                                 bodyInfo.style.display = 'block';
                                 rawBodyInfo.style.display = 'none';
                                 newToggleBtn.textContent = 'Show Raw Content';
+                                
+                                // Show metadata details when showing display content
+                                const metadataDetails = headerInfo.closest('.email-metadata-details');
+                                if (metadataDetails) {
+                                    metadataDetails.style.display = '';
+                                }
                                 
                                 // Update attachment filenames, sizes, and icons to show decrypted versions
                                 if (attachmentsInfo) {
@@ -2962,11 +3077,10 @@ ${attachmentsHtml}
                                     bodyInfo.parentNode.insertBefore(attachmentsInfo, bodyInfo.nextSibling);
                                 }
                                 
-                                // Move button to bottom
-                                if (attachmentsInfo && attachmentsInfo.parentNode) {
-                                    attachmentsInfo.parentNode.insertBefore(newToggleBtn, attachmentsInfo.nextSibling);
-                                } else {
-                                    bodyInfo.parentNode.insertBefore(newToggleBtn, bodyInfo.nextSibling);
+                                // Keep button outside the card (after the card closes)
+                                const emailDetailCard = headerInfo.closest('.email-detail-card');
+                                if (emailDetailCard && emailDetailCard.parentNode) {
+                                    emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
                                 }
                             }
                         });
@@ -2993,7 +3107,10 @@ ${attachmentsHtml}
             
             // Re-render emails to update unread indicators
             this.renderEmails();
-            if (inboxTitle) inboxTitle.textContent = 'Inbox';
+            if (inboxTitle) {
+                inboxTitle.textContent = 'Inbox';
+                inboxTitle.style.display = '';
+            }
             
         } catch (error) {
             console.error('Error showing email list:', error);
@@ -3959,7 +4076,7 @@ ${attachmentsHtml}
             if (sentList) sentList.style.display = 'none';
             if (sentDetailView) sentDetailView.style.display = 'flex';
             if (sentActions) sentActions.style.display = 'none';
-            if (sentTitle) sentTitle.textContent = 'Sent Email Detail';
+            if (sentTitle) sentTitle.style.display = 'none';
             const sentDetailContent = domManager.get('sentDetailContent');
             
             // Show loading state immediately to prevent freeze
@@ -4026,20 +4143,164 @@ ${attachmentsHtml}
                     signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
                 }
                 
+                // Get sender info (for sent emails, sender is us)
+                // IMPORTANT: For sent emails, we are the sender, so we must use OUR pubkey, not email.recipient_pubkey
+                // Always use profile cache directly (same as loadProfile) to ensure we get our own profile
+                const myKeypair = appState.getKeypair();
+                const myPubkey = myKeypair ? myKeypair.public_key : null;
+                let senderContact = null;
+                
+                // Debug: Log what pubkeys we have to ensure we're using the right one
+                console.log(`[Sent Email Detail Error] Our pubkey: ${myPubkey ? myPubkey.substring(0, 16) + '...' : 'null'}`);
+                console.log(`[Sent Email Detail Error] Email sender_pubkey: ${email.sender_pubkey || 'null'}`);
+                console.log(`[Sent Email Detail Error] Email recipient_pubkey: ${email.recipient_pubkey || 'null'}`);
+                
+                if (myPubkey) {
+                    // Look up our profile in contacts list (user's profile is now added privately)
+                    const contacts = appState.getContacts();
+                    senderContact = contacts.find(c => c.pubkey === myPubkey) || null;
+                    if (senderContact) {
+                        console.log(`[Sent Email Detail Error] Found our profile in contacts - name: ${senderContact.name}`);
+                    } else {
+                        // Fallback to database lookup
+                        console.log(`[Sent Email Detail Error] Not found in contacts, trying database lookup`);
+                        try {
+                            const ourProfile = await DatabaseService.getContact(myPubkey);
+                            if (ourProfile) {
+                                console.log(`[Sent Email Detail Error] Found our profile in database - name: ${ourProfile.name}`);
+                                senderContact = {
+                                    pubkey: myPubkey,
+                                    name: ourProfile.name || ourProfile.display_name,
+                                    display_name: ourProfile.display_name,
+                                    picture: ourProfile.picture_url || ourProfile.picture,
+                                    picture_data_url: ourProfile.picture_data_url
+                                };
+                            }
+                        } catch (e) {
+                            console.error(`[Sent Email Detail Error] Error fetching our profile from database:`, e);
+                        }
+                    }
+                } else {
+                    console.log(`[Sent Email Detail Error] No pubkey available`);
+                }
+                
+                // Avatar logic
+                const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+                let avatarSrc = defaultAvatar;
+                const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+                if (senderContact && !senderContact.picture_loading) {
+                    if (isValidDataUrl) {
+                        avatarSrc = senderContact.picture_data_url;
+                    } else if (senderContact.picture) {
+                        avatarSrc = senderContact.picture;
+                    }
+                }
+                
+                const senderName = senderContact ? (senderContact.name || senderContact.display_name || email.from) : email.from;
+                const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+                
+                // Update page header (just back button, no subject)
+                const sentDetailView = domManager.get('sentDetailView');
+                const sentDetailHeader = sentDetailView ? sentDetailView.querySelector('.email-detail-header') : null;
+                if (sentDetailHeader) {
+                    sentDetailHeader.innerHTML = `
+                        <button id="back-to-sent" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Sent
+                        </button>
+                    `;
+                    // Re-attach back button event listener
+                    const backBtn = sentDetailHeader.querySelector('#back-to-sent');
+                    if (backBtn) {
+                        backBtn.addEventListener('click', () => {
+                            const sentList = domManager.get('sentList');
+                            const sentActions = domManager.get('sentActions');
+                            const sentTitle = domManager.get('sentTitle');
+                            if (sentList) sentList.style.display = 'block';
+                            if (sentDetailView) sentDetailView.style.display = 'none';
+                            if (sentActions) sentActions.style.display = 'flex';
+                            if (sentTitle) {
+                                sentTitle.textContent = 'Sent';
+                                sentTitle.style.display = '';
+                            }
+                        });
+                    }
+                }
+                
                 sentDetailContent.innerHTML =
                     `<div class="email-detail">
+<h2 class="email-detail-subject">${Utils.escapeHtml(email.subject)}</h2>
+<div class="email-detail-card">
+<div class="email-sender-header">
+<img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
+${signatureIndicator}
+</div>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
 <div class="error" style="margin-bottom: 15px;">Cannot decrypt: Recipient pubkey not found in contacts. The email could not be decrypted with any known contact pubkey.</div>
+<details class="email-metadata-details">
+<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
 <div class="email-detail-header vertical" id="sent-email-header-info">
-<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)} ${signatureIndicator}</span></div>
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
-<div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(email.subject)}</span></div>
 </div>
-<pre id="sent-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(rawHeaders)}</pre>
+</details>
+<pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(rawHeaders)}</pre>
 <div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(rawBody).replace(/\n/g, '<br>')}</div>
-<pre id="sent-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(rawBody)}</pre>
+<pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(rawBody)}</pre>
+</div>
 <button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
+                
+                // Add event listeners for invalid signature indicator in sender header
+                if (email.signature_valid === false) {
+                    const sigIndicator = sentDetailContent.querySelector('.email-sender-header .signature-indicator.invalid');
+                    if (sigIndicator) {
+                        const originalText = sigIndicator.textContent;
+                        sigIndicator.addEventListener('mouseenter', () => {
+                            sigIndicator.textContent = 'recheck signature?';
+                        });
+                        sigIndicator.addEventListener('mouseleave', () => {
+                            sigIndicator.textContent = originalText;
+                        });
+                        sigIndicator.addEventListener('click', async (e) => {
+                            e.stopPropagation();
+                            const messageId = sigIndicator.dataset.messageId;
+                            if (messageId) {
+                                sigIndicator.textContent = 'checking...';
+                                sigIndicator.style.opacity = '0.7';
+                                try {
+                                    const result = await TauriService.recheckEmailSignature(messageId);
+                                    if (result === true) {
+                                        email.signature_valid = true;
+                                        sigIndicator.className = 'signature-indicator verified';
+                                        sigIndicator.textContent = '✓ Verified';
+                                        sigIndicator.title = 'Verified Nostr signature';
+                                        sigIndicator.removeAttribute('data-message-id');
+                                        sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                        notificationService.showSuccess('Signature verified successfully!');
+                                    } else if (result === false) {
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showError('Signature is still invalid.');
+                                    } else {
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showError('Could not verify signature.');
+                                    }
+                                } catch (error) {
+                                    console.error('[JS] Failed to recheck signature:', error);
+                                    sigIndicator.textContent = originalText;
+                                    notificationService.showError('Failed to recheck signature: ' + error);
+                                } finally {
+                                    sigIndicator.style.opacity = '1';
+                                }
+                            }
+                        });
+                    }
+                }
                 
                 // Set up the toggle button for raw content
                 const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
@@ -4065,12 +4326,24 @@ ${attachmentsHtml}
                             bodyInfo.style.display = 'none';
                             rawBodyInfo.style.display = 'block';
                             newToggleBtn.textContent = 'Show Display Content';
+                            
+                            // Hide metadata details when showing raw content
+                            const metadataDetails = headerInfo.closest('.email-metadata-details');
+                            if (metadataDetails) {
+                                metadataDetails.style.display = 'none';
+                            }
                         } else {
                             headerInfo.classList.remove('hidden-header');
                             rawHeaderInfo.style.display = 'none';
                             bodyInfo.style.display = 'block';
                             rawBodyInfo.style.display = 'none';
                             newToggleBtn.textContent = 'Show Raw Content';
+                            
+                            // Show metadata details when showing display content
+                            const metadataDetails = headerInfo.closest('.email-metadata-details');
+                            if (metadataDetails) {
+                                metadataDetails.style.display = '';
+                            }
                         }
                     });
                 }
@@ -4293,20 +4566,172 @@ ${attachmentsHtml}
                 signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
             }
             
+            // Get sender info (for sent emails, sender is us)
+            // IMPORTANT: For sent emails, we are the sender, so we must use OUR pubkey, not email.recipient_pubkey
+            // Always use profile cache directly (same as loadProfile) to ensure we get our own profile
+            const myKeypair = appState.getKeypair();
+            const myPubkey = myKeypair ? myKeypair.public_key : null;
+            let senderContact = null;
+            
+            // Debug: Log what pubkeys we have to ensure we're using the right one
+            console.log(`[Sent Email Detail] Our pubkey: ${myPubkey ? myPubkey.substring(0, 16) + '...' : 'null'}`);
+            console.log(`[Sent Email Detail] Email sender_pubkey: ${email.sender_pubkey || 'null'}`);
+            console.log(`[Sent Email Detail] Email recipient_pubkey: ${email.recipient_pubkey || 'null'}`);
+            
+            // CRITICAL: Ensure we never accidentally use recipient_pubkey for avatar lookup
+            if (myPubkey && email.recipient_pubkey && myPubkey === email.recipient_pubkey) {
+                console.error(`[Sent Email Detail] ERROR: Our pubkey matches recipient_pubkey! This should not happen for sent emails.`);
+            }
+            
+            if (myPubkey) {
+                // First try to get from profile cache (same logic as loadProfile)
+                const cachedProfiles = localStorage.getItem('nostr_mail_profiles');
+                if (cachedProfiles) {
+                    try {
+                        const profileDict = JSON.parse(cachedProfiles);
+                        const cachedProfile = profileDict[myPubkey];
+                        if (cachedProfile) {
+                            console.log(`[Sent Email Detail] Found cached profile for our pubkey`);
+                            // Get picture data URL - check if it's for our pubkey
+                            // Note: nostr_mail_profile_picture is a single value, so we need to verify it's for current profile
+                            const cachedPictureDataUrl = localStorage.getItem('nostr_mail_profile_picture');
+                            senderContact = {
+                                pubkey: myPubkey,
+                                name: cachedProfile.fields?.name || cachedProfile.fields?.display_name || cachedProfile.name,
+                                display_name: cachedProfile.fields?.display_name || cachedProfile.display_name,
+                                picture: cachedProfile.fields?.picture || cachedProfile.picture,
+                                picture_data_url: cachedPictureDataUrl
+                            };
+                            console.log(`[Sent Email Detail] Using profile cache - name: ${senderContact.name}, picture: ${senderContact.picture ? 'yes' : 'no'}`);
+                        } else {
+                            console.log(`[Sent Email Detail] No cached profile found for our pubkey`);
+                        }
+                    } catch (e) {
+                        console.error('Error parsing cached profiles:', e);
+                    }
+                }
+                
+                // Fallback: Look up our profile in contacts list (user's profile is now added privately)
+                // If not found, fall back to database lookup
+                if (!senderContact) {
+                    console.log(`[Sent Email Detail] Falling back to contacts lookup`);
+                    const contacts = appState.getContacts();
+                    senderContact = contacts.find(c => c.pubkey === myPubkey) || null;
+                    if (senderContact) {
+                        console.log(`[Sent Email Detail] Found our profile in contacts - name: ${senderContact.name}`);
+                    } else {
+                        console.log(`[Sent Email Detail] Not found in contacts, trying database lookup`);
+                        try {
+                            const ourProfile = await DatabaseService.getContact(myPubkey);
+                            if (ourProfile) {
+                                console.log(`[Sent Email Detail] Found our profile in database - name: ${ourProfile.name}`);
+                                senderContact = {
+                                    pubkey: myPubkey,
+                                    name: ourProfile.name || ourProfile.display_name,
+                                    display_name: ourProfile.display_name,
+                                    picture: ourProfile.picture_url || ourProfile.picture,
+                                    picture_data_url: ourProfile.picture_data_url
+                                };
+                            }
+                        } catch (e) {
+                            console.error(`[Sent Email Detail] Error fetching our profile from database:`, e);
+                        }
+                    }
+                }
+            } else {
+                console.log(`[Sent Email Detail] No pubkey available`);
+            }
+            
+            // Avatar logic
+            const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+            let avatarSrc = defaultAvatar;
+            const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+            if (senderContact && !senderContact.picture_loading) {
+                if (isValidDataUrl) {
+                    avatarSrc = senderContact.picture_data_url;
+                } else if (senderContact.picture) {
+                    avatarSrc = senderContact.picture;
+                }
+            }
+            
+            const senderName = senderContact ? (senderContact.name || senderContact.display_name || email.from) : email.from;
+            const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+            
             sentDetailContent.innerHTML =
                 `<div class="email-detail">
+<h2 class="email-detail-subject">${Utils.escapeHtml(subject)}</h2>
+<div class="email-detail-card">
+<div class="email-sender-header">
+<img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
+${signatureIndicator}
+</div>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
+<details class="email-metadata-details">
+<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
 <div class="email-detail-header vertical" id="sent-email-header-info">
-<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)} ${signatureIndicator}</span></div>
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
-<div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
 </div>
-<pre id="sent-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+</details>
+<pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
-<pre id="sent-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(email.raw_body)}</pre>
+<pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}</pre>
 ${attachmentsHtml}
+</div>
 <button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
+            
+            // Add event listeners for invalid signature indicator in sender header
+            if (email.signature_valid === false) {
+                const sigIndicator = sentDetailContent.querySelector('.email-sender-header .signature-indicator.invalid');
+                if (sigIndicator) {
+                    const originalText = sigIndicator.textContent;
+                    sigIndicator.addEventListener('mouseenter', () => {
+                        sigIndicator.textContent = 'recheck signature?';
+                    });
+                    sigIndicator.addEventListener('mouseleave', () => {
+                        sigIndicator.textContent = originalText;
+                    });
+                    sigIndicator.addEventListener('click', async (e) => {
+                        e.stopPropagation();
+                        const messageId = sigIndicator.dataset.messageId;
+                        if (messageId) {
+                            sigIndicator.textContent = 'checking...';
+                            sigIndicator.style.opacity = '0.7';
+                            try {
+                                const result = await TauriService.recheckEmailSignature(messageId);
+                                if (result === true) {
+                                    email.signature_valid = true;
+                                    sigIndicator.className = 'signature-indicator verified';
+                                    sigIndicator.textContent = '✓ Verified';
+                                    sigIndicator.title = 'Verified Nostr signature';
+                                    sigIndicator.removeAttribute('data-message-id');
+                                    sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                    notificationService.showSuccess('Signature verified successfully!');
+                                } else if (result === false) {
+                                    sigIndicator.textContent = originalText;
+                                    notificationService.showError('Signature is still invalid.');
+                                } else {
+                                    sigIndicator.textContent = originalText;
+                                    notificationService.showError('Could not verify signature.');
+                                }
+                            } catch (error) {
+                                console.error('[JS] Failed to recheck signature:', error);
+                                sigIndicator.textContent = originalText;
+                                notificationService.showError('Failed to recheck signature: ' + error);
+                            } finally {
+                                sigIndicator.style.opacity = '1';
+                            }
+                        }
+                    });
+                }
+            }
             
             const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
             const headerInfo = document.getElementById('sent-email-header-info');
@@ -4332,6 +4757,12 @@ ${attachmentsHtml}
                         bodyInfo.style.display = 'none';
                         rawBodyInfo.style.display = 'block';
                         newToggleBtn.textContent = 'Show Display Content';
+                        
+                        // Hide metadata details when showing raw content
+                        const metadataDetails = headerInfo.closest('.email-metadata-details');
+                        if (metadataDetails) {
+                            metadataDetails.style.display = 'none';
+                        }
                         
                         // Update attachment filenames and sizes to show encrypted versions
                         if (attachmentsInfo) {
@@ -4362,11 +4793,10 @@ ${attachmentsHtml}
                             rawBodyInfo.parentNode.insertBefore(attachmentsInfo, rawBodyInfo.nextSibling);
                         }
                         
-                        // Move button to bottom (after attachments or raw body)
-                        if (attachmentsInfo && attachmentsInfo.parentNode) {
-                            attachmentsInfo.parentNode.insertBefore(newToggleBtn, attachmentsInfo.nextSibling);
-                        } else {
-                            rawBodyInfo.parentNode.insertBefore(newToggleBtn, rawBodyInfo.nextSibling);
+                        // Keep button outside the card (after the card closes)
+                        const emailDetailCard = headerInfo.closest('.email-detail-card');
+                        if (emailDetailCard && emailDetailCard.parentNode) {
+                            emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
                         }
                     } else {
                         headerInfo.classList.remove('hidden-header');
@@ -4374,6 +4804,12 @@ ${attachmentsHtml}
                         bodyInfo.style.display = 'block';
                         rawBodyInfo.style.display = 'none';
                         newToggleBtn.textContent = 'Show Raw Content';
+                        
+                        // Show metadata details when showing display content
+                        const metadataDetails = headerInfo.closest('.email-metadata-details');
+                        if (metadataDetails) {
+                            metadataDetails.style.display = '';
+                        }
                         
                         // Update attachment filenames and sizes to show decrypted versions
                         if (attachmentsInfo) {
@@ -4404,11 +4840,10 @@ ${attachmentsHtml}
                             bodyInfo.parentNode.insertBefore(attachmentsInfo, bodyInfo.nextSibling);
                         }
                         
-                        // Move button to bottom (after attachments or regular body)
-                        if (attachmentsInfo && attachmentsInfo.parentNode) {
-                            attachmentsInfo.parentNode.insertBefore(newToggleBtn, attachmentsInfo.nextSibling);
-                        } else {
-                            bodyInfo.parentNode.insertBefore(newToggleBtn, bodyInfo.nextSibling);
+                        // Keep button outside the card (after the card closes)
+                        const emailDetailCard = headerInfo.closest('.email-detail-card');
+                        if (emailDetailCard && emailDetailCard.parentNode) {
+                            emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
                         }
                     }
                 });
@@ -5203,7 +5638,10 @@ ${attachmentsHtml}
             if (sentList) sentList.style.display = 'block';
             if (sentDetailView) sentDetailView.style.display = 'none';
             if (sentActions) sentActions.style.display = 'flex';
-            if (sentTitle) sentTitle.textContent = 'Sent';
+            if (sentTitle) {
+                sentTitle.textContent = 'Sent';
+                sentTitle.style.display = '';
+            }
         } catch (error) {
             console.error('Error showing sent email list:', error);
         }

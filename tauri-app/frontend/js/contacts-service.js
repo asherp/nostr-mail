@@ -39,6 +39,51 @@ class ContactsService {
                 picture_loading: false,
                 picture_loaded: !!contact.picture_data_url
             }));
+            
+            // Add user's own profile to contacts list as private
+            // This allows sent emails to find the user's avatar/profile
+            try {
+                const userProfile = await window.DatabaseService.getContact(userPubkey);
+                if (userProfile) {
+                    // Check if user is already in contacts (shouldn't be, but check anyway)
+                    const existingUserContact = contacts.find(c => c.pubkey === userPubkey);
+                    if (!existingUserContact) {
+                        // Get profile picture from cache if available
+                        let pictureDataUrl = userProfile.picture_data_url || null;
+                        if (!pictureDataUrl) {
+                            const cachedPictureDataUrl = localStorage.getItem('nostr_mail_profile_picture');
+                            if (cachedPictureDataUrl && cachedPictureDataUrl.startsWith('data:image')) {
+                                pictureDataUrl = cachedPictureDataUrl;
+                            }
+                        }
+                        
+                        const userContact = {
+                            pubkey: userPubkey,
+                            name: userProfile.name || userProfile.display_name || 'Me',
+                            picture: userProfile.picture_url || userProfile.picture || '',
+                            email: userProfile.email || null,
+                            is_public: false, // Private - user's own profile
+                            fields: {
+                                name: userProfile.name || 'Me',
+                                display_name: userProfile.display_name || userProfile.name || 'Me',
+                                picture: userProfile.picture_url || userProfile.picture || '',
+                                about: userProfile.about || '',
+                                email: userProfile.email || ''
+                            },
+                            picture_data_url: pictureDataUrl,
+                            picture_loading: false,
+                            picture_loaded: !!pictureDataUrl
+                        };
+                        contacts.unshift(userContact); // Add at the beginning
+                        console.log(`[JS] Added user's own profile to contacts list (private)`);
+                    }
+                } else {
+                    console.log(`[JS] User profile not found in database, skipping self-contact addition`);
+                }
+            } catch (e) {
+                console.warn(`[JS] Failed to add user's own profile to contacts:`, e);
+            }
+            
             window.appState.setContacts(contacts);
             console.log(`[JS] Contacts loaded from database: ${contacts.length} contacts`);
             this.renderContacts();

@@ -305,6 +305,18 @@ NostrMailApp.prototype.loadKeypair = async function() {
         console.log('Keypair loaded:', appState.getKeypair().public_key.substring(0, 20) + '...');
         this.renderProfilePubkey();
         
+        // Populate private key field in settings form if it's empty
+        // This ensures the user sees they're already logged in when the app starts
+        const nprivKeyInput = domManager.get('nprivKey');
+        if (nprivKeyInput && (!nprivKeyInput.value || nprivKeyInput.value.trim() === '')) {
+            if (keypair && keypair.private_key) {
+                domManager.setValue('nprivKey', keypair.private_key);
+                console.log('[APP] Populated private key field from cached keypair on startup');
+                // Update public key display to show the user is logged in
+                await this.updatePublicKeyDisplay();
+            }
+        }
+        
         // Load settings for this pubkey
         if (keypair && keypair.public_key) {
             await this.loadSettingsForPubkey(keypair.public_key);
@@ -1969,9 +1981,17 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
             this._setPopulatingForm(true);
         }
         
-        // Note: We do NOT set nprivKey here because the private key is not a setting.
-        // The private key is the source of truth that determines which settings to load.
-        // It should only be set by the user, never by loading settings.
+        // Populate private key field from cached keypair if available and field is empty
+        // This ensures the user sees they're already logged in when the app starts
+        const nprivKeyInput = domManager.get('nprivKey');
+        const currentNprivValue = nprivKeyInput?.value?.trim() || '';
+        if (!currentNprivValue) {
+            const keypair = appState.getKeypair();
+            if (keypair && keypair.private_key) {
+                domManager.setValue('nprivKey', keypair.private_key);
+                console.log('[APP] Populated private key field from cached keypair');
+            }
+        }
         
         domManager.setValue('encryptionAlgorithm', settings.encryption_algorithm || 'nip44');
         domManager.setValue('emailAddress', settings.email_address || '');

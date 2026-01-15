@@ -248,6 +248,26 @@ class DatabaseService {
         };
     }
 
+    static convertDbEmailToEmailMessage(dbEmail) {
+        return {
+            id: dbEmail.id ? dbEmail.id.toString() : dbEmail.message_id,
+            from: dbEmail.from_address,
+            to: dbEmail.to_address,
+            subject: dbEmail.subject,
+            body: dbEmail.body,
+            raw_body: dbEmail.body,
+            date: dbEmail.received_at,
+            is_read: dbEmail.is_read,
+            raw_headers: dbEmail.raw_headers || '',
+            sender_pubkey: dbEmail.sender_pubkey,
+            recipient_pubkey: dbEmail.recipient_pubkey,
+            message_id: dbEmail.message_id,
+            signature_valid: dbEmail.signature_valid,
+            is_nostr_encrypted: dbEmail.is_nostr_encrypted,
+            attachments: []
+        };
+    }
+
     // Migration helpers
     static async migrateFromLocalStorage() {
         try {

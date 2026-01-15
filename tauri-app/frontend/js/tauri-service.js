@@ -92,6 +92,15 @@ const TauriService = {
     getPublicKeyFromPrivate: async function(privateKey) {
         return await this.invoke('get_public_key_from_private', { privateKey });
     },
+    signData: async function(privateKey, data) {
+        return await this.invoke('sign_data', { privateKey, data });
+    },
+    verifySignature: async function(publicKey, signature, data) {
+        return await this.invoke('verify_signature', { publicKey, signature, data });
+    },
+    recheckEmailSignature: async function(messageId) {
+        return await this.invoke('recheck_email_signature', { messageId });
+    },
     encryptNip44Message: async function(privateKey, publicKey, message) {
         return await this.invoke('encrypt_nip04_message', { privateKey, publicKey, message });
     },
@@ -206,8 +215,8 @@ const TauriService = {
         }
         return await this.invoke('construct_email_headers', args);
     },
-    fetchEmails: async function(emailConfig, limit, searchQuery, onlyNostr = true) {
-        return await this.invoke('fetch_emails', { emailConfig, limit, searchQuery, onlyNostr });
+    fetchEmails: async function(emailConfig, limit, searchQuery, onlyNostr = true, requireSignature = null) {
+        return await this.invoke('fetch_emails', { emailConfig, limit, searchQuery, onlyNostr, requireSignature });
     },
     testImapConnection: async function(emailConfig) {
         return await this.invoke('test_imap_connection', { emailConfig });
@@ -460,12 +469,12 @@ const TauriService = {
         return await this.invoke('db_get_setting', { pubkey, key });
     },
     
-    dbGetAllSettings: async function(pubkey) {
-        return await this.invoke('db_get_all_settings', { pubkey });
+    dbGetAllSettings: async function(pubkey, privateKey) {
+        return await this.invoke('db_get_all_settings', { pubkey, privateKey });
     },
     
-    dbSaveSettingsBatch: async function(pubkey, settings) {
-        return await this.invoke('db_save_settings_batch', { pubkey, settings });
+    dbSaveSettingsBatch: async function(pubkey, settings, privateKey) {
+        return await this.invoke('db_save_settings_batch', { pubkey, settings, privateKey });
     },
     
     // Update email recipient pubkey

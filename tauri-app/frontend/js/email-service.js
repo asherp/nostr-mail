@@ -572,10 +572,14 @@ class EmailService {
                 console.log('[JS] Successfully decrypted manifest body');
                 domManager.setValue('messageBody', manifestResult.body);
                 window.notificationService.showSuccess('Body decrypted successfully');
+                // Clear signature when decrypting (body state changed)
+                this.clearSignature();
             } else if (manifestResult.type === 'legacy') {
                 console.log('[JS] Successfully decrypted legacy body');
                 domManager.setValue('messageBody', manifestResult.body);
                 window.notificationService.showSuccess('Body decrypted successfully');
+                // Clear signature when decrypting (body state changed)
+                this.clearSignature();
             }
             
         } catch (error) {
@@ -791,6 +795,24 @@ class EmailService {
         this.updateDmCheckboxVisibility();
         // Reset encrypt button state
         this.resetEncryptButtonState();
+    }
+    
+    // Clear signature when body state changes (encrypt/decrypt)
+    clearSignature() {
+        const signBtn = document.getElementById('sign-btn');
+        if (signBtn) {
+            const iconSpan = signBtn.querySelector('.sign-btn-icon i');
+            const labelSpan = signBtn.querySelector('.sign-btn-label');
+            
+            signBtn.dataset.signed = 'false';
+            delete signBtn.dataset.signature;
+            
+            if (iconSpan) iconSpan.className = 'fas fa-pen';
+            if (labelSpan) labelSpan.textContent = 'Sign';
+            signBtn.classList.remove('signed');
+            
+            console.log('[JS] Signature cleared due to body state change');
+        }
     }
     
     // Reset encrypt button state
@@ -1111,28 +1133,48 @@ class EmailService {
         try {
             const keypair = appState.getKeypair();
             const activeRelays = appState.getActiveRelays();
-            const encryptBtn = domManager.get('encryptBtn');
             
             // Check if user wants to send a matching DM (from settings)
             const settings = appState.getSettings();
             const shouldSendDm = settings && settings.send_matching_dm !== false; // Default to true
             
-            // Only send DM if setting is enabled and encrypt button is in encrypted state
-            if (shouldSendDm && encryptBtn && encryptBtn.dataset.encrypted === 'true') {
+            // Check if email is actually encrypted by examining the content
+            // Subject should be encrypted (base64-like) or body should have NIP encryption markers
+            const isSubjectEncrypted = window.Utils && window.Utils.isLikelyEncryptedContent(subject);
+            const isBodyEncrypted = body.includes('BEGIN NOSTR NIP-') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
+            const isEmailEncrypted = isSubjectEncrypted || isBodyEncrypted;
+            
+            console.log('[JS] Email encryption check:', { 
+                isSubjectEncrypted, 
+                isBodyEncrypted, 
+                isEmailEncrypted,
+                shouldSendDm,
+                subjectPreview: subject.substring(0, 50),
+                bodyPreview: body.substring(0, 50)
+            });
+            
+            // Only send DM if setting is enabled and email is actually encrypted
+            if (shouldSendDm && isEmailEncrypted) {
                 console.log('[JS] Sending matching DM to contact:', contact.name);
                 // Use the encrypted subject for the DM to match the email subject blob
                 // Since we know the subject is already encrypted, we'll pass it as encrypted content
-                const dmResult = await TauriService.sendEncryptedDirectMessage(
-                    keypair.private_key,
-                    contact.pubkey,
-                    subject, // This is already encrypted content
-                    activeRelays
-                );
-                console.log('[JS] DM sent successfully, event ID:', dmResult);
-            } else if (shouldSendDm) {
-                console.warn('[JS] Encrypt button not in encrypted state, DM will NOT be sent for security reasons.');
+                try {
+                    const dmResult = await TauriService.sendEncryptedDirectMessage(
+                        keypair.private_key,
+                        contact.pubkey,
+                        subject, // This is already encrypted content
+                        activeRelays
+                    );
+                    console.log('[JS] DM sent successfully, event ID:', dmResult);
+                    notificationService.showSuccess(`DM sent successfully (event ID: ${dmResult.substring(0, 16)}...)`);
+                } catch (dmError) {
+                    console.error('[JS] Failed to send DM:', dmError);
+                    notificationService.showError('Email sent but DM failed: ' + dmError);
+                }
+            } else if (shouldSendDm && !isEmailEncrypted) {
+                console.warn('[JS] Email is not encrypted, DM will NOT be sent for security reasons.');
                 notificationService.showInfo('No DM sent: Email is not encrypted.');
-            } else {
+            } else if (!shouldSendDm) {
                 console.log('[JS] Send matching DM setting is disabled, skipping DM.');
             }
             
@@ -2151,14 +2193,72 @@ class EmailService {
                 const attachmentIndicator = attachmentCount > 0 ? 
                     `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
+                // Add signature verification indicator
+                let signatureIndicator = '';
+                if (email.signature_valid === true) {
+                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+                } else if (email.signature_valid === false) {
+                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+                }
+
                 emailElement.innerHTML = `
                     <div class="email-header">
-                        <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator}</div>
+                        <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator} ${signatureIndicator}</div>
                         <div class="email-date">${dateDisplay}</div>
                     </div>
                     ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
                     <div class="email-preview">${previewText}</div>
                 `;
+                
+                // Add hover and click handlers for invalid signature indicator
+                if (email.signature_valid === false) {
+                    const sigIndicator = emailElement.querySelector('.signature-indicator.invalid');
+                    if (sigIndicator) {
+                        const originalText = sigIndicator.textContent;
+                        sigIndicator.addEventListener('mouseenter', () => {
+                            sigIndicator.textContent = 'recheck signature?';
+                        });
+                        sigIndicator.addEventListener('mouseleave', () => {
+                            sigIndicator.textContent = originalText;
+                        });
+                        sigIndicator.addEventListener('click', async (e) => {
+                            e.stopPropagation(); // Prevent email detail from opening
+                            const messageId = sigIndicator.dataset.messageId;
+                            if (messageId) {
+                                sigIndicator.textContent = 'checking...';
+                                sigIndicator.style.opacity = '0.7';
+                                try {
+                                    const result = await TauriService.recheckEmailSignature(messageId);
+                                    if (result === true) {
+                                        // Update the email object
+                                        email.signature_valid = true;
+                                        // Re-render this email item
+                                        sigIndicator.className = 'signature-indicator verified';
+                                        sigIndicator.textContent = '✓ Verified';
+                                        sigIndicator.title = 'Verified Nostr signature';
+                                        sigIndicator.removeAttribute('data-message-id');
+                                        // Remove hover handlers
+                                        sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                        notificationService.showSuccess('Signature verified successfully!');
+                                    } else if (result === false) {
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showError('Signature is still invalid');
+                                    } else {
+                                        sigIndicator.textContent = originalText;
+                                        notificationService.showWarning('Could not verify signature (missing pubkey or signature)');
+                                    }
+                                } catch (error) {
+                                    console.error('[JS] Failed to recheck signature:', error);
+                                    sigIndicator.textContent = originalText;
+                                    notificationService.showError('Failed to recheck signature: ' + error);
+                                } finally {
+                                    sigIndicator.style.opacity = '1';
+                                }
+                            }
+                        });
+                    }
+                }
+                
                 emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
                 emailList.appendChild(emailElement);
             }
@@ -2522,6 +2622,7 @@ class EmailService {
                                                 displayName: manifestAttachment.orig_filename,
                                                 encryptedFilename: dbAttachment.filename,
                                                 displaySize: manifestAttachment.orig_size || dbAttachment.size,
+                                                encryptedSize: manifestAttachment.cipher_size || dbAttachment.size,
                                                 displayMime: manifestAttachment.orig_mime || dbAttachment.content_type || dbAttachment.mime_type
                                             };
                                         } else {
@@ -2530,6 +2631,7 @@ class EmailService {
                                                 displayName: dbAttachment.filename,
                                                 encryptedFilename: dbAttachment.filename,
                                                 displaySize: dbAttachment.size,
+                                                encryptedSize: dbAttachment.size,
                                                 displayMime: dbAttachment.content_type || dbAttachment.mime_type
                                             };
                                         }
@@ -2540,6 +2642,7 @@ class EmailService {
                                         displayName: att.filename,
                                         encryptedFilename: att.filename,
                                         displaySize: att.size,
+                                        encryptedSize: att.size,
                                         displayMime: att.mime_type
                                     }));
                                 }
@@ -2550,6 +2653,7 @@ class EmailService {
                                     displayName: att.filename,
                                     encryptedFilename: att.filename,
                                     displaySize: att.size,
+                                    encryptedSize: att.size,
                                     displayMime: att.mime_type
                                 }));
                             }
@@ -2559,6 +2663,7 @@ class EmailService {
                                 displayName: att.filename,
                                 encryptedFilename: att.filename,
                                 displaySize: att.size,
+                                encryptedSize: att.size,
                                 displayMime: att.mime_type
                             }));
                         }
@@ -2585,13 +2690,15 @@ class EmailService {
                                     <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;" 
                                          data-encrypted-filename="${Utils.escapeHtml(encryptedFilename)}" 
                                          data-decrypted-filename="${Utils.escapeHtml(decryptedFilename)}"
+                                         data-encrypted-size="${attachment.encryptedSize || attachment.displaySize}"
+                                         data-decrypted-size="${attachment.displaySize}"
                                          data-is-encrypted="${isEncrypted}">
                                         <div class="attachment-info" style="display: flex; align-items: center;">
                                             <i class="fas fa-file" style="margin-right: 10px;"></i>
                                             <div class="attachment-details">
                                                 <div class="attachment-name" style="font-weight: bold;" data-display-name="${Utils.escapeHtml(decryptedFilename)}">${Utils.escapeHtml(decryptedFilename)}</div>
                                                 <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
-                                                    ${sizeFormatted} • <span class="attachment-status-icon">${statusIcon}</span> <span class="attachment-status-text">${statusText}</span>
+                                                    <span class="attachment-size">${sizeFormatted}</span> • <span class="attachment-status-icon">${statusIcon}</span> <span class="attachment-status-text">${statusText}</span>
                                                 </div>
                                             </div>
                                         </div>
@@ -2605,10 +2712,19 @@ class EmailService {
                             </div>
                         </div>`;
                     }
+                    
+                    // Add signature verification indicator
+                    let signatureIndicator = '';
+                    if (email.signature_valid === true) {
+                        signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+                    } else if (email.signature_valid === false) {
+                        signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+                    }
+                    
                     emailDetailContent.innerHTML =
                         `<div class="email-detail">
 <div class="email-detail-header vertical" id="inbox-email-header-info">
-<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)} ${signatureIndicator}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
 <div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(subject)}</span></div>
@@ -2644,18 +2760,26 @@ ${attachmentsHtml}
                                 rawBodyInfo.style.display = 'block';
                                 newToggleBtn.textContent = 'Show Display Content';
                                 
-                                // Update attachment filenames and icons to show encrypted versions
+                                // Update attachment filenames, sizes, and icons to show encrypted versions
                                 if (attachmentsInfo) {
                                     const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
                                     attachmentItems.forEach(item => {
                                         const encryptedFilename = item.getAttribute('data-encrypted-filename');
+                                        const encryptedSize = item.getAttribute('data-encrypted-size');
                                         const isEncrypted = item.getAttribute('data-is-encrypted') === 'true';
                                         const nameElement = item.querySelector('.attachment-name');
+                                        const sizeElement = item.querySelector('.attachment-size');
                                         const iconElement = item.querySelector('.attachment-status-icon');
                                         const textElement = item.querySelector('.attachment-status-text');
                                         
                                         if (encryptedFilename && nameElement) {
                                             nameElement.textContent = encryptedFilename;
+                                        }
+                                        
+                                        // Update size to show encrypted size
+                                        if (encryptedSize && sizeElement) {
+                                            const sizeFormatted = (parseFloat(encryptedSize) / 1024).toFixed(2) + ' KB';
+                                            sizeElement.textContent = sizeFormatted;
                                         }
                                         
                                         // Update icon and text to show encrypted state
@@ -2685,18 +2809,26 @@ ${attachmentsHtml}
                                 rawBodyInfo.style.display = 'none';
                                 newToggleBtn.textContent = 'Show Raw Content';
                                 
-                                // Update attachment filenames and icons to show decrypted versions
+                                // Update attachment filenames, sizes, and icons to show decrypted versions
                                 if (attachmentsInfo) {
                                     const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
                                     attachmentItems.forEach(item => {
                                         const decryptedFilename = item.getAttribute('data-decrypted-filename');
+                                        const decryptedSize = item.getAttribute('data-decrypted-size');
                                         const isEncrypted = item.getAttribute('data-is-encrypted') === 'true';
                                         const nameElement = item.querySelector('.attachment-name');
+                                        const sizeElement = item.querySelector('.attachment-size');
                                         const iconElement = item.querySelector('.attachment-status-icon');
                                         const textElement = item.querySelector('.attachment-status-text');
                                         
                                         if (decryptedFilename && nameElement) {
                                             nameElement.textContent = decryptedFilename;
+                                        }
+                                        
+                                        // Update size to show decrypted size
+                                        if (decryptedSize && sizeElement) {
+                                            const sizeFormatted = (parseFloat(decryptedSize) / 1024).toFixed(2) + ' KB';
+                                            sizeElement.textContent = sizeFormatted;
                                         }
                                         
                                         // Update icon and text to show decrypted state
@@ -3257,6 +3389,9 @@ ${attachmentsHtml}
                 
                 domManager.setValue('messageBody', armoredManifest.trim());
                 
+                // Clear signature when encrypting (body state changed)
+                this.clearSignature();
+                
                 // Update attachment list display
                 this.renderAttachmentList();
                 
@@ -3495,9 +3630,17 @@ ${attachmentsHtml}
         const attachmentIndicator = attachmentCount > 0 ? 
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
+        // Add signature verification indicator
+        let signatureIndicator = '';
+        if (email.signature_valid === true) {
+            signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+        } else if (email.signature_valid === false) {
+            signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+        }
+
         emailElement.innerHTML = `
             <div class="email-header">
-                <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator}</div>
+                <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator} ${signatureIndicator}</div>
                 <div class="email-date">${dateDisplay}</div>
             </div>
             ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
@@ -3508,6 +3651,55 @@ ${attachmentsHtml}
                 </button>
             </div>
         `;
+        
+        // Add hover and click handlers for invalid signature indicator
+        if (email.signature_valid === false) {
+            const sigIndicator = emailElement.querySelector('.signature-indicator.invalid');
+            if (sigIndicator) {
+                const originalText = sigIndicator.textContent;
+                sigIndicator.addEventListener('mouseenter', () => {
+                    sigIndicator.textContent = 'recheck signature?';
+                });
+                sigIndicator.addEventListener('mouseleave', () => {
+                    sigIndicator.textContent = originalText;
+                });
+                sigIndicator.addEventListener('click', async (e) => {
+                    e.stopPropagation(); // Prevent email detail from opening
+                    const messageId = sigIndicator.dataset.messageId;
+                    if (messageId) {
+                        sigIndicator.textContent = 'checking...';
+                        sigIndicator.style.opacity = '0.7';
+                        try {
+                            const result = await TauriService.recheckEmailSignature(messageId);
+                            if (result === true) {
+                                // Update the email object
+                                email.signature_valid = true;
+                                // Re-render this email item
+                                sigIndicator.className = 'signature-indicator verified';
+                                sigIndicator.textContent = '✓ Verified';
+                                sigIndicator.title = 'Verified Nostr signature';
+                                sigIndicator.removeAttribute('data-message-id');
+                                // Remove hover handlers
+                                sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                notificationService.showSuccess('Signature verified successfully!');
+                            } else if (result === false) {
+                                sigIndicator.textContent = originalText;
+                                notificationService.showError('Signature is still invalid');
+                            } else {
+                                sigIndicator.textContent = originalText;
+                                notificationService.showWarning('Could not verify signature (missing pubkey or signature)');
+                            }
+                        } catch (error) {
+                            console.error('[JS] Failed to recheck signature:', error);
+                            sigIndicator.textContent = originalText;
+                            notificationService.showError('Failed to recheck signature: ' + error);
+                        } finally {
+                            sigIndicator.style.opacity = '1';
+                        }
+                    }
+                });
+            }
+        }
         emailElement.addEventListener('click', () => this.showSentDetail(email.id));
         return emailElement;
     }
@@ -3585,32 +3777,90 @@ ${attachmentsHtml}
     async _loadSentEmailDetail(email, sentDetailContent) {
         if (!sentDetailContent) return;
         
+        // Refresh email from appState to ensure we have the latest recipient_pubkey
+        const freshEmail = appState.getSentEmails().find(e => e.id === email.id || e.message_id === email.message_id);
+        if (freshEmail) {
+            // Update the email object with fresh data
+            Object.assign(email, freshEmail);
+        }
+        
         // Check if recipient_pubkey is missing and email is encrypted
-        const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
+        // Note: We specifically check for recipient_pubkey, not nostr_pubkey (which might be sender's pubkey)
+        const hasRecipientPubkey = !!(email.recipient_pubkey);
         const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
         const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
         const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
         const isEncrypted = isEncryptedSubject || encryptedBodyMatch;
         
-        // If encrypted but no recipient_pubkey, show modal to enter it
-        if (isEncrypted && !recipientPubkey && appState.getKeypair()) {
-            const userEnteredPubkey = await this._showRecipientPubkeyModal(email);
-            if (userEnteredPubkey) {
-                // Try decryption with the entered pubkey
-                const decryptionSuccess = await this._tryDecryptWithRecipientPubkey(email, userEnteredPubkey);
-                if (decryptionSuccess) {
-                    // Update email object and reload detail
-                    email.recipient_pubkey = userEnteredPubkey;
-                    // Reload the detail view with the updated pubkey
-                    await this._loadSentEmailDetail(email, sentDetailContent);
-                    return;
-                } else {
-                    // Decryption failed, show error and continue with normal flow
-                    window.notificationService.showError('Decryption failed with the provided pubkey. Please verify the pubkey is correct.');
+        console.log(`[JS] _loadSentEmailDetail: Email ${email.id}, encrypted: ${isEncrypted}, hasRecipientPubkey: ${hasRecipientPubkey}, recipient_pubkey: ${email.recipient_pubkey || 'none'}`);
+        
+        // If encrypted but no recipient_pubkey, automatically search through all contacts
+        if (isEncrypted && !hasRecipientPubkey && appState.getKeypair()) {
+            console.log(`[JS] _loadSentEmailDetail: Starting contact search for email ${email.id}`);
+            const foundPubkey = await this._searchContactsForRecipientPubkey(email);
+            if (foundPubkey) {
+                console.log(`[JS] _loadSentEmailDetail: Found pubkey for email ${email.id}, reloading detail`);
+                // Refresh email from appState after saving (pubkey was saved in _searchContactsForRecipientPubkey)
+                const updatedEmail = appState.getSentEmails().find(e => e.id === email.id || e.message_id === email.message_id);
+                if (updatedEmail) {
+                    Object.assign(email, updatedEmail);
                 }
+                // Reload the detail view with the updated pubkey
+                await this._loadSentEmailDetail(email, sentDetailContent);
+                return;
             } else {
-                // User cancelled, show encrypted content
-                sentDetailContent.innerHTML = '<div class="error">Cannot decrypt: Recipient pubkey not available. Please enter the recipient\'s pubkey to decrypt this email.</div>';
+                // No matching pubkey found, show error but still allow viewing raw content
+                console.log(`[JS] _loadSentEmailDetail: No pubkey found for email ${email.id}`);
+                const rawBody = email.raw_body || email.body || '';
+                const rawHeaders = email.raw_headers || '';
+                sentDetailContent.innerHTML =
+                    `<div class="email-detail">
+<div class="error" style="margin-bottom: 15px;">Cannot decrypt: Recipient pubkey not found in contacts. The email could not be decrypted with any known contact pubkey.</div>
+<div class="email-detail-header vertical" id="sent-email-header-info">
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
+<div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
+<div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+<div class="email-header-row"><span class="email-header-label">Subject:</span> <span class="email-header-value">${Utils.escapeHtml(email.subject)}</span></div>
+</div>
+<pre id="sent-raw-header-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-bottom:10px; max-height:300px; overflow:auto;">${Utils.escapeHtml(rawHeaders)}</pre>
+<div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(rawBody).replace(/\n/g, '<br>')}</div>
+<pre id="sent-raw-body-info" style="display:none; background:#222b3a; color:#fff; padding:10px; border-radius:6px; margin-top:10px; max-height:400px; overflow:auto; white-space:pre-wrap;">${Utils.escapeHtml(rawBody)}</pre>
+<button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
+</div>`;
+                
+                // Set up the toggle button for raw content
+                const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
+                const headerInfo = document.getElementById('sent-email-header-info');
+                const rawHeaderInfo = document.getElementById('sent-raw-header-info');
+                const bodyInfo = document.getElementById('sent-email-body-info');
+                const rawBodyInfo = document.getElementById('sent-raw-body-info');
+                
+                if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
+                    // Remove any existing event listeners by cloning the button
+                    const newToggleBtn = toggleRawBtn.cloneNode(true);
+                    toggleRawBtn.parentNode.replaceChild(newToggleBtn, toggleRawBtn);
+                    
+                    let showingRaw = false;
+                    newToggleBtn.addEventListener('click', (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        
+                        showingRaw = !showingRaw;
+                        if (showingRaw) {
+                            headerInfo.classList.add('hidden-header');
+                            rawHeaderInfo.style.display = 'block';
+                            bodyInfo.style.display = 'none';
+                            rawBodyInfo.style.display = 'block';
+                            newToggleBtn.textContent = 'Show Display Content';
+                        } else {
+                            headerInfo.classList.remove('hidden-header');
+                            rawHeaderInfo.style.display = 'none';
+                            bodyInfo.style.display = 'block';
+                            rawBodyInfo.style.display = 'none';
+                            newToggleBtn.textContent = 'Show Raw Content';
+                        }
+                    });
+                }
                 return;
             }
         }
@@ -3726,6 +3976,7 @@ ${attachmentsHtml}
                                         displayName: manifestAttachment.orig_filename,
                                         encryptedFilename: dbAttachment.filename, // Store encrypted filename
                                         displaySize: manifestAttachment.orig_size || dbAttachment.size,
+                                        encryptedSize: manifestAttachment.cipher_size || dbAttachment.size,
                                         displayMime: manifestAttachment.orig_mime || dbAttachment.content_type || dbAttachment.mime_type
                                     };
                                 } else {
@@ -3736,6 +3987,7 @@ ${attachmentsHtml}
                                         displayName: dbAttachment.filename,
                                         encryptedFilename: dbAttachment.filename, // Same for non-encrypted
                                         displaySize: dbAttachment.size,
+                                        encryptedSize: dbAttachment.size,
                                         displayMime: dbAttachment.content_type || dbAttachment.mime_type
                                     };
                                 }
@@ -3747,6 +3999,7 @@ ${attachmentsHtml}
                                 displayName: att.filename,
                                 encryptedFilename: att.filename, // Same for non-encrypted
                                 displaySize: att.size,
+                                encryptedSize: att.size,
                                 displayMime: att.mime_type
                             }));
                         }
@@ -3758,6 +4011,7 @@ ${attachmentsHtml}
                             displayName: att.filename,
                             encryptedFilename: att.filename, // Same for non-encrypted
                             displaySize: att.size,
+                            encryptedSize: att.size,
                             displayMime: att.mime_type
                         }));
                     }
@@ -3768,6 +4022,7 @@ ${attachmentsHtml}
                         displayName: att.filename,
                         encryptedFilename: att.filename, // Same for non-encrypted
                         displaySize: att.size,
+                        encryptedSize: att.size,
                         displayMime: att.mime_type
                     }));
                 }
@@ -3793,13 +4048,15 @@ ${attachmentsHtml}
                             return `
                             <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;" 
                                  data-encrypted-filename="${Utils.escapeHtml(encryptedFilename)}" 
-                                 data-decrypted-filename="${Utils.escapeHtml(decryptedFilename)}">
+                                 data-decrypted-filename="${Utils.escapeHtml(decryptedFilename)}"
+                                 data-encrypted-size="${attachment.encryptedSize || attachment.displaySize}"
+                                 data-decrypted-size="${attachment.displaySize}">
                                 <div class="attachment-info" style="display: flex; align-items: center;">
                                     <i class="fas fa-file" style="margin-right: 10px;"></i>
                                     <div class="attachment-details">
                                         <div class="attachment-name" style="font-weight: bold;" data-display-name="${Utils.escapeHtml(decryptedFilename)}">${Utils.escapeHtml(decryptedFilename)}</div>
                                         <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
-                                            ${sizeFormatted} • ${statusIcon} ${statusText}
+                                            <span class="attachment-size">${sizeFormatted}</span> • ${statusIcon} ${statusText}
                                         </div>
                                     </div>
                                 </div>
@@ -3854,14 +4111,23 @@ ${attachmentsHtml}
                         rawBodyInfo.style.display = 'block';
                         newToggleBtn.textContent = 'Show Display Content';
                         
-                        // Update attachment filenames to show encrypted versions
+                        // Update attachment filenames and sizes to show encrypted versions
                         if (attachmentsInfo) {
                             const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
                             attachmentItems.forEach(item => {
                                 const encryptedFilename = item.getAttribute('data-encrypted-filename');
+                                const encryptedSize = item.getAttribute('data-encrypted-size');
                                 const nameElement = item.querySelector('.attachment-name');
+                                const sizeElement = item.querySelector('.attachment-size');
+                                
                                 if (encryptedFilename && nameElement) {
                                     nameElement.textContent = encryptedFilename;
+                                }
+                                
+                                // Update size to show encrypted size
+                                if (encryptedSize && sizeElement) {
+                                    const sizeFormatted = (parseFloat(encryptedSize) / 1024).toFixed(2) + ' KB';
+                                    sizeElement.textContent = sizeFormatted;
                                 }
                             });
                         }
@@ -3887,14 +4153,23 @@ ${attachmentsHtml}
                         rawBodyInfo.style.display = 'none';
                         newToggleBtn.textContent = 'Show Raw Content';
                         
-                        // Update attachment filenames to show decrypted versions
+                        // Update attachment filenames and sizes to show decrypted versions
                         if (attachmentsInfo) {
                             const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
                             attachmentItems.forEach(item => {
                                 const decryptedFilename = item.getAttribute('data-decrypted-filename');
+                                const decryptedSize = item.getAttribute('data-decrypted-size');
                                 const nameElement = item.querySelector('.attachment-name');
+                                const sizeElement = item.querySelector('.attachment-size');
+                                
                                 if (decryptedFilename && nameElement) {
                                     nameElement.textContent = decryptedFilename;
+                                }
+                                
+                                // Update size to show decrypted size
+                                if (decryptedSize && sizeElement) {
+                                    const sizeFormatted = (parseFloat(decryptedSize) / 1024).toFixed(2) + ' KB';
+                                    sizeElement.textContent = sizeFormatted;
                                 }
                             });
                         }
@@ -4152,6 +4427,56 @@ ${attachmentsHtml}
             console.error('[JS] Error trying decryption with recipient pubkey:', error);
             return false;
         }
+    }
+    
+    // Search through all contacts to find the recipient pubkey that can decrypt this email
+    async _searchContactsForRecipientPubkey(email) {
+        const keypair = appState.getKeypair();
+        if (!keypair) {
+            window.notificationService.showError('No keypair available');
+            return null;
+        }
+        
+        // Show toast notification
+        window.notificationService.showInfo('searching for recipient key...');
+        
+        // Get all contacts
+        const contacts = appState.getContacts();
+        if (!contacts || contacts.length === 0) {
+            window.notificationService.showError('No contacts available to search');
+            return null;
+        }
+        
+        console.log(`[JS] Searching through ${contacts.length} contacts for recipient pubkey...`);
+        
+        // Try each contact's pubkey
+        for (const contact of contacts) {
+            if (!contact.pubkey) {
+                continue;
+            }
+            
+            try {
+                console.log(`[JS] Trying contact pubkey: ${contact.pubkey.substring(0, 16)}...`);
+                const success = await this._tryDecryptWithRecipientPubkey(email, contact.pubkey);
+                if (success) {
+                    console.log(`[JS] Successfully decrypted with contact pubkey: ${contact.pubkey.substring(0, 16)}...`);
+                    // Ensure the email in appState is updated (should already be done in _saveRecipientPubkeyToDb)
+                    const updatedEmail = appState.getSentEmails().find(e => e.id === email.id || e.message_id === email.message_id);
+                    if (updatedEmail && updatedEmail.recipient_pubkey === contact.pubkey) {
+                        console.log(`[JS] Verified recipient_pubkey saved to appState for email ${email.id}`);
+                    }
+                    window.notificationService.showSuccess(`Found recipient key! Decryption successful.`);
+                    return contact.pubkey;
+                }
+            } catch (e) {
+                // Continue to next contact
+                console.log(`[JS] Failed to decrypt with contact pubkey ${contact.pubkey.substring(0, 16)}...:`, e);
+            }
+        }
+        
+        console.log('[JS] No matching recipient pubkey found in contacts');
+        window.notificationService.showError('Could not find recipient key in contacts');
+        return null;
     }
     
     // Save recipient pubkey to database

@@ -29,6 +29,7 @@ class DOMManager {
             previewHeadersBtn: this.getElement('preview-headers-btn'),
             nostrContactSelect: this.getElement('nostr-contact-select'),
             encryptBtn: this.getElement('encrypt-btn'),
+            signBtn: this.getElement('sign-btn'),
             
             // Inbox
             emailList: this.getElement('email-list'),
@@ -72,6 +73,7 @@ class DOMManager {
             
             // Profile (do not look for display-name, about, email, nip05)
             updateProfileBtn: this.getElement('update-profile-btn'),
+            refreshProfile: this.getElement('refresh-profile'),
             
             // Relays
             relaysList: this.getElement('relay-list'),

@@ -73,6 +73,45 @@ body.dark-mode .email-list {
     opacity: 0.7;
 }
 
+.signature-indicator {
+    font-size: 0.85em;
+    margin-left: 6px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 500;
+    display: inline-block;
+}
+
+.signature-indicator.verified {
+    background-color: #d4edda;
+    color: #155724;
+    border: 1px solid #c3e6cb;
+}
+
+.signature-indicator.invalid {
+    background-color: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+}
+
+.signature-indicator.invalid:hover {
+    background-color: #f1aeb5;
+}
+
+body.dark-mode .signature-indicator.verified {
+    background-color: #1e3a2e;
+    color: #4ade80;
+    border-color: #22c55e;
+}
+
+body.dark-mode .signature-indicator.invalid {
+    background-color: #3a1e1e;
+    color: #f87171;
+    border-color: #ef4444;
+}
+
 .email-subject {
     font-weight: 500;
     margin-bottom: 8px;

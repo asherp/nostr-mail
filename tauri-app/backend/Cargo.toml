@@ -76,3 +76,7 @@ path = "src/bin/validate_pubkey.rs"
 [[bin]]
 name = "http-server"
 path = "src/bin/http_server.rs"
+
+[[bin]]
+name = "verify_sig"
+path = "src/bin/verify_sig.rs"

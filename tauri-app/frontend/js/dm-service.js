@@ -464,7 +464,7 @@ class DMService {
                 headerElement.className = 'conversation-header';
                 headerElement.innerHTML = `
                     <div class="conversation-contact-info">
-                        <img class="contact-avatar" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';">
+                        <img class="contact-avatar" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';" style="cursor: pointer;" data-pubkey="${contactPubkey}">
                         <div class="conversation-contact-details">
                             <div class="conversation-contact-name">${contact ? contact.name : contactPubkey}</div>
                             <div class="conversation-contact-pubkey">${contactPubkey}</div>
@@ -472,6 +472,14 @@ class DMService {
                     </div>
                 `;
                 dmMessages.appendChild(headerElement);
+                
+                // Add click handler to avatar to navigate to contacts page
+                const avatarElement = headerElement.querySelector('.contact-avatar');
+                if (avatarElement) {
+                    avatarElement.addEventListener('click', () => {
+                        this.navigateToContact(contactPubkey);
+                    });
+                }
                 
                 // Create messages container
                 const messagesContainer = document.createElement('div');
@@ -571,7 +579,7 @@ class DMService {
                                 <div class="message-meta">
                                     <div class="message-time">${dateTimeDisplay}</div>
                                     ${statusIcon}
-                                    <span class="email-emoji ${isMe ? 'email-emoji-clickable' : ''}" ${isMe ? 'style="cursor: pointer;"' : ''} title="${isMe ? 'Click to view sent email' : 'Email match'}"><i class="fas fa-envelope"></i></span>
+                                    <span class="email-emoji email-emoji-clickable" style="cursor: pointer;" title="${isMe ? 'Click to view sent email' : 'Click to view received email'}"><i class="fas fa-envelope"></i></span>
                                 </div>
                             </div>
                         `;
@@ -596,54 +604,119 @@ class DMService {
                             });
                         }
                         
-                        // Handle email icon click for sent messages - navigate to sent email
-                        // Use isMe instead of message.is_sent to be more reliable
-                        if (isMe && message.hasEmailMatch && message.event_id) {
+                        // Handle email icon click - navigate to email (sent or inbox)
+                        if (message.hasEmailMatch && message.event_id) {
                             const emailIcon = messageElement.querySelector('.email-emoji-clickable');
-                            console.log(`[JS] DM: Looking for clickable email icon for sent message, found:`, emailIcon, '| event_id:', message.event_id);
+                            console.log(`[JS] DM: Looking for clickable email icon, found:`, emailIcon, '| event_id:', message.event_id, '| isMe:', isMe);
                             if (emailIcon) {
                                 emailIcon.addEventListener('click', async (event) => {
                                     event.stopPropagation();
                                     event.preventDefault();
-                                    console.log(`[JS] DM: Email icon clicked for message with event_id:`, message.event_id);
+                                    console.log(`[JS] DM: Email icon clicked for message with event_id:`, message.event_id, '| isMe:', isMe);
                                     try {
-                                        // Find the matching email ID
-                                        const emailId = await window.__TAURI__.core.invoke('db_get_matching_email_id', {
+                                        // Find the matching email ID and message_id
+                                        const emailResult = await window.__TAURI__.core.invoke('db_get_matching_email_id', {
                                             dmEventId: message.event_id
                                         });
                                         
-                                        console.log(`[JS] DM: Found matching email ID:`, emailId);
+                                        console.log(`[JS] DM: Found matching email result:`, emailResult);
                                         
-                                        if (emailId) {
-                                            // Ensure sent emails are loaded
-                                            if (!appState.getSentEmails() || appState.getSentEmails().length === 0) {
-                                                await window.emailService.loadSentEmails();
-                                            }
+                                        if (emailResult && emailResult.email_id && emailResult.message_id) {
+                                            const emailId = emailResult.email_id;
+                                            const messageId = emailResult.message_id;
                                             
-                                            // Switch to sent tab
-                                            if (window.app && window.app.switchTab) {
-                                                window.app.switchTab('sent');
+                                            if (isMe) {
+                                                // Sent message - navigate to sent tab
+                                                // Switch to sent tab first
+                                                if (window.app && window.app.switchTab) {
+                                                    window.app.switchTab('sent');
+                                                } else {
+                                                    console.error('[JS] DM: window.app.switchTab not available');
+                                                    return;
+                                                }
+                                                
+                                                // Ensure sent emails are loaded
+                                                if (!appState.getSentEmails() || appState.getSentEmails().length === 0) {
+                                                    await window.emailService.loadSentEmails();
+                                                }
+                                                
+                                                // Check if email exists in appState, if not fetch it
+                                                let email = appState.getSentEmails().find(e => e.id == emailId || e.id === emailId.toString());
+                                                if (!email) {
+                                                    console.log(`[JS] DM: Email ${emailId} not in appState, fetching from database`);
+                                                    const dbEmail = await window.TauriService.getDbEmail(messageId);
+                                                    if (dbEmail) {
+                                                        // Convert DbEmail to EmailMessage format and add to appState
+                                                        const emailMessage = window.DatabaseService.convertDbEmailToEmailMessage(dbEmail);
+                                                        const sentEmails = appState.getSentEmails();
+                                                        sentEmails.push(emailMessage);
+                                                        appState.setSentEmails(sentEmails);
+                                                        email = emailMessage;
+                                                    }
+                                                }
+                                                
+                                                // Wait a bit for tab switch to complete, then show the email detail
+                                                setTimeout(() => {
+                                                    if (email) {
+                                                        // Use the email's ID (which might be string) for showSentDetail
+                                                        window.emailService.showSentDetail(email.id);
+                                                        console.log(`[JS] DM: Navigated to sent email ${email.id}`);
+                                                    } else {
+                                                        window.notificationService.showError('Email not found');
+                                                    }
+                                                }, 100);
                                             } else {
-                                                console.error('[JS] DM: window.app.switchTab not available');
+                                                // Received message - navigate to inbox tab
+                                                // Switch to inbox tab first
+                                                if (window.app && window.app.switchTab) {
+                                                    window.app.switchTab('inbox');
+                                                } else {
+                                                    console.error('[JS] DM: window.app.switchTab not available');
+                                                    return;
+                                                }
+                                                
+                                                // Ensure inbox emails are loaded
+                                                if (!appState.getEmails() || appState.getEmails().length === 0) {
+                                                    await window.emailService.loadEmails();
+                                                }
+                                                
+                                                // Check if email exists in appState, if not fetch it
+                                                let email = appState.getEmails().find(e => e.id == emailId || e.id === emailId.toString());
+                                                if (!email) {
+                                                    console.log(`[JS] DM: Email ${emailId} not in appState, fetching from database`);
+                                                    const dbEmail = await window.TauriService.getDbEmail(messageId);
+                                                    if (dbEmail) {
+                                                        // Convert DbEmail to EmailMessage format and add to appState
+                                                        const emailMessage = window.DatabaseService.convertDbEmailToEmailMessage(dbEmail);
+                                                        const emails = appState.getEmails();
+                                                        emails.push(emailMessage);
+                                                        appState.setEmails(emails);
+                                                        email = emailMessage;
+                                                    }
+                                                }
+                                                
+                                                // Wait a bit for tab switch to complete, then show the email detail
+                                                setTimeout(() => {
+                                                    if (email) {
+                                                        // Use the email's ID (which might be string) for showEmailDetail
+                                                        window.emailService.showEmailDetail(email.id);
+                                                        console.log(`[JS] DM: Navigated to inbox email ${email.id}`);
+                                                    } else {
+                                                        window.notificationService.showError('Email not found');
+                                                    }
+                                                }, 100);
                                             }
-                                            
-                                            // Wait a bit for tab switch to complete, then show the email detail
-                                            setTimeout(() => {
-                                                window.emailService.showSentDetail(emailId.toString());
-                                            }, 100);
-                                            
-                                            console.log(`[JS] DM: Navigated to sent email ${emailId}`);
                                         } else {
-                                            window.notificationService.showError('Sent email not found');
+                                            window.notificationService.showError('Email not found');
                                         }
                                     } catch (error) {
-                                        console.error('[JS] DM: Failed to navigate to sent email:', error);
-                                        window.notificationService.showError('Failed to find sent email: ' + error.message);
+                                        console.error('[JS] DM: Failed to navigate to email:', error);
+                                        window.notificationService.showError('Failed to find email: ' + error.message);
                                     }
                                 });
                                 console.log(`[JS] DM: Click handler attached to email icon`);
                             } else {
-                                console.warn(`[JS] DM: Email icon not found for sent message. Element classes:`, messageElement.className);
+                                console.warn(`[JS] DM: Email icon not found. Element classes:`, messageElement.className);
                             }
                         }
                     } else {
@@ -1120,6 +1193,44 @@ class DMService {
         const dmContact = window.appState.getDmContacts().find(c => c.pubkey === pubkey) || contact;
         window.appState.setSelectedDmContact(dmContact);
         this.loadDmMessages(pubkey);
+    }
+
+    // Navigate to contacts page and select contact if it exists
+    navigateToContact(pubkey) {
+        try {
+            // Switch to contacts tab
+            const contactsTab = document.querySelector('[data-tab="contacts"]');
+            if (contactsTab) {
+                contactsTab.click();
+            }
+            
+            // Wait a bit for the tab to switch and contacts to render
+            setTimeout(() => {
+                // Find the contact in the contacts list
+                const contacts = window.appState.getContacts() || [];
+                const contact = contacts.find(c => c.pubkey === pubkey);
+                
+                if (contact) {
+                    // Select the contact
+                    if (window.contactsService && typeof window.contactsService.selectContact === 'function') {
+                        window.contactsService.selectContact(contact);
+                    } else {
+                        console.warn('ContactsService not available');
+                    }
+                } else {
+                    // Contact not found in contacts list - open add contact modal with pubkey pre-filled
+                    if (window.contactsService && typeof window.contactsService.showAddContactModal === 'function') {
+                        window.contactsService.showAddContactModal(pubkey);
+                    } else {
+                        console.warn('ContactsService not available');
+                        window.notificationService.showInfo('Contact not found in your contacts list');
+                    }
+                }
+            }, 100);
+        } catch (error) {
+            console.error('Error navigating to contact:', error);
+            window.notificationService.showError('Failed to navigate to contact');
+        }
     }
 
     // Load email body into expandable element

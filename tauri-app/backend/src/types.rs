@@ -34,6 +34,7 @@ pub struct EmailMessage {
     pub sender_pubkey: Option<String>,
     pub recipient_pubkey: Option<String>,
     pub message_id: Option<String>,
+    pub signature_valid: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,4 +147,11 @@ pub struct EmailAttachment {
 pub struct MatchingEmailBodyResult {
     pub body: String,
     pub email_id: Option<i64>,
+}
+
+/// Result structure for matching email ID lookup (includes both ID and message_id)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchingEmailIdResult {
+    pub email_id: Option<i64>,
+    pub message_id: String,
 } 

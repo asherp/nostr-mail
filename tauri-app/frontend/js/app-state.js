@@ -16,6 +16,7 @@ class AppState {
         this.nprivKey = null;
         this.relays = [];
         this.contacts_total = null;
+        this.lastLoadedPubkey = null;
     }
 
     // Contact management
@@ -119,6 +120,14 @@ class AppState {
 
     getKeypair() {
         return this.keypair;
+    }
+
+    setLastLoadedPubkey(pubkey) {
+        this.lastLoadedPubkey = pubkey;
+    }
+
+    getLastLoadedPubkey() {
+        return this.lastLoadedPubkey;
     }
 
     setNprivKey(nprivKey) {

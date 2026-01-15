@@ -191,6 +191,57 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
     console.log('[APP] Settings reset to defaults');
 };
 
+// Reset settings to defaults for a specific pubkey without clearing the keypair
+NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
+    console.log('[APP] Resetting settings to defaults for pubkey:', pubkey);
+    
+    // Get current keypair to preserve it
+    const keypair = appState.getKeypair();
+    
+    // Define default settings
+    const defaultSettings = {
+        npriv_key: keypair ? keypair.private_key : '',
+        encryption_algorithm: 'nip44',
+        email_address: '',
+        password: '',
+        smtp_host: '',
+        smtp_port: 587,
+        imap_host: '',
+        imap_port: 993,
+        use_tls: false,
+        email_filter: 'nostr',
+        send_matching_dm: true,
+        sync_cutoff_days: 1825, // Default to 5 years (matching loadSettingsForPubkey)
+        emails_per_page: 50,
+        require_signature: true,
+        hide_undecryptable_emails: true,
+        automatically_encrypt: true,
+        automatically_sign: true,
+        hide_unsigned_messages: true
+    };
+    
+    // Set default settings in appState
+    appState.setSettings(defaultSettings);
+    
+    // Update last loaded pubkey tracker BEFORE populating form
+    // This ensures autosave knows which pubkey to save to
+    appState.setLastLoadedPubkey(pubkey);
+    
+    // Populate form with default values
+    this.populateSettingsForm();
+    
+    // Ensure the isPopulatingForm flag is cleared after form population completes
+    // Use a slightly longer delay to ensure all form updates are complete
+    setTimeout(() => {
+        if (this._setPopulatingForm) {
+            this._setPopulatingForm(false);
+            console.log('[APP] Cleared isPopulatingForm flag after resetting to defaults');
+        }
+    }, 200);
+    
+    console.log('[APP] Settings reset to defaults for pubkey:', pubkey);
+};
+
 NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
     try {
         if (!pubkey) {
@@ -248,9 +299,29 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
             // Try to load from localStorage as fallback
             const stored = localStorage.getItem('nostr_mail_settings');
             if (stored) {
-                const settings = JSON.parse(stored);
-                appState.setSettings(settings);
-                this.populateSettingsForm();
+                try {
+                    const settings = JSON.parse(stored);
+                    // Only use localStorage settings if they match the current pubkey's keypair
+                    // (localStorage might have settings from a different keypair)
+                    const currentKeypair = appState.getKeypair();
+                    if (currentKeypair && settings.npriv_key === currentKeypair.private_key) {
+                        appState.setSettings(settings);
+                        this.populateSettingsForm();
+                        console.log('[APP] Loaded settings from localStorage for pubkey:', pubkey);
+                    } else {
+                        // localStorage has settings for a different keypair, reset to defaults
+                        console.log('[APP] localStorage settings are for a different keypair, resetting to defaults');
+                        this.resetSettingsToDefaultsForPubkey(pubkey);
+                    }
+                } catch (e) {
+                    console.error('[APP] Failed to parse localStorage settings:', e);
+                    // Reset to defaults if localStorage parse fails
+                    this.resetSettingsToDefaultsForPubkey(pubkey);
+                }
+            } else {
+                // No settings found in DB or localStorage, reset to defaults
+                console.log('[APP] No settings found anywhere, resetting to defaults for pubkey:', pubkey);
+                this.resetSettingsToDefaultsForPubkey(pubkey);
             }
         }
     } catch (error) {
@@ -260,11 +331,22 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
         if (stored) {
             try {
                 const settings = JSON.parse(stored);
-                appState.setSettings(settings);
-                this.populateSettingsForm();
+                const currentKeypair = appState.getKeypair();
+                if (currentKeypair && settings.npriv_key === currentKeypair.private_key) {
+                    appState.setSettings(settings);
+                    this.populateSettingsForm();
+                } else {
+                    // Reset to defaults if localStorage settings don't match current keypair
+                    this.resetSettingsToDefaultsForPubkey(pubkey);
+                }
             } catch (e) {
                 console.error('[APP] Failed to load from localStorage:', e);
+                // Reset to defaults on error
+                this.resetSettingsToDefaultsForPubkey(pubkey);
             }
+        } else {
+            // No localStorage settings, reset to defaults
+            this.resetSettingsToDefaultsForPubkey(pubkey);
         }
     }
 }

@@ -39,6 +39,7 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         body: email.body.clone(),
         raw_body: email.body.clone(),
         date: email.received_at,
+        transport_auth_verified: email.transport_auth_verified,
         is_read: email.is_read,
         raw_headers: raw_headers.clone(),
         sender_pubkey: email.sender_pubkey.clone(),
@@ -1683,7 +1684,7 @@ async fn db_search_sent_emails(
             
             // For sent emails, decrypt using recipient's pubkey
             // Shared secret derivation: user's private key × recipient's public key
-        let raw_headers = email.raw_headers.as_deref().unwrap_or("");
+        let _raw_headers = email.raw_headers.as_deref().unwrap_or("");
         let (decrypted_subject, decrypted_body) = if email.is_nostr_encrypted && email_config.private_key.is_some() {
             // For sent emails, shared secret = user's private key × recipient's public key
             // So we need the recipient's pubkey to decrypt (not sender's pubkey)

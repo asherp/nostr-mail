@@ -35,6 +35,7 @@ pub struct EmailMessage {
     pub recipient_pubkey: Option<String>,
     pub message_id: Option<String>,
     pub signature_valid: Option<bool>,
+    pub transport_auth_verified: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,4 +155,23 @@ pub struct MatchingEmailBodyResult {
 pub struct MatchingEmailIdResult {
     pub email_id: Option<i64>,
     pub message_id: String,
+}
+
+/// Transport authentication method used for verification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TransportAuthMethod {
+    #[serde(rename = "dmarc")]
+    Dmarc,
+    #[serde(rename = "dkim")]
+    Dkim,
+    #[serde(rename = "none")]
+    None,
+}
+
+/// Verdict from transport authentication verification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportAuthVerdict {
+    pub transport_verified: bool,
+    pub method: TransportAuthMethod,
+    pub reason: String,
 } 

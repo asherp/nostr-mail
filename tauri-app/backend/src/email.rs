@@ -12,7 +12,7 @@ use crate::types::{EmailConfig, EmailAttachment};
 use tokio::task;
 use tokio::time::timeout;
 use std::time::Duration;
-use crate::types::EmailMessage;
+use crate::types::{EmailMessage, TransportAuthVerdict, TransportAuthMethod};
 use std::net::TcpStream;
 #[cfg(not(target_os = "android"))]
 use native_tls::TlsConnector;
@@ -952,6 +952,20 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     None // No pubkey, can't verify
                 };
                 
+                // Verify transport authentication
+                let transport_auth = verify_transport_authentication(Some(body), Some(&email))
+                    .unwrap_or_else(|e| TransportAuthVerdict {
+                        transport_verified: false,
+                        method: TransportAuthMethod::None,
+                        reason: format!("Error verifying transport auth: {}", e),
+                    });
+                
+                // Skip emails that fail transport authentication
+                if !transport_auth.transport_verified {
+                    println!("[RUST] fetch_emails_from_session: Email {} failed transport authentication: {}", email_id, transport_auth.reason);
+                    continue;
+                }
+                
                 let email_message = EmailMessage {
                     id: email_id.to_string(),
                     from,
@@ -966,6 +980,7 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     message_id: extract_message_id_from_headers(&raw_headers),
                     signature_valid,
+                    transport_auth_verified: Some(transport_auth.transport_verified),
                 };
 
                 emails.push(email_message);
@@ -1088,6 +1103,20 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     None // No pubkey, can't verify
                 };
                 
+                // Verify transport authentication
+                let transport_auth = verify_transport_authentication(Some(body), Some(&email))
+                    .unwrap_or_else(|e| TransportAuthVerdict {
+                        transport_verified: false,
+                        method: TransportAuthMethod::None,
+                        reason: format!("Error verifying transport auth: {}", e),
+                    });
+                
+                // Skip emails that fail transport authentication
+                if !transport_auth.transport_verified {
+                    println!("[RUST] fetch_emails_from_session_last_24h: Email {} failed transport authentication: {}", _email_id, transport_auth.reason);
+                    continue;
+                }
+                
                 let email_message = EmailMessage {
                     id: _email_id.to_string(),
                     from,
@@ -1102,6 +1131,7 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     message_id: extract_message_id_from_headers(&raw_headers),
                     signature_valid,
+                    transport_auth_verified: Some(transport_auth.transport_verified),
                 };
                 emails.push(email_message);
             }
@@ -1528,6 +1558,20 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         None // No pubkey, can't verify
                     };
                     
+                    // Verify transport authentication
+                    let transport_auth = verify_transport_authentication(Some(body), Some(&email))
+                        .unwrap_or_else(|e| TransportAuthVerdict {
+                            transport_verified: false,
+                            method: TransportAuthMethod::None,
+                            reason: format!("Error verifying transport auth: {}", e),
+                        });
+                    
+                    // Skip emails that fail transport authentication
+                    if !transport_auth.transport_verified {
+                        println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} failed transport authentication: {}", email_id, transport_auth.reason);
+                        continue;
+                    }
+                    
                     let email_message = EmailMessage {
                         id: email_id.to_string(),
                         from,
@@ -1542,6 +1586,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                         message_id: Some(message_id),
                         signature_valid,
+                        transport_auth_verified: Some(transport_auth.transport_verified),
                     };
                     emails.push(email_message);
                 } else {
@@ -1822,6 +1867,7 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                         recipient_pubkey: None, // Will be populated during sync if contact exists
                         message_id: extract_message_id_from_headers(&raw_headers),
                         signature_valid,
+                        transport_auth_verified: None, // Sent emails don't have transport auth verification
                     };
                     
                     // Store email with attachments (keyed by message_id for lookup)
@@ -2052,6 +2098,267 @@ pub fn extract_message_id_from_headers(raw_headers: &str) -> Option<String> {
     None
 }
 
+/// Extract domain from RFC5322 From: header
+/// Handles formats like: "Name <email@domain.com>", "email@domain.com", etc.
+fn extract_domain_from_email_address(from_header: &str) -> Option<String> {
+    // Try to find email address in angle brackets first
+    if let Some(start) = from_header.find('<') {
+        if let Some(end) = from_header[start+1..].find('>') {
+            let email = &from_header[start+1..start+1+end];
+            if let Some(at_pos) = email.find('@') {
+                return Some(email[at_pos+1..].trim().to_lowercase());
+            }
+        }
+    }
+    
+    // Try to find @ symbol directly
+    if let Some(at_pos) = from_header.find('@') {
+        // Extract domain part after @
+        let after_at = &from_header[at_pos+1..];
+        // Find end of domain (space, comma, or end of string)
+        let end = after_at.find(|c: char| c.is_whitespace() || c == ',' || c == '>')
+            .unwrap_or(after_at.len());
+        return Some(after_at[..end].trim().to_lowercase());
+    }
+    
+    None
+}
+
+/// Get the last Authentication-Results header (trusted final MTA)
+fn get_last_authentication_results_header(email: &mailparse::ParsedMail) -> Option<String> {
+    // Get all Authentication-Results headers
+    let mut auth_results_headers: Vec<String> = email.headers
+        .get_all_values("Authentication-Results")
+        .into_iter()
+        .collect();
+    
+    // Return the last one (most recent/final MTA)
+    auth_results_headers.pop()
+}
+
+/// Parsed authentication results from Authentication-Results header
+#[derive(Debug, Clone)]
+struct AuthResults {
+    dmarc: Option<String>,  // "pass", "fail", "none", etc.
+    dkim: Option<String>,   // "pass", "fail", "none", etc.
+    dkim_domain: Option<String>, // The header.d domain from DKIM
+    spf: Option<String>,    // "pass", "fail", "none", etc.
+}
+
+/// Parse Authentication-Results header value
+fn parse_authentication_results(header_value: &str) -> AuthResults {
+    let mut auth_results = AuthResults {
+        dmarc: None,
+        dkim: None,
+        dkim_domain: None,
+        spf: None,
+    };
+    
+    // Authentication-Results format: authserv-id; method1=result1 reason1; method2=result2 reason2; ...
+    // Example: "mail.example.com; dmarc=pass header.from=example.com; dkim=pass header.d=example.com; spf=pass smtp.mailfrom=example.com"
+    
+    // Split by semicolon to get individual results
+    let parts: Vec<&str> = header_value.split(';').collect();
+    
+    for part in parts.iter().skip(1) { // Skip first part (authserv-id)
+        let part = part.trim();
+        
+        // Check for DMARC
+        if part.starts_with("dmarc=") {
+            let rest = &part[6..].trim();
+            // Extract result (before space or end)
+            let result = rest.split_whitespace().next().unwrap_or("").to_lowercase();
+            auth_results.dmarc = Some(result);
+        }
+        
+        // Check for DKIM
+        if part.starts_with("dkim=") {
+            let rest = &part[5..].trim();
+            // Extract result (before space or semicolon)
+            let result = rest.split_whitespace().next().unwrap_or("").to_lowercase();
+            auth_results.dkim = Some(result);
+            
+            // Look for header.d=domain in the same part
+            if let Some(d_pos) = rest.find("header.d=") {
+                let after_d = &rest[d_pos+9..];
+                let domain = after_d.split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase();
+                if !domain.is_empty() {
+                    auth_results.dkim_domain = Some(domain);
+                }
+            }
+        }
+        
+        // Check for SPF
+        if part.starts_with("spf=") {
+            let rest = &part[4..].trim();
+            // Extract result (before space or semicolon)
+            let result = rest.split_whitespace().next().unwrap_or("").to_lowercase();
+            auth_results.spf = Some(result);
+        }
+    }
+    
+    auth_results
+}
+
+/// Check DKIM alignment: header.from domain must match DKIM header.d domain
+fn check_dkim_alignment(from_domain: &str, dkim_domain: &str) -> bool {
+    from_domain.to_lowercase() == dkim_domain.to_lowercase()
+}
+
+/// Verify transport authentication (DMARC/DKIM/SPF) from RFC 5322 email
+/// Accepts either raw RFC 5322 bytes or a parsed mailparse::ParsedMail struct
+pub fn verify_transport_authentication(
+    raw_bytes: Option<&[u8]>,
+    parsed_email: Option<&mailparse::ParsedMail>
+) -> Result<TransportAuthVerdict> {
+    // Parse email if not already parsed - need to handle lifetime by parsing into owned value
+    let parsed_owned: Option<mailparse::ParsedMail> = if parsed_email.is_some() {
+        None
+    } else if let Some(bytes) = raw_bytes {
+        match parse_mail(bytes) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                return Ok(TransportAuthVerdict {
+                    transport_verified: false,
+                    method: TransportAuthMethod::None,
+                    reason: format!("Failed to parse email: {}", e),
+                });
+            }
+        }
+    } else {
+        return Ok(TransportAuthVerdict {
+            transport_verified: false,
+            method: TransportAuthMethod::None,
+            reason: "No email data provided".to_string(),
+        });
+    };
+    
+    // Use parsed_email if provided, otherwise use parsed_owned
+    let email = if let Some(parsed) = parsed_email {
+        parsed
+    } else if let Some(ref parsed) = parsed_owned {
+        parsed
+    } else {
+        unreachable!()
+    };
+    
+    // Extract RFC5322 From: domain
+    let from_header = email.headers
+        .get_first_value("From")
+        .unwrap_or_else(|| "".to_string());
+    
+    let from_domain = match extract_domain_from_email_address(&from_header) {
+        Some(domain) => domain,
+        None => {
+            return Ok(TransportAuthVerdict {
+                transport_verified: false,
+                method: TransportAuthMethod::None,
+                reason: format!("Could not extract domain from From: header: {}", from_header),
+            });
+        }
+    };
+    
+    // Find the last Authentication-Results header (trusted final MTA)
+    let auth_results_header = match get_last_authentication_results_header(email) {
+        Some(header) => header,
+        None => {
+            return Ok(TransportAuthVerdict {
+                transport_verified: false,
+                method: TransportAuthMethod::None,
+                reason: "No Authentication-Results header found".to_string(),
+            });
+        }
+    };
+    
+    // Parse Authentication-Results header
+    let auth_results = parse_authentication_results(&auth_results_header);
+    
+    // Evaluate in priority order: DMARC > DKIM > SPF
+    
+    // 1. Check DMARC
+    if let Some(ref dmarc_result) = auth_results.dmarc {
+        if dmarc_result == "pass" {
+            return Ok(TransportAuthVerdict {
+                transport_verified: true,
+                method: TransportAuthMethod::Dmarc,
+                reason: format!("DMARC verification passed for domain {}", from_domain),
+            });
+        } else if dmarc_result == "fail" {
+            return Ok(TransportAuthVerdict {
+                transport_verified: false,
+                method: TransportAuthMethod::Dmarc,
+                reason: format!("DMARC verification failed for domain {}", from_domain),
+            });
+        }
+    }
+    
+    // 2. Check DKIM (must pass AND have alignment)
+    if let Some(ref dkim_result) = auth_results.dkim {
+        if dkim_result == "pass" {
+            // Check alignment
+            if let Some(ref dkim_domain) = auth_results.dkim_domain {
+                if check_dkim_alignment(&from_domain, dkim_domain) {
+                    return Ok(TransportAuthVerdict {
+                        transport_verified: true,
+                        method: TransportAuthMethod::Dkim,
+                        reason: format!("DKIM verification passed with alignment: header.from={}, header.d={}", from_domain, dkim_domain),
+                    });
+                } else {
+                    return Ok(TransportAuthVerdict {
+                        transport_verified: false,
+                        method: TransportAuthMethod::Dkim,
+                        reason: format!("DKIM verification passed but alignment failed: header.from={}, header.d={}", from_domain, dkim_domain),
+                    });
+                }
+            } else {
+                return Ok(TransportAuthVerdict {
+                    transport_verified: false,
+                    method: TransportAuthMethod::Dkim,
+                    reason: "DKIM verification passed but no header.d domain found".to_string(),
+                });
+            }
+        } else if dkim_result == "fail" {
+            return Ok(TransportAuthVerdict {
+                transport_verified: false,
+                method: TransportAuthMethod::Dkim,
+                reason: format!("DKIM verification failed for domain {}", from_domain),
+            });
+        }
+    }
+    
+    // 3. Check SPF
+    if let Some(ref spf_result) = auth_results.spf {
+        if spf_result == "pass" {
+            return Ok(TransportAuthVerdict {
+                transport_verified: true,
+                method: TransportAuthMethod::None, // SPF is not a separate method in our enum, use "none"
+                reason: format!("SPF verification passed for domain {}", from_domain),
+            });
+        } else if spf_result == "fail" {
+            return Ok(TransportAuthVerdict {
+                transport_verified: false,
+                method: TransportAuthMethod::None,
+                reason: format!("SPF verification failed for domain {}", from_domain),
+            });
+        }
+    }
+    
+    // No authentication method passed
+    Ok(TransportAuthVerdict {
+        transport_verified: false,
+        method: TransportAuthMethod::None,
+        reason: format!("No authentication method passed. DMARC: {:?}, DKIM: {:?}, SPF: {:?}", 
+            auth_results.dmarc, auth_results.dkim, auth_results.spf),
+    })
+}
+
 /// Decrypt email content if it's a Nostr encrypted email
 /// For inbox emails: shared secret = user's private key × sender's public key
 /// So we use sender's pubkey (from headers) for decryption
@@ -2261,6 +2568,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                                 message_id: extract_message_id_from_headers(&raw_headers),
                                 signature_valid,
+                                transport_auth_verified: None, // Not verified in this path
                             };
                             emails.push(email_message);
                         }
@@ -2346,6 +2654,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                                     message_id: extract_message_id_from_headers(&raw_headers),
                                     signature_valid,
+                                    transport_auth_verified: None, // Not verified in this path
                                 };
                                 emails.push(email_message);
                             }
@@ -2363,7 +2672,6 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
 } 
 
 pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> anyhow::Result<usize> {
-    use chrono::Utc;
     
     // Fetch latest nostr email date from DB
     let latest = db.get_latest_nostr_email_received_at()?;
@@ -2419,6 +2727,16 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> any
     // Combine emails from inbox and nostr-mail folder
     raw_nostr_emails.append(&mut nostr_folder_emails);
     
+    // Filter emails based on transport authentication - always filter out unauthenticated emails
+    raw_nostr_emails.retain(|email| {
+        if let Some(false) = email.transport_auth_verified {
+            println!("[RUST] sync_nostr_emails_to_db: Filtering out email {} - transport authentication failed", email.message_id);
+            false
+        } else {
+            true
+        }
+    });
+    
     // Filter emails based on signature requirement
     if require_signature {
         raw_nostr_emails.retain(|email| {
@@ -2473,6 +2791,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> any
                 updated_at: Some(chrono::Utc::now()),
                 created_at: existing_email.created_at, // Preserve original creation date
                 signature_valid: email.signature_valid,
+                transport_auth_verified: email.transport_auth_verified,
             };
             db.save_email(&updated_email)?;
             println!("[RUST] Updated existing email in DB: message_id={}", email.message_id);
@@ -2498,6 +2817,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> any
                 updated_at: None,
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
+                transport_auth_verified: email.transport_auth_verified,
             };
             println!("[RUST] Saving email to DB: message_id={}", email.message_id);
             let email_id = db.save_email(&db_email)?;
@@ -2552,7 +2872,6 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, db: &Database) -> any
 } 
 
 pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyhow::Result<usize> {
-    use chrono::Utc;
     
     println!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
     // Fetch latest sent email date from DB using the user's email address
@@ -2570,6 +2889,12 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
     for (idx, email) in raw_sent_emails.iter().enumerate() {
         println!("[RUST] sync_sent_emails_to_db: Processing email {} of {}: message_id={}, from={}, date={}", 
             idx + 1, raw_sent_emails.len(), email.message_id, email.from, email.date);
+        // Skip emails that failed transport authentication
+        if let Some(false) = email.transport_auth_verified {
+            println!("[RUST] sync_nostr_emails_to_db: Skipping email {} - transport authentication failed", email.message_id);
+            continue;
+        }
+        
         // Check if already in DB by message_id (only check, don't save yet)
         let existing_email = match db.get_email(&email.message_id) {
             Ok(Some(existing)) => Some(existing),
@@ -2604,6 +2929,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                     updated_at: Some(chrono::Utc::now()),
                     created_at: existing_email.created_at, // Preserve original creation time
                     signature_valid: email.signature_valid,
+                    transport_auth_verified: email.transport_auth_verified,
                 };
                 match db.save_email(&updated_email) {
                     Ok(id) => println!("[RUST] Updated existing email with IMAP data, id: {}", id),
@@ -2637,6 +2963,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                 updated_at: None,
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
+                transport_auth_verified: email.transport_auth_verified,
             };
             println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}", 
                 db_email.message_id, db_email.from_address, db_email.to_address, 
@@ -2718,6 +3045,7 @@ pub struct RawNostrEmail {
     pub raw_headers: String,
     pub attachments: Vec<crate::database::Attachment>, // Attachments extracted from email (in encrypted form)
     pub signature_valid: Option<bool>,
+    pub transport_auth_verified: Option<bool>,
 }
 
 /// Fetch Nostr emails from a specific IMAP folder
@@ -2839,6 +3167,20 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         
                         let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
                         
+                        // Verify transport authentication
+                        let transport_auth = verify_transport_authentication(Some(body), Some(&email))
+                            .unwrap_or_else(|e| TransportAuthVerdict {
+                                transport_verified: false,
+                                method: TransportAuthMethod::None,
+                                reason: format!("Error verifying transport auth: {}", e),
+                            });
+                        
+                        // Skip emails that fail transport authentication
+                        if !transport_auth.transport_verified {
+                            println!("[RUST] fetch_nostr_emails_from_folder: Email {} failed transport authentication: {}", message_id, transport_auth.reason);
+                            continue;
+                        }
+                        
                         all_emails.push(RawNostrEmail {
                             message_id,
                             from,
@@ -2851,6 +3193,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             raw_headers,
                             attachments: extracted_attachments,
                             signature_valid,
+                            transport_auth_verified: Some(transport_auth.transport_verified),
                         });
                     }
                 }
@@ -2927,6 +3270,20 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                     
                     let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
                     
+                    // Verify transport authentication
+                    let transport_auth = verify_transport_authentication(Some(body), Some(&email))
+                        .unwrap_or_else(|e| TransportAuthVerdict {
+                            transport_verified: false,
+                            method: TransportAuthMethod::None,
+                            reason: format!("Error verifying transport auth: {}", e),
+                        });
+                    
+                    // Skip emails that fail transport authentication
+                    if !transport_auth.transport_verified {
+                        println!("[RUST] fetch_nostr_emails_from_folder (non-Gmail): Email {} failed transport authentication: {}", message_id, transport_auth.reason);
+                        continue;
+                    }
+                    
                     emails.push(RawNostrEmail {
                         message_id,
                         from,
@@ -2939,6 +3296,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         raw_headers,
                         attachments: extracted_attachments,
                         signature_valid,
+                        transport_auth_verified: Some(transport_auth.transport_verified),
                     });
                 }
             }
@@ -2986,6 +3344,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                     raw_headers: em.raw_headers,
                     attachments,
                     signature_valid: em.signature_valid,
+                    transport_auth_verified: em.transport_auth_verified,
                 }
             }).collect()
         } else {
@@ -3059,6 +3418,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                             raw_headers,
                             attachments: extracted_attachments,
                             signature_valid,
+                            transport_auth_verified: None, // Not verified in this path
                         };
                         emails.push(email_message);
                     }
@@ -3146,6 +3506,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                         raw_headers: em.raw_headers,
                         attachments,
                         signature_valid: em.signature_valid,
+                        transport_auth_verified: em.transport_auth_verified, // For sent emails, this will be None
                     });
                 }
             }
@@ -3216,6 +3577,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 raw_headers,
                                 attachments: vec![], // Will be extracted during sync
                                 signature_valid,
+                                transport_auth_verified: None, // Not verified in this path
                             };
                             emails.push(email_message);
                         }

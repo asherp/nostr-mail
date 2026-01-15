@@ -41,6 +41,7 @@ pub struct Email {
     pub updated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub signature_valid: Option<bool>,
+    pub transport_auth_verified: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -318,6 +319,9 @@ impl Database {
         // Migrate: Add signature_valid column to emails table if it doesn't exist
         Self::migrate_add_signature_valid_column(&conn)?;
 
+        // Migrate: Add transport_auth_verified column to emails table if it doesn't exist
+        Self::migrate_add_transport_auth_column(&conn)?;
+
         // Migrate: Remove duplicate settings entries
         Self::migrate_remove_duplicate_settings(&conn)?;
 
@@ -440,6 +444,28 @@ impl Database {
                 [],
             )?;
             println!("[DB] Migration complete: signature_valid column added to emails");
+        }
+
+        Ok(())
+    }
+
+    /// Migration: Add transport_auth_verified column to emails table if it doesn't exist
+    fn migrate_add_transport_auth_column(conn: &Connection) -> Result<()> {
+        let has_transport_auth = {
+            let mut stmt = conn.prepare("PRAGMA table_info(emails)")?;
+            let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?) // column name
+            })?.collect();
+            columns.map(|cols| cols.contains(&"transport_auth_verified".to_string())).unwrap_or(false)
+        };
+
+        if !has_transport_auth {
+            println!("[DB] Adding transport_auth_verified column to emails table");
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN transport_auth_verified BOOLEAN",
+                [],
+            )?;
+            println!("[DB] Migration complete: transport_auth_verified column added to emails");
         }
 
         Ok(())
@@ -793,13 +819,13 @@ impl Database {
                     message_id = ?, from_address = ?, to_address = ?, subject = ?, 
                     body = ?, body_plain = ?, body_html = ?, received_at = ?, 
                     is_nostr_encrypted = ?, sender_pubkey = ?, recipient_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?,
-                    subject_hash = ?, signature_valid = ?
+                    subject_hash = ?, signature_valid = ?, transport_auth_verified = ?
                 WHERE id = ?",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
                     email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                    subject_hash, email.signature_valid, id
+                    subject_hash, email.signature_valid, email.transport_auth_verified, id
                 ],
             )?;
             println!("[DB] save_email: Successfully updated email id={}", id);
@@ -841,13 +867,13 @@ impl Database {
             println!("[DB] save_email: Email is new, inserting into database");
             println!("[DB] save_email: About to execute INSERT statement");
             match conn.execute(
-                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, transport_auth_verified)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
                     email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                    subject_hash, email.signature_valid
+                    subject_hash, email.signature_valid, email.transport_auth_verified
                 ],
             ) {
                 Ok(rows_affected) => {
@@ -878,13 +904,13 @@ impl Database {
         
         println!("[DB] insert_email_direct: About to execute INSERT statement");
         match conn.execute(
-            "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, transport_auth_verified)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 email.message_id, email.from_address, email.to_address, email.subject,
                 email.body, email.body_plain, email.body_html, email.received_at,
                 email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                subject_hash, email.signature_valid
+                subject_hash, email.signature_valid, email.transport_auth_verified
             ],
         ) {
             Ok(rows_affected) => {
@@ -922,7 +948,7 @@ impl Database {
         // SQLite's TRIM and REPLACE can handle the normalization
         // We'll try multiple formats: exact match, normalized match, and with/without angle brackets
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified
              FROM emails 
              WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? 
              ORDER BY received_at DESC"
@@ -952,6 +978,7 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
+                transport_auth_verified: row.get(18)?,
             };
             println!("[DB] get_email: Found matching email, id={:?}", email.id);
             return Ok(Some(email));
@@ -967,7 +994,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
@@ -1008,6 +1035,7 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
+                transport_auth_verified: row.get(18)?,
             })
         })?;
         rows.collect()
@@ -1038,7 +1066,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
@@ -1102,6 +1130,7 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
+                transport_auth_verified: row.get(18)?,
             })
         })?;
         let emails: Vec<Email> = rows.collect::<Result<Vec<_>, _>>()?;
@@ -1315,7 +1344,7 @@ impl Database {
     pub fn find_email_by_subject_hash(&self, subject_hash: &str) -> Result<Option<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified
              FROM emails WHERE subject_hash = ? AND is_nostr_encrypted = 1 LIMIT 1"
         )?;
         let mut rows = stmt.query_map(params![subject_hash], |row| {
@@ -1338,6 +1367,7 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
+                transport_auth_verified: row.get(18)?,
             })
         })?;
         
@@ -1738,6 +1768,7 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
+                transport_auth_verified: row.get(18)?,
             })
         })?;
         
@@ -1790,7 +1821,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
         
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid FROM emails WHERE is_draft = 1"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified FROM emails WHERE is_draft = 1"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         
@@ -1824,6 +1855,7 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
+                transport_auth_verified: row.get(18)?,
             })
         })?;
         

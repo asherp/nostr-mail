@@ -16,6 +16,8 @@ body.dark-mode .email-list {
     cursor: pointer;
     transition: background-color 0.3s ease;
     position: relative;
+    display: flex;
+    align-items: flex-start;
 }
 
 .email-item:hover {
@@ -39,6 +41,11 @@ body.dark-mode .email-list {
 .email-item.unread {
     background-color: #e3f2fd;
     border-left: 4px solid #2196f3;
+}
+
+.email-content {
+    flex: 1;
+    min-width: 0; /* Allows content to shrink */
 }
 
 .email-header {
@@ -111,6 +118,40 @@ body.dark-mode .signature-indicator.invalid {
     background-color: #3a1e1e;
     color: #f87171;
     border-color: #ef4444;
+}
+
+.transport-auth-indicator {
+    font-size: 0.8125rem;
+    margin-left: 8px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-weight: 600;
+    display: inline-block;
+    vertical-align: middle;
+}
+
+.transport-auth-indicator.verified {
+    background-color: #d1ecf1;
+    color: #0c5460;
+    border: 1px solid #bee5eb;
+}
+
+.transport-auth-indicator.invalid {
+    background-color: #fff3cd;
+    color: #856404;
+    border: 1px solid #ffeaa7;
+}
+
+body.dark-mode .transport-auth-indicator.verified {
+    background-color: #1e3a3a;
+    color: #4dd0e1;
+    border-color: #26c6da;
+}
+
+body.dark-mode .transport-auth-indicator.invalid {
+    background-color: #3a3a1e;
+    color: #fbbf24;
+    border-color: #f59e0b;
 }
 
 .email-subject {

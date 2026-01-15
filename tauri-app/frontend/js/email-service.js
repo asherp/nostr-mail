@@ -2297,18 +2297,74 @@ class EmailService {
                 // Add signature verification indicator
                 let signatureIndicator = '';
                 if (email.signature_valid === true) {
-                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
                 } else if (email.signature_valid === false) {
-                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+                }
+
+                // Add transport authentication indicator
+                let transportAuthIndicator = '';
+                if (email.transport_auth_verified === true) {
+                    transportAuthIndicator = `<span class="transport-auth-indicator verified" title="Email transport authentication verified (DMARC/DKIM/SPF)"><i class="fas fa-envelope"></i> Email Verified</span>`;
+                } else if (email.transport_auth_verified === false) {
+                    transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
+                }
+
+                // Get sender contact for avatar
+                const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                const contacts = appState.getContacts();
+                let senderContact = senderPubkey ? contacts.find(c => c.pubkey === senderPubkey) : null;
+                
+                // If not found by pubkey, try to find by email address
+                if (!senderContact) {
+                    const senderEmail = email.from || email.from_address;
+                    if (senderEmail) {
+                        // Normalize Gmail addresses (remove + aliases)
+                        const normalizeGmail = (email) => {
+                            const lower = email.trim().toLowerCase();
+                            if (lower.includes('@gmail.com')) {
+                                const [local, domain] = lower.split('@');
+                                const normalizedLocal = local.split('+')[0];
+                                return `${normalizedLocal}@${domain}`;
+                            }
+                            return lower;
+                        };
+                        
+                        const normalizedEmail = normalizeGmail(senderEmail);
+                        // Try both original and normalized email
+                        senderContact = contacts.find(c => {
+                            if (!c.email) return false;
+                            const contactEmail = c.email.trim().toLowerCase();
+                            return contactEmail === senderEmail.toLowerCase() || contactEmail === normalizedEmail;
+                        });
+                    }
+                }
+                
+                // Avatar fallback logic (copied from dm-service.js)
+                const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+                let avatarSrc = defaultAvatar;
+                let avatarClass = 'contact-avatar';
+                const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+                if (senderContact && senderContact.picture_loading) {
+                    avatarClass += ' loading';
+                } else if (isValidDataUrl) {
+                    avatarSrc = senderContact.picture_data_url;
+                } else if (senderContact && senderContact.picture_data_url && !isValidDataUrl && senderContact.picture) {
+                    avatarSrc = senderContact.picture;
+                } else if (senderContact && senderContact.picture) {
+                    avatarSrc = senderContact.picture;
                 }
 
                 emailElement.innerHTML = `
-                    <div class="email-header">
-                        <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator} ${signatureIndicator}</div>
-                        <div class="email-date">${dateDisplay}</div>
+                    <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.from)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+                    <div class="email-content">
+                        <div class="email-header">
+                            <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
+                            <div class="email-date">${dateDisplay}</div>
+                        </div>
+                        ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
+                        <div class="email-preview">${previewText}</div>
                     </div>
-                    ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
-                    <div class="email-preview">${previewText}</div>
                 `;
                 
                 // Add hover and click handlers for invalid signature indicator
@@ -2335,7 +2391,7 @@ class EmailService {
                                         email.signature_valid = true;
                                         // Re-render this email item
                                         sigIndicator.className = 'signature-indicator verified';
-                                        sigIndicator.textContent = '✓ Verified';
+                                        sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
                                         sigIndicator.title = 'Verified Nostr signature';
                                         sigIndicator.removeAttribute('data-message-id');
                                         // Remove hover handlers
@@ -2834,9 +2890,9 @@ class EmailService {
                     // Add signature verification indicator
                     let signatureIndicator = '';
                     if (email.signature_valid === true) {
-                        signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+                        signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
                     } else if (email.signature_valid === false) {
-                        signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+                        signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
                     }
                     
                     // Get sender info for header
@@ -2939,7 +2995,7 @@ ${attachmentsHtml}
                                         if (result === true) {
                                             email.signature_valid = true;
                                             sigIndicator.className = 'signature-indicator verified';
-                                            sigIndicator.textContent = '✓ Verified';
+                                            sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
                                             sigIndicator.title = 'Verified Nostr signature';
                                             sigIndicator.removeAttribute('data-message-id');
                                             sigIndicator.replaceWith(sigIndicator.cloneNode(true));
@@ -3953,14 +4009,22 @@ ${attachmentsHtml}
         let signatureIndicator = '';
         // Check signature_valid - handle both boolean and null/undefined cases
         if (email.signature_valid === true || email.signature_valid === 1) {
-            signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+            signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
         } else if (email.signature_valid === false || email.signature_valid === 0) {
-            signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+            signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+        }
+
+        // Add transport authentication indicator
+        let transportAuthIndicator = '';
+        if (email.transport_auth_verified === true || email.transport_auth_verified === 1) {
+            transportAuthIndicator = `<span class="transport-auth-indicator verified" title="Email transport authentication verified (DMARC/DKIM/SPF)"><i class="fas fa-envelope"></i> Email Verified</span>`;
+        } else if (email.transport_auth_verified === false || email.transport_auth_verified === 0) {
+            transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
         }
 
         emailElement.innerHTML = `
             <div class="email-header">
-                <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator} ${signatureIndicator}</div>
+                <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
                 <div class="email-date">${dateDisplay}</div>
             </div>
             ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
@@ -3996,7 +4060,7 @@ ${attachmentsHtml}
                                 email.signature_valid = true;
                                 // Re-render this email item
                                 sigIndicator.className = 'signature-indicator verified';
-                                sigIndicator.textContent = '✓ Verified';
+                                sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
                                 sigIndicator.title = 'Verified Nostr signature';
                                 sigIndicator.removeAttribute('data-message-id');
                                 // Remove hover handlers
@@ -4138,9 +4202,9 @@ ${attachmentsHtml}
                 let signatureIndicator = '';
                 // Check signature_valid - handle both boolean and null/undefined cases
                 if (email.signature_valid === true || email.signature_valid === 1) {
-                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
                 } else if (email.signature_valid === false || email.signature_valid === 0) {
-                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
                 }
                 
                 // Get sender info (for sent emails, sender is us)
@@ -4278,7 +4342,7 @@ ${signatureIndicator}
                                     if (result === true) {
                                         email.signature_valid = true;
                                         sigIndicator.className = 'signature-indicator verified';
-                                        sigIndicator.textContent = '✓ Verified';
+                                        sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
                                         sigIndicator.title = 'Verified Nostr signature';
                                         sigIndicator.removeAttribute('data-message-id');
                                         sigIndicator.replaceWith(sigIndicator.cloneNode(true));
@@ -4561,9 +4625,9 @@ ${signatureIndicator}
             let signatureIndicator = '';
             // Check signature_valid - handle both boolean and null/undefined cases
             if (email.signature_valid === true || email.signature_valid === 1) {
-                signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature">✓ Verified</span>`;
+                signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
             } else if (email.signature_valid === false || email.signature_valid === 0) {
-                signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature">✗ Invalid signature</span>`;
+                signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
             }
             
             // Get sender info (for sent emails, sender is us)
@@ -4709,7 +4773,7 @@ ${attachmentsHtml}
                                 if (result === true) {
                                     email.signature_valid = true;
                                     sigIndicator.className = 'signature-indicator verified';
-                                    sigIndicator.textContent = '✓ Verified';
+                                    sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
                                     sigIndicator.title = 'Verified Nostr signature';
                                     sigIndicator.removeAttribute('data-message-id');
                                     sigIndicator.replaceWith(sigIndicator.cloneNode(true));

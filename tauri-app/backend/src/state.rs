@@ -110,7 +110,21 @@ impl AppState {
         }
         
         // Connect to relays
+        // #region agent log
+        let connect_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, r#"{{"id":"log_connect_start","timestamp":{},"location":"state.rs:113","message":"Before client.connect()","data":{{"hypothesisId":"E"}},"sessionId":"debug-session","runId":"startup"}}"#, connect_start)
+        });
+        // #endregion
         client.connect().await;
+        // #region agent log
+        let connect_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, r#"{{"id":"log_connect_end","timestamp":{},"location":"state.rs:113","message":"After client.connect()","data":{{"duration":{},"hypothesisId":"E"}},"sessionId":"debug-session","runId":"startup"}}"#, connect_end, connect_end - connect_start)
+        });
+        // #endregion
         
         // Wait for connections to establish (with timeout)
         // WebSocket connections are asynchronous and need time to establish
@@ -118,14 +132,36 @@ impl AppState {
         let start_time = std::time::Instant::now();
         let check_interval = std::time::Duration::from_millis(500);
         
+        // #region agent log
+        let wait_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, r#"{{"id":"log_wait_start","timestamp":{},"location":"state.rs:121","message":"Starting connection wait loop","data":{{"maxWaitSeconds":10,"hypothesisId":"E"}},"sessionId":"debug-session","runId":"startup"}}"#, wait_start)
+        });
+        // #endregion
         while start_time.elapsed() < max_wait_time {
             let relays = client.relays().await;
             
             // Check if we have at least one relay added (connection may still be establishing)
             if !relays.is_empty() {
-                println!("[RUST] Relays added, waiting for connections to establish...");
-                // Give connections more time to establish
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                println!("[RUST] Relays added, giving connections brief moment to initialize...");
+                // #region agent log
+                let sleep_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, r#"{{"id":"log_sleep_start","timestamp":{},"location":"state.rs:128","message":"Before connection wait","data":{{"relayCount":{},"hypothesisId":"E"}},"sessionId":"debug-session","runId":"startup"}}"#, sleep_start, relays.len())
+                });
+                // #endregion
+                // Give connections a brief moment to initialize (reduced from 2 seconds to 100ms)
+                // Connections will continue establishing in the background asynchronously
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // #region agent log
+                let sleep_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, r#"{{"id":"log_sleep_end","timestamp":{},"location":"state.rs:128","message":"After connection wait","data":{{"duration":{},"hypothesisId":"E"}},"sessionId":"debug-session","runId":"startup"}}"#, sleep_end, sleep_end - sleep_start)
+                });
+                // #endregion
                 break;
             }
             

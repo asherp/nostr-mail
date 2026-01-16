@@ -823,9 +823,10 @@ fn cache_profile_image(pubkey: String, data_url: String, state: tauri::State<App
 }
 
 #[tauri::command]
-fn get_cached_profile_image(pubkey: String, state: tauri::State<AppState>) -> Result<Option<String>, String> {
+fn get_cached_profile_image(pubkey: String, picture_url: Option<String>, state: tauri::State<AppState>) -> Result<Option<String>, String> {
     println!("[RUST] get_cached_profile_image called for pubkey: {}", pubkey);
     
+    // First check in-memory cache
     let cache = state.image_cache.lock().unwrap();
     if let Some(cached_image) = cache.get(&pubkey) {
         // Check if cache is still valid (24 hours)
@@ -838,16 +839,84 @@ fn get_cached_profile_image(pubkey: String, state: tauri::State<AppState>) -> Re
         let max_age = 24 * 60 * 60; // 24 hours in seconds
         
         if cache_age < max_age {
-            println!("[RUST] Found valid cached image for pubkey: {}", pubkey);
-            Ok(Some(cached_image.data_url.clone()))
+            println!("[RUST] Found valid cached image in memory for pubkey: {}", pubkey);
+            // Clone the data_url before dropping the cache lock
+            let cached_data_url = cached_image.data_url.clone();
+            drop(cache);
+            
+            // If picture_url provided, validate against database
+            if let Some(expected_url) = picture_url {
+                if let Ok(db) = state.get_database() {
+                    if let Ok(Some(contact)) = db.get_contact(&pubkey) {
+                        let db_url = contact.picture_url.unwrap_or_default();
+                        if db_url != expected_url {
+                            println!("[RUST] Picture URL changed (DB: '{}' vs current: '{}'), invalidating cache", db_url, expected_url);
+                            // Invalidate cache - URL changed
+                            state.image_cache.lock().unwrap().remove(&pubkey);
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+            
+            return Ok(Some(cached_data_url));
         } else {
-            println!("[RUST] Cached image expired for pubkey: {}", pubkey);
-            Ok(None)
+            println!("[RUST] Cached image expired in memory for pubkey: {}", pubkey);
+        }
+    }
+    drop(cache); // Release lock before DB access
+    
+    // If not in memory cache (or expired), check database
+    if let Ok(db) = state.get_database() {
+        match db.get_contact(&pubkey) {
+            Ok(Some(contact)) => {
+                // If picture_url provided, validate it matches what's in database
+                if let Some(ref expected_url) = picture_url {
+                    let db_url = contact.picture_url.as_deref().unwrap_or("");
+                    if db_url != expected_url.as_str() {
+                        println!("[RUST] Picture URL changed (DB: '{}' vs current: '{}'), cache invalid", db_url, expected_url);
+                        // URL changed - don't use cached image
+                        return Ok(None);
+                    }
+                }
+                
+                if let Some(picture_data_url) = contact.picture_data_url {
+                    // Validate the data URL
+                    if picture_data_url.starts_with("data:image") 
+                        && picture_data_url != "data:application/octet-stream;base64," 
+                        && !picture_data_url.trim().is_empty() {
+                        println!("[RUST] Found cached image in database for pubkey: {}", pubkey);
+                        
+                        // Update in-memory cache for faster access next time
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        let cached_image = state::CachedImage {
+                            data_url: picture_data_url.clone(),
+                            timestamp,
+                        };
+                        state.image_cache.lock().unwrap().insert(pubkey.clone(), cached_image);
+                        
+                        return Ok(Some(picture_data_url));
+                    } else {
+                        println!("[RUST] Invalid picture_data_url in database for pubkey: {}", pubkey);
+                    }
+                }
+            }
+            Ok(None) => {
+                println!("[RUST] Contact not found in database for pubkey: {}", pubkey);
+            }
+            Err(e) => {
+                println!("[RUST] Error querying database for pubkey {}: {}", pubkey, e);
+            }
         }
     } else {
-        println!("[RUST] No cached image found for pubkey: {}", pubkey);
-        Ok(None)
+        println!("[RUST] Failed to get database connection");
     }
+    
+    println!("[RUST] No cached image found for pubkey: {}", pubkey);
+    Ok(None)
 }
 
 #[tauri::command]
@@ -3466,11 +3535,23 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pu
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // #region agent log
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+        use std::io::Write;
+        writeln!(f, r#"{{"id":"log_backend_start","timestamp":{},"location":"lib.rs:3468","message":"Backend run() function entry","data":{{"hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+    });
+    // #endregion
     println!("[RUST] Starting nostr-mail application...");
     println!("[RUST] Registering Tauri commands...");
 
     // Create AppState and initialize the database
     let app_state = AppState::new();
+    // #region agent log
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+        use std::io::Write;
+        writeln!(f, r#"{{"id":"log_appstate_created","timestamp":{},"location":"lib.rs:3473","message":"AppState created","data":{{"hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+    });
+    // #endregion
     // Use platform-specific app data directory
     match get_app_data_dir() {
         Ok(app_dir) => {
@@ -3482,11 +3563,25 @@ pub fn run() {
                 println!("[RUST] Initializing database at: {:?}", db_path);
                 match app_state.init_database(&db_path) {
                     Ok(()) => {
+                        // #region agent log
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, r#"{{"id":"log_db_init_success","timestamp":{},"location":"lib.rs:3484","message":"Database initialized successfully","data":{{"dbPath":"{}","hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), db_path.display())
+                        });
+                        // #endregion
                         // Database initialized successfully
                         // Contacts will be loaded per-user when needed
                         println!("[RUST] Database initialized successfully");
                     },
-                    Err(e) => println!("[RUST] Failed to initialize database at startup: {}", e),
+                    Err(e) => {
+                        // #region agent log
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, r#"{{"id":"log_db_init_error","timestamp":{},"location":"lib.rs:3489","message":"Database initialization failed","data":{{"error":"{}","hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), e)
+                        });
+                        // #endregion
+                        println!("[RUST] Failed to initialize database at startup: {}", e)
+                    },
                 }
             }
         },
@@ -3649,6 +3744,12 @@ pub fn run() {
     println!("[RUST] Context generated successfully");
     
     println!("[RUST] Starting Tauri application...");
+    // #region agent log
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
+        use std::io::Write;
+        writeln!(f, r#"{{"id":"log_tauri_starting","timestamp":{},"location":"lib.rs:3651","message":"Tauri runtime starting","data":{{"hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+    });
+    // #endregion
     builder.run(context)
         .expect("error while running tauri application");
 }

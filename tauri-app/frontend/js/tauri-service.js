@@ -233,8 +233,8 @@ const TauriService = {
     cacheProfileImage: async function(pubkey, dataUrl) {
         return await this.invoke('cache_profile_image', { pubkey, dataUrl });
     },
-    getCachedProfileImage: async function(pubkey) {
-        return await this.invoke('get_cached_profile_image', { pubkey });
+    getCachedProfileImage: async function(pubkey, pictureUrl) {
+        return await this.invoke('get_cached_profile_image', { pubkey, picture_url: pictureUrl || null });
     },
     getContacts: async function() {
         return await this.invoke('get_contacts');

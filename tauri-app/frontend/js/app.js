@@ -22,6 +22,9 @@ function NostrMailApp() {
 
 // Initialize the application
 NostrMailApp.prototype.init = async function() {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:24',message:'init() function entry',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+    // #endregion
     console.log('🚀 ========================================');
     console.log('🚀   NostrMail - Starting Application');
     console.log('🚀 ========================================');
@@ -31,7 +34,13 @@ NostrMailApp.prototype.init = async function() {
     console.log('🚀 ========================================');
     // Initialize the database
     try {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:34',message:'Before TauriService.initDatabase()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         await TauriService.initDatabase();
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:35',message:'After TauriService.initDatabase() - success',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         console.log('Database initialized');
     } catch (e) {
         if (e && e.toString().includes('already initialized')) {
@@ -48,13 +57,31 @@ NostrMailApp.prototype.init = async function() {
         // This ensures we load settings for the correct pubkey
 
         console.log('🌐 Loading relay configuration from database...');
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:51',message:'Before loadRelaysFromDatabase()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         await this.loadRelaysFromDatabase();
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:51',message:'After loadRelaysFromDatabase()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
 
         console.log('🔑 Loading/generating keypair...');
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:54',message:'Before loadKeypair()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         await this.loadKeypair();
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:54',message:'After loadKeypair()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         
         console.log('🔄 Initializing live event subscription...');
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:57',message:'Before initializeLiveEvents()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         await this.initializeLiveEvents();
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:57',message:'After initializeLiveEvents()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         
         console.log('🎯 Setting up event listeners...');
         this.setupEventListeners();
@@ -64,7 +91,13 @@ NostrMailApp.prototype.init = async function() {
         
         console.log('📬 Loading initial data...');
         // Load contacts first so DM contacts can access cached profile photos
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:67',message:'Before contactsService.loadContacts()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         await contactsService.loadContacts();
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:67',message:'After contactsService.loadContacts()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         
         // Ensure default nostr-mail contact is added for this user
         console.log('📇 Ensuring default nostr-mail contact...');
@@ -93,6 +126,9 @@ NostrMailApp.prototype.init = async function() {
         console.log('✅ ========================================');
         
         this.initialized = true;
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:95',message:'init() completed successfully',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
     } catch (error) {
         console.error('❌ ========================================');
         console.error('❌   NostrMail - Startup Failed!');
@@ -266,7 +302,14 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
         const privateKey = keypair ? keypair.private_key : null;
         console.log('[APP] Using private key for decryption:', privateKey ? privateKey.substring(0, 20) + '...' : 'null');
         
+        // #region agent log
+        const dbQueryStartTime = Date.now();
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:305',message:'Before TauriService.dbGetAllSettings',data:{hypothesisId:'D'},timestamp:dbQueryStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         const dbSettings = await TauriService.dbGetAllSettings(pubkey, privateKey);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:305',message:'After TauriService.dbGetAllSettings',data:{duration:Date.now()-dbQueryStartTime,settingsCount:Object.keys(dbSettings||{}).length,hypothesisId:'D'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         console.log('[APP] Loaded settings from database:', Object.keys(dbSettings || {}).length, 'keys');
         
         if (dbSettings && Object.keys(dbSettings).length > 0) {
@@ -384,14 +427,37 @@ NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
 
 // Load keypair
 NostrMailApp.prototype.loadKeypair = async function() {
+    // #region agent log
+    const loadKeypairStartTime = Date.now();
+    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:422',message:'loadKeypair entry',data:{hypothesisId:'A'},timestamp:loadKeypairStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+    // #endregion
     try {
+        // #region agent log
+        const localStorageStartTime = Date.now();
+        // #endregion
         const stored = localStorage.getItem('nostr_keypair');
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:424',message:'After localStorage.getItem',data:{hasStored:!!stored,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         let keypair;
         if (stored) {
+            // #region agent log
+            const parseStartTime = Date.now();
+            // #endregion
             keypair = JSON.parse(stored);
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:427',message:'After JSON.parse stored keypair',data:{hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+            // #endregion
             appState.setKeypair(keypair);
         } else {
+            // #region agent log
+            const generateStartTime = Date.now();
+            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:430',message:'Before TauriService.generateKeypair',data:{hypothesisId:'B'},timestamp:generateStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+            // #endregion
             keypair = await TauriService.generateKeypair();
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:430',message:'After TauriService.generateKeypair',data:{duration:Date.now()-generateStartTime,hypothesisId:'B'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+            // #endregion
             appState.setKeypair(keypair);
             localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
         }
@@ -406,17 +472,41 @@ NostrMailApp.prototype.loadKeypair = async function() {
                 domManager.setValue('nprivKey', keypair.private_key);
                 console.log('[APP] Populated private key field from cached keypair on startup');
                 // Update public key display to show the user is logged in
+                // #region agent log
+                const updateDisplayStartTime = Date.now();
+                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:445',message:'Before updatePublicKeyDisplay',data:{hypothesisId:'C'},timestamp:updateDisplayStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+                // #endregion
                 await this.updatePublicKeyDisplay();
+                // #region agent log
+                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:445',message:'After updatePublicKeyDisplay',data:{duration:Date.now()-updateDisplayStartTime,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+                // #endregion
             }
         }
         
         // Load settings for this pubkey
         if (keypair && keypair.public_key) {
+            // #region agent log
+            const loadSettingsStartTime = Date.now();
+            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:451',message:'Before loadSettingsForPubkey',data:{pubkey:keypair.public_key.substring(0,20)+'...',hypothesisId:'D'},timestamp:loadSettingsStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+            // #endregion
             await this.loadSettingsForPubkey(keypair.public_key);
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:451',message:'After loadSettingsForPubkey',data:{duration:Date.now()-loadSettingsStartTime,hypothesisId:'D'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+            // #endregion
         }
         
         // Initialize persistent Nostr client with the loaded keypair
+        // #region agent log
+        const initClientStartTime = Date.now();
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:455',message:'Before initializeNostrClient',data:{hypothesisId:'E'},timestamp:initClientStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         await this.initializeNostrClient();
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:455',message:'After initializeNostrClient',data:{duration:Date.now()-initClientStartTime,hypothesisId:'E'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:422',message:'loadKeypair completed',data:{totalDuration:Date.now()-loadKeypairStartTime,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
     } catch (error) {
         console.error('Failed to load keypair:', error);
         notificationService.showError('Failed to load encryption keys');
@@ -425,6 +515,10 @@ NostrMailApp.prototype.loadKeypair = async function() {
 
 // Initialize the persistent Nostr client
 NostrMailApp.prototype.initializeNostrClient = async function() {
+    // #region agent log
+    const initNostrClientStartTime = Date.now();
+    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:463',message:'initializeNostrClient entry',data:{hypothesisId:'E'},timestamp:initNostrClientStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+    // #endregion
     try {
         const keypair = appState.getKeypair();
         if (!keypair || !keypair.private_key) {
@@ -433,7 +527,14 @@ NostrMailApp.prototype.initializeNostrClient = async function() {
         }
         
         console.log('[APP] Initializing persistent Nostr client...');
+        // #region agent log
+        const tauriInitStartTime = Date.now();
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:472',message:'Before TauriService.initPersistentNostrClient',data:{hypothesisId:'E'},timestamp:tauriInitStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         await TauriService.initPersistentNostrClient(keypair.private_key);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:472',message:'After TauriService.initPersistentNostrClient',data:{duration:Date.now()-tauriInitStartTime,hypothesisId:'E'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         console.log('[APP] ✅ Nostr client initialized successfully');
         
         // Update relay status display after client initialization
@@ -2031,10 +2132,21 @@ NostrMailApp.prototype.setupSwipeGestures = function() {
 NostrMailApp.prototype.setupBackButtons = function() {
     const backButtons = document.querySelectorAll('.back-to-nav-btn');
     backButtons.forEach(btn => {
+        // Other tabs use default behavior (show navbar)
         btn.addEventListener('click', () => {
             this.showNavbar();
         });
     });
+    
+    // Setup profile back button (uses dm-back-to-list-btn class for styling)
+    const profileBackButton = document.getElementById('profile-back-to-contacts-btn');
+    if (profileBackButton) {
+        profileBackButton.addEventListener('click', () => {
+            // Clear viewing profile pubkey to return to own profile next time
+            appState.clearViewingProfilePubkey();
+            this.switchTab('contacts');
+        });
+    }
 }
 
 NostrMailApp.prototype.switchTab = function(tabName) {
@@ -2103,6 +2215,11 @@ NostrMailApp.prototype.switchTab = function(tabName) {
         // Always reload contacts when switching to contacts tab to ensure they match the current user
         // This handles the case where a new keypair was generated but contacts tab wasn't active
         contactsService.loadContacts();
+        // Set up lazy image loading when contacts tab is actually opened
+        // Images will load as contacts scroll into view (IntersectionObserver)
+        setTimeout(() => {
+            contactsService.setupLazyImageLoading();
+        }, 100);
     }
     if (tabName === 'dm') {
         // Only load DM contacts if they haven't been loaded yet
@@ -3367,7 +3484,9 @@ NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
             // Also check database cache for picture (faster and more reliable)
             if (!cachedPictureDataUrl && targetPubkey) {
                 try {
-                    cachedPictureDataUrl = await TauriService.getCachedProfileImage(targetPubkey);
+                    // Get picture URL from cached profile if available
+                    const cachedPictureUrl = cachedProfile?.fields?.picture || null;
+                    cachedPictureDataUrl = await TauriService.getCachedProfileImage(targetPubkey, cachedPictureUrl);
                     if (cachedPictureDataUrl && isViewingOwnProfile) {
                         localStorage.setItem('nostr_mail_profile_picture', cachedPictureDataUrl);
                     }
@@ -3445,7 +3564,8 @@ NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
                 (async () => {
                     try {
                         // Check database cache first (fast)
-                        let dataUrl = await TauriService.getCachedProfileImage(targetPubkey);
+                        // Pass picture URL to validate cache - if URL changed, cache is invalid
+                        let dataUrl = await TauriService.getCachedProfileImage(targetPubkey, pictureUrl);
                         
                         // If not in cache, fetch it
                         if (!dataUrl) {
@@ -3673,16 +3793,25 @@ NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) 
         }
     }
     
-    // Update header title
+    // Update header title and back button visibility
+    const profileBackButton = document.getElementById('profile-back-to-contacts-btn');
     if (profileHeader) {
         if (isViewingOwnProfile) {
             profileHeader.textContent = 'Profile';
+            // Hide back button when viewing own profile
+            if (profileBackButton) {
+                profileBackButton.style.display = 'none';
+            }
         } else {
             // Get contact name if available
             const contacts = appState.getContacts() || [];
             const contact = contacts.find(c => c.pubkey === this.viewingProfilePubkey);
             const name = contact?.name || profile?.fields?.name || profile?.fields?.display_name || 'Contact Profile';
             profileHeader.textContent = name;
+            // Show back button when viewing contact profile
+            if (profileBackButton) {
+                profileBackButton.style.display = 'flex';
+            }
         }
     }
     
@@ -4030,6 +4159,10 @@ NostrMailApp.prototype.updateProfile = async function() {
 }
 
 NostrMailApp.prototype.updatePublicKeyDisplay = async function() {
+    // #region agent log
+    const updateDisplayStartTime = Date.now();
+    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4133',message:'updatePublicKeyDisplay entry',data:{hypothesisId:'C'},timestamp:updateDisplayStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+    // #endregion
     const nprivKey = domManager.getValue('nprivKey')?.trim() || '';
     
     if (!nprivKey) {
@@ -4038,15 +4171,32 @@ NostrMailApp.prototype.updatePublicKeyDisplay = async function() {
     }
     
     try {
+        // #region agent log
+        const validateStartTime = Date.now();
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4142',message:'Before validatePrivateKey',data:{hypothesisId:'C'},timestamp:validateStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         const isValid = await TauriService.validatePrivateKey(nprivKey);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4142',message:'After validatePrivateKey',data:{isValid:isValid,duration:Date.now()-validateStartTime,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         
         if (!isValid) {
             domManager.setValue('publicKeyDisplay', 'Invalid private key');
             return;
         }
         
+        // #region agent log
+        const getPubkeyStartTime = Date.now();
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4149',message:'Before getPublicKeyFromPrivate',data:{hypothesisId:'C'},timestamp:getPubkeyStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         const publicKey = await TauriService.getPublicKeyFromPrivate(nprivKey);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4149',message:'After getPublicKeyFromPrivate',data:{duration:Date.now()-getPubkeyStartTime,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         domManager.setValue('publicKeyDisplay', publicKey);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4133',message:'updatePublicKeyDisplay completed',data:{totalDuration:Date.now()-updateDisplayStartTime,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+        // #endregion
         
     } catch (error) {
         console.error('Failed to get public key:', error);
@@ -4367,6 +4517,9 @@ NostrMailApp.prototype.initializeSettingsAccordion = function() {
 
 // Initialize when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4369',message:'DOMContentLoaded event fired',data:{hypothesisId:'B'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+    // #endregion
     window.domManager = new DOMManager();
     console.log('🌐 DOM loaded - Initializing NostrMail interface...');
     
@@ -4377,6 +4530,9 @@ document.addEventListener('DOMContentLoaded', () => {
     console.log('🎨 Dark mode initialized:', darkPref === '1' ? 'enabled' : 'disabled');
     
     // Initialize the application
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4380',message:'Calling app.init()',data:{hypothesisId:'B'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
+    // #endregion
     window.app.init();
     
     // Start relay status updates

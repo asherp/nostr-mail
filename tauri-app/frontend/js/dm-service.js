@@ -198,7 +198,8 @@ class DMService {
                     if (contact.picture) {
                         try {
                             // First try to get from backend cache
-                            let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey);
+                            // Pass picture URL to validate cache - if URL changed, cache is invalid
+                            let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey, contact.picture);
                             
                             // If not in cache, fetch and cache it
                             if (!dataUrl) {

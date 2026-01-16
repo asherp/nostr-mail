@@ -6,6 +6,7 @@
 class ContactsService {
     constructor() {
         this.searchTimeout = null;
+        this.imageLoadingInProgress = false; // Prevent multiple concurrent image loading operations
     }
 
     // Load contacts from database only
@@ -90,8 +91,10 @@ class ContactsService {
             console.log(`[JS] Contacts loaded from database: ${contacts.length} contacts`);
             this.renderContacts();
             console.log('[JS] Contacts rendered to UI');
-            // Defer image loading so UI is responsive
-            this.loadContactImagesProgressively(); // don't await
+            // Images are NOT loaded automatically on startup to prevent excessive fetching
+            // Images will be loaded lazily when:
+            // 1. Contacts tab is opened (via setupLazyImageLoading in switchTab)
+            // 2. Contacts scroll into view (via IntersectionObserver)
         } catch (e) {
             console.warn('Failed to load contacts from database:', e);
             window.appState.setContacts([]);
@@ -106,7 +109,8 @@ class ContactsService {
         
         try {
             contact.picture_loading = true;
-            let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey);
+            // Pass picture URL to validate cache - if URL changed, cache is invalid
+            let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey, contact.picture);
             if (!dataUrl && contact.picture) {
                 dataUrl = await window.TauriService.fetchImage(contact.picture);
                 if (dataUrl) {
@@ -138,15 +142,29 @@ class ContactsService {
         }
     }
 
-    // Load contact images progressively
+    // Load contact images progressively - only for visible contacts
     async loadContactImagesProgressively() {
-        const contacts = window.appState.getContacts();
-        if (contacts.length === 0) {
-            console.log('[JS] loadContactImagesProgressively: No contacts to load images for');
+        // Guard is already set before setTimeout, but check again in case of direct calls
+        if (this.imageLoadingInProgress) {
+            console.log('[JS] loadContactImagesProgressively: Already in progress, skipping');
             return;
         }
+        
+        // Guard should already be set, but ensure it's set here too for direct calls
+        this.imageLoadingInProgress = true;
+        try {
+            const contacts = window.appState.getContacts();
+            if (contacts.length === 0) {
+                console.log('[JS] loadContactImagesProgressively: No contacts to load images for');
+                return;
+            }
 
-        console.log(`[JS] Loading images progressively for ${contacts.length} contacts`);
+        // Only load images for visible contacts initially (first 20)
+        // Remaining images will be loaded lazily as user scrolls
+        const initialBatchSize = 20;
+        const visibleContacts = contacts.slice(0, initialBatchSize);
+        
+        console.log(`[JS] Loading images progressively for ${visibleContacts.length} visible contacts (out of ${contacts.length} total)`);
 
         // Helper to serialize DB writes
         let lastDbWrite = Promise.resolve();
@@ -155,18 +173,19 @@ class ContactsService {
             return lastDbWrite;
         };
 
-        const batchSize = 10;
+        const batchSize = 5; // Smaller batches to reduce concurrent requests
         let i = 0;
 
-        while (i < contacts.length) {
-            const batch = contacts.slice(i, i + batchSize);
+        while (i < visibleContacts.length) {
+            const batch = visibleContacts.slice(i, i + batchSize);
             await Promise.all(batch.map(async (contact) => {
                 if (contact.picture && !contact.picture_data_url && !contact.picture_loading) {
                     try {
                         contact.picture_loading = true;
                         // Update UI to show loading spinner
                         this.renderContactItem(contact);
-                        let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey);
+                        // Pass picture URL to validate cache - if URL changed, cache is invalid
+                        let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey, contact.picture);
                         if (!dataUrl) {
                             dataUrl = await window.TauriService.fetchImage(contact.picture);
                             if (dataUrl) {
@@ -193,6 +212,88 @@ class ContactsService {
                 }
             }));
             i += batchSize;
+            // Add small delay between batches to avoid overwhelming the network
+            if (i < visibleContacts.length) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        }
+
+            // Set up lazy loading for remaining contacts using IntersectionObserver
+            if (contacts.length > initialBatchSize) {
+                setTimeout(() => {
+                    this.setupLazyImageLoading();
+                }, 1000); // Wait a bit before setting up lazy loading
+            }
+        } finally {
+            this.imageLoadingInProgress = false;
+        }
+    }
+
+    // Set up lazy loading for contacts using IntersectionObserver
+    // Only loads images from cache for first few visible contacts, then uses observer for rest
+    async setupLazyImageLoading() {
+        const contactsList = window.domManager.get('contactsList');
+        if (!contactsList) return;
+
+        const allContacts = window.appState.getContacts();
+        
+        // First, quickly load cached images for the first 5 visible contacts (cache-only, no network)
+        // This improves perceived performance without causing network requests
+        const initialVisibleContacts = allContacts.slice(0, 5);
+        for (const contact of initialVisibleContacts) {
+            if (contact.picture && !contact.picture_data_url && !contact.picture_loading) {
+                try {
+                    // Only check cache, don't fetch from network
+                    // Pass picture URL to validate cache - if URL changed, cache is invalid
+                    const cachedDataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey, contact.picture);
+                    if (cachedDataUrl) {
+                        contact.picture_data_url = cachedDataUrl;
+                        contact.picture_loaded = true;
+                        this.renderContactItem(contact);
+                    }
+                } catch (e) {
+                    // Ignore cache errors, will load via observer if needed
+                }
+            }
+        }
+        
+        // Use IntersectionObserver to detect when contacts become visible
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    const contactElement = entry.target;
+                    const pubkey = contactElement.dataset.pubkey;
+                    if (pubkey) {
+                        const contact = allContacts.find(c => c.pubkey === pubkey);
+                        if (contact && contact.picture && !contact.picture_data_url && !contact.picture_loading) {
+                            // Load image for this contact (will check cache first, then fetch if needed)
+                            this.loadContactImageAsync(contact);
+                        }
+                    }
+                    observer.unobserve(contactElement);
+                }
+            });
+        }, {
+            rootMargin: '50px' // Start loading 50px before contact becomes visible
+        });
+
+        // Observe all contact elements that don't have images loaded yet
+        const contactElements = contactsList.querySelectorAll('.contact-item[data-pubkey]');
+        contactElements.forEach(contactElement => {
+            const pubkey = contactElement.dataset.pubkey;
+            const contact = allContacts.find(c => c.pubkey === pubkey);
+            if (contact && contact.picture && !contact.picture_data_url && !contact.picture_loading) {
+                observer.observe(contactElement);
+            }
+        });
+        
+        // Check if contacts 6-20 are already visible and need immediate loading
+        const contactsNeedingLoad = allContacts.slice(5, 20).filter(c => c.picture && !c.picture_data_url && !c.picture_loading);
+        if (contactsNeedingLoad.length > 0) {
+            // Load these contacts immediately since they're likely already visible
+            contactsNeedingLoad.forEach(contact => {
+                this.loadContactImageAsync(contact);
+            });
         }
     }
 
@@ -216,12 +317,16 @@ class ContactsService {
         let avatarSrc = defaultAvatar;
         let avatarClass = 'contact-avatar';
         
-        if (contact.picture_loading) {
-            avatarClass += ' loading';
-            // You could add a loading spinner here if desired
-        } else if (contact.picture_data_url) {
+        // Prioritize picture_data_url if it exists (image is loaded)
+        if (contact.picture_data_url) {
             avatarSrc = contact.picture_data_url;
-            // console.log(`[JS] Using cached data URL for ${contact.name}`);
+            // Only show loading spinner if image is still loading AND not yet loaded
+            if (contact.picture_loading && !contact.picture_loaded) {
+                avatarClass += ' loading';
+            }
+        } else if (contact.picture_loading) {
+            // Image is loading but not yet available
+            avatarClass += ' loading';
         } else {
             console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
         }
@@ -1486,7 +1591,10 @@ class ContactsService {
                 const updatedContacts = [...localContacts, ...newContacts];
                 window.appState.setContacts(updatedContacts);
                 this.renderContacts();
-                this.loadContactImagesProgressively();
+                // Set up lazy image loading instead of loading all images at once
+                setTimeout(() => {
+                    this.setupLazyImageLoading();
+                }, 100);
                 // Save new contacts to DB with user-contact relationship
                 // These are public follows from Nostr, so is_public=true
                 for (const contact of newContacts) {
@@ -1590,7 +1698,8 @@ class ContactsService {
                 // Optionally update picture_data_url if picture changed
                 if (selectedContact.picture) {
                     try {
-                        let dataUrl = await window.TauriService.getCachedProfileImage(pubkey);
+                        // Pass picture URL to validate cache - if URL changed, cache is invalid
+                        let dataUrl = await window.TauriService.getCachedProfileImage(pubkey, selectedContact.picture);
                         if (!dataUrl) {
                             dataUrl = await window.TauriService.fetchImage(selectedContact.picture);
                             if (dataUrl) {

@@ -766,8 +766,10 @@ impl Database {
 
     pub fn get_all_contacts(&self, user_pubkey: &str) -> Result<Vec<Contact>> {
         let conn = self.conn.lock().unwrap();
+        // Optimized: Exclude picture_data_url from initial query to reduce IPC overhead
+        // picture_data_url will be fetched on-demand via getCachedProfileImage
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.pubkey, c.name, c.email, c.picture_url, c.picture_data_url, c.about, c.created_at, c.updated_at, uc.is_public
+            "SELECT c.id, c.pubkey, c.name, c.email, c.picture_url, c.about, c.created_at, c.updated_at, uc.is_public
              FROM contacts c
              INNER JOIN user_contacts uc ON c.pubkey = uc.contact_pubkey
              WHERE uc.user_pubkey = ?
@@ -781,11 +783,11 @@ impl Database {
                 name: row.get(2)?,
                 email: row.get(3)?,
                 picture_url: row.get(4)?,
-                picture_data_url: row.get(5)?,
-                about: row.get(6)?,
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                is_public: Some(row.get(9)?),
+                picture_data_url: None, // Not fetched in initial query - will be loaded on-demand
+                about: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                is_public: Some(row.get(8)?),
             })
         })?;
         

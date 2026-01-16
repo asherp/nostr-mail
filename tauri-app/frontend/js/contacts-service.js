@@ -22,6 +22,8 @@ class ContactsService {
             const userPubkey = window.appState.getKeypair().public_key;
             const dbContacts = await window.DatabaseService.getAllContacts(userPubkey);
             // Convert DB format to frontend format if needed
+            // Note: picture_data_url is not fetched in initial query to reduce IPC overhead
+            // It will be loaded on-demand via loadContactImagesProgressively
             const contacts = dbContacts.map(contact => ({
                 pubkey: contact.pubkey,
                 name: contact.name,
@@ -35,9 +37,9 @@ class ContactsService {
                     about: contact.about || '',
                     email: contact.email || ''
                 },
-                picture_data_url: contact.picture_data_url || null,
+                picture_data_url: null, // Will be loaded on-demand via getCachedProfileImage
                 picture_loading: false,
-                picture_loaded: !!contact.picture_data_url
+                picture_loaded: false // Will be set when image is loaded
             }));
             
             // Add user's own profile to contacts list as private
@@ -162,6 +164,8 @@ class ContactsService {
                 if (contact.picture && !contact.picture_data_url && !contact.picture_loading) {
                     try {
                         contact.picture_loading = true;
+                        // Update UI to show loading spinner
+                        this.renderContactItem(contact);
                         let dataUrl = await window.TauriService.getCachedProfileImage(contact.pubkey);
                         if (!dataUrl) {
                             dataUrl = await window.TauriService.fetchImage(contact.picture);
@@ -183,6 +187,8 @@ class ContactsService {
                         console.warn(`Failed to cache profile picture for ${contact.name}:`, e);
                     } finally {
                         contact.picture_loading = false;
+                        // Always update UI in finally to remove spinner, even if loading failed
+                        this.renderContactItem(contact);
                     }
                 }
             }));
@@ -344,11 +350,9 @@ class ContactsService {
             }
             
             // Store the pubkey we're viewing and navigate to profile tab
+            // switchTab will automatically load the profile when it sees viewingProfilePubkey is set
             window.appState.setViewingProfilePubkey(contact.pubkey);
             window.app.switchTab('profile');
-            
-            // Load the contact's profile
-            await window.app.loadProfile(contact.pubkey);
             
         } catch (error) {
             console.error('Error selecting contact:', error);

@@ -296,10 +296,10 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
             println!("[RUST]   ✓ {}", url);
         }
         
-        // Give relays a moment to be fully ready for queries
+        // Give relays a brief moment to be fully ready for queries (reduced from 2s to 100ms)
         // WebSocket connections may be established but not ready to receive queries immediately
-        println!("[RUST] Waiting 2 seconds for relays to be fully ready...");
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Since relays are already connected via persistent client, a short wait is sufficient
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     
     // Create filter for single profile
@@ -308,10 +308,12 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
         .kind(Kind::from(0)) // Profile events are kind 0
         .limit(1);
     
-    println!("[RUST] Fetching profile events with 15s timeout...");
+    // Use shorter timeout (5 seconds) since we only need 1 result and latest logs show
+    // successful fetches complete in <200ms. This prevents long waits when relays are slow.
+    println!("[RUST] Fetching profile events with 5s timeout...");
     let fetch_start = std::time::Instant::now();
     let profile_events = client
-        .fetch_events(profile_filter, Duration::from_secs(15))
+        .fetch_events(profile_filter, Duration::from_secs(5))
         .await
         .map_err(|e| {
             println!("[RUST] ERROR during fetch_events: {}", e);
@@ -322,8 +324,8 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
     println!("[RUST] Found {} profile events using persistent client", profile_events.len());
     
     // Log if timeout was reached (suggests relays aren't responding)
-    if fetch_duration.as_secs() >= 14 {
-        println!("[RUST] WARNING: Fetch took nearly full timeout duration. Relays may not be responding to queries.");
+    if fetch_duration.as_secs() >= 4 {
+        println!("[RUST] WARNING: Fetch took nearly full timeout duration (5s). Relays may not be responding to queries.");
         println!("[RUST] Attempting fallback: using fresh client connection to query relays directly...");
         
         // Fallback: Try using a fresh client connection

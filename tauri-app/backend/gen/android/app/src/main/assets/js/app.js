@@ -19,7 +19,7 @@ function NostrMailApp() {
 // Initialize the application
 NostrMailApp.prototype.init = async function() {
     console.log('🚀 ========================================');
-    console.log('🚀   Nostr Mail - Starting Application');
+    console.log('🚀   NostrMail - Starting Application');
     console.log('🚀 ========================================');
     console.log('📧 Email + 🔐 Nostr Integration');
     console.log('🌐 Version: 1.0.0');
@@ -74,7 +74,7 @@ NostrMailApp.prototype.init = async function() {
         }
         
         console.log('✅ ========================================');
-        console.log('✅   Nostr Mail - Successfully Started!');
+        console.log('✅   NostrMail - Successfully Started!');
         console.log('✅ ========================================');
         console.log('🎉 Application is ready for use');
         console.log('📱 UI: Modern email client with Nostr integration');
@@ -84,7 +84,7 @@ NostrMailApp.prototype.init = async function() {
         this.initialized = true;
     } catch (error) {
         console.error('❌ ========================================');
-        console.error('❌   Nostr Mail - Startup Failed!');
+        console.error('❌   NostrMail - Startup Failed!');
         console.error('❌ ========================================');
         console.error('💥 Error during initialization:', error);
         console.error('❌ ========================================');
@@ -2680,7 +2680,7 @@ NostrMailApp.prototype.stopRelayStatusUpdates = function() {
 // Initialize when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
     window.domManager = new DOMManager();
-    console.log('🌐 DOM loaded - Initializing Nostr Mail interface...');
+    console.log('🌐 DOM loaded - Initializing NostrMail interface...');
     
     // Set initial dark mode from localStorage
     const darkPref = localStorage.getItem('darkMode');

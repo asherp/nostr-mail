@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nostr Mail</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>NostrMail</title>
     <!-- CSS Files -->
     <link rel="stylesheet" href="styles/variables.css">
     <link rel="stylesheet" href="styles/reset.css">
@@ -41,7 +41,7 @@
         <!-- Sidebar -->
         <aside class="sidebar">
             <div class="sidebar-header">
-                <h1><i class="fas fa-envelope"></i> Nostr Mail</h1>
+                <h1><i class="fas fa-envelope"></i> NostrMail</h1>
             </div>
             
             <nav class="sidebar-nav">
@@ -77,7 +77,12 @@
             <!-- Compose Tab -->
             <div class="tab-content active" id="compose">
                 <div class="tab-header">
-                    <h2>Compose Email</h2>
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md);">
+                        <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2>Compose Email</h2>
+                    </div>
                 </div>
                 
                 <div class="compose-form">
@@ -143,7 +148,12 @@
             <!-- Inbox Tab -->
             <div class="tab-content" id="inbox">
                 <div class="tab-header">
-                    <h2 id="inbox-title">Inbox</h2>
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                        <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2 id="inbox-title">Inbox</h2>
+                    </div>
                     <div class="inbox-actions" id="inbox-actions">
                         <div class="email-search-container">
                             <input type="text" id="email-search" placeholder="Search by sender email..." class="email-search-input">
@@ -176,7 +186,12 @@
             <!-- Sent Tab -->
             <div class="tab-content" id="sent">
                 <div class="tab-header">
-                    <h2 id="sent-title">Sent</h2>
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                        <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2 id="sent-title">Sent</h2>
+                    </div>
                     <div class="inbox-actions" id="sent-actions">
                         <div class="email-search-container">
                             <input type="text" id="sent-search" placeholder="Search sent emails..." class="email-search-input">
@@ -205,7 +220,12 @@
             <!-- Drafts Tab -->
             <div class="tab-content" id="drafts">
                 <div class="tab-header">
-                    <h2 id="drafts-title">Drafts</h2>
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                        <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2 id="drafts-title">Drafts</h2>
+                    </div>
                     <div class="inbox-actions" id="drafts-actions">
                         <button id="refresh-drafts" class="btn btn-secondary">
                             <i class="fas fa-sync"></i> Refresh
@@ -230,7 +250,12 @@
             <!-- Direct Messages Tab -->
             <div class="tab-content" id="dm">
                 <div class="tab-header">
-                    <h2>Search</h2>
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                        <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2>Direct Messages</h2>
+                    </div>
                     <div class="dm-actions">
                         <button id="dm-search-toggle" class="btn btn-secondary">
                             <i class="fas fa-search"></i> Search
@@ -246,13 +271,15 @@
                     <i class="fas fa-search dm-search-icon"></i>
                 </div>
                 
-                <div class="dm-container">
-                    <div class="dm-sidebar">
+                <div class="dm-container dm-list-view">
+                    <!-- List View -->
+                    <div class="dm-list-panel">
                         <div class="dm-contacts" id="dm-contacts">
                             <!-- DM contacts will be populated here -->
                         </div>
                     </div>
-                    <div class="dm-main">
+                    <!-- Conversation View -->
+                    <div class="dm-conversation-panel">
                         <div class="dm-messages" id="dm-messages">
                             <!-- DM messages will be populated here -->
                         </div>
@@ -263,19 +290,24 @@
             <!-- Contacts Tab -->
             <div class="tab-content" id="contacts">
                 <div class="tab-header">
-                    <h2>Contacts</h2>
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                        <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2>Contacts</h2>
+                    </div>
                     <div class="contacts-actions">
                         <button id="contacts-search-toggle" class="btn btn-secondary">
-                            <i class="fas fa-search"></i> Search
+                            <i class="fas fa-search"></i> <span class="btn-text">Search</span>
                         </button>
                         <button id="refresh-contacts-btn" class="btn btn-secondary">
-                            <i class="fas fa-sync"></i> Refresh
+                            <i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>
                         </button>
                         <button id="export-npubs-btn" class="btn btn-secondary">
-                            <i class="fas fa-download"></i> Export Contacts
+                            <i class="fas fa-download"></i> <span class="btn-text">Export Contacts</span>
                         </button>
                         <button id="add-contact-btn" class="btn btn-primary">
-                            <i class="fas fa-plus"></i> Add Contact
+                            <i class="fas fa-plus"></i> <span class="btn-text">Add Contact</span>
                         </button>
                     </div>
                 </div>
@@ -291,20 +323,18 @@
                             <!-- Contacts will be populated here -->
                         </div>
                     </div>
-                    <div class="contacts-detail" id="contacts-detail">
-                        <!-- Contact profile details will be shown here -->
-                        <div class="contact-detail-placeholder">
-                            <i class="fas fa-user"></i>
-                            <p>Select a contact to view their profile</p>
-                        </div>
-                    </div>
                 </div>
             </div>
 
             <!-- Profile Tab -->
             <div class="tab-content" id="profile">
                 <div class="tab-header">
-                    <h2>Profile</h2>
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                        <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2>Profile</h2>
+                    </div>
                     <div class="profile-actions">
                         <button id="refresh-profile" class="btn btn-secondary">
                             <i class="fas fa-sync"></i> Refresh
@@ -332,7 +362,12 @@
             <!-- Settings Tab -->
             <div class="tab-content" id="settings">
                 <div class="tab-header">
-                    <h2>Settings</h2>
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md);">
+                        <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2>Settings</h2>
+                    </div>
                 </div>
                 
                 <div class="settings-form">
@@ -355,6 +390,9 @@
                                 </button>
                                 <button type="button" id="qr-npriv-btn" class="btn btn-secondary" title="Show QR code">
                                     <i class="fas fa-qrcode"></i>
+                                </button>
+                                <button type="button" id="scan-qr-npriv-btn" class="btn btn-secondary" title="Scan QR code">
+                                    <i class="fas fa-camera"></i>
                                 </button>
                             </div>
                         </div>

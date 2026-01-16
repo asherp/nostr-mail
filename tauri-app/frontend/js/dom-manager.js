@@ -115,6 +115,7 @@ class DOMManager {
             toggleEmailPasswordVisibilityBtn: this.getElement('toggle-email-password-visibility-btn'),
             qrNprivBtn: this.getElement('qr-npriv-btn'),
             qrNpubBtn: this.getElement('qr-npub-btn'),
+            scanQrNprivBtn: this.getElement('scan-qr-npriv-btn'),
         };
     }
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Nostr Mail",
+  "productName": "NostrMail",
   "version": "0.1.0",
   "identifier": "com.nostr.mail",
   "build": {
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Nostr Mail",
+        "title": "NostrMail",
         "width": 1280,
         "height": 900
       }

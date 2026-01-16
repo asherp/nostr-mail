@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">Nostr Mail</string>
-    <string name="main_activity_title">Nostr Mail</string>
+    <string name="app_name">NostrMail</string>
+    <string name="main_activity_title">NostrMail</string>
 </resources>

@@ -1,7 +1,7 @@
 @echo off
 REM Script to run the backend HTTP server and serve the frontend for browser development on Windows
 
-echo 🚀 Starting Nostr Mail Browser Development Mode
+echo 🚀 Starting NostrMail Browser Development Mode
 echo ================================================
 echo.
 
@@ -29,7 +29,7 @@ cargo build --bin http-server --release
 REM Start the HTTP server in a new window
 echo.
 echo 🌐 Starting HTTP server on http://127.0.0.1:1420...
-start "Nostr Mail HTTP Server" cmd /k "cargo run --bin http-server --release"
+start "NostrMail HTTP Server" cmd /k "cargo run --bin http-server --release"
 
 REM Wait a moment for the server to start
 timeout /t 3 /nobreak >nul

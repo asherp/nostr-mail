@@ -14,12 +14,16 @@ try {
 
 function NostrMailApp() {
     this.initialized = false;
+    this.mobileNavState = 'navbar'; // 'navbar' or 'page'
+    this.swipeStartX = null;
+    this.swipeStartY = null;
+    this.swipeThreshold = 50; // Minimum distance for swipe
 }
 
 // Initialize the application
 NostrMailApp.prototype.init = async function() {
     console.log('🚀 ========================================');
-    console.log('🚀   Nostr Mail - Starting Application');
+    console.log('🚀   NostrMail - Starting Application');
     console.log('🚀 ========================================');
     console.log('📧 Email + 🔐 Nostr Integration');
     console.log('🌐 Version: 1.0.0');
@@ -55,6 +59,9 @@ NostrMailApp.prototype.init = async function() {
         console.log('🎯 Setting up event listeners...');
         this.setupEventListeners();
         
+        console.log('📱 Initializing mobile navigation...');
+        this.initializeMobileNavigation();
+        
         console.log('📬 Loading initial data...');
         // Load contacts first so DM contacts can access cached profile photos
         await contactsService.loadContacts();
@@ -78,7 +85,7 @@ NostrMailApp.prototype.init = async function() {
         }
         
         console.log('✅ ========================================');
-        console.log('✅   Nostr Mail - Successfully Started!');
+        console.log('✅   NostrMail - Successfully Started!');
         console.log('✅ ========================================');
         console.log('🎉 Application is ready for use');
         console.log('📱 UI: Modern email client with Nostr integration');
@@ -88,7 +95,7 @@ NostrMailApp.prototype.init = async function() {
         this.initialized = true;
     } catch (error) {
         console.error('❌ ========================================');
-        console.error('❌   Nostr Mail - Startup Failed!');
+        console.error('❌   NostrMail - Startup Failed!');
         console.error('❌ ========================================');
         console.error('💥 Error during initialization:', error);
         console.error('❌ ========================================');
@@ -1838,6 +1845,198 @@ NostrMailApp.prototype.updateComposeButtons = function() {
 }
 
 // Tab switching
+// Check if device is mobile portrait mode
+NostrMailApp.prototype.isMobilePortrait = function() {
+    if (typeof window === 'undefined') return false;
+    
+    // Check width and orientation
+    const isPortrait = window.matchMedia('(max-width: 480px) and (orientation: portrait)').matches;
+    return isPortrait;
+}
+
+// Initialize mobile navigation
+NostrMailApp.prototype.initializeMobileNavigation = function() {
+    // Set initial state
+    if (this.isMobilePortrait()) {
+        this.showNavbar();
+    }
+    
+    // Listen for orientation/resize changes
+    window.addEventListener('resize', () => {
+        if (this.isMobilePortrait()) {
+            // Ensure navbar mode if switching to portrait
+            if (this.mobileNavState === 'page') {
+                // Don't force navbar, but update state
+                this.updateMobileNavState();
+            }
+        } else {
+            // Exit mobile nav mode on larger screens
+            const appContainer = document.querySelector('.app-container');
+            if (appContainer) {
+                appContainer.classList.remove('navbar-mode');
+            }
+            // Show all back buttons as hidden
+            const backButtons = document.querySelectorAll('.back-to-nav-btn');
+            backButtons.forEach(btn => btn.style.display = 'none');
+        }
+    });
+    
+    // Listen for orientation changes
+    window.addEventListener('orientationchange', () => {
+        setTimeout(() => {
+            if (this.isMobilePortrait()) {
+                this.updateMobileNavState();
+            }
+        }, 100);
+    });
+    
+    // Setup swipe gesture detection
+    this.setupSwipeGestures();
+    
+    // Setup back button handlers
+    this.setupBackButtons();
+}
+
+// Update mobile navigation state based on current view
+NostrMailApp.prototype.updateMobileNavState = function() {
+    const appContainer = document.querySelector('.app-container');
+    if (!appContainer) return;
+    
+    if (appContainer.classList.contains('navbar-mode')) {
+        this.mobileNavState = 'navbar';
+    } else {
+        this.mobileNavState = 'page';
+    }
+}
+
+// Show navbar (main page)
+NostrMailApp.prototype.showNavbar = function() {
+    if (!this.isMobilePortrait()) return;
+    
+    const appContainer = document.querySelector('.app-container');
+    if (!appContainer) return;
+    
+    appContainer.classList.add('navbar-mode');
+    this.mobileNavState = 'navbar';
+    
+    // Hide all back buttons
+    const backButtons = document.querySelectorAll('.back-to-nav-btn');
+    backButtons.forEach(btn => btn.style.display = 'none');
+    
+    // Remove active state from all nav items
+    const navItems = domManager.get('navItems');
+    if (navItems) {
+        navItems.forEach(item => item.classList.remove('active'));
+    }
+    
+    // Hide all tab contents
+    const tabContents = domManager.get('tabContents');
+    if (tabContents) {
+        tabContents.forEach(tab => tab.classList.remove('active'));
+    }
+}
+
+// Show a specific page
+NostrMailApp.prototype.showPage = function(tabName) {
+    if (!this.isMobilePortrait()) return;
+    
+    const appContainer = document.querySelector('.app-container');
+    if (!appContainer) return;
+    
+    // Remove navbar mode
+    appContainer.classList.remove('navbar-mode');
+    this.mobileNavState = 'page';
+    
+    // Show the selected tab
+    const tabContents = domManager.get('tabContents');
+    if (tabContents) {
+        tabContents.forEach(tab => {
+            tab.classList.remove('active');
+        });
+    }
+    
+    const newTab = document.getElementById(tabName);
+    if (newTab) {
+        newTab.classList.add('active');
+    }
+    
+    // Show back button for this tab
+    const backButton = newTab?.querySelector('.back-to-nav-btn');
+    if (backButton) {
+        backButton.style.display = 'flex';
+    }
+    
+    // Update nav item active state
+    const navItems = domManager.get('navItems');
+    if (navItems) {
+        navItems.forEach(item => {
+            item.classList.remove('active');
+            if (item.dataset.tab === tabName) {
+                item.classList.add('active');
+            }
+        });
+    }
+}
+
+// Setup swipe gesture detection
+NostrMailApp.prototype.setupSwipeGestures = function() {
+    const mainContent = document.querySelector('.main-content');
+    if (!mainContent) return;
+    
+    mainContent.addEventListener('touchstart', (e) => {
+        if (!this.isMobilePortrait() || this.mobileNavState !== 'page') return;
+        
+        const touch = e.touches[0];
+        this.swipeStartX = touch.clientX;
+        this.swipeStartY = touch.clientY;
+    }, { passive: true });
+    
+    mainContent.addEventListener('touchmove', (e) => {
+        if (!this.isMobilePortrait() || this.mobileNavState !== 'page' || !this.swipeStartX) return;
+        
+        const touch = e.touches[0];
+        const deltaX = touch.clientX - this.swipeStartX;
+        const deltaY = touch.clientY - this.swipeStartY;
+        
+        // Only handle horizontal swipes (swipe right)
+        if (Math.abs(deltaX) > Math.abs(deltaY) && deltaX > 0) {
+            // Swiping right - allow it
+            e.preventDefault();
+        }
+    }, { passive: false });
+    
+    mainContent.addEventListener('touchend', (e) => {
+        if (!this.isMobilePortrait() || this.mobileNavState !== 'page' || !this.swipeStartX) {
+            this.swipeStartX = null;
+            this.swipeStartY = null;
+            return;
+        }
+        
+        const touch = e.changedTouches[0];
+        const deltaX = touch.clientX - this.swipeStartX;
+        const deltaY = touch.clientY - this.swipeStartY;
+        
+        // Check if it's a right swipe (positive deltaX) and significant enough
+        if (deltaX > this.swipeThreshold && Math.abs(deltaX) > Math.abs(deltaY)) {
+            // Swipe right detected - return to navbar
+            this.showNavbar();
+        }
+        
+        this.swipeStartX = null;
+        this.swipeStartY = null;
+    }, { passive: true });
+}
+
+// Setup back button handlers
+NostrMailApp.prototype.setupBackButtons = function() {
+    const backButtons = document.querySelectorAll('.back-to-nav-btn');
+    backButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            this.showNavbar();
+        });
+    });
+}
+
 NostrMailApp.prototype.switchTab = function(tabName) {
     try {
         // Prevent switching if a sync/load operation is in progress
@@ -1847,33 +2046,54 @@ NostrMailApp.prototype.switchTab = function(tabName) {
             return; // Don't switch tabs while loading
         }
         
-        const tabContents = domManager.get('tabContents');
-        if (tabContents) {
-            tabContents.forEach(tab => {
-                tab.classList.remove('active');
-            });
-        }
-        
-        const newTab = document.getElementById(tabName);
-        if (newTab) {
-            newTab.classList.add('active');
-        }
-        
-        const navItems = domManager.get('navItems');
-        if (navItems) {
-            navItems.forEach(item => {
-                item.classList.remove('active');
-                if (item.dataset.tab === tabName) {
-                    item.classList.add('active');
-                }
-            });
+        // Handle mobile portrait navigation differently
+        if (this.isMobilePortrait()) {
+            // If in navbar mode, show the selected page
+            if (this.mobileNavState === 'navbar') {
+                this.showPage(tabName);
+            } else {
+                // Already on a page, switch to new page
+                this.showPage(tabName);
+            }
+        } else {
+            // Desktop/tablet mode - use standard tab switching
+            const tabContents = domManager.get('tabContents');
+            if (tabContents) {
+                tabContents.forEach(tab => {
+                    tab.classList.remove('active');
+                });
+            }
+            
+            const newTab = document.getElementById(tabName);
+            if (newTab) {
+                newTab.classList.add('active');
+            }
+            
+            const navItems = domManager.get('navItems');
+            if (navItems) {
+                navItems.forEach(item => {
+                    item.classList.remove('active');
+                    if (item.dataset.tab === tabName) {
+                        item.classList.add('active');
+                    }
+                });
+            }
         }
     } catch (error) {
         console.error('[JS] Error switching tabs:', error);
     }
 
     if (tabName === 'profile') {
-        this.loadProfile();
+        // Check if we're viewing another user's profile
+        const viewingPubkey = appState.getViewingProfilePubkey();
+        if (viewingPubkey) {
+            // Load the profile we're viewing
+            this.loadProfile(viewingPubkey);
+        } else {
+            // Load own profile and ensure viewing pubkey is cleared
+            appState.clearViewingProfilePubkey();
+            this.loadProfile();
+        }
     }
     if (tabName === 'settings') {
         this.loadRelaysFromDatabase();
@@ -2529,6 +2749,18 @@ NostrMailApp.prototype.setupQrCodeEventListeners = function() {
         });
     }
     qrNprivBtn = domManager.get('qrNprivBtn'); // update reference in case replaced
+    
+    // Setup scan QR code button for private key
+    const scanQrNprivBtn = domManager.get('scanQrNprivBtn');
+    if (scanQrNprivBtn && nprivKeyInput) {
+        const newScanQrNprivBtn = scanQrNprivBtn.cloneNode(true);
+        scanQrNprivBtn.parentNode.replaceChild(newScanQrNprivBtn, scanQrNprivBtn);
+        newScanQrNprivBtn.addEventListener('click', () => {
+            console.log('[QR] Scan private key QR button clicked');
+            this.scanPrivateKeyQRCode();
+        });
+    }
+    
     if (qrNpubBtn && publicKeyDisplayInput) {
         const newQrNpubBtn = qrNpubBtn.cloneNode(true);
         qrNpubBtn.parentNode.replaceChild(newQrNpubBtn, qrNpubBtn);
@@ -2552,6 +2784,165 @@ NostrMailApp.prototype.setupQrCodeEventListeners = function() {
             </div>
         `;
         window.app.showModal(title, modalContent);
+    }
+}
+
+// Scan QR code for private key
+NostrMailApp.prototype.scanPrivateKeyQRCode = async function() {
+    let html5QrCode = null;
+    let scannerStarted = false;
+    let isCleanedUp = false;
+    
+    const modalContent = `
+        <div id="qr-scanner-container" style="text-align:center;">
+            <p style="margin-bottom:15px;">Point your camera at the QR code</p>
+            <div id="qr-reader" style="width:100%;max-width:400px;margin:0 auto;"></div>
+            <div id="qr-scanner-error" style="display:none;color:#dc3545;margin-top:15px;"></div>
+            <div style="margin-top:20px;">
+                <button id="cancel-qr-scan-btn" class="btn btn-secondary">
+                    <i class="fas fa-times"></i> Cancel
+                </button>
+            </div>
+        </div>
+    `;
+    
+    window.app.showModal('Scan Private Key QR Code', modalContent);
+    
+    const cleanup = () => {
+        if (isCleanedUp) return;
+        isCleanedUp = true;
+        
+        if (html5QrCode && scannerStarted) {
+            try {
+                html5QrCode.stop().then(() => {
+                    html5QrCode.clear();
+                }).catch(err => {
+                    console.error('[QR] Error stopping scanner:', err);
+                });
+            } catch (err) {
+                console.error('[QR] Error during cleanup:', err);
+            }
+        }
+        html5QrCode = null;
+        scannerStarted = false;
+    };
+    
+    // Setup cancel button
+    const cancelBtn = document.getElementById('cancel-qr-scan-btn');
+    if (cancelBtn) {
+        cancelBtn.addEventListener('click', () => {
+            cleanup();
+            window.app.hideModal();
+        });
+    }
+    
+    // Check if Html5Qrcode is available
+    if (typeof Html5Qrcode === 'undefined') {
+        const errorDiv = document.getElementById('qr-scanner-error');
+        if (errorDiv) {
+            errorDiv.style.display = 'block';
+            errorDiv.textContent = 'QR scanner library not loaded. Please refresh the page.';
+        }
+        return;
+    }
+    
+    // Check camera availability
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        const errorDiv = document.getElementById('qr-scanner-error');
+        if (errorDiv) {
+            errorDiv.style.display = 'block';
+            errorDiv.textContent = 'Camera access is not available in this browser.';
+        }
+        return;
+    }
+    
+    try {
+        const qrReader = document.getElementById('qr-reader');
+        if (!qrReader) {
+            console.error('[QR] QR reader element not found');
+            return;
+        }
+        
+        html5QrCode = new Html5Qrcode('qr-reader');
+        
+        // Start scanning
+        await html5QrCode.start(
+            { facingMode: 'environment' }, // Use back camera on mobile
+            {
+                fps: 10,
+                qrbox: { width: 250, height: 250 }
+            },
+            (decodedText, decodedResult) => {
+                console.log('[QR] QR code scanned:', decodedText);
+                
+                // Validate the scanned text is a private key
+                const scannedKey = decodedText.trim();
+                if (!scannedKey.startsWith('npriv1') && !scannedKey.startsWith('nsec1')) {
+                    const errorDiv = document.getElementById('qr-scanner-error');
+                    if (errorDiv) {
+                        errorDiv.style.display = 'block';
+                        errorDiv.textContent = 'Invalid QR code: Not a valid private key format (should start with npriv1 or nsec1)';
+                    }
+                    return;
+                }
+                
+                // Populate the private key input field
+                const nprivKeyInput = domManager.get('nprivKey');
+                if (nprivKeyInput) {
+                    nprivKeyInput.value = scannedKey;
+                    // Trigger input event to update public key display
+                    nprivKeyInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    notificationService.showSuccess('Private key scanned successfully');
+                }
+                
+                // Cleanup and close modal
+                cleanup();
+                setTimeout(() => {
+                    window.app.hideModal();
+                }, 100);
+            },
+            (errorMessage) => {
+                // Ignore scanning errors (they're frequent during scanning)
+                // Only log if it's not a common "not found" error
+                if (!errorMessage.includes('No QR code found')) {
+                    console.log('[QR] Scanning:', errorMessage);
+                }
+            }
+        );
+        
+        scannerStarted = true;
+        
+    } catch (error) {
+        console.error('[QR] Error starting scanner:', error);
+        const errorDiv = document.getElementById('qr-scanner-error');
+        if (errorDiv) {
+            errorDiv.style.display = 'block';
+            if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+                errorDiv.textContent = 'Camera permission denied. Please allow camera access and try again.';
+            } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+                errorDiv.textContent = 'No camera found on this device.';
+            } else {
+                errorDiv.textContent = `Camera error: ${error.message || 'Unknown error'}`;
+            }
+        }
+        notificationService.showError('Failed to start camera');
+        cleanup();
+    }
+    
+    // Cleanup when modal is closed (if user clicks outside or ESC)
+    const modalOverlay = domManager.get('modalOverlay');
+    if (modalOverlay) {
+        const observer = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+                if (mutation.type === 'attributes' && mutation.attributeName === 'class') {
+                    if (modalOverlay.classList.contains('hidden')) {
+                        cleanup();
+                        observer.disconnect();
+                    }
+                }
+            });
+        });
+        observer.observe(modalOverlay, { attributes: true });
     }
 }
 
@@ -2927,15 +3318,30 @@ NostrMailApp.prototype.removeRelayById = async function(relayId, relayUrl) {
 // Track the last rendered profile pubkey
 NostrMailApp.prototype.lastRenderedProfilePubkey = null;
 
-NostrMailApp.prototype.loadProfile = async function() {
-    const currentPubkey = appState.getKeypair() && appState.getKeypair().public_key;
+NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
+    // Determine which pubkey to load
+    const targetPubkey = pubkey || (appState.getKeypair() && appState.getKeypair().public_key);
+    const currentUserPubkey = appState.getKeypair() && appState.getKeypair().public_key;
+    const isViewingOwnProfile = !pubkey || (targetPubkey === currentUserPubkey);
+    
+    // Store viewing mode
+    this.isViewingOwnProfile = isViewingOwnProfile;
+    this.viewingProfilePubkey = targetPubkey;
+    
+    // If viewing own profile, clear viewing pubkey from appState
+    if (isViewingOwnProfile) {
+        appState.clearViewingProfilePubkey();
+    } else {
+        appState.setViewingProfilePubkey(targetPubkey);
+    }
+    
     const profileSpinner = document.getElementById('profile-loading-spinner');
     const profileFieldsList = document.getElementById('profile-fields-list');
     const profilePicture = document.getElementById('profile-picture');
 
     // Only clear UI if switching pubkeys
-    if (this.lastRenderedProfilePubkey !== null && this.lastRenderedProfilePubkey !== currentPubkey) {
-        console.log('[Profile] Switching pubkey from', this.lastRenderedProfilePubkey, 'to', currentPubkey, '- clearing UI and showing spinner');
+    if (this.lastRenderedProfilePubkey !== null && this.lastRenderedProfilePubkey !== targetPubkey) {
+        console.log('[Profile] Switching pubkey from', this.lastRenderedProfilePubkey, 'to', targetPubkey, '- clearing UI and showing spinner');
         if (profileFieldsList) profileFieldsList.innerHTML = '';
         if (profilePicture) {
             profilePicture.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
@@ -2949,16 +3355,20 @@ NostrMailApp.prototype.loadProfile = async function() {
     let cachedPictureDataUrl = null;
     try {
         const cached = localStorage.getItem('nostr_mail_profiles');
-        if (cached && currentPubkey) {
+        if (cached && targetPubkey) {
             const profileDict = JSON.parse(cached);
-            cachedProfile = profileDict[currentPubkey];
-            cachedPictureDataUrl = localStorage.getItem('nostr_mail_profile_picture');
+            cachedProfile = profileDict[targetPubkey];
+            
+            // Get cached picture for this specific pubkey
+            if (isViewingOwnProfile) {
+                cachedPictureDataUrl = localStorage.getItem('nostr_mail_profile_picture');
+            }
             
             // Also check database cache for picture (faster and more reliable)
-            if (!cachedPictureDataUrl && currentPubkey) {
+            if (!cachedPictureDataUrl && targetPubkey) {
                 try {
-                    cachedPictureDataUrl = await TauriService.getCachedProfileImage(currentPubkey);
-                    if (cachedPictureDataUrl) {
+                    cachedPictureDataUrl = await TauriService.getCachedProfileImage(targetPubkey);
+                    if (cachedPictureDataUrl && isViewingOwnProfile) {
                         localStorage.setItem('nostr_mail_profile_picture', cachedPictureDataUrl);
                     }
                 } catch (e) {
@@ -2967,20 +3377,20 @@ NostrMailApp.prototype.loadProfile = async function() {
             }
             
             if (cachedProfile) {
-                console.log('[Profile] Rendering cached profile for pubkey', currentPubkey);
+                console.log('[Profile] Rendering cached profile for pubkey', targetPubkey);
                 if (profileSpinner) profileSpinner.style.display = 'none';
-                this.renderProfileFromObject(cachedProfile, cachedPictureDataUrl);
+                this.renderProfileFromObject(cachedProfile, cachedPictureDataUrl, isViewingOwnProfile);
             } else {
-                console.log('[Profile] No cached profile found for pubkey', currentPubkey);
+                console.log('[Profile] No cached profile found for pubkey', targetPubkey);
             }
         } else {
-            console.log('[Profile] No cached profiles in localStorage or no current pubkey');
+            console.log('[Profile] No cached profiles in localStorage or no target pubkey');
         }
     } catch (e) {
         console.warn('[Profile] Error loading cached profile:', e);
     }
 
-    if (!appState.hasKeypair() || !appState.getKeypair().public_key) {
+    if (!targetPubkey) {
         if (profileSpinner) profileSpinner.style.display = 'none';
         console.log('No public key available to fetch profile.');
         this.renderProfilePubkey();
@@ -3011,7 +3421,7 @@ NostrMailApp.prototype.loadProfile = async function() {
 
     try {
         // Use persistent client for better performance (reuses existing connections)
-        const profile = await TauriService.fetchProfilePersistent(appState.getKeypair().public_key);
+        const profile = await TauriService.fetchProfilePersistent(targetPubkey);
 
         if (profile) {
             // Remove "no profile" message if it exists
@@ -3025,36 +3435,37 @@ NostrMailApp.prototype.loadProfile = async function() {
             
             // Render profile immediately (fields and avatar URL)
             // This allows the browser to start loading the image while we fetch/cache the data URL
-            this.renderProfileFromObject(profile, null);
+            this.renderProfileFromObject(profile, null, isViewingOwnProfile);
             
             // If there's a picture URL, fetch and cache it in the background
             if (profile.fields && profile.fields.picture) {
                 const pictureUrl = profile.fields.picture;
-                const currentPubkey = appState.getKeypair().public_key;
                 
                 // Fetch and cache in background (don't block rendering)
                 (async () => {
                     try {
                         // Check database cache first (fast)
-                        let dataUrl = await TauriService.getCachedProfileImage(currentPubkey);
+                        let dataUrl = await TauriService.getCachedProfileImage(targetPubkey);
                         
                         // If not in cache, fetch it
                         if (!dataUrl) {
                             dataUrl = await TauriService.fetchImage(pictureUrl);
                             if (dataUrl) {
                                 // Cache it for next time
-                                await TauriService.cacheProfileImage(currentPubkey, dataUrl);
+                                await TauriService.cacheProfileImage(targetPubkey, dataUrl);
                             }
                         }
                         
                         // Update avatar with cached/fetched data URL if available
                         if (dataUrl) {
-                            localStorage.setItem('nostr_mail_profile_picture', dataUrl);
+                            if (isViewingOwnProfile) {
+                                localStorage.setItem('nostr_mail_profile_picture', dataUrl);
+                            }
                             const profilePicture = document.getElementById('profile-picture');
                             if (profilePicture && profilePicture.src !== dataUrl) {
-                                // Only update if still showing the same profile (check current pubkey)
-                                const currentlyDisplayedPubkey = appState.getKeypair()?.public_key;
-                                if (currentlyDisplayedPubkey === currentPubkey) {
+                                // Only update if still showing the same profile (check target pubkey)
+                                const currentlyDisplayedPubkey = this.viewingProfilePubkey;
+                                if (currentlyDisplayedPubkey === targetPubkey) {
                                     profilePicture.src = dataUrl;
                                     console.log('[Profile] Updated avatar with cached/fetched data URL');
                                 } else {
@@ -3067,49 +3478,58 @@ NostrMailApp.prototype.loadProfile = async function() {
                         // Avatar already rendered with URL, so this is fine
                     }
                 })();
-            } else {
+            } else if (isViewingOwnProfile) {
                 localStorage.removeItem('nostr_mail_profile_picture');
             }
             // Cache the profile in localStorage
-            const pubkey = appState.getKeypair() && appState.getKeypair().public_key;
-            if (pubkey) {
+            if (targetPubkey) {
                 let profileDict = {};
                 const cached = localStorage.getItem('nostr_mail_profiles');
                 if (cached) {
                     profileDict = JSON.parse(cached);
                 }
-                profileDict[pubkey] = profile;
+                profileDict[targetPubkey] = profile;
                 localStorage.setItem('nostr_mail_profiles', JSON.stringify(profileDict));
             }
             if (profileSpinner) profileSpinner.style.display = 'none';
         } else {
-            console.log('[Profile] No profile found - rendering empty form for user to create profile');
-            if (profileSpinner) profileSpinner.style.display = 'none';
-            // Show placeholder fields and picture so the user can create a new profile
-            const emptyFields = {};
-            PROFILE_FIELD_ORDER.forEach(key => { emptyFields[key] = ''; });
-            const emptyProfile = {
-                pubkey: appState.getKeypair().public_key,
-                fields: emptyFields
-            };
-            console.log('[Profile] Rendering empty profile with fields:', Object.keys(emptyFields));
-            this.renderProfileFromObject(emptyProfile, null);
-            
-            // Show helpful message when no profile exists
-            const profileFieldsList = document.getElementById('profile-fields-list');
-            if (profileFieldsList) {
-                // Check if message already exists to avoid duplicates
-                let existingMessage = profileFieldsList.querySelector('.profile-empty-message');
-                if (!existingMessage) {
-                    existingMessage = document.createElement('div');
-                    existingMessage.className = 'profile-empty-message';
-                    existingMessage.style.cssText = 'background: #e3f2fd; border-left: 4px solid #2196f3; padding: 12px; margin-bottom: 16px; border-radius: 4px;';
-                    existingMessage.innerHTML = '<strong>No profile found.</strong> Fill in the fields below and click "Update Profile" to create your Nostr profile.';
-                    profileFieldsList.insertBefore(existingMessage, profileFieldsList.firstChild);
+            if (isViewingOwnProfile) {
+                console.log('[Profile] No profile found - rendering empty form for user to create profile');
+                if (profileSpinner) profileSpinner.style.display = 'none';
+                // Show placeholder fields and picture so the user can create a new profile
+                const emptyFields = {};
+                PROFILE_FIELD_ORDER.forEach(key => { emptyFields[key] = ''; });
+                const emptyProfile = {
+                    pubkey: targetPubkey,
+                    fields: emptyFields
+                };
+                console.log('[Profile] Rendering empty profile with fields:', Object.keys(emptyFields));
+                this.renderProfileFromObject(emptyProfile, null, true);
+                
+                // Show helpful message when no profile exists
+                const profileFieldsList = document.getElementById('profile-fields-list');
+                if (profileFieldsList) {
+                    // Check if message already exists to avoid duplicates
+                    let existingMessage = profileFieldsList.querySelector('.profile-empty-message');
+                    if (!existingMessage) {
+                        existingMessage = document.createElement('div');
+                        existingMessage.className = 'profile-empty-message';
+                        existingMessage.style.cssText = 'background: #e3f2fd; border-left: 4px solid #2196f3; padding: 12px; margin-bottom: 16px; border-radius: 4px;';
+                        existingMessage.innerHTML = '<strong>No profile found.</strong> Fill in the fields below and click "Update Profile" to create your Nostr profile.';
+                        profileFieldsList.insertBefore(existingMessage, profileFieldsList.firstChild);
+                    }
+                }
+            } else {
+                // Viewing other user's profile but no profile found
+                if (profileSpinner) profileSpinner.style.display = 'none';
+                const profileFieldsList = document.getElementById('profile-fields-list');
+                if (profileFieldsList) {
+                    profileFieldsList.innerHTML = '<div class="text-muted">No profile found for this user.</div>';
                 }
             }
         }
-        this.renderProfilePubkey();
+        this.renderProfilePubkey(targetPubkey);
+        this.updateProfileUI(isViewingOwnProfile, profile);
         if (Utils.isDevMode()) {
             const rawJsonBox = document.getElementById('profile-raw-json');
             if (rawJsonBox) {
@@ -3119,7 +3539,7 @@ NostrMailApp.prototype.loadProfile = async function() {
                 } else if (profile && profile.fields) {
                     rawJsonBox.value = JSON.stringify(profile.fields, null, 2);
                 } else {
-                    rawJsonBox.value = 'No profile found. This is normal for a new keypair. Fill in the fields above to create your profile.';
+                    rawJsonBox.value = 'No profile found.';
                 }
             }
         }
@@ -3127,7 +3547,8 @@ NostrMailApp.prototype.loadProfile = async function() {
         if (profileSpinner) profileSpinner.style.display = 'none';
         console.error('Failed to fetch profile:', error);
         notificationService.showError('Could not fetch profile from relays.');
-        this.renderProfilePubkey();
+        this.renderProfilePubkey(targetPubkey);
+        this.updateProfileUI(isViewingOwnProfile, null);
         if (Utils.isDevMode()) {
             const rawJsonBox = document.getElementById('profile-raw-json');
             if (rawJsonBox) {
@@ -3137,7 +3558,7 @@ NostrMailApp.prototype.loadProfile = async function() {
         }
     }
     // After rendering a profile (cached or fetched), update the last rendered pubkey
-    this.lastRenderedProfilePubkey = currentPubkey;
+    this.lastRenderedProfilePubkey = targetPubkey;
 }
 
 NostrMailApp.prototype.refreshProfile = async function() {
@@ -3193,7 +3614,8 @@ NostrMailApp.prototype.refreshProfile = async function() {
         }
         
         // Force refresh by calling loadProfile (which will fetch from network since cache is cleared)
-        await this.loadProfile();
+        const viewingPubkey = appState.getViewingProfilePubkey();
+        await this.loadProfile(viewingPubkey || null);
         
         notificationService.showSuccess('Profile synced from network');
     } catch (error) {
@@ -3209,19 +3631,140 @@ NostrMailApp.prototype.refreshProfile = async function() {
     }
 }
 
-NostrMailApp.prototype.renderProfilePubkey = function() {
+NostrMailApp.prototype.renderProfilePubkey = function(pubkey = null) {
     const pubkeyDiv = document.getElementById('profile-pubkey');
-    if (pubkeyDiv && appState.hasKeypair() && appState.getKeypair().public_key) {
-        pubkeyDiv.textContent = `Your npub: ${appState.getKeypair().public_key}`;
-    } else if (pubkeyDiv) {
+    if (!pubkeyDiv) return;
+    
+    const targetPubkey = pubkey || (appState.hasKeypair() && appState.getKeypair().public_key);
+    if (targetPubkey) {
+        const isOwnProfile = !pubkey || (pubkey === appState.getKeypair()?.public_key);
+        pubkeyDiv.textContent = isOwnProfile 
+            ? `Your npub: ${targetPubkey}` 
+            : `npub: ${targetPubkey}`;
+    } else {
         pubkeyDiv.textContent = '';
+    }
+}
+
+// Update profile UI based on viewing mode
+NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) {
+    const updateBtn = document.getElementById('update-profile-btn');
+    const profileForm = document.getElementById('profile-fields-form');
+    const profileHeader = document.querySelector('#profile .tab-header h2');
+    const profileActions = document.querySelector('#profile .profile-actions');
+    
+    // Show/hide update button
+    if (updateBtn) {
+        updateBtn.style.display = isViewingOwnProfile ? 'block' : 'none';
+    }
+    
+    // Disable form submission when viewing other users
+    if (profileForm) {
+        if (isViewingOwnProfile) {
+            profileForm.onsubmit = (e) => {
+                e.preventDefault();
+                this.updateProfile();
+            };
+        } else {
+            profileForm.onsubmit = (e) => {
+                e.preventDefault();
+                return false;
+            };
+        }
+    }
+    
+    // Update header title
+    if (profileHeader) {
+        if (isViewingOwnProfile) {
+            profileHeader.textContent = 'Profile';
+        } else {
+            // Get contact name if available
+            const contacts = appState.getContacts() || [];
+            const contact = contacts.find(c => c.pubkey === this.viewingProfilePubkey);
+            const name = contact?.name || profile?.fields?.name || profile?.fields?.display_name || 'Contact Profile';
+            profileHeader.textContent = name;
+        }
+    }
+    
+    // Add action buttons when viewing other users
+    if (!isViewingOwnProfile && profileActions) {
+        // Remove existing action buttons container if it exists
+        let actionButtonsContainer = document.getElementById('profile-view-actions');
+        if (actionButtonsContainer) {
+            actionButtonsContainer.remove();
+        }
+        
+        // Create action buttons container
+        actionButtonsContainer = document.createElement('div');
+        actionButtonsContainer.id = 'profile-view-actions';
+        actionButtonsContainer.style.display = 'flex';
+        actionButtonsContainer.style.gap = '10px';
+        actionButtonsContainer.style.flexWrap = 'wrap';
+        
+        const contactPubkey = this.viewingProfilePubkey;
+        const contacts = appState.getContacts() || [];
+        const contact = contacts.find(c => c.pubkey === contactPubkey);
+        const email = contact?.email || profile?.fields?.email;
+        
+        // Send DM button
+        const sendDmBtn = document.createElement('button');
+        sendDmBtn.className = 'btn btn-primary';
+        sendDmBtn.innerHTML = '<i class="fas fa-comments"></i> Send DM';
+        sendDmBtn.onclick = () => {
+            if (window.contactsService && typeof window.contactsService.sendDirectMessageToContact === 'function') {
+                window.contactsService.sendDirectMessageToContact(contactPubkey);
+            }
+        };
+        actionButtonsContainer.appendChild(sendDmBtn);
+        
+        // Send Email button (if email exists)
+        if (email) {
+            const sendEmailBtn = document.createElement('button');
+            sendEmailBtn.className = 'btn btn-secondary';
+            sendEmailBtn.innerHTML = '<i class="fas fa-envelope"></i> Send Email';
+            sendEmailBtn.onclick = () => {
+                if (window.contactsService && typeof window.contactsService.sendEmailToContact === 'function') {
+                    window.contactsService.sendEmailToContact(email);
+                }
+            };
+            actionButtonsContainer.appendChild(sendEmailBtn);
+        }
+        
+        // Copy Public Key button
+        const copyPubkeyBtn = document.createElement('button');
+        copyPubkeyBtn.className = 'btn btn-secondary';
+        copyPubkeyBtn.innerHTML = '<i class="fas fa-copy"></i> Copy Public Key';
+        copyPubkeyBtn.onclick = () => {
+            if (window.contactsService && typeof window.contactsService.copyContactPubkey === 'function') {
+                window.contactsService.copyContactPubkey(contactPubkey);
+            }
+        };
+        actionButtonsContainer.appendChild(copyPubkeyBtn);
+        
+        // Insert after form actions
+        const formActions = document.querySelector('#profile .form-actions');
+        if (formActions) {
+            formActions.appendChild(actionButtonsContainer);
+        } else {
+            // If form-actions doesn't exist, append to profile-form
+            const profileForm = document.querySelector('#profile .profile-form');
+            if (profileForm) {
+                profileForm.appendChild(actionButtonsContainer);
+            }
+        }
+    } else if (isViewingOwnProfile) {
+        // Remove action buttons container when viewing own profile
+        const actionButtonsContainer = document.getElementById('profile-view-actions');
+        if (actionButtonsContainer) {
+            actionButtonsContainer.remove();
+        }
     }
 }
 
 // Store the current editable fields in memory
 NostrMailApp.prototype.editableProfileFields = {};
 
-NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPictureDataUrl) {
+NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPictureDataUrl, isViewingOwnProfile = true) {
     // Build editable fields from profile.fields, always include email
     // Ensure all fields from the profile are included, even if not in standard order
     this.editableProfileFields = { ...(profile && profile.fields ? profile.fields : {}) };
@@ -3229,9 +3772,11 @@ NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPicture
     if (!('email' in this.editableProfileFields)) {
         this.editableProfileFields.email = '';
     }
-    this.renderProfileFieldsList(this.editableProfileFields);
-    // Show warning if profile email and settings email differ
-    this.renderProfileEmailWarning();
+    this.renderProfileFieldsList(this.editableProfileFields, isViewingOwnProfile);
+    // Show warning if profile email and settings email differ (only for own profile)
+    if (isViewingOwnProfile) {
+        this.renderProfileEmailWarning();
+    }
 
     // Show profile picture if present, otherwise show a placeholder
     const profilePicture = document.getElementById('profile-picture');
@@ -3290,7 +3835,7 @@ const PROFILE_FIELD_ORDER = [
     'nip05',
 ];
 
-NostrMailApp.prototype.renderProfileFieldsList = function(fields) {
+NostrMailApp.prototype.renderProfileFieldsList = function(fields, isViewingOwnProfile = true) {
     const listDiv = document.getElementById('profile-fields-list');
     if (!listDiv) return;
     
@@ -3304,7 +3849,7 @@ NostrMailApp.prototype.renderProfileFieldsList = function(fields) {
     // Use the top-level constant for field order
     for (const key of PROFILE_FIELD_ORDER) {
         if (fields.hasOwnProperty(key)) {
-            this._renderProfileFieldItem(listDiv, key, fields[key]);
+            this._renderProfileFieldItem(listDiv, key, fields[key], isViewingOwnProfile);
         }
     }
 
@@ -3313,62 +3858,94 @@ NostrMailApp.prototype.renderProfileFieldsList = function(fields) {
         .filter(key => !PROFILE_FIELD_ORDER.includes(key))
         .sort();
     for (const key of customKeys) {
-        this._renderProfileFieldItem(listDiv, key, fields[key]);
+        this._renderProfileFieldItem(listDiv, key, fields[key], isViewingOwnProfile);
     }
 
-    // Add real-time warning update for email field
-    const emailInput = document.getElementById('profile-field-email');
-    if (emailInput) {
-        emailInput.addEventListener('input', () => {
-            this.editableProfileFields.email = emailInput.value;
-            this.renderProfileEmailWarning();
-        });
+    // Add real-time warning update for email field (only for own profile)
+    if (isViewingOwnProfile) {
+        const emailInput = document.getElementById('profile-field-email');
+        if (emailInput) {
+            emailInput.addEventListener('input', () => {
+                this.editableProfileFields.email = emailInput.value;
+                this.renderProfileEmailWarning();
+            });
+        }
     }
 }
 
 // Helper to render a single field item
-NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value) {
+NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value, isViewingOwnProfile = true) {
     const fieldDiv = document.createElement('div');
     fieldDiv.className = 'form-group profile-field-item';
     const label = document.createElement('label');
     label.textContent = key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, ' ') + ':';
     label.setAttribute('for', `profile-field-${key}`);
-    let input;
-    if (key === 'about') {
-        input = document.createElement('textarea');
-        input.rows = 3;
-    } else if (key === 'picture') {
-        input = document.createElement('input');
-        input.type = 'url';
-        input.placeholder = 'https://example.com/avatar.png';
-    } else if (typeof value === 'string' && value.length > 60) {
-        input = document.createElement('textarea');
-        input.rows = 3;
-    } else {
-        input = document.createElement('input');
-        input.type = key === 'email' ? 'email' : 'text';
-    }
-    input.id = `profile-field-${key}`;
-    input.value = value ?? '';
-    input.dataset.key = key;
-    input.className = 'profile-field-input';
-    input.addEventListener('input', (e) => {
-        this.editableProfileFields[key] = e.target.value;
-    });
-    fieldDiv.appendChild(label);
-    fieldDiv.appendChild(input);
-    // Remove button for custom fields (not for standard ones)
-    if (!['display_name','about','email','nip05','picture','banner','lud16','name'].includes(key)) {
-        const removeBtn = document.createElement('button');
-        removeBtn.type = 'button';
-        removeBtn.className = 'btn btn-danger btn-small';
-        removeBtn.innerHTML = '<i class="fas fa-trash"></i>';
-        removeBtn.title = 'Remove field';
-        removeBtn.addEventListener('click', () => {
-            delete this.editableProfileFields[key];
-            this.renderProfileFieldsList(this.editableProfileFields);
+    
+    if (isViewingOwnProfile) {
+        // Editable mode - create input/textarea
+        let input;
+        if (key === 'about') {
+            input = document.createElement('textarea');
+            input.rows = 3;
+        } else if (key === 'picture') {
+            input = document.createElement('input');
+            input.type = 'url';
+            input.placeholder = 'https://example.com/avatar.png';
+        } else if (typeof value === 'string' && value.length > 60) {
+            input = document.createElement('textarea');
+            input.rows = 3;
+        } else {
+            input = document.createElement('input');
+            input.type = key === 'email' ? 'email' : 'text';
+        }
+        input.id = `profile-field-${key}`;
+        input.value = value ?? '';
+        input.dataset.key = key;
+        input.className = 'profile-field-input';
+        input.addEventListener('input', (e) => {
+            this.editableProfileFields[key] = e.target.value;
         });
-        fieldDiv.appendChild(removeBtn);
+        fieldDiv.appendChild(label);
+        fieldDiv.appendChild(input);
+        // Remove button for custom fields (not for standard ones)
+        if (!['display_name','about','email','nip05','picture','banner','lud16','name'].includes(key)) {
+            const removeBtn = document.createElement('button');
+            removeBtn.type = 'button';
+            removeBtn.className = 'btn btn-danger btn-small';
+            removeBtn.innerHTML = '<i class="fas fa-trash"></i>';
+            removeBtn.title = 'Remove field';
+            removeBtn.addEventListener('click', () => {
+                delete this.editableProfileFields[key];
+                this.renderProfileFieldsList(this.editableProfileFields, true);
+            });
+            fieldDiv.appendChild(removeBtn);
+        }
+    } else {
+        // Read-only mode - create display div
+        const valueDiv = document.createElement('div');
+        valueDiv.className = 'profile-field-value';
+        valueDiv.id = `profile-field-${key}`;
+        if (key === 'email' && value) {
+            const emailLink = document.createElement('a');
+            emailLink.href = `mailto:${value}`;
+            emailLink.textContent = value;
+            valueDiv.appendChild(emailLink);
+        } else if (key === 'picture' && value) {
+            // For picture, show as link
+            const pictureLink = document.createElement('a');
+            pictureLink.href = value;
+            pictureLink.target = '_blank';
+            pictureLink.rel = 'noopener noreferrer';
+            pictureLink.textContent = value;
+            valueDiv.appendChild(pictureLink);
+        } else if (value) {
+            valueDiv.textContent = value;
+        } else {
+            valueDiv.textContent = '-';
+            valueDiv.style.color = '#999';
+        }
+        fieldDiv.appendChild(label);
+        fieldDiv.appendChild(valueDiv);
     }
     listDiv.appendChild(fieldDiv);
 }
@@ -3791,7 +4368,7 @@ NostrMailApp.prototype.initializeSettingsAccordion = function() {
 // Initialize when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
     window.domManager = new DOMManager();
-    console.log('🌐 DOM loaded - Initializing Nostr Mail interface...');
+    console.log('🌐 DOM loaded - Initializing NostrMail interface...');
     
     // Set initial dark mode from localStorage
     const darkPref = localStorage.getItem('darkMode');

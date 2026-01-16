@@ -1,4 +1,4 @@
-// HTTP Server for Nostr Mail Backend
+// HTTP Server for NostrMail Backend
 // This allows the frontend to run in a browser and communicate with the backend via HTTP
 
 use axum::{
@@ -250,7 +250,7 @@ async fn health_check() -> Json<serde_json::Value> {
 
 #[tokio::main]
 async fn main() {
-    println!("[HTTP] Starting Nostr Mail HTTP Server...");
+    println!("[HTTP] Starting NostrMail HTTP Server...");
     
     // Initialize app state
     let app_state = init_app_state().await;

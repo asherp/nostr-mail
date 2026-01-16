@@ -13,7 +13,7 @@ if [ ! -d "$FRONTEND_DIR" ]; then
     exit 1
 fi
 
-echo "🚀 Serving Nostr Mail frontend..."
+echo "🚀 Serving NostrMail frontend..."
 echo "📁 Directory: $(pwd)/$FRONTEND_DIR"
 echo "🌐 URL: http://localhost:$PORT"
 echo ""

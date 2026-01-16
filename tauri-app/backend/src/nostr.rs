@@ -442,34 +442,90 @@ pub fn decrypt_dm_content(
     sender_pubkey: &str,
     encrypted_content: &str,
 ) -> Result<String> {
-    let secret_key = SecretKey::from_bech32(private_key)?;
-    let sender = parse_pubkey(sender_pubkey)?;
+    println!("[DM DECRYPT] Starting decryption attempt");
+    println!("[DM DECRYPT] Sender pubkey: {}", sender_pubkey);
+    println!("[DM DECRYPT] Content length: {} bytes", encrypted_content.len());
+    println!("[DM DECRYPT] Content sample (first 100 chars): {}", &encrypted_content[..encrypted_content.len().min(100)]);
+    println!("[DM DECRYPT] Contains '?iv=': {}", encrypted_content.contains("?iv="));
+    println!("[DM DECRYPT] Content looks like base64: {}", encrypted_content.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '?'));
+    
+    let secret_key = SecretKey::from_bech32(private_key).map_err(|e| {
+        println!("[DM DECRYPT] Failed to parse private key: {:?}", e);
+        anyhow::anyhow!("Failed to parse private key: {:?}", e)
+    })?;
+    let sender = parse_pubkey(sender_pubkey).map_err(|e| {
+        println!("[DM DECRYPT] Failed to parse sender pubkey: {:?}", e);
+        anyhow::anyhow!("Failed to parse sender pubkey: {:?}", e)
+    })?;
     
     // Try NIP-44 first (newer standard)
-    if let Ok(decrypted) = nip44::decrypt(&secret_key, &sender, encrypted_content) {
-        return Ok(decrypted);
-    }
-    
-    // Try NIP-04 format: base64(encrypted_content)?iv=base64(iv)
-    if encrypted_content.contains("?iv=") {
-        println!("[NOSTR] Attempting NIP-04 decryption");
-        println!("[NOSTR] Encrypted content: {}", encrypted_content);
-        
-        // Use the actual NIP-04 decryption from nostr-sdk
-        match nip04::decrypt(&secret_key, &sender, encrypted_content) {
-            Ok(decrypted) => {
-                println!("[NOSTR] NIP-04 decryption successful");
-                return Ok(decrypted);
-            }
-            Err(e) => {
-                println!("[NOSTR] NIP-04 decryption failed: {:?}", e);
-                return Err(anyhow::anyhow!("NIP-04 decryption failed: {:?}", e));
+    println!("[DM DECRYPT] Attempting NIP-44 decryption...");
+    match nip44::decrypt(&secret_key, &sender, encrypted_content) {
+        Ok(decrypted) => {
+            println!("[DM DECRYPT] NIP-44 decryption successful! Decrypted length: {} chars", decrypted.len());
+            println!("[DM DECRYPT] Decrypted content sample: {}", &decrypted.chars().take(80).collect::<String>());
+            return Ok(decrypted);
+        }
+        Err(e) => {
+            println!("[DM DECRYPT] NIP-44 decryption failed: {:?}", e);
+            println!("[DM DECRYPT] NIP-44 error type: {}", e);
+            // Check if it's an InvalidHmac error - this might indicate it's actually NIP-04 format
+            let error_str = format!("{:?}", e);
+            if error_str.contains("InvalidHmac") {
+                println!("[DM DECRYPT] NIP-44 InvalidHmac error detected - content might be NIP-04 format");
             }
         }
     }
     
-    // If both fail, return error
-    Err(anyhow::anyhow!("Failed to decrypt with both NIP-04 and NIP-44"))
+    // Try NIP-04 format: base64(encrypted_content)?iv=base64(iv)
+    // Note: Standard NIP-04 requires "?iv=" separator, but we'll try anyway if NIP-44 failed
+    // This handles cases where content might be NIP-04 stored incorrectly
+    let is_nip04_format = encrypted_content.contains("?iv=");
+    println!("[DM DECRYPT] Attempting NIP-04 decryption (has '?iv=' separator: {})", is_nip04_format);
+    if !is_nip04_format {
+        println!("[DM DECRYPT] Warning: Content does not contain '?iv=' separator, but attempting NIP-04 anyway");
+        println!("[DM DECRYPT] This may fail if content is not NIP-04 format");
+    }
+    println!("[DM DECRYPT] Full encrypted content: {}", encrypted_content);
+    
+    match nip04::decrypt(&secret_key, &sender, encrypted_content) {
+        Ok(decrypted) => {
+            println!("[DM DECRYPT] NIP-04 decryption successful! Decrypted length: {} chars", decrypted.len());
+            println!("[DM DECRYPT] Decrypted content sample: {}", &decrypted.chars().take(80).collect::<String>());
+            return Ok(decrypted);
+        }
+        Err(e) => {
+            println!("[DM DECRYPT] NIP-04 decryption failed: {:?}", e);
+            println!("[DM DECRYPT] NIP-04 error details: {}", e);
+            if !is_nip04_format {
+                println!("[DM DECRYPT] NIP-04 failed as expected (content missing '?iv=' separator)");
+            }
+        }
+    }
+    
+    // If both fail, return error with detailed information
+    println!("[DM DECRYPT] Both NIP-44 and NIP-04 decryption attempts failed");
+    println!("[DM DECRYPT] Final content analysis:");
+    println!("[DM DECRYPT]   - Length: {} bytes", encrypted_content.len());
+    println!("[DM DECRYPT]   - Has '?iv=': {}", encrypted_content.contains("?iv="));
+    println!("[DM DECRYPT]   - First 50 chars: {}", &encrypted_content[..encrypted_content.len().min(50)]);
+    println!("[DM DECRYPT]   - Last 50 chars: {}", &encrypted_content[encrypted_content.len().saturating_sub(50)..]);
+    
+    // Additional diagnostics for InvalidHmac errors
+    println!("[DM DECRYPT] Diagnostic information:");
+    println!("[DM DECRYPT]   - Content is base64-like: {}", encrypted_content.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+    println!("[DM DECRYPT]   - Content length matches typical NIP-44 (132 bytes): {}", encrypted_content.len() == 132);
+    println!("[DM DECRYPT]   - NIP-44 error was InvalidHmac, suggesting:");
+    println!("[DM DECRYPT]     * Content format is correct but HMAC validation failed");
+    println!("[DM DECRYPT]     * Possible causes: corruption, wrong keys, or different encryption");
+    println!("[DM DECRYPT]   - NIP-04 error was InvalidContentFormat (missing '?iv=' separator)");
+    println!("[DM DECRYPT]   - Conclusion: Content appears to be NIP-44 format but HMAC check failed");
+    println!("[DM DECRYPT]   - This could indicate:");
+    println!("[DM DECRYPT]     1. Content was corrupted during storage/transmission");
+    println!("[DM DECRYPT]     2. Content was encrypted with different keys");
+    println!("[DM DECRYPT]     3. Content is from a different encryption implementation");
+    
+    Err(anyhow::anyhow!("Failed to decrypt with both NIP-04 and NIP-44. Content length: {}, Has '?iv=': {}, NIP-44 error: InvalidHmac (HMAC validation failed)", encrypted_content.len(), encrypted_content.contains("?iv=")))
 }
 
 pub async fn fetch_following_profiles(

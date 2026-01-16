@@ -11,6 +11,10 @@
 class DMService {
     constructor() {
         this.searchTimeout = null;
+        this.dmNavState = 'list'; // 'list' or 'conversation'
+        this.swipeStartX = null;
+        this.swipeStartY = null;
+        this.swipeThreshold = 50; // Minimum distance for swipe
     }
 
     // Load DM contacts from backend and network
@@ -86,6 +90,78 @@ class DMService {
         // 6. Set and render contacts
         window.appState.setDmContacts(dmContacts);
         this.renderDmContacts();
+        
+        // 7. Initialize navigation state
+        this.initializeDmNavigation();
+    }
+    
+    // Initialize DM navigation
+    initializeDmNavigation() {
+        const dmContainer = document.querySelector('.dm-container');
+        if (!dmContainer) return;
+        
+        // Always set initial state to list view
+        dmContainer.classList.remove('dm-conversation-view');
+        dmContainer.classList.add('dm-list-view');
+        this.dmNavState = 'list';
+        
+        // Hide back button if it exists
+        const backButton = document.querySelector('.dm-back-to-list-btn');
+        if (backButton) {
+            backButton.style.display = 'none';
+        }
+        
+        // Setup swipe gesture detection
+        this.setupDmSwipeGestures();
+    }
+    
+    // Setup swipe gesture detection for DM conversations
+    setupDmSwipeGestures() {
+        const dmConversationPanel = document.querySelector('.dm-conversation-panel');
+        if (!dmConversationPanel) return;
+        
+        dmConversationPanel.addEventListener('touchstart', (e) => {
+            if (this.dmNavState !== 'conversation') return;
+            
+            const touch = e.touches[0];
+            this.swipeStartX = touch.clientX;
+            this.swipeStartY = touch.clientY;
+        }, { passive: true });
+        
+        dmConversationPanel.addEventListener('touchmove', (e) => {
+            if (this.dmNavState !== 'conversation' || !this.swipeStartX) return;
+            
+            const touch = e.touches[0];
+            const deltaX = touch.clientX - this.swipeStartX;
+            const deltaY = touch.clientY - this.swipeStartY;
+            
+            // Only handle horizontal swipes (swipe right)
+            if (Math.abs(deltaX) > Math.abs(deltaY) && deltaX > 0) {
+                // Swiping right - allow it
+                e.preventDefault();
+            }
+        }, { passive: false });
+        
+        dmConversationPanel.addEventListener('touchend', (e) => {
+            if (this.dmNavState !== 'conversation' || !this.swipeStartX) {
+                this.swipeStartX = null;
+                this.swipeStartY = null;
+                return;
+            }
+            
+            const touch = e.changedTouches[0];
+            const deltaX = touch.clientX - this.swipeStartX;
+            const deltaY = touch.clientY - this.swipeStartY;
+            
+            // Check if it's a right swipe (positive deltaX) and significant enough
+            if (deltaX > this.swipeThreshold && Math.abs(deltaX) > Math.abs(deltaY)) {
+                // Swipe right detected - return to list
+                this.showDmList();
+            }
+            
+            this.swipeStartX = null;
+            this.swipeStartY = null;
+        }, { passive: true });
     }
 
     // Load profiles for DM contacts
@@ -190,6 +266,9 @@ class DMService {
         const dmContacts = window.domManager.get('dmContacts');
         if (!dmContacts) return;
         
+        // Ensure navigation is initialized
+        this.initializeDmNavigation();
+        
         try {
             dmContacts.innerHTML = '';
             
@@ -289,9 +368,56 @@ class DMService {
     // Select DM contact
     selectDmContact(contact) {
         try {
+            // Navigate to conversation view
+            this.showDmConversation(contact.pubkey);
+        } catch (error) {
+            console.error('Error selecting DM contact:', error);
+        }
+    }
+    
+    // Navigate to DM list view
+    showDmList() {
+        try {
+            const dmContainer = document.querySelector('.dm-container');
+            if (!dmContainer) return;
+            
+            // Update navigation state
+            dmContainer.classList.remove('dm-conversation-view');
+            dmContainer.classList.add('dm-list-view');
+            this.dmNavState = 'list';
+            
+            // Hide back button
+            const backButton = document.querySelector('.dm-back-to-list-btn');
+            if (backButton) {
+                backButton.style.display = 'none';
+            }
+            
+            // Optionally clear selected contact (or keep it selected)
+            // window.appState.setSelectedDmContact(null);
+        } catch (error) {
+            console.error('Error showing DM list:', error);
+        }
+    }
+    
+    // Navigate to conversation view
+    showDmConversation(contactPubkey) {
+        try {
+            const dmContainer = document.querySelector('.dm-container');
+            if (!dmContainer) return;
+            
+            // Find the contact
+            const dmContacts = window.appState.getDmContacts();
+            const contact = dmContacts.find(c => c.pubkey === contactPubkey);
+            
+            if (!contact) {
+                console.error('Contact not found:', contactPubkey);
+                return;
+            }
+            
+            // Set selected contact
             window.appState.setSelectedDmContact(contact);
             
-            // Update UI
+            // Update UI - mark contact as active
             document.querySelectorAll('.dm-contact-item').forEach(item => {
                 item.classList.remove('active');
             });
@@ -301,11 +427,18 @@ class DMService {
                 contactElement.classList.add('active');
             }
             
-            // Load messages for this contact
-            this.loadDmMessages(contact.pubkey);
+            // Update navigation state
+            dmContainer.classList.remove('dm-list-view');
+            dmContainer.classList.add('dm-conversation-view');
+            this.dmNavState = 'conversation';
             
+            // Load messages for this contact
+            this.loadDmMessages(contactPubkey);
+            
+            // Show back button after messages are loaded (it will be created in loadDmMessages)
+            // The back button handler is already set up in loadDmMessages
         } catch (error) {
-            console.error('Error selecting DM contact:', error);
+            console.error('Error showing DM conversation:', error);
         }
     }
 
@@ -463,6 +596,9 @@ class DMService {
                 const headerElement = document.createElement('div');
                 headerElement.className = 'conversation-header';
                 headerElement.innerHTML = `
+                    <button class="dm-back-to-list-btn" aria-label="Back to DM list" style="display: none;">
+                        <i class="fas fa-arrow-left"></i> Back
+                    </button>
                     <div class="conversation-contact-info">
                         <img class="contact-avatar" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';" style="cursor: pointer;" data-pubkey="${contactPubkey}">
                         <div class="conversation-contact-details">
@@ -478,6 +614,15 @@ class DMService {
                 if (avatarElement) {
                     avatarElement.addEventListener('click', () => {
                         this.navigateToContact(contactPubkey);
+                    });
+                }
+                
+                // Add click handler to back button and show it
+                const backButton = headerElement.querySelector('.dm-back-to-list-btn');
+                if (backButton) {
+                    backButton.style.display = 'flex';
+                    backButton.addEventListener('click', () => {
+                        this.showDmList();
                     });
                 }
                 
@@ -774,10 +919,8 @@ class DMService {
                     this.sendReplyMessage(contactPubkey);
                 });
                 
-                // Focus the input
-                setTimeout(() => {
-                    replyInput.focus();
-                }, 100);
+                // Don't auto-focus the input to prevent keyboard from popping up immediately
+                // User can tap the input field when they want to type
             }
             
             console.log('[JS] renderDmMessages completed successfully');
@@ -1173,8 +1316,7 @@ class DMService {
                 });
             }
             const dmContact = window.appState.getDmContacts().find(c => c.pubkey === pubkey);
-            window.appState.setSelectedDmContact(dmContact);
-            this.loadDmMessages(pubkey);
+            this.showDmConversation(pubkey);
             return;
         }
         // Add to DM contacts if not already present
@@ -1189,10 +1331,8 @@ class DMService {
                 profileLoaded: true
             });
         }
-        // Select the DM contact and load messages
-        const dmContact = window.appState.getDmContacts().find(c => c.pubkey === pubkey) || contact;
-        window.appState.setSelectedDmContact(dmContact);
-        this.loadDmMessages(pubkey);
+        // Navigate to the DM conversation
+        this.showDmConversation(pubkey);
     }
 
     // Navigate to contacts page and select contact if it exists

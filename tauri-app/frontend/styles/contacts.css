@@ -11,6 +11,7 @@
     flex: 1;
     overflow-y: auto;
     padding: 20px;
+    min-height: 0;
 }
 
 .contact-item {
@@ -87,23 +88,19 @@
 /* Contacts Container */
 .contacts-container {
     display: flex;
+    flex-direction: column;
     flex: 1;
     overflow: hidden;
 }
 
 .contacts-sidebar {
-    width: 300px;
-    border-right: 1px solid #e0e0e0;
+    width: 100%;
     background-color: #f8f9fa;
     display: flex;
     flex-direction: column;
-}
-
-.contacts-detail {
     flex: 1;
-    background-color: white;
-    overflow-y: auto;
-    padding: 20px;
+    overflow: hidden;
+    border-right: none;
 }
 
 .contact-detail-placeholder {
@@ -266,11 +263,6 @@
 body.dark-mode .contacts-sidebar {
     background-color: #232946;
     border-right-color: #181a20;
-}
-
-body.dark-mode .contacts-detail {
-    background-color: #232946;
-    color: #e0e0e0;
 }
 
 body.dark-mode .contact-detail-placeholder {
@@ -500,20 +492,75 @@ body.dark-mode .contact-item.active .contact-privacy-icon {
     color: white;
 }
 
+/* Contacts Actions */
+.contacts-actions {
+    display: flex;
+    gap: var(--spacing-sm);
+    flex-wrap: wrap;
+    align-items: center;
+}
+
 /* Responsive design for contacts */
 @media (max-width: 768px) {
+    .tab-header {
+        flex-direction: row;
+        align-items: center;
+        gap: var(--spacing-md);
+        padding: var(--spacing-md);
+        flex-wrap: wrap;
+    }
+    
+    /* Safe area support for mobile contacts header */
+    @supports (padding: max(0px)) {
+        .tab-header {
+            padding-top: max(var(--spacing-md), env(safe-area-inset-top));
+        }
+    }
+    
+    .tab-header h2 {
+        flex: 1 1 auto;
+        min-width: 0;
+        margin-bottom: 0;
+    }
+    
+    .contacts-actions {
+        width: auto;
+        gap: var(--spacing-sm);
+        justify-content: flex-end;
+        flex-wrap: nowrap;
+    }
+    
+    /* Icon-only buttons on mobile */
+    .contacts-actions .btn {
+        flex: 0 0 auto;
+        min-width: 44px;
+        width: 44px;
+        height: 44px;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: var(--radius-md);
+        gap: 0;
+    }
+    
+    /* Hide text on mobile, show only icons */
+    .contacts-actions .btn .btn-text {
+        display: none;
+    }
+    
+    .contacts-actions .btn i {
+        margin-right: 0;
+        font-size: 1.2rem;
+        flex-shrink: 0;
+    }
+    
     .contacts-container {
         flex-direction: column;
     }
     
     .contacts-sidebar {
         width: 100%;
-        height: 300px;
         border-right: none;
-        border-bottom: 1px solid #e0e0e0;
-    }
-    
-    .contacts-detail {
-        height: 400px;
     }
 } 

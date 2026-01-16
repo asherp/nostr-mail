@@ -3,7 +3,7 @@
 
 set -e
 
-echo "🚀 Starting Nostr Mail Browser Development Mode"
+echo "🚀 Starting NostrMail Browser Development Mode"
 echo "================================================"
 
 # Get the directory where this script is located

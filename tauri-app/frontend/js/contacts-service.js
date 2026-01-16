@@ -343,20 +343,16 @@ class ContactsService {
                 contactElement.classList.add('active');
             }
             
-            // Show local/cached data immediately for better UX
-            this.renderContactDetail(contact);
+            // Store the pubkey we're viewing and navigate to profile tab
+            window.appState.setViewingProfilePubkey(contact.pubkey);
+            window.app.switchTab('profile');
             
-            // Fetch fresh profile data from Nostr relays in the background
-            // This will update the UI when fresh data arrives
-            this.fetchAndUpdateContactProfile(contact).catch(error => {
-                console.error('[JS] Background profile fetch failed:', error);
-                // Silently fail - user already sees cached data
-            });
+            // Load the contact's profile
+            await window.app.loadProfile(contact.pubkey);
             
         } catch (error) {
             console.error('Error selecting contact:', error);
-            // Fallback to rendering with existing data
-            this.renderContactDetail(contact);
+            window.notificationService.showError('Failed to load contact profile');
         }
     }
 
@@ -592,7 +588,7 @@ class ContactsService {
     // Show add contact form
     showAddContactModal(pubkey = '') {
         try {
-            // Switch to contacts tab and show the add contact form in the detail panel
+            // Switch to contacts tab
             const contactsTab = document.querySelector('[data-tab="contacts"]');
             if (contactsTab) {
                 contactsTab.click();
@@ -604,56 +600,55 @@ class ContactsService {
                 item.classList.remove('active');
             });
             
-            // Show add contact form in the detail panel
-            const contactsDetail = window.domManager.get('contactsDetail');
-            if (contactsDetail) {
-                contactsDetail.innerHTML = `
-                    <div class="add-contact-form">
-                        <h3>Add New Contact</h3>
-                        <p class="form-help">Enter a Nostr public key (npub) to fetch their profile</p>
-                        
-                        <form id="add-contact-form">
-                            <div class="form-group">
-                                <label for="contact-pubkey">Public Key (npub):</label>
-                                <div class="input-with-button">
-                                    <input type="text" id="contact-pubkey" placeholder="npub1..." value="${pubkey}" required>
-                                    <button type="button" id="scan-qr-btn" class="btn btn-secondary">
-                                        <i class="fas fa-qrcode"></i> Scan QR
-                                    </button>
-                                </div>
-                            </div>
-                            <div class="form-actions">
-                                <button type="submit" class="btn btn-primary">
-                                    <i class="fas fa-search"></i> Fetch Profile
+            // Show add contact form in a modal
+            const modalContent = `
+                <div class="add-contact-form">
+                    <p class="form-help">Enter a Nostr public key (npub) to fetch their profile</p>
+                    
+                    <form id="add-contact-form">
+                        <div class="form-group">
+                            <label for="contact-pubkey">Public Key (npub):</label>
+                            <div class="input-with-button">
+                                <input type="text" id="contact-pubkey" placeholder="npub1..." value="${pubkey}" required>
+                                <button type="button" id="scan-qr-btn" class="btn btn-secondary">
+                                    <i class="fas fa-qrcode"></i> Scan QR
                                 </button>
                             </div>
-                        </form>
-                    </div>
-                `;
-                
-                // Set up event listeners
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="fas fa-search"></i> Fetch Profile
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            `;
+            
+            window.app.showModal('Add New Contact', modalContent);
+            
+            // Set up event listeners after modal is shown
+            setTimeout(() => {
                 const form = document.getElementById('add-contact-form');
                 const scanBtn = document.getElementById('scan-qr-btn');
                 
                 if (form) {
-                    form.addEventListener('submit', (e) => this.addContact(e));
+                    form.addEventListener('submit', (e) => {
+                        e.preventDefault();
+                        this.addContact(e);
+                    });
                 }
                 if (scanBtn) {
                     scanBtn.addEventListener('click', () => this.scanQRCode());
                 }
                 
-                // If pubkey is provided, automatically submit the form after a short delay
+                // If pubkey is provided, focus the input
                 if (pubkey) {
-                    setTimeout(() => {
-                        const pubkeyInput = document.getElementById('contact-pubkey');
-                        if (pubkeyInput && pubkeyInput.value) {
-                            // Optionally auto-submit, or just leave it filled for user to review
-                            // Uncomment the next line to auto-submit:
-                            // form.dispatchEvent(new Event('submit'));
-                        }
-                    }, 100);
+                    const pubkeyInput = document.getElementById('contact-pubkey');
+                    if (pubkeyInput) {
+                        pubkeyInput.focus();
+                    }
                 }
-            }
+            }, 100);
         } catch (error) {
             console.error('Error showing add contact form:', error);
         }
@@ -780,16 +775,11 @@ class ContactsService {
                 return;
             }
             
-            // Show loading state in the detail panel
-            const contactsDetail = window.domManager.get('contactsDetail');
-            if (contactsDetail) {
-                contactsDetail.innerHTML = `
-                    <div class="loading-profile">
-                        <i class="fas fa-spinner fa-spin" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
-                        <p>Fetching profile...</p>
-                    </div>
-                `;
-            }
+            // Show loading notification
+            window.notificationService.showInfo('Fetching profile...');
+            
+            // Close the modal
+            window.app.hideModal();
             
             // Fetch the profile
             try {
@@ -803,18 +793,23 @@ class ContactsService {
                 const profile = await window.TauriService.fetchProfilePersistent(pubkey);
                 
                 if (profile) {
-                    // Show the profile in the detail panel with follow button
-                    this.showProfileForAdding(pubkey, profile);
+                    // Navigate to profile page to show the profile
+                    window.appState.setViewingProfilePubkey(pubkey);
+                    window.app.switchTab('profile');
+                    await window.app.loadProfile(pubkey);
+                    
+                    // Show notification that profile was fetched
+                    window.notificationService.showSuccess('Profile fetched successfully');
                 } else {
                     window.notificationService.showError('Could not fetch profile for this public key');
-                    // Go back to the add contact form
-                    this.showAddContactModal();
+                    // Show the add contact form again
+                    this.showAddContactModal(pubkey);
                 }
             } catch (error) {
                 console.error('Failed to fetch profile:', error);
                 window.notificationService.showError('Failed to fetch profile: ' + error);
-                // Go back to the add contact form
-                this.showAddContactModal();
+                // Show the add contact form again
+                this.showAddContactModal(pubkey);
             }
             
         } catch (error) {

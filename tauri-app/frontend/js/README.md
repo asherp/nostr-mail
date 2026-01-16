@@ -1,6 +1,6 @@
-# Nostr Mail - Frontend JavaScript Architecture
+# NostrMail - Frontend JavaScript Architecture
 
-This directory contains the modular JavaScript architecture for the Nostr Mail application. The code has been refactored from a monolithic `main.js` file into separate, well-organized modules.
+This directory contains the modular JavaScript architecture for the NostrMail application. The code has been refactored from a monolithic `main.js` file into separate, well-organized modules.
 
 ## 📁 Module Structure
 

@@ -1,7 +1,170 @@
 /* Responsive Design Styles */
 
-/* Mobile/Phone specific styles - bottom navigation with icons only */
-@media (max-width: 480px) {
+/* Mobile Portrait Mode - Navbar as Main Page */
+@media (max-width: 480px) and (orientation: portrait) {
+    .app-container {
+        flex-direction: column;
+        height: 100vh;
+        overflow: hidden;
+        position: relative;
+    }
+    
+    /* Navbar Mode - Sidebar becomes full-screen main page */
+    .app-container.navbar-mode .sidebar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: 100%;
+        height: 100vh;
+        z-index: 1000;
+        flex-direction: column;
+        display: flex;
+        border-right: none;
+        border-top: none;
+        box-shadow: none;
+    }
+    
+    .app-container.navbar-mode .sidebar-header {
+        display: flex;
+        padding: var(--spacing-xl);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        justify-content: center;
+        align-items: center;
+    }
+    
+    .app-container.navbar-mode .sidebar-header h1 {
+        font-size: 2rem;
+        margin: 0;
+    }
+    
+    .app-container.navbar-mode .sidebar-nav {
+        flex: 1;
+        flex-direction: column;
+        justify-content: center;
+        align-items: stretch;
+        padding: var(--spacing-lg);
+        overflow-y: auto;
+    }
+    
+    .app-container.navbar-mode .nav-item {
+        width: 100%;
+        flex-direction: row;
+        align-items: center;
+        justify-content: flex-start;
+        padding: 20px var(--spacing-lg);
+        margin-bottom: var(--spacing-sm);
+        font-size: 1.1rem;
+        gap: var(--spacing-md);
+        border-radius: 8px;
+        color: white;
+    }
+    
+    .app-container.navbar-mode .nav-item i {
+        font-size: 1.5rem;
+        width: 30px;
+        text-align: center;
+        color: white;
+    }
+    
+    .app-container.navbar-mode .nav-item.active {
+        background-color: rgba(255, 255, 255, 0.2);
+        border-left: 4px solid #fff;
+        border-top: none;
+        border-radius: 8px;
+    }
+    
+    /* Hide main content when in navbar mode */
+    .app-container.navbar-mode .main-content {
+        display: none;
+    }
+    
+    /* Page Mode - Show main content with slide animation */
+    .app-container:not(.navbar-mode) .main-content {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: 100%;
+        height: 100vh;
+        z-index: 2000;
+        transform: translateX(0);
+        transition: transform 0.3s ease-in-out;
+        will-change: transform;
+        overflow-y: auto;
+        padding-bottom: 0;
+    }
+    
+    /* Hide sidebar when showing a page */
+    .app-container:not(.navbar-mode) .sidebar {
+        display: none;
+    }
+    
+    /* Back button styling */
+    .back-to-nav-btn {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-sm);
+        padding: var(--spacing-sm) var(--spacing-md);
+        background: none;
+        border: 1px solid #e0e0e0;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.9rem;
+        color: #333;
+        transition: all 0.2s ease;
+    }
+    
+    .back-to-nav-btn:hover {
+        background-color: #f0f0f0;
+    }
+    
+    .back-to-nav-btn i {
+        font-size: 1rem;
+    }
+    
+    /* Dark mode back button */
+    body.dark-mode .back-to-nav-btn {
+        border-color: #444;
+        color: #e0e0e0;
+    }
+    
+    body.dark-mode .back-to-nav-btn:hover {
+        background-color: #2a2a2a;
+    }
+    
+    /* Safe area support for mobile */
+    @supports (padding: max(0px)) {
+        .tab-header {
+            padding-top: max(var(--spacing-lg), env(safe-area-inset-top));
+            padding-left: max(var(--spacing-xl), env(safe-area-inset-left));
+            padding-right: max(var(--spacing-xl), env(safe-area-inset-right));
+        }
+        
+        .app-container.navbar-mode .sidebar {
+            padding-top: env(safe-area-inset-top);
+            padding-bottom: env(safe-area-inset-bottom);
+            padding-left: env(safe-area-inset-left);
+            padding-right: env(safe-area-inset-right);
+        }
+    }
+    
+    /* Dark mode adjustments */
+    body.dark-mode .app-container.navbar-mode .sidebar {
+        border-top: none;
+        box-shadow: none;
+    }
+    
+    body.dark-mode .app-container.navbar-mode .nav-item.active {
+        background-color: rgba(255, 255, 255, 0.1);
+        border-left: 4px solid #e0e0e0;
+    }
+}
+
+/* Mobile Landscape Mode - Keep bottom navigation */
+@media (max-width: 480px) and (orientation: landscape) {
     .app-container {
         flex-direction: column;
         height: 100vh;
@@ -100,12 +263,22 @@
         border-radius: 8px 8px 0 0;
     }
     
-    
     /* Add padding to main content to account for bottom nav */
     .main-content {
         padding-bottom: 60px;
         height: 100vh;
         overflow-y: auto;
+    }
+    
+    /* Safe area support for mobile - prevent header from being obscured */
+    @supports (padding: max(0px)) {
+        .tab-header {
+            padding-top: max(var(--spacing-md), env(safe-area-inset-top));
+        }
+        
+        .sidebar {
+            padding-bottom: env(safe-area-inset-bottom);
+        }
     }
     
     /* Dark mode adjustments for mobile */
@@ -153,19 +326,13 @@
     }
     
     .dm-container {
-        flex-direction: column;
+        height: auto;
+        min-height: 600px;
     }
     
-    .dm-sidebar {
-        width: 100%;
-        height: 300px;
-        border-right: none;
-        border-bottom: 1px solid #e0e0e0;
-    }
-    
-    .dm-main {
-        flex: 1;
-        min-height: 400px;
+    .dm-list-panel,
+    .dm-conversation-panel {
+        position: relative;
     }
     
     .message {

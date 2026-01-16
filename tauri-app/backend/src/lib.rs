@@ -2168,6 +2168,12 @@ fn db_get_decrypted_dms_for_conversation(
             &msg.sender_pubkey
         };
         let id_str = msg.id.map(|id| id.to_string()).unwrap_or_else(|| "<no id>".to_string());
+        println!("[DM DECRYPT] Processing message id={}", id_str);
+        println!("[DM DECRYPT] Message details: sender={}, recipient={}", msg.sender_pubkey, msg.recipient_pubkey);
+        println!("[DM DECRYPT] Using decrypt_sender_pubkey={} (for decryption)", decrypt_sender_pubkey);
+        println!("[DM DECRYPT] Content length: {} bytes", msg.content.len());
+        println!("[DM DECRYPT] Content preview: {}", &msg.content.chars().take(100).collect::<String>());
+        
         match crate::nostr::decrypt_dm_content(&private_key, decrypt_sender_pubkey, &msg.content) {
             Ok(decrypted) => {
                 println!("[DM DECRYPT] Success: id={}, sender={}, recipient={}, decrypted='{}'", id_str, msg.sender_pubkey, msg.recipient_pubkey, &decrypted.chars().take(80).collect::<String>());
@@ -2175,14 +2181,23 @@ fn db_get_decrypted_dms_for_conversation(
             },
             Err(e) => {
                 println!(
-                    "[DM DECRYPT] Failed: id={}, sender={}, recipient={}, error={}, sender_pubkey_raw={:?}, recipient_pubkey_raw={:?}, content_sample={:?}",
+                    "[DM DECRYPT] Failed: id={}, sender={}, recipient={}, error={}",
                     id_str,
                     msg.sender_pubkey,
                     msg.recipient_pubkey,
-                    e,
+                    e
+                );
+                println!(
+                    "[DM DECRYPT] Failed message details: sender_pubkey_raw={:?}, recipient_pubkey_raw={:?}, decrypt_sender_pubkey={:?}",
                     msg.sender_pubkey,
                     msg.recipient_pubkey,
-                    &msg.content.chars().take(40).collect::<String>()
+                    decrypt_sender_pubkey
+                );
+                println!(
+                    "[DM DECRYPT] Failed content analysis: length={}, sample={:?}, full_content={:?}",
+                    msg.content.len(),
+                    &msg.content.chars().take(100).collect::<String>(),
+                    &msg.content
                 );
                 msg.content = "[Failed to decrypt]".to_string();
             },

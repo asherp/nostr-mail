@@ -92,6 +92,15 @@
     background-color: #fafafa;
 }
 
+/* Safe area support for mobile devices */
+@supports (padding: max(0px)) {
+    .tab-header {
+        padding-top: max(var(--spacing-lg), env(safe-area-inset-top));
+        padding-left: max(var(--spacing-xl), env(safe-area-inset-left));
+        padding-right: max(var(--spacing-xl), env(safe-area-inset-right));
+    }
+}
+
 .tab-header h2 {
     font-size: 1.5rem;
     font-weight: 600;
@@ -126,6 +135,10 @@ body.dark-mode .main-content {
 body.dark-mode .tab-header {
     background-color: #181a20;
     border-bottom: 1px solid #232946;
+    color: #e0e0e0;
+}
+
+body.dark-mode .tab-header h2 {
     color: #e0e0e0;
 }
 

@@ -1,4 +1,4 @@
-# Nostr Mail
+# NostrMail
 
 A modern email client built with Tauri that integrates Nostr protocol features for enhanced privacy and decentralized communication.
 

@@ -130,6 +130,19 @@ class AppState {
         return this.lastLoadedPubkey;
     }
 
+    // Viewing profile pubkey management
+    setViewingProfilePubkey(pubkey) {
+        this.viewingProfilePubkey = pubkey;
+    }
+
+    getViewingProfilePubkey() {
+        return this.viewingProfilePubkey;
+    }
+
+    clearViewingProfilePubkey() {
+        this.viewingProfilePubkey = null;
+    }
+
     setNprivKey(nprivKey) {
         this.nprivKey = nprivKey;
     }

@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Nostr Mail</string>
+    <string name="main_activity_title">Nostr Mail</string>
+</resources>

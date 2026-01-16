@@ -1,0 +1,82 @@
+[package]
+name = "nostr-mail"
+version = "0.1.0"
+description = "A simple email encryption tool based on secp256k1 key pairs"
+authors = ["Asher Pembroke"]
+edition = "2021"
+default-run = "nostr-mail"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "nostr_mail_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+nostr-sdk = { version = "0.42.0", features = ["nip04", "nip44", "nip59"] }
+anyhow = "1.0"
+tokio = { version = "1", features = ["full"] }
+base64 = "0.22"
+mime_guess = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+aes-gcm = "0.10"
+hex = "0.4"
+block-modes = "0.9"
+cipher = "0.4"
+secp256k1 = { version = "0.28", features = ["rand"] }
+uuid = { version = "1.0", features = ["v4"] }
+futures = "0.3"
+mailparse = "0.14"
+qrcode = "0.13"
+image = "0.25"
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+urlencoding = "2"
+dirs = "5"
+zip = "2.1"
+tower = "0.4"
+sha2 = "0.10"
+
+# Android-specific dependencies (use rustls instead of native-tls)
+[target.'cfg(target_os = "android")'.dependencies]
+tauri = { version = "2.0.0-beta", features = ["rustls-tls"] }
+tauri-plugin-opener = { version = "2.0.0-beta", default-features = false }
+tauri-plugin-dialog = { version = "2.0.0-beta", default-features = false }
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls", "builder", "ring", "webpki-roots", "smtp-transport"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+rustls = { version = "0.23", features = ["ring"] }
+webpki-roots = "1.0"
+
+# Non-Android dependencies (use native-tls)
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tauri = { version = "2.0.0-beta", features = ["rustls-tls"] }
+tauri-plugin-opener = "2.0.0-beta"
+tauri-plugin-dialog = "2.0.0-beta"
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
+native-tls = "0.2"
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+imap = "2.4.1"
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+[features]
+# this feature is used for production builds or when `devPath` points to the filesystem
+# DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
+
+[[bin]]
+name = "validate_pubkey"
+path = "src/bin/validate_pubkey.rs"
+
+[[bin]]
+name = "http-server"
+path = "src/bin/http_server.rs"
+
+[[bin]]
+name = "verify_sig"
+path = "src/bin/verify_sig.rs"

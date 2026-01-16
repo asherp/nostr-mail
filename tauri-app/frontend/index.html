@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nostr Mail</title>
+    <!-- CSS Files -->
+    <link rel="stylesheet" href="styles/variables.css">
+    <link rel="stylesheet" href="styles/reset.css">
+    <link rel="stylesheet" href="styles/buttons.css">
+    <link rel="stylesheet" href="styles/forms.css">
+    <link rel="stylesheet" href="styles/modals.css">
+    <link rel="stylesheet" href="styles/navigation.css">
+    <link rel="stylesheet" href="styles/email.css">
+    <link rel="stylesheet" href="styles/contacts.css">
+    <link rel="stylesheet" href="styles/dm.css">
+    <link rel="stylesheet" href="styles/qr-scanner.css">
+    <link rel="stylesheet" href="styles/relay.css">
+    <link rel="stylesheet" href="styles/utilities.css">
+    <link rel="stylesheet" href="styles/loading.css">
+    <link rel="stylesheet" href="styles/responsive.css">
+    <link rel="stylesheet" href="styles/dark-mode.css">
+    <link rel="stylesheet" href="styles/avatars.css">
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script src="storage-service.js"></script>
+    <script src="js/database-service.js"></script>
+    <script src="js/contacts-service.js"></script>
+    <script src="js/dm-service.js"></script>
+    <script src="js/dom-manager.js"></script>
+    <script src="js/tauri-service.js"></script>
+    <script src="js/email-service.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/app-state.js"></script>
+    <script src="js/notification-service.js"></script>
+    <script src="js/app.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h1><i class="fas fa-envelope"></i> Nostr Mail</h1>
+            </div>
+            
+            <nav class="sidebar-nav">
+                <button class="nav-item active" data-tab="compose">
+                    <i class="fas fa-pen"></i> Compose
+                </button>
+                <button class="nav-item" data-tab="inbox">
+                    <i class="fas fa-inbox"></i> Inbox
+                </button>
+                <button class="nav-item" data-tab="sent">
+                    <i class="fas fa-paper-plane"></i> Sent
+                </button>
+                <button class="nav-item" data-tab="drafts">
+                    <i class="fas fa-save"></i> Drafts
+                </button>
+                <button class="nav-item" data-tab="dm">
+                    <i class="fas fa-comments"></i> Direct Messages
+                </button>
+                <button class="nav-item" data-tab="contacts">
+                    <i class="fas fa-address-book"></i> Contacts
+                </button>
+                <button class="nav-item" data-tab="profile">
+                    <i class="fas fa-user"></i> Profile
+                </button>
+                <button class="nav-item" data-tab="settings">
+                    <i class="fas fa-cog"></i> Settings
+                </button>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Compose Tab -->
+            <div class="tab-content active" id="compose">
+                <div class="tab-header">
+                    <h2>Compose Email</h2>
+                </div>
+                
+                <div class="compose-form">
+                    <div class="form-group">
+                        <label for="to-address">To:</label>
+                        <select id="nostr-contact-select" class="form-control" style="margin-bottom: 8px;">
+                            <option value="">Select a Nostr contact with email...</option>
+                        </select>
+                        <input type="email" id="to-address" placeholder="recipient@example.com">
+                        <div id="selected-recipient-pubkey" class="selected-pubkey-display" style="display: none;">
+                            <strong>Recipient pubkey:</strong> <span id="recipient-pubkey-value"></span>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="subject">Subject:</label>
+                        <input type="text" id="subject" placeholder="Subject">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="message-body">Message:</label>
+                        <textarea id="message-body" rows="10" placeholder="Type your message here..."></textarea>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="attachments">Attachments:</label>
+                        <div class="attachment-section">
+                            <div class="attachment-input-wrapper">
+                                <input type="file" id="attachment-input" multiple accept="*/*" style="display: none;">
+                                <button type="button" id="add-attachment-btn" class="btn btn-secondary">
+                                    <i class="fas fa-paperclip"></i> Add Attachments
+                                </button>
+                                <small class="form-text text-muted">Attachments will be encrypted individually using hybrid encryption (NIP-44 for keys + AES-256 for large files)</small>
+                            </div>
+                            <div id="attachment-list" class="attachment-list">
+                                <!-- Attachments will be displayed here -->
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button id="encrypt-btn" class="btn btn-secondary" type="button">
+                            <span class="encrypt-btn-icon"><i class="fas fa-lock"></i></span>
+                            <span class="encrypt-btn-label">Encrypt</span>
+                        </button>
+                        <button id="sign-btn" class="btn btn-secondary" type="button">
+                            <span class="sign-btn-icon"><i class="fas fa-pen"></i></span>
+                            <span class="sign-btn-label">Sign</span>
+                        </button>
+                        <button id="preview-headers-btn" class="btn btn-secondary" type="button">
+                            <i class="fas fa-eye"></i> Preview Headers
+                        </button>
+                        <button id="send-btn" class="btn btn-primary">
+                            <i class="fas fa-paper-plane"></i> Send
+                        </button>
+                        <button id="save-draft-btn" class="btn btn-secondary">
+                            <i class="fas fa-save"></i> Save Draft
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Inbox Tab -->
+            <div class="tab-content" id="inbox">
+                <div class="tab-header">
+                    <h2 id="inbox-title">Inbox</h2>
+                    <div class="inbox-actions" id="inbox-actions">
+                        <div class="email-search-container">
+                            <input type="text" id="email-search" placeholder="Search by sender email..." class="email-search-input">
+                            <i class="fas fa-search email-search-icon"></i>
+                        </div>
+                        <button id="refresh-inbox" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Email List View -->
+                <div class="email-list" id="email-list">
+                    <!-- Emails will be populated here -->
+                </div>
+                
+                <!-- Email Detail View -->
+                <div class="email-detail-view" id="email-detail-view" style="display: none;">
+                    <div class="email-detail-header">
+                        <button id="back-to-inbox" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Inbox
+                        </button>
+                    </div>
+                    <div class="email-detail-content" id="email-detail-content">
+                        <!-- Email detail content will be populated here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sent Tab -->
+            <div class="tab-content" id="sent">
+                <div class="tab-header">
+                    <h2 id="sent-title">Sent</h2>
+                    <div class="inbox-actions" id="sent-actions">
+                        <div class="email-search-container">
+                            <input type="text" id="sent-search" placeholder="Search sent emails..." class="email-search-input">
+                            <i class="fas fa-search email-search-icon"></i>
+                        </div>
+                        <button id="refresh-sent" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                <div class="email-list" id="sent-list">
+                    <!-- Sent emails will be populated here -->
+                </div>
+                <div class="email-detail-view" id="sent-detail-view" style="display: none;">
+                    <div class="email-detail-header">
+                        <button id="back-to-sent" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Sent
+                        </button>
+                    </div>
+                    <div class="email-detail-content" id="sent-detail-content">
+                        <!-- Sent email detail content will be populated here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Drafts Tab -->
+            <div class="tab-content" id="drafts">
+                <div class="tab-header">
+                    <h2 id="drafts-title">Drafts</h2>
+                    <div class="inbox-actions" id="drafts-actions">
+                        <button id="refresh-drafts" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                <div class="email-list" id="drafts-list">
+                    <!-- Drafts will be populated here -->
+                </div>
+                <div class="email-detail-view" id="drafts-detail-view" style="display: none;">
+                    <div class="email-detail-header">
+                        <button id="back-to-drafts" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Drafts
+                        </button>
+                    </div>
+                    <div class="email-detail-content" id="drafts-detail-content">
+                        <!-- Draft detail content will be populated here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Direct Messages Tab -->
+            <div class="tab-content" id="dm">
+                <div class="tab-header">
+                    <h2>Search</h2>
+                    <div class="dm-actions">
+                        <button id="dm-search-toggle" class="btn btn-secondary">
+                            <i class="fas fa-search"></i> Search
+                        </button>
+                        <button id="refresh-dm" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="dm-search-container" id="dm-search-container" style="display: none;">
+                    <input type="text" id="dm-search" placeholder="Search conversations..." class="dm-search-input">
+                    <i class="fas fa-search dm-search-icon"></i>
+                </div>
+                
+                <div class="dm-container">
+                    <div class="dm-sidebar">
+                        <div class="dm-contacts" id="dm-contacts">
+                            <!-- DM contacts will be populated here -->
+                        </div>
+                    </div>
+                    <div class="dm-main">
+                        <div class="dm-messages" id="dm-messages">
+                            <!-- DM messages will be populated here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Contacts Tab -->
+            <div class="tab-content" id="contacts">
+                <div class="tab-header">
+                    <h2>Contacts</h2>
+                    <div class="contacts-actions">
+                        <button id="contacts-search-toggle" class="btn btn-secondary">
+                            <i class="fas fa-search"></i> Search
+                        </button>
+                        <button id="refresh-contacts-btn" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                        <button id="export-npubs-btn" class="btn btn-secondary">
+                            <i class="fas fa-download"></i> Export Contacts
+                        </button>
+                        <button id="add-contact-btn" class="btn btn-primary">
+                            <i class="fas fa-plus"></i> Add Contact
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="contacts-search-container" id="contacts-search-container" style="display: none;">
+                    <input type="text" id="contacts-search" placeholder="Search contacts..." class="contacts-search-input">
+                    <i class="fas fa-search contacts-search-icon"></i>
+                </div>
+                
+                <div class="contacts-container">
+                    <div class="contacts-sidebar">
+                        <div class="contacts-list" id="contacts-list">
+                            <!-- Contacts will be populated here -->
+                        </div>
+                    </div>
+                    <div class="contacts-detail" id="contacts-detail">
+                        <!-- Contact profile details will be shown here -->
+                        <div class="contact-detail-placeholder">
+                            <i class="fas fa-user"></i>
+                            <p>Select a contact to view their profile</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Profile Tab -->
+            <div class="tab-content" id="profile">
+                <div class="tab-header">
+                    <h2>Profile</h2>
+                    <div class="profile-actions">
+                        <button id="refresh-profile" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                <div id="profile-loading-spinner" style="display:none;text-align:center;margin:16px 0;">
+                    <i class="fas fa-spinner fa-spin" style="font-size:2em;"></i>
+                    <div>Loading profile...</div>
+                </div>
+                <div class="profile-form no-card">
+                    <img id="profile-picture" class="profile-picture" style="width:120px;height:120px;object-fit:cover;border-radius:50%;margin-bottom:16px;display:none;" alt="Profile picture">
+                    <form id="profile-fields-form">
+                        <div id="profile-fields-list" class="profile-fields-list"></div>
+                        <div class="form-actions">
+                            
+                            <button id="update-profile-btn" class="btn btn-primary" type="submit">
+                                <i class="fas fa-save"></i> Update Profile
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Settings Tab -->
+            <div class="tab-content" id="settings">
+                <div class="tab-header">
+                    <h2>Settings</h2>
+                </div>
+                
+                <div class="settings-form">
+                    <!-- Nostr Settings -->
+                    <div class="settings-section" data-section="nostr">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-key"></i> Nostr Settings</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
+                        <div class="form-group">
+                            <label for="npriv-key">Private Key (nsec/npriv):</label>
+                            <div class="input-with-buttons">
+                                <input type="password" id="npriv-key" placeholder="nsec1... or npriv1...">
+                                <button type="button" id="toggle-npriv-visibility-btn" class="btn btn-secondary" title="Show private key">
+                                    <i class="fas fa-eye"></i>
+                                </button>
+                                <button type="button" id="copy-npriv-btn" class="btn btn-secondary" title="Copy private key">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                                <button type="button" id="qr-npriv-btn" class="btn btn-secondary" title="Show QR code">
+                                    <i class="fas fa-qrcode"></i>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="public-key-display">Public Key (npub):</label>
+                            <div class="input-with-buttons">
+                                <input type="text" id="public-key-display" readonly placeholder="Will be generated from private key">
+                                <button type="button" id="copy-pubkey-btn" class="btn btn-secondary" title="Copy public key">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                                <button type="button" id="qr-npub-btn" class="btn btn-secondary" title="Show QR code">
+                                    <i class="fas fa-qrcode"></i>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Live Events Status:</label>
+                            <div class="live-events-status">
+                                <span id="live-events-indicator" class="status-indicator">
+                                    <i class="fas fa-circle"></i>
+                                    <span id="live-events-text">Initializing...</span>
+                                </span>
+                                <small class="status-description">Real-time direct messages and profile updates</small>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <button id="generate-key-btn" class="btn btn-secondary">
+                                <i class="fas fa-key"></i> Generate New Keypair
+                            </button>
+                        </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Email Settings -->
+                    <div class="settings-section" data-section="email">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-envelope"></i> Email Settings</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
+                        <div class="form-group">
+                            <label for="email-provider">Email Provider:</label>
+                            <select id="email-provider">
+                                <option value="">Select provider...</option>
+                                <option value="gmail">Gmail</option>
+                                <option value="outlook">Outlook/Office 365</option>
+                                <option value="yahoo">Yahoo</option>
+                                <option value="custom">Custom</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="email-address">Email Address:</label>
+                            <input type="email" id="email-address" placeholder="your@email.com">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="email-password">Password:</label>
+                            <div class="input-with-buttons">
+                                <input type="password" id="email-password" placeholder="Password or App Password">
+                                <button type="button" id="toggle-email-password-visibility-btn" class="btn btn-secondary" title="Show password">
+                                    <i class="fas fa-eye"></i>
+                                </button>
+                                <button type="button" id="copy-email-password-btn" class="btn btn-secondary" title="Copy password">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="smtp-host">SMTP Host:</label>
+                            <input type="text" id="smtp-host" placeholder="smtp.gmail.com">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="smtp-port">SMTP Port:</label>
+                            <input type="number" id="smtp-port" placeholder="587" value="587">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="imap-host">IMAP Host:</label>
+                            <input type="text" id="imap-host" placeholder="imap.gmail.com">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="imap-port">IMAP Port:</label>
+                            <input type="number" id="imap-port" placeholder="993" value="993">
+                        </div>
+                        
+                        <div class="form-group">
+                            <div class="toggle-setting">
+                                <label for="use-tls">Use TLS/SSL</label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="use-tls" checked>
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="form-actions">
+                            <button id="test-email-connection-btn" class="btn btn-secondary">
+                                <i class="fas fa-envelope"></i> Test Email Connection
+                            </button>
+                        </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Advanced -->
+                    <div class="settings-section" data-section="preferences">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-sliders-h"></i> Advanced</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
+                        <div class="form-group">
+                            <label for="encryption-algorithm">Encryption Algorithm:</label>
+                            <select id="encryption-algorithm">
+                                <option value="nip44">NIP-44 (Recommended)</option>
+                                <option value="nip04">NIP-04 (Legacy)</option>
+                            </select>
+                            <div class="form-text">
+                                NIP-44 is the modern, secure encryption standard. NIP-04 is legacy and less secure.
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="email-filter-preference">Inbox Filter:</label>
+                            <select id="email-filter-preference">
+                                <option value="nostr">Nostr Emails Only</option>
+                                <option value="all">All Emails</option>
+                            </select>
+                            <small class="form-text text-muted">Choose whether to show only Nostr-encrypted emails or all emails in your inbox</small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Email Preferences:</label>
+                            <ul class="toggle-settings-list">
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="send-matching-dm-preference">Send Matching DM</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="send-matching-dm-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Automatically send a direct message with the same subject line when sending encrypted emails to Nostr contacts</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="require-signature-preference">Require Signatures</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="require-signature-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Only accept emails with valid Nostr signatures. Emails without signatures will be ignored.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="hide-undecryptable-emails-preference">Hide Undecryptable Emails</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="hide-undecryptable-emails-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Hide emails that cannot be decrypted with your private key from the inbox view.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="automatically-encrypt-preference">Automatically Encrypt</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="automatically-encrypt-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Automatically encrypt outgoing emails when composing.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="automatically-sign-preference">Automatically Sign</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="automatically-sign-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Automatically sign outgoing emails with your Nostr key.</small>
+                                </li>
+                                
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="hide-unsigned-messages-preference">Hide Unverified</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="hide-unsigned-messages-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Hide messages with missing or unverified signatures.</small>
+                                </li>
+                            </ul>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="sync-cutoff-days">Sync Cutoff (Days):</label>
+                            <input type="number" id="sync-cutoff-days" placeholder="365" min="1" max="36500" value="365">
+                            <small class="form-text text-muted">How far back in time to sync emails when setting up on a new device. Default: 365 days (1 year). Set to 0 to sync all emails.</small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="emails-per-page">Emails Per Page:</label>
+                            <input type="number" id="emails-per-page" placeholder="50" min="10" max="500" value="50">
+                            <small class="form-text text-muted">Number of emails to display per page in the inbox. Default: 50.</small>
+                        </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Relay Settings -->
+                    <div class="settings-section" data-section="relay">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-network-wired"></i> Relay Settings</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
+                        <div class="form-group">
+                            <div id="relay-list" class="relay-list expanded">
+                                <!-- Relays will be populated here -->
+                                <div class="add-relay-section">
+                                    <div class="form-group">
+                                        <label for="new-relay-url">Add Relay:</label>
+                                        <div class="input-with-button">
+                                            <input type="text" id="new-relay-url" placeholder="wss://relay.example.com">
+                                            <button id="add-relay-btn" class="btn btn-secondary">
+                                                <i class="fas fa-plus"></i> Add
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Appearance Settings -->
+                    <div class="settings-section" data-section="appearance">
+                        <div class="settings-section-header">
+                            <h3><i class="fas fa-palette"></i> Appearance</h3>
+                            <i class="fas fa-chevron-down settings-section-toggle"></i>
+                        </div>
+                        <div class="settings-section-content">
+                        <div class="form-group">
+                            <label>Theme:</label>
+                            <div class="input-with-button">
+                                <div style="display: flex; align-items: center; gap: 12px;">
+                                    <span id="theme-label">Dark Mode</span>
+                                    <button id="dark-mode-toggle" class="btn btn-secondary" title="Toggle dark mode" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
+                                        <i id="dark-mode-icon" class="fas fa-moon"></i>
+                                        <span id="dark-mode-text">Enable Dark Mode</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <small class="form-text text-muted">Switch between light and dark theme</small>
+                        </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal Overlay -->
+    <div id="modal-overlay" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modal-title">Modal Title</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div id="modal-body" class="modal-body">
+                <!-- Modal content will be populated here -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Load the modular JavaScript -->
+</body>
+</html> 

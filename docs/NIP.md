@@ -8,19 +8,19 @@ Email integration enables several features for nostr users that relays alone can
 
 #### Long form messaging
 
-Nostr messages are intended to mimic the short form messaging of social media. It is largely up to the relay to determine the length of messages, but attachments and formatting are not supported (other NIPs that address this?). Email provides a means of communicating much larger messages, which are more suitable in personal or business contxts (with the added bonus of privacy offered by nostr's encryption).
+Nostr messages are intended to mimic the short form messaging of social media. It is largely up to the relay to determine the length of messages, but attachments and formatting are not supported (other NIPs that address this?). Email can extend nostr's capabilities by providing an out-of-band means of communicating larger messages with attachments, which are more suitable in personal or business contexts.
 
 #### Archival storage
 
-Nostr relays are not required to store DMs permanently. With nostr-mail DMs are replicated (in encrypted form) as the subject of an associated email. Thus, email provides a free back up for any DMs sent or received in this manner, in addition to any longer form content or files intended for long term storage.
+Nostr relays are not required to store DMs permanently. With nostr-mail DMs are replicated (in encrypted form) as the subject of an associated email. Thus, email provides a free backup for any DMs sent or received in this manner, in addition to any longer form content or files intended for long term storage.
 
 #### Email authentication/identification
 
-While the [NIP-05](https://github.com/nostr-protocol/nips/blob/master/05.md) standard allows nostr profiles to be associated with a user who controls their own domain, this is not the case for vast majority of users. Nostr-mail provides a more accessible way to associate one's identity with a public key. The setup process will be familiar to anyone who uses a desktop email client: simply allow the email server to accept SMTP connections and provide email credentials to the nostr-mail client.
+While the [NIP-05](https://github.com/nostr-protocol/nips/blob/master/05.md) standard allows nostr profiles to be associated with a user who controls their own domain, this is not the case for the vast majority of users. nostr-mail provides a more accessible way to associate one's identity with a public key, by including their email in the profile. The nostr-mail client setup process should be similar to traditional desktop email clients: simply allow the email server to accept SMTP connections and provide email credentials to the nostr-mail client.
 
 #### Email privacy
 
-While Email PGP has been availble in various forms since 1991. Despite decades of attempts to educate the public, it has not seen wide adoption. Since all Nostr users have key pairs by default, we can leap frog the education propblems associated with traditional PGP. [NIP-04](https://github.com/nostr-protocol/nips/blob/master/04.md) provides a mechanism for encrypting DMs, and we apply the scheme to encrypt/decrypt emails as well as link them to specific Nostr DMs.
+While Email PGP has been available in various forms since 1991, despite decades of attempts to educate the public, it has not seen wide adoption. Since all Nostr users have key pairs by default, we can leapfrog the education problems associated with traditional PGP. [NIP-04](https://github.com/nostr-protocol/nips/blob/master/04.md) provides a mechanism for encrypting DMs, and we apply the scheme to encrypt/decrypt email content while linking them to specific Nostr DMs. nostr-mail intends to keep up-to-date with the latest encryption standards for DMs. 
 
 #### Key rotation
 
@@ -77,7 +77,7 @@ alice_profile = dict(display_name='Alice',
 When an email is sent from a nostr-mail client, two things **must** occur:
 
 1. a DM with the encrypted subject of the email should be broadcast to the user's nostr relays
-1. the body of the email **must** be encrypted with the same shared secret.
-1. an email with the encrypted subject and body (using the same shared secret) **must** be sent via the user's SMTP server
+2. the body of the email **must** be encrypted with the same shared secret.
+3. an email with the encrypted subject and body (using the same shared secret) **must** be sent via the user's SMTP server
 
-It is crucial that the email subject matches the encrypted DM exactly. This allows the receiver to verify that the email came from the same author as the DM - specifically, the author who's private key signed the DM event. Second, it allows the receiver to find the encrypted message on their mail server using the subject. Specifically, the `iv` string used in the encryption will be unique to that message.
+It is crucial that the email subject matches the encrypted DM exactly. This allows the receiver to verify that the email came from the same author as the DM - specifically, the author whose private key signed the DM event. Second, it allows the receiver to find the encrypted message on their mail server using the subject. Specifically, the `iv` string used in the encryption will be unique to that message.

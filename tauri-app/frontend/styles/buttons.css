@@ -1,0 +1,170 @@
+/* Buttons */
+.btn {
+    padding: var(--spacing-sm) var(--spacing-lg);
+    border: none;
+    border-radius: var(--radius-md);
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    text-decoration: none;
+}
+
+.btn-primary {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+}
+
+.btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md);
+}
+
+.btn-secondary {
+    background-color: #f8f9fa;
+    color: #6c757d;
+    border: 2px solid #e9ecef;
+}
+
+.btn-secondary:hover {
+    background-color: #e9ecef;
+    color: #495057;
+}
+
+.btn-danger {
+    background-color: #dc3545;
+    color: white;
+}
+
+.btn-danger:hover {
+    background-color: #c82333;
+}
+
+.btn-small {
+    padding: 5px 10px;
+    font-size: 0.8rem;
+    margin-left: 10px;
+}
+
+/* Follow button styles */
+.follow-btn {
+    background: linear-gradient(135deg, #28a745, #20c997) !important;
+    border: none !important;
+    color: white !important;
+    font-weight: 500 !important;
+    transition: all 0.2s ease-in-out !important;
+}
+
+.follow-btn:hover:not(:disabled) {
+    background: linear-gradient(135deg, #218838, #1ea085) !important;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(40, 167, 69, 0.25);
+}
+
+.follow-btn:active:not(:disabled) {
+    transform: translateY(0);
+    box-shadow: 0 2px 8px rgba(40, 167, 69, 0.3);
+    transition: all 0.1s ease-in-out !important;
+}
+
+.follow-btn:disabled {
+    background: linear-gradient(135deg, #6c757d, #5a6268) !important;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
+/* Dark mode button styles */
+body.dark-mode .btn-primary {
+    background: linear-gradient(135deg, #232946 0%, #121629 100%);
+    color: #e0e0e0;
+}
+
+body.dark-mode .btn-secondary {
+    background-color: #232946;
+    color: #e0e0e0;
+    border: 2px solid #232946;
+}
+
+body.dark-mode .btn-danger {
+    background-color: #c82333;
+    color: #fff;
+}
+
+body.dark-mode .follow-btn {
+    background: linear-gradient(135deg, #28a745, #20c997) !important;
+}
+
+body.dark-mode .follow-btn:hover:not(:disabled) {
+    background: linear-gradient(135deg, #218838, #1ea085) !important;
+}
+
+/* Draft actions styling */
+.draft-actions {
+    display: flex;
+    gap: var(--spacing-sm);
+    margin-top: var(--spacing-sm);
+}
+
+.draft-actions .btn-small {
+    padding: 4px 8px;
+    font-size: 12px;
+    min-width: auto;
+}
+
+.email-item .draft-actions {
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+
+.email-item:hover .draft-actions {
+    opacity: 1;
+}
+
+body.dark-mode .draft-actions .btn-small {
+    background-color: #232946;
+    color: #e0e0e0;
+    border: 1px solid #232946;
+}
+
+body.dark-mode .draft-actions .btn-small:hover {
+    background-color: #181a20;
+    border-color: #181a20;
+}
+
+body.dark-mode .draft-actions .btn-danger.btn-small {
+    background-color: #c82333;
+    color: #fff;
+    border-color: #c82333;
+}
+
+body.dark-mode .draft-actions .btn-danger.btn-small:hover {
+    background-color: #a71e2a;
+    border-color: #a71e2a;
+}
+
+/* Sign button signed state */
+#sign-btn.signed {
+    background-color: #d4edda;
+    color: #155724;
+    border-color: #c3e6cb;
+}
+
+#sign-btn.signed:hover {
+    background-color: #c3e6cb;
+    color: #155724;
+}
+
+body.dark-mode #sign-btn.signed {
+    background-color: #28a74533;
+    color: #28a745;
+    border-color: #28a74566;
+}
+
+body.dark-mode #sign-btn.signed:hover {
+    background-color: #28a7454d;
+    color: #28a745;
+} 

@@ -1,0 +1,57 @@
+/* QR Scanner Styles */
+
+/* QR Scanner Container */
+#qr-scanner-container {
+    text-align: center;
+}
+
+#qr-reader {
+    width: 100%;
+    max-width: 400px;
+    margin: 0 auto 20px;
+}
+
+.qr-scanner-controls {
+    margin-top: 20px;
+}
+
+#qr-reader__scan_region {
+    border: 2px solid #667eea;
+    border-radius: 8px;
+}
+
+#qr-reader__scan_region > img {
+    border-radius: 6px;
+}
+
+/* Camera Error */
+.camera-error {
+    text-align: left;
+    padding: 20px 0;
+}
+
+.camera-error h3 {
+    color: #dc3545;
+    margin-bottom: 15px;
+}
+
+.camera-error p {
+    margin-bottom: 15px;
+    line-height: 1.6;
+}
+
+.camera-error ul {
+    margin: 15px 0;
+    padding-left: 20px;
+}
+
+.camera-error li {
+    margin-bottom: 8px;
+    line-height: 1.5;
+}
+
+.camera-error .form-actions {
+    margin-top: 25px;
+    padding-top: 20px;
+    border-top: 1px solid #e0e0e0;
+} 

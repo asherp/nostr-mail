@@ -1,3 +1,35 @@
+
+* when changing email addresses, app has trouble decrypting emails in db
+* mac build instructions
+* building on a mac for android, you'll need:
+    java (from adoptium)
+    make, which you can get from xcode command line tools:
+        xcode-select --install
+    cmake (from cmake.org)
+    set the following env varibles
+     ANDROID_HOME=/path/to/user/Library/Android/sdk\nexport ANDROID_SDK_ROOT=$ANDROID_HOME\nexport ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.13846066\nexport ANDROID_NDK_ROOT=$ANDROID_NDK_HOME\nexport PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin:$PATH"
+
+* encrypted attachments, manifest
+* NIP-44 may fail if email body is too long, so witch to mainfest style if/when that happens
+* live updates
+* persistent relay connections
+* email body inline with DM
+* checkbox for dm notification
+* fixed double encryption bug in subject dm
+* fix render dm avatar
+* fix follow contact, jwt image rendering
+* fetch inbox emails for current user
+* switch between profiles
+* fixed profile update button, jump to send dm
+* sqlite db
+* fetch nostr emails only, decrypt content
+* refactor frontend
+* send DM working
+* fetch emails, filtering
+* working email send
+* dm decryption
+* tauri app prototype
+
 # 2023-10-30 20:12:34.177188: clock-out
 
 * nav, compose, inbox, settings layout
@@ -9,7 +41,6 @@
 * kivy app
 
 # 2023-10-30 08:29:41.131573: clock-in
-
 # 2023-04-29 01:11:50.217567: clock-out
 
 * documentation, presentation

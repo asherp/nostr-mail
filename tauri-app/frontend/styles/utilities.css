@@ -1,0 +1,13 @@
+/* Utility Classes */
+
+.hidden {
+    display: none !important;
+}
+
+.text-center {
+    text-align: center;
+}
+
+.text-muted {
+    color: #6c757d;
+} 

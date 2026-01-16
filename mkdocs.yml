@@ -1,14 +1,37 @@
-site_name: NostrMail
+site_name: nostr-mail
+repo_name: nostr-mail
+repo_url: https://github.com/asherp/nostr-mail
+site_url: https://nostr-mail.com
+
 
 repo_url: https://github.com/asherp/nostr-mail
 
 
 nav:
-- Home: README.md
-- NIP: NIP.md
-- Techstack: Techstack.md
-- Related Work: related_work.md
-- WorkLog: WorkLog.md
+- Home: index.md
+- Getting Started:
+  - Installation: installation.md
+  - Quick Start: quick-start.md
+- User Guides:
+  - Compose Page: pages/compose.md
+  - Inbox Page: pages/inbox.md
+  - Sent Page: pages/sent.md
+  - Drafts Page: pages/drafts.md
+  - Direct Messages: pages/direct-messages.md
+  - Contacts Page: pages/contacts.md
+  - Profile Page: pages/profile.md
+  - Settings Page: pages/settings.md
+- Technical Documentation:
+  - Architecture: architecture.md
+  - Development: development.md
+  - NIP-44 Encryption: nip44.md
+- Legacy Documentation:
+  - Legacy Docker Setup: legacy.md
+- Additional Documentation:
+  - NIP: NIP.md
+  - Techstack: Techstack.md
+  - Related Work: related_work.md
+  - WorkLog: WorkLog.md
 
 extra_files:
   - README.md

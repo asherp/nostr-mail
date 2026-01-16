@@ -1,14 +1,13 @@
-Here's other directions we've looked at for potential use in NostrMail.
+Here's other directions we've looked at for potential use in nostr-mail.
 
 ## NIP-05
 
 !!! note
-    This is not required by NostrMail. This section is just kept for pedagogical purposes.
+    This is not required by nostr-mail. This section is just kept for pedagogical purposes.
 
+[nip-05](https://github.com/nostr-protocol/nips/blob/master/05.md) is a Pub key validation standard based on control over a domain. Most email users will not have their own servers, however, so nostr-mail clients should not require it.
 
-[nip-05](https://github.com/nostr-protocol/nips/blob/master/05.md) is a Pub key validation standard based on control over a domain. Most email users will not have their own servers, however, so NostrMail clients should not require it.
-
-HelloJessica is nip05 compliant, so we should be able to a get request to his server to verify his pub key
+HelloJessica is nip05 compliant, so we should be able to make a get request to his server to verify his pub key.
 
 ```python
 from nostrmail.utils import validate_nip05
@@ -20,16 +19,14 @@ validate_nip05(node_hello_hex) # returns the name of this user according to thei
 
 Hello Jessica's NIP-05 json actually includes several other names, so this doubles as a PGP registry. However, `nip-02` [provides a similar solution](https://github.com/nostr-protocol/nips/blob/master/02.md) to registration.
 
-
 ## NIP-02
 
-[NIP-02](https://github.com/nostr-protocol/nips/blob/master/02.md) Supports contacts lists, comprised of pub keys, petnames, and preferred relays. Users may be found by walking through the network of contacts. This is desirable for nostrmail, where we want to easily look up an email address through dot notation. For instance, an email to `carol.bob.alice` means `find carol in my contacts`, then `find bob in carol's contacts`, then `find alice in bob's contacts`.
-
+[NIP-02](https://github.com/nostr-protocol/nips/blob/master/02.md) Supports contacts lists, comprised of pub keys, petnames, and preferred relays. Users may be found by walking through the network of contacts. This is desirable for nostr-mail, where we want to easily look up an email address through dot notation. For instance, an email to `carol.bob.alice` means `find carol in my contacts`, then `find bob in carol's contacts`, then `find alice in bob's contacts`.
 
 ## Fernet encryption
 
 !!! note
-    NostrMail does not use this method. We decided to use the same scheme as NOSTr DMs to reduce the workload on other implementations.
+    Nostr-mail does not use this method. We decided to use the same scheme as NOSTr DMs to reduce the workload on other implementations.
 
 We could have used [Fernet encryption](https://cryptography.io/en/latest/fernet/#fernet-symmetric-encryption) available from the cryptography package. Fernet encryption is a form of symmetric encryption, meaning the same key may be used to encrypt and decrypt a message.
 
@@ -64,15 +61,14 @@ def decrypt(message, key):
 decrypt(encrypt('hello world', 'yowzah'), 'yowzah')
 ```
 
-While apparently simpler, there are a few drawbacks that make this untennable:
+While apparently simpler, there are a few drawbacks that make this untenable:
 
 * There's no `iv` token as with AES, so you have to directly match the dm with the subject when looking up emails
-* All NostrMail clients would have to implement fernet encryption in addition to AES for dms
-
+* All nostr-mail clients would have to implement fernet encryption in addition to AES for dms
 
 ## TOTP
 
-We may use a different key for each message by concatonating the shared secret with a time stamp and hashing the result. This is known as a [time-based on-time password](https://en.wikipedia.org/wiki/Time-based_one-time_password) (TOTP) and should already be familiar to anyone who has used [google authenticator](https://googleauthenticator.net/). The time used would be the time the email was sent. The epoch needs to be large enough for the mail servers to route the message.
+We may use a different key for each message by concatenating the shared secret with a time stamp and hashing the result. This is known as a [time-based one-time password](https://en.wikipedia.org/wiki/Time-based_one-time_password) (TOTP) and should already be familiar to anyone who has used [google authenticator](https://googleauthenticator.net/). The time used would be the time the email was sent. The epoch needs to be large enough for the mail servers to route the message.
 
 It might also help to use the latest block hash as the time stamp.
 
@@ -101,7 +97,7 @@ sha256('hey')
 
 ```python
 def hash_concat(key, value):
-    """concatonates a message with a value and returns the hash
+    """concatenates a message with a value and returns the hash
     key - a binary
     """
     key_str = base64.urlsafe_b64encode(key).decode('ascii')

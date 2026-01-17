@@ -22,9 +22,6 @@ function NostrMailApp() {
 
 // Initialize the application
 NostrMailApp.prototype.init = async function() {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:24',message:'init() function entry',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-    // #endregion
     console.log('🚀 ========================================');
     console.log('🚀   NostrMail - Starting Application');
     console.log('🚀 ========================================');
@@ -32,15 +29,29 @@ NostrMailApp.prototype.init = async function() {
     console.log('🌐 Version: 1.0.1-beta');
     console.log('⏰ Started at:', new Date().toLocaleString());
     console.log('🚀 ========================================');
+    
+    // Check if we should clear localStorage cache
+    try {
+        const shouldClear = await TauriService.invoke('should_clear_localstorage_cache');
+        if (shouldClear) {
+            console.log('🧹 Clearing localStorage cache due to NOSTR_MAIL_CLEAR_CACHE environment variable...');
+            // Clear all nostr-mail related localStorage items
+            localStorage.removeItem('nostr_mail_settings');
+            localStorage.removeItem('nostr_mail_profiles');
+            localStorage.removeItem('nostr_mail_profile_picture');
+            localStorage.removeItem('nostr_keypair');
+            // Also clear legacy items if they exist
+            localStorage.removeItem('contacts');
+            localStorage.removeItem('settings');
+            console.log('✅ localStorage cache cleared (including keypair)');
+        }
+    } catch (e) {
+        console.warn('⚠️ Failed to check clear cache environment variable:', e);
+    }
+    
     // Initialize the database
     try {
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:34',message:'Before TauriService.initDatabase()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         await TauriService.initDatabase();
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:35',message:'After TauriService.initDatabase() - success',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         console.log('Database initialized');
     } catch (e) {
         if (e && e.toString().includes('already initialized')) {
@@ -57,31 +68,29 @@ NostrMailApp.prototype.init = async function() {
         // This ensures we load settings for the correct pubkey
 
         console.log('🌐 Loading relay configuration from database...');
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:51',message:'Before loadRelaysFromDatabase()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         await this.loadRelaysFromDatabase();
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:51',message:'After loadRelaysFromDatabase()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
 
         console.log('🔑 Loading/generating keypair...');
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:54',message:'Before loadKeypair()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         await this.loadKeypair();
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:54',message:'After loadKeypair()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
+        
+        // Check if no keypair is available - navigate to settings and show message
+        if (!appState.hasKeypair()) {
+            console.log('[APP] No keypair found on startup - navigating to settings');
+            // Navigate to settings tab
+            await this.switchTab('settings');
+            // Expand the Nostr Settings section so user can see where to log in
+            setTimeout(() => {
+                const nostrSection = document.querySelector('.settings-section[data-section="nostr"]');
+                if (nostrSection) {
+                    nostrSection.classList.remove('collapsed');
+                }
+            }, 100);
+            // Show message to user
+            this.showSettingsStatus('warning', 'Log in to nostr to continue');
+        }
         
         console.log('🔄 Initializing live event subscription...');
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:57',message:'Before initializeLiveEvents()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         await this.initializeLiveEvents();
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:57',message:'After initializeLiveEvents()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         
         console.log('🎯 Setting up event listeners...');
         this.setupEventListeners();
@@ -90,14 +99,20 @@ NostrMailApp.prototype.init = async function() {
         this.initializeMobileNavigation();
         
         console.log('📬 Loading initial data...');
+        // Ensure DM service is initialized
+        if (!window.dmService) {
+            console.log('🔧 Initializing DM service...');
+            if (typeof DMService !== 'undefined') {
+                window.DMService = DMService;
+                window.dmService = new DMService();
+                console.log('✅ DM service initialized');
+            } else {
+                console.error('❌ DMService class not found. Check if dm-service.js is loaded.');
+            }
+        }
+        
         // Load contacts first so DM contacts can access cached profile photos
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:67',message:'Before contactsService.loadContacts()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         await contactsService.loadContacts();
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:67',message:'After contactsService.loadContacts()',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         
         // Ensure default nostr-mail contact is added for this user
         console.log('📇 Ensuring default nostr-mail contact...');
@@ -126,9 +141,6 @@ NostrMailApp.prototype.init = async function() {
         console.log('✅ ========================================');
         
         this.initialized = true;
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:95',message:'init() completed successfully',data:{hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
     } catch (error) {
         console.error('❌ ========================================');
         console.error('❌   NostrMail - Startup Failed!');
@@ -301,15 +313,7 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
         const keypair = appState.getKeypair();
         const privateKey = keypair ? keypair.private_key : null;
         console.log('[APP] Using private key for decryption:', privateKey ? privateKey.substring(0, 20) + '...' : 'null');
-        
-        // #region agent log
-        const dbQueryStartTime = Date.now();
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:305',message:'Before TauriService.dbGetAllSettings',data:{hypothesisId:'D'},timestamp:dbQueryStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         const dbSettings = await TauriService.dbGetAllSettings(pubkey, privateKey);
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:305',message:'After TauriService.dbGetAllSettings',data:{duration:Date.now()-dbQueryStartTime,settingsCount:Object.keys(dbSettings||{}).length,hypothesisId:'D'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         console.log('[APP] Loaded settings from database:', Object.keys(dbSettings || {}).length, 'keys');
         
         if (dbSettings && Object.keys(dbSettings).length > 0) {
@@ -409,7 +413,7 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
 NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
     try {
         const relays = await TauriService.getDbRelays();
-        console.log('Loaded relays from DB:', relays); // DEBUG
+        console.log('Loaded relays from DB:', relays);
         appState.setRelays(relays);
         
         // Sync disconnected relays first, then render
@@ -427,42 +431,26 @@ NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
 
 // Load keypair
 NostrMailApp.prototype.loadKeypair = async function() {
-    // #region agent log
-    const loadKeypairStartTime = Date.now();
-    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:422',message:'loadKeypair entry',data:{hypothesisId:'A'},timestamp:loadKeypairStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-    // #endregion
     try {
-        // #region agent log
-        const localStorageStartTime = Date.now();
-        // #endregion
         const stored = localStorage.getItem('nostr_keypair');
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:424',message:'After localStorage.getItem',data:{hasStored:!!stored,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
-        let keypair;
+        let keypair = null;
         if (stored) {
-            // #region agent log
-            const parseStartTime = Date.now();
-            // #endregion
             keypair = JSON.parse(stored);
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:427',message:'After JSON.parse stored keypair',data:{hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-            // #endregion
             appState.setKeypair(keypair);
         } else {
-            // #region agent log
-            const generateStartTime = Date.now();
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:430',message:'Before TauriService.generateKeypair',data:{hypothesisId:'B'},timestamp:generateStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-            // #endregion
-            keypair = await TauriService.generateKeypair();
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:430',message:'After TauriService.generateKeypair',data:{duration:Date.now()-generateStartTime,hypothesisId:'B'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-            // #endregion
-            appState.setKeypair(keypair);
-            localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
+            // No keypair in localStorage - don't auto-generate
+            // User must explicitly generate one via the "Generate New Keypair" button
+            appState.setKeypair(null);
+            console.log('[APP] No keypair found in localStorage. User must generate one in settings.');
         }
-        console.log('Keypair loaded:', appState.getKeypair().public_key.substring(0, 20) + '...');
-        this.renderProfilePubkey();
+        
+        // Only proceed with keypair-dependent operations if keypair exists
+        if (keypair) {
+            console.log('Keypair loaded:', appState.getKeypair().public_key.substring(0, 20) + '...');
+            this.renderProfilePubkey();
+        } else {
+            console.log('[APP] No keypair available - skipping keypair-dependent initialization');
+        }
         
         // Populate private key field in settings form if it's empty
         // This ensures the user sees they're already logged in when the app starts
@@ -472,41 +460,21 @@ NostrMailApp.prototype.loadKeypair = async function() {
                 domManager.setValue('nprivKey', keypair.private_key);
                 console.log('[APP] Populated private key field from cached keypair on startup');
                 // Update public key display to show the user is logged in
-                // #region agent log
-                const updateDisplayStartTime = Date.now();
-                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:445',message:'Before updatePublicKeyDisplay',data:{hypothesisId:'C'},timestamp:updateDisplayStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-                // #endregion
                 await this.updatePublicKeyDisplay();
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:445',message:'After updatePublicKeyDisplay',data:{duration:Date.now()-updateDisplayStartTime,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-                // #endregion
             }
         }
         
         // Load settings for this pubkey
         if (keypair && keypair.public_key) {
-            // #region agent log
-            const loadSettingsStartTime = Date.now();
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:451',message:'Before loadSettingsForPubkey',data:{pubkey:keypair.public_key.substring(0,20)+'...',hypothesisId:'D'},timestamp:loadSettingsStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-            // #endregion
             await this.loadSettingsForPubkey(keypair.public_key);
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:451',message:'After loadSettingsForPubkey',data:{duration:Date.now()-loadSettingsStartTime,hypothesisId:'D'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-            // #endregion
         }
         
-        // Initialize persistent Nostr client with the loaded keypair
-        // #region agent log
-        const initClientStartTime = Date.now();
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:455',message:'Before initializeNostrClient',data:{hypothesisId:'E'},timestamp:initClientStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
-        await this.initializeNostrClient();
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:455',message:'After initializeNostrClient',data:{duration:Date.now()-initClientStartTime,hypothesisId:'E'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:422',message:'loadKeypair completed',data:{totalDuration:Date.now()-loadKeypairStartTime,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
+        // Initialize persistent Nostr client with the loaded keypair (only if keypair exists)
+        if (keypair && keypair.private_key) {
+            await this.initializeNostrClient();
+        } else {
+            console.log('[APP] Skipping Nostr client initialization - no keypair available');
+        }
     } catch (error) {
         console.error('Failed to load keypair:', error);
         notificationService.showError('Failed to load encryption keys');
@@ -515,10 +483,6 @@ NostrMailApp.prototype.loadKeypair = async function() {
 
 // Initialize the persistent Nostr client
 NostrMailApp.prototype.initializeNostrClient = async function() {
-    // #region agent log
-    const initNostrClientStartTime = Date.now();
-    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:463',message:'initializeNostrClient entry',data:{hypothesisId:'E'},timestamp:initNostrClientStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-    // #endregion
     try {
         const keypair = appState.getKeypair();
         if (!keypair || !keypair.private_key) {
@@ -527,14 +491,7 @@ NostrMailApp.prototype.initializeNostrClient = async function() {
         }
         
         console.log('[APP] Initializing persistent Nostr client...');
-        // #region agent log
-        const tauriInitStartTime = Date.now();
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:472',message:'Before TauriService.initPersistentNostrClient',data:{hypothesisId:'E'},timestamp:tauriInitStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         await TauriService.initPersistentNostrClient(keypair.private_key);
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:472',message:'After TauriService.initPersistentNostrClient',data:{duration:Date.now()-tauriInitStartTime,hypothesisId:'E'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         console.log('[APP] ✅ Nostr client initialized successfully');
         
         // Update relay status display after client initialization
@@ -742,6 +699,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     // Decrypt mode
                     console.log('[JS] Decrypt button clicked');
                     // Get keys and contact
+                    if (!appState.hasKeypair()) {
+                        return;
+                    }
                     const privkey = appState.getKeypair().private_key;
                     const pubkey = window.emailService?.selectedNostrContact?.pubkey;
                     const armoredBody = domManager.getValue('messageBody') || '';
@@ -837,7 +797,6 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     
                     const keypair = appState.getKeypair();
                     if (!keypair || !keypair.private_key) {
-                        notificationService.showError('No private key found. Please set up your keypair first.');
                         return;
                     }
                     
@@ -1314,7 +1273,6 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     await app.loadSettingsForPubkey(keypair.public_key);
                     
                     // Restart live events with new keypair
-                    console.log('[LiveEvents] New keypair generated, restarting live events');
                     await app.cleanupLiveEvents();
                     await app.initializeLiveEvents();
                     
@@ -1396,7 +1354,6 @@ NostrMailApp.prototype.setupEventListeners = function() {
 // Live Event Subscription System
 NostrMailApp.prototype.initializeLiveEvents = async function() {
     if (!appState.hasKeypair()) {
-        console.log('[LiveEvents] No keypair available, skipping live event subscription');
         this.updateLiveEventsStatus('inactive', 'No keypair');
         return;
     }
@@ -1412,7 +1369,6 @@ NostrMailApp.prototype.initializeLiveEvents = async function() {
         
         this.liveEventsActive = true;
         this.updateLiveEventsStatus('active', 'Connected');
-        console.log('[LiveEvents] Live event subscription initialized successfully');
         
     } catch (error) {
         console.error('[LiveEvents] Failed to initialize live events:', error);
@@ -1423,27 +1379,17 @@ NostrMailApp.prototype.initializeLiveEvents = async function() {
 
 NostrMailApp.prototype.setupLiveEventListeners = async function() {
     try {
-        console.log('[LiveEvents] Setting up event listeners...');
         
         // Listen for live direct messages
         this.dmUnlisten = await window.__TAURI__.event.listen('dm-received', (event) => {
-            console.log('[LiveEvents] *** DM EVENT LISTENER TRIGGERED ***');
-            console.log('[LiveEvents] Raw event:', event);
-            console.log('[LiveEvents] Event payload:', event.payload);
             this.handleLiveDM(event.payload);
         });
         
         // Listen for live profile updates
         this.profileUnlisten = await window.__TAURI__.event.listen('profile-updated', (event) => {
-            console.log('[LiveEvents] *** PROFILE EVENT LISTENER TRIGGERED ***');
-            console.log('[LiveEvents] Raw event:', event);
-            console.log('[LiveEvents] Event payload:', event.payload);
             this.handleLiveProfileUpdate(event.payload);
         });
         
-        console.log('[LiveEvents] Event listeners set up successfully');
-        console.log('[LiveEvents] DM listener:', this.dmUnlisten ? 'ACTIVE' : 'FAILED');
-        console.log('[LiveEvents] Profile listener:', this.profileUnlisten ? 'ACTIVE' : 'FAILED');
         
     } catch (error) {
         console.error('[LiveEvents] Failed to set up event listeners:', error);
@@ -1452,46 +1398,64 @@ NostrMailApp.prototype.setupLiveEventListeners = async function() {
 
 NostrMailApp.prototype.handleLiveDM = function(dmData) {
     try {
-        console.log('[LiveEvents] *** LIVE DM RECEIVED ***');
-        console.log('[LiveEvents] DM Data:', dmData);
-        console.log('[LiveEvents] Event payload:', JSON.stringify(dmData, null, 2));
+        
+        // Dispatch custom DOM event for confirmation waiting (includes event_id)
         
         // Start performance timing
         const startTime = performance.now();
-        console.log('[LiveEvents] Starting UI refresh at', startTime);
         
         // Run refreshes in parallel for better performance
         const refreshPromises = [];
         
-        // Always refresh DM conversations to show new message immediately
-        if (window.dmService) {
-            console.log('[LiveEvents] Starting DM conversations refresh');
-            const contactsPromise = window.dmService.loadDmContacts().catch(error => {
-                console.error('[LiveEvents] Failed to refresh DM conversations:', error);
-            });
-            refreshPromises.push(contactsPromise);
-        }
+        // Check if we're viewing a conversation with this sender/recipient
+        const isInConversationView = document.querySelector('.tab-content#dm.active');
+        const currentContact = window.appState.getSelectedDmContact();
+        const isViewingThisConversation = currentContact && 
+            (currentContact.pubkey === dmData.sender_pubkey || currentContact.pubkey === dmData.recipient_pubkey);
         
-        // If currently viewing messages tab, also refresh the active conversation immediately
-        if (document.querySelector('.tab-content#dm.active')) {
-            // Check if we're viewing a conversation with this sender
-            const currentContact = window.appState.getSelectedDmContact();
-            if (currentContact && 
-                (currentContact.pubkey === dmData.sender_pubkey || currentContact.pubkey === dmData.recipient_pubkey)) {
-                console.log('[LiveEvents] Starting active conversation refresh');
-                if (window.dmService) {
-                    const messagesPromise = window.dmService.loadDmMessages(currentContact.pubkey).catch(error => {
+        // CRITICAL FIX: If viewing this conversation, refresh messages FIRST, then contacts.
+        // This ensures messages appear immediately and aren't overwritten by loadDmContacts.
+        // If NOT viewing this conversation, refresh contacts list only (messages will load when user opens conversation).
+        if (isInConversationView && isViewingThisConversation) {
+            
+            
+            // Refresh messages FIRST (this will render immediately)
+            // Force fresh load from database to ensure newly sent message is included
+            let messagesPromise = null;
+            if (window.dmService) {
+                messagesPromise = window.dmService.loadDmMessages(currentContact.pubkey, true) // forceRefresh = true
+                    .then(() => {
+                    })
+                    .catch(error => {
                         console.error('[LiveEvents] Failed to refresh conversation messages:', error);
                     });
-                    refreshPromises.push(messagesPromise);
-                }
+                refreshPromises.push(messagesPromise);
+            }
+            
+            // Then refresh contacts list AFTER messages are loaded (to update last message preview)
+            // Wait for messages to complete first to prevent race condition
+            if (window.dmService && messagesPromise) {
+                const contactsPromise = messagesPromise.then(() => {
+                    return window.dmService.loadDmContacts();
+                }).catch(error => {
+                    console.error('[LiveEvents] Failed to refresh DM conversations:', error);
+                });
+                refreshPromises.push(contactsPromise);
+            }
+        } else {
+            // Not viewing this conversation - just refresh contacts list
+            
+            if (window.dmService) {
+                const contactsPromise = window.dmService.loadDmContacts().catch(error => {
+                    console.error('[LiveEvents] Failed to refresh DM conversations:', error);
+                });
+                refreshPromises.push(contactsPromise);
             }
         }
         
         // Wait for all refreshes to complete and log timing
         Promise.all(refreshPromises).then(() => {
             const endTime = performance.now();
-            console.log(`[LiveEvents] UI refresh completed in ${(endTime - startTime).toFixed(2)}ms`);
         }).catch(error => {
             const endTime = performance.now();
             console.error(`[LiveEvents] UI refresh failed after ${(endTime - startTime).toFixed(2)}ms:`, error);
@@ -1507,7 +1471,6 @@ NostrMailApp.prototype.handleLiveDM = function(dmData) {
         // Update unread count or other UI indicators
         // TODO: Implement unread count system
         
-        console.log('[LiveEvents] Live DM processed successfully');
         
     } catch (error) {
         console.error('[LiveEvents] Error handling live DM:', error);
@@ -1522,7 +1485,6 @@ NostrMailApp.prototype.handleLiveProfileUpdate = function(profileData) {
         const isOnProfileTab = document.querySelector('.tab-content#profile.active');
         
         if (isCurrentUser && isOnProfileTab) {
-            console.log('[LiveEvents] Updating profile UI for live update');
             
             // Compare with current profile to detect actual changes
             const currentFields = this.editableProfileFields || {};
@@ -1538,7 +1500,6 @@ NostrMailApp.prototype.handleLiveProfileUpdate = function(profileData) {
                 const newValue = newFields[field] || '';
                 if (String(currentValue).trim() !== String(newValue).trim()) {
                     hasChanges = true;
-                    console.log(`[LiveEvents] Profile field '${field}' changed: '${currentValue}' -> '${newValue}'`);
                     break;
                 }
             }
@@ -1548,7 +1509,6 @@ NostrMailApp.prototype.handleLiveProfileUpdate = function(profileData) {
             const newKeys = new Set(Object.keys(newFields));
             if (currentKeys.size !== newKeys.size) {
                 hasChanges = true;
-                console.log('[LiveEvents] Profile fields count changed');
             } else {
                 // Check if any field values differ (including fields not in fieldsToCheck)
                 for (const key of newKeys) {
@@ -1556,7 +1516,6 @@ NostrMailApp.prototype.handleLiveProfileUpdate = function(profileData) {
                     const newValue = newFields[key] || '';
                     if (String(currentValue).trim() !== String(newValue).trim()) {
                         hasChanges = true;
-                        console.log(`[LiveEvents] Profile field '${key}' changed: '${currentValue}' -> '${newValue}'`);
                         break;
                     }
                 }
@@ -1579,7 +1538,6 @@ NostrMailApp.prototype.handleLiveProfileUpdate = function(profileData) {
             if (hasChanges) {
                 notificationService.showInfo('Profile updated from another device');
             } else {
-                console.log('[LiveEvents] Profile update received but no changes detected');
             }
         }
         
@@ -1588,7 +1546,6 @@ NostrMailApp.prototype.handleLiveProfileUpdate = function(profileData) {
             contactsService.updateContactProfile(profileData.pubkey, profileData.fields);
         }
         
-        console.log('[LiveEvents] Live profile update processed successfully');
         
     } catch (error) {
         console.error('[LiveEvents] Error handling live profile update:', error);
@@ -1606,7 +1563,6 @@ NostrMailApp.prototype.updateProfileCache = function(profileData) {
             }
             profileDict[pubkey] = profileData;
             localStorage.setItem('nostr_mail_profiles', JSON.stringify(profileDict));
-            console.log('[LiveEvents] Profile cache updated for', pubkey);
         }
     } catch (error) {
         console.error('[LiveEvents] Error updating profile cache:', error);
@@ -1632,7 +1588,6 @@ NostrMailApp.prototype.cleanupLiveEvents = async function() {
             
             this.liveEventsActive = false;
             this.updateLiveEventsStatus('inactive', 'Disconnected');
-            console.log('[LiveEvents] Live events cleaned up successfully');
             
         } catch (error) {
             console.error('[LiveEvents] Error cleaning up live events:', error);
@@ -1655,7 +1610,6 @@ NostrMailApp.prototype.updateLiveEventsStatus = function(status, text) {
             // Update text
             textElement.textContent = text;
             
-            console.log(`[LiveEvents] Status updated: ${status} - ${text}`);
         }
     } catch (error) {
         console.error('[LiveEvents] Error updating status indicator:', error);
@@ -1694,19 +1648,17 @@ NostrMailApp.prototype.debugLiveEvents = function() {
 
 // Experimental: Try to insert message directly into UI for instant updates
 NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
+    
     try {
-        console.log('[LiveEvents] Attempting direct message insertion');
-        
         // Only try if we're viewing the messages tab
-        if (!document.querySelector('.tab-content#dm.active')) {
-            console.log('[LiveEvents] Not on messages tab, skipping direct insertion');
+        const dmTab = document.querySelector('.tab-content#dm.active');
+        if (!dmTab) {
             return;
         }
         
         // Check if we're viewing a conversation with this sender/recipient
         const currentContact = window.appState.getSelectedDmContact();
         if (!currentContact) {
-            console.log('[LiveEvents] No active conversation, skipping direct insertion');
             return;
         }
         
@@ -1714,25 +1666,23 @@ NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
                                  currentContact.pubkey === dmData.recipient_pubkey;
         
         if (!isRelevantMessage) {
-            console.log('[LiveEvents] Message not for current conversation, skipping direct insertion');
             return;
         }
         
-        // Find the messages container
-        const messagesContainer = document.querySelector('#dm-messages');
+        // Find the messages container - must be .messages-container, not #dm-messages
+        // This is where messages are actually stored (inside #dm-messages)
+        const messagesContainer = document.querySelector('.messages-container');
         if (!messagesContainer) {
-            console.log('[LiveEvents] Messages container not found, skipping direct insertion');
             return;
         }
+        
         
         // Check if this message already exists (prevent duplicates)
         const existingMessage = messagesContainer.querySelector(`[data-event-id="${dmData.event_id}"]`);
         if (existingMessage) {
-            console.log('[LiveEvents] Message already exists in UI, skipping direct insertion');
             return;
         }
         
-        console.log('[LiveEvents] Messages container found, proceeding with insertion');
         
         // Create message element matching the actual DM service structure
         const messageDiv = document.createElement('div');
@@ -1743,10 +1693,11 @@ NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
         const currentUserPubkey = window.appState.getKeypair()?.public_key;
         const isOutgoing = dmData.sender_pubkey === currentUserPubkey;
         
+        // Use correct classes matching dm-service.js structure
         if (isOutgoing) {
-            messageDiv.classList.add('outgoing');
+            messageDiv.classList.add('message-sent');
         } else {
-            messageDiv.classList.add('incoming');
+            messageDiv.classList.add('message-received');
         }
         
         // Format timestamp to match existing messages
@@ -1775,17 +1726,14 @@ NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
         
         // Add to messages container
         messagesContainer.appendChild(messageDiv);
-        console.log('[LiveEvents] Message element appended to container');
         
         // Scroll to bottom
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        console.log('[LiveEvents] Scrolled to bottom');
         
-        console.log('[LiveEvents] Message inserted directly into UI successfully');
-        console.log('[LiveEvents] Message content preview:', dmData.content?.substring(0, 50) + '...');
         
     } catch (error) {
-        console.error('[LiveEvents] Error in direct message insertion:', error);
+        console.error('[DIRECT_INSERT] ✗ ERROR in direct message insertion:', error);
+        console.error('[DIRECT_INSERT] Error stack:', error.stack);
         // Fail silently - the regular refresh will handle it
     }
 };
@@ -2009,22 +1957,9 @@ NostrMailApp.prototype.isMobilePortrait = function() {
 
 // Debug function to check landscape button styles
 NostrMailApp.prototype.debugLandscapeButtons = function() {
-    // #region agent log
-    const windowWidth = window.innerWidth;
-    const windowHeight = window.innerHeight;
-    const orientation = window.innerWidth > window.innerHeight ? 'landscape' : 'portrait';
-    const landscapeMediaQuery = window.matchMedia('(max-width: 480px) and (orientation: landscape)');
-    const portraitMediaQuery = window.matchMedia('(max-width: 480px) and (orientation: portrait)');
-    const mobileMediaQuery = window.matchMedia('(max-width: 768px)');
-    
-    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1965',message:'Debug landscape buttons - window dimensions',data:{windowWidth,windowHeight,orientation,landscapeMatches:landscapeMediaQuery.matches,portraitMatches:portraitMediaQuery.matches,mobileMatches:mobileMediaQuery.matches,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
-    // #endregion
     
     // Check for buttons in tab headers
     const tabHeaders = document.querySelectorAll('.tab-header');
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1975',message:'Debug landscape buttons - tab headers found',data:{tabHeaderCount:tabHeaders.length,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
-    // #endregion
     
     tabHeaders.forEach((header, idx) => {
         const buttons = header.querySelectorAll('.btn');
@@ -2032,32 +1967,9 @@ NostrMailApp.prototype.debugLandscapeButtons = function() {
         const composeActions = header.querySelector('.compose-actions');
         const profileActions = header.querySelector('.profile-actions');
         
-        // #region agent log
-        const buttonData = Array.from(buttons).map((btn, btnIdx) => {
-            const computedStyle = window.getComputedStyle(btn);
-            return {
-                index: btnIdx,
-                className: btn.className,
-                width: computedStyle.width,
-                height: computedStyle.height,
-                padding: computedStyle.padding,
-                fontSize: computedStyle.fontSize,
-                display: computedStyle.display,
-                hasInlineStyle: btn.hasAttribute('style'),
-                inlineStyle: btn.getAttribute('style') || null,
-                textContent: btn.textContent.trim().substring(0, 30)
-            };
-        });
-        
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1990',message:'Debug landscape buttons - header button styles',data:{headerIndex:idx,buttonCount:buttons.length,buttons:buttonData,hasContactsActions:!!contactsActions,hasComposeActions:!!composeActions,hasProfileActions:!!profileActions,hypothesisId:'B'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
-        // #endregion
-        
         // Check for CSS rule matches
         if (contactsActions) {
             const computedStyle = window.getComputedStyle(contactsActions);
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2000',message:'Debug landscape buttons - contacts-actions computed styles',data:{gap:computedStyle.gap,flexWrap:computedStyle.flexWrap,display:computedStyle.display,hypothesisId:'D'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
-            // #endregion
         }
     });
     
@@ -2068,18 +1980,11 @@ NostrMailApp.prototype.debugLandscapeButtons = function() {
         try {
             if (sheet.href && sheet.href.includes('responsive.css')) {
                 responsiveCssFound = true;
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2010',message:'Debug landscape buttons - responsive.css found',data:{sheetIndex:idx,href:sheet.href,hypothesisId:'E'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
-                // #endregion
             }
         } catch (e) {
             // Cross-origin stylesheets may throw errors
         }
     });
-    
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2020',message:'Debug landscape buttons - summary',data:{responsiveCssFound,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
-    // #endregion
 }
 
 // Initialize mobile navigation
@@ -2112,9 +2017,6 @@ NostrMailApp.prototype.initializeMobileNavigation = function() {
     // Listen for orientation changes
     window.addEventListener('orientationchange', () => {
         setTimeout(() => {
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1994',message:'Orientation change detected',data:{hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'orientation-change'})}).catch(()=>{});
-            // #endregion
             if (this.isMobilePortrait()) {
                 this.updateMobileNavState();
             }
@@ -2125,9 +2027,6 @@ NostrMailApp.prototype.initializeMobileNavigation = function() {
     
     // Also listen for resize events to catch landscape mode
     window.addEventListener('resize', () => {
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2005',message:'Resize event detected',data:{width:window.innerWidth,height:window.innerHeight,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'resize'})}).catch(()=>{});
-        // #endregion
         setTimeout(() => {
             this.debugLandscapeButtons();
         }, 100);
@@ -2291,7 +2190,7 @@ NostrMailApp.prototype.setupBackButtons = function() {
     }
 }
 
-NostrMailApp.prototype.switchTab = function(tabName) {
+NostrMailApp.prototype.switchTab = async function(tabName) {
     try {
         // Prevent switching if a sync/load operation is in progress
         const refreshSent = domManager.get('refreshSent');
@@ -2344,7 +2243,17 @@ NostrMailApp.prototype.switchTab = function(tabName) {
             // Load the profile we're viewing
             this.loadProfile(viewingPubkey);
         } else {
+            // Loading own profile - check if keypair exists
+            const keypair = appState.getKeypair();
+            if (!keypair || !keypair.public_key) {
+                // No keypair - redirect to settings
+                notificationService.showWarning('Please generate a keypair first');
+                await this.switchTab('settings');
+                return;
+            }
+            
             // Load own profile and ensure viewing pubkey is cleared
+            // Note: If profile doesn't exist, loadProfile will show an empty form for the user to fill out
             appState.clearViewingProfilePubkey();
             this.loadProfile();
         }
@@ -2374,15 +2283,34 @@ NostrMailApp.prototype.switchTab = function(tabName) {
         }
     }
     if (tabName === 'dm') {
-        // Only load DM contacts if they haven't been loaded yet
-        if (window.dmService) {
-            if (!appState.getDmContacts() || appState.getDmContacts().length === 0) {
-                window.dmService.loadDmContacts();
+        // Always load DM contacts when switching to DM tab to ensure list is up-to-date
+        if (!window.dmService) {
+            console.error('[JS] DM service not initialized. Attempting to initialize...');
+            // Try to initialize if not available (shouldn't happen, but safety check)
+            if (typeof DMService !== 'undefined') {
+                window.DMService = DMService;
+                window.dmService = new DMService();
+                console.log('[JS] DM service initialized successfully');
             } else {
-                // Just render the existing DM contacts
-                window.dmService.renderDmContacts();
+                console.error('[JS] DMService class not found. Checking script loading...');
+                // Check if the script tag exists
+                const dmScript = Array.from(document.querySelectorAll('script')).find(
+                    s => s.src && s.src.includes('dm-service.js')
+                );
+                if (!dmScript) {
+                    console.error('[JS] dm-service.js script tag not found in DOM');
+                    window.notificationService.showError('DM service script not loaded. Please refresh the page.');
+                } else {
+                    console.error('[JS] dm-service.js script tag found but DMService class not available');
+                    window.notificationService.showError('DM service failed to initialize. Please refresh the page.');
+                }
+                return;
             }
         }
+        window.dmService.loadDmContacts().catch(error => {
+            console.error('[JS] Error loading DM contacts:', error);
+            window.notificationService.showError('Failed to load conversations');
+        });
     }
     if (tabName === 'inbox') {
         if (window.emailService) {
@@ -2531,7 +2459,6 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 await this.loadSettingsForPubkey(publicKey);
                 // Note: loadSettingsForPubkey already sets lastLoadedPubkey, so we don't need to set it here
                 
-                console.log('[LiveEvents] Keypair changed, restarting live events');
                 await this.cleanupLiveEvents();
                 await this.initializeLiveEvents();
                 
@@ -3626,9 +3553,21 @@ NostrMailApp.prototype.lastRenderedProfilePubkey = null;
 
 NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
     // Determine which pubkey to load
-    const targetPubkey = pubkey || (appState.getKeypair() && appState.getKeypair().public_key);
-    const currentUserPubkey = appState.getKeypair() && appState.getKeypair().public_key;
+    const keypair = appState.getKeypair();
+    const targetPubkey = pubkey || (keypair && keypair.public_key);
+    const currentUserPubkey = keypair && keypair.public_key;
     const isViewingOwnProfile = !pubkey || (targetPubkey === currentUserPubkey);
+    
+    // Early check: if viewing own profile and no keypair exists, redirect to settings
+    if (isViewingOwnProfile && (!keypair || !keypair.public_key)) {
+        console.log('[Profile] No keypair available - redirecting to settings');
+        notificationService.showWarning('Please generate a keypair first');
+        this.switchTab('settings');
+        return;
+    }
+    
+    // Note: If profile doesn't exist, we'll show an empty form for the user to fill out
+    // No need to redirect - the profile page handles empty profiles gracefully
     
     // Store viewing mode
     this.isViewingOwnProfile = isViewingOwnProfile;
@@ -4307,7 +4246,6 @@ NostrMailApp.prototype.addProfileField = function() {
 // Update profile
 NostrMailApp.prototype.updateProfile = async function() {
     if (!appState.hasKeypair()) {
-        notificationService.showError('No keypair available');
         return;
     }
 
@@ -4374,10 +4312,6 @@ NostrMailApp.prototype.updateProfile = async function() {
 }
 
 NostrMailApp.prototype.updatePublicKeyDisplay = async function() {
-    // #region agent log
-    const updateDisplayStartTime = Date.now();
-    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4133',message:'updatePublicKeyDisplay entry',data:{hypothesisId:'C'},timestamp:updateDisplayStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-    // #endregion
     const nprivKey = domManager.getValue('nprivKey')?.trim() || '';
     
     if (!nprivKey) {
@@ -4386,32 +4320,14 @@ NostrMailApp.prototype.updatePublicKeyDisplay = async function() {
     }
     
     try {
-        // #region agent log
-        const validateStartTime = Date.now();
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4142',message:'Before validatePrivateKey',data:{hypothesisId:'C'},timestamp:validateStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         const isValid = await TauriService.validatePrivateKey(nprivKey);
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4142',message:'After validatePrivateKey',data:{isValid:isValid,duration:Date.now()-validateStartTime,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         
         if (!isValid) {
             domManager.setValue('publicKeyDisplay', 'Invalid private key');
             return;
         }
-        
-        // #region agent log
-        const getPubkeyStartTime = Date.now();
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4149',message:'Before getPublicKeyFromPrivate',data:{hypothesisId:'C'},timestamp:getPubkeyStartTime,sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         const publicKey = await TauriService.getPublicKeyFromPrivate(nprivKey);
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4149',message:'After getPublicKeyFromPrivate',data:{duration:Date.now()-getPubkeyStartTime,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         domManager.setValue('publicKeyDisplay', publicKey);
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4133',message:'updatePublicKeyDisplay completed',data:{totalDuration:Date.now()-updateDisplayStartTime,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-        // #endregion
         
     } catch (error) {
         console.error('Failed to get public key:', error);
@@ -4732,9 +4648,6 @@ NostrMailApp.prototype.initializeSettingsAccordion = function() {
 
 // Initialize when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4369',message:'DOMContentLoaded event fired',data:{hypothesisId:'B'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-    // #endregion
     window.domManager = new DOMManager();
     console.log('🌐 DOM loaded - Initializing NostrMail interface...');
     
@@ -4745,14 +4658,10 @@ document.addEventListener('DOMContentLoaded', () => {
     console.log('🎨 Dark mode initialized:', darkPref === '1' ? 'enabled' : 'disabled');
     
     // Initialize the application
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4380',message:'Calling app.init()',data:{hypothesisId:'B'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
-    // #endregion
     window.app.init();
     
     // Debug button styles after initialization - immediate check
     setTimeout(() => {
-        // #region agent log
         const checkLandscapeButtons = () => {
             const windowWidth = window.innerWidth;
             const windowHeight = window.innerHeight;
@@ -4777,9 +4686,6 @@ document.addEventListener('DOMContentLoaded', () => {
             };
             
             console.log('🔍 EMULATOR Landscape Debug:', debugInfo);
-            
-            const logData = {...debugInfo, hypothesisId:'A'};
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4648',message:'EMULATOR Landscape check - window dimensions and media query',data:logData,timestamp:Date.now(),sessionId:'debug-session',runId:'emulator-check'})}).catch(()=>{});
             
             const tabHeaders = document.querySelectorAll('.tab-header');
             console.log('🔍 Found tab headers:', tabHeaders.length);
@@ -4821,8 +4727,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     
                     console.log(`🔍 Contacts Actions Container Styles:`, containerStyles);
                     
-                    const logData2 = {headerIndex:idx,buttonCount:buttons.length,containerStyles,buttonStyles,hypothesisId:'B'};
-                    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4680',message:'EMULATOR Landscape check - contacts-actions styles',data:logData2,timestamp:Date.now(),sessionId:'debug-session',runId:'emulator-check'})}).catch(()=>{});
                 }
             });
         };

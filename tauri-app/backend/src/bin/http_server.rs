@@ -41,6 +41,9 @@ async fn invoke_handler(
                 .unwrap_or("World");
             Ok(serde_json::json!(format!("Hello, {}! You've been greeted from Rust!", name)))
         },
+        "should_clear_localstorage_cache" => {
+            Ok(serde_json::json!(nostr_mail_lib::should_clear_localstorage_cache_http()))
+        },
         "generate_keypair" => {
             match nostr_mail_lib::generate_keypair_http() {
                 Ok(kp) => Ok(serde_json::to_value(kp).unwrap()),

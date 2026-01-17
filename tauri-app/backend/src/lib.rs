@@ -15,8 +15,8 @@ mod database;
 use types::*;
 pub use state::{AppState, Relay};
 pub use types::KeyPair;
-use storage::{Storage, Contact, Conversation, UserProfile, AppSettings, EmailDraft};
-use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay};
+use storage::{Storage, Contact, UserProfile, AppSettings, EmailDraft};
+use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation};
 use crate::types::{EmailMessage, RelayStatus, RelayConnectionStatus};
 
 use nostr_sdk::Metadata;
@@ -28,6 +28,7 @@ use std::time::Duration;
 use state::EventSubscription;
 use serde_json;
 use tauri::Emitter;
+use chrono::{DateTime, Utc};
 
 fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
     let raw_headers = email.raw_headers.clone().unwrap_or_default();
@@ -56,6 +57,7 @@ async fn send_direct_message_persistent(
     content: &MessageContent,
     encryption_algorithm: Option<&str>,
     state: &AppState,
+    app_handle: Option<&tauri::AppHandle>,
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
     use crate::types::MessageContent;
@@ -99,25 +101,74 @@ async fn send_direct_message_persistent(
         }
     };
     
-    // Create and send the event
-    let event = EventBuilder::new(Kind::EncryptedDirectMessage, &encrypted_content)
+    // Build and sign the event first to get the event ID
+    let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, &encrypted_content)
         .tag(Tag::public_key(recipient));
     
-    let output = client.send_event_builder(event).await.map_err(|e| e.to_string())?;
+    let event = event_builder.build(keys.public_key()).sign_with_keys(&keys).map_err(|e| e.to_string())?;
+    let event_id = event.id.to_hex();
+    let event_timestamp = event.created_at.as_u64();
     
-    println!("[RUST] Message sent successfully with output: {:?}", output);
+    println!("[RUST] Built and signed event with ID: {}", event_id);
     
-    // The output.success contains relay URLs that successfully received the event
-    // For now, we'll generate a placeholder event ID since we can't get the actual ID from Output
-    // In a real implementation, you might want to store the event before sending
-    let placeholder_id = format!("sent_to_{}_relays", output.success.len());
-    Ok(placeholder_id)
+    // Send the event to relays (DO NOT save to database here - persistence happens when live handler receives confirmation)
+    let send_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let output = client.send_event(&event).await.map_err(|e| e.to_string())?;
+    let send_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    
+    println!("[RUST] Message sent to relays. Success: {}, Failed: {}", 
+        output.success.len(), output.failed.len());
+    
+    // CRITICAL FIX: Relays don't immediately echo sent messages back to the sender.
+    // Manually trigger the live handler immediately after successful send to avoid delay.
+    // This ensures the sender sees their message instantly, matching receiver experience.
+    if output.success.len() > 0 {
+        if let Some(app_handle) = app_handle {
+            println!("[RUST] Manually triggering live handler for sent message (relays don't echo immediately)");
+            
+            // Process the sent message through the live handler immediately
+            // This uses the same code path as relay notifications, ensuring consistency
+            let app_handle_clone = app_handle.clone();
+            let state_clone = state.clone();
+            let user_pubkey_clone = keys.public_key();
+            let event_clone = event.clone();
+            
+            // Spawn async task to handle without blocking
+            tokio::spawn(async move {
+                if let Err(e) = handle_live_direct_message(&event_clone, &app_handle_clone, &state_clone, &user_pubkey_clone).await {
+                    println!("[RUST] Error manually handling sent DM: {}", e);
+                } else {
+                    println!("[RUST] Successfully processed sent message via manual handler");
+                }
+            });
+        } else {
+            println!("[RUST] App handle not available, cannot manually trigger handler (message will appear when relay echoes it back)");
+        }
+    }
+    
+    // Return the actual event ID - frontend will receive confirmation via manual handler
+    Ok(event_id)
 }
 
 #[tauri::command]
 fn greet(name: &str) -> String {
     println!("[RUST] greet called with: {}", name);
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[tauri::command]
+fn should_clear_localstorage_cache() -> bool {
+    match std::env::var("NOSTR_MAIL_CLEAR_CACHE") {
+        Ok(val) => {
+            println!("[RUST] NOSTR_MAIL_CLEAR_CACHE environment variable is set to: {}", val);
+            // Return true if the variable is set to "1", "true", "yes", or any non-empty value
+            val == "1" || val.to_lowercase() == "true" || val.to_lowercase() == "yes" || !val.is_empty()
+        },
+        Err(_) => {
+            println!("[RUST] NOSTR_MAIL_CLEAR_CACHE environment variable is not set");
+            false
+        }
+    }
 }
 
 #[tauri::command]
@@ -186,7 +237,11 @@ fn recheck_email_signature(message_id: String, state: tauri::State<AppState>) ->
 }
 
 #[tauri::command]
-async fn send_direct_message(request: DirectMessageRequest, state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn send_direct_message(
+    request: DirectMessageRequest, 
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle
+) -> Result<String, String> {
     println!("[RUST] send_direct_message called");
     println!("[RUST] Recipient: {}", request.recipient_pubkey);
     println!("[RUST] Content type: {:?}", request.content);
@@ -197,7 +252,8 @@ async fn send_direct_message(request: DirectMessageRequest, state: tauri::State<
         &request.recipient_pubkey,
         &request.content,
         request.encryption_algorithm.as_deref(),
-        &state
+        &state,
+        Some(&app_handle)
     )
     .await
     .map(|event_id| {
@@ -215,19 +271,16 @@ async fn send_direct_message(request: DirectMessageRequest, state: tauri::State<
 
 #[tauri::command]
 async fn fetch_direct_messages(private_key: String, relays: Vec<String>, since: Option<i64>) -> Result<Vec<NostrEvent>, String> {
-    println!("[RUST] fetch_direct_messages called");
     nostr::fetch_direct_messages(&private_key, &relays, since).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn fetch_conversations(private_key: String, relays: Vec<String>) -> Result<Vec<nostr::Conversation>, String> {
-    println!("[RUST] fetch_conversations called");
     nostr::fetch_conversations(&private_key, &relays).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn fetch_conversation_messages(private_key: String, contact_pubkey: String, relays: Vec<String>) -> Result<Vec<nostr::ConversationMessage>, String> {
-    println!("[RUST] fetch_conversation_messages called for contact: {}", contact_pubkey);
     nostr::fetch_conversation_messages(&private_key, &contact_pubkey, &relays).await.map_err(|e| e.to_string())
 }
 
@@ -579,7 +632,6 @@ async fn get_nostr_client_status(state: tauri::State<'_, AppState>) -> Result<bo
 
 #[tauri::command]
 async fn get_relay_status(state: tauri::State<'_, AppState>) -> Result<Vec<RelayStatus>, String> {
-    println!("[RUST] get_relay_status called");
     let client_option = {
         let client_guard = state.nostr_client.lock().unwrap();
         client_guard.clone()
@@ -672,15 +724,8 @@ async fn test_relay_connection(relay_url: String) -> Result<bool, String> {
 
 #[tauri::command]
 fn decrypt_dm_content(private_key: String, sender_pubkey: String, encrypted_content: String) -> Result<String, String> {
-    println!("[RUST] decrypt_dm_content called");
-    println!("[RUST] Decrypting with sender_pubkey: {}", sender_pubkey);
-    println!("[RUST] Encrypted content: {}", encrypted_content);
-    let result = nostr::decrypt_dm_content(&private_key, &sender_pubkey, &encrypted_content);
-    match &result {
-        Ok(decrypted) => println!("[RUST] Decryption successful: {}", decrypted),
-        Err(e) => println!("[RUST] Decryption failed: {}", e),
-    }
-    result.map_err(|e| e.to_string())
+    nostr::decrypt_dm_content(&private_key, &sender_pubkey, &encrypted_content)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1109,7 +1154,6 @@ fn storage_save_contacts(contacts: Vec<Contact>) -> Result<(), String> {
 
 #[tauri::command]
 fn storage_get_contacts() -> Result<Vec<Contact>, String> {
-    println!("[RUST] storage_get_contacts called");
     let storage = Storage::new().map_err(|e| e.to_string())?;
     storage.get_contacts().map_err(|e| e.to_string())
 }
@@ -1121,26 +1165,6 @@ fn storage_clear_contacts() -> Result<(), String> {
     storage.clear_contacts().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn storage_save_conversations(conversations: Vec<Conversation>) -> Result<(), String> {
-    println!("[RUST] storage_save_conversations called");
-    let storage = Storage::new().map_err(|e| e.to_string())?;
-    storage.save_conversations(conversations).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn storage_get_conversations() -> Result<Vec<Conversation>, String> {
-    println!("[RUST] storage_get_conversations called");
-    let storage = Storage::new().map_err(|e| e.to_string())?;
-    storage.get_conversations().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn storage_clear_conversations() -> Result<(), String> {
-    println!("[RUST] storage_clear_conversations called");
-    let storage = Storage::new().map_err(|e| e.to_string())?;
-    storage.clear_conversations().map_err(|e| e.to_string())
-}
 
 #[tauri::command]
 fn storage_save_user_profile(profile: UserProfile) -> Result<(), String> {
@@ -1172,7 +1196,6 @@ fn storage_save_settings(settings: AppSettings) -> Result<(), String> {
 
 #[tauri::command]
 fn storage_get_settings() -> Result<Option<AppSettings>, String> {
-    println!("[RUST] storage_get_settings called");
     let storage = Storage::new().map_err(|e| e.to_string())?;
     storage.get_settings().map_err(|e| e.to_string())
 }
@@ -1207,7 +1230,6 @@ fn storage_save_relays(relays: Vec<storage::Relay>) -> Result<(), String> {
 
 #[tauri::command]
 fn storage_get_relays() -> Result<Vec<storage::Relay>, String> {
-    println!("[RUST] storage_get_relays called");
     let storage = Storage::new().map_err(|e| e.to_string())?;
     storage.get_relays().map_err(|e| e.to_string())
 }
@@ -1228,10 +1250,8 @@ fn storage_get_data_size() -> Result<u64, String> {
 
 #[tauri::command]
 fn get_contacts() -> Result<Vec<storage::Contact>, String> {
-    println!("[RUST] get_contacts called");
     let storage = Storage::new().map_err(|e| e.to_string())?;
     let contacts = storage.get_contacts().map_err(|e| e.to_string())?;
-    println!("[RUST] Retrieved {} contacts from storage", contacts.len());
     Ok(contacts)
 }
 
@@ -1264,22 +1284,6 @@ fn update_contact_picture_data_url(pubkey: String, picture_data_url: String) -> 
     storage.update_contact_picture_data_url(&pubkey, picture_data_url).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn get_conversations() -> Result<Vec<Conversation>, String> {
-    println!("[RUST] get_conversations called");
-    let storage = Storage::new().map_err(|e| e.to_string())?;
-    storage.get_conversations().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn set_conversations(conversations: Vec<Conversation>) -> Result<(), String> {
-    println!("[RUST] set_conversations called with {} conversations", conversations.len());
-    let storage = Storage::new().map_err(|e| e.to_string())?;
-    println!("[RUST] set_conversations: Storage initialized, saving conversations...");
-    let result = storage.save_conversations(conversations).map_err(|e| e.to_string());
-    println!("[RUST] set_conversations: Save operation completed");
-    result
-}
 
 #[tauri::command]
 async fn test_imap_connection(email_config: EmailConfig) -> Result<(), String> {
@@ -1328,6 +1332,11 @@ fn generate_qr_code(data: String, _size: Option<u32>) -> Result<String, String> 
 
 /// Get the app data directory path, handling Android-specific paths
 fn get_app_data_dir() -> Result<std::path::PathBuf, String> {
+    // Check for custom database path override via environment variable
+    if let Ok(custom_db_path) = std::env::var("NOSTR_MAIL_DB") {
+        return Ok(std::path::PathBuf::from(custom_db_path));
+    }
+    
     #[cfg(target_os = "android")]
     {
         // On Android, apps can write to their internal files directory
@@ -1388,7 +1397,6 @@ fn db_save_contact(contact: DbContact, state: tauri::State<AppState>) -> Result<
 
 #[tauri::command]
 fn db_get_contact(pubkey: String, state: tauri::State<AppState>) -> Result<Option<DbContact>, String> {
-    println!("[RUST] db_get_contact called for pubkey: {}", pubkey);
     let db = state.get_database()?;
     db.get_contact(&pubkey).map_err(|e| e.to_string())
 }
@@ -2229,43 +2237,137 @@ fn db_get_decrypted_dms_for_conversation(
         } else {
             &msg.sender_pubkey
         };
-        let id_str = msg.id.map(|id| id.to_string()).unwrap_or_else(|| "<no id>".to_string());
-        println!("[DM DECRYPT] Processing message id={}", id_str);
-        println!("[DM DECRYPT] Message details: sender={}, recipient={}", msg.sender_pubkey, msg.recipient_pubkey);
-        println!("[DM DECRYPT] Using decrypt_sender_pubkey={} (for decryption)", decrypt_sender_pubkey);
-        println!("[DM DECRYPT] Content length: {} bytes", msg.content.len());
-        println!("[DM DECRYPT] Content preview: {}", &msg.content.chars().take(100).collect::<String>());
-        
         match crate::nostr::decrypt_dm_content(&private_key, decrypt_sender_pubkey, &msg.content) {
             Ok(decrypted) => {
-                println!("[DM DECRYPT] Success: id={}, sender={}, recipient={}, decrypted='{}'", id_str, msg.sender_pubkey, msg.recipient_pubkey, &decrypted.chars().take(80).collect::<String>());
                 msg.content = decrypted;
             },
             Err(e) => {
-                println!(
-                    "[DM DECRYPT] Failed: id={}, sender={}, recipient={}, error={}",
-                    id_str,
+                eprintln!(
+                    "[DM DECRYPT] Failed to decrypt message: sender={}, recipient={}, error={}",
                     msg.sender_pubkey,
                     msg.recipient_pubkey,
                     e
-                );
-                println!(
-                    "[DM DECRYPT] Failed message details: sender_pubkey_raw={:?}, recipient_pubkey_raw={:?}, decrypt_sender_pubkey={:?}",
-                    msg.sender_pubkey,
-                    msg.recipient_pubkey,
-                    decrypt_sender_pubkey
-                );
-                println!(
-                    "[DM DECRYPT] Failed content analysis: length={}, sample={:?}, full_content={:?}",
-                    msg.content.len(),
-                    &msg.content.chars().take(100).collect::<String>(),
-                    &msg.content
                 );
                 msg.content = "[Failed to decrypt]".to_string();
             },
         }
     }
     Ok(messages)
+}
+
+// Response struct for conversations with decrypted last message
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct ConversationWithDecryptedLastMessage {
+    pub id: Option<i64>,
+    pub user_pubkey: String,
+    pub contact_pubkey: String,
+    pub contact_name: Option<String>,
+    pub last_message: String,  // Decrypted on-demand
+    pub last_timestamp: i64,
+    pub message_count: i64,
+    pub cached_at: DateTime<Utc>,
+}
+
+// Database commands for conversations
+#[tauri::command]
+fn db_save_conversation(conversation: DbConversation, state: tauri::State<AppState>) -> Result<i64, String> {
+    println!("[RUST] db_save_conversation called");
+    let db = state.get_database()?;
+    db.save_conversation(&conversation).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_conversations(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<DbConversation>, String> {
+    println!("[RUST] db_get_conversations called for user: {}", user_pubkey);
+    let db = state.get_database()?;
+    db.get_conversations(&user_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_conversations_with_decrypted_last_message(
+    user_pubkey: String,
+    private_key: String,
+    state: tauri::State<AppState>
+) -> Result<Vec<ConversationWithDecryptedLastMessage>, String> {
+    println!("[RUST] db_get_conversations_with_decrypted_last_message called for user: {}", user_pubkey);
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let conversations = db.get_conversations(&user_pubkey).map_err(|e| e.to_string())?;
+    
+    let mut result = Vec::new();
+    for conv in conversations {
+        // Fetch the last message by event_id and decrypt it
+        let last_message = match db.get_dm_encrypted_content_by_event_id(&conv.last_message_event_id) {
+            Ok(encrypted_content) => {
+                // Determine which pubkey to use for decryption (the other party in the conversation)
+                let decrypt_sender_pubkey = if conv.user_pubkey == user_pubkey {
+                    &conv.contact_pubkey
+                } else {
+                    &conv.user_pubkey
+                };
+                
+                match crate::nostr::decrypt_dm_content(&private_key, decrypt_sender_pubkey, &encrypted_content) {
+                    Ok(decrypted) => decrypted,
+                    Err(e) => {
+                        println!("[RUST] Failed to decrypt last message for conversation {}: {}", conv.contact_pubkey, e);
+                        "[Failed to decrypt]".to_string()
+                    }
+                }
+            },
+            Err(e) => {
+                println!("[RUST] Failed to fetch last message for conversation {}: {}", conv.contact_pubkey, e);
+                "[Message not found]".to_string()
+            }
+        };
+        
+        result.push(ConversationWithDecryptedLastMessage {
+            id: conv.id,
+            user_pubkey: conv.user_pubkey,
+            contact_pubkey: conv.contact_pubkey,
+            contact_name: conv.contact_name,
+            last_message,
+            last_timestamp: conv.last_timestamp,
+            message_count: conv.message_count,
+            cached_at: conv.cached_at,
+        });
+    }
+    
+    Ok(result)
+}
+
+#[tauri::command]
+fn db_get_conversation(user_pubkey: String, contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<DbConversation>, String> {
+    println!("[RUST] db_get_conversation called for user: {}, contact: {}", user_pubkey, contact_pubkey);
+    let db = state.get_database()?;
+    db.get_conversation(&user_pubkey, &contact_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_update_conversation_metadata(
+    user_pubkey: String,
+    contact_pubkey: String,
+    last_message_event_id: String,
+    last_timestamp: i64,
+    message_count: i64,
+    state: tauri::State<AppState>
+) -> Result<(), String> {
+    println!("[RUST] db_update_conversation_metadata called");
+    let db = state.get_database()?;
+    db.update_conversation_metadata(&user_pubkey, &contact_pubkey, &last_message_event_id, last_timestamp, message_count)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_delete_conversation(user_pubkey: String, contact_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_delete_conversation called");
+    let db = state.get_database()?;
+    db.delete_conversation(&user_pubkey, &contact_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_clear_conversations(user_pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_clear_conversations called");
+    let db = state.get_database()?;
+    db.clear_conversations(&user_pubkey).map_err(|e| e.to_string())
 }
 
 // Database commands for attachments
@@ -2753,6 +2855,107 @@ async fn sync_direct_messages_with_network(private_key: String, relays: Vec<Stri
 }
 
 #[tauri::command]
+async fn sync_conversation_with_network(
+    private_key: String,
+    contact_pubkey: String,
+    relays: Vec<String>,
+    state: tauri::State<'_, AppState>
+) -> Result<usize, String> {
+    println!("[RUST] sync_conversation_with_network called for contact: {}", contact_pubkey);
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    
+    // Get user's pubkey
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key)
+        .map_err(|e| e.to_string())?;
+    let keys = nostr_sdk::prelude::Keys::new(secret_key);
+    let user_pubkey = keys.public_key().to_bech32().map_err(|e| e.to_string())?;
+    
+    // Get latest timestamp for this conversation
+    let latest = db.get_latest_dm_created_at_for_conversation(&user_pubkey, &contact_pubkey)
+        .map_err(|e| e.to_string())?;
+    let since = latest.map(|dt| dt.timestamp());
+    
+    println!("[RUST] Latest timestamp for conversation: {:?}", since);
+    
+    // Parse contact pubkey
+    let contact_pubkey_parsed = nostr_sdk::prelude::PublicKey::from_bech32(&contact_pubkey)
+        .map_err(|e| e.to_string())?;
+    
+    // Create client and fetch events
+    let client = nostr_sdk::prelude::Client::new(keys.clone());
+    for relay in &relays {
+        client.add_relay(relay.clone()).await.map_err(|e| e.to_string())?;
+    }
+    client.connect().await;
+    
+    // Create filter for messages between these two users
+    let mut filter = nostr_sdk::prelude::Filter::new()
+        .kind(nostr_sdk::prelude::Kind::EncryptedDirectMessage)
+        .authors([keys.public_key(), contact_pubkey_parsed])
+        .pubkeys([keys.public_key(), contact_pubkey_parsed]);
+    
+    if let Some(since_ts) = since {
+        filter = filter.since(nostr_sdk::prelude::Timestamp::from(since_ts as u64));
+    }
+    
+    let events = client.fetch_events(filter, std::time::Duration::from_secs(10))
+        .await.map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Fetched {} events for conversation", events.len());
+    
+    // Convert and save to database
+    let mut saved_count = 0;
+    for event in events {
+        let sender_npub = event.pubkey.to_bech32().map_err(|e| e.to_string())?;
+        let recipient_npub = event.tags.iter()
+            .find(|tag| tag.kind().as_str() == "p")
+            .and_then(|tag| tag.content())
+            .and_then(|pk| {
+                nostr_sdk::prelude::PublicKey::from_bech32(pk)
+                    .or_else(|_| nostr_sdk::prelude::PublicKey::from_hex(pk))
+                    .ok()
+                    .and_then(|pubkey| pubkey.to_bech32().ok())
+            })
+            .unwrap_or_else(|| user_pubkey.clone());
+        
+        // Ensure this message is actually between the user and contact
+        if sender_npub != user_pubkey && sender_npub != contact_pubkey {
+            continue; // Skip messages not from user or contact
+        }
+        if recipient_npub != user_pubkey && recipient_npub != contact_pubkey {
+            continue; // Skip messages not to user or contact
+        }
+        
+        let dm = DbDirectMessage {
+            id: None,
+            event_id: event.id.to_hex(),
+            sender_pubkey: sender_npub,
+            recipient_pubkey: recipient_npub,
+            content: event.content,
+            created_at: chrono::DateTime::from_timestamp(event.created_at.as_u64() as i64, 0)
+                .unwrap_or_else(|| chrono::Utc::now()),
+            received_at: chrono::Utc::now(),
+        };
+        
+        match db.save_dm(&dm) {
+            Ok(_) => saved_count += 1,
+            Err(e) => {
+                if !e.to_string().contains("UNIQUE constraint failed") {
+                    println!("[RUST] Failed to save DM: {}", e);
+                }
+            }
+        }
+    }
+    
+    // Update conversation metadata
+    let _ = db.update_conversation_from_messages(&user_pubkey, &contact_pubkey);
+    let _ = db.update_conversation_from_messages(&contact_pubkey, &user_pubkey);
+    
+    println!("[RUST] Saved {} new messages for conversation", saved_count);
+    Ok(saved_count)
+}
+
+#[tauri::command]
 fn db_get_all_dm_pubkeys(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     db.get_all_dm_pubkeys().map_err(|e| e.to_string())
@@ -3014,6 +3217,10 @@ async fn handle_subscription_notifications(
                 RelayPoolNotification::Event { event, .. } => {
                     match event.kind {
                         Kind::EncryptedDirectMessage => {
+                            let notification_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                            let event_id = event.id.to_hex();
+                            let is_sent = event.pubkey == user_pubkey;
+                            
                             println!("[RUST] Processing DM: {}", event.id.to_hex()[..8].to_string() + "...");
                             if let Err(e) = handle_live_direct_message(&event, &app_handle, &state, &user_pubkey).await {
                                 println!("[RUST] Error handling DM: {}", e);
@@ -3078,7 +3285,9 @@ async fn handle_live_direct_message(
     state: &AppState,
     user_pubkey: &PublicKey,
 ) -> Result<(), String> {
-    // Processing live DM - logging handled by caller
+    let handler_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let event_id = event.id.to_hex();
+    let is_sent = event.pubkey == *user_pubkey;
     
     // Convert sender_pubkey to npub format
     let sender_npub = event.pubkey.to_bech32().map_err(|e| e.to_string())?;
@@ -3109,11 +3318,14 @@ async fn handle_live_direct_message(
     
     // Save to database (will handle deduplication via UNIQUE constraint)
     let db = state.get_database().map_err(|e| e.to_string())?;
+    let save_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
     match db.save_dm(&dm) {
         Ok(_) => {
+            let save_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             println!("[RUST] Saved live DM to database");
             
             // Emit event to frontend
+            let emit_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             let dm_payload = serde_json::json!({
                 "event_id": event.id.to_hex(),
                 "sender_pubkey": sender_npub,
@@ -3126,13 +3338,14 @@ async fn handle_live_direct_message(
             if let Err(e) = app_handle.emit("dm-received", &dm_payload) {
                 println!("[RUST] Failed to emit dm-received event: {}", e);
             } else {
+                let emit_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
                 println!("[RUST] Emitted dm-received event");
             }
         },
         Err(e) => {
             // Check if it's a duplicate (UNIQUE constraint violation)
             if e.to_string().contains("UNIQUE constraint failed") {
-                println!("[RUST] DM already exists in database (duplicate): {}", event.id.to_hex());
+                // Duplicate message - silently ignore
             } else {
                 println!("[RUST] Failed to save DM: {}", e);
                 return Err(format!("Failed to save DM: {}", e));
@@ -3320,7 +3533,6 @@ fn db_mark_as_read(message_id: String, state: tauri::State<AppState>) -> Result<
 
 #[tauri::command]
 fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<bool, String> {
-    println!("[RUST] db_check_dm_matches_email_encrypted called for DM event_id: {}", dm_event_id);
     let db = state.get_database().map_err(|e| e.to_string())?;
     
     // Get the DM content hash for fast lookup
@@ -3328,23 +3540,17 @@ fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String
         .map_err(|e| e.to_string())? {
         Some(hash) => hash,
         None => {
-            println!("[RUST] DM not found or hash not available");
             return Ok(false);
         }
     };
     
-    println!("[RUST] DM content hash: {}", dm_content_hash);
-    
     // Use hash-based lookup instead of scanning all emails
     match db.find_email_by_subject_hash(&dm_content_hash)
         .map_err(|e| e.to_string())? {
-        Some(email) => {
-            println!("[RUST] Found matching email for DM content. Email ID: {}, Subject length: {}", 
-                email.id.unwrap_or(0), email.subject.len());
+        Some(_email) => {
             Ok(true)
         },
         None => {
-            println!("[RUST] No matching email found for DM content hash");
             Ok(false)
         }
     }
@@ -3526,23 +3732,11 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pu
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // #region agent log
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
-        use std::io::Write;
-        writeln!(f, r#"{{"id":"log_backend_start","timestamp":{},"location":"lib.rs:3468","message":"Backend run() function entry","data":{{"hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-    });
-    // #endregion
     println!("[RUST] Starting nostr-mail application...");
     println!("[RUST] Registering Tauri commands...");
 
     // Create AppState and initialize the database
     let app_state = AppState::new();
-    // #region agent log
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
-        use std::io::Write;
-        writeln!(f, r#"{{"id":"log_appstate_created","timestamp":{},"location":"lib.rs:3473","message":"AppState created","data":{{"hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-    });
-    // #endregion
     // Use platform-specific app data directory
     match get_app_data_dir() {
         Ok(app_dir) => {
@@ -3554,23 +3748,11 @@ pub fn run() {
                 println!("[RUST] Initializing database at: {:?}", db_path);
                 match app_state.init_database(&db_path) {
                     Ok(()) => {
-                        // #region agent log
-                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
-                            use std::io::Write;
-                            writeln!(f, r#"{{"id":"log_db_init_success","timestamp":{},"location":"lib.rs:3484","message":"Database initialized successfully","data":{{"dbPath":"{}","hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), db_path.display())
-                        });
-                        // #endregion
                         // Database initialized successfully
                         // Contacts will be loaded per-user when needed
                         println!("[RUST] Database initialized successfully");
                     },
                     Err(e) => {
-                        // #region agent log
-                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
-                            use std::io::Write;
-                            writeln!(f, r#"{{"id":"log_db_init_error","timestamp":{},"location":"lib.rs:3489","message":"Database initialization failed","data":{{"error":"{}","hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), e)
-                        });
-                        // #endregion
                         println!("[RUST] Failed to initialize database at startup: {}", e)
                     },
                 }
@@ -3593,6 +3775,7 @@ pub fn run() {
     
     let builder = builder.invoke_handler(tauri::generate_handler![
         greet,
+        should_clear_localstorage_cache,
         generate_keypair,
         validate_private_key,
         validate_public_key,
@@ -3635,9 +3818,6 @@ pub fn run() {
         storage_save_contacts,
         storage_get_contacts,
         storage_clear_contacts,
-        storage_save_conversations,
-        storage_get_conversations,
-        storage_clear_conversations,
         storage_save_user_profile,
         storage_get_user_profile,
         storage_clear_user_profile,
@@ -3655,8 +3835,6 @@ pub fn run() {
         save_contact,
         get_contact,
         update_contact_picture_data_url,
-        get_conversations,
-        set_conversations,
         test_imap_connection,
         test_smtp_connection,
         check_message_confirmation,
@@ -3688,6 +3866,13 @@ pub fn run() {
         db_save_dm,
         db_get_dms_for_conversation,
         db_get_decrypted_dms_for_conversation,
+        db_save_conversation,
+        db_get_conversations,
+        db_get_conversations_with_decrypted_last_message,
+        db_get_conversation,
+        db_update_conversation_metadata,
+        db_delete_conversation,
+        db_clear_conversations,
         db_save_attachment,
         db_get_attachments_for_email,
         db_get_attachment,
@@ -3713,6 +3898,7 @@ pub fn run() {
         sync_sent_emails,
         sync_all_emails,
         sync_direct_messages_with_network,
+        sync_conversation_with_network,
         db_get_all_dm_pubkeys,
         db_get_all_dm_pubkeys_sorted,
         update_profile,
@@ -3736,12 +3922,6 @@ pub fn run() {
     println!("[RUST] Context generated successfully");
     
     println!("[RUST] Starting Tauri application...");
-    // #region agent log
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/asherp/git/nostr-mail/.cursor/debug.log").and_then(|mut f| {
-        use std::io::Write;
-        writeln!(f, r#"{{"id":"log_tauri_starting","timestamp":{},"location":"lib.rs:3651","message":"Tauri runtime starting","data":{{"hypothesisId":"A"}},"sessionId":"debug-session","runId":"startup"}}"#, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-    });
-    // #endregion
     builder.run(context)
         .expect("error while running tauri application");
 }
@@ -3778,6 +3958,20 @@ pub fn validate_private_key_http(private_key: &str) -> Result<bool, String> {
 
 pub fn validate_public_key_http(public_key: &str) -> Result<bool, String> {
     crypto::validate_public_key(public_key).map_err(|e| e.to_string())
+}
+
+pub fn should_clear_localstorage_cache_http() -> bool {
+    match std::env::var("NOSTR_MAIL_CLEAR_CACHE") {
+        Ok(val) => {
+            println!("[RUST] NOSTR_MAIL_CLEAR_CACHE environment variable is set to: {}", val);
+            // Return true if the variable is set to "1", "true", "yes", or any non-empty value
+            val == "1" || val.to_lowercase() == "true" || val.to_lowercase() == "yes" || !val.is_empty()
+        },
+        Err(_) => {
+            println!("[RUST] NOSTR_MAIL_CLEAR_CACHE environment variable is not set");
+            false
+        }
+    }
 }
 
 pub fn get_public_key_from_private_http(private_key: &str) -> Result<String, String> {

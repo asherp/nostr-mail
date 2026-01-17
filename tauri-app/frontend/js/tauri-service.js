@@ -251,11 +251,32 @@ const TauriService = {
     updateContactPictureDataUrl: async function(pubkey, pictureDataUrl) {
         return await this.invoke('update_contact_picture_data_url', { pubkey, pictureDataUrl });
     },
-    getConversations: async function() {
-        return await this.invoke('get_conversations');
+    getConversations: async function(userPubkey, privateKey) {
+        return await this.invoke('db_get_conversations_with_decrypted_last_message', { 
+            userPubkey, 
+            privateKey 
+        });
     },
-    setConversations: async function(conversations) {
-        return await this.invoke('set_conversations', { conversations });
+    getConversationsWithoutDecryption: async function(userPubkey) {
+        return await this.invoke('db_get_conversations', { userPubkey });
+    },
+    saveConversation: async function(conversation) {
+        return await this.invoke('db_save_conversation', { conversation });
+    },
+    updateConversationMetadata: async function(userPubkey, contactPubkey, lastMessageEventId, lastTimestamp, messageCount) {
+        return await this.invoke('db_update_conversation_metadata', {
+            userPubkey,
+            contactPubkey,
+            lastMessageEventId,
+            lastTimestamp,
+            messageCount
+        });
+    },
+    deleteConversation: async function(userPubkey, contactPubkey) {
+        return await this.invoke('db_delete_conversation', { userPubkey, contactPubkey });
+    },
+    clearConversations: async function(userPubkey) {
+        return await this.invoke('db_clear_conversations', { userPubkey });
     },
     getRelays: async function() {
         return await this.invoke('get_relays');

@@ -17,32 +17,6 @@ pub struct Contact {
     pub cached_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Conversation {
-    pub contact_pubkey: String,
-    pub contact_name: Option<String>,
-    pub last_message: String,
-    pub last_timestamp: i64,
-    pub message_count: usize,
-    pub messages: Vec<ConversationMessage>,
-    pub cached_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationMessage {
-    pub id: String,
-    pub sender_pubkey: String,
-    pub receiver_pubkey: String,
-    pub content: String,
-    pub timestamp: i64,
-    pub is_sent: bool,
-    #[serde(default = "default_confirmed")]
-    pub confirmed: bool,
-}
-
-fn default_confirmed() -> bool {
-    false
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
@@ -86,7 +60,6 @@ pub struct EmailDraft {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageData {
     pub contacts: HashMap<String, Contact>,
-    pub conversations: HashMap<String, Conversation>,
     pub user_profile: Option<UserProfile>,
     pub settings: Option<AppSettings>,
     pub email_drafts: HashMap<String, EmailDraft>,
@@ -147,7 +120,6 @@ impl Storage {
         if !self.data_file.exists() {
             return Ok(StorageData {
                 contacts: HashMap::new(),
-                conversations: HashMap::new(),
                 user_profile: None,
                 settings: None,
                 email_drafts: HashMap::new(),
@@ -165,8 +137,27 @@ impl Storage {
         }
         
         let content = fs::read_to_string(&self.data_file)?;
-        let data: StorageData = serde_json::from_str(&content)?;
-        Ok(data)
+        // Use a temporary struct that includes conversations for backward compatibility
+        #[derive(Deserialize)]
+        struct StorageDataWithConversations {
+            contacts: HashMap<String, Contact>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            conversations: HashMap<String, serde_json::Value>, // Ignore old conversations
+            user_profile: Option<UserProfile>,
+            settings: Option<AppSettings>,
+            email_drafts: HashMap<String, EmailDraft>,
+            relays: Vec<Relay>,
+        }
+        
+        let temp_data: StorageDataWithConversations = serde_json::from_str(&content)?;
+        Ok(StorageData {
+            contacts: temp_data.contacts,
+            user_profile: temp_data.user_profile,
+            settings: temp_data.settings,
+            email_drafts: temp_data.email_drafts,
+            relays: temp_data.relays,
+        })
     }
     
     pub fn save_data(&self, data: &StorageData) -> Result<()> {
@@ -228,34 +219,6 @@ impl Storage {
         } else {
             Err(anyhow::anyhow!("Contact not found: {}", pubkey))
         }
-    }
-    
-    // Conversation operations
-    pub fn save_conversations(&self, conversations: Vec<Conversation>) -> Result<()> {
-        println!("[STORAGE] save_conversations: Starting save of {} conversations", conversations.len());
-        let mut data = self.load_data()?;
-        println!("[STORAGE] save_conversations: Data loaded, clearing existing conversations");
-        data.conversations.clear();
-        
-        for conversation in conversations {
-            data.conversations.insert(conversation.contact_pubkey.clone(), conversation);
-        }
-        
-        println!("[STORAGE] save_conversations: Conversations inserted, saving to file...");
-        let result = self.save_data(&data);
-        println!("[STORAGE] save_conversations: Save operation completed");
-        result
-    }
-    
-    pub fn get_conversations(&self) -> Result<Vec<Conversation>> {
-        let data = self.load_data()?;
-        Ok(data.conversations.values().cloned().collect())
-    }
-    
-    pub fn clear_conversations(&self) -> Result<()> {
-        let mut data = self.load_data()?;
-        data.conversations.clear();
-        self.save_data(&data)
     }
     
     // Profile operations

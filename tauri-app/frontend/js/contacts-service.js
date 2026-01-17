@@ -15,7 +15,6 @@ class ContactsService {
 
         // Optionally, you can keep the keypair check if you want
         if (!window.appState.hasKeypair()) {
-            window.notificationService.showError('No keypair available');
             return;
         }
 
@@ -1731,7 +1730,6 @@ class ContactsService {
     async refreshContacts() {
         console.log('[JS] refreshContacts called - fetching fresh data from network...');
         if (!window.appState.hasKeypair()) {
-            window.notificationService.showError('No keypair available');
             return;
         }
         const activeRelays = window.appState.getActiveRelays();
@@ -2085,7 +2083,6 @@ class ContactsService {
     async toggleContactPrivacy(contactPubkey, isPublic, checkboxElement) {
         try {
             if (!window.appState.hasKeypair()) {
-                window.notificationService.showError('No keypair available');
                 // Revert checkbox if error
                 if (checkboxElement) checkboxElement.checked = !isPublic;
                 return;
@@ -2160,7 +2157,6 @@ class ContactsService {
     async deletePrivateContact(contact) {
         try {
             if (!window.appState.hasKeypair()) {
-                window.notificationService.showError('No keypair available');
                 return;
             }
 

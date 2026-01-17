@@ -195,6 +195,11 @@
         display: none;
     }
     
+    /* Hide version footer on mobile landscape */
+    .sidebar-footer {
+        display: none;
+    }
+    
     /* Move sidebar to bottom */
     .sidebar {
         position: fixed;

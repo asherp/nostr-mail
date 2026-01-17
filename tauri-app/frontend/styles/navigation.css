@@ -57,6 +57,20 @@ body.dark-mode .nostr-mail-logo-dark {
 .sidebar-nav {
     flex: 1;
     padding: var(--spacing-lg) 0;
+    overflow-y: auto;
+}
+
+.sidebar-footer {
+    padding: var(--spacing-md) var(--spacing-lg);
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.version-text {
+    font-size: 0.875rem;
+    color: rgba(255, 255, 255, 0.7);
+    font-weight: 400;
 }
 
 .nav-item {
@@ -151,6 +165,14 @@ body.dark-mode .sidebar-header,
 body.dark-mode .sidebar-nav,
 body.dark-mode .icon-button {
     color: #e0e0e0;
+}
+
+body.dark-mode .sidebar-footer {
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+body.dark-mode .version-text {
+    color: rgba(224, 224, 224, 0.6);
 }
 
 body.dark-mode .main-content {

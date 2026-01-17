@@ -6,6 +6,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 use sha2::{Sha256, Digest};
+use base64::{Engine as _, engine::general_purpose};
 
 pub fn generate_keypair() -> Result<KeyPair> {
     // Generate a proper secp256k1 keypair using nostr-sdk
@@ -201,7 +202,7 @@ pub fn encrypt_setting_value(private_key: &str, value: &str) -> Result<String> {
     let mut combined = nonce.to_vec();
     combined.extend_from_slice(&ciphertext);
     
-    Ok(base64::encode(&combined))
+    Ok(general_purpose::STANDARD.encode(&combined))
 }
 
 /// Decrypt sensitive data using a key derived from the user's private key
@@ -211,7 +212,7 @@ pub fn decrypt_setting_value(private_key: &str, encrypted_value: &str) -> Result
     }
     
     // Decode base64
-    let combined = base64::decode(encrypted_value)
+    let combined = general_purpose::STANDARD.decode(encrypted_value)
         .map_err(|e| anyhow::anyhow!("Base64 decode failed: {}", e))?;
     
     if combined.len() < 12 {

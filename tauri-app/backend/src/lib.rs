@@ -955,7 +955,6 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
     let db = state.get_database()?;
     let mut results = Vec::new();
     let mut pubkeys_to_fetch = Vec::new();
-    let mut public_keys_to_fetch = Vec::new();
     
     println!("[RUST] Checking database for existing contacts...");
     for pubkey_str in &pubkeys {
@@ -1038,7 +1037,7 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         .collect();
     
     let parsed_keys = parsed_keys?;
-    public_keys_to_fetch = parsed_keys;
+    let public_keys_to_fetch = parsed_keys;
     
     println!("[RUST] Fetching {} profiles from relays", public_keys_to_fetch.len());
     

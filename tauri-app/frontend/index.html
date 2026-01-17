@@ -41,7 +41,7 @@
         <!-- Sidebar -->
         <aside class="sidebar">
             <div class="sidebar-header">
-                <h1><i class="fas fa-envelope"></i> NostrMail</h1>
+                <h1><img src="assets/nostr-mail-logo.png" alt="NostrMail" class="nostr-mail-logo"> NostrMail</h1>
             </div>
             
             <nav class="sidebar-nav">
@@ -58,7 +58,7 @@
                     <i class="fas fa-save"></i> Drafts
                 </button>
                 <button class="nav-item" data-tab="dm">
-                    <i class="fas fa-comments"></i> Direct Messages
+                    <i class="fas fa-comments"></i> Messages
                 </button>
                 <button class="nav-item" data-tab="contacts">
                     <i class="fas fa-address-book"></i> Contacts
@@ -254,7 +254,7 @@
                         <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
                             <i class="fas fa-arrow-left"></i> Back
                         </button>
-                        <h2>Direct Messages</h2>
+                        <h2>Messages</h2>
                     </div>
                     <div class="dm-actions">
                         <button id="dm-search-toggle" class="btn btn-secondary">
@@ -280,6 +280,9 @@
                     </div>
                     <!-- Conversation View -->
                     <div class="dm-conversation-panel">
+                        <div class="dm-conversation-header" id="dm-conversation-header" style="display: none;">
+                            <!-- Back button will be populated here -->
+                        </div>
                         <div class="dm-messages" id="dm-messages">
                             <!-- DM messages will be populated here -->
                         </div>
@@ -291,7 +294,7 @@
             <div class="tab-content" id="contacts">
                 <div class="tab-header">
                     <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
-                        <button class="back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                        <button class="btn btn-secondary" id="contacts-back-btn" aria-label="Back to contacts list" style="display: none;">
                             <i class="fas fa-arrow-left"></i> Back
                         </button>
                         <h2>Contacts</h2>
@@ -317,10 +320,17 @@
                     <i class="fas fa-search contacts-search-icon"></i>
                 </div>
                 
-                <div class="contacts-container">
+                <div class="contacts-container contacts-list-view">
                     <div class="contacts-sidebar">
                         <div class="contacts-list" id="contacts-list">
                             <!-- Contacts will be populated here -->
+                        </div>
+                    </div>
+                    <div class="contacts-detail" id="contacts-detail">
+                        <!-- Contact profile details will be shown here -->
+                        <div class="contact-detail-placeholder">
+                            <i class="fas fa-user"></i>
+                            <p>Select a contact to view their profile</p>
                         </div>
                     </div>
                 </div>

@@ -28,6 +28,13 @@
     gap: var(--spacing-sm);
 }
 
+.nostr-mail-logo {
+    width: 3.5rem;
+    height: 3.5rem;
+    object-fit: contain;
+    flex-shrink: 0;
+}
+
 .sidebar-nav {
     flex: 1;
     padding: var(--spacing-lg) 0;

@@ -81,8 +81,6 @@ body.dark-mode .dm-search-icon {
     flex-direction: column;
     background: var(--bg-color);
     transform: translateX(0);
-    transition: transform 0.3s ease-in-out;
-    will-change: transform;
 }
 
 /* Conversation Panel */
@@ -98,8 +96,16 @@ body.dark-mode .dm-search-icon {
     flex-direction: column;
     background: var(--bg-color);
     transform: translateX(100%);
-    transition: transform 0.3s ease-in-out;
-    will-change: transform;
+}
+
+/* DM Conversation Header (similar to email-detail-header) */
+.dm-conversation-header {
+    padding: 20px 30px;
+    border-bottom: 1px solid var(--border-color);
+    background-color: var(--bg-color);
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
 }
 
 /* Navigation States */
@@ -254,7 +260,7 @@ body.dark-mode .dm-search-icon {
     align-items: center;
     gap: var(--spacing-sm);
     padding: var(--spacing-sm) var(--spacing-md);
-    background: none;
+    background: var(--light-bg);
     border: 1px solid var(--border-color);
     border-radius: 6px;
     cursor: pointer;

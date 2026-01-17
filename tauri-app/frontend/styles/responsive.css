@@ -183,7 +183,7 @@
 }
 
 /* Mobile Landscape Mode - Keep bottom navigation */
-@media (max-width: 480px) and (orientation: landscape) {
+@media (max-width: 1024px) and (orientation: landscape) {
     .app-container {
         flex-direction: column;
         height: 100vh;
@@ -289,10 +289,237 @@
         overflow-y: auto;
     }
     
+    /* Tab header optimizations for landscape */
+    .tab-header {
+        padding-top: max(12px, env(safe-area-inset-top)) !important;
+        padding-bottom: 6px !important;
+        padding-left: max(var(--spacing-sm), env(safe-area-inset-left)) !important;
+        padding-right: max(var(--spacing-sm), env(safe-area-inset-right)) !important;
+        flex-wrap: nowrap !important;
+        align-items: center !important;
+        min-height: auto !important;
+        gap: 6px !important;
+    }
+    
+    .tab-header h2 {
+        font-size: 1rem !important;
+        margin: 0 !important;
+        flex: 0 1 auto !important;
+        min-width: 0 !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        padding-right: 4px !important;
+    }
+    
+    /* Action button container fixes - higher specificity to override contacts.css */
+    .tab-header .contacts-actions,
+    .tab-header .compose-actions,
+    .tab-header .profile-actions,
+    #contacts .tab-header .contacts-actions,
+    #compose .tab-header .compose-actions,
+    #profile .tab-header .profile-actions {
+        display: flex !important;
+        flex-wrap: nowrap !important;
+        flex-shrink: 0 !important;
+        gap: 3px !important;
+        align-items: center !important;
+        flex: 0 0 auto !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+        overflow: visible !important;
+        width: auto !important;
+    }
+    
+    /* Ensure tab-header itself doesn't wrap */
+    .tab-header > div {
+        flex-shrink: 1 !important;
+        min-width: 0 !important;
+        overflow: hidden !important;
+    }
+    
+    .tab-header > div:last-child {
+        flex-shrink: 0 !important;
+    }
+    
+    /* Button optimizations for landscape - icon-only like portrait mode */
+    /* Target all buttons in tab headers to ensure icon-only display */
+    .tab-header .btn,
+    .tab-header .btn-primary,
+    .tab-header .btn-secondary,
+    .contacts-actions .btn,
+    .contacts-actions .btn-primary,
+    .contacts-actions .btn-secondary,
+    .compose-actions .btn,
+    .compose-actions .btn-primary,
+    .compose-actions .btn-secondary,
+    .profile-actions .btn,
+    .profile-actions .btn-primary,
+    .profile-actions .btn-secondary {
+        flex: 0 0 auto !important;
+        min-width: 36px !important;
+        width: 36px !important;
+        height: 36px !important;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        border-radius: var(--radius-md) !important;
+        gap: 0 !important;
+        margin: 0 !important;
+        position: relative !important;
+        font-size: 0 !important;
+        line-height: 0 !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+    }
+    
+    /* Hide ALL text content in buttons on landscape mobile - show only icons */
+    .tab-header .btn .btn-text,
+    .tab-header .btn-primary .btn-text,
+    .tab-header .btn-secondary .btn-text,
+    .contacts-actions .btn .btn-text,
+    .contacts-actions .btn-primary .btn-text,
+    .contacts-actions .btn-secondary .btn-text,
+    .compose-actions .btn .btn-text,
+    .compose-actions .btn-primary .btn-text,
+    .compose-actions .btn-secondary .btn-text,
+    .profile-actions .btn .btn-text,
+    .profile-actions .btn-primary .btn-text,
+    .profile-actions .btn-secondary .btn-text,
+    .tab-header .btn .encrypt-btn-label,
+    .tab-header .btn .sign-btn-label,
+    .contacts-actions .btn .encrypt-btn-label,
+    .contacts-actions .btn .sign-btn-label,
+    .compose-actions .btn .encrypt-btn-label,
+    .compose-actions .btn .sign-btn-label,
+    .profile-actions .btn .encrypt-btn-label,
+    .profile-actions .btn .sign-btn-label {
+        display: none !important;
+        visibility: hidden !important;
+        width: 0 !important;
+        height: 0 !important;
+        overflow: hidden !important;
+        text-indent: -9999px !important;
+    }
+    
+    /* Ensure icons remain visible even when button text is hidden */
+    .tab-header .btn i,
+    .contacts-actions .btn i,
+    .compose-actions .btn i,
+    .profile-actions .btn i {
+        color: inherit !important;
+    }
+    
+    .tab-header .btn-primary i,
+    .contacts-actions .btn-primary i,
+    .compose-actions .btn-primary i,
+    .profile-actions .btn-primary i {
+        color: white !important;
+    }
+    
+    .tab-header .btn-secondary i,
+    .contacts-actions .btn-secondary i,
+    .compose-actions .btn-secondary i,
+    .profile-actions .btn-secondary i {
+        color: #6c757d !important;
+    }
+    
+    body.dark-mode .tab-header .btn-secondary i,
+    body.dark-mode .contacts-actions .btn-secondary i,
+    body.dark-mode .compose-actions .btn-secondary i,
+    body.dark-mode .profile-actions .btn-secondary i {
+        color: #e0e0e0 !important;
+    }
+    
+    /* Show only icons - handle all icon variations */
+    .tab-header .btn i,
+    .tab-header .btn-primary i,
+    .tab-header .btn-secondary i,
+    .contacts-actions .btn i,
+    .contacts-actions .btn-primary i,
+    .contacts-actions .btn-secondary i,
+    .compose-actions .btn i,
+    .compose-actions .btn-primary i,
+    .compose-actions .btn-secondary i,
+    .profile-actions .btn i,
+    .profile-actions .btn-primary i,
+    .profile-actions .btn-secondary i,
+    .tab-header .btn .encrypt-btn-icon,
+    .tab-header .btn .sign-btn-icon,
+    .contacts-actions .btn .encrypt-btn-icon,
+    .contacts-actions .btn .sign-btn-icon,
+    .compose-actions .btn .encrypt-btn-icon,
+    .compose-actions .btn .sign-btn-icon,
+    .profile-actions .btn .encrypt-btn-icon,
+    .profile-actions .btn .sign-btn-icon {
+        display: inline-block !important;
+        margin: 0 !important;
+        font-size: 1rem !important;
+        flex-shrink: 0 !important;
+        line-height: 1 !important;
+        width: auto !important;
+        height: auto !important;
+        visibility: visible !important;
+    }
+    
+    /* Ensure icon containers are visible */
+    .tab-header .btn .encrypt-btn-icon,
+    .tab-header .btn .sign-btn-icon,
+    .contacts-actions .btn .encrypt-btn-icon,
+    .contacts-actions .btn .sign-btn-icon,
+    .compose-actions .btn .encrypt-btn-icon,
+    .compose-actions .btn .sign-btn-icon,
+    .profile-actions .btn .encrypt-btn-icon,
+    .profile-actions .btn .sign-btn-icon {
+        display: inline-block !important;
+    }
+    
+    .tab-header .btn .encrypt-btn-icon i,
+    .tab-header .btn .sign-btn-icon i,
+    .contacts-actions .btn .encrypt-btn-icon i,
+    .contacts-actions .btn .sign-btn-icon i,
+    .compose-actions .btn .encrypt-btn-icon i,
+    .compose-actions .btn .sign-btn-icon i,
+    .profile-actions .btn .encrypt-btn-icon i,
+    .profile-actions .btn .sign-btn-icon i {
+        display: inline-block !important;
+        font-size: 1rem;
+        margin: 0;
+    }
+    
+    /* Ensure back button is icon-only too */
+    .back-to-nav-btn {
+        flex: 0 0 auto !important;
+        min-width: 36px !important;
+        width: 36px !important;
+        height: 36px !important;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        font-size: 0 !important;
+        line-height: 0 !important;
+        color: transparent !important;
+    }
+    
+    .back-to-nav-btn i {
+        font-size: 1rem !important;
+        margin: 0 !important;
+        display: inline-block !important;
+        color: #333 !important;
+    }
+    
+    /* Dark mode back button icon */
+    body.dark-mode .back-to-nav-btn i {
+        color: #e0e0e0 !important;
+    }
+    
     /* Safe area support for mobile - prevent header from being obscured */
+    /* Note: Safe area padding is already applied above with !important, this is a fallback */
     @supports (padding: max(0px)) {
         .tab-header {
-            padding-top: max(var(--spacing-md), env(safe-area-inset-top));
+            padding-top: max(12px, env(safe-area-inset-top)) !important;
         }
         
         .sidebar {

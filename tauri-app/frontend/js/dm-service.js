@@ -105,10 +105,17 @@ class DMService {
         dmContainer.classList.add('dm-list-view');
         this.dmNavState = 'list';
         
-        // Hide back button if it exists
-        const backButton = document.querySelector('.dm-back-to-list-btn');
-        if (backButton) {
-            backButton.style.display = 'none';
+        // Hide conversation header if it exists
+        const dmConversationHeader = document.getElementById('dm-conversation-header');
+        if (dmConversationHeader) {
+            dmConversationHeader.style.display = 'none';
+        }
+        
+        // Hide back button in tab-header initially
+        const tabHeader = document.querySelector('#dm .tab-header');
+        const tabHeaderBackBtn = tabHeader?.querySelector('.back-to-nav-btn');
+        if (tabHeaderBackBtn) {
+            tabHeaderBackBtn.style.display = 'none';
         }
         
         // Setup swipe gesture detection
@@ -387,10 +394,21 @@ class DMService {
             dmContainer.classList.add('dm-list-view');
             this.dmNavState = 'list';
             
-            // Hide back button
-            const backButton = document.querySelector('.dm-back-to-list-btn');
-            if (backButton) {
-                backButton.style.display = 'none';
+            // Hide conversation header
+            const dmConversationHeader = document.getElementById('dm-conversation-header');
+            if (dmConversationHeader) {
+                dmConversationHeader.style.display = 'none';
+            }
+            
+            // Hide back button in tab-header
+            const tabHeader = document.querySelector('#dm .tab-header');
+            const tabHeaderBackBtn = tabHeader?.querySelector('.back-to-nav-btn');
+            if (tabHeaderBackBtn) {
+                tabHeaderBackBtn.style.display = 'none';
+                // Remove btn btn-secondary classes when hiding
+                tabHeaderBackBtn.classList.remove('btn', 'btn-secondary');
+                // Restore original handler (will be set up by setupBackButtons)
+                tabHeaderBackBtn.onclick = null;
             }
             
             // Optionally clear selected contact (or keep it selected)
@@ -432,6 +450,21 @@ class DMService {
             dmContainer.classList.remove('dm-list-view');
             dmContainer.classList.add('dm-conversation-view');
             this.dmNavState = 'conversation';
+            
+            // Show back button in tab-header (left of "Messages")
+            const tabHeader = document.querySelector('#dm .tab-header');
+            const tabHeaderBackBtn = tabHeader?.querySelector('.back-to-nav-btn');
+            if (tabHeaderBackBtn) {
+                // Add btn btn-secondary classes to match "back to inbox" button styling
+                tabHeaderBackBtn.classList.add('btn', 'btn-secondary');
+                tabHeaderBackBtn.style.display = 'flex';
+                // Update click handler to go back to DM list instead of navbar
+                tabHeaderBackBtn.onclick = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.showDmList();
+                };
+            }
             
             // Load messages for this contact
             this.loadDmMessages(contactPubkey);
@@ -594,12 +627,18 @@ class DMService {
                     console.log(`[DM HEADER AVATAR] ${contact ? contact.name : contactPubkey}: using default avatar (no image available).`);
                 }
                 // --- End avatar fallback logic ---
+                
+                // Back button is now handled in showDmConversation() - no need to create it here
+                // Hide the dm-conversation-header if it exists
+                const dmConversationHeader = document.getElementById('dm-conversation-header');
+                if (dmConversationHeader) {
+                    dmConversationHeader.style.display = 'none';
+                }
+                
+                // Create conversation header with contact info (no back button here)
                 const headerElement = document.createElement('div');
                 headerElement.className = 'conversation-header';
                 headerElement.innerHTML = `
-                    <button class="dm-back-to-list-btn" aria-label="Back to DM list" style="display: none;">
-                        <i class="fas fa-arrow-left"></i> Back
-                    </button>
                     <div class="conversation-contact-info">
                         <img class="contact-avatar" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';" style="cursor: pointer;" data-pubkey="${contactPubkey}">
                         <div class="conversation-contact-details">
@@ -615,15 +654,6 @@ class DMService {
                 if (avatarElement) {
                     avatarElement.addEventListener('click', () => {
                         this.navigateToContact(contactPubkey);
-                    });
-                }
-                
-                // Add click handler to back button and show it
-                const backButton = headerElement.querySelector('.dm-back-to-list-btn');
-                if (backButton) {
-                    backButton.style.display = 'flex';
-                    backButton.addEventListener('click', () => {
-                        this.showDmList();
                     });
                 }
                 
@@ -1289,11 +1319,6 @@ class DMService {
 
     // Send direct message to contact from contacts page
     sendDirectMessageToContact(pubkey) {
-        // Switch to the DM tab
-        const dmTab = document.querySelector('[data-tab="dm"]');
-        if (dmTab) {
-            dmTab.click();
-        }
         // Find the contact in main contacts list
         const contact = window.appState.getContacts().find(c => c.pubkey === pubkey);
         const myPubkey = window.appState.getKeypair()?.public_key;
@@ -1301,11 +1326,12 @@ class DMService {
             window.notificationService.showError('Contact not found');
             return;
         }
-        // Special case: DM to self
-        if (pubkey === myPubkey) {
-            console.log('[DM DEBUG] Starting DM to self');
-            // Add to DM contacts if not already present
-            if (!window.appState.getDmContacts().find(c => c.pubkey === pubkey)) {
+        
+        // Add to DM contacts if not already present (do this before switching tabs)
+        if (!window.appState.getDmContacts().find(c => c.pubkey === pubkey)) {
+            if (pubkey === myPubkey) {
+                // Special case: DM to self
+                console.log('[DM DEBUG] Starting DM to self');
                 window.appState.addDmContact({
                     pubkey: myPubkey,
                     name: 'Myself',
@@ -1315,25 +1341,31 @@ class DMService {
                     picture_data_url: null,
                     profileLoaded: true
                 });
+            } else {
+                window.appState.addDmContact({
+                    pubkey: contact.pubkey,
+                    name: contact.name,
+                    lastMessage: '',
+                    lastMessageTime: new Date(),
+                    messageCount: 0,
+                    picture_data_url: contact.picture_data_url || null,
+                    profileLoaded: true
+                });
             }
-            const dmContact = window.appState.getDmContacts().find(c => c.pubkey === pubkey);
+        }
+        
+        // Switch to the DM tab using switchTab instead of clicking
+        window.app.switchTab('dm');
+        
+        // Wait for tab to initialize and DM contacts to be rendered
+        setTimeout(() => {
+            // Ensure DM contacts are rendered
+            if (window.dmService) {
+                window.dmService.renderDmContacts();
+            }
+            // Now show the conversation
             this.showDmConversation(pubkey);
-            return;
-        }
-        // Add to DM contacts if not already present
-        if (!window.appState.getDmContacts().find(c => c.pubkey === pubkey)) {
-            window.appState.addDmContact({
-                pubkey: contact.pubkey,
-                name: contact.name,
-                lastMessage: '',
-                lastMessageTime: new Date(),
-                messageCount: 0,
-                picture_data_url: contact.picture_data_url || null,
-                profileLoaded: true
-            });
-        }
-        // Navigate to the DM conversation
-        this.showDmConversation(pubkey);
+        }, 100);
     }
 
     // Navigate to contacts page and select contact if it exists

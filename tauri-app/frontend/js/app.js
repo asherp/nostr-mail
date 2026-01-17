@@ -940,6 +940,14 @@ NostrMailApp.prototype.setupEventListeners = function() {
             contactsSearchToggle.addEventListener('click', () => contactsService.toggleContactsSearch());
         }
         
+        // Wire up contacts back button
+        const contactsBackButton = document.getElementById('contacts-back-btn');
+        if (contactsBackButton) {
+            contactsBackButton.addEventListener('click', () => {
+                contactsService.handleBackToContactsList();
+            });
+        }
+        
         // Profile refresh button
         const refreshProfile = domManager.get('refreshProfile');
         if (refreshProfile) {
@@ -1955,6 +1963,81 @@ NostrMailApp.prototype.isMobilePortrait = function() {
     return isPortrait;
 }
 
+// Debug function to check landscape button styles
+NostrMailApp.prototype.debugLandscapeButtons = function() {
+    // #region agent log
+    const windowWidth = window.innerWidth;
+    const windowHeight = window.innerHeight;
+    const orientation = window.innerWidth > window.innerHeight ? 'landscape' : 'portrait';
+    const landscapeMediaQuery = window.matchMedia('(max-width: 480px) and (orientation: landscape)');
+    const portraitMediaQuery = window.matchMedia('(max-width: 480px) and (orientation: portrait)');
+    const mobileMediaQuery = window.matchMedia('(max-width: 768px)');
+    
+    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1965',message:'Debug landscape buttons - window dimensions',data:{windowWidth,windowHeight,orientation,landscapeMatches:landscapeMediaQuery.matches,portraitMatches:portraitMediaQuery.matches,mobileMatches:mobileMediaQuery.matches,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
+    // #endregion
+    
+    // Check for buttons in tab headers
+    const tabHeaders = document.querySelectorAll('.tab-header');
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1975',message:'Debug landscape buttons - tab headers found',data:{tabHeaderCount:tabHeaders.length,hypothesisId:'C'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
+    // #endregion
+    
+    tabHeaders.forEach((header, idx) => {
+        const buttons = header.querySelectorAll('.btn');
+        const contactsActions = header.querySelector('.contacts-actions');
+        const composeActions = header.querySelector('.compose-actions');
+        const profileActions = header.querySelector('.profile-actions');
+        
+        // #region agent log
+        const buttonData = Array.from(buttons).map((btn, btnIdx) => {
+            const computedStyle = window.getComputedStyle(btn);
+            return {
+                index: btnIdx,
+                className: btn.className,
+                width: computedStyle.width,
+                height: computedStyle.height,
+                padding: computedStyle.padding,
+                fontSize: computedStyle.fontSize,
+                display: computedStyle.display,
+                hasInlineStyle: btn.hasAttribute('style'),
+                inlineStyle: btn.getAttribute('style') || null,
+                textContent: btn.textContent.trim().substring(0, 30)
+            };
+        });
+        
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1990',message:'Debug landscape buttons - header button styles',data:{headerIndex:idx,buttonCount:buttons.length,buttons:buttonData,hasContactsActions:!!contactsActions,hasComposeActions:!!composeActions,hasProfileActions:!!profileActions,hypothesisId:'B'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
+        // #endregion
+        
+        // Check for CSS rule matches
+        if (contactsActions) {
+            const computedStyle = window.getComputedStyle(contactsActions);
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2000',message:'Debug landscape buttons - contacts-actions computed styles',data:{gap:computedStyle.gap,flexWrap:computedStyle.flexWrap,display:computedStyle.display,hypothesisId:'D'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
+            // #endregion
+        }
+    });
+    
+    // Check if landscape media query CSS is loaded
+    const styleSheets = Array.from(document.styleSheets);
+    let responsiveCssFound = false;
+    styleSheets.forEach((sheet, idx) => {
+        try {
+            if (sheet.href && sheet.href.includes('responsive.css')) {
+                responsiveCssFound = true;
+                // #region agent log
+                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2010',message:'Debug landscape buttons - responsive.css found',data:{sheetIndex:idx,href:sheet.href,hypothesisId:'E'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
+                // #endregion
+            }
+        } catch (e) {
+            // Cross-origin stylesheets may throw errors
+        }
+    });
+    
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2020',message:'Debug landscape buttons - summary',data:{responsiveCssFound,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'debug'})}).catch(()=>{});
+    // #endregion
+}
+
 // Initialize mobile navigation
 NostrMailApp.prototype.initializeMobileNavigation = function() {
     // Set initial state
@@ -1985,9 +2068,24 @@ NostrMailApp.prototype.initializeMobileNavigation = function() {
     // Listen for orientation changes
     window.addEventListener('orientationchange', () => {
         setTimeout(() => {
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1994',message:'Orientation change detected',data:{hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'orientation-change'})}).catch(()=>{});
+            // #endregion
             if (this.isMobilePortrait()) {
                 this.updateMobileNavState();
             }
+            // Debug button styles after orientation change
+            this.debugLandscapeButtons();
+        }, 100);
+    });
+    
+    // Also listen for resize events to catch landscape mode
+    window.addEventListener('resize', () => {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2005',message:'Resize event detected',data:{width:window.innerWidth,height:window.innerHeight,hypothesisId:'A'},timestamp:Date.now(),sessionId:'debug-session',runId:'resize'})}).catch(()=>{});
+        // #endregion
+        setTimeout(() => {
+            this.debugLandscapeButtons();
         }, 100);
     });
     
@@ -2220,6 +2318,16 @@ NostrMailApp.prototype.switchTab = function(tabName) {
         setTimeout(() => {
             contactsService.setupLazyImageLoading();
         }, 100);
+        
+        // Check if there's a selected contact - if so, show detail view; otherwise show list view
+        const selectedContact = window.appState.getSelectedContact();
+        if (selectedContact) {
+            // Show detail view for selected contact
+            contactsService.showContactDetailView(selectedContact);
+        } else {
+            // Show list view
+            contactsService.showContactsListView();
+        }
     }
     if (tabName === 'dm') {
         // Only load DM contacts if they haven't been loaded yet
@@ -3897,10 +4005,16 @@ NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPicture
     // Build editable fields from profile.fields, always include email
     // Ensure all fields from the profile are included, even if not in standard order
     this.editableProfileFields = { ...(profile && profile.fields ? profile.fields : {}) };
-    // Optionally, always include email if missing
-    if (!('email' in this.editableProfileFields)) {
-        this.editableProfileFields.email = '';
+    
+    // When viewing own profile, always include all standard fields so they can be filled in
+    if (isViewingOwnProfile) {
+        PROFILE_FIELD_ORDER.forEach(key => {
+            if (!(key in this.editableProfileFields)) {
+                this.editableProfileFields[key] = '';
+            }
+        });
     }
+    
     this.renderProfileFieldsList(this.editableProfileFields, isViewingOwnProfile);
     // Show warning if profile email and settings email differ (only for own profile)
     if (isViewingOwnProfile) {
@@ -3960,7 +4074,10 @@ const PROFILE_FIELD_ORDER = [
     'about',
     'picture',
     'banner',
+    'website',
+    'location',
     'lud16',
+    'lud06',
     'nip05',
 ];
 
@@ -3976,9 +4093,13 @@ NostrMailApp.prototype.renderProfileFieldsList = function(fields, isViewingOwnPr
     }
 
     // Use the top-level constant for field order
+    // When viewing own profile, always show all standard fields (even if empty)
+    // When viewing others, only show fields that have values
     for (const key of PROFILE_FIELD_ORDER) {
-        if (fields.hasOwnProperty(key)) {
-            this._renderProfileFieldItem(listDiv, key, fields[key], isViewingOwnProfile);
+        if (isViewingOwnProfile || fields.hasOwnProperty(key)) {
+            // For own profile, always render (will show empty inputs)
+            // For others, only render if field exists
+            this._renderProfileFieldItem(listDiv, key, fields[key] || '', isViewingOwnProfile);
         }
     }
 
@@ -4016,10 +4137,16 @@ NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value, i
         if (key === 'about') {
             input = document.createElement('textarea');
             input.rows = 3;
-        } else if (key === 'picture') {
+        } else if (key === 'picture' || key === 'banner' || key === 'website') {
             input = document.createElement('input');
             input.type = 'url';
-            input.placeholder = 'https://example.com/avatar.png';
+            if (key === 'picture') {
+                input.placeholder = 'https://example.com/avatar.png';
+            } else if (key === 'banner') {
+                input.placeholder = 'https://example.com/banner.jpg';
+            } else if (key === 'website') {
+                input.placeholder = 'https://example.com';
+            }
         } else if (typeof value === 'string' && value.length > 60) {
             input = document.createElement('textarea');
             input.rows = 3;
@@ -4036,19 +4163,6 @@ NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value, i
         });
         fieldDiv.appendChild(label);
         fieldDiv.appendChild(input);
-        // Remove button for custom fields (not for standard ones)
-        if (!['display_name','about','email','nip05','picture','banner','lud16','name'].includes(key)) {
-            const removeBtn = document.createElement('button');
-            removeBtn.type = 'button';
-            removeBtn.className = 'btn btn-danger btn-small';
-            removeBtn.innerHTML = '<i class="fas fa-trash"></i>';
-            removeBtn.title = 'Remove field';
-            removeBtn.addEventListener('click', () => {
-                delete this.editableProfileFields[key];
-                this.renderProfileFieldsList(this.editableProfileFields, true);
-            });
-            fieldDiv.appendChild(removeBtn);
-        }
     } else {
         // Read-only mode - create display div
         const valueDiv = document.createElement('div');
@@ -4059,14 +4173,14 @@ NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value, i
             emailLink.href = `mailto:${value}`;
             emailLink.textContent = value;
             valueDiv.appendChild(emailLink);
-        } else if (key === 'picture' && value) {
-            // For picture, show as link
-            const pictureLink = document.createElement('a');
-            pictureLink.href = value;
-            pictureLink.target = '_blank';
-            pictureLink.rel = 'noopener noreferrer';
-            pictureLink.textContent = value;
-            valueDiv.appendChild(pictureLink);
+        } else if ((key === 'picture' || key === 'banner' || key === 'website') && value) {
+            // For URLs, show as clickable link
+            const urlLink = document.createElement('a');
+            urlLink.href = value;
+            urlLink.target = '_blank';
+            urlLink.rel = 'noopener noreferrer';
+            urlLink.textContent = value;
+            valueDiv.appendChild(urlLink);
         } else if (value) {
             valueDiv.textContent = value;
         } else {
@@ -4534,6 +4648,86 @@ document.addEventListener('DOMContentLoaded', () => {
     fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4380',message:'Calling app.init()',data:{hypothesisId:'B'},timestamp:Date.now(),sessionId:'debug-session',runId:'startup'})}).catch(()=>{});
     // #endregion
     window.app.init();
+    
+    // Debug button styles after initialization - immediate check
+    setTimeout(() => {
+        // #region agent log
+        const checkLandscapeButtons = () => {
+            const windowWidth = window.innerWidth;
+            const windowHeight = window.innerHeight;
+            const screenWidth = window.screen.width;
+            const screenHeight = window.screen.height;
+            const orientation = window.innerWidth > window.innerHeight ? 'landscape' : 'portrait';
+            const landscapeMediaQuery = window.matchMedia('(max-width: 1024px) and (orientation: landscape)');
+            const portraitMediaQuery = window.matchMedia('(max-width: 1024px) and (orientation: portrait)');
+            const anyLandscapeQuery = window.matchMedia('(orientation: landscape)');
+            const any1024Query = window.matchMedia('(max-width: 1024px)');
+            
+            const debugInfo = {
+                windowWidth, 
+                windowHeight, 
+                screenWidth,
+                screenHeight,
+                orientation, 
+                landscapeMatches: landscapeMediaQuery.matches,
+                portraitMatches: portraitMediaQuery.matches,
+                anyLandscapeMatches: anyLandscapeQuery.matches,
+                any1024Matches: any1024Query.matches
+            };
+            
+            console.log('🔍 EMULATOR Landscape Debug:', debugInfo);
+            
+            const logData = {...debugInfo, hypothesisId:'A'};
+            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4648',message:'EMULATOR Landscape check - window dimensions and media query',data:logData,timestamp:Date.now(),sessionId:'debug-session',runId:'emulator-check'})}).catch(()=>{});
+            
+            const tabHeaders = document.querySelectorAll('.tab-header');
+            console.log('🔍 Found tab headers:', tabHeaders.length);
+            
+            tabHeaders.forEach((header, idx) => {
+                const buttons = header.querySelectorAll('.btn');
+                const contactsActions = header.querySelector('.contacts-actions');
+                
+                console.log(`🔍 Header ${idx}:`, {buttonCount: buttons.length, hasContactsActions: !!contactsActions});
+                
+                if (contactsActions) {
+                    const computedStyle = window.getComputedStyle(contactsActions);
+                    const buttonStyles = Array.from(buttons).slice(0, 4).map((btn, btnIdx) => {
+                        const btnStyle = window.getComputedStyle(btn);
+                        const styles = {
+                            width: btnStyle.width,
+                            height: btnStyle.height,
+                            fontSize: btnStyle.fontSize,
+                            display: btnStyle.display,
+                            flexWrap: btnStyle.flexWrap,
+                            gap: btnStyle.gap,
+                            padding: btnStyle.padding,
+                            textContent: btn.textContent.trim().substring(0, 30),
+                            hasBtnText: !!btn.querySelector('.btn-text'),
+                            btnTextDisplay: btn.querySelector('.btn-text') ? window.getComputedStyle(btn.querySelector('.btn-text')).display : 'N/A'
+                        };
+                        console.log(`🔍 Button ${btnIdx}:`, styles);
+                        return styles;
+                    });
+                    
+                    const containerStyles = {
+                        gap: computedStyle.gap,
+                        flexWrap: computedStyle.flexWrap,
+                        display: computedStyle.display,
+                        width: computedStyle.width,
+                        maxWidth: computedStyle.maxWidth,
+                        flexShrink: computedStyle.flexShrink
+                    };
+                    
+                    console.log(`🔍 Contacts Actions Container Styles:`, containerStyles);
+                    
+                    const logData2 = {headerIndex:idx,buttonCount:buttons.length,containerStyles,buttonStyles,hypothesisId:'B'};
+                    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:4680',message:'EMULATOR Landscape check - contacts-actions styles',data:logData2,timestamp:Date.now(),sessionId:'debug-session',runId:'emulator-check'})}).catch(()=>{});
+                }
+            });
+        };
+        checkLandscapeButtons();
+        window.app.debugLandscapeButtons();
+    }, 1000);
     
     // Start relay status updates
     window.app.startRelayStatusUpdates();

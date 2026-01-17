@@ -93,6 +93,28 @@
     overflow: hidden;
 }
 
+/* View States */
+.contacts-container.contacts-list-view .contacts-sidebar {
+    display: flex;
+}
+
+.contacts-container.contacts-list-view .contacts-detail {
+    display: none;
+}
+
+.contacts-container.contacts-detail-view .contacts-sidebar {
+    display: none;
+}
+
+.contacts-container.contacts-detail-view .contacts-detail {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow-y: auto;
+    padding: 30px;
+    background-color: #ffffff;
+}
+
 .contacts-sidebar {
     width: 100%;
     background-color: #f8f9fa;
@@ -101,6 +123,15 @@
     flex: 1;
     overflow: hidden;
     border-right: none;
+}
+
+.contacts-detail {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow-y: auto;
+    padding: 30px;
+    background-color: #ffffff;
 }
 
 .contact-detail-placeholder {
@@ -263,6 +294,12 @@
 body.dark-mode .contacts-sidebar {
     background-color: #232946;
     border-right-color: #181a20;
+}
+
+body.dark-mode .contacts-detail,
+body.dark-mode .contacts-container.contacts-detail-view .contacts-detail {
+    background-color: #181a20;
+    color: #e0e0e0;
 }
 
 body.dark-mode .contact-detail-placeholder {

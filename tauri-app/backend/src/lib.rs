@@ -788,7 +788,6 @@ async fn fetch_emails(email_config: EmailConfig, limit: usize, search_query: Opt
 
 #[tauri::command]
 async fn fetch_image(url: String) -> Result<String, String> {
-    println!("[RUST] fetch_image called for url: {}", url);
     nostr::fetch_image_as_data_url(&url).await.map_err(|e| e.to_string())
 }
 
@@ -800,7 +799,6 @@ async fn fetch_multiple_images(urls: Vec<String>) -> Result<std::collections::Ha
 
 #[tauri::command]
 fn cache_profile_image(pubkey: String, data_url: String, state: tauri::State<AppState>) -> Result<(), String> {
-    println!("[RUST] cache_profile_image called for pubkey: {}", pubkey);
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -810,13 +808,10 @@ fn cache_profile_image(pubkey: String, data_url: String, state: tauri::State<App
         timestamp,
     };
     state.image_cache.lock().unwrap().insert(pubkey.clone(), cached_image);
-    println!("[RUST] Cached image for pubkey: {}", pubkey);
     // Persist to database as well
     if let Ok(db) = state.get_database() {
         if let Err(e) = db.update_contact_picture_data_url(&pubkey, &data_url) {
             println!("[RUST] Failed to persist picture_data_url to DB for pubkey {}: {}", pubkey, e);
-        } else {
-            println!("[RUST] Persisted picture_data_url to DB for pubkey: {}", pubkey);
         }
     }
     Ok(())
@@ -824,8 +819,6 @@ fn cache_profile_image(pubkey: String, data_url: String, state: tauri::State<App
 
 #[tauri::command]
 fn get_cached_profile_image(pubkey: String, picture_url: Option<String>, state: tauri::State<AppState>) -> Result<Option<String>, String> {
-    println!("[RUST] get_cached_profile_image called for pubkey: {}", pubkey);
-    
     // First check in-memory cache
     let cache = state.image_cache.lock().unwrap();
     if let Some(cached_image) = cache.get(&pubkey) {
@@ -839,7 +832,6 @@ fn get_cached_profile_image(pubkey: String, picture_url: Option<String>, state: 
         let max_age = 24 * 60 * 60; // 24 hours in seconds
         
         if cache_age < max_age {
-            println!("[RUST] Found valid cached image in memory for pubkey: {}", pubkey);
             // Clone the data_url before dropping the cache lock
             let cached_data_url = cached_image.data_url.clone();
             drop(cache);
@@ -850,7 +842,6 @@ fn get_cached_profile_image(pubkey: String, picture_url: Option<String>, state: 
                     if let Ok(Some(contact)) = db.get_contact(&pubkey) {
                         let db_url = contact.picture_url.unwrap_or_default();
                         if db_url != expected_url {
-                            println!("[RUST] Picture URL changed (DB: '{}' vs current: '{}'), invalidating cache", db_url, expected_url);
                             // Invalidate cache - URL changed
                             state.image_cache.lock().unwrap().remove(&pubkey);
                             return Ok(None);
@@ -860,8 +851,6 @@ fn get_cached_profile_image(pubkey: String, picture_url: Option<String>, state: 
             }
             
             return Ok(Some(cached_data_url));
-        } else {
-            println!("[RUST] Cached image expired in memory for pubkey: {}", pubkey);
         }
     }
     drop(cache); // Release lock before DB access
@@ -874,7 +863,6 @@ fn get_cached_profile_image(pubkey: String, picture_url: Option<String>, state: 
                 if let Some(ref expected_url) = picture_url {
                     let db_url = contact.picture_url.as_deref().unwrap_or("");
                     if db_url != expected_url.as_str() {
-                        println!("[RUST] Picture URL changed (DB: '{}' vs current: '{}'), cache invalid", db_url, expected_url);
                         // URL changed - don't use cached image
                         return Ok(None);
                     }
@@ -885,8 +873,6 @@ fn get_cached_profile_image(pubkey: String, picture_url: Option<String>, state: 
                     if picture_data_url.starts_with("data:image") 
                         && picture_data_url != "data:application/octet-stream;base64," 
                         && !picture_data_url.trim().is_empty() {
-                        println!("[RUST] Found cached image in database for pubkey: {}", pubkey);
-                        
                         // Update in-memory cache for faster access next time
                         let timestamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -905,7 +891,7 @@ fn get_cached_profile_image(pubkey: String, picture_url: Option<String>, state: 
                 }
             }
             Ok(None) => {
-                println!("[RUST] Contact not found in database for pubkey: {}", pubkey);
+                // Contact not found - silent fail
             }
             Err(e) => {
                 println!("[RUST] Error querying database for pubkey {}: {}", pubkey, e);
@@ -915,7 +901,6 @@ fn get_cached_profile_image(pubkey: String, picture_url: Option<String>, state: 
         println!("[RUST] Failed to get database connection");
     }
     
-    println!("[RUST] No cached image found for pubkey: {}", pubkey);
     Ok(None)
 }
 

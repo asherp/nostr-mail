@@ -13,9 +13,29 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// Load keystore properties
+val keystorePropertiesFile = file("keystore.properties")
+val keystoreProperties = Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(keystorePropertiesFile.inputStream())
+}
+
 android {
     compileSdk = 36
     namespace = "com.nostr.mail"
+    
+    // Signing configurations
+    signingConfigs {
+        create("release") {
+            if (keystorePropertiesFile.exists()) {
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["keyPassword"] as String
+                storeFile = file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["storePassword"] as String
+            }
+        }
+    }
+    
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "com.nostr.mail"
@@ -37,6 +57,11 @@ android {
             }
         }
         getByName("release") {
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                null
+            }
             isDebuggable = true  // Enable debugging for release builds (remove for production)
             isJniDebuggable = true
             isMinifyEnabled = true

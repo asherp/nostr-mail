@@ -91,6 +91,13 @@ class ContactsService {
             console.log(`[JS] Contacts loaded from database: ${contacts.length} contacts`);
             this.renderContacts();
             console.log('[JS] Contacts rendered to UI');
+            
+            // Initialize view state - show list view by default if no contact is selected
+            const selectedContact = window.appState.getSelectedContact();
+            if (!selectedContact) {
+                this.showContactsListView();
+            }
+            
             // Images are NOT loaded automatically on startup to prevent excessive fetching
             // Images will be loaded lazily when:
             // 1. Contacts tab is opened (via setupLazyImageLoading in switchTab)
@@ -441,6 +448,17 @@ class ContactsService {
     // Select a contact
     async selectContact(contact) {
         try {
+            // Ensure contacts tab is active before showing detail view
+            const contactsTab = document.querySelector('[data-tab="contacts"]');
+            const isContactsTabActive = contactsTab && contactsTab.classList.contains('active');
+            
+            if (!isContactsTabActive) {
+                // Switch to contacts tab first
+                window.app.switchTab('contacts');
+                // Wait a bit for the tab to switch and contacts to render
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            
             window.appState.setSelectedContact(contact);
             
             // Update UI - remove active class from all contacts
@@ -454,15 +472,88 @@ class ContactsService {
                 contactElement.classList.add('active');
             }
             
-            // Store the pubkey we're viewing and navigate to profile tab
-            // switchTab will automatically load the profile when it sees viewingProfilePubkey is set
-            window.appState.setViewingProfilePubkey(contact.pubkey);
-            window.app.switchTab('profile');
+            // Show contact detail view in contacts tab (don't navigate to profile tab)
+            this.showContactDetailView(contact);
             
         } catch (error) {
             console.error('Error selecting contact:', error);
             window.notificationService.showError('Failed to load contact profile');
         }
+    }
+
+    // Show contact detail view within contacts tab
+    showContactDetailView(contact) {
+        const contactsContainer = document.querySelector('.contacts-container');
+        const contactsSidebar = document.querySelector('.contacts-sidebar');
+        const contactsDetail = window.domManager.get('contactsDetail');
+        const backButton = document.getElementById('contacts-back-btn');
+        
+        if (!contactsContainer || !contactsDetail) {
+            console.warn('[JS] Contacts container or detail element not found');
+            return;
+        }
+        
+        // Switch to detail view state
+        contactsContainer.classList.remove('contacts-list-view');
+        contactsContainer.classList.add('contacts-detail-view');
+        
+        // Show back button
+        if (backButton) {
+            backButton.style.display = 'inline-flex';
+        }
+        
+        // Render contact detail
+        this.renderContactDetail(contact);
+        
+        // Fetch fresh profile data in background
+        this.fetchAndUpdateContactProfile(contact).catch(error => {
+            console.error('[JS] Background profile fetch failed:', error);
+            // Silently fail - user already sees cached data
+        });
+    }
+
+    // Show contacts list view
+    showContactsListView() {
+        const contactsContainer = document.querySelector('.contacts-container');
+        const contactsDetail = window.domManager.get('contactsDetail');
+        const backButton = document.getElementById('contacts-back-btn');
+        
+        if (!contactsContainer) {
+            console.warn('[JS] Contacts container not found');
+            return;
+        }
+        
+        // Switch to list view state
+        contactsContainer.classList.remove('contacts-detail-view');
+        contactsContainer.classList.add('contacts-list-view');
+        
+        // Hide back button
+        if (backButton) {
+            backButton.style.display = 'none';
+        }
+        
+        // Clear selected contact
+        window.appState.setSelectedContact(null);
+        
+        // Remove active class from all contacts
+        document.querySelectorAll('.contact-item').forEach(item => {
+            item.classList.remove('active');
+        });
+        
+        // Show placeholder in detail view
+        if (contactsDetail) {
+            contactsDetail.innerHTML = `
+                <div class="contact-detail-placeholder">
+                    <i class="fas fa-user"></i>
+                    <p>Select a contact to view their profile</p>
+                </div>
+            `;
+        }
+    }
+
+    // Handle back button click to return to contacts list
+    handleBackToContactsList() {
+        this.showContactsListView();
     }
 
     // Fetch fresh profile data and update contact (called in background)
@@ -703,11 +794,9 @@ class ContactsService {
                 contactsTab.click();
             }
             
-            // Clear any selected contact
+            // Clear any selected contact and show list view
             window.appState.setSelectedContact(null);
-            document.querySelectorAll('.contact-item').forEach(item => {
-                item.classList.remove('active');
-            });
+            this.showContactsListView();
             
             // Show add contact form in a modal
             const modalContent = `
@@ -902,10 +991,12 @@ class ContactsService {
                 const profile = await window.TauriService.fetchProfilePersistent(pubkey);
                 
                 if (profile) {
-                    // Navigate to profile page to show the profile
-                    window.appState.setViewingProfilePubkey(pubkey);
-                    window.app.switchTab('profile');
-                    await window.app.loadProfile(pubkey);
+                    // Switch to contacts tab
+                    window.app.switchTab('contacts');
+                    // Wait a bit for the tab to switch
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    // Show profile for adding with follow button
+                    this.showProfileForAdding(pubkey, profile);
                     
                     // Show notification that profile was fetched
                     window.notificationService.showSuccess('Profile fetched successfully');
@@ -942,8 +1033,23 @@ class ContactsService {
 
     // Show profile for adding (not following yet)
     showProfileForAdding(pubkey, profile) {
+        const contactsContainer = document.querySelector('.contacts-container');
         const contactsDetail = window.domManager.get('contactsDetail');
-        if (!contactsDetail) return;
+        const backButton = document.getElementById('contacts-back-btn');
+        
+        if (!contactsContainer || !contactsDetail) {
+            console.warn('[JS] Contacts container or detail element not found');
+            return;
+        }
+        
+        // Switch to detail view state
+        contactsContainer.classList.remove('contacts-list-view');
+        contactsContainer.classList.add('contacts-detail-view');
+        
+        // Show back button
+        if (backButton) {
+            backButton.style.display = 'inline-flex';
+        }
         
         try {
             console.log('Fetched profile:', profile);

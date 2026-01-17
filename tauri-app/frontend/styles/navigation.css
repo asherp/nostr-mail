@@ -35,6 +35,25 @@
     flex-shrink: 0;
 }
 
+/* Light mode logo - shown by default */
+.nostr-mail-logo-light {
+    display: block;
+}
+
+/* Dark mode logo - hidden by default */
+.nostr-mail-logo-dark {
+    display: none;
+}
+
+/* In dark mode, show dark logo and hide light logo */
+body.dark-mode .nostr-mail-logo-light {
+    display: none;
+}
+
+body.dark-mode .nostr-mail-logo-dark {
+    display: block;
+}
+
 .sidebar-nav {
     flex: 1;
     padding: var(--spacing-lg) 0;

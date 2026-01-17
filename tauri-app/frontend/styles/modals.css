@@ -9,7 +9,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 1000;
+    z-index: 10000;
     transition: opacity 0.3s ease;
 }
 
@@ -149,4 +149,25 @@ body.dark-mode .confirmation-modal .confirmation-actions button {
 body.dark-mode .confirmation-modal .confirmation-actions button#confirm-ok {
     background-color: #dc3545;
     color: #fff;
+}
+
+/* Mobile-specific modal fixes */
+@media (max-width: 480px) {
+    .modal-overlay {
+        z-index: 10000 !important;
+        position: fixed !important;
+    }
+    
+    .modal {
+        max-width: 95%;
+        width: 95%;
+    }
+}
+
+/* Ensure modal is always on top on mobile landscape */
+@media (max-width: 1024px) and (orientation: landscape) {
+    .modal-overlay {
+        z-index: 10000 !important;
+        position: fixed !important;
+    }
 } 

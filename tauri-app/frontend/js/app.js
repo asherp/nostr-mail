@@ -2425,7 +2425,12 @@ NostrMailApp.prototype.showModal = function(title, content) {
         
         if (modalTitle) modalTitle.textContent = title;
         if (modalBody) modalBody.innerHTML = content;
-        if (modalOverlay) modalOverlay.classList.remove('hidden');
+        if (modalOverlay) {
+            modalOverlay.classList.remove('hidden');
+            // Ensure modal is always on top, especially on mobile
+            modalOverlay.style.zIndex = '10000';
+            modalOverlay.style.position = 'fixed';
+        }
     } catch (error) {
         console.error('Error showing modal:', error);
     }
@@ -3068,7 +3073,7 @@ NostrMailApp.prototype.scanPrivateKeyQRCode = async function() {
     const modalContent = `
         <div id="qr-scanner-container" style="text-align:center;">
             <p style="margin-bottom:15px;">Point your camera at the QR code</p>
-            <div id="qr-reader" style="width:100%;max-width:400px;margin:0 auto;"></div>
+            <div id="qr-reader" style="width:100%;max-width:400px;margin:0 auto;min-height:300px;"></div>
             <div id="qr-scanner-error" style="display:none;color:#dc3545;margin-top:15px;"></div>
             <div style="margin-top:20px;">
                 <button id="cancel-qr-scan-btn" class="btn btn-secondary">
@@ -3128,78 +3133,107 @@ NostrMailApp.prototype.scanPrivateKeyQRCode = async function() {
         return;
     }
     
-    try {
-        const qrReader = document.getElementById('qr-reader');
-        if (!qrReader) {
-            console.error('[QR] QR reader element not found');
-            return;
-        }
-        
-        html5QrCode = new Html5Qrcode('qr-reader');
-        
-        // Start scanning
-        await html5QrCode.start(
-            { facingMode: 'environment' }, // Use back camera on mobile
-            {
-                fps: 10,
-                qrbox: { width: 250, height: 250 }
-            },
-            (decodedText, decodedResult) => {
-                console.log('[QR] QR code scanned:', decodedText);
-                
-                // Validate the scanned text is a private key
-                const scannedKey = decodedText.trim();
-                if (!scannedKey.startsWith('npriv1') && !scannedKey.startsWith('nsec1')) {
-                    const errorDiv = document.getElementById('qr-scanner-error');
-                    if (errorDiv) {
-                        errorDiv.style.display = 'block';
-                        errorDiv.textContent = 'Invalid QR code: Not a valid private key format (should start with npriv1 or nsec1)';
+    // Wait for modal to be fully visible and element to have dimensions
+    const startScanner = async () => {
+        try {
+            const qrReader = document.getElementById('qr-reader');
+            if (!qrReader) {
+                console.error('[QR] QR reader element not found');
+                return;
+            }
+            
+            // Wait for element to be visible and have dimensions
+            let attempts = 0;
+            const maxAttempts = 50; // 5 seconds max wait
+            while (attempts < maxAttempts) {
+                const rect = qrReader.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    break;
+                }
+                await new Promise(resolve => setTimeout(resolve, 100));
+                attempts++;
+            }
+            
+            html5QrCode = new Html5Qrcode('qr-reader');
+            
+            // Detect if we're on mobile or desktop
+            const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+            const cameraConfig = isMobile 
+                ? { facingMode: 'environment' } // Back camera on mobile
+                : { facingMode: 'user' }; // Front camera on desktop (or omit for default)
+            
+            // Start scanning
+            await html5QrCode.start(
+                cameraConfig,
+                {
+                    fps: 10,
+                    qrbox: { width: 250, height: 250 },
+                    aspectRatio: 1.0
+                },
+                (decodedText, decodedResult) => {
+                    console.log('[QR] QR code scanned:', decodedText);
+                    
+                    // Validate the scanned text is a private key
+                    const scannedKey = decodedText.trim();
+                    if (!scannedKey.startsWith('npriv1') && !scannedKey.startsWith('nsec1')) {
+                        const errorDiv = document.getElementById('qr-scanner-error');
+                        if (errorDiv) {
+                            errorDiv.style.display = 'block';
+                            errorDiv.textContent = 'Invalid QR code: Not a valid private key format (should start with npriv1 or nsec1)';
+                        }
+                        return;
                     }
-                    return;
+                    
+                    // Populate the private key input field
+                    const nprivKeyInput = domManager.get('nprivKey');
+                    if (nprivKeyInput) {
+                        nprivKeyInput.value = scannedKey;
+                        // Trigger input event to update public key display
+                        nprivKeyInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        notificationService.showSuccess('Private key scanned successfully');
+                    }
+                    
+                    // Cleanup and close modal
+                    cleanup();
+                    setTimeout(() => {
+                        window.app.hideModal();
+                    }, 100);
+                },
+                (errorMessage) => {
+                    // Ignore scanning errors (they're frequent during scanning)
+                    // Only log if it's not a common "not found" error
+                    if (!errorMessage.includes('No QR code found')) {
+                        console.log('[QR] Scanning:', errorMessage);
+                    }
                 }
-                
-                // Populate the private key input field
-                const nprivKeyInput = domManager.get('nprivKey');
-                if (nprivKeyInput) {
-                    nprivKeyInput.value = scannedKey;
-                    // Trigger input event to update public key display
-                    nprivKeyInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    notificationService.showSuccess('Private key scanned successfully');
-                }
-                
-                // Cleanup and close modal
-                cleanup();
-                setTimeout(() => {
-                    window.app.hideModal();
-                }, 100);
-            },
-            (errorMessage) => {
-                // Ignore scanning errors (they're frequent during scanning)
-                // Only log if it's not a common "not found" error
-                if (!errorMessage.includes('No QR code found')) {
-                    console.log('[QR] Scanning:', errorMessage);
+            );
+            
+            scannerStarted = true;
+            
+        } catch (error) {
+            console.error('[QR] Error starting scanner:', error);
+            const errorDiv = document.getElementById('qr-scanner-error');
+            if (errorDiv) {
+                errorDiv.style.display = 'block';
+                if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+                    errorDiv.textContent = 'Camera permission denied. Please allow camera access and try again.';
+                } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+                    errorDiv.textContent = 'No camera found on this device.';
+                } else {
+                    errorDiv.textContent = `Camera error: ${error.message || 'Unknown error'}`;
                 }
             }
-        );
-        
-        scannerStarted = true;
-        
-    } catch (error) {
-        console.error('[QR] Error starting scanner:', error);
-        const errorDiv = document.getElementById('qr-scanner-error');
-        if (errorDiv) {
-            errorDiv.style.display = 'block';
-            if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-                errorDiv.textContent = 'Camera permission denied. Please allow camera access and try again.';
-            } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
-                errorDiv.textContent = 'No camera found on this device.';
-            } else {
-                errorDiv.textContent = `Camera error: ${error.message || 'Unknown error'}`;
-            }
+            notificationService.showError('Failed to start camera');
+            cleanup();
         }
-        notificationService.showError('Failed to start camera');
-        cleanup();
-    }
+    };
+    
+    // Wait for next animation frame to ensure modal is rendered
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            startScanner();
+        });
+    });
     
     // Cleanup when modal is closed (if user clicks outside or ESC)
     const modalOverlay = domManager.get('modalOverlay');

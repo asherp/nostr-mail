@@ -931,82 +931,163 @@ class ContactsService {
 
     // Scan QR code
     async scanQRCode() {
-        try {
-            // Show QR scanner in the detail panel
-            const contactsDetail = window.domManager.get('contactsDetail');
-            if (contactsDetail) {
-                contactsDetail.innerHTML = `
-                    <div id="qr-scanner-container">
-                        <h3>Scan QR Code</h3>
-                        <div id="qr-reader"></div>
-                        <div class="qr-scanner-controls">
-                            <button id="close-scanner-btn" class="btn btn-secondary">
-                                <i class="fas fa-times"></i> Back to Form
-                            </button>
-                        </div>
-                    </div>
-                `;
-            }
-            
-            // Let the browser handle camera permissions directly
-            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-                    
-                    // Create video element for camera feed
-                    const video = document.createElement('video');
-                    video.style.width = '100%';
-                    video.style.height = 'auto';
-                    video.style.maxWidth = '400px';
-                    video.autoplay = true;
-                    video.muted = true;
-                    video.playsInline = true;
-                    
-                    const qrReader = document.getElementById('qr-reader');
-                    if (qrReader) {
-                        qrReader.appendChild(video);
-                        video.srcObject = stream;
-                        
-                        // Simple QR code detection (you might want to use a proper QR library)
-                        const canvas = document.createElement('canvas');
-                        const context = canvas.getContext('2d');
-                        
-                        const checkQR = () => {
-                            if (video.videoWidth > 0) {
-                                canvas.width = video.videoWidth;
-                                canvas.height = video.videoHeight;
-                                context.drawImage(video, 0, 0);
-                                
-                                // Here you would implement QR code detection
-                                // For now, we'll just show the camera feed
-                            }
-                            requestAnimationFrame(checkQR);
-                        };
-                        
-                        checkQR();
-                    }
-                    
-                    // Handle close scanner button
-                    const closeBtn = document.getElementById('close-scanner-btn');
-                    if (closeBtn) {
-                        closeBtn.addEventListener('click', () => {
-                            stream.getTracks().forEach(track => track.stop());
-                            this.showAddContactModal();
-                        });
-                    }
-                    
-                } catch (error) {
-                    console.error('Camera access error:', error);
-                    this.showCameraError();
-                }
-            } else {
-                this.showCameraError();
-            }
-            
-        } catch (error) {
-            console.error('QR scanner error:', error);
-            this.showCameraError();
+        let html5QrCode = null;
+        let scannerStarted = false;
+        let isCleanedUp = false;
+        
+        // Check if Html5Qrcode is available
+        if (typeof Html5Qrcode === 'undefined') {
+            window.notificationService.showError('QR scanner library not loaded. Please refresh the page.');
+            return;
         }
+        
+        // Check camera availability
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            window.notificationService.showError('Camera access is not available in this browser.');
+            return;
+        }
+        
+        // Show QR scanner in the modal
+        const modalContent = `
+            <div id="qr-scanner-container" style="text-align:center;">
+                <p style="margin-bottom:15px;">Point your camera at the QR code</p>
+                <div id="qr-reader" style="width:100%;max-width:400px;margin:0 auto;min-height:300px;"></div>
+                <div id="qr-scanner-error" style="display:none;color:#dc3545;margin-top:15px;"></div>
+                <div style="margin-top:20px;">
+                    <button id="close-scanner-btn" class="btn btn-secondary">
+                        <i class="fas fa-times"></i> Back to Form
+                    </button>
+                </div>
+            </div>
+        `;
+        
+        // Update the modal content
+        const modalBody = window.domManager.get('modalBody');
+        if (modalBody) {
+            modalBody.innerHTML = modalContent;
+        }
+        
+        const cleanup = () => {
+            if (isCleanedUp) return;
+            isCleanedUp = true;
+            
+            if (html5QrCode && scannerStarted) {
+                try {
+                    html5QrCode.stop().then(() => {
+                        html5QrCode.clear();
+                    }).catch(err => {
+                        console.error('[QR] Error stopping scanner:', err);
+                    });
+                } catch (err) {
+                    console.error('[QR] Error during cleanup:', err);
+                }
+            }
+            html5QrCode = null;
+            scannerStarted = false;
+        };
+        
+        // Setup close scanner button
+        const closeBtn = document.getElementById('close-scanner-btn');
+        if (closeBtn) {
+            closeBtn.addEventListener('click', () => {
+                cleanup();
+                // Restore the add contact form
+                this.showAddContactModal();
+            });
+        }
+        
+        // Wait for modal to be fully visible and element to have dimensions
+        const startScanner = async () => {
+            try {
+                const qrReader = document.getElementById('qr-reader');
+                if (!qrReader) {
+                    console.error('[QR] QR reader element not found');
+                    return;
+                }
+                
+                // Wait for element to be visible and have dimensions
+                let attempts = 0;
+                const maxAttempts = 50; // 5 seconds max wait
+                while (attempts < maxAttempts) {
+                    const rect = qrReader.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        break;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    attempts++;
+                }
+                
+                html5QrCode = new Html5Qrcode('qr-reader');
+                
+                // Detect if we're on mobile or desktop
+                const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+                const cameraConfig = isMobile 
+                    ? { facingMode: 'environment' } // Back camera on mobile
+                    : { facingMode: 'user' }; // Front camera on desktop
+                
+                // Start scanning
+                await html5QrCode.start(
+                    cameraConfig,
+                    {
+                        fps: 10,
+                        qrbox: { width: 250, height: 250 },
+                        aspectRatio: 1.0
+                    },
+                    (decodedText, decodedResult) => {
+                        console.log('[QR] QR code scanned:', decodedText);
+                        
+                        // Validate the scanned text is a public key
+                        const scannedKey = decodedText.trim();
+                        if (!scannedKey.startsWith('npub1')) {
+                            const errorDiv = document.getElementById('qr-scanner-error');
+                            if (errorDiv) {
+                                errorDiv.style.display = 'block';
+                                errorDiv.textContent = 'Invalid QR code: Not a valid public key format (should start with npub1)';
+                            }
+                            return;
+                        }
+                        
+                        // Stop scanning
+                        cleanup();
+                        
+                        // Restore the add contact form with the scanned key
+                        // This will replace the scanner view with the form, populated with the scanned key
+                        this.showAddContactModal(scannedKey);
+                    },
+                    (errorMessage) => {
+                        // Ignore scanning errors (they're frequent during scanning)
+                        if (!errorMessage.includes('No QR code found')) {
+                            console.log('[QR] Scanning:', errorMessage);
+                        }
+                    }
+                );
+                
+                scannerStarted = true;
+                
+            } catch (error) {
+                console.error('[QR] Error starting scanner:', error);
+                const errorDiv = document.getElementById('qr-scanner-error');
+                if (errorDiv) {
+                    errorDiv.style.display = 'block';
+                    if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+                        errorDiv.textContent = 'Camera permission denied. Please allow camera access and try again.';
+                    } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+                        errorDiv.textContent = 'No camera found on this device.';
+                    } else {
+                        errorDiv.textContent = `Camera error: ${error.message || 'Unknown error'}`;
+                    }
+                }
+                window.notificationService.showError('Failed to start camera');
+                cleanup();
+            }
+        };
+        
+        // Wait for next animation frame to ensure modal is rendered
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                startScanner();
+            });
+        });
     }
 
     // Show camera error

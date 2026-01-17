@@ -1,4 +1,4 @@
-# Release Notes - v1.0.0-beta
+# Release Notes - v1.0.1-beta
 
 ## Overview
 

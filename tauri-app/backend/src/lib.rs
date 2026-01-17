@@ -1422,6 +1422,13 @@ fn db_remove_user_contact(user_pubkey: String, contact_pubkey: String, state: ta
 }
 
 #[tauri::command]
+fn db_remove_user_contact_and_cleanup(user_pubkey: String, contact_pubkey: String, state: tauri::State<AppState>) -> Result<(bool, bool), String> {
+    println!("[RUST] db_remove_user_contact_and_cleanup called: user={}, contact={}", user_pubkey, contact_pubkey);
+    let db = state.get_database()?;
+    db.remove_user_contact_and_cleanup(&user_pubkey, &contact_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn db_get_public_contact_pubkeys(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     println!("[RUST] db_get_public_contact_pubkeys called for user: {}", user_pubkey);
     let db = state.get_database()?;
@@ -3661,6 +3668,7 @@ pub fn run() {
         db_delete_contact,
         db_add_user_contact,
         db_remove_user_contact,
+        db_remove_user_contact_and_cleanup,
         db_get_public_contact_pubkeys,
         db_update_user_contact_public_status,
         db_find_pubkeys_by_email,

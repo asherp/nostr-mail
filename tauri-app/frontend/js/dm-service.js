@@ -424,13 +424,33 @@ class DMService {
             const dmContainer = document.querySelector('.dm-container');
             if (!dmContainer) return;
             
-            // Find the contact
-            const dmContacts = window.appState.getDmContacts();
-            const contact = dmContacts.find(c => c.pubkey === contactPubkey);
+            // Find the contact in DM contacts first
+            let dmContacts = window.appState.getDmContacts();
+            let contact = dmContacts.find(c => c.pubkey === contactPubkey);
             
+            // If not found in DM contacts, look it up from main contacts and create a temporary entry
+            // This allows showing a conversation for a contact that doesn't have messages yet
             if (!contact) {
-                console.error('Contact not found:', contactPubkey);
-                return;
+                const myPubkey = window.appState.getKeypair()?.public_key;
+                const mainContact = window.appState.getContacts().find(c => c.pubkey === contactPubkey);
+                
+                if (mainContact || contactPubkey === myPubkey) {
+                    // Create a temporary contact object for displaying the conversation
+                    // This contact is NOT added to the DM contacts list (to avoid showing empty conversations)
+                    // It's only used for the conversation view
+                    contact = {
+                        pubkey: contactPubkey,
+                        name: contactPubkey === myPubkey ? 'Myself' : (mainContact?.name || contactPubkey.substring(0, 16) + '...'),
+                        lastMessage: '',
+                        lastMessageTime: new Date(),
+                        messageCount: 0,
+                        picture_data_url: mainContact?.picture_data_url || null,
+                        profileLoaded: !!mainContact
+                    };
+                } else {
+                    console.error('Contact not found:', contactPubkey);
+                    return;
+                }
             }
             
             // Set selected contact
@@ -589,7 +609,15 @@ class DMService {
         
         try {
             const messages = window.appState.getDmMessages(contactPubkey) || [];
-            const contact = window.appState.getDmContacts().find(c => c.pubkey === contactPubkey);
+            // Try to find contact in DM contacts list first, then fall back to selected contact
+            // (selected contact may be a temporary contact not in the DM contacts list)
+            let contact = window.appState.getDmContacts().find(c => c.pubkey === contactPubkey);
+            if (!contact) {
+                const selectedContact = window.appState.getSelectedDmContact();
+                if (selectedContact && selectedContact.pubkey === contactPubkey) {
+                    contact = selectedContact;
+                }
+            }
             
             console.log('[JS] renderDmMessages called for contact:', contactPubkey);
             console.log('[JS] Number of messages to render:', messages.length);
@@ -597,66 +625,70 @@ class DMService {
             
             dmMessages.innerHTML = '';
             
-            if (messages.length === 0) {
-                dmMessages.innerHTML = `
-                    <div class="text-center text-muted" style="padding: 2rem;">
-                        <i class="fas fa-comments" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
-                        <p>No messages yet</p>
-                        <p>Start a conversation with ${contact ? contact.name : 'this contact'}!</p>
-                    </div>
-                `;
+            // Always show conversation header (even when there are no messages)
+            // --- Avatar fallback logic for conversation header ---
+            const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+            let avatarSrc = defaultAvatar;
+            let avatarClass = 'contact-avatar';
+            const isValidDataUrl = contact && contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
+            if (contact && contact.picture_loading) {
+                avatarClass += ' loading';
+                console.log(`[DM HEADER AVATAR] ${contact.name}: picture_loading true, using default avatar.`);
+            } else if (isValidDataUrl) {
+                avatarSrc = contact.picture_data_url;
+                console.log(`[DM HEADER AVATAR] ${contact.name}: using picture_data_url.`);
+            } else if (contact && contact.picture_data_url && !isValidDataUrl && contact.picture) {
+                avatarSrc = contact.picture;
+                console.log(`[DM HEADER AVATAR] ${contact.name}: invalid picture_data_url, falling back to picture (URL or fallback).`);
+            } else if (contact && contact.picture) {
+                avatarSrc = contact.picture;
+                console.log(`[DM HEADER AVATAR] ${contact.name}: using picture (URL or fallback).`);
             } else {
-                // --- Avatar fallback logic for conversation header ---
-                const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
-                let avatarSrc = defaultAvatar;
-                let avatarClass = 'contact-avatar';
-                const isValidDataUrl = contact && contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
-                if (contact && contact.picture_loading) {
-                    avatarClass += ' loading';
-                    console.log(`[DM HEADER AVATAR] ${contact.name}: picture_loading true, using default avatar.`);
-                } else if (isValidDataUrl) {
-                    avatarSrc = contact.picture_data_url;
-                    console.log(`[DM HEADER AVATAR] ${contact.name}: using picture_data_url.`);
-                } else if (contact && contact.picture_data_url && !isValidDataUrl && contact.picture) {
-                    avatarSrc = contact.picture;
-                    console.log(`[DM HEADER AVATAR] ${contact.name}: invalid picture_data_url, falling back to picture (URL or fallback).`);
-                } else if (contact && contact.picture) {
-                    avatarSrc = contact.picture;
-                    console.log(`[DM HEADER AVATAR] ${contact.name}: using picture (URL or fallback).`);
-                } else {
-                    console.log(`[DM HEADER AVATAR] ${contact ? contact.name : contactPubkey}: using default avatar (no image available).`);
-                }
-                // --- End avatar fallback logic ---
-                
-                // Back button is now handled in showDmConversation() - no need to create it here
-                // Hide the dm-conversation-header if it exists
-                const dmConversationHeader = document.getElementById('dm-conversation-header');
-                if (dmConversationHeader) {
-                    dmConversationHeader.style.display = 'none';
-                }
-                
-                // Create conversation header with contact info (no back button here)
-                const headerElement = document.createElement('div');
-                headerElement.className = 'conversation-header';
-                headerElement.innerHTML = `
-                    <div class="conversation-contact-info">
-                        <img class="contact-avatar" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';" style="cursor: pointer;" data-pubkey="${contactPubkey}">
-                        <div class="conversation-contact-details">
-                            <div class="conversation-contact-name">${contact ? contact.name : contactPubkey}</div>
-                            <div class="conversation-contact-pubkey">${contactPubkey}</div>
-                        </div>
+                console.log(`[DM HEADER AVATAR] ${contact ? contact.name : contactPubkey}: using default avatar (no image available).`);
+            }
+            // --- End avatar fallback logic ---
+            
+            // Back button is now handled in showDmConversation() - no need to create it here
+            // Hide the dm-conversation-header if it exists
+            const dmConversationHeader = document.getElementById('dm-conversation-header');
+            if (dmConversationHeader) {
+                dmConversationHeader.style.display = 'none';
+            }
+            
+            // Create conversation header with contact info (no back button here)
+            const headerElement = document.createElement('div');
+            headerElement.className = 'conversation-header';
+            headerElement.innerHTML = `
+                <div class="conversation-contact-info">
+                    <img class="contact-avatar" src="${avatarSrc}" alt="${contact ? contact.name : contactPubkey}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';" style="cursor: pointer;" data-pubkey="${contactPubkey}">
+                    <div class="conversation-contact-details">
+                        <div class="conversation-contact-name">${contact ? contact.name : contactPubkey}</div>
+                        <div class="conversation-contact-pubkey">${contactPubkey}</div>
                     </div>
+                </div>
+            `;
+            dmMessages.appendChild(headerElement);
+            
+            // Add click handler to avatar to navigate to contacts page
+            const avatarElement = headerElement.querySelector('.contact-avatar');
+            if (avatarElement) {
+                avatarElement.addEventListener('click', () => {
+                    this.navigateToContact(contactPubkey);
+                });
+            }
+            
+            if (messages.length === 0) {
+                // Show empty state message
+                const emptyStateDiv = document.createElement('div');
+                emptyStateDiv.className = 'text-center text-muted';
+                emptyStateDiv.style.cssText = 'padding: 2rem;';
+                emptyStateDiv.innerHTML = `
+                    <i class="fas fa-comments" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
+                    <p>No messages yet</p>
+                    <p>Start a conversation with ${contact ? contact.name : 'this contact'}!</p>
                 `;
-                dmMessages.appendChild(headerElement);
-                
-                // Add click handler to avatar to navigate to contacts page
-                const avatarElement = headerElement.querySelector('.contact-avatar');
-                if (avatarElement) {
-                    avatarElement.addEventListener('click', () => {
-                        this.navigateToContact(contactPubkey);
-                    });
-                }
-                
+                dmMessages.appendChild(emptyStateDiv);
+            } else {
                 // Create messages container
                 const messagesContainer = document.createElement('div');
                 messagesContainer.className = 'messages-container';
@@ -1327,32 +1359,8 @@ class DMService {
             return;
         }
         
-        // Add to DM contacts if not already present (do this before switching tabs)
-        if (!window.appState.getDmContacts().find(c => c.pubkey === pubkey)) {
-            if (pubkey === myPubkey) {
-                // Special case: DM to self
-                console.log('[DM DEBUG] Starting DM to self');
-                window.appState.addDmContact({
-                    pubkey: myPubkey,
-                    name: 'Myself',
-                    lastMessage: '',
-                    lastMessageTime: new Date(),
-                    messageCount: 0,
-                    picture_data_url: null,
-                    profileLoaded: true
-                });
-            } else {
-                window.appState.addDmContact({
-                    pubkey: contact.pubkey,
-                    name: contact.name,
-                    lastMessage: '',
-                    lastMessageTime: new Date(),
-                    messageCount: 0,
-                    picture_data_url: contact.picture_data_url || null,
-                    profileLoaded: true
-                });
-            }
-        }
+        // Don't add to DM contacts here - showDmConversation will handle creating a temporary contact
+        // if needed. This prevents empty conversations from appearing in the list.
         
         // Switch to the DM tab using switchTab instead of clicking
         window.app.switchTab('dm');

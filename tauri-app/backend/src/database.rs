@@ -738,6 +738,36 @@ impl Database {
         Ok(())
     }
 
+    /// Count how many users are following a given contact
+    pub fn count_users_following_contact(&self, contact_pubkey: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM user_contacts WHERE contact_pubkey = ?"
+        )?;
+        let count: i64 = stmt.query_row(params![contact_pubkey], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// Remove a user-contact relationship and cleanup contact if no users remain
+    /// Returns (success, contact_deleted)
+    pub fn remove_user_contact_and_cleanup(&self, user_pubkey: &str, contact_pubkey: &str) -> Result<(bool, bool)> {
+        // First, remove the user-contact relationship
+        self.remove_user_contact(user_pubkey, contact_pubkey)?;
+        
+        // Check if any other users are following this contact
+        let remaining_count = self.count_users_following_contact(contact_pubkey)?;
+        
+        // If no users are following the contact, delete it from the contacts table
+        let contact_deleted = if remaining_count == 0 {
+            self.delete_contact(contact_pubkey)?;
+            true
+        } else {
+            false
+        };
+        
+        Ok((true, contact_deleted))
+    }
+
     pub fn get_contact(&self, pubkey: &str) -> Result<Option<Contact>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

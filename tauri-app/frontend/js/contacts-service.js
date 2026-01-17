@@ -317,7 +317,9 @@ class ContactsService {
         
         let emailIcon = '';
         if (contact.email) {
-            emailIcon = `<a href="mailto:${contact.email}" class="contact-email-icon" title="Send email to ${contact.email}"><i class="fas fa-envelope"></i></a>`;
+            emailIcon = `<button class="contact-email-icon" title="Send email to ${contact.email}" aria-label="Send email to ${contact.email}" data-email="${contact.email}">
+                <i class="fas fa-envelope"></i>
+            </button>`;
         }
 
         // Determine avatar source
@@ -395,7 +397,9 @@ class ContactsService {
                     
                     let emailIcon = '';
                     if (contact.email) {
-                        emailIcon = `<a href="mailto:${contact.email}" class="contact-email-icon" title="Send email to ${contact.email}"><i class="fas fa-envelope"></i></a>`;
+                        emailIcon = `<button class="contact-email-icon" title="Send email to ${contact.email}" aria-label="Send email to ${contact.email}" data-email="${contact.email}">
+                            <i class="fas fa-envelope"></i>
+                        </button>`;
                     }
 
                     // Determine avatar source and class - only use cached data URLs to prevent offline errors
@@ -413,10 +417,28 @@ class ContactsService {
                         console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
                     }
 
-                    // Add privacy indicator icon
-                    const privacyIcon = contact.is_public === false 
-                        ? '<i class="fas fa-lock contact-privacy-icon" title="Private contact"></i>'
-                        : '<i class="fas fa-globe contact-privacy-icon" title="Public contact"></i>';
+                    // Add privacy toggle switch
+                    const isPublic = contact.is_public !== undefined ? contact.is_public : true;
+                    const privacyIcon = isPublic 
+                        ? '<i class="fas fa-globe privacy-toggle-icon" title="Public follow - visible in your public follow list"></i>'
+                        : '<i class="fas fa-lock privacy-toggle-icon" title="Private follow - not in your public follow list"></i>';
+                    const privacyToggleHTML = `
+                        <div class="privacy-toggle-wrapper" title="${isPublic ? 'Public follow - visible in your public follow list. Click to make private.' : 'Private follow - not in your public follow list. Click to make public.'}">
+                            ${privacyIcon}
+                            <label class="privacy-toggle privacy-toggle-compact" id="privacy-toggle-list-${contact.pubkey}">
+                                <input type="checkbox" ${isPublic ? 'checked' : ''} 
+                                       aria-label="${isPublic ? 'Public follow - click to make private' : 'Private follow - click to make public'}">
+                                <span class="privacy-toggle-slider"></span>
+                            </label>
+                        </div>
+                    `;
+                    
+                    // Add delete icon for private contacts (only visible on hover)
+                    const deleteIconHTML = !isPublic 
+                        ? `<button class="contact-delete-icon" data-pubkey="${contact.pubkey}" title="Remove this private contact" aria-label="Remove contact ${contact.name}">
+                            <i class="fas fa-trash-alt"></i>
+                           </button>`
+                        : '';
                     
                     contactElement.innerHTML = `
                         <img class="${avatarClass}" src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
@@ -424,13 +446,68 @@ class ContactsService {
                             <div class="contact-name">${contact.name}</div>
                         </div>
                         <div class="contact-actions">
-                            ${privacyIcon}
+                            ${deleteIconHTML}
+                            ${privacyToggleHTML}
                             ${emailIcon}
                         </div>
                     `;
                     
-                    // Add click event listener
-                    contactElement.addEventListener('click', () => this.selectContact(contact));
+                    // Add click event listener for contact selection
+                    contactElement.addEventListener('click', (e) => {
+                        // Don't select contact if clicking on toggle wrapper, toggle, delete icon, or email icon
+                        if (e.target.closest('.privacy-toggle-wrapper') || e.target.closest('.privacy-toggle') || e.target.closest('.contact-delete-icon') || e.target.closest('.contact-email-icon')) {
+                            return;
+                        }
+                        this.selectContact(contact);
+                    });
+                    
+                    // Add event listener for delete icon (if present)
+                    if (!isPublic) {
+                        const deleteButton = contactElement.querySelector('.contact-delete-icon');
+                        if (deleteButton) {
+                            deleteButton.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                this.deletePrivateContact(contact);
+                            });
+                        }
+                    }
+                    
+                    // Add event listener for email icon
+                    if (contact.email) {
+                        const emailButton = contactElement.querySelector('.contact-email-icon');
+                        if (emailButton) {
+                            emailButton.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                this.sendEmailToContact(contact.email);
+                            });
+                        }
+                    }
+                    
+                    // Add event listener for privacy toggle
+                    const toggleCheckbox = contactElement.querySelector(`#privacy-toggle-list-${contact.pubkey} input[type="checkbox"]`);
+                    const toggleWrapper = contactElement.querySelector('.privacy-toggle-wrapper');
+                    if (toggleCheckbox && toggleWrapper) {
+                        toggleCheckbox.addEventListener('change', (e) => {
+                            e.stopPropagation();
+                            const newIsPublic = e.target.checked;
+                            
+                            // Update icon immediately for visual feedback
+                            const iconElement = toggleWrapper.querySelector('.privacy-toggle-icon');
+                            if (iconElement) {
+                                if (newIsPublic) {
+                                    iconElement.className = 'fas fa-globe privacy-toggle-icon';
+                                    iconElement.title = 'Public follow - visible in your public follow list';
+                                    toggleWrapper.title = 'Public follow - visible in your public follow list. Click to make private.';
+                                } else {
+                                    iconElement.className = 'fas fa-lock privacy-toggle-icon';
+                                    iconElement.title = 'Private follow - not in your public follow list';
+                                    toggleWrapper.title = 'Private follow - not in your public follow list. Click to make public.';
+                                }
+                            }
+                            
+                            this.toggleContactPrivacy(contact.pubkey, newIsPublic, e.target);
+                        });
+                    }
                     
                     contactsList.appendChild(contactElement);
                 });
@@ -1995,6 +2072,62 @@ class ContactsService {
             window.notificationService.showError('Failed to update contact privacy: ' + error);
             // Revert checkbox if error
             if (checkboxElement) checkboxElement.checked = !isPublic;
+        }
+    }
+
+    // Delete a private contact
+    async deletePrivateContact(contact) {
+        try {
+            if (!window.appState.hasKeypair()) {
+                window.notificationService.showError('No keypair available');
+                return;
+            }
+
+            const userPubkey = window.appState.getKeypair().public_key;
+            const contactName = contact.name || contact.pubkey;
+            
+            // Show confirmation dialog
+            const confirmed = await window.notificationService.showConfirmation(
+                `Are you sure you want to remove ${contactName} from your contacts? This will remove the private follow relationship.`,
+                'Remove Contact'
+            );
+            
+            if (!confirmed) return;
+
+            // Call backend to remove the relationship and cleanup if needed
+            const result = await window.__TAURI__.core.invoke('db_remove_user_contact_and_cleanup', {
+                userPubkey: userPubkey,
+                contactPubkey: contact.pubkey
+            });
+
+            const [success, contactDeleted] = result;
+            
+            if (success) {
+                // Remove contact from app state
+                const contacts = window.appState.getContacts();
+                const updatedContacts = contacts.filter(c => c.pubkey !== contact.pubkey);
+                window.appState.setContacts(updatedContacts);
+                
+                // Clear selected contact if it was the deleted one
+                const selectedContact = window.appState.getSelectedContact();
+                if (selectedContact && selectedContact.pubkey === contact.pubkey) {
+                    window.appState.setSelectedContact(null);
+                }
+                
+                // Re-render contacts list
+                this.renderContacts();
+                
+                // Show success message
+                const message = contactDeleted 
+                    ? `${contactName} has been removed from your contacts and deleted from the database.`
+                    : `${contactName} has been removed from your contacts.`;
+                window.notificationService.showSuccess(message);
+            } else {
+                window.notificationService.showError('Failed to remove contact');
+            }
+        } catch (error) {
+            console.error('Error deleting private contact:', error);
+            window.notificationService.showError('Failed to remove contact: ' + error);
         }
     }
 }

@@ -85,6 +85,71 @@
     color: #333;
 }
 
+.contact-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* Email icon button */
+.contact-email-icon {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px;
+    color: #667eea;
+    font-size: 14px;
+    opacity: 0.8;
+    transition: opacity 0.2s ease, color 0.2s ease;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.contact-email-icon:hover {
+    opacity: 1;
+    color: #5568d3;
+    background-color: rgba(102, 126, 234, 0.1);
+}
+
+/* Delete icon for private contacts */
+.contact-delete-icon {
+    display: none;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px;
+    color: #dc3545;
+    font-size: 14px;
+    opacity: 0.7;
+    transition: opacity 0.2s ease, color 0.2s ease;
+    border-radius: 4px;
+}
+
+.contact-delete-icon:hover {
+    opacity: 1;
+    color: #c82333;
+    background-color: rgba(220, 53, 69, 0.1);
+}
+
+.contact-item:hover .contact-delete-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.contact-item.active .contact-delete-icon {
+    color: white;
+    opacity: 0.9;
+}
+
+.contact-item.active .contact-delete-icon:hover {
+    color: white;
+    opacity: 1;
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
 /* Contacts Container */
 .contacts-container {
     display: flex;
@@ -371,11 +436,14 @@ body.dark-mode .contact-detail-pubkey code {
 }
 
 body.dark-mode .contact-email-icon {
-    color: #a0a0a0;
+    color: #667eea;
+    opacity: 0.8;
 }
 
 body.dark-mode .contact-email-icon:hover {
-    color: #e0e0e0;
+    color: #7c8ef5;
+    opacity: 1;
+    background-color: rgba(102, 126, 234, 0.15);
 }
 
 /* Dark mode support for contacts search */
@@ -404,6 +472,108 @@ body.dark-mode .contacts-search-icon {
 
 .contact-item.active .contact-privacy-icon {
     color: white;
+}
+
+/* Compact privacy toggle for contact list items */
+.privacy-toggle-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-right: 8px;
+}
+
+.privacy-toggle-wrapper .privacy-toggle-icon {
+    font-size: 14px;
+    color: #6c757d;
+    flex-shrink: 0;
+}
+
+.contact-item.active .privacy-toggle-wrapper .privacy-toggle-icon {
+    color: white;
+}
+
+.contact-item .privacy-toggle-compact {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+}
+
+.contact-item .privacy-toggle-compact input[type="checkbox"] {
+    display: none;
+}
+
+.contact-item .privacy-toggle-compact .privacy-toggle-slider {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    background-color: #ccc;
+    border-radius: 20px;
+    transition: background-color 0.3s ease;
+}
+
+.contact-item .privacy-toggle-compact input[type="checkbox"]:checked + .privacy-toggle-slider {
+    background-color: #667eea;
+}
+
+.contact-item .privacy-toggle-compact .privacy-toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background-color: white;
+    top: 2px;
+    left: 2px;
+    transition: transform 0.3s ease;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.contact-item .privacy-toggle-compact input[type="checkbox"]:checked + .privacy-toggle-slider::before {
+    transform: translateX(16px);
+}
+
+.contact-item .privacy-toggle-compact:hover .privacy-toggle-slider {
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+}
+
+/* Dark mode support for compact privacy toggle */
+body.dark-mode .contact-item .privacy-toggle-compact .privacy-toggle-slider {
+    background-color: #444;
+}
+
+body.dark-mode .contact-item .privacy-toggle-compact input[type="checkbox"]:checked + .privacy-toggle-slider {
+    background-color: #667eea;
+}
+
+body.dark-mode .privacy-toggle-wrapper .privacy-toggle-icon {
+    color: #a0a0a0;
+}
+
+body.dark-mode .contact-item.active .privacy-toggle-wrapper .privacy-toggle-icon {
+    color: white;
+}
+
+/* Dark mode support for delete icon */
+body.dark-mode .contact-delete-icon {
+    color: #ff6b6b;
+    opacity: 0.7;
+}
+
+body.dark-mode .contact-delete-icon:hover {
+    color: #ff5252;
+    background-color: rgba(255, 107, 107, 0.15);
+}
+
+body.dark-mode .contact-item.active .contact-delete-icon {
+    color: white;
+    opacity: 0.9;
+}
+
+body.dark-mode .contact-item.active .contact-delete-icon:hover {
+    color: white;
+    opacity: 1;
+    background-color: rgba(255, 255, 255, 0.2);
 }
 
 .privacy-toggle-section {

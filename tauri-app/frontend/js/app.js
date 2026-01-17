@@ -2544,6 +2544,9 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 // Reload the currently active page to reflect the new keypair
                 await this.reloadActivePage();
                 
+                // Ensure default nostr-mail contact is added for the new user
+                await this.ensureDefaultContact();
+                
                 // After loading settings for new keypair, check if settings were actually loaded
                 const loadedSettings = appState.getSettings();
                 if (loadedSettings && Object.keys(loadedSettings).length > 0) {
@@ -3608,15 +3611,11 @@ NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
     const profileFieldsList = document.getElementById('profile-fields-list');
     const profilePicture = document.getElementById('profile-picture');
 
-    // Only clear UI if switching pubkeys
+    // Show loading spinner if switching pubkeys or if no cached profile exists
+    let shouldShowSpinner = false;
     if (this.lastRenderedProfilePubkey !== null && this.lastRenderedProfilePubkey !== targetPubkey) {
         console.log('[Profile] Switching pubkey from', this.lastRenderedProfilePubkey, 'to', targetPubkey, '- clearing UI and showing spinner');
-        if (profileFieldsList) profileFieldsList.innerHTML = '';
-        if (profilePicture) {
-            profilePicture.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
-            profilePicture.style.display = '';
-        }
-        if (profileSpinner) profileSpinner.style.display = '';
+        shouldShowSpinner = true;
     }
 
     // Always try to render cached profile immediately
@@ -3653,12 +3652,32 @@ NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
                 this.renderProfileFromObject(cachedProfile, cachedPictureDataUrl, isViewingOwnProfile);
             } else {
                 console.log('[Profile] No cached profile found for pubkey', targetPubkey);
+                // No cached profile - show spinner while we fetch
+                shouldShowSpinner = true;
             }
         } else {
             console.log('[Profile] No cached profiles in localStorage or no target pubkey');
+            // No cache at all - show spinner while we fetch
+            if (targetPubkey) {
+                shouldShowSpinner = true;
+            }
         }
     } catch (e) {
         console.warn('[Profile] Error loading cached profile:', e);
+        // Error loading cache - show spinner while we fetch
+        if (targetPubkey) {
+            shouldShowSpinner = true;
+        }
+    }
+
+    // Show spinner and clear UI if we need to fetch the profile
+    if (shouldShowSpinner && targetPubkey) {
+        if (profileFieldsList) profileFieldsList.innerHTML = '';
+        if (profilePicture) {
+            profilePicture.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
+            profilePicture.style.display = '';
+        }
+        if (profileSpinner) profileSpinner.style.display = '';
     }
 
     if (!targetPubkey) {
@@ -3678,6 +3697,7 @@ NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
     // Check if we have any relays configured (persistent client will handle connection logic)
     const allRelays = appState.getRelays();
     if (allRelays.length === 0) {
+        if (profileSpinner) profileSpinner.style.display = 'none';
         notificationService.showError('No relays configured to fetch profile from.');
         this.renderProfilePubkey();
         if (Utils.isDevMode()) {
@@ -3703,6 +3723,9 @@ NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
                     existingMessage.remove();
                 }
             }
+            
+            // Hide spinner now that we have the profile
+            if (profileSpinner) profileSpinner.style.display = 'none';
             
             // Render profile immediately (fields and avatar URL)
             // This allows the browser to start loading the image while we fetch/cache the data URL

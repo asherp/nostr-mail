@@ -1015,7 +1015,6 @@ class EmailService {
                 
                 // Check if we have a keypair and active relays
                 if (!appState.hasKeypair()) {
-                    notificationService.showError('No Nostr keypair available for encryption');
                     return;
                 }
                 
@@ -3788,7 +3787,6 @@ ${attachmentsHtml}
         }
         if (!appState.hasKeypair()) {
             console.log('[JS] No keypair available');
-            notificationService.showError('No Nostr keypair available for encryption');
             return false;
         }
         const subject = domManager.getValue('subject') || '';
@@ -5466,7 +5464,6 @@ ${attachmentsHtml}
         try {
             const keypair = appState.getKeypair();
             if (!keypair) {
-                window.notificationService.showError('No keypair available');
                 return false;
             }
             
@@ -5552,7 +5549,6 @@ ${attachmentsHtml}
     async _searchContactsForRecipientPubkey(email) {
         const keypair = appState.getKeypair();
         if (!keypair) {
-            window.notificationService.showError('No keypair available');
             return null;
         }
         
@@ -5660,7 +5656,6 @@ ${attachmentsHtml}
                 
                 const keypair = appState.getKeypair();
                 if (!keypair) {
-                    window.notificationService.showError('No keypair available for decryption');
                     return;
                 }
                 
@@ -5759,7 +5754,6 @@ ${attachmentsHtml}
                 
                 const keypair = appState.getKeypair();
                 if (!keypair) {
-                    window.notificationService.showError('No keypair available for decryption');
                     return;
                 }
                 
@@ -5906,7 +5900,6 @@ ${attachmentsHtml}
                 
                 const keypair = appState.getKeypair();
                 if (!keypair) {
-                    window.notificationService.showError('No keypair available for decryption');
                     return;
                 }
                 
@@ -6001,7 +5994,6 @@ ${attachmentsHtml}
                 
                 const keypair = appState.getKeypair();
                 if (!keypair) {
-                    window.notificationService.showError('No keypair available for decryption');
                     return;
                 }
                 

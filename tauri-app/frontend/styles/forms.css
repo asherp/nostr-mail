@@ -292,6 +292,41 @@ body.dark-mode .form-text {
     min-height: 100px;
 }
 
+/* Settings Separator */
+.settings-separator {
+    display: flex;
+    align-items: center;
+    text-align: center;
+    margin: 24px 0;
+    position: relative;
+}
+
+.settings-separator::before,
+.settings-separator::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: #e0e0e0;
+}
+
+.settings-separator span {
+    padding: 0 16px;
+    color: #6c757d;
+    font-size: 0.875rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+body.dark-mode .settings-separator::before,
+body.dark-mode .settings-separator::after {
+    background: #444;
+}
+
+body.dark-mode .settings-separator span {
+    color: #a0a0a0;
+}
+
 /* Live Events Status Indicator */
 .live-events-status {
     display: flex;

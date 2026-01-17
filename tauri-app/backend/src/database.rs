@@ -55,6 +55,18 @@ pub struct DirectMessage {
     pub received_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DbConversation {
+    pub id: Option<i64>,
+    pub user_pubkey: String,
+    pub contact_pubkey: String,
+    pub contact_name: Option<String>,
+    pub last_message_event_id: String,
+    pub last_timestamp: i64,
+    pub message_count: i64,
+    pub cached_at: DateTime<Utc>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserSettings {
@@ -307,6 +319,22 @@ impl Database {
             [],
         )?;
 
+        // Conversations table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_pubkey TEXT NOT NULL,
+                contact_pubkey TEXT NOT NULL,
+                contact_name TEXT,
+                last_message_event_id TEXT NOT NULL,
+                last_timestamp INTEGER NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                cached_at DATETIME NOT NULL,
+                UNIQUE(user_pubkey, contact_pubkey)
+            )",
+            [],
+        )?;
+
         // Migrate: Add hash columns to emails and direct_messages tables if they don't exist
         Self::migrate_add_hash_columns(&conn)?;
 
@@ -345,6 +373,8 @@ impl Database {
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_settings_pubkey_key_unique ON user_settings(pubkey, key)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_relays_url ON relays(url)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_email_id ON attachments(email_id)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user_pubkey ON conversations(user_pubkey, last_timestamp DESC)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_contact_pubkey ON conversations(contact_pubkey)", [])?;
 
         Ok(())
     }
@@ -1264,7 +1294,7 @@ impl Database {
         // Compute hash for DM content
         let content_hash = Self::compute_content_hash(&dm.content);
         
-        if let Some(id) = dm.id {
+        let result = if let Some(id) = dm.id {
             conn.execute(
                 "UPDATE direct_messages SET 
                     event_id = ?, sender_pubkey = ?, recipient_pubkey = ?, content = ?, 
@@ -1275,7 +1305,7 @@ impl Database {
                     dm.created_at, dm.received_at, content_hash, id
                 ],
             )?;
-            Ok(id)
+            id
         } else {
             let _id = conn.execute(
                 "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash)
@@ -1285,14 +1315,23 @@ impl Database {
                     dm.created_at, dm.received_at, content_hash
                 ],
             )?;
-            Ok(conn.last_insert_rowid())
-        }
+            conn.last_insert_rowid()
+        };
+        
+        // Update conversation metadata for both sender and recipient
+        drop(conn); // Release lock before calling update_conversation_from_messages
+        let _ = self.update_conversation_from_messages(&dm.sender_pubkey, &dm.recipient_pubkey);
+        let _ = self.update_conversation_from_messages(&dm.recipient_pubkey, &dm.sender_pubkey);
+        
+        Ok(result)
     }
 
     /// Save a batch of direct messages, skipping any that already exist by event_id
     pub fn save_dm_batch(&self, dms: &[DirectMessage]) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let mut inserted = 0;
+        let mut conversations_to_update = std::collections::HashSet::new();
+        
         for dm in dms {
             // Check if this event_id already exists
             let mut stmt = conn.prepare("SELECT 1 FROM direct_messages WHERE event_id = ? LIMIT 1")?;
@@ -1311,7 +1350,17 @@ impl Database {
                 ],
             )?;
             inserted += 1;
+            // Track conversations that need updating
+            conversations_to_update.insert((dm.sender_pubkey.clone(), dm.recipient_pubkey.clone()));
+            conversations_to_update.insert((dm.recipient_pubkey.clone(), dm.sender_pubkey.clone()));
         }
+        
+        // Update conversation metadata for all affected conversations
+        drop(conn); // Release lock before calling update_conversation_from_messages
+        for (user_pubkey, contact_pubkey) in conversations_to_update {
+            let _ = self.update_conversation_from_messages(&user_pubkey, &contact_pubkey);
+        }
+        
         Ok(inserted)
     }
 
@@ -1348,6 +1397,31 @@ impl Database {
         let mut rows = stmt.query([])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // Returns the latest created_at timestamp for a specific conversation, or None if no messages exist
+    pub fn get_latest_dm_created_at_for_conversation(
+        &self, 
+        user_pubkey: &str, 
+        contact_pubkey: &str
+    ) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT created_at FROM direct_messages 
+             WHERE (sender_pubkey = ? AND recipient_pubkey = ?) 
+                OR (sender_pubkey = ? AND recipient_pubkey = ?)
+             ORDER BY created_at DESC LIMIT 1"
+        )?;
+        let mut rows = stmt.query_map(
+            params![user_pubkey, contact_pubkey, contact_pubkey, user_pubkey], 
+            |row| row.get::<_, DateTime<Utc>>(0)
+        )?;
+        
+        if let Some(row) = rows.next() {
+            Ok(Some(row?))
         } else {
             Ok(None)
         }
@@ -1974,6 +2048,179 @@ impl Database {
             "UPDATE emails SET signature_valid = ? WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?",
             params![signature_valid, normalized_id],
         )?;
+        Ok(())
+    }
+
+    // Conversation operations
+    pub fn save_conversation(&self, conv: &DbConversation) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        
+        if let Some(id) = conv.id {
+            conn.execute(
+                "UPDATE conversations SET 
+                    user_pubkey = ?, contact_pubkey = ?, contact_name = ?, 
+                    last_message_event_id = ?, last_timestamp = ?, message_count = ?, cached_at = ?
+                WHERE id = ?",
+                params![
+                    conv.user_pubkey, conv.contact_pubkey, conv.contact_name,
+                    conv.last_message_event_id, conv.last_timestamp, conv.message_count, conv.cached_at, id
+                ],
+            )?;
+            Ok(id)
+        } else {
+            conn.execute(
+                "INSERT INTO conversations (user_pubkey, contact_pubkey, contact_name, last_message_event_id, last_timestamp, message_count, cached_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_pubkey, contact_pubkey) DO UPDATE SET
+                    contact_name = excluded.contact_name,
+                    last_message_event_id = excluded.last_message_event_id,
+                    last_timestamp = excluded.last_timestamp,
+                    message_count = excluded.message_count,
+                    cached_at = excluded.cached_at",
+                params![
+                    conv.user_pubkey, conv.contact_pubkey, conv.contact_name,
+                    conv.last_message_event_id, conv.last_timestamp, conv.message_count, now
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+
+    pub fn get_conversations(&self, user_pubkey: &str) -> Result<Vec<DbConversation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_pubkey, contact_pubkey, contact_name, last_message_event_id, last_timestamp, message_count, cached_at
+             FROM conversations 
+             WHERE user_pubkey = ?
+             ORDER BY last_timestamp DESC"
+        )?;
+        
+        let rows = stmt.query_map(params![user_pubkey], |row| {
+            Ok(DbConversation {
+                id: Some(row.get(0)?),
+                user_pubkey: row.get(1)?,
+                contact_pubkey: row.get(2)?,
+                contact_name: row.get(3)?,
+                last_message_event_id: row.get(4)?,
+                last_timestamp: row.get(5)?,
+                message_count: row.get(6)?,
+                cached_at: row.get(7)?,
+            })
+        })?;
+        
+        rows.collect()
+    }
+
+    pub fn get_conversation(&self, user_pubkey: &str, contact_pubkey: &str) -> Result<Option<DbConversation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_pubkey, contact_pubkey, contact_name, last_message_event_id, last_timestamp, message_count, cached_at
+             FROM conversations 
+             WHERE user_pubkey = ? AND contact_pubkey = ?"
+        )?;
+        
+        let mut rows = stmt.query_map(params![user_pubkey, contact_pubkey], |row| {
+            Ok(DbConversation {
+                id: Some(row.get(0)?),
+                user_pubkey: row.get(1)?,
+                contact_pubkey: row.get(2)?,
+                contact_name: row.get(3)?,
+                last_message_event_id: row.get(4)?,
+                last_timestamp: row.get(5)?,
+                message_count: row.get(6)?,
+                cached_at: row.get(7)?,
+            })
+        })?;
+        
+        match rows.next() {
+            Some(Ok(conv)) => Ok(Some(conv)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn update_conversation_metadata(&self, user_pubkey: &str, contact_pubkey: &str, last_message_event_id: &str, last_timestamp: i64, message_count: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO conversations (user_pubkey, contact_pubkey, last_message_event_id, last_timestamp, message_count, cached_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_pubkey, contact_pubkey) DO UPDATE SET
+                 last_message_event_id = excluded.last_message_event_id,
+                 last_timestamp = excluded.last_timestamp,
+                 message_count = excluded.message_count,
+                 cached_at = excluded.cached_at",
+            params![user_pubkey, contact_pubkey, last_message_event_id, last_timestamp, message_count, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_conversation(&self, user_pubkey: &str, contact_pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM conversations WHERE user_pubkey = ? AND contact_pubkey = ?",
+            params![user_pubkey, contact_pubkey],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_conversations(&self, user_pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM conversations WHERE user_pubkey = ?",
+            params![user_pubkey],
+        )?;
+        Ok(())
+    }
+
+    /// Update conversation metadata from messages in direct_messages table
+    /// This computes last_message_event_id, last_timestamp, and message_count from actual messages
+    pub fn update_conversation_from_messages(&self, user_pubkey: &str, contact_pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        
+        // Get the last message for this conversation
+        let mut stmt = conn.prepare(
+            "SELECT event_id, created_at 
+             FROM direct_messages 
+             WHERE (sender_pubkey = ? AND recipient_pubkey = ?) OR (sender_pubkey = ? AND recipient_pubkey = ?)
+             ORDER BY created_at DESC LIMIT 1"
+        )?;
+        
+        let last_message: Option<(String, DateTime<Utc>)> = stmt.query_map(
+            params![user_pubkey, contact_pubkey, contact_pubkey, user_pubkey],
+            |row| Ok((row.get(0)?, row.get(1)?))
+        )?.next().transpose()?;
+        
+        if let Some((event_id, created_at)) = last_message {
+            // Get message count
+            let mut count_stmt = conn.prepare(
+                "SELECT COUNT(*) 
+                 FROM direct_messages 
+                 WHERE (sender_pubkey = ? AND recipient_pubkey = ?) OR (sender_pubkey = ? AND recipient_pubkey = ?)"
+            )?;
+            let message_count: i64 = count_stmt.query_row(
+                params![user_pubkey, contact_pubkey, contact_pubkey, user_pubkey],
+                |row| row.get(0)
+            )?;
+            
+            // Convert DateTime to timestamp (seconds since epoch)
+            let last_timestamp = created_at.timestamp();
+            
+            // Update or insert conversation
+            let now = Utc::now();
+            conn.execute(
+                "INSERT INTO conversations (user_pubkey, contact_pubkey, last_message_event_id, last_timestamp, message_count, cached_at)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(user_pubkey, contact_pubkey) DO UPDATE SET
+                     last_message_event_id = excluded.last_message_event_id,
+                     last_timestamp = excluded.last_timestamp,
+                     message_count = excluded.message_count,
+                     cached_at = excluded.cached_at",
+                params![user_pubkey, contact_pubkey, event_id, last_timestamp, message_count, now],
+            )?;
+        }
+        
         Ok(())
     }
 

@@ -553,6 +553,13 @@ NostrMailApp.prototype.initializeNostrClient = async function() {
 NostrMailApp.prototype.ensureDefaultContact = async function() {
     const DEFAULT_CONTACT_PUBKEY = 'npub1agg7melcvmue7vwj2wqdh2666454xv5vsdu7n2tmkv73fl0a0tsq7asr9j';
     
+    // Prevent concurrent execution
+    if (this._ensuringDefaultContact) {
+        return;
+    }
+    
+    this._ensuringDefaultContact = true;
+    
     try {
         const keypair = appState.getKeypair();
         if (!keypair || !keypair.public_key) {
@@ -572,47 +579,79 @@ NostrMailApp.prototype.ensureDefaultContact = async function() {
             return;
         }
         
-        console.log('[APP] Default nostr-mail contact not found, fetching profile...');
+        console.log('[APP] Default nostr-mail contact not found, creating contact immediately...');
         
-        // Fetch the profile from Nostr relays
-        const profileResult = await window.TauriService.fetchProfilePersistent(DEFAULT_CONTACT_PUBKEY);
-        
-        if (!profileResult) {
-            console.warn('[APP] Could not fetch default nostr-mail profile, skipping');
-            return;
-        }
-        
-        console.log('[APP] Successfully fetched default nostr-mail profile');
-        
-        // Extract profile information
-        const profile = profileResult;
-        const profileName = profile.fields?.name || profile.fields?.display_name || 'nostr-mail';
-        const email = profile.fields?.email || null;
-        
-        // Create contact object in the same format as confirmFollowContact
+        // Create contact immediately with default data (don't wait for profile fetch)
+        // This ensures the contact appears instantly in the UI
         const now = new Date().toISOString();
         const contact = {
             pubkey: DEFAULT_CONTACT_PUBKEY,
-            name: profileName,
-            email: email,
-            picture: profile.fields?.picture || '',
-            fields: profile.fields || {},
+            name: 'nostr-mail', // Default name, will be updated when profile is fetched
+            email: null,
+            picture: '',
+            fields: {},
             picture_data_url: null,
             picture_loaded: false,
             picture_loading: false,
+            is_public: false, // Private contact - not in public follow list
             created_at: now,
             updated_at: now
         };
         
-        // Convert to database format and save as private contact
+        // Convert to database format and save as private contact immediately
         const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
         await window.DatabaseService.saveContact(dbContact, userPubkey, false); // isPublic = false
         
-        // Update app state and refresh UI
-        window.appState.addContact(contact);
+        // Reload contacts from database immediately so user sees the contact right away
         if (window.contactsService) {
-            window.contactsService.renderContacts();
+            await window.contactsService.loadContacts();
         }
+        
+        // Fetch profile asynchronously in the background and update the contact when ready
+        // This doesn't block the UI - user sees the contact immediately
+        window.TauriService.fetchProfilePersistent(DEFAULT_CONTACT_PUBKEY).then(async (profileResult) => {
+            if (profileResult) {
+                console.log('[APP] Successfully fetched default nostr-mail profile (async update)');
+                
+                // Extract profile information
+                const profile = profileResult;
+                const profileName = profile.fields?.name || profile.fields?.display_name || 'nostr-mail';
+                const email = profile.fields?.email || null;
+                
+                // Update the contact with fetched profile data
+                const updatedContact = {
+                    pubkey: DEFAULT_CONTACT_PUBKEY,
+                    name: profileName,
+                    email: email,
+                    picture: profile.fields?.picture || '',
+                    fields: profile.fields || {},
+                    picture_data_url: null,
+                    picture_loaded: false,
+                    picture_loading: false,
+                    is_public: false,
+                    created_at: contact.created_at,
+                    updated_at: new Date().toISOString()
+                };
+                
+                // Update in database
+                const updatedDbContact = window.DatabaseService.convertContactToDbFormat(updatedContact);
+                await window.DatabaseService.saveContact(updatedDbContact, userPubkey, false);
+                
+                // Reload contacts to show updated profile data
+                if (window.contactsService) {
+                    await window.contactsService.loadContacts();
+                }
+                
+                // Refresh compose dropdown
+                if (window.emailService) {
+                    window.emailService.populateNostrContactDropdown();
+                }
+            } else {
+                console.warn('[APP] Could not fetch default nostr-mail profile (async), contact created with default name');
+            }
+        }).catch((error) => {
+            console.error('[APP] Error fetching default nostr-mail profile (async):', error);
+        });
         
         // Refresh compose dropdown to include new contact
         if (window.emailService) {
@@ -623,6 +662,8 @@ NostrMailApp.prototype.ensureDefaultContact = async function() {
     } catch (error) {
         // Don't block startup if this fails - just log the error
         console.error('[APP] Failed to ensure default contact:', error);
+    } finally {
+        this._ensuringDefaultContact = false;
     }
 }
 
@@ -1290,6 +1331,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     
                     // Reload the currently active page to reflect the new keypair
                     await app.reloadActivePage();
+                    
+                    // Ensure default nostr-mail contact is added for the new user
+                    await app.ensureDefaultContact();
                     
                     notificationService.showSuccess('New keypair generated!');
                 } catch (error) {

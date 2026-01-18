@@ -14,6 +14,7 @@
 }
 
 .modal-overlay.hidden {
+    display: none !important;
     opacity: 0;
     pointer-events: none;
 }
@@ -65,6 +66,15 @@
 .modal-body {
     padding: var(--spacing-xl);
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
+}
+
+/* Mobile-specific modal body styles */
+@media (max-width: 480px) {
+    .modal-body {
+        padding: var(--spacing-lg);
+        max-height: calc(90vh - 120px); /* Account for header and footer */
+    }
 }
 
 /* Headers preview modal specific styles */
@@ -156,11 +166,23 @@ body.dark-mode .confirmation-modal .confirmation-actions button#confirm-ok {
     .modal-overlay {
         z-index: 10000 !important;
         position: fixed !important;
+        display: flex !important;
+        top: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        width: 100% !important;
+        height: 100% !important;
+    }
+    
+    .modal-overlay.hidden {
+        display: none !important;
     }
     
     .modal {
         max-width: 95%;
         width: 95%;
+        max-height: 90vh;
     }
 }
 
@@ -169,5 +191,16 @@ body.dark-mode .confirmation-modal .confirmation-actions button#confirm-ok {
     .modal-overlay {
         z-index: 10000 !important;
         position: fixed !important;
+        display: flex !important;
+        top: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        width: 100% !important;
+        height: 100% !important;
+    }
+    
+    .modal-overlay.hidden {
+        display: none !important;
     }
 } 

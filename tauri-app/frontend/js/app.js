@@ -26,7 +26,7 @@ NostrMailApp.prototype.init = async function() {
     console.log('🚀   NostrMail - Starting Application');
     console.log('🚀 ========================================');
     console.log('📧 Email + 🔐 Nostr Integration');
-    console.log('🌐 Version: 1.0.1-beta');
+    console.log('🌐 Version: 1.0.2-beta');
     console.log('⏰ Started at:', new Date().toLocaleString());
     console.log('🚀 ========================================');
     
@@ -925,8 +925,20 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const refreshContactsBtn = domManager.get('refreshContactsBtn');
         if (refreshContactsBtn) {
             refreshContactsBtn.addEventListener('click', async () => {
-                await contactsService.refreshContacts();
-                await contactsService.refreshSelectedContactProfile();
+                // Show loading state immediately
+                domManager.disable('refreshContactsBtn');
+                domManager.setHTML('refreshContactsBtn', '<span class="loading"></span> Refreshing...');
+                try {
+                    await contactsService.refreshContacts();
+                    await contactsService.refreshSelectedContactProfile();
+                } catch (error) {
+                    console.error('[JS] Error refreshing contacts:', error);
+                    notificationService.showError('Failed to refresh contacts: ' + error.message);
+                } finally {
+                    // Restore button state
+                    domManager.enable('refreshContactsBtn');
+                    domManager.setHTML('refreshContactsBtn', '<i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>');
+                }
             });
         }
         
@@ -2354,10 +2366,18 @@ NostrMailApp.prototype.showModal = function(title, content) {
         if (modalTitle) modalTitle.textContent = title;
         if (modalBody) modalBody.innerHTML = content;
         if (modalOverlay) {
+            // Remove hidden class to show modal
             modalOverlay.classList.remove('hidden');
             // Ensure modal is always on top, especially on mobile
             modalOverlay.style.zIndex = '10000';
             modalOverlay.style.position = 'fixed';
+            modalOverlay.style.display = 'flex';
+            modalOverlay.style.top = '0';
+            modalOverlay.style.left = '0';
+            modalOverlay.style.right = '0';
+            modalOverlay.style.bottom = '0';
+            modalOverlay.style.width = '100%';
+            modalOverlay.style.height = '100%';
         }
     } catch (error) {
         console.error('Error showing modal:', error);

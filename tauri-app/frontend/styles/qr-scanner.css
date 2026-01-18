@@ -11,6 +11,18 @@
     margin: 0 auto 20px;
 }
 
+/* Mobile-specific QR scanner styles */
+@media (max-width: 480px) {
+    #qr-reader {
+        max-width: 100%;
+        min-height: 250px;
+    }
+    
+    #qr-scanner-container {
+        padding: 10px;
+    }
+}
+
 .qr-scanner-controls {
     margin-top: 20px;
 }

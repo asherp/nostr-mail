@@ -3335,7 +3335,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-mail"
-version = "1.0.1-beta"
+version = "1.0.2-beta"
 dependencies = [
  "aes-gcm",
  "anyhow",

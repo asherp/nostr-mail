@@ -119,6 +119,20 @@ async fn send_direct_message_persistent(
     println!("[RUST] Message sent to relays. Success: {}, Failed: {}", 
         output.success.len(), output.failed.len());
     
+    // Check if at least one relay succeeded - if all failed, return an error
+    if output.success.is_empty() {
+        let failed_details: Vec<String> = output.failed.iter()
+            .map(|(url, err)| format!("{}: {}", url, err))
+            .collect();
+        let error_msg = format!(
+            "Failed to send message to any relay. All {} relays failed: {}", 
+            output.failed.len(),
+            failed_details.join("; ")
+        );
+        println!("[RUST] {}", error_msg);
+        return Err(error_msg);
+    }
+    
     // CRITICAL FIX: Relays don't immediately echo sent messages back to the sender.
     // Manually trigger the live handler immediately after successful send to avoid delay.
     // This ensures the sender sees their message instantly, matching receiver experience.
@@ -1006,7 +1020,16 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         match db.get_contact(pubkey_str) {
             Ok(Some(contact)) => {
                 // Check if contact has profile data (name, email, picture_url, or about)
-                let has_profile_data = contact.name.is_some() 
+                // BUT exclude placeholder names (pubkey prefix + "...")
+                let is_placeholder_name = contact.name.as_ref()
+                    .map(|name| {
+                        // Placeholder names are exactly 19 chars (16 + "...") and end with "..."
+                        // Also check if it matches the pubkey prefix pattern
+                        name.len() == 19 && name.ends_with("...") && name.starts_with(&pubkey_str[..16.min(pubkey_str.len())])
+                    })
+                    .unwrap_or(false);
+
+                let has_profile_data = (!is_placeholder_name && contact.name.is_some())
                     || contact.email.is_some() 
                     || contact.picture_url.is_some() 
                     || contact.about.is_some();
@@ -1072,6 +1095,35 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         }
     };
     
+    // Check relay connection status before fetching
+    // Wait for at least one relay to be connected (up to 10 seconds)
+    let max_wait_time = std::time::Duration::from_secs(10);
+    let start_time = std::time::Instant::now();
+    let check_interval = std::time::Duration::from_millis(500);
+    
+    let mut connected_relays = client.relays().await;
+    println!("[RUST] Checking relay status before batch profile fetch...");
+    println!("[RUST] Initial relays in client: {}", connected_relays.len());
+    
+    // Wait for at least one relay to connect
+    while connected_relays.is_empty() && start_time.elapsed() < max_wait_time {
+        println!("[RUST] No relays connected yet, waiting... ({:?} elapsed)", start_time.elapsed());
+        tokio::time::sleep(check_interval).await;
+        connected_relays = client.relays().await;
+    }
+    
+    if connected_relays.is_empty() {
+        println!("[RUST] WARNING: No relays connected after waiting! Batch profile fetch will likely fail.");
+        return Err("No relays connected. Please check your relay configuration and network connection.".to_string());
+    } else {
+        println!("[RUST] Connected to {} relay(s) for batch fetch:", connected_relays.len());
+        for (url, _) in connected_relays.iter() {
+            println!("[RUST]   ✓ {}", url);
+        }
+        // Give relays a brief moment to be fully ready for queries
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    
     // Parse pubkeys that need fetching
     let parsed_keys: Result<Vec<PublicKey>, String> = pubkeys_to_fetch.iter()
         .map(|pubkey_str| {
@@ -1092,10 +1144,62 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         .kind(Kind::from(0)) // Profile events are kind 0
         .limit(1000); // Allow for multiple profiles
         
-    let profile_events = client
+    println!("[RUST] Fetching profile events with 30s timeout...");
+    let fetch_start = std::time::Instant::now();
+    let profile_events: Vec<_> = match client
         .fetch_events(profiles_filter, Duration::from_secs(30))
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(events) => events.into_iter().collect(),
+        Err(e) => {
+            println!("[RUST] ERROR during batch fetch_events: {}", e);
+            Vec::new()
+        }
+    };
+    let fetch_duration = fetch_start.elapsed();
+    println!("[RUST] Fetch completed in {:?}", fetch_duration);
+    
+    // Check if fetch took too long or returned empty results, attempt fallback
+    let mut fallback_profiles: std::collections::HashMap<String, (std::collections::HashMap<String, serde_json::Value>, String)> = std::collections::HashMap::new();
+    
+    if fetch_duration.as_secs() >= 25 || profile_events.is_empty() {
+        println!("[RUST] WARNING: Batch fetch took too long ({:?}) or returned no results ({} events). Attempting fallback...", 
+            fetch_duration, profile_events.len());
+        
+        // Fallback: Try using single fetches for remaining pubkeys
+        let db_relays = db.get_all_relays()
+            .map_err(|e| format!("Failed to load relays from database: {}", e))?;
+        let relay_urls: Vec<String> = db_relays.iter()
+            .filter(|r| r.is_active)
+            .map(|r| r.url.clone())
+            .collect();
+        
+        if !relay_urls.is_empty() {
+            println!("[RUST] Fallback: Querying {} relays with fresh connection for {} pubkeys", 
+                relay_urls.len(), pubkeys_to_fetch.len());
+            
+            // Try fetching each pubkey individually using fallback
+            for pubkey_str in &pubkeys_to_fetch {
+                match nostr::fetch_events(pubkey_str, Some(0), &relay_urls).await {
+                    Ok(events) => {
+                        if let Some(latest_event) = events.into_iter().max_by_key(|e| e.created_at) {
+                            if let Ok(fields) = serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&latest_event.content) {
+                                fallback_profiles.insert(pubkey_str.clone(), (fields, latest_event.content));
+                                println!("[RUST] Fallback successfully retrieved profile for: {}", pubkey_str);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        println!("[RUST] Fallback failed for {}: {}", pubkey_str, e);
+                    }
+                }
+            }
+            
+            if !fallback_profiles.is_empty() {
+                println!("[RUST] Fallback retrieved {} profiles", fallback_profiles.len());
+            }
+        }
+    }
     
     println!("[RUST] Found {} profile events from relays", profile_events.len());
     
@@ -1130,12 +1234,22 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
                 }
             }
         } else {
-            println!("[RUST] No profile found in relay for pubkey: {}", pubkey_str);
-            results.push(ProfileResult {
-                pubkey: pubkey_str.clone(),
-                fields: std::collections::HashMap::new(),
-                raw_content: "{}".to_string(),
-            });
+            // Check if fallback found this profile
+            if let Some((fields, raw_content)) = fallback_profiles.get(pubkey_str) {
+                println!("[RUST] Using fallback profile for: {}", pubkey_str);
+                results.push(ProfileResult {
+                    pubkey: pubkey_str.clone(),
+                    fields: fields.clone(),
+                    raw_content: raw_content.clone(),
+                });
+            } else {
+                println!("[RUST] No profile found in relay for pubkey: {}", pubkey_str);
+                results.push(ProfileResult {
+                    pubkey: pubkey_str.clone(),
+                    fields: std::collections::HashMap::new(),
+                    raw_content: "{}".to_string(),
+                });
+            }
         }
     }
     

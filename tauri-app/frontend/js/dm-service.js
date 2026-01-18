@@ -1196,7 +1196,9 @@ class DMService {
             
         } catch (error) {
             console.error('Failed to send DM message:', error);
-            window.notificationService.showError('Failed to send message: ' + error.message);
+            // Extract error message - handle both string errors and Error objects
+            const errorMessage = typeof error === 'string' ? error : (error.message || error.toString());
+            window.notificationService.showError('Failed to send message: ' + errorMessage);
             
             // Re-enable send button on error
             const sendBtn = document.getElementById('dm-send-btn');

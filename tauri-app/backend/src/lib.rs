@@ -107,14 +107,14 @@ async fn send_direct_message_persistent(
     
     let event = event_builder.build(keys.public_key()).sign_with_keys(&keys).map_err(|e| e.to_string())?;
     let event_id = event.id.to_hex();
-    let event_timestamp = event.created_at.as_u64();
+    let _event_timestamp = event.created_at.as_u64();
     
     println!("[RUST] Built and signed event with ID: {}", event_id);
     
     // Send the event to relays (DO NOT save to database here - persistence happens when live handler receives confirmation)
-    let send_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let _send_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
     let output = client.send_event(&event).await.map_err(|e| e.to_string())?;
-    let send_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let _send_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
     
     println!("[RUST] Message sent to relays. Success: {}, Failed: {}", 
         output.success.len(), output.failed.len());
@@ -3331,9 +3331,9 @@ async fn handle_subscription_notifications(
                 RelayPoolNotification::Event { event, .. } => {
                     match event.kind {
                         Kind::EncryptedDirectMessage => {
-                            let notification_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
-                            let event_id = event.id.to_hex();
-                            let is_sent = event.pubkey == user_pubkey;
+                            let _notification_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                            let _event_id = event.id.to_hex();
+                            let _is_sent = event.pubkey == user_pubkey;
                             
                             println!("[RUST] Processing DM: {}", event.id.to_hex()[..8].to_string() + "...");
                             if let Err(e) = handle_live_direct_message(&event, &app_handle, &state, &user_pubkey).await {
@@ -3399,9 +3399,9 @@ async fn handle_live_direct_message(
     state: &AppState,
     user_pubkey: &PublicKey,
 ) -> Result<(), String> {
-    let handler_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
-    let event_id = event.id.to_hex();
-    let is_sent = event.pubkey == *user_pubkey;
+    let _handler_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let _event_id = event.id.to_hex();
+    let _is_sent = event.pubkey == *user_pubkey;
     
     // Convert sender_pubkey to npub format
     let sender_npub = event.pubkey.to_bech32().map_err(|e| e.to_string())?;
@@ -3432,14 +3432,14 @@ async fn handle_live_direct_message(
     
     // Save to database (will handle deduplication via UNIQUE constraint)
     let db = state.get_database().map_err(|e| e.to_string())?;
-    let save_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let _save_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
     match db.save_dm(&dm) {
         Ok(_) => {
-            let save_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _save_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             println!("[RUST] Saved live DM to database");
             
             // Emit event to frontend
-            let emit_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            let _emit_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             let dm_payload = serde_json::json!({
                 "event_id": event.id.to_hex(),
                 "sender_pubkey": sender_npub,
@@ -3452,7 +3452,7 @@ async fn handle_live_direct_message(
             if let Err(e) = app_handle.emit("dm-received", &dm_payload) {
                 println!("[RUST] Failed to emit dm-received event: {}", e);
             } else {
-                let emit_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                let _emit_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
                 println!("[RUST] Emitted dm-received event");
             }
         },

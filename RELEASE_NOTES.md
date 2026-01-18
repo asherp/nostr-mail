@@ -1,8 +1,25 @@
-# Release Notes - v1.0.1-beta
+# Release Notes - v1.0.2-beta
 
 ## Overview
 
 We're excited to announce the beta release of **nostr-mail**, a modern cross-platform email encryption tool that bridges Nostr and email protocols. This release brings end-to-end encrypted email communication using secp256k1 key pairs and Nostr's decentralized social key registry.
+
+## What's New in v1.0.2-beta
+
+### 🚀 Performance Improvements
+- **Faster Contact Loading**: Significantly improved performance when loading contacts from your Nostr follow list
+- **Immediate Message Loading**: Sent and received messages now load immediately on startup
+
+### 🔧 Bug Fixes & Improvements
+- **Fixed Startup Workflow**: Improved application startup and initialization process
+- **Code Quality**: Fixed compiler warnings and improved code stability
+- **UI Enhancements**: Added new modal styles and QR scanner styling improvements
+
+### 🏗️ Technical Changes
+- Major backend refactoring for better maintainability
+- Enhanced database functionality with improved query handling
+- Frontend service improvements for better reliability
+- Removed deprecated state management code
 
 ## Key Features
 

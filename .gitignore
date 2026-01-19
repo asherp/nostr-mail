@@ -15,3 +15,10 @@ __pycache__/
 
 # Cursor IDE
 .cursor/
+
+# Mock relay events
+events.json
+
+# Rust build files
+target/
+**/target/

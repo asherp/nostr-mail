@@ -91,6 +91,105 @@
     gap: 8px;
 }
 
+/* Privacy status icon */
+.privacy-status-icon {
+    font-size: 14px;
+    flex-shrink: 0;
+    cursor: default;
+}
+
+.privacy-status-public {
+    color: #4CAF50;
+}
+
+.privacy-status-private {
+    color: #FF9800;
+}
+
+.contact-item.active .privacy-status-icon {
+    color: white !important;
+}
+
+/* Dark mode support for privacy icons */
+body.dark-mode .privacy-status-public {
+    color: #66BB6A;
+}
+
+body.dark-mode .privacy-status-private {
+    color: #FFB74D;
+}
+
+body.dark-mode .contact-item.active .privacy-status-icon {
+    color: white !important;
+}
+
+/* Contact sections */
+.contact-section {
+    margin-bottom: 20px;
+}
+
+.contact-section-header {
+    display: flex;
+    align-items: center;
+    padding: 12px 15px;
+    background-color: #f8f9fa;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.2s ease;
+    margin-bottom: 8px;
+}
+
+.contact-section-header:hover {
+    background-color: #e9ecef;
+}
+
+.contact-section-header .section-chevron {
+    margin-right: 10px;
+    font-size: 12px;
+    color: #6c757d;
+    transition: transform 0.2s ease;
+}
+
+.contact-section-header .section-label {
+    font-weight: 600;
+    color: #333;
+    font-size: 0.95rem;
+}
+
+.contact-section-content {
+    transition: opacity 0.2s ease;
+}
+
+.contact-section-content .section-empty-message {
+    padding: 20px;
+    font-style: italic;
+    color: #6c757d;
+}
+
+/* Dark mode support for sections */
+body.dark-mode .contact-section-header {
+    background-color: #2d2d2d;
+    border-color: #444;
+}
+
+body.dark-mode .contact-section-header:hover {
+    background-color: #353535;
+}
+
+body.dark-mode .contact-section-header .section-chevron {
+    color: #a0a0a0;
+}
+
+body.dark-mode .contact-section-header .section-label {
+    color: #e0e0e0;
+}
+
+body.dark-mode .contact-section-content .section-empty-message {
+    color: #a0a0a0;
+}
+
 /* Email icon button */
 .contact-email-icon {
     background: none;
@@ -474,85 +573,6 @@ body.dark-mode .contacts-search-icon {
     color: white;
 }
 
-/* Compact privacy toggle for contact list items */
-.privacy-toggle-wrapper {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-right: 8px;
-}
-
-.privacy-toggle-wrapper .privacy-toggle-icon {
-    font-size: 14px;
-    color: #6c757d;
-    flex-shrink: 0;
-}
-
-.contact-item.active .privacy-toggle-wrapper .privacy-toggle-icon {
-    color: white;
-}
-
-.contact-item .privacy-toggle-compact {
-    display: flex;
-    align-items: center;
-    cursor: pointer;
-    user-select: none;
-}
-
-.contact-item .privacy-toggle-compact input[type="checkbox"] {
-    display: none;
-}
-
-.contact-item .privacy-toggle-compact .privacy-toggle-slider {
-    position: relative;
-    width: 36px;
-    height: 20px;
-    background-color: #ccc;
-    border-radius: 20px;
-    transition: background-color 0.3s ease;
-}
-
-.contact-item .privacy-toggle-compact input[type="checkbox"]:checked + .privacy-toggle-slider {
-    background-color: #667eea;
-}
-
-.contact-item .privacy-toggle-compact .privacy-toggle-slider::before {
-    content: '';
-    position: absolute;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background-color: white;
-    top: 2px;
-    left: 2px;
-    transition: transform 0.3s ease;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-}
-
-.contact-item .privacy-toggle-compact input[type="checkbox"]:checked + .privacy-toggle-slider::before {
-    transform: translateX(16px);
-}
-
-.contact-item .privacy-toggle-compact:hover .privacy-toggle-slider {
-    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
-}
-
-/* Dark mode support for compact privacy toggle */
-body.dark-mode .contact-item .privacy-toggle-compact .privacy-toggle-slider {
-    background-color: #444;
-}
-
-body.dark-mode .contact-item .privacy-toggle-compact input[type="checkbox"]:checked + .privacy-toggle-slider {
-    background-color: #667eea;
-}
-
-body.dark-mode .privacy-toggle-wrapper .privacy-toggle-icon {
-    color: #a0a0a0;
-}
-
-body.dark-mode .contact-item.active .privacy-toggle-wrapper .privacy-toggle-icon {
-    color: white;
-}
 
 /* Dark mode support for delete icon */
 body.dark-mode .contact-delete-icon {

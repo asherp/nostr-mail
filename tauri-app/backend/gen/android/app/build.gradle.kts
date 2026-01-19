@@ -46,6 +46,11 @@ android {
     }
     buildTypes {
         getByName("debug") {
+            // Note: Removed applicationIdSuffix to allow Tauri CLI to launch the app correctly
+            // Debug and release builds use different signing keys, so they're still distinguishable
+            // Use different app name for dev builds so it's distinguishable
+            resValue("string", "app_name", "NostrMail Dev")
+            resValue("string", "main_activity_title", "NostrMail Dev")
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
             isJniDebuggable = true

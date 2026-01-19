@@ -344,4 +344,20 @@ body.dark-mode .add-relay-section {
 
 body.dark-mode .add-relay-section label {
     color: #adb5bd;
+}
+
+/* Relay URL input validation */
+#new-relay-url.invalid {
+    border-color: #dc3545;
+    box-shadow: 0 0 0 0.2rem rgba(220, 53, 69, 0.25);
+}
+
+#new-relay-url.invalid:focus {
+    border-color: #dc3545;
+    box-shadow: 0 0 0 0.2rem rgba(220, 53, 69, 0.25);
+}
+
+body.dark-mode #new-relay-url.invalid {
+    border-color: #dc3545;
+    background-color: rgba(220, 53, 69, 0.1);
 } 

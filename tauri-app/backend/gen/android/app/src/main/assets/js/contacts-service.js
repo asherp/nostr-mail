@@ -514,7 +514,10 @@ class ContactsService {
     }
 
     // Show add contact form
-    showAddContactModal() {
+    showAddContactModal(pubkey = '') {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:517',message:'showAddContactModal entry',data:{pubkey:pubkey.substring(0,30)+'...',pubkeyLength:pubkey.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+        // #endregion
         try {
             // Switch to contacts tab and show the add contact form in the detail panel
             const contactsTab = document.querySelector('[data-tab="contacts"]');
@@ -531,6 +534,9 @@ class ContactsService {
             // Show add contact form in the detail panel
             const contactsDetail = window.domManager.get('contactsDetail');
             if (contactsDetail) {
+                // #region agent log
+                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:533',message:'Setting contactsDetail innerHTML',data:{pubkeyInValue:pubkey.substring(0,30)+'...'},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+                // #endregion
                 contactsDetail.innerHTML = `
                     <div class="add-contact-form">
                         <h3>Add New Contact</h3>
@@ -540,7 +546,7 @@ class ContactsService {
                             <div class="form-group">
                                 <label for="contact-pubkey">Public Key (npub):</label>
                                 <div class="input-with-button">
-                                    <input type="text" id="contact-pubkey" placeholder="npub1..." required>
+                                    <input type="text" id="contact-pubkey" placeholder="npub1..." value="${pubkey}" required>
                                     <button type="button" id="scan-qr-btn" class="btn btn-secondary">
                                         <i class="fas fa-qrcode"></i> Scan QR
                                     </button>
@@ -565,6 +571,14 @@ class ContactsService {
                 if (scanBtn) {
                     scanBtn.addEventListener('click', () => this.scanQRCode());
                 }
+                
+                // If pubkey is provided, focus the input
+                if (pubkey) {
+                    const pubkeyInput = document.getElementById('contact-pubkey');
+                    if (pubkeyInput) {
+                        pubkeyInput.focus();
+                    }
+                }
             }
         } catch (error) {
             console.error('Error showing add contact form:', error);
@@ -573,82 +587,222 @@ class ContactsService {
 
     // Scan QR code
     async scanQRCode() {
-        try {
-            // Show QR scanner in the detail panel
-            const contactsDetail = window.domManager.get('contactsDetail');
-            if (contactsDetail) {
-                contactsDetail.innerHTML = `
-                    <div id="qr-scanner-container">
-                        <h3>Scan QR Code</h3>
-                        <div id="qr-reader"></div>
-                        <div class="qr-scanner-controls">
-                            <button id="close-scanner-btn" class="btn btn-secondary">
-                                <i class="fas fa-times"></i> Back to Form
-                            </button>
-                        </div>
-                    </div>
-                `;
-            }
-            
-            // Let the browser handle camera permissions directly
-            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-                    
-                    // Create video element for camera feed
-                    const video = document.createElement('video');
-                    video.style.width = '100%';
-                    video.style.height = 'auto';
-                    video.style.maxWidth = '400px';
-                    video.autoplay = true;
-                    video.muted = true;
-                    video.playsInline = true;
-                    
-                    const qrReader = document.getElementById('qr-reader');
-                    if (qrReader) {
-                        qrReader.appendChild(video);
-                        video.srcObject = stream;
-                        
-                        // Simple QR code detection (you might want to use a proper QR library)
-                        const canvas = document.createElement('canvas');
-                        const context = canvas.getContext('2d');
-                        
-                        const checkQR = () => {
-                            if (video.videoWidth > 0) {
-                                canvas.width = video.videoWidth;
-                                canvas.height = video.videoHeight;
-                                context.drawImage(video, 0, 0);
-                                
-                                // Here you would implement QR code detection
-                                // For now, we'll just show the camera feed
-                            }
-                            requestAnimationFrame(checkQR);
-                        };
-                        
-                        checkQR();
-                    }
-                    
-                    // Handle close scanner button
-                    const closeBtn = document.getElementById('close-scanner-btn');
-                    if (closeBtn) {
-                        closeBtn.addEventListener('click', () => {
-                            stream.getTracks().forEach(track => track.stop());
-                            this.showAddContactModal();
-                        });
-                    }
-                    
-                } catch (error) {
-                    console.error('Camera access error:', error);
-                    this.showCameraError();
-                }
-            } else {
-                this.showCameraError();
-            }
-            
-        } catch (error) {
-            console.error('QR scanner error:', error);
-            this.showCameraError();
+        let html5QrCode = null;
+        let scannerStarted = false;
+        let isCleanedUp = false;
+        
+        // Check if Html5Qrcode is available
+        if (typeof Html5Qrcode === 'undefined') {
+            window.notificationService.showError('QR scanner library not loaded. Please refresh the page.');
+            return;
         }
+        
+        // Check camera availability
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            window.notificationService.showError('Camera access is not available in this browser.');
+            return;
+        }
+        
+        // Show QR scanner in the detail panel
+        const contactsDetail = window.domManager.get('contactsDetail');
+        if (contactsDetail) {
+            contactsDetail.innerHTML = `
+                <div id="qr-scanner-container" style="text-align:center;">
+                    <p style="margin-bottom:15px;">Point your camera at the QR code</p>
+                    <div id="qr-reader" style="width:100%;max-width:400px;margin:0 auto;min-height:300px;"></div>
+                    <div id="qr-scanner-error" style="display:none;color:#dc3545;margin-top:15px;"></div>
+                    <div style="margin-top:20px;">
+                        <button id="close-scanner-btn" class="btn btn-secondary">
+                            <i class="fas fa-times"></i> Back to Form
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+        
+        const cleanup = () => {
+            if (isCleanedUp) return;
+            isCleanedUp = true;
+            
+            if (html5QrCode && scannerStarted) {
+                try {
+                    html5QrCode.stop().then(() => {
+                        html5QrCode.clear();
+                    }).catch(err => {
+                        console.error('[QR] Error stopping scanner:', err);
+                    });
+                } catch (err) {
+                    console.error('[QR] Error during cleanup:', err);
+                }
+            }
+            html5QrCode = null;
+            scannerStarted = false;
+        };
+        
+        // Setup close scanner button
+        const closeBtn = document.getElementById('close-scanner-btn');
+        if (closeBtn) {
+            closeBtn.addEventListener('click', () => {
+                cleanup();
+                // Restore the add contact form
+                this.showAddContactModal();
+            });
+        }
+        
+        // Wait for element to be fully visible and have dimensions
+        const startScanner = async () => {
+            try {
+                const qrReader = document.getElementById('qr-reader');
+                if (!qrReader) {
+                    console.error('[QR] QR reader element not found');
+                    return;
+                }
+                
+                // Wait for element to be visible and have dimensions
+                let attempts = 0;
+                const maxAttempts = 50; // 5 seconds max wait
+                while (attempts < maxAttempts) {
+                    const rect = qrReader.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        break;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    attempts++;
+                }
+                
+                html5QrCode = new Html5Qrcode('qr-reader');
+                
+                // Detect if we're on mobile or desktop
+                const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+                const cameraConfig = isMobile 
+                    ? { facingMode: 'environment' } // Back camera on mobile
+                    : { facingMode: 'user' }; // Front camera on desktop
+                
+                // Start scanning
+                await html5QrCode.start(
+                    cameraConfig,
+                    {
+                        fps: 10,
+                        qrbox: { width: 250, height: 250 },
+                        aspectRatio: 1.0
+                    },
+                    (decodedText, decodedResult) => {
+                        // #region agent log
+                        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1046',message:'QR code scanned',data:{decodedText:decodedText.substring(0,50)+'...'},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+                        // #endregion
+                        console.log('[QR] QR code scanned:', decodedText);
+                        
+                        // Stop scanning immediately to prevent multiple scans
+                        cleanup();
+                        
+                        // Handle async decode in a separate async function
+                        // Capture 'this' context to ensure it's available in the async IIFE
+                        console.log('[QR] About to start async decode, this:', typeof this, 'has showAddContactModal:', typeof this?.showAddContactModal);
+                        const self = this;
+                        console.log('[QR] Captured self:', typeof self, 'has showAddContactModal:', typeof self?.showAddContactModal);
+                        (async () => {
+                            try {
+                                console.log('[QR] Async IIFE started');
+                                // Decode the scanned identifier (handles nostr: prefix, nprofile1, npub1, etc.)
+                                const scannedKey = decodedText.trim();
+                                console.log('[QR] Scanned key trimmed:', scannedKey.substring(0, 50) + '...');
+                                // #region agent log
+                                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1055',message:'Before decodeNostrIdentifier call',data:{scannedKey:scannedKey.substring(0,50)+'...',hasTauriService:!!window.TauriService,hasDecodeFn:!!window.TauriService?.decodeNostrIdentifier},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+                                // #endregion
+                                console.log('[QR] Calling decodeNostrIdentifier with:', scannedKey);
+                                console.log('[QR] TauriService available:', !!window.TauriService);
+                                console.log('[QR] decodeNostrIdentifier available:', !!window.TauriService?.decodeNostrIdentifier);
+                                
+                                if (!window.TauriService || !window.TauriService.decodeNostrIdentifier) {
+                                    // #region agent log
+                                    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1061',message:'TauriService not available',data:{hasTauriService:!!window.TauriService,hasDecodeFn:!!window.TauriService?.decodeNostrIdentifier},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+                                    // #endregion
+                                    throw new Error('TauriService.decodeNostrIdentifier is not available');
+                                }
+                                
+                                const decodedPubkey = await window.TauriService.decodeNostrIdentifier(scannedKey);
+                                // #region agent log
+                                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1065',message:'decodeNostrIdentifier success',data:{decodedPubkey:decodedPubkey.substring(0,30)+'...'},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+                                // #endregion
+                                console.log('[QR] Successfully decoded to:', decodedPubkey);
+                                
+                                // #region agent log
+                                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:724',message:'Calling showAddContactModal',data:{decodedPubkey:decodedPubkey.substring(0,30)+'...',hasShowAddContactModal:typeof self.showAddContactModal==='function',selfType:typeof self},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+                                // #endregion
+                                // Restore the add contact form with the decoded pubkey
+                                if (!self || typeof self.showAddContactModal !== 'function') {
+                                    // #region agent log
+                                    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:727',message:'showAddContactModal not available',data:{hasSelf:!!self,selfType:typeof self,hasMethod:!!self?.showAddContactModal},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+                                    // #endregion
+                                    throw new Error('showAddContactModal is not available');
+                                }
+                                self.showAddContactModal(decodedPubkey);
+                                // #region agent log
+                                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:726',message:'showAddContactModal called',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+                                // #endregion
+                            } catch (error) {
+                                // #region agent log
+                                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1070',message:'decodeNostrIdentifier error',data:{errorType:typeof error,errorMessage:typeof error==='string'?error:error?.message||error?.toString()||'unknown',errorString:String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                                // #endregion
+                                console.error('[QR] Failed to decode identifier:', error);
+                                // Tauri errors can be strings or Error objects
+                                let errorMessage = 'Not a valid Nostr identifier';
+                                if (typeof error === 'string') {
+                                    errorMessage = error;
+                                } else if (error?.message) {
+                                    errorMessage = error.message;
+                                } else if (error?.toString) {
+                                    errorMessage = error.toString();
+                                }
+                                console.error('[QR] Error details:', { error, errorType: typeof error, message: errorMessage });
+                                
+                                // Show error in modal or restore form
+                                const errorDiv = document.getElementById('qr-scanner-error');
+                                if (errorDiv) {
+                                    errorDiv.style.display = 'block';
+                                    errorDiv.textContent = `Invalid QR code: ${errorMessage}`;
+                                } else {
+                                    // If error div doesn't exist, restore the form and show notification
+                                    window.notificationService.showError(`Failed to decode QR code: ${errorMessage}`);
+                                    this.showAddContactModal();
+                                }
+                            }
+                        })();
+                    },
+                    (errorMessage) => {
+                        // Ignore scanning errors (they're frequent during scanning)
+                        if (!errorMessage.includes('No QR code found')) {
+                            console.log('[QR] Scanning:', errorMessage);
+                        }
+                    }
+                );
+                
+                scannerStarted = true;
+                
+            } catch (error) {
+                console.error('[QR] Error starting scanner:', error);
+                const errorDiv = document.getElementById('qr-scanner-error');
+                if (errorDiv) {
+                    errorDiv.style.display = 'block';
+                    if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+                        errorDiv.textContent = 'Camera permission denied. Please allow camera access and try again.';
+                    } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+                        errorDiv.textContent = 'No camera found on this device.';
+                    } else {
+                        errorDiv.textContent = `Camera error: ${error.message || 'Unknown error'}`;
+                    }
+                }
+                window.notificationService.showError('Failed to start camera');
+                cleanup();
+            }
+        };
+        
+        // Wait for next animation frame to ensure element is rendered
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                startScanner();
+            });
+        });
     }
 
     // Show camera error
@@ -678,29 +832,40 @@ class ContactsService {
     async addContact(event) {
         event.preventDefault();
         
+        const submitButton = event.target.querySelector('button[type="submit"]');
+        const pubkeyInput = document.getElementById('contact-pubkey');
+        const scanBtn = document.getElementById('scan-qr-btn');
+        const formHelp = document.querySelector('.add-contact-form .form-help');
+        
         try {
-            const pubkey = document.getElementById('contact-pubkey')?.value || '';
+            let pubkey = pubkeyInput?.value || '';
             
-            // Validate public key
+            // Decode/validate Nostr identifier (handles nostr: prefix, nprofile1, npub1, hex, etc.)
             try {
-                if (!pubkey.startsWith('npub1') && !pubkey.startsWith('nsec1')) {
-                    window.notificationService.showError('Invalid public key format. Must start with npub1 or nsec1');
-                    return;
+                pubkey = await window.TauriService.decodeNostrIdentifier(pubkey);
+                // Update the input with the decoded npub
+                if (pubkeyInput) {
+                    pubkeyInput.value = pubkey;
                 }
             } catch (e) {
-                window.notificationService.showError('Invalid public key format');
+                window.notificationService.showError(`Invalid Nostr identifier: ${e.message || e}`);
                 return;
             }
             
-            // Show loading state in the detail panel
-            const contactsDetail = window.domManager.get('contactsDetail');
-            if (contactsDetail) {
-                contactsDetail.innerHTML = `
-                    <div class="loading-profile">
-                        <i class="fas fa-spinner fa-spin" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5;"></i>
-                        <p>Fetching profile...</p>
-                    </div>
-                `;
+            // Show loading state on button and inputs
+            if (submitButton) {
+                submitButton.disabled = true;
+                submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Fetching Profile...';
+            }
+            if (pubkeyInput) {
+                pubkeyInput.disabled = true;
+            }
+            if (scanBtn) {
+                scanBtn.disabled = true;
+            }
+            if (formHelp) {
+                formHelp.textContent = 'Fetching profile from relays...';
+                formHelp.style.color = 'var(--primary-color, #007bff)';
             }
             
             // Fetch the profile
@@ -708,7 +873,29 @@ class ContactsService {
                 const activeRelays = window.appState.getActiveRelays();
                 if (activeRelays.length === 0) {
                     window.notificationService.showError('No active relays to fetch profile');
+                    // Reset loading state
+                    if (submitButton) {
+                        submitButton.disabled = false;
+                        submitButton.innerHTML = '<i class="fas fa-search"></i> Fetch Profile';
+                    }
+                    if (pubkeyInput) pubkeyInput.disabled = false;
+                    if (scanBtn) scanBtn.disabled = false;
+                    if (formHelp) {
+                        formHelp.textContent = 'Enter a Nostr public key (npub) to fetch their profile and follow them';
+                        formHelp.style.color = '';
+                    }
                     return;
+                }
+                
+                // Show loading state in the detail panel
+                const contactsDetail = window.domManager.get('contactsDetail');
+                if (contactsDetail) {
+                    contactsDetail.innerHTML = `
+                        <div class="loading-profile" style="text-align: center; padding: 2rem;">
+                            <i class="fas fa-spinner fa-spin" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.5; color: var(--primary-color, #007bff);"></i>
+                            <p style="color: var(--text-color, #fff);">Fetching profile from relays...</p>
+                        </div>
+                    `;
                 }
                 
                 console.log('Fetching profile for:', pubkey);
@@ -719,19 +906,41 @@ class ContactsService {
                     this.showProfileForAdding(pubkey, profile);
                 } else {
                     window.notificationService.showError('Could not fetch profile for this public key');
-                    // Go back to the add contact form
-                    this.showAddContactModal();
+                    // Go back to the add contact form with the pubkey preserved
+                    this.showAddContactModal(pubkey);
                 }
             } catch (error) {
                 console.error('Failed to fetch profile:', error);
                 window.notificationService.showError('Failed to fetch profile: ' + error);
-                // Go back to the add contact form
-                this.showAddContactModal();
+                // Go back to the add contact form with the pubkey preserved
+                this.showAddContactModal(pubkey);
             }
             
         } catch (error) {
             console.error('Error adding contact:', error);
             window.notificationService.showError('Failed to add contact');
+            // Reset loading state on error
+            if (submitButton) {
+                submitButton.disabled = false;
+                submitButton.innerHTML = '<i class="fas fa-search"></i> Fetch Profile';
+            }
+            if (pubkeyInput) {
+                pubkeyInput.disabled = false;
+                // Restore form with the pubkey if available
+                const pubkey = pubkeyInput.value || '';
+                if (pubkey) {
+                    this.showAddContactModal(pubkey);
+                } else {
+                    this.showAddContactModal();
+                }
+            } else {
+                this.showAddContactModal();
+            }
+            if (scanBtn) scanBtn.disabled = false;
+            if (formHelp) {
+                formHelp.textContent = 'Enter a Nostr public key (npub) to fetch their profile and follow them';
+                formHelp.style.color = '';
+            }
         }
     }
 
@@ -1090,15 +1299,30 @@ class ContactsService {
     // Update contact profile from live events
     updateContactProfile(pubkey, profileFields) {
         try {
+            // Get contacts from appState
+            const contacts = window.appState.getContacts() || [];
             // Find contact in current list
-            const contact = this.contacts.find(c => c.pubkey === pubkey);
-            if (contact) {
+            const contactIndex = contacts.findIndex(c => c.pubkey === pubkey);
+            if (contactIndex !== -1) {
+                const contact = contacts[contactIndex];
                 // Update contact fields
                 if (profileFields.name) contact.name = profileFields.name;
                 if (profileFields.display_name) contact.display_name = profileFields.display_name;
                 if (profileFields.about) contact.about = profileFields.about;
                 if (profileFields.picture) contact.picture = profileFields.picture;
                 if (profileFields.nip05) contact.nip05 = profileFields.nip05;
+                
+                // Also update fields object if it exists
+                if (contact.fields) {
+                    if (profileFields.name) contact.fields.name = profileFields.name;
+                    if (profileFields.display_name) contact.fields.display_name = profileFields.display_name;
+                    if (profileFields.about) contact.fields.about = profileFields.about;
+                    if (profileFields.picture) contact.fields.picture = profileFields.picture;
+                    if (profileFields.nip05) contact.fields.nip05 = profileFields.nip05;
+                }
+                
+                // Persist changes to appState
+                window.appState.setContacts(contacts);
                 
                 console.log('[ContactsService] Updated contact profile for', pubkey);
                 
@@ -1117,6 +1341,8 @@ class ContactsService {
                 if (window.emailService) {
                     window.emailService.populateNostrContactDropdown();
                 }
+            } else {
+                console.log('[ContactsService] Contact not found in contacts list:', pubkey);
             }
         } catch (error) {
             console.error('[ContactsService] Error updating contact profile:', error);

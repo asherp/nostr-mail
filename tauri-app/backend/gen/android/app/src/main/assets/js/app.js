@@ -1547,9 +1547,13 @@ NostrMailApp.prototype.setupQrCodeEventListeners = function() {
         const newQrNpubBtn = qrNpubBtn.cloneNode(true);
         qrNpubBtn.parentNode.replaceChild(newQrNpubBtn, qrNpubBtn);
         newQrNpubBtn.addEventListener('click', async () => {
-            const value = publicKeyDisplayInput.value;
+            let value = publicKeyDisplayInput.value;
             console.log('[QR] Public key QR button clicked. Value:', value);
             if (!value) return;
+            // Prefix with nostr: if not already prefixed (NIP-21 standard)
+            if (!value.startsWith('nostr:')) {
+                value = 'nostr:' + value;
+            }
             try {
                 const dataUrl = await TauriService.generateQrCode(value);
                 showQrModal('Public Key QR Code', dataUrl, value);

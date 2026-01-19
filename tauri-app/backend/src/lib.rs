@@ -21,7 +21,10 @@ use crate::types::{EmailMessage, RelayStatus, RelayConnectionStatus};
 
 use nostr_sdk::Metadata;
 use nostr_sdk::ToBech32;
-use nostr_sdk::{PublicKey, Filter, Kind, FromBech32, SecretKey, Keys, RelayPoolNotification, Timestamp};
+use nostr_sdk::{PublicKey, Filter, Kind, FromBech32, SecretKey, Keys, RelayPoolNotification, Timestamp, RelayUrl, ClientMessage};
+use std::sync::Arc;
+use std::sync::Mutex;
+use nostr_sdk::nips::nip19::Nip19;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -29,6 +32,339 @@ use state::EventSubscription;
 use serde_json;
 use tauri::Emitter;
 use chrono::{DateTime, Utc};
+
+/// Helper function to sync relay states - auto-disables relays that failed or aren't connected
+async fn sync_relay_states_internal(state: &AppState) -> Vec<String> {
+    let client_option = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        client_guard.as_ref().cloned()
+    };
+    
+    let mut updated_relays = Vec::new();
+    
+    if let Some(client) = client_option {
+        let connected_relays = client.relays().await;
+        
+        // Get the map of failed relays (URL -> error message)
+        let failed_relays_map = {
+            let failed_guard = state.failed_relays.lock().unwrap();
+            failed_guard.clone()
+        };
+        
+        // Get current relay configuration from database (not just in-memory state)
+        let db = match state.get_database() {
+            Ok(db) => db,
+            Err(e) => {
+                println!("[RUST] sync_relay_states_internal: Failed to get database: {}", e);
+                return updated_relays;
+            }
+        };
+        let all_db_relays = match db.get_all_relays() {
+            Ok(relays) => relays,
+            Err(e) => {
+                println!("[RUST] sync_relay_states_internal: Failed to get relays from database: {}", e);
+                return updated_relays;
+            }
+        };
+        
+        let mut relays_to_update = Vec::new();
+        for db_relay in all_db_relays.iter() {
+            if db_relay.is_active {
+                // Check if relay is in failed_relays map (connection failures)
+                let is_failed = failed_relays_map.contains_key(&db_relay.url);
+                
+                // Check if relay is actually connected
+                let relay_url_key = match RelayUrl::from_str(&db_relay.url) {
+                    Ok(url) => url,
+                    Err(_) => {
+                        // Invalid URL, mark for update
+                        relays_to_update.push(db_relay.url.clone());
+                        continue;
+                    }
+                };
+                let is_connected = connected_relays.contains_key(&relay_url_key);
+                
+                // Auto-disable if relay failed to connect OR is not connected
+                if is_failed || !is_connected {
+                    println!("[RUST] sync_relay_states_internal: Auto-disabling relay {} (failed: {}, connected: {})", 
+                        db_relay.url, is_failed, is_connected);
+                    relays_to_update.push(db_relay.url.clone());
+                }
+            }
+        }
+        
+        // Update disconnected relays to inactive and disconnect from client
+        for relay_url in relays_to_update {
+            // Keep error message in failed_relays map so it can be displayed even after disabling
+            // We'll only remove it when the relay is successfully reconnected
+            {
+                let failed_map = state.failed_relays.lock().unwrap();
+                if let Some(error_msg) = failed_map.get(&relay_url) {
+                    println!("[RUST] sync_relay_states_internal: Keeping relay {} in failed_relays map (auto-disabled). Error: {}", relay_url, error_msg);
+                }
+            }
+            
+            // Disconnect from the relay in the client
+            if let Ok(relay_url_key) = RelayUrl::from_str(&relay_url) {
+                if connected_relays.contains_key(&relay_url_key) {
+                    match client.remove_relay(&relay_url_key).await {
+                        Ok(_) => {
+                            println!("[RUST] sync_relay_states_internal: Disconnected from relay {}", relay_url);
+                        },
+                        Err(e) => {
+                            let error_msg = e.to_string();
+                            if error_msg.contains("relay not found") || error_msg.contains("not found") {
+                                // Relay was already disconnected - this is fine
+                                println!("[RUST] sync_relay_states_internal: Relay {} was already disconnected", relay_url);
+                            } else {
+                                println!("[RUST] sync_relay_states_internal: Failed to disconnect from relay {}: {}", relay_url, e);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Update in-memory state (if relay exists there)
+            {
+                let mut relays_guard = state.relays.lock().unwrap();
+                if let Some(relay) = relays_guard.iter_mut().find(|r| r.url == relay_url) {
+                    relay.is_active = false;
+                }
+            }
+            
+            // Update in database
+            let db = match state.get_database() {
+                Ok(db) => db,
+                Err(_) => {
+                    updated_relays.push(relay_url);
+                    continue;
+                }
+            };
+            let all_relays = match db.get_all_relays() {
+                Ok(relays) => relays,
+                Err(_) => {
+                    updated_relays.push(relay_url);
+                    continue;
+                }
+            };
+            if let Some(db_relay) = all_relays.iter().find(|r| r.url == relay_url) {
+                let updated_relay = crate::database::DbRelay {
+                    id: db_relay.id,
+                    url: relay_url.clone(),
+                    is_active: false,
+                    created_at: db_relay.created_at,
+                    updated_at: chrono::Utc::now(),
+                };
+                if let Err(e) = db.save_relay(&updated_relay) {
+                    println!("[RUST] sync_relay_states_internal: Failed to update relay in database: {}", e);
+                }
+            }
+            
+            updated_relays.push(relay_url);
+        }
+        
+        // Only log when relays are actually updated
+        if !updated_relays.is_empty() {
+            println!("[RUST] sync_relay_states_internal: Auto-disabled {} disconnected relay(s): {:?}", updated_relays.len(), updated_relays);
+        }
+    }
+    
+    updated_relays
+}
+
+/// Check if an error message indicates authentication is required
+fn is_auth_required_error(error_msg: &str) -> bool {
+    let msg_lower = error_msg.to_lowercase();
+    msg_lower.starts_with("auth-required:") || 
+    msg_lower.contains("auth-required:") ||
+    msg_lower.starts_with("restricted:") ||
+    msg_lower.contains("restricted:") ||
+    msg_lower.contains("authed owner") ||
+    msg_lower.contains("authentication required") ||
+    msg_lower.contains("requires authentication")
+}
+
+/// Attempt to authenticate with a relay if authentication is required
+async fn attempt_relay_authentication(
+    client: &nostr_sdk::Client,
+    state: &AppState,
+    relay_url: &RelayUrl,
+) -> Result<(), String> {
+    println!("[RUST] Attempting to authenticate with relay: {}", relay_url);
+    
+    let relay_url_str = relay_url.to_string();
+    
+    // Check if we're already authenticated - if we got a restricted error after auth,
+    // the auth may have expired, so clear it and re-authenticate
+    let was_authenticated = {
+        let auth_status = state.relay_auth_status.lock().unwrap();
+        auth_status.get(&relay_url_str).copied().unwrap_or(false)
+    };
+    
+    if was_authenticated {
+        println!("[RUST] Relay {} was previously authenticated but got restricted error - clearing auth status and re-authenticating", relay_url);
+        // Clear auth status - we'll need to re-authenticate
+        {
+            let mut auth_status = state.relay_auth_status.lock().unwrap();
+            auth_status.remove(&relay_url_str);
+        }
+        // Also clear any old challenge
+        {
+            let mut challenges = state.pending_auth_challenges.lock().unwrap();
+            challenges.remove(&relay_url_str);
+        }
+    }
+    
+    // Get private key first
+    let private_key = {
+        let pk_guard = state.current_private_key.lock().unwrap();
+        pk_guard.clone()
+    };
+    
+    if private_key.is_none() {
+        return Err("No private key available for authentication".to_string());
+    }
+    let private_key = private_key.unwrap();
+    
+    // Check if we already have a pending challenge
+    let challenge = {
+        let challenges = state.pending_auth_challenges.lock().unwrap();
+        challenges.get(&relay_url_str).cloned()
+    };
+    
+    if let Some(challenge) = challenge {
+        // We have a challenge, try to authenticate
+        return handle_auth_challenge(client, state, relay_url, &challenge, &private_key).await;
+    }
+    
+    // No challenge yet - wait for AUTH challenge from relay
+    // Some relays send AUTH challenges immediately, others may delay
+    // If we were previously authenticated, the relay might send a new challenge soon
+    println!("[RUST] No pending challenge for relay {}, waiting up to 3 seconds for AUTH challenge", relay_url);
+    
+    let max_wait_time = std::time::Duration::from_secs(3);
+    let check_interval = std::time::Duration::from_millis(100);
+    let start_time = std::time::Instant::now();
+    
+    while start_time.elapsed() < max_wait_time {
+        // Check if challenge arrived
+        let challenge = {
+            let challenges = state.pending_auth_challenges.lock().unwrap();
+            challenges.get(&relay_url_str).cloned()
+        };
+        
+        if let Some(challenge) = challenge {
+            println!("[RUST] AUTH challenge received for relay {}, authenticating...", relay_url);
+            return handle_auth_challenge(client, state, relay_url, &challenge, &private_key).await;
+        }
+        
+        // Wait a bit before checking again
+        tokio::time::sleep(check_interval).await;
+    }
+    
+    // Still no challenge after waiting
+    println!("[RUST] No AUTH challenge received for relay {} after waiting", relay_url);
+    Err("No AUTH challenge received yet - relay may require manual authentication".to_string())
+}
+
+/// Helper function to update relay status based on send_event failures
+/// Marks relays as disconnected if they fail with "relay not connected" errors
+/// Also handles authentication-required errors
+/// Then immediately syncs relay states to auto-disable failed relays
+/// Returns the list of relay URLs that were updated
+async fn update_relay_status_from_send_failures(
+    failed_relays: &std::collections::HashMap<RelayUrl, String>,
+    state: &AppState,
+) -> Vec<String> {
+    println!("[RUST] update_relay_status_from_send_failures called with {} failed relay(s)", failed_relays.len());
+    let mut relays_to_mark_failed = Vec::new();
+    
+    // Get client reference before locking mutexes
+    let client_option = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        client_guard.as_ref().cloned()
+    };
+    
+    // Collect relays that need authentication (before locking mutex)
+    let mut relays_to_authenticate = Vec::new();
+    
+    // Add to failed_relays map so get_relay_status can report them as disconnected with error messages
+    {
+        let mut failed_map = state.failed_relays.lock().unwrap();
+        
+        for (relay_url, error_msg) in failed_relays {
+            let relay_url_str = relay_url.to_string();
+            println!("[RUST] Processing failure for relay {}: {}", relay_url_str, error_msg);
+            
+            // Check for authentication-required errors
+            if is_auth_required_error(&error_msg) {
+                println!("[RUST] Relay {} requires authentication: {}", relay_url_str, error_msg);
+                // Collect relays that need authentication (we'll handle them after dropping the lock)
+                relays_to_authenticate.push(relay_url.clone());
+                // Don't mark as failed for auth errors - authentication will be handled asynchronously
+            } else {
+                // Store all connection-related errors (not just "not connected")
+                // This includes: not connected, not ready, timeout, connection closed, etc.
+                let is_connection_error = error_msg.contains("relay not connected") || 
+                   error_msg.contains("not connected") ||
+                   error_msg.contains("connection closed") ||
+                   error_msg.contains("not ready") ||
+                   error_msg.contains("timeout") ||
+                   error_msg.contains("initialized but not ready");
+                
+                println!("[RUST] Relay {} error check: is_connection_error={}", relay_url_str, is_connection_error);
+                
+                if is_connection_error {
+                    failed_map.insert(relay_url_str.clone(), error_msg.clone());
+                    relays_to_mark_failed.push(relay_url_str.clone());
+                    println!("[RUST] Added relay {} to failed_relays map with error: {}", relay_url_str, error_msg);
+                } else {
+                    // Log other errors for debugging but don't track them as connection failures
+                    println!("[RUST] Relay {} failed with non-connection error (not tracking): {}", relay_url_str, error_msg);
+                }
+            }
+        }
+    } // MutexGuard dropped here
+    
+    // Now handle authentication attempts (after dropping all locks)
+    if let Some(ref client) = client_option {
+        let mut failed_auth_relays = Vec::new();
+        
+        for relay_url in relays_to_authenticate {
+            let relay_url_str = relay_url.to_string();
+            if let Err(e) = attempt_relay_authentication(client, state, &relay_url).await {
+                println!("[RUST] Failed to authenticate with relay {}: {}", relay_url, e);
+                failed_auth_relays.push((relay_url_str.clone(), format!("Authentication required but failed: {}", e)));
+            }
+        }
+        
+        // Mark relays that failed authentication as having auth errors
+        if !failed_auth_relays.is_empty() {
+            let mut failed_map = state.failed_relays.lock().unwrap();
+            for (relay_url_str, error_msg) in failed_auth_relays {
+                failed_map.insert(relay_url_str.clone(), error_msg.clone());
+                relays_to_mark_failed.push(relay_url_str);
+                println!("[RUST] Marked relay as failed due to authentication error");
+            }
+        }
+    }
+    
+    // Sync relay states for all failed relays (including auth failures)
+    if !relays_to_mark_failed.is_empty() {
+        println!("[RUST] Marking {} relay(s) as failed in connection tracking", relays_to_mark_failed.len());
+        
+        // Immediately sync relay states to auto-disable failed relays
+        println!("[RUST] Triggering immediate sync_relay_states to auto-disable failed relays");
+        let updated_relays = sync_relay_states_internal(state).await;
+        if !updated_relays.is_empty() {
+            println!("[RUST] Auto-disabled {} relay(s) immediately after detecting failures: {:?}", 
+                updated_relays.len(), updated_relays);
+        }
+        updated_relays
+    } else {
+        Vec::new()
+    }
+}
 
 fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
     let raw_headers = email.raw_headers.clone().unwrap_or_default();
@@ -118,6 +454,34 @@ async fn send_direct_message_persistent(
     
     println!("[RUST] Message sent to relays. Success: {}, Failed: {}", 
         output.success.len(), output.failed.len());
+    
+    // Clear successfully connected relays from failed map
+    if !output.success.is_empty() {
+        let mut failed_map = state.failed_relays.lock().unwrap();
+        for relay_url in &output.success {
+            let relay_url_str = relay_url.to_string();
+            if let Some(error_msg) = failed_map.remove(&relay_url_str) {
+                println!("[RUST] Cleared relay {} from failed_relays map (successfully connected). Previous error: {}", relay_url_str, error_msg);
+            }
+        }
+    }
+    
+    // Update relay status based on failures
+    if !output.failed.is_empty() {
+        let updated_relays = update_relay_status_from_send_failures(&output.failed, state).await;
+        // Emit event to frontend if relays were updated (e.g., auth failures)
+        if !updated_relays.is_empty() {
+            if let Some(ref app_handle) = app_handle {
+                if let Err(e) = app_handle.emit("relay-status-changed", &serde_json::json!({
+                    "updated_relays": updated_relays
+                })) {
+                    println!("[RUST] Failed to emit relay-status-changed event: {}", e);
+                } else {
+                    println!("[RUST] Emitted relay-status-changed event for {} relay(s)", updated_relays.len());
+                }
+            }
+        }
+    }
     
     // Check if at least one relay succeeded - if all failed, return an error
     if output.success.is_empty() {
@@ -340,7 +704,7 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
     // Check relay connection status before fetching
     // Wait for at least one relay to be connected (up to 10 seconds)
     let max_wait_time = std::time::Duration::from_secs(10);
-    let start_time = std::time::Instant::now();
+    let wait_start = std::time::Instant::now();
     let check_interval = std::time::Duration::from_millis(500);
     
     let mut connected_relays = client.relays().await;
@@ -348,8 +712,8 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
     println!("[RUST] Initial relays in client: {}", connected_relays.len());
     
     // Wait for at least one relay to connect
-    while connected_relays.is_empty() && start_time.elapsed() < max_wait_time {
-        println!("[RUST] No relays connected yet, waiting... ({:?} elapsed)", start_time.elapsed());
+    while connected_relays.is_empty() && wait_start.elapsed() < max_wait_time {
+        println!("[RUST] No relays connected yet, waiting... ({:?} elapsed)", wait_start.elapsed());
         tokio::time::sleep(check_interval).await;
         connected_relays = client.relays().await;
     }
@@ -362,11 +726,6 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
         for (url, _) in connected_relays.iter() {
             println!("[RUST]   ✓ {}", url);
         }
-        
-        // Give relays a brief moment to be fully ready for queries (reduced from 2s to 100ms)
-        // WebSocket connections may be established but not ready to receive queries immediately
-        // Since relays are already connected via persistent client, a short wait is sufficient
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     
     // Create filter for single profile
@@ -375,20 +734,33 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
         .kind(Kind::from(0)) // Profile events are kind 0
         .limit(1);
     
-    // Use shorter timeout (5 seconds) since we only need 1 result and latest logs show
-    // successful fetches complete in <200ms. This prevents long waits when relays are slow.
-    println!("[RUST] Fetching profile events with 5s timeout...");
+    // Use persistent client directly - much faster than creating temporary clients
+    // Use shorter timeout (2 seconds) since we only need 1 result and mock relay responds quickly
+    println!("[RUST] Fetching profile events using persistent client with 2s timeout...");
+    println!("[RUST] Querying {} relay(s) for profile: {}", connected_relays.len(), pubkey);
+    
     let fetch_start = std::time::Instant::now();
-    let profile_events = client
-        .fetch_events(profile_filter, Duration::from_secs(5))
-        .await
-        .map_err(|e| {
-            println!("[RUST] ERROR during fetch_events: {}", e);
-            e.to_string()
-        })?;
+    
+    // Use persistent client directly - queries all connected relays in parallel
+    // Returns as soon as results are available (doesn't wait for slow relays)
+    let profile_events_result = client
+        .fetch_events(profile_filter, Duration::from_secs(2))
+        .await;
+    
     let fetch_duration = fetch_start.elapsed();
-    println!("[RUST] Fetch completed in {:?}", fetch_duration);
-    println!("[RUST] Found {} profile events using persistent client", profile_events.len());
+    
+    let profile_events: Vec<nostr_sdk::Event> = match profile_events_result {
+        Ok(events) => {
+            let events: Vec<nostr_sdk::Event> = events.into_iter().collect();
+            println!("[RUST] Fetch completed in {:?}", fetch_duration);
+            println!("[RUST] Found {} profile events from persistent client", events.len());
+            events
+        },
+        Err(e) => {
+            println!("[RUST] Fetch failed after {:?}: {}", fetch_duration, e);
+            Vec::new()
+        }
+    };
     
     // Log if timeout was reached (suggests relays aren't responding)
     if fetch_duration.as_secs() >= 4 {
@@ -406,11 +778,11 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
         
         if !relay_urls.is_empty() {
             println!("[RUST] Fallback: Querying {} relays with fresh connection", relay_urls.len());
-            match nostr::fetch_events(&pubkey, Some(0), &relay_urls).await {
+            match crate::nostr::fetch_events(&pubkey, Some(0), &relay_urls).await {
                 Ok(events) => {
                     println!("[RUST] Fallback found {} profile events", events.len());
                     if let Some(latest_event) = events.into_iter().max_by_key(|e| e.created_at) {
-                        let profile = nostr::parse_profile_from_event(&latest_event)
+                        let profile = crate::nostr::parse_profile_from_event(&latest_event)
                             .map_err(|e| format!("Failed to parse profile: {}", e))?;
                         println!("[RUST] Fallback successfully retrieved profile!");
                         return Ok(Some(ProfileResult {
@@ -457,12 +829,82 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
 }
 
 #[tauri::command]
+async fn decode_nostr_identifier(identifier: String) -> Result<String, String> {
+    println!("[RUST] decode_nostr_identifier called for: {}", identifier);
+    
+    // Strip nostr: prefix if present
+    let identifier = identifier.strip_prefix("nostr:").unwrap_or(&identifier).trim();
+    println!("[RUST] After stripping prefix: {}", identifier);
+    
+    // Try to decode as nprofile (NIP-19 profile identifier)
+    if identifier.starts_with("nprofile1") {
+        println!("[RUST] Detected nprofile1, attempting to decode...");
+        match Nip19::from_bech32(identifier) {
+            Ok(nip19) => {
+                println!("[RUST] Successfully decoded bech32, checking variant...");
+                match nip19 {
+                    Nip19::Profile(profile) => {
+                        println!("[RUST] Matched Profile variant, extracting pubkey...");
+                        let npub = profile.public_key.to_bech32()
+                            .map_err(|e| {
+                                println!("[RUST] Error converting pubkey to bech32: {}", e);
+                                format!("Failed to convert pubkey to bech32: {}", e)
+                            })?;
+                        println!("[RUST] Successfully decoded nprofile to npub: {}", npub);
+                        return Ok(npub);
+                    }
+                    other => {
+                        println!("[RUST] Nip19 variant is not Profile: {:?}", other);
+                        return Err(format!("Invalid nprofile format: expected Profile variant"));
+                    }
+                }
+            }
+            Err(e) => {
+                println!("[RUST] Failed to decode nprofile bech32: {}", e);
+                return Err(format!("Failed to decode nprofile: {}", e));
+            }
+        }
+    }
+    
+    // If it's already an npub, return it as-is
+    if identifier.starts_with("npub1") {
+        // Validate it's a valid bech32
+        match PublicKey::from_bech32(identifier) {
+            Ok(_) => {
+                println!("[RUST] Valid npub identifier: {}", identifier);
+                return Ok(identifier.to_string());
+            }
+            Err(e) => {
+                return Err(format!("Invalid npub format: {}", e));
+            }
+        }
+    }
+    
+    // Try as hex pubkey
+    if identifier.len() == 64 && identifier.chars().all(|c| c.is_ascii_hexdigit()) {
+        match PublicKey::from_hex(identifier) {
+            Ok(pubkey) => {
+                let npub = pubkey.to_bech32()
+                    .map_err(|e| format!("Failed to convert hex to bech32: {}", e))?;
+                println!("[RUST] Converted hex to npub: {}", npub);
+                return Ok(npub);
+            }
+            Err(e) => {
+                return Err(format!("Invalid hex pubkey: {}", e));
+            }
+        }
+    }
+    
+    Err(format!("Unsupported Nostr identifier format: {}", identifier))
+}
+
+#[tauri::command]
 async fn fetch_nostr_following_pubkeys(pubkey: String, relays: Vec<String>) -> Result<Vec<String>, String> {
     nostr::fetch_following_pubkeys(&pubkey, &relays).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn fetch_following_pubkeys_persistent(pubkey: String, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+async fn fetch_following_pubkeys_persistent(pubkey: String, state: tauri::State<'_, AppState>) -> Result<crate::types::FollowListResult, String> {
     println!("[RUST] fetch_following_pubkeys_persistent called for pubkey: {}", pubkey);
     
     // Get the persistent client
@@ -482,25 +924,79 @@ async fn fetch_following_pubkeys_persistent(pubkey: String, state: tauri::State<
     
     println!("[RUST] Using persistent client to fetch following for: {}", pubkey);
     
+    // Check relay connection status before fetching (similar to fetch_profile_persistent)
+    // Wait for at least one relay to be connected (up to 10 seconds)
+    let max_wait_time = std::time::Duration::from_secs(10);
+    let wait_start = std::time::Instant::now();
+    let check_interval = std::time::Duration::from_millis(500);
+    
+    let mut connected_relays = client.relays().await;
+    println!("[RUST] Checking relay status before contact list fetch...");
+    println!("[RUST] Initial relays in client: {}", connected_relays.len());
+    
+    // Wait for at least one relay to connect
+    while connected_relays.is_empty() && wait_start.elapsed() < max_wait_time {
+        println!("[RUST] No relays connected yet, waiting... ({:?} elapsed)", wait_start.elapsed());
+        tokio::time::sleep(check_interval).await;
+        connected_relays = client.relays().await;
+    }
+    
+    if connected_relays.is_empty() {
+        println!("[RUST] Warning: No relays connected after waiting, proceeding anyway");
+    } else {
+        let relay_urls: Vec<String> = connected_relays.iter()
+            .map(|(url, _)| url.to_string())
+            .collect();
+        println!("[RUST] Connected to {} relay(s): {:?}", connected_relays.len(), relay_urls);
+    }
+    
     // Fetch user's kind 3 event (contact list) using persistent client
+    // Don't use limit(1) - fetch multiple and get the latest by created_at
+    // This ensures we get the most recent event even if relays return them out of order
     let contact_list_filter = Filter::new()
         .author(public_key)
-        .kind(Kind::ContactList)
-        .limit(1);
+        .kind(Kind::ContactList);
 
-    println!("[RUST] Fetching contact list events using persistent client...");
+    println!("[RUST] Fetching contact list events using persistent client with 2s timeout...");
+    
+    // Use shorter timeout (2 seconds) - mock relay responds quickly, and persistent client returns as soon as results are available
     let contact_events = client
-        .fetch_events(contact_list_filter, Duration::from_secs(10))
+        .fetch_events(contact_list_filter, Duration::from_secs(2))
         .await
         .map_err(|e| e.to_string())?;
     
     println!("[RUST] Found {} contact list events", contact_events.len());
     
+    // Log all events found for debugging
+    for (i, event) in contact_events.iter().enumerate() {
+        println!("[RUST] Contact event {}: ID={}, created_at={}, tags={}", 
+            i, 
+            event.id.to_hex()[..16].to_string() + "...",
+            event.created_at.as_u64(),
+            event.tags.len()
+        );
+    }
+    
     let latest_contact_event = contact_events.into_iter().max_by_key(|e| e.created_at);
 
     if let Some(event) = latest_contact_event {
         println!("[RUST] Latest contact event ID: {}", event.id.to_hex());
+        println!("[RUST] Latest contact event created_at: {}", event.created_at.as_u64());
         println!("[RUST] Contact event has {} tags", event.tags.len());
+        
+        // Debug: Log all tags to see what we're getting
+        if event.tags.is_empty() {
+            println!("[RUST] Contact event found but has 0 tags - this is a valid empty follow list");
+        } else {
+            println!("[RUST] Tag details:");
+            for (i, tag) in event.tags.iter().enumerate() {
+                println!("[RUST]   Tag {}: kind='{}', content='{}'", 
+                    i, 
+                    tag.kind().as_str(), 
+                    tag.content().unwrap_or("None")
+                );
+            }
+        }
         
         // Get followed pubkeys from 'p' tags
         let followed_pubkeys: Vec<String> = event.tags
@@ -517,11 +1013,30 @@ async fn fetch_following_pubkeys_persistent(pubkey: String, state: tauri::State<
             })
             .collect();
         
-        println!("[RUST] Found {} followed pubkeys using persistent client", followed_pubkeys.len());
-        Ok(followed_pubkeys)
+        // If event has 0 'p' tags (empty follow list), treat as "no event found" to abort sync
+        // This preserves existing contacts when an empty event is found (might be a mistake or old event)
+        if followed_pubkeys.is_empty() {
+            println!("[RUST] Contact event found but has 0 'p' tags (empty follow list) - treating as 'no event found' to abort sync");
+            Ok(crate::types::FollowListResult {
+                pubkeys: vec![],
+                event_found: false,
+                event_id: Some(event.id.to_hex()),
+            })
+        } else {
+            println!("[RUST] Found {} followed pubkeys using persistent client (event found: true)", followed_pubkeys.len());
+            Ok(crate::types::FollowListResult {
+                pubkeys: followed_pubkeys,
+                event_found: true,
+                event_id: Some(event.id.to_hex()),
+            })
+        }
     } else {
-        println!("[RUST] No contact list events found");
-        Ok(vec![])
+        println!("[RUST] No contact list events found on any relay");
+        Ok(crate::types::FollowListResult {
+            pubkeys: vec![],
+            event_found: false,
+            event_id: None,
+        })
     }
 }
 
@@ -550,68 +1065,7 @@ async fn update_single_relay(relay_url: String, is_active: bool, state: tauri::S
 
 #[tauri::command]
 async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    let client_option = {
-        let client_guard = state.nostr_client.lock().unwrap();
-        client_guard.clone()
-    };
-    
-    let mut updated_relays = Vec::new();
-    
-    if let Some(client) = client_option {
-        let connected_relays = client.relays().await;
-        
-        // Get current relay configuration from database (not just in-memory state)
-        let db = state.get_database().map_err(|e| e.to_string())?;
-        let all_db_relays = db.get_all_relays().map_err(|e| e.to_string())?;
-        
-        let mut relays_to_update = Vec::new();
-        for db_relay in all_db_relays.iter() {
-            if db_relay.is_active {
-                let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == db_relay.url);
-                if !is_connected {
-                    // This relay is marked as active but not actually connected
-                    relays_to_update.push(db_relay.url.clone());
-                }
-            }
-        }
-        
-        // Update disconnected relays to inactive
-        for relay_url in relays_to_update {
-            // Update in-memory state (if relay exists there)
-            {
-                let mut relays_guard = state.relays.lock().unwrap();
-                if let Some(relay) = relays_guard.iter_mut().find(|r| r.url == relay_url) {
-                    relay.is_active = false;
-                }
-            }
-            
-            // Update in database
-            let db = state.get_database().map_err(|e| e.to_string())?;
-            // Try to get relay from database and update it
-            let all_relays = db.get_all_relays().map_err(|e| e.to_string())?;
-            if let Some(db_relay) = all_relays.iter().find(|r| r.url == relay_url) {
-                let updated_relay = crate::database::DbRelay {
-                    id: db_relay.id,
-                    url: relay_url.clone(),
-                    is_active: false,
-                    created_at: db_relay.created_at,
-                    updated_at: chrono::Utc::now(),
-                };
-                if let Err(e) = db.save_relay(&updated_relay) {
-                    println!("[RUST] Failed to update relay in database: {}", e);
-                }
-            }
-            
-            updated_relays.push(relay_url);
-        }
-        
-        // Only log when relays are actually updated
-        if !updated_relays.is_empty() {
-            println!("[RUST] sync_relay_states: Auto-disabled {} disconnected relay(s): {:?}", updated_relays.len(), updated_relays);
-        }
-    }
-    
-    Ok(updated_relays)
+    Ok(sync_relay_states_internal(&state).await)
 }
 
 #[tauri::command]
@@ -661,21 +1115,52 @@ async fn get_relay_status(state: tauri::State<'_, AppState>) -> Result<Vec<Relay
     if let Some(client) = client_option {
         let connected_relays = client.relays().await;
         
+        // Get the map of failed relays (URL -> error message)
+        let failed_relays_map = {
+            let failed_guard = state.failed_relays.lock().unwrap();
+            failed_guard.clone()
+        };
+        
+        if !failed_relays_map.is_empty() {
+            println!("[RUST] get_relay_status: Found {} failed relay(s) in tracking map", failed_relays_map.len());
+        }
+        
         for configured_relay in configured_relays {
-            let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == configured_relay.url);
+            // Check if this relay has an error message (even if disabled)
+            let error_message = failed_relays_map.get(&configured_relay.url).cloned();
             
-            let status = if !configured_relay.is_active {
-                RelayConnectionStatus::Disabled
-            } else if is_connected {
-                RelayConnectionStatus::Connected
+            let (status, error_message) = if !configured_relay.is_active {
+                // Relay is disabled - return Disabled status with error message if available
+                (RelayConnectionStatus::Disabled, error_message)
             } else {
-                RelayConnectionStatus::Disconnected
+                // Relay is active - check if it's in the failed_relays map first
+                if let Some(error_msg) = error_message {
+                    println!("[RUST] get_relay_status: Relay {} is in failed_relays map, marking as Disconnected. Error: {}", configured_relay.url, error_msg);
+                    (RelayConnectionStatus::Disconnected, Some(error_msg))
+                } else {
+                    // Try to parse the relay URL and check if it's in the connected relays map
+                    match RelayUrl::from_str(&configured_relay.url) {
+                        Ok(relay_url_key) => {
+                            // Check if relay is in the connected relays map
+                            if connected_relays.contains_key(&relay_url_key) {
+                                (RelayConnectionStatus::Connected, None)
+                            } else {
+                                (RelayConnectionStatus::Disconnected, None)
+                            }
+                        },
+                        Err(_) => {
+                            // Invalid URL format, mark as disconnected
+                            (RelayConnectionStatus::Disconnected, None)
+                        }
+                    }
+                }
             };
             
             relay_statuses.push(RelayStatus {
                 url: configured_relay.url,
                 is_active: configured_relay.is_active,
                 status,
+                error_message,
             });
         }
     } else {
@@ -691,6 +1176,7 @@ async fn get_relay_status(state: tauri::State<'_, AppState>) -> Result<Vec<Relay
                 url: configured_relay.url,
                 is_active: configured_relay.is_active,
                 status,
+                error_message: None,
             });
         }
     }
@@ -698,42 +1184,104 @@ async fn get_relay_status(state: tauri::State<'_, AppState>) -> Result<Vec<Relay
     Ok(relay_statuses)
 }
 
-#[tauri::command]
-async fn test_relay_connection(relay_url: String) -> Result<bool, String> {
-    println!("[RUST] test_relay_connection called for: {}", relay_url);
-    
+/// Probe a relay to determine if it requires authentication
+/// Returns (requires_auth: bool, is_connected: bool)
+/// Note: We can only detect auth requirements after connecting, as relays send AUTH challenges post-connection
+async fn probe_relay_auth_requirement(relay_url: &str) -> Result<(bool, bool), String> {
     use nostr_sdk::prelude::*;
     
-    // Create a temporary client to test the connection
-    let keys = Keys::generate(); // Use ephemeral keys for testing
+    println!("[RUST] Probing relay {} for auth requirements", relay_url);
+    
+    // Create a temporary client with ephemeral keys
+    let keys = Keys::generate();
     let client = Client::new(keys);
     
+    // Track if we receive an AUTH challenge
+    let auth_required = Arc::new(Mutex::new(false));
+    let auth_required_clone = auth_required.clone();
+    let relay_url_str = relay_url.to_string();
+    
     // Try to add and connect to the relay
-    match client.add_relay(&relay_url).await {
+    match client.add_relay(relay_url).await {
         Ok(_) => {
             println!("[RUST] Successfully added relay: {}", relay_url);
+            
+            // Set up a notification listener to catch AUTH challenges
+            let mut notifications = client.notifications();
+            
+            // Spawn task to listen for AUTH challenges
+            let handle = {
+                let relay_url_str_clone = relay_url_str.clone();
+                tokio::spawn(async move {
+                    let timeout = tokio::time::Duration::from_secs(3);
+                    let start = std::time::Instant::now();
+                    
+                    while start.elapsed() < timeout {
+                        tokio::select! {
+                            result = notifications.recv() => {
+                                match result {
+                                    Ok(RelayPoolNotification::Message { relay_url: url, message }) => {
+                                        if url.to_string() == relay_url_str_clone {
+                                            if let RelayMessage::Auth { .. } = message {
+                                                println!("[RUST] Received AUTH challenge from relay {}", relay_url_str_clone);
+                                                *auth_required_clone.lock().unwrap() = true;
+                                                break;
+                                            }
+                                        }
+                                    },
+                                    Ok(_) => {},
+                                    Err(_) => break,
+                                }
+                            },
+                            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                                // Continue checking
+                            }
+                        }
+                    }
+                })
+            };
             
             // Try to connect
             client.connect().await;
             
-            // Wait a moment for connection to establish
-            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+            // Wait for connection to establish and for potential AUTH challenge
+            tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
             
             // Check if connected
             let relays = client.relays().await;
             let is_connected = relays.iter().any(|(url, _)| url.to_string() == relay_url);
             
+            // Check if auth is required
+            let requires_auth = *auth_required.lock().unwrap();
+            
             // Disconnect the test client
             client.disconnect().await;
+            handle.abort();
             
-            println!("[RUST] Relay {} connection test result: {}", relay_url, is_connected);
-            Ok(is_connected)
+            println!("[RUST] Relay {} probe result: connected={}, requires_auth={}", relay_url, is_connected, requires_auth);
+            Ok((requires_auth, is_connected))
         },
         Err(e) => {
             println!("[RUST] Failed to add relay {}: {}", relay_url, e);
             Err(format!("Failed to connect to relay: {}", e))
         }
     }
+}
+
+#[tauri::command]
+async fn test_relay_connection(relay_url: String) -> Result<bool, String> {
+    println!("[RUST] test_relay_connection called for: {}", relay_url);
+    
+    let (_, is_connected) = probe_relay_auth_requirement(&relay_url).await?;
+    Ok(is_connected)
+}
+
+#[tauri::command]
+async fn check_relay_auth_requirement(relay_url: String) -> Result<bool, String> {
+    println!("[RUST] check_relay_auth_requirement called for: {}", relay_url);
+    
+    let (requires_auth, _) = probe_relay_auth_requirement(&relay_url).await?;
+    Ok(requires_auth)
 }
 
 #[tauri::command]
@@ -1144,10 +1692,12 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
         .kind(Kind::from(0)) // Profile events are kind 0
         .limit(1000); // Allow for multiple profiles
         
-    println!("[RUST] Fetching profile events with 30s timeout...");
+    // Use shorter timeout for mock servers (2 seconds is plenty for local relays)
+    // This prevents unnecessary delays when relays respond quickly
+    println!("[RUST] Fetching profile events with 2s timeout (optimized for mock servers)...");
     let fetch_start = std::time::Instant::now();
     let profile_events: Vec<_> = match client
-        .fetch_events(profiles_filter, Duration::from_secs(30))
+        .fetch_events(profiles_filter, Duration::from_secs(2))
         .await
     {
         Ok(events) => events.into_iter().collect(),
@@ -1562,6 +2112,20 @@ fn db_update_user_contact_public_status(user_pubkey: String, contact_pubkey: Str
     println!("[RUST] db_update_user_contact_public_status called: user={}, contact={}, is_public={}", user_pubkey, contact_pubkey, is_public);
     let db = state.get_database()?;
     db.update_user_contact_public_status(&user_pubkey, &contact_pubkey, is_public).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_batch_update_user_contact_public_status(user_pubkey: String, updates: Vec<(String, bool)>, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_batch_update_user_contact_public_status called: user={}, updates={}", user_pubkey, updates.len());
+    let db = state.get_database()?;
+    db.batch_update_user_contact_public_status(&user_pubkey, &updates).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_batch_save_contacts(user_pubkey: String, contacts: Vec<DbContact>, is_public: bool, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_batch_save_contacts called: user={}, contacts={}, is_public={}", user_pubkey, contacts.len(), is_public);
+    let db = state.get_database()?;
+    db.batch_save_contacts(&user_pubkey, &contacts, is_public).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2763,18 +3327,69 @@ fn db_clear_all_data(state: tauri::State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn follow_user(private_key: String, pubkey_to_follow: String, relays: Vec<String>) -> Result<(), String> {
+async fn follow_user(private_key: String, pubkey_to_follow: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    use nostr_sdk::prelude::*;
+    
     println!("[RUST] follow_user called for pubkey: {}", pubkey_to_follow);
     
-    // First, get the current follow list
-    let current_follows = nostr::fetch_following_profiles(&private_key, &relays)
-        .await
-        .map_err(|e| format!("Failed to fetch current follows: {}", e))?;
+    // Get or initialize the persistent client (will reinitialize if keys don't match)
+    let client = state.get_nostr_client(Some(&private_key)).await.map_err(|e| {
+        format!("Failed to get or initialize persistent client: {}", e)
+    })?;
     
-    // Extract pubkeys from current follows
-    let mut current_pubkeys: Vec<String> = current_follows.iter()
-        .map(|profile| profile.pubkey.clone())
-        .collect();
+    // Parse private key and create keys
+    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let keys = Keys::new(secret_key);
+    
+    // Get the user's public key
+    let user_public_key = keys.public_key();
+    
+    // Check relay connection status before fetching
+    let max_wait_time = std::time::Duration::from_secs(10);
+    let start_time = std::time::Instant::now();
+    let check_interval = std::time::Duration::from_millis(500);
+    
+    let mut connected_relays = client.relays().await;
+    println!("[RUST] Checking relay status before contact list fetch...");
+    
+    // Wait for at least one relay to connect
+    while connected_relays.is_empty() && start_time.elapsed() < max_wait_time {
+        println!("[RUST] No relays connected yet, waiting... ({:?} elapsed)", start_time.elapsed());
+        tokio::time::sleep(check_interval).await;
+        connected_relays = client.relays().await;
+    }
+    
+    // Fetch current follow list using persistent client
+    println!("[RUST] Fetching current follow list using persistent client...");
+    let contact_list_filter = Filter::new()
+        .author(user_public_key)
+        .kind(Kind::ContactList);
+    
+    let contact_events = client
+        .fetch_events(contact_list_filter, Duration::from_secs(30))
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    // Get the latest contact event
+    let latest_contact_event = contact_events.into_iter().max_by_key(|e| e.created_at);
+    
+    // Extract current pubkeys from the latest event
+    let mut current_pubkeys: Vec<String> = if let Some(event) = latest_contact_event {
+        event.tags
+            .iter()
+            .filter(|tag| tag.kind().as_str() == "p")
+            .filter_map(|tag| {
+                tag.content().and_then(|pk| {
+                    PublicKey::from_bech32(pk)
+                        .or_else(|_| PublicKey::from_hex(pk))
+                        .ok()
+                        .and_then(|pubkey| pubkey.to_bech32().ok())
+                })
+            })
+            .collect()
+    } else {
+        vec![]
+    };
     
     // Add the new pubkey if it's not already in the list
     if !current_pubkeys.contains(&pubkey_to_follow) {
@@ -2786,23 +3401,52 @@ async fn follow_user(private_key: String, pubkey_to_follow: String, relays: Vec<
     }
     
     // Create tags for the follow event (kind 3)
-    let tags: Vec<Vec<String>> = current_pubkeys.iter()
-        .map(|pubkey| vec!["p".to_string(), pubkey.clone()])
+    let tags: Vec<Tag> = current_pubkeys.iter()
+        .filter_map(|pubkey| {
+            PublicKey::from_bech32(pubkey)
+                .or_else(|_| PublicKey::from_hex(pubkey))
+                .ok()
+                .map(|pk| Tag::public_key(pk))
+        })
         .collect();
     
-    // Empty content for follow events
-    let content = "".to_string();
+    // Build the follow event (kind 3)
+    let event_builder = EventBuilder::new(Kind::ContactList, "");
+    let event = event_builder
+        .tags(tags)
+        .build(keys.public_key())
+        .sign_with_keys(&keys)
+        .map_err(|e| e.to_string())?;
     
-    // Publish the new follow event with the complete list
-    nostr::publish_event(&private_key, &content, 3, tags, &relays)
-        .await
-        .map(|_| {
-            println!("[RUST] Successfully published follow event with {} follows", current_pubkeys.len());
-        })
-        .map_err(|e| {
-            println!("[RUST] Failed to publish follow event: {}", e);
-            e.to_string()
-        })
+    println!("[RUST] Built follow event with ID: {}", event.id.to_hex());
+    
+    // Get connected relays count for logging
+    let connected_relays = client.relays().await;
+    println!("[RUST] Publishing follow event to {} connected relays", connected_relays.len());
+    
+    // Publish event using persistent client
+    let output = client.send_event(&event).await.map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Follow event published successfully to {} relays", output.success.len());
+    
+    // Clear successfully connected relays from failed map
+    if !output.success.is_empty() {
+        let mut failed_map = state.failed_relays.lock().unwrap();
+        for relay_url in &output.success {
+            let relay_url_str = relay_url.to_string();
+            if let Some(error_msg) = failed_map.remove(&relay_url_str) {
+                println!("[RUST] Cleared relay {} from failed_relays map (successfully connected). Previous error: {}", relay_url_str, error_msg);
+            }
+        }
+    }
+    
+    // Update relay status based on failures
+    if !output.failed.is_empty() {
+        sync_relay_states_internal(&state).await;
+        println!("[RUST] Updated relay states after follow event publish failures");
+    }
+    
+    Ok(())
 }
 
 #[tauri::command]
@@ -3108,31 +3752,21 @@ async fn update_profile(private_key: String, fields: std::collections::HashMap<S
 }
 
 #[tauri::command]
-async fn update_profile_persistent(private_key: String, fields: std::collections::HashMap<String, serde_json::Value>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn update_profile_persistent(private_key: String, fields: std::collections::HashMap<String, serde_json::Value>, app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] update_profile_persistent called");
-    
-    // Get the persistent client
-    let client = {
-        let client_guard = state.nostr_client.lock().unwrap();
-        match client_guard.as_ref() {
-            Some(client) => client.clone(),
-            None => return Err("Persistent Nostr client not initialized".to_string()),
-        }
-    };
     
     // Convert fields to JSON string
     let content = serde_json::to_string(&fields).map_err(|e| e.to_string())?;
     println!("[RUST] Profile content: {}", content);
 
+    // Get or initialize the persistent client (will reinitialize if keys don't match)
+    let client = state.get_nostr_client(Some(&private_key)).await.map_err(|e| {
+        format!("Failed to get or initialize persistent client: {}", e)
+    })?;
+
     // Parse private key and create keys
-    let secret_key = nostr_sdk::prelude::SecretKey::from_str(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
-    
-    // Verify the client is using the same keys
-    let current_keys = state.get_current_keys().ok_or("No current keys available")?;
-    if current_keys.public_key() != keys.public_key() {
-        return Err("Private key doesn't match the persistent client's keys".to_string());
-    }
 
     // Build the profile event (kind 0)
     let metadata: Metadata = serde_json::from_str(&content).map_err(|e| e.to_string())?;
@@ -3149,8 +3783,34 @@ async fn update_profile_persistent(private_key: String, fields: std::collections
     let output = client.send_event(&event).await.map_err(|e| e.to_string())?;
     
     println!("[RUST] Profile update published successfully to {} relays", output.success.len());
+    
+    // Clear successfully connected relays from failed map
+    if !output.success.is_empty() {
+        let mut failed_map = state.failed_relays.lock().unwrap();
+        for relay_url in &output.success {
+            let relay_url_str = relay_url.to_string();
+            if let Some(error_msg) = failed_map.remove(&relay_url_str) {
+                println!("[RUST] Cleared relay {} from failed_relays map (successfully connected). Previous error: {}", relay_url_str, error_msg);
+            }
+        }
+    }
+    
     if !output.failed.is_empty() {
         println!("[RUST] Failed to publish to {} relays: {:?}", output.failed.len(), output.failed);
+        
+        // Update relay status based on failures
+        let updated_relays = update_relay_status_from_send_failures(&output.failed, &state).await;
+        
+        // Emit event to frontend to refresh relay status immediately
+        if !updated_relays.is_empty() {
+            if let Err(e) = app_handle.emit("relay-status-changed", &serde_json::json!({
+                "updated_relays": updated_relays
+            })) {
+                println!("[RUST] Failed to emit relay-status-changed event: {}", e);
+            } else {
+                println!("[RUST] Emitted relay-status-changed event for {} relay(s)", updated_relays.len());
+            }
+        }
     }
 
     Ok(())
@@ -3310,6 +3970,58 @@ async fn get_live_subscription_status(
     Ok(is_active)
 }
 
+// Handle AUTH challenge from relay (NIP-42)
+async fn handle_auth_challenge(
+    client: &nostr_sdk::Client,
+    state: &AppState,
+    relay_url: &RelayUrl,
+    challenge: &str,
+    private_key: &str,
+) -> Result<(), String> {
+    println!("[RUST] Received AUTH challenge from relay: {}", relay_url);
+    
+    // Convert relay URL to string
+    let relay_url_str = relay_url.to_string();
+    
+    // Store pending challenge
+    {
+        let mut challenges = state.pending_auth_challenges.lock().unwrap();
+        challenges.insert(relay_url_str.clone(), challenge.to_string());
+    }
+    
+    // Create AUTH event using the create_auth_event function from nostr.rs
+    let auth_event = crate::nostr::create_auth_event(private_key, &relay_url_str, challenge)
+        .map_err(|e| format!("Failed to create AUTH event: {}", e))?;
+    
+    // Send AUTH response
+    send_auth_response(client, relay_url, &auth_event).await?;
+    
+    println!("[RUST] AUTH challenge handled and response sent");
+    Ok(())
+}
+
+// Send AUTH response to relay
+async fn send_auth_response(
+    client: &nostr_sdk::Client,
+    relay_url: &RelayUrl,
+    auth_event: &nostr_sdk::Event,
+) -> Result<(), String> {
+    println!("[RUST] Sending AUTH response to relay: {}", relay_url);
+    
+    // Get the relay handle
+    let relay = client.relay(relay_url.clone()).await
+        .map_err(|e| format!("Failed to get relay handle: {}", e))?;
+    
+    // Send AUTH message: ["AUTH", <signed-event-json>]
+    // Use the relay's send_msg method with the AUTH message
+    // ClientMessage::auth creates the AUTH message format
+    relay.send_msg(ClientMessage::auth(auth_event.clone()))
+        .map_err(|e| format!("Failed to send AUTH response: {}", e))?;
+    
+    println!("[RUST] AUTH response sent successfully");
+    Ok(())
+}
+
 // Handle subscription notifications with automatic retry and exponential backoff
 async fn handle_subscription_notifications(
     client: nostr_sdk::Client,
@@ -3351,8 +4063,59 @@ async fn handle_subscription_notifications(
                         }
                     }
                 },
-                RelayPoolNotification::Message { .. } => {
-                    // Silently handle relay messages - no logging to reduce verbosity
+                RelayPoolNotification::Message { relay_url, message } => {
+                    // Handle AUTH challenges and other relay messages
+                    match message {
+                        nostr_sdk::RelayMessage::Auth { challenge } => {
+                            // Handle AUTH challenge
+                            println!("[RUST] Received AUTH challenge from relay: {}", relay_url);
+                            // Get private key from state
+                            let private_key = {
+                                let pk_guard = state.current_private_key.lock().unwrap();
+                                pk_guard.clone()
+                            };
+                            if let Some(pk) = private_key {
+                                if let Err(e) = handle_auth_challenge(&client, &state, &relay_url, &challenge, &pk).await {
+                                    println!("[RUST] Error handling AUTH challenge: {}", e);
+                                }
+                            } else {
+                                println!("[RUST] Cannot handle AUTH challenge: no private key available");
+                            }
+                        },
+                        nostr_sdk::RelayMessage::Ok { event_id: _, status, message: ok_message } => {
+                            // Check if this is an OK response for an AUTH event
+                            // We need to check if we have a pending challenge for this relay
+                            let relay_url_str = relay_url.to_string();
+                            let has_pending_challenge = {
+                                let challenges = state.pending_auth_challenges.lock().unwrap();
+                                challenges.contains_key(&relay_url_str)
+                            };
+                            
+                            if has_pending_challenge && status {
+                                // Authentication successful
+                                println!("[RUST] AUTH successful for relay: {}", relay_url);
+                                {
+                                    let mut auth_status = state.relay_auth_status.lock().unwrap();
+                                    auth_status.insert(relay_url_str.clone(), true);
+                                }
+                                {
+                                    let mut challenges = state.pending_auth_challenges.lock().unwrap();
+                                    challenges.remove(&relay_url_str);
+                                }
+                            } else if has_pending_challenge && !status {
+                                // Authentication failed
+                                let error_msg = ok_message.to_string();
+                                println!("[RUST] AUTH failed for relay {}: {}", relay_url, error_msg);
+                                {
+                                    let mut challenges = state.pending_auth_challenges.lock().unwrap();
+                                    challenges.remove(&relay_url_str);
+                                }
+                            }
+                        },
+                        _ => {
+                            // Silently handle other relay messages - no logging to reduce verbosity
+                        }
+                    }
                 },
                 RelayPoolNotification::Shutdown => {
                     println!("[RUST] Received shutdown notification");
@@ -3488,8 +4251,9 @@ async fn handle_live_profile_update(
         let db = match state.get_database() {
             Ok(db) => db,
             Err(e) => {
-                println!("[RUST] Failed to get database to check contact: {}", e);
-                return Ok(()); // Silently ignore if DB unavailable
+                eprintln!("[RUST] ERROR: Failed to get database to check contact: {}", e);
+                // Log error but don't crash - this is a non-critical operation
+                return Ok(());
             }
         };
         
@@ -3499,11 +4263,12 @@ async fn handle_live_profile_update(
                 println!("[RUST] Processing profile update for contact: {}", event_pubkey_str);
             },
             Ok(false) => {
-                println!("[RUST] Ignoring profile update from non-contact user");
+                // Not a contact, ignore silently (this is expected)
                 return Ok(());
             },
             Err(e) => {
-                println!("[RUST] Error checking if contact: {}", e);
+                eprintln!("[RUST] ERROR: Failed to check if user follows contact {}: {}", event_pubkey_str, e);
+                // Log error but continue - might be a transient DB issue
                 return Ok(());
             }
         }
@@ -3903,6 +4668,7 @@ pub fn run() {
         fetch_conversation_messages,
         fetch_profile,
         fetch_profile_persistent,
+        decode_nostr_identifier,
         fetch_following_profiles,
         fetch_nostr_following_pubkeys,
         fetch_following_pubkeys_persistent,
@@ -3963,6 +4729,8 @@ pub fn run() {
         db_remove_user_contact_and_cleanup,
         db_get_public_contact_pubkeys,
         db_update_user_contact_public_status,
+        db_batch_update_user_contact_public_status,
+        db_batch_save_contacts,
         db_find_pubkeys_by_email,
         db_find_pubkeys_by_email_including_dms,
         db_filter_new_contacts,
@@ -4206,21 +4974,48 @@ pub async fn http_get_relay_status(app_state: std::sync::Arc<AppState>) -> Resul
     if let Some(client) = client_option {
         let connected_relays = client.relays().await;
         
+        // Get the map of failed relays (URL -> error message)
+        let failed_relays_map = {
+            let failed_guard = app_state.failed_relays.lock().unwrap();
+            failed_guard.clone()
+        };
+        
+        if !failed_relays_map.is_empty() {
+            println!("[RUST] http_get_relay_status: Found {} failed relay(s) in tracking map", failed_relays_map.len());
+        }
+        
         for configured_relay in configured_relays {
-            let is_connected = connected_relays.iter().any(|(url, _)| url.to_string() == configured_relay.url);
-            
-            let status = if !configured_relay.is_active {
-                RelayConnectionStatus::Disabled
-            } else if is_connected {
-                RelayConnectionStatus::Connected
+            let (status, error_message) = if !configured_relay.is_active {
+                (RelayConnectionStatus::Disabled, None)
             } else {
-                RelayConnectionStatus::Disconnected
+                // Check if this relay is in the failed_relays map first
+                if let Some(error_msg) = failed_relays_map.get(&configured_relay.url) {
+                    println!("[RUST] http_get_relay_status: Relay {} is in failed_relays map, marking as Disconnected. Error: {}", configured_relay.url, error_msg);
+                    (RelayConnectionStatus::Disconnected, Some(error_msg.clone()))
+                } else {
+                    // Try to parse the relay URL and check if it's in the connected relays map
+                    match RelayUrl::from_str(&configured_relay.url) {
+                        Ok(relay_url_key) => {
+                            // Check if relay is in the connected relays map
+                            if connected_relays.contains_key(&relay_url_key) {
+                                (RelayConnectionStatus::Connected, None)
+                            } else {
+                                (RelayConnectionStatus::Disconnected, None)
+                            }
+                        },
+                        Err(_) => {
+                            // Invalid URL format, mark as disconnected
+                            (RelayConnectionStatus::Disconnected, None)
+                        }
+                    }
+                }
             };
             
             relay_statuses.push(RelayStatus {
                 url: configured_relay.url,
                 is_active: configured_relay.is_active,
                 status,
+                error_message,
             });
         }
     } else {
@@ -4235,6 +5030,7 @@ pub async fn http_get_relay_status(app_state: std::sync::Arc<AppState>) -> Resul
                 url: configured_relay.url,
                 is_active: configured_relay.is_active,
                 status,
+                error_message: None,
             });
         }
     }

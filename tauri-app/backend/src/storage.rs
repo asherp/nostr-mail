@@ -123,16 +123,7 @@ impl Storage {
                 user_profile: None,
                 settings: None,
                 email_drafts: HashMap::new(),
-                relays: vec![
-                    Relay {
-                        url: "wss://nostr-pub.wellorder.net".to_string(),
-                        is_active: true,
-                    },
-                    Relay {
-                        url: "wss://relay.damus.io".to_string(),
-                        is_active: true,
-                    },
-                ],
+                relays: Self::load_default_relays_from_file(),
             });
         }
         
@@ -279,6 +270,75 @@ impl Storage {
     pub fn get_relays(&self) -> Result<Vec<Relay>> {
         let data = self.load_data()?;
         Ok(data.relays)
+    }
+    
+    /// Load default relays from JSON file, with fallback to hardcoded defaults
+    fn load_default_relays_from_file() -> Vec<Relay> {
+        // Try to load from file in backend directory
+        let json_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("nostr-mail-config.json");
+        
+        if let Ok(json_content) = fs::read_to_string(&json_path) {
+            println!("[STORAGE] Loading default relays from: {:?}", json_path);
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&json_content) {
+                if let Some(relays_array) = config.get("relays").and_then(|r| r.as_array()) {
+                    let mut loaded_relays = Vec::new();
+                    for relay_obj in relays_array {
+                        if let (Some(url), is_active) = (
+                            relay_obj.get("url").and_then(|u| u.as_str()),
+                            relay_obj.get("is_active").and_then(|a| a.as_bool()).unwrap_or(true)
+                        ) {
+                            loaded_relays.push(Relay {
+                                url: url.to_string(),
+                                is_active,
+                            });
+                        }
+                    }
+                    if !loaded_relays.is_empty() {
+                        println!("[STORAGE] Loaded {} relay(s) from JSON file", loaded_relays.len());
+                        return loaded_relays;
+                    }
+                }
+            }
+            println!("[STORAGE] Failed to parse JSON file, using hardcoded defaults");
+        } else {
+            println!("[STORAGE] Default relays file not found at {:?}, using hardcoded defaults", json_path);
+        }
+        
+        // Fallback to hardcoded defaults
+        vec![
+            Relay {
+                url: "wss://relay.damus.io".to_string(),
+                is_active: true,
+            },
+            Relay {
+                url: "wss://nos.lol".to_string(),
+                is_active: true,
+            },
+            Relay {
+                url: "wss://relay.nostr.pub".to_string(),
+                is_active: true,
+            },
+            Relay {
+                url: "wss://nostr.rocks".to_string(),
+                is_active: true,
+            },
+            Relay {
+                url: "wss://nostr.mom".to_string(),
+                is_active: true,
+            },
+            Relay {
+                url: "wss://nostr.wine".to_string(),
+                is_active: true,
+            },
+            Relay {
+                url: "wss://cache1.primal.net".to_string(),
+                is_active: true,
+            },
+            Relay {
+                url: "wss://relay.nostr.band".to_string(),
+                is_active: true,
+            },
+        ]
     }
     
     // Utility methods

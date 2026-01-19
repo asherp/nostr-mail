@@ -7,6 +7,10 @@ class ContactsService {
     constructor() {
         this.searchTimeout = null;
         this.imageLoadingInProgress = false; // Prevent multiple concurrent image loading operations
+        this.sectionStates = {
+            public: true,  // Default: expanded
+            private: true  // Default: expanded
+        };
     }
 
     // Helper function to reconstruct fields object from DB contact data
@@ -35,7 +39,8 @@ class ContactsService {
         console.log('[JS] loadContacts called - loading contacts from database...');
 
         // Optionally, you can keep the keypair check if you want
-        if (!window.appState.hasKeypair()) {
+        const hasKeypair = window.appState.hasKeypair();
+        if (!hasKeypair) {
             return;
         }
 
@@ -45,11 +50,15 @@ class ContactsService {
             // Convert DB format to frontend format and reconstruct fields object
             // Note: picture_data_url is not fetched in initial query to reduce IPC overhead
             // It will be loaded on-demand via loadContactImagesProgressively
-            const contacts = dbContacts.map(dbContact => {
-                const reconstructed = this.reconstructContactFields(dbContact);
-                // Preserve is_public status
-                reconstructed.is_public = dbContact.is_public !== undefined ? dbContact.is_public : true;
-                return reconstructed;
+            const contacts = dbContacts.map((dbContact, index) => {
+                try {
+                    const reconstructed = this.reconstructContactFields(dbContact);
+                    // Preserve is_public status
+                    reconstructed.is_public = dbContact.is_public !== undefined ? dbContact.is_public : true;
+                    return reconstructed;
+                } catch (e) {
+                    throw e;
+                }
             });
             
             // Add user's own profile to contacts list as private
@@ -98,6 +107,7 @@ class ContactsService {
             
             window.appState.setContacts(contacts);
             console.log(`[JS] Contacts loaded from database: ${contacts.length} contacts`);
+            
             this.renderContacts();
             console.log('[JS] Contacts rendered to UI');
             
@@ -371,28 +381,142 @@ class ContactsService {
         }
 
         try {
+            // Always clear the container first
             contactsList.innerHTML = '';
 
             // Filter contacts based on search query
-            let filteredContacts = window.appState.getContacts();
-            if (searchQuery) {
-                filteredContacts = window.appState.getContacts().filter(contact => 
-                    contact.name.toLowerCase().includes(searchQuery) ||
-                    contact.pubkey.toLowerCase().includes(searchQuery) ||
+            const allContacts = window.appState.getContacts() || [];
+            let filteredContacts = allContacts;
+            if (searchQuery && allContacts.length > 0) {
+                filteredContacts = allContacts.filter(contact => 
+                    contact.name && contact.name.toLowerCase().includes(searchQuery) ||
+                    contact.pubkey && contact.pubkey.toLowerCase().includes(searchQuery) ||
                     (contact.email && contact.email.toLowerCase().includes(searchQuery))
                 );
             }
 
-            console.log(`[JS] renderContacts: Rendering ${filteredContacts.length} contacts (searchQuery: "${searchQuery}")`);
+            console.log(`[JS] renderContacts: Rendering ${filteredContacts ? filteredContacts.length : 0} contacts (searchQuery: "${searchQuery}")`);
             if (filteredContacts && filteredContacts.length > 0) {
-                // Sort: contacts with email first
-                filteredContacts.sort((a, b) => {
+                // Group contacts by privacy status
+                // is_public can be: true, false, undefined, or null
+                // Default to public if undefined/null
+                const publicContacts = [];
+                const privateContacts = [];
+                
+                filteredContacts.forEach(c => {
+                    // Determine if contact is public
+                    // Handle various cases: true, false, undefined, null, 1, 0
+                    let isPublic = true; // default to public
+                    if (c.is_public !== undefined && c.is_public !== null) {
+                        // Convert to boolean if needed (handles 1/0 from database)
+                        isPublic = c.is_public === true || c.is_public === 1 || c.is_public === 'true';
+                    }
+                    
+                    if (isPublic) {
+                        publicContacts.push(c);
+                    } else {
+                        privateContacts.push(c);
+                    }
+                });
+                
+                console.log(`[JS] Grouped contacts: ${publicContacts.length} public, ${privateContacts.length} private (total: ${filteredContacts.length})`);
+                console.log(`[JS] Sample contact is_public values:`, filteredContacts.slice(0, 3).map(c => ({name: c.name, is_public: c.is_public, type: typeof c.is_public})));
+                
+                // Sort contacts: contacts with emails first, then alphabetically within each group
+                const sortContacts = (a, b) => {
                     const aHasEmail = !!(a.email && a.email.trim());
                     const bHasEmail = !!(b.email && b.email.trim());
-                    if (aHasEmail === bHasEmail) return 0;
-                    return aHasEmail ? -1 : 1;
-                });
-                filteredContacts.forEach((contact, index) => {
+                    
+                    // If one has email and the other doesn't, prioritize the one with email
+                    if (aHasEmail && !bHasEmail) return -1;
+                    if (!aHasEmail && bHasEmail) return 1;
+                    
+                    // Both have email or both don't - sort alphabetically by name
+                    return (a.name || '').localeCompare(b.name || '');
+                };
+                publicContacts.sort(sortContacts);
+                privateContacts.sort(sortContacts);
+                
+                // Always render both sections, even if empty
+                // Private contacts appear first, then public contacts
+                this.renderContactSection(contactsList, 'private', privateContacts, searchQuery);
+                this.renderContactSection(contactsList, 'public', publicContacts, searchQuery);
+            } else {
+                // If no contacts at all, show message but still render empty sections
+                const message = searchQuery 
+                    ? `No contacts found matching "${searchQuery}"`
+                    : 'You are not following anyone yet, or contacts could not be loaded.';
+                
+                // Still show sections structure even when empty
+                this.renderContactSection(contactsList, 'private', [], searchQuery);
+                this.renderContactSection(contactsList, 'public', [], searchQuery);
+                
+                // Also show a general message
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'text-muted text-center';
+                messageDiv.style.padding = '20px';
+                messageDiv.textContent = message;
+                contactsList.insertBefore(messageDiv, contactsList.firstChild);
+            }
+        } catch (error) {
+            console.error('Error rendering contacts:', error);
+            // On error, at least show sections structure
+            try {
+                if (contactsList) {
+                    contactsList.innerHTML = '';
+                    this.renderContactSection(contactsList, 'private', [], '');
+                    this.renderContactSection(contactsList, 'public', []);
+                    const errorDiv = document.createElement('div');
+                    errorDiv.className = 'text-muted text-center';
+                    errorDiv.style.padding = '20px';
+                    errorDiv.style.color = '#dc3545';
+                    errorDiv.textContent = 'Error loading contacts. Please try refreshing.';
+                    contactsList.insertBefore(errorDiv, contactsList.firstChild);
+                }
+            } catch (e) {
+                console.error('Error in error handler:', e);
+            }
+        }
+    }
+
+    // Render a contact section (public or private)
+    renderContactSection(container, sectionType, contacts, searchQuery = '') {
+        const sectionLabel = sectionType === 'public' ? 'Public Contacts' : 'Private Contacts';
+        const contactCount = contacts.length;
+        // Collapse empty sections by default, but preserve user's manual toggle state if section has contacts
+        // Default to expanded if state is not set
+        const isExpanded = contactCount === 0 ? false : (this.sectionStates[sectionType] !== undefined ? this.sectionStates[sectionType] : true);
+        
+        console.log(`[JS] Rendering ${sectionLabel}: ${contactCount} contacts, expanded: ${isExpanded}`);
+        
+        // Create section container
+        const sectionDiv = document.createElement('div');
+        sectionDiv.className = 'contact-section';
+        sectionDiv.setAttribute('data-section', sectionType);
+        
+        // Create section header
+        const headerDiv = document.createElement('div');
+        headerDiv.className = 'contact-section-header';
+        headerDiv.setAttribute('data-section', sectionType);
+        headerDiv.innerHTML = `
+            <i class="fas fa-chevron-${isExpanded ? 'down' : 'right'} section-chevron"></i>
+            <span class="section-label">${sectionLabel} (${contactCount})</span>
+        `;
+        
+        // Add click handler to toggle section
+        headerDiv.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleSection(sectionType);
+        });
+        
+        // Create section content container
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'contact-section-content';
+        contentDiv.style.display = isExpanded ? 'block' : 'none';
+        
+        // Render contacts in this section
+        if (contacts.length > 0) {
+            contacts.forEach((contact, index) => {
                     const contactElement = document.createElement('div');
                     contactElement.className = 'contact-item';
                     contactElement.setAttribute('data-pubkey', contact.pubkey);
@@ -426,23 +550,8 @@ class ContactsService {
                         console.log(`[JS] Using default avatar for ${contact.name} (no cached image available)`);
                     }
 
-                    // Add privacy toggle switch
-                    const isPublic = contact.is_public !== undefined ? contact.is_public : true;
-                    const privacyIcon = isPublic 
-                        ? '<i class="fas fa-globe privacy-toggle-icon" title="Public follow - visible in your public follow list"></i>'
-                        : '<i class="fas fa-lock privacy-toggle-icon" title="Private follow - not in your public follow list"></i>';
-                    const privacyToggleHTML = `
-                        <div class="privacy-toggle-wrapper" title="${isPublic ? 'Public follow - visible in your public follow list. Click to make private.' : 'Private follow - not in your public follow list. Click to make public.'}">
-                            ${privacyIcon}
-                            <label class="privacy-toggle privacy-toggle-compact" id="privacy-toggle-list-${contact.pubkey}">
-                                <input type="checkbox" ${isPublic ? 'checked' : ''} 
-                                       aria-label="${isPublic ? 'Public follow - click to make private' : 'Private follow - click to make public'}">
-                                <span class="privacy-toggle-slider"></span>
-                            </label>
-                        </div>
-                    `;
-                    
                     // Add delete icon for private contacts (only visible on hover)
+                    const isPublic = contact.is_public !== undefined ? contact.is_public : true;
                     const deleteIconHTML = !isPublic 
                         ? `<button class="contact-delete-icon" data-pubkey="${contact.pubkey}" title="Remove this private contact" aria-label="Remove contact ${contact.name}">
                             <i class="fas fa-trash-alt"></i>
@@ -456,15 +565,14 @@ class ContactsService {
                         </div>
                         <div class="contact-actions">
                             ${deleteIconHTML}
-                            ${privacyToggleHTML}
                             ${emailIcon}
                         </div>
                     `;
                     
                     // Add click event listener for contact selection
                     contactElement.addEventListener('click', (e) => {
-                        // Don't select contact if clicking on toggle wrapper, toggle, delete icon, or email icon
-                        if (e.target.closest('.privacy-toggle-wrapper') || e.target.closest('.privacy-toggle') || e.target.closest('.contact-delete-icon') || e.target.closest('.contact-email-icon')) {
+                        // Don't select contact if clicking on delete icon or email icon
+                        if (e.target.closest('.contact-delete-icon') || e.target.closest('.contact-email-icon')) {
                             return;
                         }
                         this.selectContact(contact);
@@ -492,43 +600,29 @@ class ContactsService {
                         }
                     }
                     
-                    // Add event listener for privacy toggle
-                    const toggleCheckbox = contactElement.querySelector(`#privacy-toggle-list-${contact.pubkey} input[type="checkbox"]`);
-                    const toggleWrapper = contactElement.querySelector('.privacy-toggle-wrapper');
-                    if (toggleCheckbox && toggleWrapper) {
-                        toggleCheckbox.addEventListener('change', (e) => {
-                            e.stopPropagation();
-                            const newIsPublic = e.target.checked;
-                            
-                            // Update icon immediately for visual feedback
-                            const iconElement = toggleWrapper.querySelector('.privacy-toggle-icon');
-                            if (iconElement) {
-                                if (newIsPublic) {
-                                    iconElement.className = 'fas fa-globe privacy-toggle-icon';
-                                    iconElement.title = 'Public follow - visible in your public follow list';
-                                    toggleWrapper.title = 'Public follow - visible in your public follow list. Click to make private.';
-                                } else {
-                                    iconElement.className = 'fas fa-lock privacy-toggle-icon';
-                                    iconElement.title = 'Private follow - not in your public follow list';
-                                    toggleWrapper.title = 'Private follow - not in your public follow list. Click to make public.';
-                                }
-                            }
-                            
-                            this.toggleContactPrivacy(contact.pubkey, newIsPublic, e.target);
-                        });
-                    }
-                    
-                    contactsList.appendChild(contactElement);
+                    contentDiv.appendChild(contactElement);
                 });
             } else {
-                const message = searchQuery 
-                    ? `No contacts found matching "${searchQuery}"`
-                    : 'You are not following anyone yet, or contacts could not be loaded.';
-                contactsList.innerHTML = `<div class="text-muted text-center">${message}</div>`;
+                // Show message if section is empty
+                const emptyMessage = searchQuery 
+                    ? `No ${sectionLabel.toLowerCase()} found matching "${searchQuery}"`
+                    : `No ${sectionLabel.toLowerCase()} yet`;
+                contentDiv.innerHTML = `<div class="text-muted text-center section-empty-message">${emptyMessage}</div>`;
             }
-        } catch (error) {
-            console.error('Error rendering contacts:', error);
-        }
+            
+            // Assemble section
+            sectionDiv.appendChild(headerDiv);
+            sectionDiv.appendChild(contentDiv);
+            container.appendChild(sectionDiv);
+    }
+
+    // Toggle section expand/collapse
+    toggleSection(sectionType) {
+        this.sectionStates[sectionType] = !this.sectionStates[sectionType];
+        // Preserve current search query when re-rendering
+        const searchInput = window.domManager.get('contactsSearch');
+        const searchQuery = searchInput ? searchInput.value.trim() : '';
+        this.renderContacts(searchQuery);
     }
 
     // Select a contact
@@ -732,9 +826,6 @@ class ContactsService {
         const contactsDetail = window.domManager.get('contactsDetail');
         if (!contactsDetail) return;
         
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:721',message:'renderContactDetail called',data:{pubkey:contact?.pubkey?.substring(0,20),hasFields:!!contact?.fields,fieldsKeys:contact?.fields?Object.keys(contact.fields).join(','):'none',hasName:!!contact?.name,hasEmail:!!contact?.email},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-        // #endregion
         try {
             const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
             
@@ -1045,23 +1136,54 @@ class ContactsService {
                     (decodedText, decodedResult) => {
                         console.log('[QR] QR code scanned:', decodedText);
                         
-                        // Validate the scanned text is a public key
-                        const scannedKey = decodedText.trim();
-                        if (!scannedKey.startsWith('npub1')) {
-                            const errorDiv = document.getElementById('qr-scanner-error');
-                            if (errorDiv) {
-                                errorDiv.style.display = 'block';
-                                errorDiv.textContent = 'Invalid QR code: Not a valid public key format (should start with npub1)';
-                            }
-                            return;
-                        }
-                        
-                        // Stop scanning
+                        // Stop scanning immediately to prevent multiple scans
                         cleanup();
                         
-                        // Restore the add contact form with the scanned key
-                        // This will replace the scanner view with the form, populated with the scanned key
-                        this.showAddContactModal(scannedKey);
+                        // Handle async decode in a separate async function
+                        // Capture 'this' context to ensure it's available in the async IIFE
+                        const self = this;
+                        (async () => {
+                            try {
+                                // Decode the scanned identifier (handles nostr: prefix, nprofile1, npub1, etc.)
+                                const scannedKey = decodedText.trim();
+                                console.log('[QR] Calling decodeNostrIdentifier with:', scannedKey);
+                                
+                                if (!window.TauriService || !window.TauriService.decodeNostrIdentifier) {
+                                    throw new Error('TauriService.decodeNostrIdentifier is not available');
+                                }
+                                
+                                const decodedPubkey = await window.TauriService.decodeNostrIdentifier(scannedKey);
+                                console.log('[QR] Successfully decoded to:', decodedPubkey);
+                                
+                                // Restore the add contact form with the decoded pubkey
+                                if (!self || typeof self.showAddContactModal !== 'function') {
+                                    throw new Error('showAddContactModal is not available');
+                                }
+                                self.showAddContactModal(decodedPubkey);
+                            } catch (error) {
+                                console.error('[QR] Failed to decode identifier:', error);
+                                // Tauri errors can be strings or Error objects
+                                let errorMessage = 'Not a valid Nostr identifier';
+                                if (typeof error === 'string') {
+                                    errorMessage = error;
+                                } else if (error?.message) {
+                                    errorMessage = error.message;
+                                } else if (error?.toString) {
+                                    errorMessage = error.toString();
+                                }
+                                
+                                // Show error in modal or restore form
+                                const errorDiv = document.getElementById('qr-scanner-error');
+                                if (errorDiv) {
+                                    errorDiv.style.display = 'block';
+                                    errorDiv.textContent = `Invalid QR code: ${errorMessage}`;
+                                } else {
+                                    // If error div doesn't exist, restore the form and show notification
+                                    window.notificationService.showError(`Failed to decode QR code: ${errorMessage}`);
+                                    this.showAddContactModal();
+                                }
+                            }
+                        })();
                     },
                     (errorMessage) => {
                         // Ignore scanning errors (they're frequent during scanning)
@@ -1126,44 +1248,86 @@ class ContactsService {
     async addContact(event) {
         event.preventDefault();
         
+        const submitButton = event.target.querySelector('button[type="submit"]');
+        const pubkeyInput = document.getElementById('contact-pubkey');
+        const scanBtn = document.getElementById('scan-qr-btn');
+        const formHelp = document.querySelector('.add-contact-form .form-help');
+        
         try {
-            const pubkey = document.getElementById('contact-pubkey')?.value || '';
+            let pubkey = pubkeyInput?.value || '';
             
-            // Validate public key
+            // Decode/validate Nostr identifier (handles nostr: prefix, nprofile1, npub1, hex, etc.)
             try {
-                if (!pubkey.startsWith('npub1') && !pubkey.startsWith('nsec1')) {
-                    window.notificationService.showError('Invalid public key format. Must start with npub1 or nsec1');
-                    return;
+                pubkey = await window.TauriService.decodeNostrIdentifier(pubkey);
+                // Update the input with the decoded npub
+                if (pubkeyInput) {
+                    pubkeyInput.value = pubkey;
                 }
             } catch (e) {
-                window.notificationService.showError('Invalid public key format');
+                // Tauri errors can be strings or Error objects
+                let errorMsg = 'Invalid Nostr identifier';
+                if (typeof e === 'string') {
+                    errorMsg = e;
+                } else if (e?.message) {
+                    errorMsg = e.message;
+                } else if (e?.toString) {
+                    errorMsg = e.toString();
+                }
+                console.error('[ContactsService] Failed to decode identifier:', e);
+                window.notificationService.showError(`Invalid Nostr identifier: ${errorMsg}`);
                 return;
             }
             
-            // Show loading notification
-            window.notificationService.showInfo('Fetching profile...');
-            
-            // Close the modal
-            window.app.hideModal();
+            // Show loading state
+            if (submitButton) {
+                submitButton.disabled = true;
+                submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Fetching Profile...';
+            }
+            if (pubkeyInput) {
+                pubkeyInput.disabled = true;
+            }
+            if (scanBtn) {
+                scanBtn.disabled = true;
+            }
+            if (formHelp) {
+                formHelp.textContent = 'Fetching profile from relays...';
+                formHelp.style.color = 'var(--primary-color, #007bff)';
+            }
             
             // Fetch the profile
             try {
                 const activeRelays = window.appState.getActiveRelays();
                 if (activeRelays.length === 0) {
                     window.notificationService.showError('No active relays to fetch profile');
+                    // Reset loading state
+                    if (submitButton) {
+                        submitButton.disabled = false;
+                        submitButton.innerHTML = '<i class="fas fa-search"></i> Fetch Profile';
+                    }
+                    if (pubkeyInput) pubkeyInput.disabled = false;
+                    if (scanBtn) scanBtn.disabled = false;
+                    if (formHelp) {
+                        formHelp.textContent = 'Enter a Nostr public key (npub) to fetch their profile';
+                        formHelp.style.color = '';
+                    }
                     return;
                 }
                 
                 console.log('Fetching profile for:', pubkey);
                 const profile = await window.TauriService.fetchProfilePersistent(pubkey);
                 
+                // Close the modal
+                window.app.hideModal();
+                
                 if (profile) {
                     // Switch to contacts tab
                     window.app.switchTab('contacts');
-                    // Wait a bit for the tab to switch
+                    // Wait for contacts to load and render before showing profile detail
+                    await this.loadContacts();
+                    // Wait a bit more for the UI to settle
                     await new Promise(resolve => setTimeout(resolve, 100));
                     // Show profile for adding with follow button
-                    this.showProfileForAdding(pubkey, profile);
+                    await this.showProfileForAdding(pubkey, profile);
                     
                     // Show notification that profile was fetched
                     window.notificationService.showSuccess('Profile fetched successfully');
@@ -1182,6 +1346,17 @@ class ContactsService {
         } catch (error) {
             console.error('Error adding contact:', error);
             window.notificationService.showError('Failed to add contact');
+            // Reset loading state on error
+            if (submitButton) {
+                submitButton.disabled = false;
+                submitButton.innerHTML = '<i class="fas fa-search"></i> Fetch Profile';
+            }
+            if (pubkeyInput) pubkeyInput.disabled = false;
+            if (scanBtn) scanBtn.disabled = false;
+            if (formHelp) {
+                formHelp.textContent = 'Enter a Nostr public key (npub) to fetch their profile';
+                formHelp.style.color = '';
+            }
         }
     }
 
@@ -1199,13 +1374,24 @@ class ContactsService {
     }
 
     // Show profile for adding (not following yet)
-    showProfileForAdding(pubkey, profile) {
+    async showProfileForAdding(pubkey, profile) {
         const contactsContainer = document.querySelector('.contacts-container');
-        const contactsDetail = window.domManager.get('contactsDetail');
+        let contactsDetail = window.domManager.get('contactsDetail');
         const backButton = document.getElementById('contacts-back-btn');
         
+        // Wait for detail element to be available (in case contacts are still loading)
+        if (!contactsDetail) {
+            console.log('[JS] Waiting for contacts detail element to be available...');
+            for (let i = 0; i < 10; i++) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+                contactsDetail = window.domManager.get('contactsDetail');
+                if (contactsDetail) break;
+            }
+        }
+        
         if (!contactsContainer || !contactsDetail) {
-            console.warn('[JS] Contacts container or detail element not found');
+            console.warn('[JS] Contacts container or detail element not found after waiting');
+            window.notificationService.showError('Failed to show profile detail. Please try again.');
             return;
         }
         
@@ -1343,7 +1529,7 @@ class ContactsService {
                     const isPublic = contactExists 
                         ? (followCheckbox?.checked ?? privacyToggle?.checked ?? true)
                         : (privacyToggle?.checked ?? true); // For new contacts, use privacy toggle
-                    this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '', isPublic);
+                    this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '', isPublic, followBtn);
                 });
                 
                 followSection.appendChild(followBtn);
@@ -1477,7 +1663,7 @@ class ContactsService {
                                 const isPublic = contactExists 
                                     ? (followCheckbox?.checked ?? privacyToggle?.checked ?? true)
                                     : (privacyToggle?.checked ?? true); // For new contacts, use privacy toggle
-                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '', isPublic);
+                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '', isPublic, followBtn2);
                             });
                             
                             followSection2.appendChild(followBtn2);
@@ -1604,7 +1790,7 @@ class ContactsService {
                                 const isPublic = contactExists 
                                     ? (followCheckbox?.checked ?? privacyToggle?.checked ?? true)
                                     : (privacyToggle?.checked ?? true); // For new contacts, use privacy toggle
-                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '', isPublic);
+                                this.confirmFollowContact(pubkey, profile, profileName, profile.fields.email || '', isPublic, followBtn2);
                             });
                             
                             followSection2.appendChild(followBtn2);
@@ -1738,11 +1924,10 @@ class ContactsService {
 
     // Refresh contacts from network (called by refresh button)
     async refreshContacts() {
-        // #region agent log
-        const startTime = Date.now();
-        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1727',message:'refreshContacts started',data:{timestamp:Date.now()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-        // #endregion
+        const startTime = performance.now();
         console.log('[JS] refreshContacts called - fetching fresh data from network...');
+        console.log('[DEBUG] refreshContacts entry', {timestamp: Date.now()});
+        
         if (!window.appState.hasKeypair()) {
             return;
         }
@@ -1764,79 +1949,101 @@ class ContactsService {
                     <span>Fetching follow list...</span>
                 </div>
             `;
-            // #region agent log
-            const fetchFollowListStart = Date.now();
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1750',message:'fetchFollowingPubkeysPersistent start',data:{timestamp:Date.now()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-            // #endregion
-            const followedPubkeys = await window.TauriService.fetchFollowingPubkeysPersistent(
-                window.appState.getKeypair().public_key
-            );
-            // #region agent log
-            const fetchFollowListDuration = Date.now() - fetchFollowListStart;
-            fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1753',message:'fetchFollowingPubkeysPersistent end',data:{duration:fetchFollowListDuration,count:followedPubkeys?.length||0},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-            // #endregion
-            console.log('[JS] Fetched followed npubs using persistent client:', followedPubkeys);
+            let followListResult = null;
+            let fetchSucceeded = false;
+            const fetchFollowListStart = performance.now();
+            try {
+                followListResult = await window.TauriService.fetchFollowingPubkeysPersistent(
+                    window.appState.getKeypair().public_key
+                );
+                fetchSucceeded = true; // Mark that fetch completed successfully
+                console.log('[JS] Fetched follow list result using persistent client:', followListResult);
+            } catch (error) {
+                console.error('[JS] Error fetching followed pubkeys from relays:', error);
+                // If fetch fails, we'll fall back to loading from database
+                // This handles cases like: client not initialized, network errors, etc.
+                followListResult = null;
+                fetchSucceeded = false; // Mark that fetch failed
+            }
             
             const userPubkey = window.appState.getKeypair().public_key;
             
-            // Handle case where no follows found on network
-            if (!followedPubkeys || followedPubkeys.length === 0) {
-                // Get existing public contacts from DB
-                const existingPublicPubkeys = await window.__TAURI__.core.invoke('db_get_public_contact_pubkeys', {
-                    userPubkey: userPubkey
-                });
-                // If there were public contacts but now none, convert them all to private
-                if (existingPublicPubkeys.length > 0) {
-                    console.log('[JS] No follows found on network, converting all public contacts to private');
-                    for (const pubkey of existingPublicPubkeys) {
-                        await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
-                            userPubkey: userPubkey,
-                            contactPubkey: pubkey,
-                            isPublic: false
-                        });
-                    }
-                    const localContacts = await window.DatabaseService.getAllContacts(userPubkey);
-                    window.appState.setContacts(localContacts);
-                    this.renderContacts();
-                    window.notificationService.hideLoading(loadingNotification);
-                    window.notificationService.showInfo(`No follows found on network. ${existingPublicPubkeys.length} contacts converted to private.`);
+            // Handle case where no kind 3 event found on any relay
+            // If no event is found, abort sync to preserve existing DB state
+            // This prevents accidental changes when relays are misconfigured
+            // Note: event_found=false means no event found, event_found=true with empty pubkeys means valid empty list
+            if (!fetchSucceeded || !followListResult || !followListResult.event_found) {
+                console.log('[JS] No kind 3 event found on any relay - aborting sync to preserve existing contacts');
+                window.notificationService.hideLoading(loadingNotification);
+                if (!fetchSucceeded) {
+                    window.notificationService.showError('Could not fetch follow list from relays. Your contacts were not updated. Please check your relay configuration.');
                 } else {
-                    window.notificationService.hideLoading(loadingNotification);
-                    window.notificationService.showInfo('No follows found on the network');
+                    window.notificationService.showError('No follow list found on relays. Your contacts were not updated. Please check your relay configuration.');
                 }
                 return;
             }
             
-            // 2. Get existing public contacts from DB
-            const existingPublicPubkeys = await window.__TAURI__.core.invoke('db_get_public_contact_pubkeys', {
-                userPubkey: userPubkey
-            });
-            console.log('[JS] Existing public contacts in DB:', existingPublicPubkeys.length);
+            // Extract pubkeys from the result (could be empty array if event has 0 tags - that's valid)
+            const followedPubkeys = followListResult.pubkeys || [];
+            console.log('[JS] Follow list event found (event_id: ' + (followListResult.event_id || 'unknown') + '), pubkeys: ' + followedPubkeys.length);
             
-            // 3. Find contacts that were publicly followed but are no longer in the follow list
+            // 2. Get all contacts from DB to sync is_public status with published list
+            const getAllContacts1Start = performance.now();
+            const dbAllContacts = await window.DatabaseService.getAllContacts(userPubkey);
             const followedPubkeysSet = new Set(followedPubkeys);
-            const unfollowedPubkeys = existingPublicPubkeys.filter(pubkey => !followedPubkeysSet.has(pubkey));
             
-            if (unfollowedPubkeys.length > 0) {
-                console.log('[JS] Detected unfollowed contacts (no longer in public follow list):', unfollowedPubkeys);
-                // Convert public follows to private (preserve contact data but mark as private)
-                // #region agent log
-                const unfollowStart = Date.now();
-                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1798',message:'unfollowUpdates start',data:{count:unfollowedPubkeys.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-                // #endregion
-                for (const pubkey of unfollowedPubkeys) {
-                    await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
-                        userPubkey: userPubkey,
-                        contactPubkey: pubkey,
-                        isPublic: false
-                    });
+            // 3. Update is_public status for all contacts based on published kind 3 list
+            // Contacts in published list → is_public=true, contacts not in list → is_public=false
+            const contactsToUpdate = [];
+            for (const dbContact of dbAllContacts) {
+                const shouldBePublic = followedPubkeysSet.has(dbContact.pubkey);
+                const currentlyPublic = dbContact.is_public !== undefined ? dbContact.is_public : true;
+                
+                // Only update if status needs to change
+                if (shouldBePublic !== currentlyPublic) {
+                    contactsToUpdate.push({ pubkey: dbContact.pubkey, isPublic: shouldBePublic });
                 }
-                // #region agent log
-                const unfollowDuration = Date.now() - unfollowStart;
-                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1805',message:'unfollowUpdates end',data:{duration:unfollowDuration,count:unfollowedPubkeys.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-                // #endregion
-                console.log(`[JS] Converted ${unfollowedPubkeys.length} public contacts to private`);
             }
+            
+            // Update all contacts that need status changes (batch operation for performance)
+            if (contactsToUpdate.length > 0) {
+                console.log(`[JS] Batch updating is_public status for ${contactsToUpdate.length} contacts based on published follow list`);
+                const batchUpdateStart = performance.now();
+                try {
+                    // Convert to array of [pubkey, isPublic] tuples for batch update
+                    const batchUpdates = contactsToUpdate.map(({ pubkey, isPublic }) => [pubkey, isPublic]);
+                    await window.__TAURI__.core.invoke('db_batch_update_user_contact_public_status', {
+                        userPubkey: userPubkey,
+                        updates: batchUpdates
+                    });
+                    console.log(`[JS] Successfully batch updated is_public status for ${contactsToUpdate.length} contacts`);
+                } catch (error) {
+                    console.error(`[JS] Failed to batch update is_public status:`, error);
+                    // Fallback to individual updates if batch fails
+                    console.log(`[JS] Falling back to individual updates...`);
+                    const failedUpdates = [];
+                    for (const { pubkey, isPublic } of contactsToUpdate) {
+                        try {
+                            await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                                userPubkey: userPubkey,
+                                contactPubkey: pubkey,
+                                isPublic: isPublic
+                            });
+                        } catch (err) {
+                            console.error(`[JS] Failed to update is_public status for contact ${pubkey}:`, err);
+                            failedUpdates.push(pubkey);
+                        }
+                    }
+                    if (failedUpdates.length > 0) {
+                        console.warn(`[JS] Failed to update is_public status for ${failedUpdates.length} contacts:`, failedUpdates);
+                    }
+                }
+            }
+            
+            const existingPublicPubkeys = dbAllContacts
+                .filter(c => c.is_public !== undefined ? c.is_public : true)
+                .map(c => c.pubkey);
+            const unfollowedPubkeys = existingPublicPubkeys.filter(pubkey => !followedPubkeysSet.has(pubkey));
             
             // 4. Filter out npubs already in the DB for this user
             loadingNotification.innerHTML = `
@@ -1845,6 +2052,7 @@ class ContactsService {
                     <span>Checking for new contacts...</span>
                 </div>
             `;
+            const filterNewContactsStart = performance.now();
             const newPubkeys = await window.TauriService.filterNewContacts(userPubkey, followedPubkeys);
             console.log('[JS] New npubs not in DB:', newPubkeys);
             
@@ -1871,35 +2079,52 @@ class ContactsService {
                     updated_at: new Date().toISOString()
                 }));
                 
-                // Save minimal contacts to DB immediately (is_public=true for public follows)
-                // #region agent log
-                const saveMinimalStart = Date.now();
-                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1842',message:'saveMinimalContacts start',data:{count:minimalContacts.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-                // #endregion
-                for (const contact of minimalContacts) {
-                    // #region agent log
-                    const saveOneStart = Date.now();
-                    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1844',message:'saveContact start',data:{pubkey:contact.pubkey.substring(0,20)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-                    // #endregion
-                    const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
-                    await window.DatabaseService.saveContact(dbContact, userPubkey, true);
-                    // #region agent log
-                    const saveOneDuration = Date.now() - saveOneStart;
-                    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1846',message:'saveContact end',data:{duration:saveOneDuration},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-                    // #endregion
+                // Save minimal contacts to DB immediately using batch operation (is_public=true for public follows)
+                const batchSaveStart = performance.now();
+                try {
+                    const dbContacts = minimalContacts.map(contact => 
+                        window.DatabaseService.convertContactToDbFormat(contact)
+                    );
+                    await window.__TAURI__.core.invoke('db_batch_save_contacts', {
+                        userPubkey: userPubkey,
+                        contacts: dbContacts,
+                        isPublic: true
+                    });
+                    console.log(`[JS] Batch saved ${minimalContacts.length} minimal contacts to DB`);
+                } catch (error) {
+                    console.error(`[JS] Batch save failed, falling back to individual saves:`, error);
+                    // Fallback to individual saves if batch fails
+                    const failedSaves = [];
+                    for (const contact of minimalContacts) {
+                        try {
+                            const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
+                            await window.DatabaseService.saveContact(dbContact, userPubkey, true);
+                        } catch (err) {
+                            console.error(`[JS] Failed to save minimal contact ${contact.pubkey}:`, err);
+                            failedSaves.push(contact.pubkey);
+                        }
+                    }
+                    const savedCount = minimalContacts.length - failedSaves.length;
+                    console.log(`[JS] Saved ${savedCount}/${minimalContacts.length} minimal contacts to DB`);
+                    if (failedSaves.length > 0) {
+                        console.warn(`[JS] Failed to save ${failedSaves.length} contacts:`, failedSaves);
+                    }
                 }
-                // #region agent log
-                const saveMinimalDuration = Date.now() - saveMinimalStart;
-                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1847',message:'saveMinimalContacts end',data:{duration:saveMinimalDuration,count:minimalContacts.length,avgPerContact:saveMinimalDuration/minimalContacts.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-                // #endregion
-                console.log(`[JS] Saved ${minimalContacts.length} minimal contacts to DB`);
                 
                 // Get all local contacts (including the newly added minimal ones)
+                const getAllContacts2Start = performance.now();
                 const dbContacts = await window.DatabaseService.getAllContacts(userPubkey);
-                const localContacts = dbContacts.map(dbContact => this.reconstructContactFields(dbContact));
+                // Sync is_public status with current relay state (followedPubkeysSet is defined above)
+                const localContacts = dbContacts.map(dbContact => {
+                    const reconstructed = this.reconstructContactFields(dbContact);
+                    // Set is_public based on whether contact is in the public follow list from relays
+                    reconstructed.is_public = followedPubkeysSet.has(dbContact.pubkey);
+                    return reconstructed;
+                });
                 
                 // Update UI immediately so users see contacts right away
                 window.appState.setContacts(localContacts);
+                const renderContacts1Start = performance.now();
                 this.renderContacts();
                 
                 // Set up lazy image loading
@@ -1915,15 +2140,8 @@ class ContactsService {
                     </div>
                 `;
                 console.log(`[JS] Calling fetchProfilesPersistent for ${newPubkeys.length} pubkeys...`);
-                // #region agent log
-                const fetchProfilesStart = Date.now();
-                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1868',message:'fetchProfilesPersistent start',data:{count:newPubkeys.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-                // #endregion
+                const fetchProfilesStart = performance.now();
                 const newProfiles = await window.TauriService.fetchProfilesPersistent(newPubkeys);
-                // #region agent log
-                const fetchProfilesDuration = Date.now() - fetchProfilesStart;
-                fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1869',message:'fetchProfilesPersistent end',data:{duration:fetchProfilesDuration,count:newProfiles?.length||0},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-                // #endregion
                 console.log(`[JS] Fetched new profiles using persistent client: ${newProfiles ? newProfiles.length : 0} profiles`);
                 
                 // 7. Update contacts with profile data incrementally
@@ -1935,38 +2153,57 @@ class ContactsService {
                         </div>
                     `;
                     
-                    // Update contacts with profile data (saveContact does UPSERT, so it will update existing contacts)
-                    // #region agent log
-                    const updateProfilesStart = Date.now();
-                    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1881',message:'updateProfiles start',data:{count:newProfiles.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-                    // #endregion
-                    for (const profile of newProfiles) {
-                        // #region agent log
-                        const updateOneStart = Date.now();
-                        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1883',message:'updateContact start',data:{pubkey:profile.pubkey.substring(0,20)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-                        // #endregion
-                        const updatedContact = {
-                            pubkey: profile.pubkey,
-                            name: profile.fields.name || profile.fields.display_name || profile.pubkey.substring(0, 16) + '...',
-                            picture: profile.fields.picture || '',
-                            email: profile.fields.email || null,
-                            fields: profile.fields || {},
-                            picture_data_url: null,
-                            picture_loading: false,
-                            picture_loaded: false,
-                            updated_at: new Date().toISOString()
-                        };
-                        const dbContact = window.DatabaseService.convertContactToDbFormat(updatedContact);
-                        await window.DatabaseService.saveContact(dbContact, userPubkey, true);
-                        // #region agent log
-                        const updateOneDuration = Date.now() - updateOneStart;
-                        fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1895',message:'updateContact end',data:{duration:updateOneDuration},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-                        // #endregion
+                    // Update contacts with profile data using batch operation (much faster)
+                    const batchUpdateProfilesStart = performance.now();
+                    try {
+                        const updatedContacts = newProfiles.map(profile => {
+                            const updatedContact = {
+                                pubkey: profile.pubkey,
+                                name: profile.fields.name || profile.fields.display_name || profile.pubkey.substring(0, 16) + '...',
+                                picture: profile.fields.picture || '',
+                                email: profile.fields.email || null,
+                                fields: profile.fields || {},
+                                picture_data_url: null,
+                                picture_loading: false,
+                                picture_loaded: false,
+                                updated_at: new Date().toISOString()
+                            };
+                            return window.DatabaseService.convertContactToDbFormat(updatedContact);
+                        });
+                        await window.__TAURI__.core.invoke('db_batch_save_contacts', {
+                            userPubkey: userPubkey,
+                            contacts: updatedContacts,
+                            isPublic: true
+                        });
+                        console.log(`[JS] Batch updated ${newProfiles.length} contact profiles`);
+                    } catch (error) {
+                        console.error(`[JS] Batch profile update failed, falling back to individual updates:`, error);
+                        // Fallback to individual updates if batch fails
+                        const failedProfileUpdates = [];
+                        for (const profile of newProfiles) {
+                            try {
+                                const updatedContact = {
+                                    pubkey: profile.pubkey,
+                                    name: profile.fields.name || profile.fields.display_name || profile.pubkey.substring(0, 16) + '...',
+                                    picture: profile.fields.picture || '',
+                                    email: profile.fields.email || null,
+                                    fields: profile.fields || {},
+                                    picture_data_url: null,
+                                    picture_loading: false,
+                                    picture_loaded: false,
+                                    updated_at: new Date().toISOString()
+                                };
+                                const dbContact = window.DatabaseService.convertContactToDbFormat(updatedContact);
+                                await window.DatabaseService.saveContact(dbContact, userPubkey, true);
+                            } catch (err) {
+                                console.error(`[JS] Failed to update contact profile for ${profile.pubkey}:`, err);
+                                failedProfileUpdates.push(profile.pubkey);
+                            }
+                        }
+                        if (failedProfileUpdates.length > 0) {
+                            console.warn(`[JS] Failed to update ${failedProfileUpdates.length} contact profiles:`, failedProfileUpdates);
+                        }
                     }
-                    // #region agent log
-                    const updateProfilesDuration = Date.now() - updateProfilesStart;
-                    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1896',message:'updateProfiles end',data:{duration:updateProfilesDuration,count:newProfiles.length,avgPerContact:updateProfilesDuration/newProfiles.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-                    // #endregion
                     
                     // Get current contacts from appState to preserve full fields data
                     const currentContacts = window.appState.getContacts();
@@ -1986,7 +2223,8 @@ class ContactsService {
                             picture_loading: false,
                             picture_loaded: !!existingContact?.picture_data_url,
                             updated_at: new Date().toISOString(),
-                            is_public: existingContact?.is_public !== undefined ? existingContact.is_public : true
+                            // Sync is_public with current relay state (followedPubkeysSet is defined above)
+                            is_public: followedPubkeysSet.has(profile.pubkey)
                         };
                         updatedContactsInMemory.push(updatedContact);
                     }
@@ -1998,6 +2236,7 @@ class ContactsService {
                     
                     // Update appState with contacts that have full fields data preserved (don't reload from DB)
                     window.appState.setContacts(allUpdatedContacts);
+                    const renderContacts2Start = performance.now();
                     this.renderContacts();
                     
                     // Refresh compose dropdown to include new contacts
@@ -2005,10 +2244,6 @@ class ContactsService {
                         window.emailService.populateNostrContactDropdown();
                     }
                     
-                    // #region agent log
-                    const totalDuration = Date.now() - startTime;
-                    fetch('http://127.0.0.1:7242/ingest/b8f7161b-abb4-4d62-b1ad-efed0c555360',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'contacts-service.js:1907',message:'refreshContacts completed',data:{totalDuration:totalDuration},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-                    // #endregion
                     window.notificationService.hideLoading(loadingNotification);
                     const message = unfollowedPubkeys.length > 0 
                         ? `Added ${newProfiles.length} new contacts. ${unfollowedPubkeys.length} contacts converted to private.`
@@ -2025,8 +2260,15 @@ class ContactsService {
             } else {
                 // No new contacts, handle re-follows and re-render
                 // Get all local contacts for this user (before checking re-follows)
+                const getAllContacts3Start = performance.now();
                 const dbAllContacts = await window.DatabaseService.getAllContacts(userPubkey);
-                const allContacts = dbAllContacts.map(dbContact => this.reconstructContactFields(dbContact));
+                // Sync is_public status with current relay state (followedPubkeysSet is defined above)
+                const allContacts = dbAllContacts.map(dbContact => {
+                    const reconstructed = this.reconstructContactFields(dbContact);
+                    // Set is_public based on whether contact is in the public follow list from relays
+                    reconstructed.is_public = followedPubkeysSet.has(dbContact.pubkey);
+                    return reconstructed;
+                });
                 const allContactPubkeys = new Set(allContacts.map(c => c.pubkey));
                 
                 // Update is_public for contacts that are back in the follow list (were private, now public again)
@@ -2036,18 +2278,34 @@ class ContactsService {
                 });
                 if (reFollowedPubkeys.length > 0) {
                     console.log('[JS] Contacts re-added to public follow list:', reFollowedPubkeys);
+                    const failedReFollows = [];
                     for (const pubkey of reFollowedPubkeys) {
-                        await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
-                            userPubkey: userPubkey,
-                            contactPubkey: pubkey,
-                            isPublic: true
-                        });
+                        try {
+                            await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
+                                userPubkey: userPubkey,
+                                contactPubkey: pubkey,
+                                isPublic: true
+                            });
+                        } catch (error) {
+                            console.error(`[JS] Failed to update re-followed contact ${pubkey}:`, error);
+                            failedReFollows.push(pubkey);
+                        }
+                    }
+                    if (failedReFollows.length > 0) {
+                        console.warn(`[JS] Failed to update ${failedReFollows.length} re-followed contacts:`, failedReFollows);
                     }
                 }
                 
                 // Get all local contacts for this user (after updates)
+                const getAllContacts4Start = performance.now();
                 const dbLocalContacts = await window.DatabaseService.getAllContacts(userPubkey);
-                const localContacts = dbLocalContacts.map(dbContact => this.reconstructContactFields(dbContact));
+                // Sync is_public status with current relay state (followedPubkeysSet is defined above)
+                const localContacts = dbLocalContacts.map(dbContact => {
+                    const reconstructed = this.reconstructContactFields(dbContact);
+                    // Set is_public based on whether contact is in the public follow list from relays
+                    reconstructed.is_public = followedPubkeysSet.has(dbContact.pubkey);
+                    return reconstructed;
+                });
                 window.appState.setContacts(localContacts);
                 this.renderContacts();
                 
@@ -2067,24 +2325,53 @@ class ContactsService {
         }
     }
 
-    async confirmFollowContact(pubkey, profile, profileName, email, isPublic = true) {
+    async confirmFollowContact(pubkey, profile, profileName, email, isPublic = true, buttonElement = null) {
+        // Store original button state for restoration
+        let originalButtonHTML = null;
+        let originalButtonDisabled = false;
+        
+        // On mobile, ensure we're showing the contacts detail view before showing confirmation
+        // This prevents the modal from appearing on the navigation page
+        if (window.app && window.app.isMobilePortrait && window.app.isMobilePortrait()) {
+            const contactsContainer = document.querySelector('.contacts-container');
+            if (contactsContainer && !contactsContainer.classList.contains('contacts-detail-view')) {
+                // Ensure detail view is active
+                contactsContainer.classList.remove('contacts-list-view');
+                contactsContainer.classList.add('contacts-detail-view');
+            }
+            // Ensure contacts tab is active
+            window.app.switchTab('contacts');
+            // Wait a moment for the view to settle
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        
         // Show a confirmation dialog
         const followType = isPublic ? 'publicly' : 'privately';
         const confirmed = await window.notificationService.showConfirmation(
             `Do you want to ${followType} follow nostr user ${pubkey}?`,
             'Confirm Follow'
         );
-        if (!confirmed) return;
+        if (!confirmed) {
+            return;
+        }
+        
+        // Set loading state on button after confirmation
+        if (buttonElement) {
+            originalButtonHTML = buttonElement.innerHTML;
+            originalButtonDisabled = buttonElement.disabled;
+            buttonElement.disabled = true;
+            buttonElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Adding Contact...';
+        }
 
         try {
-            // Get your private key and relays
+            // Get your private key
             const privateKey = window.appState.getKeypair().private_key;
-            const relays = window.appState.getActiveRelays();
             const userPubkey = window.appState.getKeypair().public_key;
 
             // Only call backend to follow the user on Nostr if it's a public follow
+            // Uses persistent client (no relays parameter needed)
             if (isPublic) {
-                await window.TauriService.followUser(privateKey, pubkey, relays);
+                await window.TauriService.followUser(privateKey, pubkey);
             }
 
             // Save the contact locally with the appropriate is_public flag
@@ -2102,19 +2389,56 @@ class ContactsService {
                 updated_at: now
             };
             const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
-            await window.DatabaseService.saveContact(dbContact, userPubkey, isPublic);
+            try {
+                await window.DatabaseService.saveContact(dbContact, userPubkey, isPublic);
+            } catch (error) {
+                console.error('[JS] Failed to save contact to database:', error);
+                if (buttonElement) {
+                    buttonElement.disabled = originalButtonDisabled;
+                    buttonElement.innerHTML = originalButtonHTML;
+                }
+                window.notificationService.showError('Failed to save contact: ' + error);
+                return;
+            }
 
             // Update app state and UI
             window.appState.addContact(contact);
-            this.renderContacts();
+            
+            // Ensure we stay on the page - keep detail view active
+            const contactsContainer = document.querySelector('.contacts-container');
+            const isInDetailView = contactsContainer && contactsContainer.classList.contains('contacts-detail-view');
+            
+            if (isInDetailView) {
+                // Re-render the contact detail with updated info (now it's a saved contact)
+                this.renderContactDetail(contact);
+                // Update selected contact in app state
+                window.appState.setSelectedContact(contact);
+            } else {
+                // If not in detail view, just render contacts list
+                this.renderContacts();
+            }
+            
             // Refresh compose dropdown to include new contact
             if (window.emailService) {
                 window.emailService.populateNostrContactDropdown();
             }
             const followTypeMsg = isPublic ? 'publicly' : 'privately';
             window.notificationService.showSuccess(`You are now ${followTypeMsg} following ${profileName}!`);
+            
+            // Restore button state after successful completion
+            if (buttonElement && originalButtonHTML !== null) {
+                // Button will be removed/replaced by renderContactDetail, but restore just in case
+                buttonElement.disabled = originalButtonDisabled;
+                buttonElement.innerHTML = originalButtonHTML;
+            }
         } catch (error) {
             window.notificationService.showError('Failed to follow and add contact: ' + error);
+            
+            // Restore button state on error
+            if (buttonElement && originalButtonHTML !== null) {
+                buttonElement.disabled = originalButtonDisabled;
+                buttonElement.innerHTML = originalButtonHTML;
+            }
         }
     }
 
@@ -2163,10 +2487,15 @@ class ContactsService {
                     contacts[idx] = selectedContact;
                     window.appState.setContacts(contacts);
                     // Save updated contact to the database
-                    const userPubkey = window.appState.getKeypair().public_key;
-                    const dbContact = window.DatabaseService.convertContactToDbFormat(selectedContact);
-                    // Keep existing is_public status (default to true if updating)
-                    await window.DatabaseService.saveContact(dbContact, userPubkey, true);
+                    try {
+                        const userPubkey = window.appState.getKeypair().public_key;
+                        const dbContact = window.DatabaseService.convertContactToDbFormat(selectedContact);
+                        // Keep existing is_public status (default to true if updating)
+                        await window.DatabaseService.saveContact(dbContact, userPubkey, true);
+                    } catch (dbError) {
+                        console.error('[JS] Failed to save updated contact to database:', dbError);
+                        // Continue anyway - contact is updated in memory
+                    }
                 }
                 // Re-render the contact detail
                 this.renderContactDetail(selectedContact);
@@ -2185,15 +2514,30 @@ class ContactsService {
     // Update contact profile from live events
     updateContactProfile(pubkey, profileFields) {
         try {
+            // Get contacts from appState
+            const contacts = window.appState.getContacts() || [];
             // Find contact in current list
-            const contact = this.contacts.find(c => c.pubkey === pubkey);
-            if (contact) {
+            const contactIndex = contacts.findIndex(c => c.pubkey === pubkey);
+            if (contactIndex !== -1) {
+                const contact = contacts[contactIndex];
                 // Update contact fields
                 if (profileFields.name) contact.name = profileFields.name;
                 if (profileFields.display_name) contact.display_name = profileFields.display_name;
                 if (profileFields.about) contact.about = profileFields.about;
                 if (profileFields.picture) contact.picture = profileFields.picture;
                 if (profileFields.nip05) contact.nip05 = profileFields.nip05;
+                
+                // Also update fields object if it exists
+                if (contact.fields) {
+                    if (profileFields.name) contact.fields.name = profileFields.name;
+                    if (profileFields.display_name) contact.fields.display_name = profileFields.display_name;
+                    if (profileFields.about) contact.fields.about = profileFields.about;
+                    if (profileFields.picture) contact.fields.picture = profileFields.picture;
+                    if (profileFields.nip05) contact.fields.nip05 = profileFields.nip05;
+                }
+                
+                // Persist changes to appState
+                window.appState.setContacts(contacts);
                 
                 console.log('[ContactsService] Updated contact profile for', pubkey);
                 
@@ -2212,6 +2556,8 @@ class ContactsService {
                 if (window.emailService) {
                     window.emailService.populateNostrContactDropdown();
                 }
+            } else {
+                console.log('[ContactsService] Contact not found in contacts list:', pubkey);
             }
         } catch (error) {
             console.error('[ContactsService] Error updating contact profile:', error);
@@ -2259,6 +2605,7 @@ class ContactsService {
         this.renderContacts(searchQuery);
     }
 
+
     // Toggle contact privacy status
     async toggleContactPrivacy(contactPubkey, isPublic, checkboxElement) {
         try {
@@ -2270,7 +2617,13 @@ class ContactsService {
 
             const userPubkey = window.appState.getKeypair().public_key;
             const privateKey = window.appState.getKeypair().private_key;
-            const relays = window.appState.getActiveRelays();
+            const activeRelays = window.appState.getActiveRelays();
+            
+            if (activeRelays.length === 0) {
+                window.notificationService.showError('No active relays configured. Cannot publish follow list.');
+                if (checkboxElement) checkboxElement.checked = !isPublic;
+                return;
+            }
             
             // Update in database
             await window.__TAURI__.core.invoke('db_update_user_contact_public_status', {
@@ -2278,17 +2631,6 @@ class ContactsService {
                 contactPubkey: contactPubkey,
                 isPublic: isPublic
             });
-
-            // Publish the updated follow list to Nostr (always publish to keep it in sync)
-            try {
-                console.log('[JS] Publishing updated follow list to Nostr...');
-                await window.TauriService.publishFollowList(privateKey, userPubkey, relays);
-                console.log('[JS] Successfully published follow list');
-            } catch (publishError) {
-                console.error('[JS] Failed to publish follow list:', publishError);
-                // Don't fail the whole operation, but warn the user
-                window.notificationService.showWarning('Contact updated but failed to publish follow list: ' + publishError);
-            }
 
             // Update in app state
             const contacts = window.appState.getContacts();
@@ -2317,13 +2659,24 @@ class ContactsService {
                     }
                 }
                 
-                // Re-render the contacts list to update the privacy icon
+                // Re-render the contacts list
                 this.renderContacts();
-                
-                const message = isPublic 
-                    ? 'Contact is now public and follow list published' 
-                    : 'Contact is now private and follow list updated';
-                window.notificationService.showSuccess(message);
+            }
+            
+            // Automatically publish the updated follow list to relays
+            // This ensures that privacy changes are immediately reflected on relays
+            try {
+                // getActiveRelays() already returns an array of URLs (strings)
+                await window.TauriService.publishFollowList(privateKey, userPubkey, activeRelays);
+                console.log(`[JS] Successfully published follow list after ${isPublic ? 'making' : 'removing'} contact public`);
+            } catch (publishError) {
+                console.error('[JS] Error publishing follow list:', publishError);
+                // Don't fail the entire operation - the database update succeeded
+                // Just show a warning that the change is local only
+                window.notificationService.showWarning(
+                    `Contact privacy updated locally, but failed to publish to relays: ${publishError}. ` +
+                    'You may need to manually publish your follow list later.'
+                );
             }
         } catch (error) {
             console.error('Error toggling contact privacy:', error);
@@ -2332,6 +2685,7 @@ class ContactsService {
             if (checkboxElement) checkboxElement.checked = !isPublic;
         }
     }
+
 
     // Delete a private contact
     async deletePrivateContact(contact) {

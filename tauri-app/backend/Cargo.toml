@@ -1,6 +1,6 @@
 [package]
 name = "nostr-mail"
-version = "1.0.2-beta"
+version = "1.0.3-beta"
 description = "A simple email encryption tool based on secp256k1 key pairs"
 authors = ["Asher Pembroke"]
 edition = "2021"

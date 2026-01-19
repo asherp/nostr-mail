@@ -15,6 +15,38 @@ fn parse_pubkey(pubkey: &str) -> anyhow::Result<nostr_sdk::prelude::PublicKey> {
     }
 }
 
+/// Create and sign an AUTH event (kind 22242) for NIP-42 authentication
+/// 
+/// The AUTH event must include:
+/// - kind: 22242
+/// - tags: ["relay", "<relay-url>"] and ["challenge", "<challenge-string>"]
+/// - created_at: current timestamp
+/// - signed with the user's private key
+pub fn create_auth_event(
+    private_key: &str,
+    relay_url: &str,
+    challenge: &str,
+) -> Result<Event> {
+    // Parse private key from bech32 format
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let keys = Keys::new(secret_key);
+    
+    // Normalize relay URL (remove trailing slash if present)
+    let normalized_relay_url = relay_url.trim_end_matches('/');
+    
+    // Create AUTH event with kind 22242
+    let event = EventBuilder::new(
+        Kind::from(22242u16),
+        "", // AUTH events have empty content
+    )
+    .tag(Tag::parse(["relay", normalized_relay_url])?)
+    .tag(Tag::parse(["challenge", challenge])?)
+    .build(keys.public_key())
+    .sign_with_keys(&keys)?;
+    
+    Ok(event)
+}
+
 pub async fn publish_event(
     private_key: &str,
     content: &str,

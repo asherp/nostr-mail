@@ -539,8 +539,14 @@ fn should_clear_localstorage_cache() -> bool {
     match std::env::var("NOSTR_MAIL_CLEAR_CACHE") {
         Ok(val) => {
             println!("[RUST] NOSTR_MAIL_CLEAR_CACHE environment variable is set to: {}", val);
-            // Return true if the variable is set to "1", "true", "yes", or any non-empty value
-            val == "1" || val.to_lowercase() == "true" || val.to_lowercase() == "yes" || !val.is_empty()
+            let val_lower = val.to_lowercase();
+            // Return false if explicitly set to "false", "0", "no", or "off"
+            if val_lower == "false" || val == "0" || val_lower == "no" || val_lower == "off" {
+                println!("[RUST] NOSTR_MAIL_CLEAR_CACHE is set to false, cache will NOT be cleared");
+                return false;
+            }
+            // Return true if the variable is set to "1", "true", "yes", or any other non-empty value
+            val == "1" || val_lower == "true" || val_lower == "yes" || !val.is_empty()
         },
         Err(_) => {
             println!("[RUST] NOSTR_MAIL_CLEAR_CACHE environment variable is not set");
@@ -1276,13 +1282,6 @@ async fn test_relay_connection(relay_url: String) -> Result<bool, String> {
     Ok(is_connected)
 }
 
-#[tauri::command]
-async fn check_relay_auth_requirement(relay_url: String) -> Result<bool, String> {
-    println!("[RUST] check_relay_auth_requirement called for: {}", relay_url);
-    
-    let (requires_auth, _) = probe_relay_auth_requirement(&relay_url).await?;
-    Ok(requires_auth)
-}
 
 #[tauri::command]
 fn decrypt_dm_content(private_key: String, sender_pubkey: String, encrypted_content: String) -> Result<String, String> {
@@ -3450,7 +3449,9 @@ async fn follow_user(private_key: String, pubkey_to_follow: String, state: tauri
 }
 
 #[tauri::command]
-async fn publish_follow_list(private_key: String, user_pubkey: String, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn publish_follow_list(private_key: String, user_pubkey: String, _relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+    
     println!("[RUST] publish_follow_list called for user: {}", user_pubkey);
     
     // Get all public contacts from database
@@ -3460,29 +3461,79 @@ async fn publish_follow_list(private_key: String, user_pubkey: String, relays: V
     
     println!("[RUST] Found {} public contacts to publish", public_pubkeys.len());
     
-    if public_pubkeys.is_empty() {
-        println!("[RUST] No public contacts to publish");
-        // Still publish an empty list to clear the follow list
-    }
+    // Get or initialize the persistent client (same one used for fetching)
+    // This ensures we use the same relay connections
+    let client = state.get_nostr_client(Some(&private_key)).await.map_err(|e| {
+        format!("Failed to get or initialize persistent client: {}", e)
+    })?;
+    
+    // Parse private key and create keys (same keypair, just need it for signing)
+    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let keys = Keys::new(secret_key);
     
     // Create tags for the follow event (kind 3)
-    let tags: Vec<Vec<String>> = public_pubkeys.iter()
-        .map(|pubkey: &String| vec!["p".to_string(), pubkey.clone()])
+    let tags: Vec<Tag> = public_pubkeys.iter()
+        .filter_map(|pubkey| {
+            PublicKey::from_bech32(pubkey)
+                .or_else(|_| PublicKey::from_hex(pubkey))
+                .ok()
+                .map(|pk| Tag::public_key(pk))
+        })
         .collect();
     
-    // Empty content for follow events
-    let content = "".to_string();
+    // Build the follow event (kind 3)
+    let event_builder = EventBuilder::new(Kind::ContactList, "");
+    let event = event_builder
+        .tags(tags)
+        .build(keys.public_key())
+        .sign_with_keys(&keys)
+        .map_err(|e| e.to_string())?;
     
-    // Publish the follow event with the complete list
-    nostr::publish_event(&private_key, &content, 3, tags, &relays)
-        .await
-        .map(|_| {
-            println!("[RUST] Successfully published follow event with {} public contacts", public_pubkeys.len());
-        })
-        .map_err(|e| {
-            println!("[RUST] Failed to publish follow event: {}", e);
-            e.to_string()
-        })
+    let event_id = event.id.to_hex();
+    println!("[RUST] Built follow event with ID: {}", event_id);
+    
+    // Check relay connection status before publishing
+    let max_wait_time = std::time::Duration::from_secs(10);
+    let start_time = std::time::Instant::now();
+    let check_interval = std::time::Duration::from_millis(500);
+    
+    let mut connected_relays = client.relays().await;
+    println!("[RUST] Checking relay status before publishing follow list...");
+    
+    // Wait for at least one relay to connect
+    while connected_relays.is_empty() && start_time.elapsed() < max_wait_time {
+        println!("[RUST] No relays connected yet, waiting... ({:?} elapsed)", start_time.elapsed());
+        tokio::time::sleep(check_interval).await;
+        connected_relays = client.relays().await;
+    }
+    
+    if connected_relays.is_empty() {
+        return Err("No relays connected after waiting".to_string());
+    }
+    
+    let relay_urls: Vec<String> = connected_relays.iter()
+        .map(|(url, _)| url.to_string())
+        .collect();
+    println!("[RUST] Publishing follow event to {} connected relays: {:?}", connected_relays.len(), relay_urls);
+    
+    // Publish event using persistent client (same client used for fetching)
+    let output = client.send_event(&event).await.map_err(|e| e.to_string())?;
+    
+    println!("[RUST] Successfully published follow event with {} public contacts", public_pubkeys.len());
+    println!("[RUST] Published to {} relay(s), failed on {} relay(s)", 
+        output.success.len(), output.failed.len());
+    
+    if !output.success.is_empty() {
+        let success_urls: Vec<String> = output.success.iter().map(|url| url.to_string()).collect();
+        println!("[RUST] Successfully published to relays: {:?}", success_urls);
+    }
+    if !output.failed.is_empty() {
+        for (url, error) in &output.failed {
+            println!("[RUST] Failed to publish to relay {}: {:?}", url, error);
+        }
+    }
+    
+    Ok(event_id)
 }
 
 #[tauri::command]
@@ -3559,16 +3610,84 @@ async fn sync_all_emails(config: EmailConfig, state: tauri::State<'_, AppState>)
 
 #[tauri::command]
 async fn sync_direct_messages_with_network(private_key: String, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
-    println!("SYNC COMMAND CALLED");
+    println!("[RUST] sync_direct_messages_with_network called");
     let db = state.get_database().map_err(|e| e.to_string())?;
+    
+    // Get the persistent client (clone it before await to avoid Send issues)
+    let client_option = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        client_guard.as_ref().cloned()
+    };
+    
+    let client = match client_option {
+        Some(client) => client,
+        None => {
+            println!("[RUST] Persistent client not initialized, falling back to temporary client");
+            // Fallback to old method if persistent client not available
+            let latest = db.get_latest_dm_created_at().map_err(|e| e.to_string())?;
+            let since = latest.map(|dt| dt.timestamp());
+            let events = crate::nostr::fetch_direct_messages(&private_key, &relays, since)
+                .await
+                .map_err(|e| e.to_string())?;
+            return sync_dms_from_events(events, db);
+        }
+    };
+    
+    // Parse private key to get keys
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key)
+        .map_err(|e| e.to_string())?;
+    let keys = nostr_sdk::prelude::Keys::new(secret_key);
+    
+    // Check relay connection status before fetching
+    let max_wait_time = std::time::Duration::from_secs(10);
+    let wait_start = std::time::Instant::now();
+    let check_interval = std::time::Duration::from_millis(500);
+    
+    let mut connected_relays = client.relays().await;
+    println!("[RUST] Checking relay status before DM sync...");
+    println!("[RUST] Initial relays in client: {}", connected_relays.len());
+    
+    // Wait for at least one relay to connect
+    while connected_relays.is_empty() && wait_start.elapsed() < max_wait_time {
+        println!("[RUST] No relays connected yet, waiting... ({:?} elapsed)", wait_start.elapsed());
+        tokio::time::sleep(check_interval).await;
+        connected_relays = client.relays().await;
+    }
+    
+    if connected_relays.is_empty() {
+        println!("[RUST] WARNING: No relays connected after waiting! Falling back to temporary client.");
+        // Fallback to old method
+        let latest = db.get_latest_dm_created_at().map_err(|e| e.to_string())?;
+        let since = latest.map(|dt| dt.timestamp());
+        let events = crate::nostr::fetch_direct_messages(&private_key, &relays, since)
+            .await
+            .map_err(|e| e.to_string())?;
+        return sync_dms_from_events(events, db);
+    } else {
+        println!("[RUST] Connected to {} relay(s) for DM sync:", connected_relays.len());
+        for (url, _) in connected_relays.iter() {
+            println!("[RUST]   ✓ {}", url);
+        }
+        // Give relays a brief moment to be fully ready
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    
     // 1. Get latest DM timestamp
     let latest = db.get_latest_dm_created_at().map_err(|e| e.to_string())?;
     let since = latest.map(|dt| dt.timestamp());
-    // 2. Fetch new DMs from network
-    let events = crate::nostr::fetch_direct_messages(&private_key, &relays, since)
+    
+    // 2. Fetch new DMs from network using persistent client
+    println!("[RUST] Fetching DMs using persistent client...");
+    let events = crate::nostr::fetch_direct_messages_with_client(&client, &keys, since)
         .await
         .map_err(|e| e.to_string())?;
-    // 3. Convert NostrEvent to DirectMessage
+    
+    sync_dms_from_events(events, db)
+}
+
+// Helper function to convert events to DMs and save them
+fn sync_dms_from_events(events: Vec<NostrEvent>, db: crate::database::Database) -> Result<usize, String> {
+    // Convert NostrEvent to DirectMessage
     let dms: Vec<DbDirectMessage> = events.iter().map(|event| {
         // Convert sender_pubkey to npub format
         let sender_npub = if event.pubkey.starts_with("npub1") {
@@ -3606,9 +3725,10 @@ async fn sync_direct_messages_with_network(private_key: String, relays: Vec<Stri
             received_at: chrono::Utc::now(),
         }
     }).collect();
-    // 4. Save new DMs
+    // Save new DMs
     let inserted = db.save_dm_batch(&dms).map_err(|e| e.to_string())?;
-    // 5. Return number of new messages
+    println!("[RUST] Saved {} new DM(s) to database", inserted);
+    // Return number of new messages
     Ok(inserted)
 }
 
@@ -3639,12 +3759,87 @@ async fn sync_conversation_with_network(
     let contact_pubkey_parsed = nostr_sdk::prelude::PublicKey::from_bech32(&contact_pubkey)
         .map_err(|e| e.to_string())?;
     
-    // Create client and fetch events
-    let client = nostr_sdk::prelude::Client::new(keys.clone());
-    for relay in &relays {
-        client.add_relay(relay.clone()).await.map_err(|e| e.to_string())?;
+    // Get the persistent client (clone it before await to avoid Send issues)
+    let client_option = {
+        let client_guard = state.nostr_client.lock().unwrap();
+        client_guard.as_ref().cloned()
+    };
+    
+    let client = match client_option {
+        Some(client) => client,
+        None => {
+            println!("[RUST] Persistent client not initialized, falling back to temporary client");
+            // Fallback to old method if persistent client not available
+            let client = nostr_sdk::prelude::Client::new(keys.clone());
+            for relay in &relays {
+                client.add_relay(relay.clone()).await.map_err(|e| e.to_string())?;
+            }
+            client.connect().await;
+            
+            let mut filter = nostr_sdk::prelude::Filter::new()
+                .kind(nostr_sdk::prelude::Kind::EncryptedDirectMessage)
+                .authors([keys.public_key(), contact_pubkey_parsed])
+                .pubkeys([keys.public_key(), contact_pubkey_parsed]);
+            
+            if let Some(since_ts) = since {
+                filter = filter.since(nostr_sdk::prelude::Timestamp::from(since_ts as u64));
+            }
+            
+            let events: Vec<nostr_sdk::Event> = client.fetch_events(filter, std::time::Duration::from_secs(2))
+                .await.map_err(|e| e.to_string())?
+                .into_iter().collect();
+            
+            return sync_conversation_events(events, &db, &user_pubkey, &contact_pubkey);
+        }
+    };
+    
+    // Check relay connection status before fetching
+    let max_wait_time = std::time::Duration::from_secs(10);
+    let wait_start = std::time::Instant::now();
+    let check_interval = std::time::Duration::from_millis(500);
+    
+    let mut connected_relays = client.relays().await;
+    println!("[RUST] Checking relay status before conversation sync...");
+    println!("[RUST] Initial relays in client: {}", connected_relays.len());
+    
+    // Wait for at least one relay to connect
+    while connected_relays.is_empty() && wait_start.elapsed() < max_wait_time {
+        println!("[RUST] No relays connected yet, waiting... ({:?} elapsed)", wait_start.elapsed());
+        tokio::time::sleep(check_interval).await;
+        connected_relays = client.relays().await;
     }
-    client.connect().await;
+    
+    if connected_relays.is_empty() {
+        println!("[RUST] WARNING: No relays connected after waiting! Falling back to temporary client.");
+        // Fallback to old method
+        let client = nostr_sdk::prelude::Client::new(keys.clone());
+        for relay in &relays {
+            client.add_relay(relay.clone()).await.map_err(|e| e.to_string())?;
+        }
+        client.connect().await;
+        
+        let mut filter = nostr_sdk::prelude::Filter::new()
+            .kind(nostr_sdk::prelude::Kind::EncryptedDirectMessage)
+            .authors([keys.public_key(), contact_pubkey_parsed])
+            .pubkeys([keys.public_key(), contact_pubkey_parsed]);
+        
+        if let Some(since_ts) = since {
+            filter = filter.since(nostr_sdk::prelude::Timestamp::from(since_ts as u64));
+        }
+        
+        let events: Vec<nostr_sdk::Event> = client.fetch_events(filter, std::time::Duration::from_secs(2))
+            .await.map_err(|e| e.to_string())?
+            .into_iter().collect();
+        
+        return sync_conversation_events(events, &db, &user_pubkey, &contact_pubkey);
+    } else {
+        println!("[RUST] Connected to {} relay(s) for conversation sync:", connected_relays.len());
+        for (url, _) in connected_relays.iter() {
+            println!("[RUST]   ✓ {}", url);
+        }
+        // Give relays a brief moment to be fully ready
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     
     // Create filter for messages between these two users
     let mut filter = nostr_sdk::prelude::Filter::new()
@@ -3656,11 +3851,23 @@ async fn sync_conversation_with_network(
         filter = filter.since(nostr_sdk::prelude::Timestamp::from(since_ts as u64));
     }
     
-    let events = client.fetch_events(filter, std::time::Duration::from_secs(10))
-        .await.map_err(|e| e.to_string())?;
+    println!("[RUST] Fetching conversation events using persistent client with 2s timeout...");
+    let events: Vec<nostr_sdk::Event> = client.fetch_events(filter, std::time::Duration::from_secs(2))
+        .await.map_err(|e| e.to_string())?
+        .into_iter().collect();
     
     println!("[RUST] Fetched {} events for conversation", events.len());
     
+    sync_conversation_events(events, &db, &user_pubkey, &contact_pubkey)
+}
+
+// Helper function to convert and save conversation events
+fn sync_conversation_events(
+    events: Vec<nostr_sdk::Event>,
+    db: &crate::database::Database,
+    user_pubkey: &str,
+    contact_pubkey: &str,
+) -> Result<usize, String> {
     // Convert and save to database
     let mut saved_count = 0;
     for event in events {
@@ -3674,7 +3881,7 @@ async fn sync_conversation_with_network(
                     .ok()
                     .and_then(|pubkey| pubkey.to_bech32().ok())
             })
-            .unwrap_or_else(|| user_pubkey.clone());
+            .unwrap_or_else(|| user_pubkey.to_string());
         
         // Ensure this message is actually between the user and contact
         if sender_npub != user_pubkey && sender_npub != contact_pubkey {
@@ -3706,8 +3913,8 @@ async fn sync_conversation_with_network(
     }
     
     // Update conversation metadata
-    let _ = db.update_conversation_from_messages(&user_pubkey, &contact_pubkey);
-    let _ = db.update_conversation_from_messages(&contact_pubkey, &user_pubkey);
+    let _ = db.update_conversation_from_messages(user_pubkey, contact_pubkey);
+    let _ = db.update_conversation_from_messages(contact_pubkey, user_pubkey);
     
     println!("[RUST] Saved {} new messages for conversation", saved_count);
     Ok(saved_count)
@@ -4846,8 +5053,14 @@ pub fn should_clear_localstorage_cache_http() -> bool {
     match std::env::var("NOSTR_MAIL_CLEAR_CACHE") {
         Ok(val) => {
             println!("[RUST] NOSTR_MAIL_CLEAR_CACHE environment variable is set to: {}", val);
-            // Return true if the variable is set to "1", "true", "yes", or any non-empty value
-            val == "1" || val.to_lowercase() == "true" || val.to_lowercase() == "yes" || !val.is_empty()
+            let val_lower = val.to_lowercase();
+            // Return false if explicitly set to "false", "0", "no", or "off"
+            if val_lower == "false" || val == "0" || val_lower == "no" || val_lower == "off" {
+                println!("[RUST] NOSTR_MAIL_CLEAR_CACHE is set to false, cache will NOT be cleared");
+                return false;
+            }
+            // Return true if the variable is set to "1", "true", "yes", or any other non-empty value
+            val == "1" || val_lower == "true" || val_lower == "yes" || !val.is_empty()
         },
         Err(_) => {
             println!("[RUST] NOSTR_MAIL_CLEAR_CACHE environment variable is not set");

@@ -300,29 +300,12 @@ pub struct ConversationMessage {
     pub is_sent: bool,
 }
 
-pub async fn fetch_direct_messages(
-    private_key: &str,
-    relays: &[String],
+/// Fetch direct messages using a provided client (for use with persistent client)
+pub async fn fetch_direct_messages_with_client(
+    client: &Client,
+    keys: &Keys,
     since: Option<i64>,
 ) -> Result<Vec<NostrEvent>> {
-    // Parse private key from bech32 format
-    let secret_key = SecretKey::from_bech32(private_key)?;
-    let keys = Keys::new(secret_key);
-    let client = Client::new(keys.clone());
-    
-    // Add relays
-    for relay in relays {
-        client.add_relay(relay.clone()).await?;
-    }
-    
-    // If no relays provided, use defaults
-    if relays.is_empty() {
-        client.add_relay("wss://nostr-pub.wellorder.net").await?;
-        client.add_relay("wss://relay.damus.io").await?;
-    }
-    
-    client.connect().await;
-    
     // Create filter for encrypted direct messages - fetch both sent and received
     let mut sent_filter = Filter::new()
         .kind(Kind::EncryptedDirectMessage)
@@ -337,8 +320,9 @@ pub async fn fetch_direct_messages(
     }
     
     // Get events for both sent and received
-    let sent_events = client.fetch_events(sent_filter, Duration::from_secs(10)).await?;
-    let received_events = client.fetch_events(received_filter, Duration::from_secs(10)).await?;
+    // Use shorter timeout (2 seconds) optimized for mock servers, same as profile fetch
+    let sent_events = client.fetch_events(sent_filter, Duration::from_secs(2)).await?;
+    let received_events = client.fetch_events(received_filter, Duration::from_secs(2)).await?;
     
     // Combine and deduplicate events
     let mut all_events = sent_events;
@@ -371,6 +355,32 @@ pub async fn fetch_direct_messages(
     }).collect();
     
     Ok(nostr_events)
+}
+
+pub async fn fetch_direct_messages(
+    private_key: &str,
+    relays: &[String],
+    since: Option<i64>,
+) -> Result<Vec<NostrEvent>> {
+    // Parse private key from bech32 format
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let keys = Keys::new(secret_key);
+    let client = Client::new(keys.clone());
+    
+    // Add relays
+    for relay in relays {
+        client.add_relay(relay.clone()).await?;
+    }
+    
+    // If no relays provided, use defaults
+    if relays.is_empty() {
+        client.add_relay("wss://nostr-pub.wellorder.net").await?;
+        client.add_relay("wss://relay.damus.io").await?;
+    }
+    
+    client.connect().await;
+    
+    fetch_direct_messages_with_client(&client, &keys, since).await
 }
 
 pub async fn fetch_events(

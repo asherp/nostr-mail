@@ -4307,7 +4307,7 @@ NostrMailApp.prototype.renderProfileFieldsList = function(fields, isViewingOwnPr
     
     // Validate all fields on initial render (only for own profile)
     if (isViewingOwnProfile) {
-        const fieldsToValidate = ['email', 'picture', 'banner', 'website', 'lud16', 'lud06', 'nip05'];
+        const fieldsToValidate = ['email', 'picture', 'banner', 'website', 'lud16', 'nip05'];
         fieldsToValidate.forEach(key => {
             const input = document.getElementById(`profile-field-${key}`);
             if (input) {
@@ -4419,9 +4419,7 @@ NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value, i
         } else if (key === 'lud06') {
             input = document.createElement('input');
             input.type = 'text';
-            input.pattern = '^lnurl[a-z0-9]+$';
             input.placeholder = 'lnurl1...';
-            input.title = 'Please enter a valid LNURL (starts with lnurl)';
         } else if (key === 'nip05') {
             input = document.createElement('input');
             input.type = 'text';
@@ -4554,14 +4552,6 @@ NostrMailApp.prototype.validateProfileField = function(key, inputElement) {
             }
             break;
             
-        case 'lud06':
-            const lud06Regex = /^lnurl[a-z0-9]+$/i;
-            if (!lud06Regex.test(value)) {
-                isValid = false;
-                errorMessage = 'Please enter a valid LNURL (starts with lnurl)';
-            }
-            break;
-            
         case 'nip05':
             const nip05Regex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
             if (!nip05Regex.test(value)) {
@@ -4608,7 +4598,7 @@ NostrMailApp.prototype.updateProfile = async function() {
     }
 
     // Validate all fields before submitting
-    const fieldsToValidate = ['email', 'picture', 'banner', 'website', 'lud16', 'lud06', 'nip05'];
+    const fieldsToValidate = ['email', 'picture', 'banner', 'website', 'lud16', 'nip05'];
     let hasValidationErrors = false;
     const invalidFields = [];
     
@@ -4632,9 +4622,6 @@ NostrMailApp.prototype.updateProfile = async function() {
                 case 'lud16':
                 case 'nip05':
                     isValid = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value);
-                    break;
-                case 'lud06':
-                    isValid = /^lnurl[a-z0-9]+$/i.test(value);
                     break;
             }
             

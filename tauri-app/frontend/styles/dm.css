@@ -534,7 +534,7 @@ body.dark-mode .dm-back-to-list-btn:hover {
 }
 
 .dm-send-btn {
-    background: var(--primary-color);
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     color: white;
     border: none;
     border-radius: 50%;
@@ -548,13 +548,14 @@ body.dark-mode .dm-back-to-list-btn:hover {
     flex-shrink: 0;
 }
 
-.dm-send-btn:hover {
-    background: var(--primary-hover);
+.dm-send-btn:hover:not(:disabled) {
+    background: linear-gradient(135deg, #5568d3 0%, #653a8f 100%);
 }
 
 .dm-send-btn:disabled {
-    background: var(--muted-color);
+    background: linear-gradient(135deg, #9ca3af 0%, #6b7280 100%);
     cursor: not-allowed;
+    opacity: 0.6;
 }
 
 /* Dark mode support for DM message input */
@@ -574,6 +575,21 @@ body.dark-mode .dm-message-input {
 
 body.dark-mode .dm-message-input::placeholder {
     color: #666;
+}
+
+body.dark-mode .dm-send-btn {
+    background: linear-gradient(135deg, #232946 0%, #121629 100%);
+    color: #e0e0e0;
+}
+
+body.dark-mode .dm-send-btn:hover:not(:disabled) {
+    background: linear-gradient(135deg, #2a3152 0%, #1a1f35 100%);
+}
+
+body.dark-mode .dm-send-btn:disabled {
+    background: linear-gradient(135deg, #374151 0%, #1f2937 100%);
+    color: #6b7280;
+    opacity: 0.5;
 }
 
 /* Responsive design for DM */

@@ -654,12 +654,12 @@
                                     <div class="form-group">
                                         <label for="new-relay-url">Add Relay:</label>
                                         <div class="input-with-button">
-                                            <input type="text" id="new-relay-url" placeholder="wss://relay.example.com" pattern="^wss://.*" required autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                                            <input type="text" id="new-relay-url" placeholder="ws://10.0.2.2:8080 or wss://relay.example.com" pattern="^(ws|wss)://.*" required autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
                                             <button id="add-relay-btn" class="btn btn-secondary">
                                                 <i class="fas fa-plus"></i> Add
                                             </button>
                                         </div>
-                                        <small class="form-text text-muted" style="display: block; margin-top: 4px; font-size: 0.875em;">Relay URL must start with wss://</small>
+                                        <small class="form-text text-muted" style="display: block; margin-top: 4px; font-size: 0.875em;">Relay URL must start with ws:// or wss:// (use ws:// for local testing)</small>
                                     </div>
                                 </div>
                             </div>

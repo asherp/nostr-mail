@@ -1018,8 +1018,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
             // Real-time validation as user types
             newRelayUrlInput.addEventListener('input', (e) => {
                 const url = e.target.value.trim();
-                if (url && !url.startsWith('wss://')) {
-                    e.target.setCustomValidity('Relay URL must start with wss://');
+                if (url && !url.startsWith('ws://') && !url.startsWith('wss://')) {
+                    e.target.setCustomValidity('Relay URL must start with ws:// or wss://');
                     e.target.classList.add('invalid');
                 } else {
                     e.target.setCustomValidity('');
@@ -1030,8 +1030,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
             // Validate on blur
             newRelayUrlInput.addEventListener('blur', (e) => {
                 const url = e.target.value.trim();
-                if (url && !url.startsWith('wss://')) {
-                    e.target.setCustomValidity('Relay URL must start with wss://');
+                if (url && !url.startsWith('ws://') && !url.startsWith('wss://')) {
+                    e.target.setCustomValidity('Relay URL must start with ws:// or wss://');
                     e.target.classList.add('invalid');
                 } else {
                     e.target.setCustomValidity('');
@@ -1044,10 +1044,10 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 if (e.key === 'Enter') {
                     e.preventDefault();
                     const url = e.target.value.trim();
-                    if (url && url.startsWith('wss://')) {
+                    if (url && (url.startsWith('ws://') || url.startsWith('wss://'))) {
                         this.addRelay();
                     } else {
-                        notificationService.showError('Invalid relay URL. Must start with wss://');
+                        notificationService.showError('Invalid relay URL. Must start with ws:// or wss://');
                     }
                 }
             });
@@ -3483,8 +3483,8 @@ NostrMailApp.prototype.addRelay = async function() {
         notificationService.showError('Please enter a relay URL');
         return;
     }
-    if (!url.startsWith('wss://')) {
-        notificationService.showError('Invalid relay URL. Must start with wss://');
+    if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
+        notificationService.showError('Invalid relay URL. Must start with ws:// or wss://');
         return;
     }
     
@@ -4758,7 +4758,7 @@ NostrMailApp.prototype.setDarkMode = function(enabled) {
     }
     const text = document.getElementById('dark-mode-text');
     if (text) {
-        text.textContent = enabled ? 'Disable Dark Mode' : 'Enable Dark Mode';
+        text.textContent = enabled ? 'Enable Light Mode' : 'Enable Dark Mode';
     }
     const label = document.getElementById('theme-label');
     if (label) {

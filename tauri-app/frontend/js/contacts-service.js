@@ -841,7 +841,7 @@ class ContactsService {
             // Privacy toggle
             const isPublic = contact.is_public !== undefined ? contact.is_public : true;
             const privacyToggleHTML = `
-                <div class="privacy-toggle-container">
+                <div class="privacy-toggle-container" id="privacy-toggle-container-${contact.pubkey}">
                     <label class="privacy-toggle" id="privacy-toggle-${contact.pubkey}">
                         <input type="checkbox" ${isPublic ? 'checked' : ''} 
                                onchange="window.contactsService.toggleContactPrivacy('${contact.pubkey}', this.checked, this)">
@@ -862,8 +862,16 @@ class ContactsService {
                     <img class="profile-picture" src="${avatarSrc}" alt="${contact.name}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='profile-picture';" style="width:120px;height:120px;object-fit:cover;border-radius:50%;margin-right:20px;">
                     <div class="contact-detail-info">
                         <h3>${contact.name}</h3>
-                        <div class="contact-detail-pubkey">
-                            <code>${contact.pubkey}</code>
+                        <div class="contact-detail-pubkey-with-buttons">
+                            <code class="contact-detail-pubkey-code">${contact.pubkey}</code>
+                            <div class="contact-detail-pubkey-buttons">
+                                <button type="button" class="btn btn-secondary" title="Copy public key" onclick="window.contactsService.copyContactPubkey('${contact.pubkey}')">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                                <button type="button" class="btn btn-secondary" title="Show QR code" onclick="window.contactsService.showContactQrCode('${contact.pubkey}')">
+                                    <i class="fas fa-qrcode"></i>
+                                </button>
+                            </div>
                         </div>
                         ${contact.email ? `<div class="contact-detail-email">${contact.email}</div>` : ''}
                     </div>
@@ -962,6 +970,42 @@ class ContactsService {
                     <p>Error loading contact details</p>
                 </div>
             `;
+        }
+    }
+
+    // Show QR code modal for a contact
+    async showContactQrCode(pubkey) {
+        try {
+            // Ensure pubkey is in npub format
+            let npubKey = pubkey;
+            
+            // If not already npub format, try to convert it
+            if (!npubKey.startsWith('npub1')) {
+                try {
+                    npubKey = await window.TauriService.decodeNostrIdentifier(npubKey);
+                } catch (decodeError) {
+                    console.warn('[JS] Failed to decode pubkey to npub format, using original:', decodeError);
+                    // Continue with original pubkey - QR code generation might still work
+                }
+            }
+            
+            // Prefix with nostr: for NIP-21 standard
+            const qrData = npubKey.startsWith('nostr:') ? npubKey : `nostr:${npubKey}`;
+            
+            // Generate QR code
+            const qrDataUrl = await window.TauriService.generateQrCode(qrData);
+            
+            // Show QR code in modal
+            const modalContent = `
+                <div style="text-align:center;">
+                    <img src="${qrDataUrl}" alt="QR Code" style="max-width:220px;max-height:220px;" />
+                    <p style="word-break:break-all;margin-top:10px;">${qrData}</p>
+                </div>
+            `;
+            window.app.showModal('Contact QR Code', modalContent);
+        } catch (error) {
+            console.error('[JS] Error generating QR code for contact:', error);
+            window.notificationService.showError('Failed to generate QR code');
         }
     }
 
@@ -1850,14 +1894,27 @@ class ContactsService {
     }
 
     // Copy contact public key to clipboard
-    copyContactPubkey(pubkey) {
+    async copyContactPubkey(pubkey) {
         try {
-            navigator.clipboard.writeText(pubkey).then(() => {
+            // Ensure pubkey is in npub format for copying
+            let npubKey = pubkey;
+            
+            // If not already npub format, try to convert it
+            if (!npubKey.startsWith('npub1')) {
+                try {
+                    npubKey = await window.TauriService.decodeNostrIdentifier(npubKey);
+                } catch (decodeError) {
+                    console.warn('[JS] Failed to decode pubkey to npub format, using original:', decodeError);
+                    // Continue with original pubkey
+                }
+            }
+            
+            navigator.clipboard.writeText(npubKey).then(() => {
                 window.notificationService.showSuccess('Public key copied to clipboard');
             }).catch(() => {
                 // Fallback for older browsers
                 const textArea = document.createElement('textarea');
-                textArea.value = pubkey;
+                textArea.value = npubKey;
                 document.body.appendChild(textArea);
                 textArea.select();
                 document.execCommand('copy');
@@ -2608,10 +2665,44 @@ class ContactsService {
 
     // Toggle contact privacy status
     async toggleContactPrivacy(contactPubkey, isPublic, checkboxElement) {
+        // Get the toggle container to show loading state
+        const toggleContainer = document.getElementById(`privacy-toggle-container-${contactPubkey}`);
+        const toggleLabel = document.getElementById(`privacy-toggle-${contactPubkey}`);
+        let loadingOverlay = null;
+        
+        // Show loading state by adding a loading overlay
+        if (toggleContainer && toggleLabel) {
+            // Disable the toggle
+            toggleLabel.style.pointerEvents = 'none';
+            toggleLabel.style.opacity = '0.5';
+            
+            // Create and insert loading overlay
+            loadingOverlay = document.createElement('div');
+            loadingOverlay.id = `privacy-toggle-loading-${contactPubkey}`;
+            loadingOverlay.className = 'privacy-toggle-loading';
+            loadingOverlay.innerHTML = `
+                <i class="fas fa-spinner fa-spin"></i>
+                <span>Updating...</span>
+            `;
+            toggleContainer.appendChild(loadingOverlay);
+        }
+        
+        // Helper function to remove loading state
+        const removeLoadingState = () => {
+            if (toggleLabel) {
+                toggleLabel.style.pointerEvents = '';
+                toggleLabel.style.opacity = '';
+            }
+            if (loadingOverlay && loadingOverlay.parentNode) {
+                loadingOverlay.parentNode.removeChild(loadingOverlay);
+            }
+        };
+        
         try {
             if (!window.appState.hasKeypair()) {
                 // Revert checkbox if error
                 if (checkboxElement) checkboxElement.checked = !isPublic;
+                removeLoadingState();
                 return;
             }
 
@@ -2622,6 +2713,7 @@ class ContactsService {
             if (activeRelays.length === 0) {
                 window.notificationService.showError('No active relays configured. Cannot publish follow list.');
                 if (checkboxElement) checkboxElement.checked = !isPublic;
+                removeLoadingState();
                 return;
             }
             
@@ -2667,8 +2759,8 @@ class ContactsService {
             // This ensures that privacy changes are immediately reflected on relays
             try {
                 // getActiveRelays() already returns an array of URLs (strings)
-                await window.TauriService.publishFollowList(privateKey, userPubkey, activeRelays);
-                console.log(`[JS] Successfully published follow list after ${isPublic ? 'making' : 'removing'} contact public`);
+                const eventId = await window.TauriService.publishFollowList(privateKey, userPubkey, activeRelays);
+                console.log(`[JS] Successfully published follow list after ${isPublic ? 'making' : 'removing'} contact public, event ID: ${eventId}`);
             } catch (publishError) {
                 console.error('[JS] Error publishing follow list:', publishError);
                 // Don't fail the entire operation - the database update succeeded
@@ -2678,11 +2770,17 @@ class ContactsService {
                     'You may need to manually publish your follow list later.'
                 );
             }
+            
+            // Remove loading state after successful update
+            removeLoadingState();
         } catch (error) {
             console.error('Error toggling contact privacy:', error);
             window.notificationService.showError('Failed to update contact privacy: ' + error);
             // Revert checkbox if error
             if (checkboxElement) checkboxElement.checked = !isPublic;
+            
+            // Remove loading state on error
+            removeLoadingState();
         }
     }
 

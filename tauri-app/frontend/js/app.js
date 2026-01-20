@@ -26,7 +26,7 @@ NostrMailApp.prototype.init = async function() {
     console.log('🚀   NostrMail - Starting Application');
     console.log('🚀 ========================================');
     console.log('📧 Email + 🔐 Nostr Integration');
-    console.log('🌐 Version: 1.0.3-beta');
+    console.log('🌐 Version: 1.0.4-beta');
     console.log('⏰ Started at:', new Date().toLocaleString());
     console.log('🚀 ========================================');
     

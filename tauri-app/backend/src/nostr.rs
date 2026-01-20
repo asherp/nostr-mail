@@ -5,6 +5,16 @@ use std::time::Duration;
 use serde::{Serialize, Deserialize};
 use base64::engine::{general_purpose, Engine as _};
 
+// Helper function to initialize rustls crypto provider on Android
+// This must be called before creating any Client instances that will make WebSocket connections
+pub fn init_android_rustls() {
+    #[cfg(target_os = "android")]
+    {
+        // Try to install default provider, but don't fail if already installed
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 fn parse_pubkey(pubkey: &str) -> anyhow::Result<nostr_sdk::prelude::PublicKey> {
     if pubkey.starts_with("npub1") {
         nostr_sdk::prelude::PublicKey::from_bech32(pubkey).map_err(|e| anyhow::anyhow!(e))
@@ -54,6 +64,9 @@ pub async fn publish_event(
     tags: Vec<Vec<String>>,
     relays: &[String],
 ) -> Result<String> {
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     // Parse private key from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key);
@@ -101,6 +114,9 @@ pub async fn send_direct_message(
     message: &str,
     relays: &[String],
 ) -> Result<String> {
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     // Parse keys from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key.clone());
@@ -166,6 +182,9 @@ pub async fn send_direct_message_with_content(
     relays: &[String],
     encryption_algorithm: Option<&str>,
 ) -> Result<String> {
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     // Parse keys from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key.clone());
@@ -524,6 +543,9 @@ pub async fn fetch_following_profiles(
     println!("[NOSTR] fetch_following_profiles called");
     println!("[NOSTR] Using relays: {:?}", relays);
     
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key);
     let client = Client::new(keys.clone());
@@ -647,6 +669,10 @@ pub async fn fetch_following_pubkeys(
 ) -> Result<Vec<String>> {
     println!("[NOSTR] fetch_following_pubkeys called for pubkey: {}", pubkey);
     println!("[NOSTR] Using relays: {:?}", relays);
+    
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     let pubkey = match PublicKey::from_bech32(pubkey) {
         Ok(pk) => pk,
         Err(_) => PublicKey::from_hex(pubkey)?
@@ -753,6 +779,9 @@ pub async fn fetch_conversations(
     relays: &[String],
 ) -> Result<Vec<Conversation>> {
     println!("[NOSTR] fetch_conversations called");
+    
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
     
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key);

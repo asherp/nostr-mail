@@ -76,6 +76,9 @@ impl AppState {
     pub async fn init_nostr_client(&self, private_key: &str) -> Result<(), String> {
         println!("[RUST] Initializing persistent Nostr client with private key");
         
+        // Initialize rustls on Android before creating client
+        crate::nostr::init_android_rustls();
+        
         // Parse private key
         let secret_key = SecretKey::from_bech32(private_key).map_err(|e| e.to_string())?;
         let keys = Keys::new(secret_key);

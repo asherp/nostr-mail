@@ -18,6 +18,7 @@ __pycache__/
 
 # Mock relay events
 events.json
+relay.log
 
 # Rust build files
 target/

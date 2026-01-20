@@ -25,8 +25,10 @@ impl RelayManager {
     }
 
     /// Start a new relay on the given port
+    /// Binds to 0.0.0.0 to allow connections from other devices (e.g., Android emulator/physical device)
     pub async fn start_relay(&mut self, port: u16) -> Result<SocketAddr> {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        // Bind to 0.0.0.0 to allow connections from other devices on the network
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
         let store = Arc::new(EventStore::new());
         let server = RelayServer::new(addr, store.clone());
 
@@ -115,7 +117,8 @@ impl Default for RelayManager {
 
 /// Start a single relay instance (library function for testing)
 pub async fn start_relay(port: u16) -> Result<(SocketAddr, JoinHandle<Result<()>>)> {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+    // Bind to 0.0.0.0 to allow connections from other devices (e.g., Android emulator/physical device)
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
     let store = Arc::new(EventStore::new());
     let server = RelayServer::new(addr, store);
 

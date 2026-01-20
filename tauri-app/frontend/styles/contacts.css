@@ -91,6 +91,105 @@
     gap: 8px;
 }
 
+/* Privacy status icon */
+.privacy-status-icon {
+    font-size: 14px;
+    flex-shrink: 0;
+    cursor: default;
+}
+
+.privacy-status-public {
+    color: #4CAF50;
+}
+
+.privacy-status-private {
+    color: #FF9800;
+}
+
+.contact-item.active .privacy-status-icon {
+    color: white !important;
+}
+
+/* Dark mode support for privacy icons */
+body.dark-mode .privacy-status-public {
+    color: #66BB6A;
+}
+
+body.dark-mode .privacy-status-private {
+    color: #FFB74D;
+}
+
+body.dark-mode .contact-item.active .privacy-status-icon {
+    color: white !important;
+}
+
+/* Contact sections */
+.contact-section {
+    margin-bottom: 20px;
+}
+
+.contact-section-header {
+    display: flex;
+    align-items: center;
+    padding: 12px 15px;
+    background-color: #f8f9fa;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.2s ease;
+    margin-bottom: 8px;
+}
+
+.contact-section-header:hover {
+    background-color: #e9ecef;
+}
+
+.contact-section-header .section-chevron {
+    margin-right: 10px;
+    font-size: 12px;
+    color: #6c757d;
+    transition: transform 0.2s ease;
+}
+
+.contact-section-header .section-label {
+    font-weight: 600;
+    color: #333;
+    font-size: 0.95rem;
+}
+
+.contact-section-content {
+    transition: opacity 0.2s ease;
+}
+
+.contact-section-content .section-empty-message {
+    padding: 20px;
+    font-style: italic;
+    color: #6c757d;
+}
+
+/* Dark mode support for sections */
+body.dark-mode .contact-section-header {
+    background-color: #2d2d2d;
+    border-color: #444;
+}
+
+body.dark-mode .contact-section-header:hover {
+    background-color: #353535;
+}
+
+body.dark-mode .contact-section-header .section-chevron {
+    color: #a0a0a0;
+}
+
+body.dark-mode .contact-section-header .section-label {
+    color: #e0e0e0;
+}
+
+body.dark-mode .contact-section-content .section-empty-message {
+    color: #a0a0a0;
+}
+
 /* Email icon button */
 .contact-email-icon {
     background: none;
@@ -253,6 +352,39 @@
     padding: 2px 4px;
     border-radius: 4px;
     font-family: 'Courier New', Courier, monospace;
+}
+
+.contact-detail-pubkey-with-buttons {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+
+.contact-detail-pubkey-code {
+    flex: 1;
+    min-width: 0;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.9rem;
+    color: #333;
+    background-color: #f8f9fa;
+    padding: 6px 8px;
+    border-radius: 4px;
+    word-break: break-all;
+    margin: 0;
+}
+
+.contact-detail-pubkey-buttons {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.contact-detail-pubkey-buttons .btn {
+    min-width: 40px;
+    padding: 6px 10px;
 }
 
 .contact-detail-email {
@@ -435,6 +567,11 @@ body.dark-mode .contact-detail-pubkey code {
     font-family: 'Courier New', Courier, monospace;
 }
 
+body.dark-mode .contact-detail-pubkey-code {
+    color: #e0e0e0;
+    background-color: #181a20;
+}
+
 body.dark-mode .contact-email-icon {
     color: #667eea;
     opacity: 0.8;
@@ -474,85 +611,6 @@ body.dark-mode .contacts-search-icon {
     color: white;
 }
 
-/* Compact privacy toggle for contact list items */
-.privacy-toggle-wrapper {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-right: 8px;
-}
-
-.privacy-toggle-wrapper .privacy-toggle-icon {
-    font-size: 14px;
-    color: #6c757d;
-    flex-shrink: 0;
-}
-
-.contact-item.active .privacy-toggle-wrapper .privacy-toggle-icon {
-    color: white;
-}
-
-.contact-item .privacy-toggle-compact {
-    display: flex;
-    align-items: center;
-    cursor: pointer;
-    user-select: none;
-}
-
-.contact-item .privacy-toggle-compact input[type="checkbox"] {
-    display: none;
-}
-
-.contact-item .privacy-toggle-compact .privacy-toggle-slider {
-    position: relative;
-    width: 36px;
-    height: 20px;
-    background-color: #ccc;
-    border-radius: 20px;
-    transition: background-color 0.3s ease;
-}
-
-.contact-item .privacy-toggle-compact input[type="checkbox"]:checked + .privacy-toggle-slider {
-    background-color: #667eea;
-}
-
-.contact-item .privacy-toggle-compact .privacy-toggle-slider::before {
-    content: '';
-    position: absolute;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background-color: white;
-    top: 2px;
-    left: 2px;
-    transition: transform 0.3s ease;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-}
-
-.contact-item .privacy-toggle-compact input[type="checkbox"]:checked + .privacy-toggle-slider::before {
-    transform: translateX(16px);
-}
-
-.contact-item .privacy-toggle-compact:hover .privacy-toggle-slider {
-    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
-}
-
-/* Dark mode support for compact privacy toggle */
-body.dark-mode .contact-item .privacy-toggle-compact .privacy-toggle-slider {
-    background-color: #444;
-}
-
-body.dark-mode .contact-item .privacy-toggle-compact input[type="checkbox"]:checked + .privacy-toggle-slider {
-    background-color: #667eea;
-}
-
-body.dark-mode .privacy-toggle-wrapper .privacy-toggle-icon {
-    color: #a0a0a0;
-}
-
-body.dark-mode .contact-item.active .privacy-toggle-wrapper .privacy-toggle-icon {
-    color: white;
-}
 
 /* Dark mode support for delete icon */
 body.dark-mode .contact-delete-icon {
@@ -610,6 +668,7 @@ body.dark-mode .contact-item.active .contact-delete-icon:hover {
     flex-direction: row;
     align-items: center;
     gap: 12px;
+    position: relative;
 }
 
 .privacy-toggle {
@@ -665,6 +724,40 @@ body.dark-mode .contact-item.active .contact-delete-icon:hover {
     color: #6c757d;
 }
 
+/* Loading overlay for privacy toggle */
+.privacy-toggle-loading {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    background-color: rgba(255, 255, 255, 0.95);
+    border-radius: 8px;
+    z-index: 10;
+    padding: 0;
+    font-size: 0.95rem;
+    color: #667eea;
+    font-weight: 600;
+    backdrop-filter: blur(2px);
+}
+
+.privacy-toggle-loading i {
+    font-size: 1rem;
+}
+
+.privacy-toggle-loading span {
+    margin-left: 4px;
+}
+
+body.dark-mode .privacy-toggle-loading {
+    background-color: rgba(24, 26, 32, 0.98);
+    color: #667eea;
+}
+
 /* Dark mode support for privacy toggle */
 body.dark-mode .privacy-toggle-section {
     background-color: #181a20;
@@ -706,6 +799,7 @@ body.dark-mode .contact-item.active .contact-privacy-icon {
     flex-wrap: wrap;
     align-items: center;
 }
+
 
 /* Responsive design for contacts */
 @media (max-width: 768px) {

@@ -1,0 +1,36 @@
+{
+  "relays": [
+    {
+      "url": "wss://relay.damus.io",
+      "is_active": true
+    },
+    {
+      "url": "wss://nos.lol",
+      "is_active": true
+    },
+    {
+      "url": "wss://relay.nostr.pub",
+      "is_active": true
+    },
+    {
+      "url": "wss://nostr.rocks",
+      "is_active": true
+    },
+    {
+      "url": "wss://nostr.mom",
+      "is_active": true
+    },
+    {
+      "url": "wss://nostr.wine",
+      "is_active": true
+    },
+    {
+      "url": "wss://cache1.primal.net",
+      "is_active": true
+    },
+    {
+      "url": "wss://relay.nostr.band",
+      "is_active": true
+    }
+  ]
+}

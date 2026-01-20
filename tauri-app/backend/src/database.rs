@@ -6,6 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
+// Embed config file at compile time for Android builds
+#[cfg(target_os = "android")]
+const EMBEDDED_CONFIG: &str = include_str!("../nostr-mail-config.json");
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Contact {
     pub id: Option<i64>,
@@ -116,11 +120,73 @@ impl Database {
         conn.pragma_update(None, "journal_mode", &"WAL")?;
         let db = Database { conn: Arc::new(Mutex::new(conn)) };
         db.init_tables()?;
-        db.seed_default_relays()?;
+        
+        // Determine config path: use NOSTR_MAIL_CONFIG if set, otherwise use platform-specific approach
+        let is_test_mode = std::env::var("NOSTR_MAIL_CONFIG").is_ok();
+        
+        #[cfg(target_os = "android")]
+        {
+            // On Android, use embedded config content
+            if !is_test_mode {
+                println!("[DB] Loading config data from embedded config (Android)");
+                let config_loaded = db.load_config_data_from_str(EMBEDDED_CONFIG).is_ok();
+                if !config_loaded {
+                    println!("[DB] Warning: Failed to parse embedded config data");
+                } else {
+                    println!("[DB] Successfully loaded config data from embedded config");
+                }
+            } else {
+                // Test mode: use environment variable path
+                let config_path = std::env::var("NOSTR_MAIL_CONFIG").unwrap();
+                println!("[DB] Loading config data from: {} (test mode)", config_path);
+                let config_loaded = db.load_config_data(&config_path).is_ok();
+                if !config_loaded {
+                    println!("[DB] Failed to load test config from {}: file not found or invalid", config_path);
+                } else {
+                    println!("[DB] Successfully loaded config data from {}", config_path);
+                }
+            }
+        }
+        
+        #[cfg(not(target_os = "android"))]
+        {
+            // On desktop, use file path
+            let config_path = if is_test_mode {
+                std::env::var("NOSTR_MAIL_CONFIG").unwrap()
+            } else {
+                // Default to nostr-mail-config.json in backend directory
+                let default_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("nostr-mail-config.json");
+                default_path.to_string_lossy().to_string()
+            };
+            
+            // Load config data - this will handle relay seeding from the config file
+            println!("[DB] Loading config data from: {}", config_path);
+            let config_loaded = db.load_config_data(&config_path).is_ok();
+            
+            if !config_loaded {
+                if is_test_mode {
+                    println!("[DB] Failed to load test config from {}: file not found or invalid", config_path);
+                } else {
+                    println!("[DB] Warning: Failed to load config from {}: file not found or invalid", config_path);
+                }
+            } else {
+                println!("[DB] Successfully loaded config data from {}", config_path);
+            }
+        }
+        
+        // Only seed hardcoded defaults if:
+        // 1. Not in test mode (NOSTR_MAIL_CONFIG not set)
+        // 2. Relays table is still empty (config file had no relays or failed to load)
+        if !is_test_mode {
+            db.seed_default_relays()?;
+        }
+        
         Ok(db)
     }
     
     /// Seed default relays if the relays table is empty
+    /// Loads relays from nostr-mail-config.json (shipped with the app)
     fn seed_default_relays(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         
@@ -128,31 +194,68 @@ impl Database {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM relays", [], |row| row.get(0))?;
         
         if count == 0 {
-            println!("[DB] Seeding default relays...");
+            println!("[DB] Seeding default relays from nostr-mail-config.json...");
             let now = Utc::now();
-            let default_relays = vec![
-                ("wss://nostr-pub.wellorder.net", true),
-                ("wss://nostr.mom", true),
-                ("wss://purplepage.es", true),
-                ("wss://relay.damus.io", true),
-                ("wss://relay.nostr.band", true),
-                ("wss://relay.primal.net", true),
-                ("wss://relay.weloveit.info", true),
-            ];
             
-            for (url, is_active) in default_relays {
-                conn.execute(
-                    "INSERT OR IGNORE INTO relays (url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                    params![url, is_active, now, now],
-                )?;
-                println!("[DB] Seeded relay: {} (active: {})", url, is_active);
+            // Load config content - use embedded on Android, file on desktop
+            let json_content = Self::get_config_content();
+            
+            match json_content {
+                Ok(content) => {
+                    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(relays_array) = config.get("relays").and_then(|r| r.as_array()) {
+                            let mut loaded_count = 0;
+                            for relay_obj in relays_array {
+                                if let (Some(url), is_active) = (
+                                    relay_obj.get("url").and_then(|u| u.as_str()),
+                                    relay_obj.get("is_active").and_then(|a| a.as_bool()).unwrap_or(true)
+                                ) {
+                                    conn.execute(
+                                        "INSERT OR IGNORE INTO relays (url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                                        params![url, is_active, now, now],
+                                    )?;
+                                    println!("[DB] Seeded relay: {} (active: {})", url, is_active);
+                                    loaded_count += 1;
+                                }
+                            }
+                            if loaded_count > 0 {
+                                println!("[DB] Successfully seeded {} relay(s) from nostr-mail-config.json", loaded_count);
+                            } else {
+                                println!("[DB] Warning: nostr-mail-config.json contains no valid relays");
+                            }
+                        } else {
+                            println!("[DB] Warning: Invalid relays format in nostr-mail-config.json");
+                        }
+                    } else {
+                        println!("[DB] Warning: Failed to parse nostr-mail-config.json");
+                    }
+                }
+                Err(e) => {
+                    println!("[DB] Warning: Could not read nostr-mail-config.json: {} (file should be shipped with the app)", e);
+                }
             }
-            println!("[DB] Default relays seeded successfully");
         } else {
             println!("[DB] Relays table already contains {} relay(s), skipping seed", count);
         }
         
         Ok(())
+    }
+    
+    /// Get config file content - embedded on Android, from file on desktop
+    fn get_config_content() -> std::result::Result<String, String> {
+        #[cfg(target_os = "android")]
+        {
+            // On Android, use embedded config
+            Ok(EMBEDDED_CONFIG.to_string())
+        }
+        
+        #[cfg(not(target_os = "android"))]
+        {
+            // On desktop, read from file
+            let json_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("nostr-mail-config.json");
+            std::fs::read_to_string(&json_path)
+                .map_err(|e| format!("{}", e))
+        }
     }
 
     /// Compute SHA256 hash of encrypted content for fast lookups
@@ -765,6 +868,72 @@ impl Database {
             "UPDATE user_contacts SET is_public = ? WHERE user_pubkey = ? AND contact_pubkey = ?",
             params![is_public, user_pubkey, contact_pubkey],
         )?;
+        Ok(())
+    }
+
+    /// Batch update is_public status for multiple user-contact relationships
+    /// This is much faster than calling update_user_contact_public_status multiple times
+    pub fn batch_update_user_contact_public_status(&self, user_pubkey: &str, updates: &[(String, bool)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE user_contacts SET is_public = ? WHERE user_pubkey = ? AND contact_pubkey = ?"
+            )?;
+            for (contact_pubkey, is_public) in updates {
+                stmt.execute(params![is_public, user_pubkey, contact_pubkey])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Batch save contacts and user-contact relationships
+    /// This is much faster than calling save_contact and add_user_contact multiple times
+    pub fn batch_save_contacts(&self, user_pubkey: &str, contacts: &[Contact], is_public: bool) -> Result<()> {
+        if contacts.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let now = Utc::now();
+        
+        // Batch insert/update contacts
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO contacts (pubkey, name, email, picture_url, picture_data_url, about, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pubkey) DO UPDATE SET
+                    name = excluded.name,
+                    email = excluded.email,
+                    picture_url = excluded.picture_url,
+                    picture_data_url = excluded.picture_data_url,
+                    about = excluded.about,
+                    updated_at = excluded.updated_at"
+            )?;
+            for contact in contacts {
+                stmt.execute(params![
+                    contact.pubkey, contact.name, contact.email, contact.picture_url,
+                    contact.picture_data_url, contact.about, now, now
+                ])?;
+            }
+        }
+        
+        // Batch insert/update user-contact relationships
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO user_contacts (user_pubkey, contact_pubkey, is_public, created_at)
+                VALUES (?, ?, ?, ?)"
+            )?;
+            for contact in contacts {
+                stmt.execute(params![user_pubkey, contact.pubkey, is_public, now])?;
+            }
+        }
+        
+        tx.commit()?;
         Ok(())
     }
 
@@ -1695,6 +1864,195 @@ impl Database {
     pub fn delete_settings_for_pubkey(&self, pubkey: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM user_settings WHERE pubkey = ?", params![pubkey])?;
+        Ok(())
+    }
+
+    /// Load config data from JSON string (events, profiles, relays)
+    fn load_config_data_from_str(&self, content: &str) -> Result<()> {
+        self.parse_and_load_config_data(content)
+    }
+    
+    /// Load config data from JSON file (events, profiles, relays)
+    /// Requires an absolute path or path relative to current working directory
+    fn load_config_data(&self, json_path: &str) -> Result<()> {
+        use std::fs;
+        let content = fs::read_to_string(json_path)
+            .map_err(|e| rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                Some(format!("Failed to read config file {}: {} (use absolute path)", json_path, e))
+            ))?;
+        
+        self.parse_and_load_config_data(&content)
+    }
+    
+    /// Parse and load config data from JSON content
+    /// Supports both full format (events, profiles, relays) and simple format (just relays)
+    fn parse_and_load_config_data(&self, content: &str) -> Result<()> {
+        use serde_json;
+        
+        // First, try to parse as simple format (just relays)
+        if let Ok(simple_config) = serde_json::from_str::<serde_json::Value>(content) {
+            if simple_config.get("relays").is_some() && simple_config.get("events").is_none() {
+                // Simple format - just load relays
+                if let Some(relays_array) = simple_config.get("relays").and_then(|r| r.as_array()) {
+                    let conn = self.conn.lock().unwrap();
+                    let now = Utc::now();
+                    let mut added_count = 0;
+                    let mut skipped_count = 0;
+                    
+                    for relay_obj in relays_array {
+                        if let (Some(url), is_active) = (
+                            relay_obj.get("url").and_then(|u| u.as_str()),
+                            relay_obj.get("is_active").and_then(|a| a.as_bool()).unwrap_or(true)
+                        ) {
+                            let exists: bool = conn.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM relays WHERE url = ?)",
+                                params![url],
+                                |row| row.get(0)
+                            ).unwrap_or(false);
+                            
+                            if !exists {
+                                conn.execute(
+                                    "INSERT INTO relays (url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                                    params![url, is_active, now, now],
+                                )?;
+                                added_count += 1;
+                            } else {
+                                skipped_count += 1;
+                            }
+                        }
+                    }
+                    println!("[DB] Loaded {} relay(s) from simple config format ({} added, {} skipped)", 
+                        added_count + skipped_count, added_count, skipped_count);
+                    return Ok(());
+                }
+            }
+        }
+        
+        // Try full format (events, profiles, relays)
+        #[derive(Deserialize)]
+        struct ConfigEvent {
+            #[allow(dead_code)]
+            id: String,
+            pubkey: String,
+            created_at: i64,
+            kind: u16,
+            #[allow(dead_code)]
+            tags: Vec<Vec<String>>,
+            content: String,
+            #[allow(dead_code)]
+            sig: String,
+        }
+        
+        #[derive(Deserialize)]
+        struct ConfigProfile {
+            #[allow(dead_code)]
+            pubkey: String,
+            #[allow(dead_code)]
+            private_key: String,
+        }
+        
+        #[derive(Deserialize)]
+        struct ConfigData {
+            events: Vec<ConfigEvent>,
+            profiles: Option<Vec<ConfigProfile>>,
+            relays: Option<Vec<String>>,
+        }
+        
+        let config_data: ConfigData = serde_json::from_str(content)
+            .map_err(|e| rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                Some(format!("Failed to parse config JSON: {}", e))
+            ))?;
+        
+        let profile_count = config_data.profiles.as_ref().map(|p: &Vec<ConfigProfile>| p.len()).unwrap_or(0);
+        let relay_count = config_data.relays.as_ref().map(|r: &Vec<String>| r.len()).unwrap_or(0);
+        println!("[DB] Parsed config data: {} events, {} profiles, {} relays", 
+            config_data.events.len(),
+            profile_count,
+            relay_count);
+        
+        // Load relays (merge with existing relays)
+        if let Some(relays) = &config_data.relays {
+            println!("[DB] Merging {} relays from config", relays.len());
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now();
+            
+            // Insert relays that don't already exist
+            let mut added_count = 0;
+            let mut skipped_count = 0;
+            for relay_url in relays {
+                // Check if relay already exists
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM relays WHERE url = ?)",
+                    params![relay_url],
+                    |row| row.get(0)
+                ).unwrap_or(false);
+                
+                if !exists {
+                    conn.execute(
+                        "INSERT INTO relays (url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                        params![relay_url, true, now, now],
+                    )?;
+                    println!("[DB] Added relay: {} (active: true)", relay_url);
+                    added_count += 1;
+                } else {
+                    println!("[DB] Skipped existing relay: {}", relay_url);
+                    skipped_count += 1;
+                }
+            }
+            println!("[DB] Merged relays: {} added, {} skipped (already exist)", added_count, skipped_count);
+        }
+        
+        // Load contacts from profile events (kind 0)
+        let mut contacts_loaded = 0;
+        for event in &config_data.events {
+            if event.kind == 0 {
+                // Parse profile metadata
+                if let Ok(metadata) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&event.content) {
+                    let name = metadata.get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let display_name = metadata.get("display_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let email = metadata.get("email")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let picture = metadata.get("picture")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let about = metadata.get("about")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    
+                    let contact = Contact {
+                        id: None,
+                        pubkey: event.pubkey.clone(),
+                        name: display_name.or(name),
+                        email,
+                        picture_url: picture,
+                        picture_data_url: None,
+                        about,
+                        created_at: DateTime::from_timestamp(event.created_at, 0).unwrap_or_else(Utc::now),
+                        updated_at: DateTime::from_timestamp(event.created_at, 0).unwrap_or_else(Utc::now),
+                        is_public: Some(true),
+                    };
+                    
+                    if let Err(e) = self.save_contact(&contact) {
+                        println!("[DB] Failed to save contact {}: {}", event.pubkey, e);
+                    } else {
+                        contacts_loaded += 1;
+                    }
+                }
+            }
+        }
+        println!("[DB] Loaded {} contacts from config data", contacts_loaded);
+        
+        // Note: Direct messages (kind 4) would need to be decrypted with private keys
+        // This is more complex and would require the user's private key, so we skip it for now
+        // The DMs will be available from the relay when queried
+        
         Ok(())
     }
 

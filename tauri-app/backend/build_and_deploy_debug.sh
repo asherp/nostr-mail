@@ -119,5 +119,7 @@ else
     
     # Run cargo tauri android dev
     # This command handles building, signing, and installing automatically
+    # Environment variables set before this script will be passed through to the build
+    # Example: NOSTR_MAIL_DB=/custom/path ./build_and_deploy_debug.sh
     cargo tauri android dev
 fi

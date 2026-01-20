@@ -35,6 +35,10 @@ pub struct AppState {
     pub nostr_client: Arc<Mutex<Option<Client>>>,
     pub current_keys: Arc<Mutex<Option<Keys>>>,
     pub active_subscription: Arc<RwLock<Option<EventSubscription>>>,
+    pub failed_relays: Arc<Mutex<std::collections::HashMap<String, String>>>, // Track relays that failed to connect: URL -> error message
+    pub relay_auth_status: Arc<Mutex<std::collections::HashMap<String, bool>>>, // Track authentication status per relay: URL -> authenticated boolean
+    pub pending_auth_challenges: Arc<Mutex<std::collections::HashMap<String, String>>>, // Track pending AUTH challenges: URL -> challenge string
+    pub current_private_key: Arc<Mutex<Option<String>>>, // Store current private key in bech32 format for AUTH
 }
 
 impl AppState {
@@ -47,6 +51,10 @@ impl AppState {
             nostr_client: Arc::new(Mutex::new(None)),
             current_keys: Arc::new(Mutex::new(None)),
             active_subscription: Arc::new(RwLock::new(None)),
+            failed_relays: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            relay_auth_status: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_auth_challenges: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            current_private_key: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -64,8 +72,12 @@ impl AppState {
     }
 
     /// Initialize or update the persistent Nostr client with new keys and relays
+    /// Requires a private key - connections are only established when a private key is provided
     pub async fn init_nostr_client(&self, private_key: &str) -> Result<(), String> {
-        println!("[RUST] Initializing persistent Nostr client");
+        println!("[RUST] Initializing persistent Nostr client with private key");
+        
+        // Initialize rustls on Android before creating client
+        crate::nostr::init_android_rustls();
         
         // Parse private key
         let secret_key = SecretKey::from_bech32(private_key).map_err(|e| e.to_string())?;
@@ -147,9 +159,10 @@ impl AppState {
             println!("[RUST] Warning: No relays were added");
         }
         
-        // Store client and keys
+        // Store client, keys, and private key
         *self.nostr_client.lock().unwrap() = Some(client.clone());
-        *self.current_keys.lock().unwrap() = Some(keys);
+        *self.current_keys.lock().unwrap() = Some(keys.clone());
+        *self.current_private_key.lock().unwrap() = Some(private_key.to_string());
         
         // Check if there was an active subscription that needs to be restarted
         let subscription_to_restart = {
@@ -193,7 +206,32 @@ impl AppState {
     }
 
     /// Get the persistent Nostr client (initialize if needed)
+    /// Requires a private key to initialize the client
+    /// If a private key is provided and doesn't match the current client's keys, reinitializes the client
     pub async fn get_nostr_client(&self, private_key: Option<&str>) -> Result<Client, String> {
+        use nostr_sdk::prelude::*;
+        
+        // If a private key is provided, check if we need to reinitialize
+        if let Some(pk) = private_key {
+            // Parse the provided private key
+            let secret_key = SecretKey::from_bech32(pk).map_err(|e| e.to_string())?;
+            let provided_keys = Keys::new(secret_key);
+            
+            // Check if keys match current client
+            let needs_reinit = {
+                let current_keys = self.get_current_keys();
+                match current_keys {
+                    Some(current_keys) => current_keys.public_key() != provided_keys.public_key(),
+                    None => true, // No keys stored, need to initialize
+                }
+            };
+            
+            if needs_reinit {
+                println!("[RUST] Private key changed, reinitializing client connections");
+                self.init_nostr_client(pk).await?;
+            }
+        }
+        
         // First, try to get the existing client
         let existing_client = {
             let client_guard = self.nostr_client.lock().unwrap();
@@ -236,20 +274,23 @@ impl AppState {
         self.current_keys.lock().unwrap().clone()
     }
 
-    /// Update relays and reconnect client if needed
+    /// Update relays configuration without connecting
+    /// Connections are only established when init_nostr_client is called with a private key
     pub async fn update_relays(&self, new_relays: Vec<Relay>) -> Result<(), String> {
-        println!("[RUST] Updating relays");
+        println!("[RUST] Updating relay configuration (stored, not connecting yet)");
         
         // Update stored relays
         *self.relays.lock().unwrap() = new_relays.clone();
         
-        // If client exists, update its relays
+        // If client exists and is initialized (has private key), update its relays
         let client_clone = {
             let client_guard = self.nostr_client.lock().unwrap();
             client_guard.as_ref().cloned()
         };
         
+        // Only update connections if client exists (meaning we have a private key)
         if let Some(client) = client_clone {
+            println!("[RUST] Client exists, updating relay connections");
             // Disconnect from all current relays
             client.disconnect().await;
             
@@ -302,6 +343,8 @@ impl AppState {
             } else {
                 println!("[RUST] Warning: No relays were added after update");
             }
+        } else {
+            println!("[RUST] No client initialized yet - relay configuration stored, will connect when private key is provided");
         }
         
         Ok(())
@@ -341,7 +384,7 @@ impl AppState {
             }
         }
         
-        // Update the client connections
+        // Update the client connections only if client exists (has private key)
         let client_option = {
             let client_guard = self.nostr_client.lock().unwrap();
             client_guard.as_ref().cloned()
@@ -349,6 +392,14 @@ impl AppState {
         
         if let Some(client) = client_option {
             if is_active {
+                // Clear from failed_relays map when reconnecting
+                {
+                    let mut failed_map = self.failed_relays.lock().unwrap();
+                    if failed_map.remove(relay_url).is_some() {
+                        println!("[RUST] Cleared relay {} from failed_relays map (reconnecting)", relay_url);
+                    }
+                }
+                
                 // Connect to this relay
                 match client.add_relay(relay_url).await {
                     Ok(_) => {

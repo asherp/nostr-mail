@@ -155,6 +155,9 @@ const TauriService = {
     fetchProfilePersistent: async function(pubkey) {
         return await this.invoke('fetch_profile_persistent', { pubkey });
     },
+    decodeNostrIdentifier: async function(identifier) {
+        return await this.invoke('decode_nostr_identifier', { identifier });
+    },
     fetchFollowingProfiles: async function(privateKey, relays) {
         return await this.invoke('fetch_following_profiles', { privateKey, relays });
     },
@@ -409,6 +412,9 @@ const TauriService = {
     // Fetch single profile using persistent client (more efficient)
     fetchProfilePersistent: async function(pubkey) {
         return await this.invoke('fetch_profile_persistent', { pubkey });
+    },
+    decodeNostrIdentifier: async function(identifier) {
+        return await this.invoke('decode_nostr_identifier', { identifier });
     },
     // Fetch profiles using persistent client (more efficient)
     fetchProfilesPersistent: async function(pubkeys) {

@@ -26,7 +26,7 @@ NostrMailApp.prototype.init = async function() {
     console.log('🚀   NostrMail - Starting Application');
     console.log('🚀 ========================================');
     console.log('📧 Email + 🔐 Nostr Integration');
-    console.log('🌐 Version: 1.0.2-beta');
+    console.log('🌐 Version: 1.0.4-beta');
     console.log('⏰ Started at:', new Date().toLocaleString());
     console.log('🚀 ========================================');
     
@@ -224,7 +224,7 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
         smtp_port: 587,
         imap_host: '',
         imap_port: 993,
-        use_tls: false,
+        use_tls: true,
         email_filter: 'nostr',
         send_matching_dm: true,
         sync_cutoff_days: 365,
@@ -247,6 +247,9 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
     // Cleanup live events since there's no keypair
     await this.cleanupLiveEvents();
     
+    // Show pre-release warning again when keypair is cleared
+    this.updatePreReleaseWarning();
+    
     console.log('[APP] Settings reset to defaults');
 };
 
@@ -267,7 +270,7 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         smtp_port: 587,
         imap_host: '',
         imap_port: 993,
-        use_tls: false,
+        use_tls: true,
         email_filter: 'nostr',
         send_matching_dm: true,
         sync_cutoff_days: 1825, // Default to 5 years (matching loadSettingsForPubkey)
@@ -475,9 +478,27 @@ NostrMailApp.prototype.loadKeypair = async function() {
         } else {
             console.log('[APP] Skipping Nostr client initialization - no keypair available');
         }
+        
+        // Update pre-release warning visibility based on keypair existence
+        this.updatePreReleaseWarning();
     } catch (error) {
         console.error('Failed to load keypair:', error);
         notificationService.showError('Failed to load encryption keys');
+    }
+}
+
+// Update pre-release warning visibility based on keypair existence
+NostrMailApp.prototype.updatePreReleaseWarning = function() {
+    const warningDiv = document.getElementById('pre-release-warning');
+    if (!warningDiv) return;
+    
+    const keypair = appState.getKeypair();
+    const hasKeypair = keypair && keypair.private_key;
+    
+    if (hasKeypair) {
+        warningDiv.style.display = 'none';
+    } else {
+        warningDiv.style.display = 'flex';
     }
 }
 
@@ -923,16 +944,22 @@ NostrMailApp.prototype.setupEventListeners = function() {
         }
         
         const refreshContactsBtn = domManager.get('refreshContactsBtn');
+        console.log('[DEBUG] refreshContactsBtn element', {exists: !!refreshContactsBtn, id: refreshContactsBtn?.id});
         if (refreshContactsBtn) {
             refreshContactsBtn.addEventListener('click', async () => {
+                console.log('[DEBUG] Refresh button clicked');
                 // Show loading state immediately
                 domManager.disable('refreshContactsBtn');
                 domManager.setHTML('refreshContactsBtn', '<span class="loading"></span> Refreshing...');
                 try {
+                    console.log('[DEBUG] Calling refreshContacts()');
                     await contactsService.refreshContacts();
+                    console.log('[DEBUG] refreshContacts() completed, calling refreshSelectedContactProfile()');
                     await contactsService.refreshSelectedContactProfile();
+                    console.log('[DEBUG] Refresh completed successfully');
                 } catch (error) {
                     console.error('[JS] Error refreshing contacts:', error);
+                    console.error('[DEBUG] Refresh error details', {error: String(error), message: error.message, stack: error.stack});
                     notificationService.showError('Failed to refresh contacts: ' + error.message);
                 } finally {
                     // Restore button state
@@ -940,6 +967,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     domManager.setHTML('refreshContactsBtn', '<i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>');
                 }
             });
+        } else {
+            console.warn('[DEBUG] refreshContactsBtn not found in DOM');
         }
         
         const contactsSearch = domManager.get('contactsSearch');
@@ -981,6 +1010,47 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const addRelayBtn = domManager.get('addRelayBtn');
         if (addRelayBtn) {
             addRelayBtn.addEventListener('click', () => this.addRelay());
+        }
+        
+        // Add real-time validation for relay URL input
+        const newRelayUrlInput = domManager.get('newRelayUrl');
+        if (newRelayUrlInput) {
+            // Real-time validation as user types
+            newRelayUrlInput.addEventListener('input', (e) => {
+                const url = e.target.value.trim();
+                if (url && !url.startsWith('ws://') && !url.startsWith('wss://')) {
+                    e.target.setCustomValidity('Relay URL must start with ws:// or wss://');
+                    e.target.classList.add('invalid');
+                } else {
+                    e.target.setCustomValidity('');
+                    e.target.classList.remove('invalid');
+                }
+            });
+            
+            // Validate on blur
+            newRelayUrlInput.addEventListener('blur', (e) => {
+                const url = e.target.value.trim();
+                if (url && !url.startsWith('ws://') && !url.startsWith('wss://')) {
+                    e.target.setCustomValidity('Relay URL must start with ws:// or wss://');
+                    e.target.classList.add('invalid');
+                } else {
+                    e.target.setCustomValidity('');
+                    e.target.classList.remove('invalid');
+                }
+            });
+            
+            // Allow Enter key to submit
+            newRelayUrlInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const url = e.target.value.trim();
+                    if (url && (url.startsWith('ws://') || url.startsWith('wss://'))) {
+                        this.addRelay();
+                    } else {
+                        notificationService.showError('Invalid relay URL. Must start with ws:// or wss://');
+                    }
+                }
+            });
         }
         
         // Email provider selection
@@ -1085,6 +1155,10 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     console.log('[APP] Private key cleared, resetting settings to defaults');
                     await this.resetSettingsToDefaults();
                     appState.setLastLoadedPubkey(null);
+                    appState.setKeypair(null);
+                    localStorage.removeItem('nostr_keypair');
+                    // Show pre-release warning again when keypair is cleared
+                    this.updatePreReleaseWarning();
                     return;
                 }
                 
@@ -1137,6 +1211,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                         const keypair = { private_key: finalNprivKey, public_key: publicKey };
                                         appState.setKeypair(keypair);
                                         localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
+                                        // Hide pre-release warning once keypair is set
+                                        this.updatePreReleaseWarning();
                                         
                                         // Clear contacts from appState since they belong to the old user
                                         appState.setContacts([]);
@@ -1191,71 +1267,6 @@ NostrMailApp.prototype.setupEventListeners = function() {
         }
         
         // Contacts: Export npubs
-        const exportNpubsBtn = document.getElementById('export-npubs-btn');
-        if (exportNpubsBtn) {
-            exportNpubsBtn.addEventListener('click', async () => {
-                const contacts = appState.getContacts();
-                if (!contacts || contacts.length === 0) {
-                    notificationService.showError('No contacts to export.');
-                    return;
-                }
-                const npubs = contacts.map(c => c.pubkey).join('\n');
-                const filename = 'nostr-contacts.txt';
-
-                // Tauri-native save dialog and file write
-                if (window.__TAURI__ && window.__TAURI__.dialog && window.__TAURI__.fs) {
-                    try {
-                        const { save } = window.__TAURI__.dialog;
-                        const { writeTextFile } = window.__TAURI__.fs;
-                        const selectedPath = await save({
-                            defaultPath: filename,
-                            filters: [
-                                { name: 'Text Files', extensions: ['txt'] },
-                            ],
-                        });
-                        if (selectedPath) {
-                            await writeTextFile({ path: selectedPath, contents: npubs });
-                            notificationService.showSuccess(`Exported all contact npubs as a file!\nSaved to: ${selectedPath}`);
-                        } else {
-                            notificationService.showError('Export cancelled.');
-                        }
-                        return;
-                    } catch (err) {
-                        notificationService.showError('Failed to save file: ' + err.message);
-                        return;
-                    }
-                }
-
-                // Try File System Access API
-                if (window.showSaveFilePicker) {
-                    try {
-                        const handle = await window.showSaveFilePicker({
-                            suggestedName: filename,
-                            types: [
-                                {
-                                    description: 'Text Files',
-                                    accept: { 'text/plain': ['.txt'] },
-                                },
-                            ],
-                        });
-                        const writable = await handle.createWritable();
-                        await writable.write(npubs);
-                        await writable.close();
-                        notificationService.showSuccess('Exported all contact npubs as a file!');
-                        return;
-                    } catch (err) {
-                        if (err.name !== 'AbortError') {
-                            notificationService.showError('Failed to save file: ' + err.message);
-                        }
-                        return;
-                    }
-                }
-                // Fallback: download as file
-                Utils.downloadAsFile(npubs, filename);
-                notificationService.showSuccess('Exported all contact npubs as a file!');
-            });
-        }
-        
         // Copy public key to clipboard (copy button)
         const copyPubkeyBtn = domManager.get('copyPubkeyBtn');
         const publicKeyDisplayInput = domManager.get('publicKeyDisplay');
@@ -1279,6 +1290,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
                     domManager.setValue('nprivKey', keypair.private_key);
                     await app.updatePublicKeyDisplay();
+                    
+                    // Hide pre-release warning once keypair is generated
+                    app.updatePreReleaseWarning();
                     
                     // Load settings for the new pubkey
                     console.log('[APP] New keypair generated, loading settings for pubkey:', keypair.public_key);
@@ -1400,6 +1414,20 @@ NostrMailApp.prototype.setupLiveEventListeners = async function() {
         // Listen for live profile updates
         this.profileUnlisten = await window.__TAURI__.event.listen('profile-updated', (event) => {
             this.handleLiveProfileUpdate(event.payload);
+        });
+        
+        // Listen for relay status changes (when relays fail/disconnect)
+        this.relayStatusUnlisten = await window.__TAURI__.event.listen('relay-status-changed', async (event) => {
+            console.log('[APP] Relay status changed event received:', event.payload);
+            try {
+                // Reload relays from database first to get updated is_active state
+                await this.loadRelaysFromDatabase();
+                // Re-render relays to update toggle switches and status display
+                await this.renderRelays();
+                console.log('[APP] Relay status updated after change event');
+            } catch (err) {
+                console.error('[APP] Failed to update relay status after change event:', err);
+            }
         });
         
         
@@ -2474,6 +2502,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 appState.setKeypair(keypair);
                 localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
                 this.renderProfilePubkey();
+                // Hide pre-release warning once keypair is set
+                this.updatePreReleaseWarning();
                 
                 console.log('[APP] Keypair changed, loading settings for new pubkey:', publicKey);
                 await this.loadSettingsForPubkey(publicKey);
@@ -2513,6 +2543,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 appState.setKeypair(keypair);
                 localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
                 this.renderProfilePubkey();
+                // Hide pre-release warning once keypair is set
+                this.updatePreReleaseWarning();
                 
                 // If on profile tab, reload profile
                 if (document.querySelector('.tab-content#profile.active')) {
@@ -2989,9 +3021,13 @@ NostrMailApp.prototype.setupQrCodeEventListeners = function() {
         const newQrNpubBtn = qrNpubBtn.cloneNode(true);
         qrNpubBtn.parentNode.replaceChild(newQrNpubBtn, qrNpubBtn);
         newQrNpubBtn.addEventListener('click', async () => {
-            const value = publicKeyDisplayInput.value;
+            let value = publicKeyDisplayInput.value;
             console.log('[QR] Public key QR button clicked. Value:', value);
             if (!value) return;
+            // Prefix with nostr: if not already prefixed (NIP-21 standard)
+            if (!value.startsWith('nostr:')) {
+                value = 'nostr:' + value;
+            }
             try {
                 const dataUrl = await TauriService.generateQrCode(value);
                 showQrModal('Public Key QR Code', dataUrl, value);
@@ -3265,6 +3301,7 @@ NostrMailApp.prototype.renderRelays = async function() {
         // Find matching status from backend
         const status = relayStatuses.find(s => s.url === relay.url);
         const connectionStatus = status?.status || 'Disconnected';
+        const errorMessage = status?.error_message || null;
         const statusClass = this.getRelayStatusClass(connectionStatus);
         const statusIcon = this.getRelayStatusIcon(connectionStatus);
         const statusText = this.getRelayStatusText(connectionStatus);
@@ -3277,6 +3314,12 @@ NostrMailApp.prototype.renderRelays = async function() {
             `<button class="btn btn-secondary btn-small retry-btn" data-relay-id="${relay.id}" data-relay-url="${relay.url}" title="Retry connection">
                 <i class="fas fa-redo"></i>
             </button>` : '';
+        
+        // Build error message HTML if present
+        const errorHtml = errorMessage ? 
+            `<div class="relay-error-message" style="font-size: 0.85em; color: #dc3545; margin-top: 4px; font-style: italic;">
+                <i class="fas fa-exclamation-circle"></i> ${errorMessage}
+            </div>` : '';
             
         relayItem.innerHTML = `
             <div class="relay-item-info">
@@ -3285,6 +3328,7 @@ NostrMailApp.prototype.renderRelays = async function() {
                     <i class="fas ${statusIcon}"></i>
                     <span class="relay-status-text">${statusText}</span>
                 </div>
+                ${errorHtml}
             </div>
             <div class="relay-item-actions">
                 ${retryButtonHtml}
@@ -3340,9 +3384,13 @@ NostrMailApp.prototype.getRelayStatusIcon = function(connectionStatus) {
 }
 
 NostrMailApp.prototype.getRelayStatusText = function(connectionStatus) {
+    // Check if private key is set - if not, show "Not Connected" instead of "Connection Failed"
+    const keypair = appState.getKeypair();
+    const hasPrivateKey = keypair && keypair.private_key;
+    
     switch (connectionStatus) {
         case 'Connected': return 'Connected';
-        case 'Disconnected': return 'Connection Failed';
+        case 'Disconnected': return hasPrivateKey ? 'Connection Failed' : 'Not Connected';
         case 'Disabled': return 'Disabled';
         case 'Connecting': return 'Connecting...';
         case 'Disconnecting': return 'Disconnecting...';
@@ -3351,19 +3399,43 @@ NostrMailApp.prototype.getRelayStatusText = function(connectionStatus) {
 }
 
 // Update status for a single relay without full re-render
-NostrMailApp.prototype.updateSingleRelayStatus = function(relayUrl, connectionStatus) {
-    const statusElement = document.querySelector(`input[data-relay-url="${relayUrl}"]`)?.closest('.relay-item')?.querySelector('.relay-status');
-    if (statusElement) {
-        const statusClass = this.getRelayStatusClass(connectionStatus);
-        const statusIcon = this.getRelayStatusIcon(connectionStatus);
-        const statusText = this.getRelayStatusText(connectionStatus);
+NostrMailApp.prototype.updateSingleRelayStatus = function(relayUrl, connectionStatus, errorMessage) {
+    const relayItem = document.querySelector(`input[data-relay-url="${relayUrl}"]`)?.closest('.relay-item');
+    if (relayItem) {
+        const statusElement = relayItem.querySelector('.relay-status');
+        if (statusElement) {
+            const statusClass = this.getRelayStatusClass(connectionStatus);
+            const statusIcon = this.getRelayStatusIcon(connectionStatus);
+            const statusText = this.getRelayStatusText(connectionStatus);
+            
+            // Update the status element
+            statusElement.className = `relay-status ${statusClass}`;
+            statusElement.innerHTML = `
+                <i class="fas ${statusIcon}"></i>
+                <span class="relay-status-text">${statusText}</span>
+            `;
+        }
         
-        // Update the status element
-        statusElement.className = `relay-status ${statusClass}`;
-        statusElement.innerHTML = `
-            <i class="fas ${statusIcon}"></i>
-            <span class="relay-status-text">${statusText}</span>
-        `;
+        // Update or create error message element
+        let errorElement = relayItem.querySelector('.relay-error-message');
+        if (errorMessage) {
+            if (!errorElement) {
+                errorElement = document.createElement('div');
+                errorElement.className = 'relay-error-message';
+                errorElement.style.cssText = 'font-size: 0.85em; color: #dc3545; margin-top: 4px; font-style: italic;';
+                const statusElement = relayItem.querySelector('.relay-status');
+                if (statusElement && statusElement.parentNode) {
+                    statusElement.parentNode.insertBefore(errorElement, statusElement.nextSibling);
+                }
+            }
+            errorElement.innerHTML = `<i class="fas fa-exclamation-circle"></i> ${errorMessage}`;
+            errorElement.style.display = 'block';
+        } else {
+            // Remove error message if relay is now connected
+            if (errorElement) {
+                errorElement.remove();
+            }
+        }
     }
 }
 
@@ -3407,8 +3479,16 @@ NostrMailApp.prototype.syncDisconnectedRelays = async function() {
 
 NostrMailApp.prototype.addRelay = async function() {
     const url = domManager.getValue('newRelayUrl')?.trim();
-    if (url && (url.startsWith('ws://') || url.startsWith('wss://'))) {
-        const relays = appState.getRelays();
+    if (!url) {
+        notificationService.showError('Please enter a relay URL');
+        return;
+    }
+    if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
+        notificationService.showError('Invalid relay URL. Must start with ws:// or wss://');
+        return;
+    }
+    
+    const relays = appState.getRelays();
         if (!relays.some(r => r.url === url)) {
             try {
                 await TauriService.invoke('db_save_relay', {
@@ -3455,9 +3535,6 @@ NostrMailApp.prototype.addRelay = async function() {
         } else {
             notificationService.showError('Relay already exists.');
         }
-    } else {
-        notificationService.showError('Invalid relay URL. Must start with ws:// or wss://');
-    }
 }
 
 NostrMailApp.prototype.toggleRelayById = async function(relayId, relayUrl) {
@@ -3516,13 +3593,14 @@ NostrMailApp.prototype.toggleRelayById = async function(relayId, relayUrl) {
                     const relayStatuses = await TauriService.getRelayStatus();
                     const status = relayStatuses.find(s => s.url === relayUrl);
                     if (status) {
-                        this.updateSingleRelayStatus(relayUrl, status.status);
+                        this.updateSingleRelayStatus(relayUrl, status.status, status.error_message);
                         
                         // Show final connection result
                         if (newActiveState && status.status === 'Connected') {
                             notificationService.showSuccess(`✅ Successfully connected to ${relayUrl}`);
                         } else if (newActiveState && status.status === 'Disconnected') {
-                            notificationService.showError(`❌ Failed to connect to ${relayUrl}`);
+                            const errorMsg = status.error_message ? `: ${status.error_message}` : '';
+                            notificationService.showError(`❌ Failed to connect to ${relayUrl}${errorMsg}`);
                         }
                     } else {
                         // Fallback to expected status
@@ -3592,6 +3670,7 @@ NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
     // Store viewing mode
     this.isViewingOwnProfile = isViewingOwnProfile;
     this.viewingProfilePubkey = targetPubkey;
+    console.log('[Profile] loadProfile - Set isViewingOwnProfile:', isViewingOwnProfile, 'for pubkey:', targetPubkey);
     
     // If viewing own profile, clear viewing pubkey from appState
     if (isViewingOwnProfile) {
@@ -3603,6 +3682,13 @@ NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
     const profileSpinner = document.getElementById('profile-loading-spinner');
     const profileFieldsList = document.getElementById('profile-fields-list');
     const profilePicture = document.getElementById('profile-picture');
+    const updateBtn = document.getElementById('update-profile-btn');
+    
+    // Disable update button while loading profile
+    if (updateBtn) {
+        updateBtn.disabled = true;
+        console.log('[Profile] loadProfile - Button disabled at start of loading');
+    }
 
     // Show loading spinner if switching pubkeys or if no cached profile exists
     let shouldShowSpinner = false;
@@ -3936,14 +4022,34 @@ NostrMailApp.prototype.renderProfilePubkey = function(pubkey = null) {
 
 // Update profile UI based on viewing mode
 NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) {
+    console.log('[Profile] updateProfileUI called:', {
+        isViewingOwnProfile,
+        hasProfile: !!profile,
+        editableFieldsKeys: Object.keys(this.editableProfileFields || {}),
+        originalFieldsKeys: Object.keys(this.originalProfileFields || {})
+    });
+    
     const updateBtn = document.getElementById('update-profile-btn');
     const profileForm = document.getElementById('profile-fields-form');
     const profileHeader = document.querySelector('#profile .tab-header h2');
     const profileActions = document.querySelector('#profile .profile-actions');
     
-    // Show/hide update button
+    // Show/hide and enable/disable update button
     if (updateBtn) {
         updateBtn.style.display = isViewingOwnProfile ? 'block' : 'none';
+        console.log('[Profile] updateProfileUI - Button display set to:', updateBtn.style.display);
+        
+        // Check form changes to determine button state (will disable if no changes)
+        if (isViewingOwnProfile) {
+            console.log('[Profile] updateProfileUI - Checking form changes for button state');
+            this.checkProfileFormChanges();
+        } else {
+            // Not viewing own profile - disable button
+            updateBtn.disabled = true;
+            console.log('[Profile] updateProfileUI - Button disabled (not viewing own profile)');
+        }
+    } else {
+        console.log('[Profile] updateProfileUI - Update button not found in DOM');
     }
     
     // Disable form submission when viewing other users
@@ -4060,6 +4166,8 @@ NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) 
 
 // Store the current editable fields in memory
 NostrMailApp.prototype.editableProfileFields = {};
+// Store the original form state to detect changes
+NostrMailApp.prototype.originalProfileFields = {};
 
 NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPictureDataUrl, isViewingOwnProfile = true) {
     // Build editable fields from profile.fields, always include email
@@ -4075,10 +4183,17 @@ NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPicture
         });
     }
     
+    // Capture original state for change detection (deep copy)
+    this.originalProfileFields = JSON.parse(JSON.stringify(this.editableProfileFields));
+    console.log('[Profile] Captured original profile fields:', JSON.stringify(this.originalProfileFields, null, 2));
+    
     this.renderProfileFieldsList(this.editableProfileFields, isViewingOwnProfile);
     // Show warning if profile email and settings email differ (only for own profile)
     if (isViewingOwnProfile) {
         this.renderProfileEmailWarning();
+        // Ensure button is disabled after form is loaded (no changes yet)
+        console.log('[Profile] renderProfileFromObject - Form loaded, checking for changes');
+        this.checkProfileFormChanges();
     }
 
     // Show profile picture if present, otherwise show a placeholder
@@ -4177,10 +4292,87 @@ NostrMailApp.prototype.renderProfileFieldsList = function(fields, isViewingOwnPr
         if (emailInput) {
             emailInput.addEventListener('input', () => {
                 this.editableProfileFields.email = emailInput.value;
+                // Validate email field
+                this.validateProfileField('email', emailInput);
                 this.renderProfileEmailWarning();
+                // Check if form has changed and update button state
+                this.checkProfileFormChanges();
+            });
+            // Validate on blur
+            emailInput.addEventListener('blur', () => {
+                this.validateProfileField('email', emailInput);
             });
         }
     }
+    
+    // Validate all fields on initial render (only for own profile)
+    if (isViewingOwnProfile) {
+        const fieldsToValidate = ['email', 'picture', 'banner', 'website', 'lud16', 'nip05'];
+        fieldsToValidate.forEach(key => {
+            const input = document.getElementById(`profile-field-${key}`);
+            if (input) {
+                this.validateProfileField(key, input);
+            }
+        });
+    }
+}
+
+// Check if profile form has changed from original state
+NostrMailApp.prototype.checkProfileFormChanges = function() {
+    const updateBtn = document.getElementById('update-profile-btn');
+    if (!updateBtn) {
+        console.log('[Profile] checkProfileFormChanges: update button not found');
+        return;
+    }
+    
+    // Compare current fields with original fields
+    const hasChanges = this.hasProfileFormChanges();
+    const isViewingOwnProfile = this.isViewingOwnProfile !== false;
+    
+    console.log('[Profile] checkProfileFormChanges:', {
+        isViewingOwnProfile,
+        hasChanges,
+        currentFields: JSON.stringify(this.editableProfileFields, null, 2),
+        originalFields: JSON.stringify(this.originalProfileFields, null, 2),
+        buttonWillBeDisabled: !isViewingOwnProfile || !hasChanges
+    });
+    
+    // Enable button only if viewing own profile AND there are changes
+    updateBtn.disabled = !isViewingOwnProfile || !hasChanges;
+    
+    console.log('[Profile] Button state updated - disabled:', updateBtn.disabled);
+}
+
+// Check if profile form fields have changed from original state
+NostrMailApp.prototype.hasProfileFormChanges = function() {
+    const current = this.editableProfileFields || {};
+    const original = this.originalProfileFields || {};
+    
+    console.log('[Profile] hasProfileFormChanges - comparing:', {
+        currentKeys: Object.keys(current),
+        originalKeys: Object.keys(original),
+        current: JSON.stringify(current, null, 2),
+        original: JSON.stringify(original, null, 2)
+    });
+    
+    // Get all unique keys from both objects
+    const allKeys = new Set([...Object.keys(current), ...Object.keys(original)]);
+    
+    for (const key of allKeys) {
+        const currentValue = (current[key] || '').trim();
+        const originalValue = (original[key] || '').trim();
+        
+        if (currentValue !== originalValue) {
+            console.log(`[Profile] Change detected in field "${key}":`, {
+                current: currentValue,
+                original: originalValue
+            });
+            return true;
+        }
+    }
+    
+    console.log('[Profile] No changes detected');
+    return false;
 }
 
 // Helper to render a single field item
@@ -4202,27 +4394,82 @@ NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value, i
             input.type = 'url';
             if (key === 'picture') {
                 input.placeholder = 'https://example.com/avatar.png';
+                input.pattern = '^https?://.+';
+                input.title = 'Please enter a valid URL starting with http:// or https://';
             } else if (key === 'banner') {
                 input.placeholder = 'https://example.com/banner.jpg';
+                input.pattern = '^https?://.+';
+                input.title = 'Please enter a valid URL starting with http:// or https://';
             } else if (key === 'website') {
                 input.placeholder = 'https://example.com';
+                input.pattern = '^https?://.+';
+                input.title = 'Please enter a valid URL starting with http:// or https://';
             }
+        } else if (key === 'email') {
+            input = document.createElement('input');
+            input.type = 'email';
+            input.pattern = '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$';
+            input.title = 'Please enter a valid email address';
+        } else if (key === 'lud16') {
+            input = document.createElement('input');
+            input.type = 'text';
+            input.pattern = '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$';
+            input.placeholder = 'user@domain.com';
+            input.title = 'Please enter a valid Lightning address (e.g., user@domain.com)';
+        } else if (key === 'lud06') {
+            input = document.createElement('input');
+            input.type = 'text';
+            input.placeholder = 'lnurl1...';
+        } else if (key === 'nip05') {
+            input = document.createElement('input');
+            input.type = 'text';
+            input.pattern = '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$';
+            input.placeholder = 'user@domain.com';
+            input.title = 'Please enter a valid Nostr verification identifier (e.g., user@domain.com)';
         } else if (typeof value === 'string' && value.length > 60) {
             input = document.createElement('textarea');
             input.rows = 3;
         } else {
             input = document.createElement('input');
-            input.type = key === 'email' ? 'email' : 'text';
+            input.type = 'text';
         }
         input.id = `profile-field-${key}`;
         input.value = value ?? '';
         input.dataset.key = key;
         input.className = 'profile-field-input';
+        
+        // Add validation event listeners
         input.addEventListener('input', (e) => {
+            const oldValue = this.editableProfileFields[key];
             this.editableProfileFields[key] = e.target.value;
+            console.log(`[Profile] Field "${key}" changed:`, {
+                oldValue,
+                newValue: e.target.value,
+                currentFields: JSON.stringify(this.editableProfileFields, null, 2)
+            });
+            // Validate the field
+            this.validateProfileField(key, e.target);
+            // Check if form has changed and update button state
+            this.checkProfileFormChanges();
         });
+        
+        // Validate on blur
+        input.addEventListener('blur', (e) => {
+            this.validateProfileField(key, e.target);
+        });
+        
         fieldDiv.appendChild(label);
         fieldDiv.appendChild(input);
+        
+        // Add error message container
+        const errorDiv = document.createElement('div');
+        errorDiv.className = 'profile-field-error';
+        errorDiv.id = `profile-field-error-${key}`;
+        errorDiv.style.display = 'none';
+        errorDiv.style.color = '#dc3545';
+        errorDiv.style.fontSize = '0.875rem';
+        errorDiv.style.marginTop = '4px';
+        fieldDiv.appendChild(errorDiv);
     } else {
         // Read-only mode - create display div
         const valueDiv = document.createElement('div');
@@ -4253,6 +4500,85 @@ NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value, i
     listDiv.appendChild(fieldDiv);
 }
 
+// Validate a profile field
+NostrMailApp.prototype.validateProfileField = function(key, inputElement) {
+    if (!inputElement) return;
+    
+    const value = inputElement.value.trim();
+    const errorDiv = document.getElementById(`profile-field-error-${key}`);
+    let isValid = true;
+    let errorMessage = '';
+    
+    // Skip validation if field is empty (optional fields)
+    if (!value) {
+        inputElement.setCustomValidity('');
+        inputElement.classList.remove('invalid');
+        if (errorDiv) errorDiv.style.display = 'none';
+        return;
+    }
+    
+    // Field-specific validation
+    switch (key) {
+        case 'email':
+            const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+            if (!emailRegex.test(value)) {
+                isValid = false;
+                errorMessage = 'Please enter a valid email address';
+            }
+            break;
+            
+        case 'picture':
+        case 'banner':
+            const urlRegex = /^https?:\/\/.+/;
+            if (!urlRegex.test(value)) {
+                isValid = false;
+                errorMessage = 'Please enter a valid URL starting with http:// or https://';
+            }
+            break;
+            
+        case 'website':
+            const websiteRegex = /^https?:\/\/.+/;
+            if (!websiteRegex.test(value)) {
+                isValid = false;
+                errorMessage = 'Please enter a valid URL starting with http:// or https://';
+            }
+            break;
+            
+        case 'lud16':
+            const lud16Regex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+            if (!lud16Regex.test(value)) {
+                isValid = false;
+                errorMessage = 'Please enter a valid Lightning address (e.g., user@domain.com)';
+            }
+            break;
+            
+        case 'nip05':
+            const nip05Regex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+            if (!nip05Regex.test(value)) {
+                isValid = false;
+                errorMessage = 'Please enter a valid Nostr verification identifier (e.g., user@domain.com)';
+            }
+            break;
+    }
+    
+    // Update UI based on validation result
+    if (isValid) {
+        inputElement.setCustomValidity('');
+        inputElement.classList.remove('invalid');
+        if (errorDiv) {
+            errorDiv.style.display = 'none';
+            errorDiv.textContent = '';
+        }
+    } else {
+        inputElement.setCustomValidity(errorMessage);
+        inputElement.classList.add('invalid');
+        if (errorDiv) {
+            errorDiv.style.display = 'block';
+            errorDiv.textContent = errorMessage;
+        }
+    }
+}
+
 // Add new profile field
 NostrMailApp.prototype.addProfileField = function() {
     const fieldName = prompt('Enter field name:');
@@ -4260,12 +4586,61 @@ NostrMailApp.prototype.addProfileField = function() {
         const key = fieldName.trim().toLowerCase().replace(/\s+/g, '_');
         this.editableProfileFields[key] = '';
         this.renderProfileFieldsList(this.editableProfileFields);
+        // Check if form has changed and update button state
+        this.checkProfileFormChanges();
     }
 }
 
 // Update profile
 NostrMailApp.prototype.updateProfile = async function() {
     if (!appState.hasKeypair()) {
+        return;
+    }
+
+    // Validate all fields before submitting
+    const fieldsToValidate = ['email', 'picture', 'banner', 'website', 'lud16', 'nip05'];
+    let hasValidationErrors = false;
+    const invalidFields = [];
+    
+    for (const key of fieldsToValidate) {
+        const input = document.getElementById(`profile-field-${key}`);
+        if (input && input.value.trim()) {
+            const value = input.value.trim();
+            let isValid = true;
+            
+            switch (key) {
+                case 'email':
+                    isValid = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value);
+                    break;
+                case 'picture':
+                case 'banner':
+                    isValid = /^https?:\/\/.+/.test(value);
+                    break;
+                case 'website':
+                    isValid = /^https?:\/\/.+/.test(value);
+                    break;
+                case 'lud16':
+                case 'nip05':
+                    isValid = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value);
+                    break;
+            }
+            
+            if (!isValid) {
+                hasValidationErrors = true;
+                invalidFields.push(key);
+                this.validateProfileField(key, input);
+            }
+        }
+    }
+    
+    if (hasValidationErrors) {
+        notificationService.showError(`Please fix validation errors in: ${invalidFields.join(', ')}`);
+        // Scroll to first invalid field
+        const firstInvalid = document.getElementById(`profile-field-${invalidFields[0]}`);
+        if (firstInvalid) {
+            firstInvalid.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            firstInvalid.focus();
+        }
         return;
     }
 
@@ -4314,7 +4689,12 @@ NostrMailApp.prototype.updateProfile = async function() {
 
         // Update the editable fields
         this.editableProfileFields = { ...cleanedFields };
+        // Reset original state to current state (no changes after successful update)
+        this.originalProfileFields = JSON.parse(JSON.stringify(this.editableProfileFields));
         this.renderProfileFieldsList(this.editableProfileFields);
+        
+        // Disable button after successful update (no changes)
+        this.checkProfileFormChanges();
 
         notificationService.showSuccess('Profile updated successfully');
 
@@ -4322,11 +4702,12 @@ NostrMailApp.prototype.updateProfile = async function() {
         console.error('Failed to update profile:', error);
         notificationService.showError('Failed to update profile: ' + error);
     } finally {
-        // Re-enable the button
+        // Restore button state based on form changes
         const updateBtn = document.getElementById('update-profile-btn');
         if (updateBtn) {
-            updateBtn.disabled = false;
             updateBtn.innerHTML = '<i class="fas fa-save"></i> Update Profile';
+            // Check if there are still changes (in case update failed, button should be enabled if changes exist)
+            this.checkProfileFormChanges();
         }
     }
 }
@@ -4364,7 +4745,7 @@ NostrMailApp.prototype.setDarkMode = function(enabled) {
     }
     const text = document.getElementById('dark-mode-text');
     if (text) {
-        text.textContent = enabled ? 'Disable Dark Mode' : 'Enable Dark Mode';
+        text.textContent = enabled ? 'Enable Light Mode' : 'Enable Dark Mode';
     }
     const label = document.getElementById('theme-label');
     if (label) {
@@ -4404,6 +4785,8 @@ NostrMailApp.prototype.renderProfileEmailWarning = function() {
             this.editableProfileFields.email = settingsEmail;
             this.renderProfileFieldsList(this.editableProfileFields);
             this.renderProfileEmailWarning();
+            // Check if form has changed and update button state
+            this.checkProfileFormChanges();
         };
     } else {
         warningDiv.innerHTML = '';
@@ -4525,7 +4908,7 @@ NostrMailApp.prototype.retryRelayConnection = async function(relayId, relayUrl) 
     
     try {
         // Show connecting status
-        this.updateSingleRelayStatus(relayUrl, 'Connecting');
+        this.updateSingleRelayStatus(relayUrl, 'Connecting', null);
         notificationService.showInfo(`🔄 Retrying connection to ${relayUrl}...`);
         
         // Attempt to reconnect by toggling the relay off and on
@@ -4540,29 +4923,30 @@ NostrMailApp.prototype.retryRelayConnection = async function(relayId, relayUrl) 
                 const status = relayStatuses.find(s => s.url === relayUrl);
                 
                 if (status) {
-                    this.updateSingleRelayStatus(relayUrl, status.status);
+                    this.updateSingleRelayStatus(relayUrl, status.status, status.error_message);
                     
                     if (status.status === 'Connected') {
                         notificationService.showSuccess(`✅ Successfully reconnected to ${relayUrl}`);
                         // Re-render to remove retry button
                         await this.renderRelays();
                     } else {
-                        notificationService.showError(`❌ Retry failed for ${relayUrl}. Check relay URL and network connection.`);
+                        const errorMsg = status.error_message ? `: ${status.error_message}` : '';
+                        notificationService.showError(`❌ Retry failed for ${relayUrl}${errorMsg}`);
                     }
                 } else {
-                    this.updateSingleRelayStatus(relayUrl, 'Disconnected');
+                    this.updateSingleRelayStatus(relayUrl, 'Disconnected', null);
                     notificationService.showError(`❌ Retry failed for ${relayUrl}`);
                 }
             } catch (error) {
                 console.error('Failed to verify retry status:', error);
-                this.updateSingleRelayStatus(relayUrl, 'Disconnected');
+                this.updateSingleRelayStatus(relayUrl, 'Disconnected', null);
                 notificationService.showError(`❌ Retry failed for ${relayUrl}: ${error}`);
             }
         }, 3000); // Give more time for connection to establish
         
     } catch (error) {
         console.error('Failed to retry relay connection:', error);
-        this.updateSingleRelayStatus(relayUrl, 'Disconnected');
+        this.updateSingleRelayStatus(relayUrl, 'Disconnected', null);
         notificationService.showError(`Failed to retry connection: ${error}`);
     }
 }
@@ -4581,7 +4965,7 @@ NostrMailApp.prototype.updateRelayStatusOnly = async function() {
         
         if (isExpanded) {
             relayStatuses.forEach(status => {
-                this.updateSingleRelayStatus(status.url, status.status);
+                this.updateSingleRelayStatus(status.url, status.status, status.error_message);
             });
             
             // Check if we need to re-render to show/hide retry buttons

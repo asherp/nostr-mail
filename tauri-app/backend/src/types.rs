@@ -126,6 +126,7 @@ pub struct RelayStatus {
     pub url: String,
     pub is_active: bool,
     pub status: RelayConnectionStatus,
+    pub error_message: Option<String>, // Error message if the relay failed to connect
 }
 
 /// Represents an email attachment
@@ -174,4 +175,15 @@ pub struct TransportAuthVerdict {
     pub transport_verified: bool,
     pub method: TransportAuthMethod,
     pub reason: String,
+}
+
+/// Result structure for follow list fetch that distinguishes between no event found vs empty event
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowListResult {
+    /// List of followed pubkeys (empty if event has no tags)
+    pub pubkeys: Vec<String>,
+    /// True if a kind 3 event was found on relays (even if it has 0 tags)
+    pub event_found: bool,
+    /// ID of the latest contact list event found (if any)
+    pub event_id: Option<String>,
 } 

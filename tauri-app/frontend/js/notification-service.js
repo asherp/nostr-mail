@@ -202,10 +202,11 @@ class NotificationService {
                 left: 0;
                 width: 100%;
                 height: 100%;
-                z-index: 1002;
+                z-index: 10000;
                 display: flex;
                 align-items: center;
                 justify-content: center;
+                pointer-events: auto;
             `;
             
             const overlay = modal.querySelector('.confirmation-overlay');
@@ -260,12 +261,19 @@ class NotificationService {
                 resolve(true);
             });
             
-            // Close on overlay click
+            // Close on overlay click - prevent event propagation to avoid triggering navigation
             overlay.addEventListener('click', (e) => {
                 if (e.target === overlay) {
+                    e.stopPropagation();
+                    e.preventDefault();
                     cleanup();
                     resolve(false);
                 }
+            });
+            
+            // Prevent clicks inside the dialog from bubbling up
+            dialog.addEventListener('click', (e) => {
+                e.stopPropagation();
             });
             
             // Focus OK button

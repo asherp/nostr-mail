@@ -164,6 +164,9 @@ const TauriService = {
     fetchProfilePersistent: async function(pubkey) {
         return await this.invoke('fetch_profile_persistent', { pubkey });
     },
+    decodeNostrIdentifier: async function(identifier) {
+        return await this.invoke('decode_nostr_identifier', { identifier });
+    },
     fetchFollowingProfiles: async function(privateKey, relays) {
         return await this.invoke('fetch_following_profiles', { privateKey, relays });
     },
@@ -173,8 +176,8 @@ const TauriService = {
     publishNostrEvent: async function(privateKey, content, kind, tags, relays) {
         return await this.invoke('publish_nostr_event', { privateKey, content, kind, tags, relays });
     },
-    followUser: async function(privateKey, pubkeyToFollow, relays) {
-        return await this.invoke('follow_user', { privateKey, pubkeyToFollow, relays });
+    followUser: async function(privateKey, pubkeyToFollow) {
+        return await this.invoke('follow_user', { privateKey, pubkeyToFollow });
     },
     publishFollowList: async function(privateKey, userPubkey, relays) {
         return await this.invoke('publish_follow_list', { privateKey, userPubkey, relays });
@@ -442,6 +445,9 @@ const TauriService = {
     // Fetch single profile using persistent client (more efficient)
     fetchProfilePersistent: async function(pubkey) {
         return await this.invoke('fetch_profile_persistent', { pubkey });
+    },
+    decodeNostrIdentifier: async function(identifier) {
+        return await this.invoke('decode_nostr_identifier', { identifier });
     },
     // Fetch profiles using persistent client (more efficient)
     fetchProfilesPersistent: async function(pubkeys) {

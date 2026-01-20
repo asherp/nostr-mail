@@ -76,7 +76,7 @@
             </nav>
             
             <div class="sidebar-footer">
-                <span class="version-text">v1.0.2-beta</span>
+                <span class="version-text">v1.0.4-beta</span>
             </div>
         </aside>
 
@@ -314,9 +314,6 @@
                         <button id="refresh-contacts-btn" class="btn btn-secondary">
                             <i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>
                         </button>
-                        <button id="export-npubs-btn" class="btn btn-secondary">
-                            <i class="fas fa-download"></i> <span class="btn-text">Export Contacts</span>
-                        </button>
                         <button id="add-contact-btn" class="btn btn-primary">
                             <i class="fas fa-plus"></i> <span class="btn-text">Add Contact</span>
                         </button>
@@ -369,7 +366,7 @@
                         <div id="profile-fields-list" class="profile-fields-list"></div>
                         <div class="form-actions">
                             
-                            <button id="update-profile-btn" class="btn btn-primary" type="submit">
+                            <button id="update-profile-btn" class="btn btn-primary" type="submit" disabled>
                                 <i class="fas fa-save"></i> Update Profile
                             </button>
                         </div>
@@ -398,6 +395,12 @@
                         <div class="settings-section-content">
                         <!-- Login to your nostr account -->
                         <h4 style="margin-top: 0; margin-bottom: 16px; font-weight: 600;">Login to your nostr account:</h4>
+                        
+                        <!-- Pre-release warning -->
+                        <div id="pre-release-warning" class="pre-release-warning" style="margin-bottom: 16px; padding: 12px 16px; background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; color: #856404;">
+                            <i class="fas fa-exclamation-triangle" style="margin-right: 8px;"></i>
+                            <span>⚠️ Heads up! This is a pre-release build and may have bugs. We recommend generating a new keypair rather than using an existing one.</span>
+                        </div>
                         
                         <div class="form-group">
                             <label for="npriv-key">Private Key (nsec/npriv):</label>
@@ -651,11 +654,12 @@
                                     <div class="form-group">
                                         <label for="new-relay-url">Add Relay:</label>
                                         <div class="input-with-button">
-                                            <input type="text" id="new-relay-url" placeholder="wss://relay.example.com">
+                                            <input type="text" id="new-relay-url" placeholder="ws://10.0.2.2:8080 or wss://relay.example.com" pattern="^(ws|wss)://.*" required autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
                                             <button id="add-relay-btn" class="btn btn-secondary">
                                                 <i class="fas fa-plus"></i> Add
                                             </button>
                                         </div>
+                                        <small class="form-text text-muted" style="display: block; margin-top: 4px; font-size: 0.875em;">Relay URL must start with ws:// or wss:// (use ws:// for local testing)</small>
                                     </div>
                                 </div>
                             </div>

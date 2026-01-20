@@ -5,6 +5,16 @@ use std::time::Duration;
 use serde::{Serialize, Deserialize};
 use base64::engine::{general_purpose, Engine as _};
 
+// Helper function to initialize rustls crypto provider on Android
+// This must be called before creating any Client instances that will make WebSocket connections
+pub fn init_android_rustls() {
+    #[cfg(target_os = "android")]
+    {
+        // Try to install default provider, but don't fail if already installed
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 fn parse_pubkey(pubkey: &str) -> anyhow::Result<nostr_sdk::prelude::PublicKey> {
     if pubkey.starts_with("npub1") {
         nostr_sdk::prelude::PublicKey::from_bech32(pubkey).map_err(|e| anyhow::anyhow!(e))
@@ -15,6 +25,38 @@ fn parse_pubkey(pubkey: &str) -> anyhow::Result<nostr_sdk::prelude::PublicKey> {
     }
 }
 
+/// Create and sign an AUTH event (kind 22242) for NIP-42 authentication
+/// 
+/// The AUTH event must include:
+/// - kind: 22242
+/// - tags: ["relay", "<relay-url>"] and ["challenge", "<challenge-string>"]
+/// - created_at: current timestamp
+/// - signed with the user's private key
+pub fn create_auth_event(
+    private_key: &str,
+    relay_url: &str,
+    challenge: &str,
+) -> Result<Event> {
+    // Parse private key from bech32 format
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let keys = Keys::new(secret_key);
+    
+    // Normalize relay URL (remove trailing slash if present)
+    let normalized_relay_url = relay_url.trim_end_matches('/');
+    
+    // Create AUTH event with kind 22242
+    let event = EventBuilder::new(
+        Kind::from(22242u16),
+        "", // AUTH events have empty content
+    )
+    .tag(Tag::parse(["relay", normalized_relay_url])?)
+    .tag(Tag::parse(["challenge", challenge])?)
+    .build(keys.public_key())
+    .sign_with_keys(&keys)?;
+    
+    Ok(event)
+}
+
 pub async fn publish_event(
     private_key: &str,
     content: &str,
@@ -22,6 +64,9 @@ pub async fn publish_event(
     tags: Vec<Vec<String>>,
     relays: &[String],
 ) -> Result<String> {
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     // Parse private key from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key);
@@ -69,6 +114,9 @@ pub async fn send_direct_message(
     message: &str,
     relays: &[String],
 ) -> Result<String> {
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     // Parse keys from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key.clone());
@@ -134,6 +182,9 @@ pub async fn send_direct_message_with_content(
     relays: &[String],
     encryption_algorithm: Option<&str>,
 ) -> Result<String> {
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     // Parse keys from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key.clone());
@@ -268,29 +319,12 @@ pub struct ConversationMessage {
     pub is_sent: bool,
 }
 
-pub async fn fetch_direct_messages(
-    private_key: &str,
-    relays: &[String],
+/// Fetch direct messages using a provided client (for use with persistent client)
+pub async fn fetch_direct_messages_with_client(
+    client: &Client,
+    keys: &Keys,
     since: Option<i64>,
 ) -> Result<Vec<NostrEvent>> {
-    // Parse private key from bech32 format
-    let secret_key = SecretKey::from_bech32(private_key)?;
-    let keys = Keys::new(secret_key);
-    let client = Client::new(keys.clone());
-    
-    // Add relays
-    for relay in relays {
-        client.add_relay(relay.clone()).await?;
-    }
-    
-    // If no relays provided, use defaults
-    if relays.is_empty() {
-        client.add_relay("wss://nostr-pub.wellorder.net").await?;
-        client.add_relay("wss://relay.damus.io").await?;
-    }
-    
-    client.connect().await;
-    
     // Create filter for encrypted direct messages - fetch both sent and received
     let mut sent_filter = Filter::new()
         .kind(Kind::EncryptedDirectMessage)
@@ -305,8 +339,9 @@ pub async fn fetch_direct_messages(
     }
     
     // Get events for both sent and received
-    let sent_events = client.fetch_events(sent_filter, Duration::from_secs(10)).await?;
-    let received_events = client.fetch_events(received_filter, Duration::from_secs(10)).await?;
+    // Use shorter timeout (2 seconds) optimized for mock servers, same as profile fetch
+    let sent_events = client.fetch_events(sent_filter, Duration::from_secs(2)).await?;
+    let received_events = client.fetch_events(received_filter, Duration::from_secs(2)).await?;
     
     // Combine and deduplicate events
     let mut all_events = sent_events;
@@ -339,6 +374,32 @@ pub async fn fetch_direct_messages(
     }).collect();
     
     Ok(nostr_events)
+}
+
+pub async fn fetch_direct_messages(
+    private_key: &str,
+    relays: &[String],
+    since: Option<i64>,
+) -> Result<Vec<NostrEvent>> {
+    // Parse private key from bech32 format
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let keys = Keys::new(secret_key);
+    let client = Client::new(keys.clone());
+    
+    // Add relays
+    for relay in relays {
+        client.add_relay(relay.clone()).await?;
+    }
+    
+    // If no relays provided, use defaults
+    if relays.is_empty() {
+        client.add_relay("wss://nostr-pub.wellorder.net").await?;
+        client.add_relay("wss://relay.damus.io").await?;
+    }
+    
+    client.connect().await;
+    
+    fetch_direct_messages_with_client(&client, &keys, since).await
 }
 
 pub async fn fetch_events(
@@ -482,6 +543,9 @@ pub async fn fetch_following_profiles(
     println!("[NOSTR] fetch_following_profiles called");
     println!("[NOSTR] Using relays: {:?}", relays);
     
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key);
     let client = Client::new(keys.clone());
@@ -605,6 +669,10 @@ pub async fn fetch_following_pubkeys(
 ) -> Result<Vec<String>> {
     println!("[NOSTR] fetch_following_pubkeys called for pubkey: {}", pubkey);
     println!("[NOSTR] Using relays: {:?}", relays);
+    
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
+    
     let pubkey = match PublicKey::from_bech32(pubkey) {
         Ok(pk) => pk,
         Err(_) => PublicKey::from_hex(pubkey)?
@@ -711,6 +779,9 @@ pub async fn fetch_conversations(
     relays: &[String],
 ) -> Result<Vec<Conversation>> {
     println!("[NOSTR] fetch_conversations called");
+    
+    // Initialize rustls on Android before creating client
+    init_android_rustls();
     
     let secret_key = SecretKey::from_bech32(private_key)?;
     let keys = Keys::new(secret_key);

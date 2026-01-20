@@ -1,7 +1,9 @@
-name: nostr-mail
+name: NostrMail
 summary: A modern, cross-platform email encryption tool that bridges Nostr and email protocols
 description: |
-  Nostr-mail encrypts email content using a symmetric key derived from a combination of the sender's private key and the receiver's public key. Both sender and receiver derive a shared secret known only to them, which is used to protect their communications.
+  ⚠️ **Pre-release Notice:** This is a pre-release build and may have bugs. We recommend generating a new keypair rather than using an existing one.
+  
+  NostrMail encrypts email content using a symmetric key derived from a combination of the sender's private key and the receiver's public key. Both sender and receiver derive a shared secret known only to them, which is used to protect their communications.
   
   This application can use any email server for delivery while leveraging Nostr's decentralized social key registry for key discovery and management.
   
@@ -12,10 +14,12 @@ description: |
   - Profile management with Nostr social key registry
   - Cross-platform support (Windows, macOS, Linux, Android)
 repository: https://github.com/asherp/nostr-mail
-homepage: https://github.com/asherp/nostr-mail
+homepage: https://nostr-mail.com
 icon: tauri-app/backend/icons/icon.png
 tags: nostr email encryption privacy freedom-tech pgp
+license: Apache-2.0
 assets:
-  - tauri-app/backend/gen/android/app/build/outputs/apk/.*release.*.apk
+  - tauri-app/backend/gen/android/app/build/outputs/apk/universal/release/.*\.apk
+  - NostrMail.*\.dmg
 remote_metadata:
   - github

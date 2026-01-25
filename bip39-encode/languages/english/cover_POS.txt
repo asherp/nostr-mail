@@ -21,6 +21,7 @@ anyone|Pron
 anyway|Adv
 appeal|N
 apply|V
+appointment|N
 are|V
 arise|V
 aside|Adv,N
@@ -148,6 +149,7 @@ ease|N
 eat|V,N
 editor|N
 effect|N
+email|N,V
 elect|V,Adj
 ethnic|Adj
 even|Adv
@@ -189,6 +191,9 @@ fourth|N
 free|Adj
 freeze|N
 from|Prep
+fw|N
+fwd|N
+fyi|N
 full|Adj
 fully|Adv
 fund|N
@@ -226,6 +231,7 @@ heel|N
 hell|N
 here|Adv
 hey|Intj
+hi|Intj
 hide|V,N
 highly|Adv
 hit|V,N
@@ -237,6 +243,7 @@ house|N
 how|Adv
 hunter|N
 ideal|Adj
+important|Adj
 imply|V
 indeed|Adv
 insist|V
@@ -301,6 +308,7 @@ may|Modal
 maybe|N
 mayor|N
 meal|Adj
+meeting|N
 medium|Adj
 meet|N
 mental|Adj
@@ -400,6 +408,7 @@ rank|N
 rarely|Adv
 rating|N,V
 ratio|N
+re|N
 reach|N
 react|V,N
 read|V,N
@@ -409,10 +418,13 @@ recent|Adj
 red|N,Adj
 refer|V,N
 regard|N
+regarding|Prep
+reminder|N
 regime|N
 relate|V
 remote|Adj
 reply|Adv
+request|N,V
 resort|N
 rest|N
 retain|V
@@ -435,6 +447,7 @@ sales|N
 saving|N,Adj,Prep,V
 scared|Adj,V
 scope|N
+schedule|N,V
 score|N
 scream|N
 sector|N
@@ -547,6 +560,7 @@ troop|N
 union|N
 unless|Conj,Prep
 unlike|Prep,Adj
+urgent|Adj
 user|N
 value|N
 vary|N
@@ -590,7 +604,11 @@ writer|N
 yeah|Adv,N
 yell|N
 yes|N
+yesterday|Adv,N
 yet|Adv
 yield|N
 your|N
 yours|N
+Re:|Prefix
+Fwd:|Prefix
+Fw:|Prefix

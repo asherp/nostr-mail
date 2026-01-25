@@ -874,7 +874,7 @@ home|N,Adj,Adv,V
 honey|N,V
 hood|N,V
 hope|V
-horn|N,V
+horn|N
 horror|N
 horse|N,V
 hospital|N

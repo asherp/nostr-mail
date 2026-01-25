@@ -17,9 +17,19 @@ enum Pos {
     Adj,
     N,
     V,
+    Modal,
+    Aux,
+    Cop,
+    To,
     Prep,
     Adv,
     Dot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Number {
+    Singular,
+    Plural,
 }
 
 #[derive(Clone, Debug)]
@@ -43,14 +53,18 @@ impl PayloadTok {
 #[derive(Clone, Debug)]
 struct Lexicon {
     by_pos: HashMap<Pos, Vec<String>>,
+    /// Lowercased payload words (for filtering / repetition logic).
     payload_set: HashSet<String>,
+    /// Lowercased full BIP39 set (for collision checks when inflecting cover words).
+    bip39_set: HashSet<String>,
 }
 
 impl Lexicon {
-    fn new(payload_set: HashSet<String>) -> Self {
+    fn new(payload_set: HashSet<String>, bip39_set: HashSet<String>) -> Self {
         Self {
             by_pos: HashMap::new(),
             payload_set,
+            bip39_set,
         }
     }
 
@@ -74,7 +88,7 @@ impl Lexicon {
         let available: Vec<&String> = list
             .iter()
             .filter(|w| {
-                !self.payload_set.contains(*w) && 
+                !self.payload_set.contains(&w.to_lowercase()) && 
                 !recent_words.iter().any(|&rw| rw == w.as_str())
             })
             .collect();
@@ -83,7 +97,7 @@ impl Lexicon {
             // If all words would be repeats, fall back to any non-payload word
             let fallback: Vec<&String> = list
                 .iter()
-                .filter(|w| !self.payload_set.contains(*w))
+                .filter(|w| !self.payload_set.contains(&w.to_lowercase()))
                 .collect();
             if fallback.is_empty() {
                 panic!("No available cover words for {:?}", pos);
@@ -122,8 +136,15 @@ fn expand_cfg<R: Rng>(rng: &mut R, sym: Sym, out: &mut Vec<Pos>, min_len: usize,
                     if let Some(pos) = start_pos {
                         match pos {
                             Pos::N => {
-                                // Start with determiner + noun: Det N VP Dot
-                                vec![Sym::T(Pos::Det), Sym::T(Pos::N), Sym::NT("VP"), Sym::T(Pos::Dot)]
+                                // Allow nouns to start sentences directly (N VP Dot) or with determiner (Det N VP Dot)
+                                // Prefer direct start (70%) to prioritize input words, but sometimes use determiner (30%) for variety
+                                if rng.gen_bool(0.7) {
+                                    // Start directly with noun: N VP Dot (e.g., "Wallet could check...")
+                                    vec![Sym::T(Pos::N), Sym::NT("VP"), Sym::T(Pos::Dot)]
+                                } else {
+                                    // Start with determiner + noun: Det N VP Dot (e.g., "The wallet could check...")
+                                    vec![Sym::T(Pos::Det), Sym::T(Pos::N), Sym::NT("VP"), Sym::T(Pos::Dot)]
+                                }
                             }
                             Pos::V => {
                                 // Start with verb: V NP Dot (imperative)
@@ -132,6 +153,10 @@ fn expand_cfg<R: Rng>(rng: &mut R, sym: Sym, out: &mut Vec<Pos>, min_len: usize,
                             Pos::Adj => {
                                 // Start with adjective: Adj N VP Dot
                                 vec![Sym::T(Pos::Adj), Sym::T(Pos::N), Sym::NT("VP"), Sym::T(Pos::Dot)]
+                            }
+                            Pos::Modal | Pos::Aux | Pos::Cop | Pos::To => {
+                                // These are cover-only helpers; don't force the sentence to start with them.
+                                vec![Sym::NT("NP"), Sym::NT("VP"), Sym::T(Pos::Dot)]
                             }
                             Pos::Adv => {
                                 // Start with adverb: Adv V NP Dot
@@ -156,37 +181,39 @@ fn expand_cfg<R: Rng>(rng: &mut R, sym: Sym, out: &mut Vec<Pos>, min_len: usize,
                     }
                 }
                 "NP" => {
-                    // NP -> Det Adj* N (Adj* = 0..2, but increase if we want length)
-                    let extra = if want_long { 2 } else { 0 };
-                    let k = rng.gen_range(0..=2) + extra;
+                    // NP -> Det Adj? N (Adj? = 0 or 1, max 1 adjective for naturalness)
+                    let has_adj = rng.gen_bool(0.5); // 50% chance of having one adjective
 
                     let mut p = vec![Sym::T(Pos::Det)];
-                    for _ in 0..k {
-                        // occasional adverb-as-intensifier in adj slot? keep it simple: just Adj
+                    if has_adj {
                         p.push(Sym::T(Pos::Adj));
                     }
                     p.push(Sym::T(Pos::N));
                     p
                 }
                 "VP" => {
-                    // VP choices:
-                    //  - V
-                    //  - V NP
-                    //  - Adv V NP
-                    //  - V NP PP
-                    // Bias to longer if want_long.
+                    // Simplified VP patterns for naturalness:
+                    //  - Modal V NP        (e.g., "could check the wallet")
+                    //  - Cop Adj            (e.g., "is secure")
+                    //  - Cop Adj PP         (e.g., "is secure in the system")
+                    //  - V NP               (imperative/intransitive, when natural)
+                    // Removed awkward patterns:
+                    //  - Modal V (no object) - produces "should everything"
+                    //  - Aux V NP           - produces "does legitimate" which is awkward
                     if want_long {
-                        match rng.gen_range(0..3) {
-                            0 => vec![Sym::T(Pos::V), Sym::NT("NP")],
-                            1 => vec![Sym::T(Pos::Adv), Sym::T(Pos::V), Sym::NT("NP")],
-                            _ => vec![Sym::T(Pos::V), Sym::NT("NP"), Sym::NT("PP")],
+                        // Long mode: Modal V NP (40%), Modal V NP PP (20%), Cop Adj (20%), Cop Adj PP (20%)
+                        match rng.gen_range(0..10) {
+                            0..=3 => vec![Sym::T(Pos::Modal), Sym::T(Pos::V), Sym::NT("NP")],
+                            4..=5 => vec![Sym::T(Pos::Modal), Sym::T(Pos::V), Sym::NT("NP"), Sym::NT("PP")],
+                            6..=7 => vec![Sym::T(Pos::Cop), Sym::T(Pos::Adj)],
+                            _ => vec![Sym::T(Pos::Cop), Sym::T(Pos::Adj), Sym::NT("PP")],
                         }
                     } else {
-                        match rng.gen_range(0..4) {
-                            0 => vec![Sym::T(Pos::V)],
-                            1 => vec![Sym::T(Pos::V), Sym::NT("NP")],
-                            2 => vec![Sym::T(Pos::Adv), Sym::T(Pos::V), Sym::NT("NP")],
-                            _ => vec![Sym::T(Pos::V), Sym::NT("NP"), Sym::NT("PP")],
+                        // Short mode: Modal V NP (60%), Cop Adj (30%), V NP (10%)
+                        match rng.gen_range(0..10) {
+                            0..=5 => vec![Sym::T(Pos::Modal), Sym::T(Pos::V), Sym::NT("NP")],
+                            6..=8 => vec![Sym::T(Pos::Cop), Sym::T(Pos::Adj)],
+                            _ => vec![Sym::T(Pos::V), Sym::NT("NP")],
                         }
                     }
                 }
@@ -210,6 +237,27 @@ fn starts_with_vowel_sound(word: &str) -> bool {
     matches!(first_char, 'a' | 'e' | 'i' | 'o' | 'u')
 }
 
+fn pluralize_cover_noun(s: &str) -> String {
+    // Conservative, ASCII-only rules are fine here because cover lexicon is lowercase ASCII.
+    if s.is_empty() {
+        return String::new();
+    }
+    // If it's already plural-ish, leave it (avoid "classs").
+    if s.ends_with('s') {
+        return s.to_string();
+    }
+    if s.ends_with("ch") || s.ends_with("sh") || s.ends_with('x') || s.ends_with('z') {
+        return format!("{s}es");
+    }
+    if s.ends_with('y') && s.len() >= 2 {
+        let prev = s.as_bytes()[s.len() - 2] as char;
+        if !matches!(prev, 'a' | 'e' | 'i' | 'o' | 'u') {
+            return format!("{}ies", &s[..s.len() - 1]);
+        }
+    }
+    format!("{s}s")
+}
+
 /// Fill a slot stream with cover words + payload words (in-order).
 /// Returns (words, payload_embedded_count).
 /// `prev_words` are the last few words from the previous sentence (if any), to prevent repetition across sentences.
@@ -225,6 +273,10 @@ fn fill_slots<R: Rng>(
     const REPETITION_WINDOW: usize = 3; // Check last 3 words to avoid repetition
     // Cache for words picked early (for a/an selection) to reuse later
     let mut word_cache: HashMap<usize, String> = HashMap::new();
+    // Noun number chosen per NP, keyed by the noun slot index within this sentence.
+    let mut noun_number: HashMap<usize, Number> = HashMap::new();
+    // Only used for agreement when we introduce Aux/Cop later; keep it stable now.
+    let mut subject_number: Option<Number> = None;
 
     for (i, &slot) in slots.iter().enumerate() {
         match slot {
@@ -236,10 +288,50 @@ fn fill_slots<R: Rng>(
                 }
             }
             Pos::Det => {
+                // Allow embedding payload determiners (e.g., "this", "that") without mutation.
+                if *payload_i < payload.len() && payload_fits(&payload[*payload_i], Pos::Det) {
+                    out.push(payload[*payload_i].word.clone());
+                    *payload_i += 1;
+                    continue;
+                }
+
                 // Build recent words list: prev_words + last few words from current output
                 let mut recent_words: Vec<&str> = prev_words.to_vec();
                 let start_idx = out.len().saturating_sub(REPETITION_WINDOW);
                 recent_words.extend(out[start_idx..].iter().map(|s| s.as_str()));
+
+                // Determine NP number (singular/plural) for this NP.
+                // We force the first NP (likely the subject) to singular to reduce agreement issues
+                // when payload nouns are embedded (payload spelling cannot be pluralized).
+                let mut np_number = if subject_number.is_none() {
+                    Number::Singular
+                } else if rng.gen_bool(0.25) {
+                    Number::Plural
+                } else {
+                    Number::Singular
+                };
+
+                // Locate the noun slot for this NP (Det Adj? N).
+                let mut noun_idx = None;
+                let mut j = i + 1;
+                while j < slots.len() && slots[j] == Pos::Adj {
+                    j += 1;
+                }
+                if j < slots.len() && slots[j] == Pos::N {
+                    noun_idx = Some(j);
+                }
+
+                // Record subject number on first NP.
+                if subject_number.is_none() {
+                    subject_number = Some(np_number);
+                }
+
+                if let Some(ni) = noun_idx {
+                    noun_number.insert(ni, np_number);
+                } else {
+                    // No noun slot ahead; fall back to singular-safe determiners.
+                    np_number = Number::Singular;
+                }
                 
                 // Determine what the next word will be (for a/an selection)
                 let next_word_str = if *payload_i < payload.len() {
@@ -272,24 +364,37 @@ fn fill_slots<R: Rng>(
                     None
                 };
 
-                let det_word = if let Some(next) = next_word_str {
-                    // Choose a/an based on next word
-                    if starts_with_vowel_sound(next) {
-                        "an".to_string()
-                    } else {
-                        "a".to_string()
+                let det_word = match np_number {
+                    Number::Singular => {
+                        // Use a/an sometimes when we know the next word, otherwise choose a safer determiner.
+                        if let Some(next) = next_word_str {
+                            if rng.gen_bool(0.35) {
+                                if starts_with_vowel_sound(next) {
+                                    "an".to_string()
+                                } else {
+                                    "a".to_string()
+                                }
+                            } else {
+                                let det_options = ["the", "each", "some"];
+                                det_options.choose(rng).unwrap().to_string()
+                            }
+                        } else {
+                            let det_options = ["the", "each", "some"];
+                            det_options.choose(rng).unwrap().to_string()
+                        }
                     }
-                } else {
-                    // Default: pick randomly from determiners (excluding a/an to avoid conflicts)
-                    let det_options = ["the", "these", "those", "each", "some"];
-                    det_options.choose(rng).unwrap().to_string()
+                    Number::Plural => {
+                        // Avoid these/those because payload nouns cannot be pluralized.
+                        let det_options = ["the", "some"];
+                        det_options.choose(rng).unwrap().to_string()
+                    }
                 };
 
                 // Check if this determiner would repeat a recent word
                 // If so and it's not a/an, pick a different one
                 let final_det = if recent_words.contains(&det_word.as_str()) && det_word != "a" && det_word != "an" {
                     // Avoid repetition for non-a/an determiners
-                    let det_options = ["the", "these", "those", "each", "some"];
+                    let det_options = ["the", "each", "some"];
                     det_options.iter()
                         .find(|&&d| !recent_words.contains(&d))
                         .copied()
@@ -314,7 +419,43 @@ fn fill_slots<R: Rng>(
                         let mut recent_words: Vec<&str> = prev_words.to_vec();
                         let start_idx = out.len().saturating_sub(REPETITION_WINDOW);
                         recent_words.extend(out[start_idx..].iter().map(|s| s.as_str()));
-                        let cover_word = lex.pick_cover(rng, slot, &recent_words);
+                        let cover_word = if slot == Pos::Aux {
+                            match subject_number.unwrap_or(Number::Singular) {
+                                Number::Singular => "does".to_string(),
+                                Number::Plural => "do".to_string(),
+                            }
+                        } else if slot == Pos::Cop {
+                            match subject_number.unwrap_or(Number::Singular) {
+                                Number::Singular => "is".to_string(),
+                                Number::Plural => "are".to_string(),
+                            }
+                        } else if slot == Pos::To {
+                            "to".to_string()
+                        } else if slot == Pos::N {
+                            let num = noun_number.get(&i).copied().unwrap_or(Number::Singular);
+                            match num {
+                                Number::Singular => lex.pick_cover(rng, slot, &recent_words),
+                                Number::Plural => {
+                                    // Attempt a few times to find a plural that won't collide with BIP39.
+                                    const MAX_TRIES: usize = 8;
+                                    let mut chosen = None;
+                                    for _ in 0..MAX_TRIES {
+                                        let base = lex.pick_cover(rng, slot, &recent_words);
+                                        let plural = pluralize_cover_noun(&base);
+                                        let plural_lc = plural.to_lowercase();
+                                        if !lex.bip39_set.contains(&plural_lc)
+                                            && !recent_words.iter().any(|&rw| rw == plural_lc.as_str())
+                                        {
+                                            chosen = Some(plural);
+                                            break;
+                                        }
+                                    }
+                                    chosen.unwrap_or_else(|| lex.pick_cover(rng, slot, &recent_words))
+                                }
+                            }
+                        } else {
+                            lex.pick_cover(rng, slot, &recent_words)
+                        };
                         out.push(cover_word);
                     }
                 }
@@ -354,47 +495,28 @@ fn generate_text<R: Rng>(
             min_words_per_sentence
         };
 
-        // For the first sentence, start with the first payload word's POS
-        let start_pos = if payload_i == 0 && !payload.is_empty() {
-            // Get the first allowed POS for the first payload word
+        // Prioritize input words for ALL sentences by starting with the next payload word's POS
+        let start_pos = if payload_i < payload.len() {
+            // Get the next payload word's allowed POS tags
             // Prefer N, V, Adj in that order for better grammar
-            let first_word = &payload[0];
-            if first_word.allowed.contains(&Pos::N) {
+            let next_word = &payload[payload_i];
+            if next_word.allowed.contains(&Pos::N) {
                 Some(Pos::N)
-            } else if first_word.allowed.contains(&Pos::V) {
+            } else if next_word.allowed.contains(&Pos::V) {
                 Some(Pos::V)
-            } else if first_word.allowed.contains(&Pos::Adj) {
+            } else if next_word.allowed.contains(&Pos::Adj) {
                 Some(Pos::Adj)
-            } else if first_word.allowed.contains(&Pos::Adv) {
+            } else if next_word.allowed.contains(&Pos::Adv) {
                 Some(Pos::Adv)
-            } else if first_word.allowed.contains(&Pos::Prep) {
+            } else if next_word.allowed.contains(&Pos::Prep) {
                 Some(Pos::Prep)
             } else {
                 // Fallback to first available POS
-                first_word.allowed.iter().next().copied()
+                next_word.allowed.iter().next().copied()
             }
         } else {
             None
         };
-
-        let mut slots = Vec::new();
-        expand_cfg(rng, Sym::NT("S"), &mut slots, sentence_min, start_pos);
-
-        // Print grammar structure in verbose mode
-        if verbose {
-            let grammar_str: Vec<String> = slots.iter().map(|pos| {
-                match pos {
-                    Pos::Det => "Det".to_string(),
-                    Pos::Adj => "Adj".to_string(),
-                    Pos::N => "N".to_string(),
-                    Pos::V => "V".to_string(),
-                    Pos::Prep => "Prep".to_string(),
-                    Pos::Adv => "Adv".to_string(),
-                    Pos::Dot => "Dot".to_string(),
-                }
-            }).collect();
-            eprintln!("Grammar: {}", grammar_str.join(" "));
-        }
 
         // Pass the last few words from previous sentence to prevent repetition across sentences
         const REPETITION_WINDOW: usize = 3;
@@ -409,14 +531,64 @@ fn generate_text<R: Rng>(
             .collect();
         let prev_words_refs: Vec<&str> = prev_words.iter().map(|s| s.as_str()).collect();
         let payload_i_before = payload_i;
-        let mut sentence_words = fill_slots(
-            rng, 
-            lex, 
-            &slots, 
-            payload, 
-            &mut payload_i,
-            &prev_words_refs
-        );
+        
+        // Try to generate a sentence that contains at least one payload word
+        // Retry up to 10 times to avoid infinite loops
+        const MAX_RETRIES: usize = 10;
+        let mut retry_count = 0;
+        let (mut sentence_words, slots) = loop {
+            let mut current_payload_i = payload_i;
+            let mut current_slots = Vec::new();
+            expand_cfg(rng, Sym::NT("S"), &mut current_slots, sentence_min, start_pos);
+            
+            let current_sentence_words = fill_slots(
+                rng, 
+                lex, 
+                &current_slots, 
+                payload, 
+                &mut current_payload_i,
+                &prev_words_refs
+            );
+            
+            // Check if this sentence embedded at least one payload word
+            if current_payload_i > payload_i || retry_count >= MAX_RETRIES {
+                payload_i = current_payload_i;
+                break (current_sentence_words, current_slots);
+            }
+            
+            retry_count += 1;
+            if verbose {
+                eprintln!("Skipping sentence with no payload words (retry {}/{})", retry_count, MAX_RETRIES);
+            }
+        };
+        
+        // If we exhausted retries and still no payload words, we'll include it anyway
+        // (this shouldn't happen in practice if grammar is working correctly)
+        if payload_i == payload_i_before && retry_count >= MAX_RETRIES {
+            if verbose {
+                eprintln!("Warning: Generated sentence with no payload words after {} retries", MAX_RETRIES);
+            }
+        }
+
+        // Print grammar structure in verbose mode
+        if verbose {
+            let grammar_str: Vec<String> = slots.iter().map(|pos| {
+                match pos {
+                    Pos::Det => "Det".to_string(),
+                    Pos::Adj => "Adj".to_string(),
+                    Pos::N => "N".to_string(),
+                    Pos::V => "V".to_string(),
+                    Pos::Modal => "Modal".to_string(),
+                    Pos::Aux => "Aux".to_string(),
+                    Pos::Cop => "Cop".to_string(),
+                    Pos::To => "To".to_string(),
+                    Pos::Prep => "Prep".to_string(),
+                    Pos::Adv => "Adv".to_string(),
+                    Pos::Dot => "Dot".to_string(),
+                }
+            }).collect();
+            eprintln!("Grammar: {}", grammar_str.join(" "));
+        }
 
         // Print actual word-to-POS mapping in verbose mode
         if verbose {
@@ -435,6 +607,10 @@ fn generate_text<R: Rng>(
                         Pos::Adj => "Adj",
                         Pos::N => "N",
                         Pos::V => "V",
+                        Pos::Modal => "Modal",
+                        Pos::Aux => "Aux",
+                        Pos::Cop => "Cop",
+                        Pos::To => "To",
                         Pos::Prep => "Prep",
                         Pos::Adv => "Adv",
                         Pos::Dot => "Dot", // Shouldn't happen here
@@ -448,6 +624,10 @@ fn generate_text<R: Rng>(
                                 Pos::Adj => "Adj",
                                 Pos::N => "N",
                                 Pos::V => "V",
+                                Pos::Modal => "Modal",
+                                Pos::Aux => "Aux",
+                                Pos::Cop => "Cop",
+                                Pos::To => "To",
                                 Pos::Prep => "Prep",
                                 Pos::Adv => "Adv",
                                 Pos::Dot => "Dot",
@@ -464,16 +644,26 @@ fn generate_text<R: Rng>(
             eprintln!("Words:   {}", word_pos_mapping.join(" "));
         }
 
-        // Capitalize the first word of the sentence.
-        if let Some(first) = sentence_words.first_mut() {
-            *first = capitalize(first);
-        }
+        // Only add the sentence if it contains at least one payload word
+        if payload_i > payload_i_before {
+            // Capitalize the first word of the sentence.
+            if let Some(first) = sentence_words.first_mut() {
+                *first = capitalize(first);
+            }
 
-        // Add spacing between sentences.
-        if !words.is_empty() {
-            // ensure previous ended with punctuation. (We put '.' on last token)
+            // Add spacing between sentences.
+            if !words.is_empty() {
+                // ensure previous ended with punctuation. (We put '.' on last token)
+            }
+            words.append(&mut sentence_words);
+        } else {
+            // Sentence contained no payload words - skip it
+            // Reset payload_i since we didn't actually use this sentence
+            payload_i = payload_i_before;
+            if verbose {
+                eprintln!("Skipping sentence with no payload words");
+            }
         }
-        words.append(&mut sentence_words);
     }
 
     // Post-fix: ensure output ends with a period.
@@ -483,24 +673,20 @@ fn generate_text<R: Rng>(
         }
     }
 
-    // Highlight BIP39 words with ANSI color codes
-    let highlighted_words: Vec<String> = words
+    // Surround BIP39 words with | | for easy parsing.
+    let rendered_words: Vec<String> = words
         .iter()
         .map(|word| {
-            // Remove punctuation temporarily to check if it's a payload word
-            let word_lower = word.to_lowercase();
-            let word_clean = word_lower.trim_end_matches('.');
-            
-            if payload_set.contains(word_clean) {
-                // Use ANSI color codes: \x1b[1;32m for bold green, \x1b[0m to reset
-                format!("\x1b[1;32m{}\x1b[0m", word)
+            let word_clean = normalize_token_for_bip39(word);
+            if !word_clean.is_empty() && payload_set.contains(&word_clean) {
+                wrap_payload_with_bars(word)
             } else {
                 word.clone()
             }
         })
         .collect();
 
-    (highlighted_words.join(" "), payload_set)
+    (rendered_words.join(" "), payload_set)
 }
 
 fn capitalize(s: &str) -> String {
@@ -511,23 +697,84 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+fn normalize_token_for_bip39(s: &str) -> String {
+    // Decoder is case-insensitive; BIP39 words are lowercase ASCII a-z.
+    // Strip leading/trailing non-letters to tolerate punctuation/quotes.
+    s.trim()
+        .trim_matches(|c: char| !c.is_ascii_alphabetic())
+        .to_lowercase()
+}
+
+fn wrap_payload_with_bars(word_with_punct: &str) -> String {
+    // Surround the word token with | | while keeping trailing punctuation outside the bars.
+    // Example: "abandon." -> "|abandon|."
+    // Example: "Abandon"  -> "|Abandon|"
+    let mut core = word_with_punct.to_string();
+    let mut suffix = String::new();
+    while let Some(last) = core.chars().last() {
+        if last.is_ascii_alphabetic() {
+            break;
+        }
+        core.pop();
+        suffix.insert(0, last);
+    }
+    format!("|{core}|{suffix}")
+}
+
 /// Build comprehensive POS mapping for all BIP39 words.
 /// Returns a HashMap mapping each word to its allowed POS tags.
+/// Reads POS tags from the file format: word|POS1,POS2,...
 fn build_pos_mapping() -> HashMap<String, Vec<Pos>> {
-    let wordlist = include_str!("../english.txt");
+    let wordlist = include_str!("../bip39_POS.txt");
     let mut mapping = HashMap::new();
     
-    for word in wordlist.lines() {
-        let word = word.trim().to_lowercase();
-        if word.is_empty() {
+    for line in wordlist.lines() {
+        let line: &str = line.trim();
+        if line.is_empty() {
             continue;
         }
         
-        let pos_tags = assign_pos_tags(&word);
-        mapping.insert(word, pos_tags);
+        // Parse format: word|POS1,POS2,... or just word (backward compatibility)
+        let (word, pos_tags) = if let Some(pipe_idx) = line.find('|') {
+            let word = line[..pipe_idx].trim().to_lowercase();
+            let pos_str = line[pipe_idx + 1..].trim();
+            let pos_tags = parse_pos_tags(pos_str);
+            (word, pos_tags)
+        } else {
+            // Backward compatibility: no POS tags, use heuristics
+            let word = line.to_lowercase();
+            let pos_tags = assign_pos_tags(&word);
+            (word, pos_tags)
+        };
+        
+        if !word.is_empty() {
+            mapping.insert(word, pos_tags);
+        }
     }
     
     mapping
+}
+
+/// Parse POS tags from a comma-separated string (e.g., "Prep,Adv" -> [Pos::Prep, Pos::Adv]).
+fn parse_pos_tags(pos_str: &str) -> Vec<Pos> {
+    pos_str
+        .split(',')
+        .map(|s| s.trim())
+        .filter_map(|s| match s {
+            "Det" => Some(Pos::Det),
+            "Adj" => Some(Pos::Adj),
+            "N" => Some(Pos::N),
+            "V" => Some(Pos::V),
+            "Modal" => Some(Pos::Modal),
+            "Aux" => Some(Pos::Aux),
+            "Cop" => Some(Pos::Cop),
+            "To" => Some(Pos::To),
+            "Prep" => Some(Pos::Prep),
+            "Adv" => Some(Pos::Adv),
+            "Dot" => Some(Pos::Dot),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Assign POS tags to a word based on comprehensive heuristics.
@@ -561,11 +808,15 @@ fn assign_pos_tags(word: &str) -> Vec<Pos> {
     // Determiners
     let det_words: HashSet<&str> = [
         "all", "any", "each", "either", "few", "more", "most", "much",
-        "neither", "other", "some", "such", "that", "this", "what", "which"
+        "neither", "other", "some", "such", "that", "this", "what", "which",
+        "several",
     ].iter().copied().collect();
     
     if det_words.contains(word_lower.as_str()) {
-        return vec![Pos::Det, Pos::Adj]; // Many determiners can also be adjectives
+        // Treat determiners as determiners only. This prevents cover-Adj lists from
+        // producing phrases like "a several ..." and forces payload determiners to
+        // embed via Det slots (which is now supported).
+        return vec![Pos::Det];
     }
     
     // Verbs (action words, often can be nouns too)
@@ -678,10 +929,44 @@ fn assign_pos_tags(word: &str) -> Vec<Pos> {
     
     let is_verb = verb_patterns.iter().any(|&v| word_lower == v) || is_verb_ending;
     
+    // Common BIP39 nouns that should always be tagged as nouns (not adjectives)
+    // These words are incorrectly matched by adjective patterns
+    let noun_exceptions: HashSet<&str> = [
+        "donkey", "west", "slot", "crane", "horn", "danger", "city", "country",
+        "valley", "journey", "money", "story", "history", "victory", "factory",
+        "library", "category", "theory", "memory", "discovery", "delivery",
+        "company", "family", "army", "enemy", "party", "body", "copy", "key",
+        "way", "day", "may", "say", "play", "stay", "pay", "ray", "tray",
+        "delay", "display", "essay", "highway", "holiday", "relay", "spray",
+        "survey", "turkey", "valley", "alley", "attorney", "chimney", "honey",
+        "journey", "kidney", "money", "monkey", "turkey", "volley"
+    ].iter().copied().collect();
+    
+    // Check noun exceptions first (before adjective patterns)
+    if noun_exceptions.contains(word_lower.as_str()) {
+        return vec![Pos::N];
+    }
+    
+    // Nouns (things, people, places, concepts) - check BEFORE adjectives
+    let noun_endings = ["tion", "sion", "ness", "ment", "ity", "ty", "er", "or",
+                        "ist", "ism", "age", "ance", "ence", "dom", "hood", "ship",
+                        "ure", "ture", "sure"];
+    let is_noun_ending = noun_endings.iter().any(|ending| word_lower.ends_with(ending));
+    
+    // Check for consonant+y ending (like "donkey", "city") - these are usually nouns
+    let is_consonant_y = word_lower.len() >= 2 && word_lower.ends_with('y') && {
+        let prev_char = word_lower.chars().rev().nth(1).unwrap();
+        !matches!(prev_char, 'a' | 'e' | 'i' | 'o' | 'u')
+    };
+    
     // Adjectives (descriptive words)
+    // Remove "y" from adj_endings since we handle it specially for consonant+y
     let adj_endings = ["able", "ible", "ful", "less", "ic", "ical", "al", "ary",
-                       "ive", "ous", "ious", "y", "ish", "ed", "ing", "en"];
+                       "ive", "ous", "ious", "ish", "ed", "ing", "en"];
     let is_adj_ending = adj_endings.iter().any(|ending| word_lower.ends_with(ending));
+    
+    // Handle "y" ending specially: consonant+y is usually a noun, vowel+y can be adjective
+    let is_adj_y = word_lower.ends_with('y') && !is_consonant_y;
     
     let adj_patterns = [
         "able", "absent", "abstract", "absurd", "actual", "afraid", "ahead",
@@ -841,32 +1126,30 @@ fn assign_pos_tags(word: &str) -> Vec<Pos> {
         "video", "vigorous", "violent", "virtual", "visible", "visual", "vital",
         "vivid", "vocal", "voluntary", "vulnerable", "warm", "wary", "wasteful",
         "watery", "weak", "wealthy", "weary", "weekly", "weird", "welcome",
-        "well", "west", "western", "wet", "what", "whatever", "which",
+        "well", "western", "wet", "what", "whatever", "which",
         "whichever", "white", "whole", "wide", "widespread", "wild", "willing",
         "wise", "witty", "wonderful", "wooden", "woolen", "working", "world",
         "worldwide", "worried", "worse", "worst", "worth", "worthwhile",
         "worthy", "wounded", "wrong", "yellow", "young", "youthful", "zealous"
     ];
     
-    let is_adj = adj_patterns.iter().any(|&a| word_lower == a) || is_adj_ending;
+    // Exclude noun exceptions from adj_patterns check
+    let is_adj_pattern = adj_patterns.iter().any(|&a| word_lower == a) && !noun_exceptions.contains(word_lower.as_str());
+    let is_adj = is_adj_pattern || is_adj_ending || is_adj_y;
     
-    // Nouns (things, people, places, concepts)
-    let noun_endings = ["tion", "sion", "ness", "ment", "ity", "ty", "er", "or",
-                        "ist", "ism", "age", "ance", "ence", "dom", "hood", "ship",
-                        "ure", "ture", "sure"];
-    let is_noun_ending = noun_endings.iter().any(|ending| word_lower.ends_with(ending));
-    
-    // Return only one POS tag per word, prioritizing: Verb > Adjective > Noun
+    // Return only one POS tag per word, prioritizing: Verb > Noun > Adjective
+    // Changed priority: check nouns before adjectives to fix incorrect tagging
     if is_verb {
         return vec![Pos::V];
     }
     
-    if is_adj {
-        return vec![Pos::Adj];
+    // Check nouns before adjectives (fixes issues like "donkey", "west", "slot", etc.)
+    if is_noun_ending || is_consonant_y {
+        return vec![Pos::N];
     }
     
-    if is_noun_ending {
-        return vec![Pos::N];
+    if is_adj {
+        return vec![Pos::Adj];
     }
     
     // Default to noun if no pattern matches
@@ -892,12 +1175,21 @@ fn tag_word(word: &str) -> Vec<Pos> {
 }
 
 /// Load all BIP39 words from the wordlist file.
+/// Handles both formats: word|POS (new) and word (old, backward compatibility).
 fn load_bip39_words() -> Vec<String> {
-    let wordlist = include_str!("../english.txt");
+    let wordlist = include_str!("../bip39_POS.txt");
     wordlist
         .lines()
-        .map(|line| line.trim().to_string())
-        .filter(|word| !word.is_empty())
+        .map(|line: &str| {
+            let line = line.trim();
+            // Extract word part before | if present
+            if let Some(pipe_idx) = line.find('|') {
+                line[..pipe_idx].trim().to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .filter(|word: &String| !word.is_empty())
         .collect()
 }
 
@@ -916,17 +1208,15 @@ fn load_safe_words(bip39_set: &HashSet<String>) -> Vec<String> {
 /// Randomly select N words from the BIP39 wordlist.
 fn select_random_words<R: Rng>(rng: &mut R, count: usize) -> Vec<String> {
     let all_words = load_bip39_words();
-    if count > all_words.len() {
-        eprintln!("Warning: Requested {} words but only {} available. Using all words.", count, all_words.len());
-        return all_words;
+    if all_words.is_empty() || count == 0 {
+        return Vec::new();
     }
-    
-    // Use choose_multiple if available, otherwise fall back to manual selection
-    let selected: Vec<String> = all_words
-        .choose_multiple(rng, count)
-        .cloned()
-        .collect();
-    
+
+    // Sample WITH replacement so duplicates are possible (and therefore decodable).
+    let mut selected = Vec::with_capacity(count);
+    for _ in 0..count {
+        selected.push(all_words.choose(rng).unwrap().clone());
+    }
     selected
 }
 
@@ -1085,7 +1375,7 @@ fn main() {
         })
         .collect();
 
-    let payload_set: HashSet<String> = payload.iter().map(|t| t.word.clone()).collect();
+    let payload_set: HashSet<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
 
     // Load BIP39 words for validation
     let bip39_words = load_bip39_words();
@@ -1127,8 +1417,15 @@ fn main() {
     adv_words.sort();
     adv_words.dedup();
     
-    // Keep determiners as a small fixed set (function words)
+    // Keep function words as small fixed sets.
+    // IMPORTANT: these must NOT overlap the BIP39 list (validated below).
     let det_words = ["the", "a", "an", "these", "those", "each", "some"];
+    // Modal verbs that are NOT in the BIP39 list (e.g., "can"/"will"/"must" are BIP39!).
+    let modal_words = ["should", "could", "would", "might", "may"];
+    // Aux/Cop/To are inserted with agreement logic (not randomized) but still validated here.
+    let aux_words = ["do", "does"];
+    let cop_words = ["is", "are"];
+    let to_words = ["to"];
     
     // Convert to slices for the lexicon
     let adj_words_slice: Vec<&str> = adj_words.iter().map(|s| s.as_str()).collect();
@@ -1139,6 +1436,10 @@ fn main() {
     
     // Validate all cover words against BIP39 wordlist
     let all_cover_words: Vec<&str> = det_words.iter()
+        .chain(modal_words.iter())
+        .chain(aux_words.iter())
+        .chain(cop_words.iter())
+        .chain(to_words.iter())
         .chain(adj_words_slice.iter())
         .chain(n_words_slice.iter())
         .chain(v_words_slice.iter())
@@ -1158,8 +1459,9 @@ fn main() {
         eprintln!("  Adverbs: {}", adv_words.len());
     }
     
-    let lex = Lexicon::new(payload_set)
+    let lex = Lexicon::new(payload_set, bip39_set.clone())
         .with_words(Pos::Det, &det_words)
+        .with_words(Pos::Modal, &modal_words)
         .with_words(Pos::Adj, &adj_words_slice)
         .with_words(Pos::N, &n_words_slice)
         .with_words(Pos::V, &v_words_slice)
@@ -1169,28 +1471,16 @@ fn main() {
     let (text, payload_set_from_gen) = generate_text(&mut rng, &lex, &payload, min_words_per_sentence, verbose);
     
     // Validate that the generated text contains exactly the input BIP39 words in order
-    // Extract BIP39 words from the generated text (handling ANSI color codes)
+    // Extract BIP39 words from the generated text
     let extracted_bip39_words: Vec<String> = {
-        // Remove ANSI color codes first
-        let text_clean = text
-            .replace("\x1b[1;32m", "")
-            .replace("\x1b[0m", "");
-        
-        text_clean
+        text
             .split_whitespace()
-            .map(|w| {
-                // Remove punctuation
-                w.trim_end_matches('.')
-                 .trim_end_matches(',')
-                 .trim_end_matches('!')
-                 .trim_end_matches('?')
-                 .to_lowercase()
-            })
+            .map(normalize_token_for_bip39)
             .filter(|w| !w.is_empty() && payload_set_from_gen.contains(w))
             .collect()
     };
     
-    let expected_words: Vec<String> = payload.iter().map(|t| t.word.clone()).collect();
+    let expected_words: Vec<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
     
     if extracted_bip39_words != expected_words {
         eprintln!("ERROR: Generated BIP39 words do not match input words!");

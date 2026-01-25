@@ -11,6 +11,13 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::OnceLock;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HighlightMode {
+    None,
+    Bars,
+    Highlight,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Pos {
     Det,
@@ -102,10 +109,27 @@ impl Lexicon {
             if fallback.is_empty() {
                 panic!("No available cover words for {:?}", pos);
             }
-            return fallback.choose(rng).unwrap().to_string();
+            // Prioritize shorter words in fallback too
+            let min_len = fallback.iter().map(|w| w.len()).min().unwrap_or(0);
+            let shortest_fallback: Vec<&String> = fallback
+                .iter()
+                .filter(|w| w.len() == min_len)
+                .copied()
+                .collect();
+            return shortest_fallback.choose(rng).unwrap().to_string();
         }
 
-        available.choose(rng).unwrap().to_string()
+        // Find the shortest length among available words
+        let min_len = available.iter().map(|w| w.len()).min().unwrap_or(0);
+        
+        // Filter to only words of the shortest length
+        let shortest_words: Vec<&String> = available
+            .iter()
+            .filter(|w| w.len() == min_len)
+            .copied()
+            .collect();
+
+        shortest_words.choose(rng).unwrap().to_string()
     }
 
 }
@@ -136,15 +160,9 @@ fn expand_cfg<R: Rng>(rng: &mut R, sym: Sym, out: &mut Vec<Pos>, min_len: usize,
                     if let Some(pos) = start_pos {
                         match pos {
                             Pos::N => {
-                                // Allow nouns to start sentences directly (N VP Dot) or with determiner (Det N VP Dot)
-                                // Prefer direct start (70%) to prioritize input words, but sometimes use determiner (30%) for variety
-                                if rng.gen_bool(0.7) {
-                                    // Start directly with noun: N VP Dot (e.g., "Wallet could check...")
-                                    vec![Sym::T(Pos::N), Sym::NT("VP"), Sym::T(Pos::Dot)]
-                                } else {
-                                    // Start with determiner + noun: Det N VP Dot (e.g., "The wallet could check...")
-                                    vec![Sym::T(Pos::Det), Sym::T(Pos::N), Sym::NT("VP"), Sym::T(Pos::Dot)]
-                                }
+                                // Always start directly with noun when start_pos is N to guarantee payload word placement
+                                // This ensures the payload word is placed in the first slot, avoiding retries
+                                vec![Sym::T(Pos::N), Sym::NT("VP"), Sym::T(Pos::Dot)]
                             }
                             Pos::V => {
                                 // Start with verb: V NP Dot (imperative)
@@ -167,8 +185,8 @@ fn expand_cfg<R: Rng>(rng: &mut R, sym: Sym, out: &mut Vec<Pos>, min_len: usize,
                                 vec![Sym::T(Pos::Prep), Sym::NT("NP"), Sym::NT("VP"), Sym::T(Pos::Dot)]
                             }
                             Pos::Det => {
-                                // Normal case: Det NP VP Dot
-                                vec![Sym::NT("NP"), Sym::NT("VP"), Sym::T(Pos::Dot)]
+                                // Start with determiner: Det NP VP Dot (NP will expand to Adj? N)
+                                vec![Sym::T(Pos::Det), Sym::NT("NP"), Sym::NT("VP"), Sym::T(Pos::Dot)]
                             }
                             Pos::Dot => {
                                 // Shouldn't happen, but fallback to normal
@@ -261,6 +279,7 @@ fn pluralize_cover_noun(s: &str) -> String {
 /// Fill a slot stream with cover words + payload words (in-order).
 /// Returns (words, payload_embedded_count).
 /// `prev_words` are the last few words from the previous sentence (if any), to prevent repetition across sentences.
+/// `expected_first_pos` is the POS that should appear first (if set), used to ensure payload word placement.
 fn fill_slots<R: Rng>(
     rng: &mut R,
     lex: &Lexicon,
@@ -268,6 +287,7 @@ fn fill_slots<R: Rng>(
     payload: &[PayloadTok],
     payload_i: &mut usize,
     prev_words: &[&str],
+    expected_first_pos: Option<Pos>,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     const REPETITION_WINDOW: usize = 3; // Check last 3 words to avoid repetition
@@ -279,6 +299,16 @@ fn fill_slots<R: Rng>(
     let mut subject_number: Option<Number> = None;
 
     for (i, &slot) in slots.iter().enumerate() {
+        // If this is the first non-Dot slot and we have an expected_first_pos, ensure we place the payload word
+        // Find the first non-Dot slot index
+        let first_non_dot_idx = slots.iter().position(|&s| s != Pos::Dot).unwrap_or(0);
+        let is_first_slot = i == first_non_dot_idx;
+        let should_force_placement = is_first_slot && 
+                                      expected_first_pos.is_some() && 
+                                      expected_first_pos.unwrap() == slot &&
+                                      *payload_i < payload.len() &&
+                                      payload_fits(&payload[*payload_i], slot);
+        
         match slot {
             Pos::Dot => {
                 if let Some(last) = out.last_mut() {
@@ -289,7 +319,8 @@ fn fill_slots<R: Rng>(
             }
             Pos::Det => {
                 // Allow embedding payload determiners (e.g., "this", "that") without mutation.
-                if *payload_i < payload.len() && payload_fits(&payload[*payload_i], Pos::Det) {
+                // Force placement if this is the expected first slot
+                if should_force_placement || (*payload_i < payload.len() && payload_fits(&payload[*payload_i], Pos::Det)) {
                     out.push(payload[*payload_i].word.clone());
                     *payload_i += 1;
                     continue;
@@ -367,6 +398,7 @@ fn fill_slots<R: Rng>(
                 let det_word = match np_number {
                     Number::Singular => {
                         // Use a/an sometimes when we know the next word, otherwise choose a safer determiner.
+                        // Prioritize shorter words: "the" (3) < "a"/"an" (1-2) < "each"/"some" (4)
                         if let Some(next) = next_word_str {
                             if rng.gen_bool(0.35) {
                                 if starts_with_vowel_sound(next) {
@@ -375,18 +407,33 @@ fn fill_slots<R: Rng>(
                                     "a".to_string()
                                 }
                             } else {
+                                // Prefer "the" (shortest) but allow some variety
                                 let det_options = ["the", "each", "some"];
-                                det_options.choose(rng).unwrap().to_string()
+                                if rng.gen_bool(0.7) {
+                                    "the".to_string() // Prefer shortest
+                                } else {
+                                    det_options.choose(rng).unwrap().to_string()
+                                }
                             }
                         } else {
+                            // Prefer "the" (shortest) but allow some variety
                             let det_options = ["the", "each", "some"];
-                            det_options.choose(rng).unwrap().to_string()
+                            if rng.gen_bool(0.7) {
+                                "the".to_string() // Prefer shortest
+                            } else {
+                                det_options.choose(rng).unwrap().to_string()
+                            }
                         }
                     }
                     Number::Plural => {
                         // Avoid these/those because payload nouns cannot be pluralized.
+                        // Prefer "the" (3) over "some" (4)
                         let det_options = ["the", "some"];
-                        det_options.choose(rng).unwrap().to_string()
+                        if rng.gen_bool(0.7) {
+                            "the".to_string() // Prefer shortest
+                        } else {
+                            det_options.choose(rng).unwrap().to_string()
+                        }
                     }
                 };
 
@@ -394,12 +441,18 @@ fn fill_slots<R: Rng>(
                 // If so and it's not a/an, pick a different one
                 let final_det = if recent_words.contains(&det_word.as_str()) && det_word != "a" && det_word != "an" {
                     // Avoid repetition for non-a/an determiners
+                    // Prioritize shorter words when avoiding repetition
                     let det_options = ["the", "each", "some"];
-                    det_options.iter()
-                        .find(|&&d| !recent_words.contains(&d))
-                        .copied()
-                        .unwrap_or_else(|| det_options.choose(rng).unwrap())
-                        .to_string()
+                    // Try shortest first, then others
+                    if !recent_words.contains(&"the") {
+                        "the".to_string()
+                    } else {
+                        det_options.iter()
+                            .find(|&&d| !recent_words.contains(&d))
+                            .copied()
+                            .unwrap_or_else(|| det_options.choose(rng).unwrap())
+                            .to_string()
+                    }
                 } else {
                     det_word
                 };
@@ -407,7 +460,8 @@ fn fill_slots<R: Rng>(
                 out.push(final_det);
             }
             _ => {
-                if *payload_i < payload.len() && payload_fits(&payload[*payload_i], slot) {
+                // Force placement if this is the expected first slot, otherwise check normally
+                if should_force_placement || (*payload_i < payload.len() && payload_fits(&payload[*payload_i], slot)) {
                     out.push(payload[*payload_i].word.clone());
                     *payload_i += 1;
                 } else {
@@ -467,13 +521,12 @@ fn fill_slots<R: Rng>(
 }
 
 /// Generate sentences until all payload tokens are embedded.
-/// Each sentence will have at least min_words_per_sentence words.
-/// Returns (formatted_text, payload_set) where formatted_text has BIP39 words highlighted.
+/// Returns (formatted_text, payload_set) where formatted_text has BIP39 words highlighted according to highlight_mode.
 fn generate_text<R: Rng>(
     rng: &mut R,
     lex: &Lexicon,
     payload: &[PayloadTok],
-    min_words_per_sentence: usize,
+    highlight_mode: HighlightMode,
     verbose: bool,
 ) -> (String, HashSet<String>) {
     let mut words: Vec<String> = Vec::new();
@@ -486,13 +539,13 @@ fn generate_text<R: Rng>(
     while payload_i < payload.len() {
         // Make each sentence size adapt to remaining needs.
         let remaining_payload = payload.len().saturating_sub(payload_i);
-        // Use the user-specified minimum, but adapt if many payload tokens remain
+        // Adapt sentence length based on remaining payload
         let sentence_min = if remaining_payload > 10 {
-            min_words_per_sentence.max(18)
+            18
         } else if remaining_payload > 5 {
-            min_words_per_sentence.max(14)
+            14
         } else {
-            min_words_per_sentence
+            5
         };
 
         // Prioritize input words for ALL sentences by starting with the next payload word's POS
@@ -500,6 +553,20 @@ fn generate_text<R: Rng>(
             // Get the next payload word's allowed POS tags
             // Prefer N, V, Adj in that order for better grammar
             let next_word = &payload[payload_i];
+            
+            // Panic if the payload word has no allowed POS tags - this indicates a POS tagging failure
+            if next_word.allowed.is_empty() {
+                panic!(
+                    "BUG: Payload word '{}' has no allowed POS tags!\n\
+                     This indicates a POS tagging failure. Check:\n\
+                     1. Is '{}' in bip39_POS.txt?\n\
+                     2. Does it have POS tags assigned?\n\
+                     3. Is the POS tag parsing working correctly?",
+                    next_word.word,
+                    next_word.word
+                );
+            }
+            
             if next_word.allowed.contains(&Pos::N) {
                 Some(Pos::N)
             } else if next_word.allowed.contains(&Pos::V) {
@@ -511,8 +578,8 @@ fn generate_text<R: Rng>(
             } else if next_word.allowed.contains(&Pos::Prep) {
                 Some(Pos::Prep)
             } else {
-                // Fallback to first available POS
-                next_word.allowed.iter().next().copied()
+                // Fallback to first available POS (should always exist since we checked for empty above)
+                Some(next_word.allowed.iter().next().copied().expect("Payload word should have at least one POS tag"))
             }
         } else {
             None
@@ -532,43 +599,61 @@ fn generate_text<R: Rng>(
         let prev_words_refs: Vec<&str> = prev_words.iter().map(|s| s.as_str()).collect();
         let payload_i_before = payload_i;
         
-        // Try to generate a sentence that contains at least one payload word
-        // Retry up to 10 times to avoid infinite loops
-        const MAX_RETRIES: usize = 10;
-        let mut retry_count = 0;
-        let (mut sentence_words, slots) = loop {
-            let mut current_payload_i = payload_i;
-            let mut current_slots = Vec::new();
-            expand_cfg(rng, Sym::NT("S"), &mut current_slots, sentence_min, start_pos);
-            
-            let current_sentence_words = fill_slots(
-                rng, 
-                lex, 
-                &current_slots, 
-                payload, 
-                &mut current_payload_i,
-                &prev_words_refs
-            );
-            
-            // Check if this sentence embedded at least one payload word
-            if current_payload_i > payload_i || retry_count >= MAX_RETRIES {
-                payload_i = current_payload_i;
-                break (current_sentence_words, current_slots);
-            }
-            
-            retry_count += 1;
-            if verbose {
-                eprintln!("Skipping sentence with no payload words (retry {}/{})", retry_count, MAX_RETRIES);
-            }
-        };
+        // Generate a sentence - it MUST contain at least one payload word
+        // If start_pos is set, the grammar and fill_slots are designed to guarantee placement
+        let mut slots = Vec::new();
+        expand_cfg(rng, Sym::NT("S"), &mut slots, sentence_min, start_pos);
         
-        // If we exhausted retries and still no payload words, we'll include it anyway
-        // (this shouldn't happen in practice if grammar is working correctly)
-        if payload_i == payload_i_before && retry_count >= MAX_RETRIES {
-            if verbose {
-                eprintln!("Warning: Generated sentence with no payload words after {} retries", MAX_RETRIES);
-            }
+        let mut current_payload_i = payload_i;
+        let mut sentence_words = fill_slots(
+            rng, 
+            lex, 
+            &slots, 
+            payload, 
+            &mut current_payload_i,
+            &prev_words_refs,
+            start_pos  // Pass start_pos to ensure payload word placement
+        );
+        
+        // Panic if no payload word was placed - this indicates a bug in the grammar or fill_slots logic
+        if current_payload_i == payload_i_before {
+            let slots_str: Vec<String> = slots.iter().map(|pos| {
+                match pos {
+                    Pos::Det => "Det".to_string(),
+                    Pos::Adj => "Adj".to_string(),
+                    Pos::N => "N".to_string(),
+                    Pos::V => "V".to_string(),
+                    Pos::Modal => "Modal".to_string(),
+                    Pos::Aux => "Aux".to_string(),
+                    Pos::Cop => "Cop".to_string(),
+                    Pos::To => "To".to_string(),
+                    Pos::Prep => "Prep".to_string(),
+                    Pos::Adv => "Adv".to_string(),
+                    Pos::Dot => "Dot".to_string(),
+                }
+            }).collect();
+            
+            let next_payload_word = if payload_i < payload.len() {
+                format!("{} (allowed POS: {:?})", payload[payload_i].word, payload[payload_i].allowed)
+            } else {
+                "none".to_string()
+            };
+            
+            panic!(
+                "BUG: Generated sentence with no payload words!\n\
+                 Expected start_pos: {:?}\n\
+                 Next payload word: {}\n\
+                 Generated slots: {}\n\
+                 Sentence: {}\n\
+                 This should never happen - the grammar and fill_slots should guarantee payload word placement.",
+                start_pos,
+                next_payload_word,
+                slots_str.join(" "),
+                sentence_words.join(" ")
+            );
         }
+        
+        payload_i = current_payload_i;
 
         // Print grammar structure in verbose mode
         if verbose {
@@ -651,6 +736,26 @@ fn generate_text<R: Rng>(
                 *first = capitalize(first);
             }
 
+            // Print sentence as it's generated if verbose and single variation
+            if verbose {
+                let sentence_text: String = sentence_words.iter()
+                    .map(|w| {
+                        let word_clean = normalize_token_for_bip39(w);
+                        if !word_clean.is_empty() && payload_set.contains(&word_clean) {
+                            match highlight_mode {
+                                HighlightMode::None => w.clone(),
+                                HighlightMode::Bars => wrap_payload_with_bars(w),
+                                HighlightMode::Highlight => wrap_payload_with_highlight(w),
+                            }
+                        } else {
+                            w.clone()
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join(" ");
+                eprintln!("{}", sentence_text);
+            }
+
             // Add spacing between sentences.
             if !words.is_empty() {
                 // ensure previous ended with punctuation. (We put '.' on last token)
@@ -673,13 +778,17 @@ fn generate_text<R: Rng>(
         }
     }
 
-    // Surround BIP39 words with | | for easy parsing.
+    // Apply highlighting to BIP39 words according to highlight_mode.
     let rendered_words: Vec<String> = words
         .iter()
         .map(|word| {
             let word_clean = normalize_token_for_bip39(word);
             if !word_clean.is_empty() && payload_set.contains(&word_clean) {
-                wrap_payload_with_bars(word)
+                match highlight_mode {
+                    HighlightMode::None => word.clone(),
+                    HighlightMode::Bars => wrap_payload_with_bars(word),
+                    HighlightMode::Highlight => wrap_payload_with_highlight(word),
+                }
             } else {
                 word.clone()
             }
@@ -699,10 +808,25 @@ fn capitalize(s: &str) -> String {
 
 fn normalize_token_for_bip39(s: &str) -> String {
     // Decoder is case-insensitive; BIP39 words are lowercase ASCII a-z.
-    // Strip leading/trailing non-letters to tolerate punctuation/quotes.
-    s.trim()
+    // Strip ANSI escape codes (e.g., \x1b[1m, \x1b[0m), highlighting bars (|), and punctuation.
+    let mut result = s.to_string();
+    
+    // Remove ANSI escape codes: ESC[ followed by digits and 'm'
+    // Pattern: \x1b[ or ESC[ followed by optional digits and 'm'
+    result = regex::Regex::new(r"\x1b\[[0-9;]*m")
+        .unwrap()
+        .replace_all(&result, "")
+        .to_string();
+    
+    // Remove highlighting bars
+    result = result.replace('|', "");
+    
+    // Strip leading/trailing non-letters to tolerate punctuation/quotes
+    result = result.trim()
         .trim_matches(|c: char| !c.is_ascii_alphabetic())
-        .to_lowercase()
+        .to_lowercase();
+    
+    result
 }
 
 fn wrap_payload_with_bars(word_with_punct: &str) -> String {
@@ -719,6 +843,23 @@ fn wrap_payload_with_bars(word_with_punct: &str) -> String {
         suffix.insert(0, last);
     }
     format!("|{core}|{suffix}")
+}
+
+fn wrap_payload_with_highlight(word_with_punct: &str) -> String {
+    // Highlight the word using ANSI escape codes (green color) while keeping trailing punctuation outside.
+    // Example: "abandon." -> "\x1b[32mabandon\x1b[0m."
+    // Example: "Abandon"  -> "\x1b[32mAbandon\x1b[0m"
+    // ANSI color codes: 32 = green, 33 = yellow, 34 = blue, 35 = magenta, 36 = cyan
+    let mut core = word_with_punct.to_string();
+    let mut suffix = String::new();
+    while let Some(last) = core.chars().last() {
+        if last.is_ascii_alphabetic() {
+            break;
+        }
+        core.pop();
+        suffix.insert(0, last);
+    }
+    format!("\x1b[32m{core}\x1b[0m{suffix}")
 }
 
 /// Build comprehensive POS mapping for all BIP39 words.
@@ -739,7 +880,12 @@ fn build_pos_mapping() -> HashMap<String, Vec<Pos>> {
             let word = line[..pipe_idx].trim().to_lowercase();
             let pos_str = line[pipe_idx + 1..].trim();
             let pos_tags = parse_pos_tags(pos_str);
-            (word, pos_tags)
+            // If POS tags are empty (e.g., "word|"), fall back to heuristics
+            if pos_tags.is_empty() {
+                (word.clone(), assign_pos_tags(&word))
+            } else {
+                (word, pos_tags)
+            }
         } else {
             // Backward compatibility: no POS tags, use heuristics
             let word = line.to_lowercase();
@@ -1253,19 +1399,20 @@ fn print_usage(program_name: &str) {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --random <N>            Generate sentences from N random BIP39 words");
-    eprintln!("  --min-words <N>         Minimum words per sentence (default: 5)");
+    eprintln!("  --highlight <mode>      Highlight BIP39 words: 'none', 'bars' (default), or 'highlight'");
     eprintln!("  --seed <N>              Seed for deterministic random generation");
+    eprintln!("  --variations <N>         Generate N variations and select the most compact (default: 1)");
     eprintln!("  --verbose, -v           Show detailed debugging information");
     eprintln!("  --help                  Show this help message");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} abandon ability able about above absent", program_name);
-    eprintln!("  {} --min-words 15 word1 word2 word3", program_name);
     eprintln!("  {} --random 10", program_name);
-    eprintln!("  {} --random 5 --min-words 12", program_name);
+    eprintln!("  {} --random 5 --highlight none", program_name);
+    eprintln!("  {} --random 5 --highlight highlight", program_name);
 }
 
-fn parse_args() -> Result<(Vec<String>, usize, Option<usize>, bool, Option<u64>), String> {
+fn parse_args() -> Result<(Vec<String>, Option<usize>, bool, Option<u64>, usize, HighlightMode), String> {
     let args: Vec<String> = env::args().collect();
     let program_name = args[0].clone();
     
@@ -1274,10 +1421,11 @@ fn parse_args() -> Result<(Vec<String>, usize, Option<usize>, bool, Option<u64>)
     }
     
     let mut words = Vec::new();
-    let mut min_words_per_sentence = 5;
     let mut random_count: Option<usize> = None;
     let mut verbose = false;
     let mut seed: Option<u64> = None;
+    let mut variations = 1;
+    let mut highlight_mode = HighlightMode::Bars;
     let mut i = 1;
     
     while i < args.len() {
@@ -1298,12 +1446,16 @@ fn parse_args() -> Result<(Vec<String>, usize, Option<usize>, bool, Option<u64>)
                     .map_err(|_| format!("Invalid number for --random: {}", args[i + 1]))?);
                 i += 2;
             }
-            "--min-words" => {
+            "--highlight" => {
                 if i + 1 >= args.len() {
-                    return Err("--min-words requires a value".to_string());
+                    return Err("--highlight requires a value".to_string());
                 }
-                min_words_per_sentence = args[i + 1].parse()
-                    .map_err(|_| format!("Invalid number for --min-words: {}", args[i + 1]))?;
+                highlight_mode = match args[i + 1].as_str() {
+                    "none" => HighlightMode::None,
+                    "bars" => HighlightMode::Bars,
+                    "highlight" => HighlightMode::Highlight,
+                    _ => return Err(format!("Invalid highlight mode: {}. Use 'none', 'bars', or 'highlight'", args[i + 1])),
+                };
                 i += 2;
             }
             "--seed" => {
@@ -1312,6 +1464,17 @@ fn parse_args() -> Result<(Vec<String>, usize, Option<usize>, bool, Option<u64>)
                 }
                 seed = Some(args[i + 1].parse()
                     .map_err(|_| format!("Invalid number for --seed: {}", args[i + 1]))?);
+                i += 2;
+            }
+            "--variations" => {
+                if i + 1 >= args.len() {
+                    return Err("--variations requires a value".to_string());
+                }
+                variations = args[i + 1].parse()
+                    .map_err(|_| format!("Invalid number for --variations: {}", args[i + 1]))?;
+                if variations == 0 {
+                    return Err("--variations must be at least 1".to_string());
+                }
                 i += 2;
             }
             arg if arg.starts_with("--") => {
@@ -1332,12 +1495,12 @@ fn parse_args() -> Result<(Vec<String>, usize, Option<usize>, bool, Option<u64>)
         return Err("No words provided. Use --random <N> or provide words as arguments.".to_string());
     }
     
-    Ok((words, min_words_per_sentence, random_count, verbose, seed))
+    Ok((words, random_count, verbose, seed, variations, highlight_mode))
 }
 
 // --- CLI usage ---
 fn main() {
-    let (mut words, min_words_per_sentence, random_count, verbose, seed) = match parse_args() {
+    let (mut words, random_count, verbose, seed, variations, highlight_mode) = match parse_args() {
         Ok(args) => args,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -1376,6 +1539,7 @@ fn main() {
         .collect();
 
     let payload_set: HashSet<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
+    let payload_set_clone = payload_set.clone(); // Keep a copy for later statistics
 
     // Load BIP39 words for validation
     let bip39_words = load_bip39_words();
@@ -1393,6 +1557,10 @@ fn main() {
     
     for word in &safe_words {
         let tags = tag_word(word);
+        // Skip words with no POS tags
+        if tags.is_empty() {
+            continue;
+        }
         for tag in tags {
             match tag {
                 Pos::Adj => adj_words.push(word.clone()),
@@ -1468,31 +1636,421 @@ fn main() {
         .with_words(Pos::Prep, &prep_words_slice)
         .with_words(Pos::Adv, &adv_words_slice);
 
-    let (text, payload_set_from_gen) = generate_text(&mut rng, &lex, &payload, min_words_per_sentence, verbose);
-    
-    // Validate that the generated text contains exactly the input BIP39 words in order
-    // Extract BIP39 words from the generated text
-    let extracted_bip39_words: Vec<String> = {
-        text
-            .split_whitespace()
-            .map(normalize_token_for_bip39)
-            .filter(|w| !w.is_empty() && payload_set_from_gen.contains(w))
-            .collect()
-    };
-    
+    let input_word_count = payload.len();
     let expected_words: Vec<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
-    
-    if extracted_bip39_words != expected_words {
-        eprintln!("ERROR: Generated BIP39 words do not match input words!");
-        eprintln!("Expected: {:?}", expected_words);
-        eprintln!("Got:      {:?}", extracted_bip39_words);
-        eprintln!();
-        eprintln!("Generated text: {}", text);
-        panic!("BIP39 word mismatch: generated words do not match input words exactly");
+
+    // Calculate input statistics by POS
+    let mut input_pos_counts: HashMap<Pos, usize> = HashMap::new();
+    for tok in &payload {
+        for pos in &tok.allowed {
+            *input_pos_counts.entry(*pos).or_insert(0) += 1;
+        }
     }
+
+    // Generate multiple variations and select the most compact one
+    let mut best_text: Option<String> = None;
+    let mut best_compactness = 0.0;
+    let mut best_output_count = 0;
+    let mut variation_stats: Vec<f64> = Vec::new();
+
+    if verbose && variations > 1 {
+        eprintln!("Generating {} variations to maximize compactness...", variations);
+    }
+
+    for variation in 0..variations {
+        // Use different seeds for each variation (increment base seed)
+        let variation_seed = seed_value.wrapping_add(variation as u64);
+        let mut variation_rng = StdRng::seed_from_u64(variation_seed);
+        
+        let (text, payload_set_from_gen) = generate_text(&mut variation_rng, &lex, &payload, highlight_mode, variations == 1 && verbose);
+        
+        // Validate that the generated text contains exactly the input BIP39 words in order
+        let extracted_bip39_words: Vec<String> = {
+            text
+                .split_whitespace()
+                .map(normalize_token_for_bip39)
+                .filter(|w| !w.is_empty() && payload_set_from_gen.contains(w))
+                .collect()
+        };
+        
+        if extracted_bip39_words != expected_words {
+            if verbose || variations == 1 {
+                eprintln!("Variation {}: ERROR - Generated BIP39 words do not match input words!", variation + 1);
+                eprintln!("  Expected: {:?}", expected_words);
+                eprintln!("  Got:      {:?}", extracted_bip39_words);
+                eprintln!("  Text:     {}", text.chars().take(500).collect::<String>());
+                eprintln!("  Payload set size: {}", payload_set_from_gen.len());
+                eprintln!("  Sample payload words: {:?}", payload_set_from_gen.iter().take(5).collect::<Vec<_>>());
+                // Debug: show what words are being extracted
+                let all_normalized: Vec<String> = text
+                    .split_whitespace()
+                    .map(normalize_token_for_bip39)
+                    .filter(|w| !w.is_empty())
+                    .collect();
+                eprintln!("  All normalized words (first 20): {:?}", all_normalized.iter().take(20).collect::<Vec<_>>());
+                let matching_words: Vec<String> = all_normalized
+                    .iter()
+                    .filter(|w| payload_set_from_gen.contains(*w))
+                    .cloned()
+                    .collect();
+                eprintln!("  Matching words: {:?}", matching_words);
+            }
+            continue;
+        }
+        
+        // Calculate compactness score for this variation (based on character counts)
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let output_word_count = words.len();
+        let mut bip39_chars = 0;
+        let mut non_bip39_chars = 0;
+        
+        for word in &words {
+            let normalized = normalize_token_for_bip39(word);
+            if !normalized.is_empty() && payload_set_from_gen.contains(&normalized) {
+                // Count characters in BIP39 word (use normalized length)
+                bip39_chars += normalized.chars().count();
+            } else {
+                // Count characters in non-BIP39 word (use normalized length, excluding punctuation)
+                non_bip39_chars += normalized.chars().count();
+            }
+        }
+        
+        let total_chars = bip39_chars + non_bip39_chars;
+        let compactness = if total_chars > 0 {
+            bip39_chars as f64 / total_chars as f64
+        } else {
+            0.0
+        };
+
+        variation_stats.push(compactness);
+
+        if verbose && variations > 1 {
+            eprintln!("Variation {}: compactness {:.3} ({} BIP39 chars / {} total chars)", 
+                      variation + 1, compactness, bip39_chars, total_chars);
+        }
+
+        // Keep track of the best (most compact) variation
+        if compactness > best_compactness {
+            best_compactness = compactness;
+            best_text = Some(text);
+            best_output_count = output_word_count;
+        }
+    }
+
+    // Output the best variation
+    let text = match best_text {
+        Some(t) => t,
+        None => {
+            eprintln!("Error: Failed to generate any valid variations after {} attempts.", variations);
+            eprintln!("This may happen if:");
+            eprintln!("  - The grammar cannot accommodate all input words");
+            eprintln!("  - There are POS tagging issues with some words");
+            eprintln!("  - The word extraction logic is failing");
+            eprintln!("\nTry running with --verbose to see detailed error messages.");
+            std::process::exit(1);
+        }
+    };
     
     println!("{}", text);
 
+    // Calculate detailed statistics from the best text
+    let sentences: Vec<&str> = text.split('.').filter(|s| !s.trim().is_empty()).collect();
+    let sentence_count = sentences.len();
+    let avg_words_per_sentence = if sentence_count > 0 {
+        best_output_count as f64 / sentence_count as f64
+    } else {
+        0.0
+    };
+
+    // Count payload vs cover words and characters
+    let payload_words_in_output: HashSet<String> = payload_set_clone.iter().cloned().collect();
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut payload_word_count = 0;
+    let mut cover_word_count = 0;
+    let mut bip39_char_count = 0;
+    let mut non_bip39_char_count = 0;
+    
+    for word in &words {
+        let normalized = normalize_token_for_bip39(word);
+        if !normalized.is_empty() && payload_words_in_output.contains(&normalized) {
+            payload_word_count += 1;
+            bip39_char_count += normalized.chars().count();
+        } else {
+            cover_word_count += 1;
+            non_bip39_char_count += normalized.chars().count();
+        }
+    }
+    
+    let total_output_chars = bip39_char_count + non_bip39_char_count;
+
+    // Print comprehensive statistics (only when generating multiple variations)
+    if variations > 1 {
+        eprintln!("\n=== Statistics ===");
+        eprintln!("Input:");
+        eprintln!("  Total words: {}", input_word_count);
+        if !input_pos_counts.is_empty() {
+            eprintln!("  POS breakdown:");
+            let mut pos_vec: Vec<_> = input_pos_counts.iter().collect();
+            pos_vec.sort_by_key(|(pos, _)| {
+                match pos {
+                    Pos::N => 1,
+                    Pos::V => 2,
+                    Pos::Adj => 3,
+                    Pos::Adv => 4,
+                    Pos::Prep => 5,
+                    Pos::Det => 6,
+                    _ => 7,
+                }
+            });
+            for (pos, count) in pos_vec {
+                let pos_name = match pos {
+                    Pos::Det => "Determiners",
+                    Pos::Adj => "Adjectives",
+                    Pos::N => "Nouns",
+                    Pos::V => "Verbs",
+                    Pos::Modal => "Modals",
+                    Pos::Aux => "Auxiliaries",
+                    Pos::Cop => "Copulas",
+                    Pos::To => "To",
+                    Pos::Prep => "Prepositions",
+                    Pos::Adv => "Adverbs",
+                    Pos::Dot => "Punctuation",
+                };
+                eprintln!("    {}: {}", pos_name, count);
+            }
+        }
+        
+        eprintln!("Output:");
+        eprintln!("  Total words: {}", best_output_count);
+        eprintln!("  Payload words: {} ({:.1}%)", payload_word_count, 
+                  (payload_word_count as f64 / best_output_count as f64) * 100.0);
+        eprintln!("  Cover words: {} ({:.1}%)", cover_word_count,
+                  (cover_word_count as f64 / best_output_count as f64) * 100.0);
+        eprintln!("  Sentences: {}", sentence_count);
+        eprintln!("  Avg words per sentence: {:.1}", avg_words_per_sentence);
+        
+        eprintln!("Compactness:");
+        eprintln!("  Score: {:.3} ({} BIP39 chars / {} total chars)", 
+                  best_compactness, bip39_char_count, total_output_chars);
+        eprintln!("  Efficiency: {:.1}% BIP39 characters", (best_compactness * 100.0));
+        
+        if !variation_stats.is_empty() {
+        let min_compactness = variation_stats.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max_compactness = variation_stats.iter().fold(0.0_f64, |a, &b| a.max(b));
+        let avg_compactness = variation_stats.iter().sum::<f64>() / variation_stats.len() as f64;
+        eprintln!("Variations:");
+        eprintln!("  Tested: {}", variations);
+        eprintln!("  Min compactness: {:.3}", min_compactness);
+        eprintln!("  Max compactness: {:.3}", max_compactness);
+        eprintln!("  Avg compactness: {:.3}", avg_compactness);
+        eprintln!("  Improvement: {:.1}% better than average", 
+                  ((best_compactness - avg_compactness) / avg_compactness * 100.0).max(0.0));
+        }
+    }
+
     // Decoding: split on whitespace/punct, keep only tokens that are in the BIP39 set.
     // The payload_set contains all the BIP39 words, so filtering is straightforward.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bip39_encode::GrammarChecker;
+
+    /// Fixed seed for reproducible tests
+    const TEST_SEED: u64 = 42;
+
+    /// Helper function to set up a test lexicon with minimal cover words
+    fn setup_test_lexicon(payload_set: HashSet<String>, bip39_set: HashSet<String>) -> Lexicon {
+        let det_words = ["the", "a", "an", "each", "some"];
+        let modal_words = ["should", "could", "would", "might", "may"];
+        let adj_words = ["bright", "clear", "simple", "secure", "quiet", "steady"];
+        let n_words = ["wallet", "user", "server", "system", "note"];
+        let v_words = ["check", "send", "hold", "verify", "process"];
+        let prep_words = ["about", "above", "along", "beneath", "throughout"];
+        let adv_words = ["soon", "well", "quite", "very"];
+
+        Lexicon::new(payload_set, bip39_set)
+            .with_words(Pos::Det, &det_words)
+            .with_words(Pos::Modal, &modal_words)
+            .with_words(Pos::Adj, &adj_words)
+            .with_words(Pos::N, &n_words)
+            .with_words(Pos::V, &v_words)
+            .with_words(Pos::Prep, &prep_words)
+            .with_words(Pos::Adv, &adv_words)
+    }
+
+    /// Extract individual sentences from generated text
+    fn extract_sentences(text: &str) -> Vec<String> {
+        text.split('.')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                // Remove BIP39 markers (|word|)
+                s.replace('|', "")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_generated_sentences_grammar() {
+        // Skip if grammar checker files are not available
+        let grammar_checker = match GrammarChecker::from_language(bip39_encode::Language::English) {
+            Ok(checker) => checker,
+            Err(_) => {
+                eprintln!("Skipping grammar test: nlprule binary files not found");
+                return;
+            }
+        };
+
+        // Generate sentences with random BIP39 words (using fixed seed for reproducibility)
+        let mut rng = StdRng::seed_from_u64(TEST_SEED);
+        let words = select_random_words(&mut rng, 10);
+        
+        let payload: Vec<PayloadTok> = words
+            .iter()
+            .map(|word| {
+                let tags = tag_word(word);
+                PayloadTok::new(word.clone(), &tags)
+            })
+            .collect();
+
+        let payload_set: HashSet<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
+        let bip39_words = load_bip39_words();
+        let bip39_set: HashSet<String> = bip39_words.iter().map(|w| w.to_lowercase()).collect();
+
+        let lex = setup_test_lexicon(payload_set.clone(), bip39_set);
+        let (text, _) = generate_text(&mut rng, &lex, &payload, 5, false);
+
+        // Extract individual sentences
+        let sentences = extract_sentences(&text);
+
+        assert!(!sentences.is_empty(), "Should generate at least one sentence");
+
+        // Check grammar for each sentence
+        let mut total_suggestions = 0;
+        let mut sentences_with_errors = 0;
+
+        for sentence in &sentences {
+            let suggestions = grammar_checker.check(sentence);
+            total_suggestions += suggestions.len();
+            
+            if !suggestions.is_empty() {
+                sentences_with_errors += 1;
+                eprintln!("Sentence with grammar issues: \"{}\"", sentence);
+                for suggestion in &suggestions {
+                    eprintln!("  Suggestion: {:?}", suggestion);
+                }
+            }
+        }
+
+        // Report results
+        eprintln!("\nGrammar check results:");
+        eprintln!("  Total sentences: {}", sentences.len());
+        eprintln!("  Sentences with errors: {}", sentences_with_errors);
+        eprintln!("  Total suggestions: {}", total_suggestions);
+        eprintln!("  Average suggestions per sentence: {:.2}", 
+                  total_suggestions as f64 / sentences.len() as f64);
+
+        // Allow some grammar errors (generated sentences may not be perfect)
+        // But we want most sentences to be reasonably correct
+        let error_rate = sentences_with_errors as f64 / sentences.len() as f64;
+        assert!(
+            error_rate < 0.5,
+            "More than 50% of sentences have grammar errors (error rate: {:.2}%)",
+            error_rate * 100.0
+        );
+    }
+
+    #[test]
+    fn test_grammar_with_different_payload_sizes() {
+        // Skip if grammar checker files are not available
+        let grammar_checker = match GrammarChecker::from_language(bip39_encode::Language::English) {
+            Ok(checker) => checker,
+            Err(_) => {
+                eprintln!("Skipping grammar test: nlprule binary files not found");
+                return;
+            }
+        };
+
+        // Test with different payload sizes (using same seed for reproducibility)
+        for word_count in [5, 8, 12] {
+            let mut rng = StdRng::seed_from_u64(TEST_SEED);
+            let words = select_random_words(&mut rng, word_count);
+            
+            let payload: Vec<PayloadTok> = words
+                .iter()
+                .map(|word| {
+                    let tags = tag_word(word);
+                    PayloadTok::new(word.clone(), &tags)
+                })
+                .collect();
+
+            let payload_set: HashSet<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
+            let bip39_words = load_bip39_words();
+            let bip39_set: HashSet<String> = bip39_words.iter().map(|w| w.to_lowercase()).collect();
+
+            let lex = setup_test_lexicon(payload_set, bip39_set);
+            let (text, _) = generate_text(&mut rng, &lex, &payload, 5, false);
+
+            let sentences = extract_sentences(&text);
+            
+            // Check that at least some sentences are grammatically reasonable
+            let mut correct_sentences = 0;
+            for sentence in &sentences {
+                let suggestions = grammar_checker.check(sentence);
+                if suggestions.is_empty() {
+                    correct_sentences += 1;
+                }
+            }
+
+            eprintln!("Payload size {}: {}/{} sentences grammatically correct", 
+                     word_count, correct_sentences, sentences.len());
+            
+            // At least one sentence should be correct
+            assert!(
+                correct_sentences > 0 || sentences.is_empty(),
+                "No grammatically correct sentences generated for payload size {}",
+                word_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_sentence_structure() {
+        // Test that generated sentences have reasonable structure (using fixed seed for reproducibility)
+        let mut rng = StdRng::seed_from_u64(TEST_SEED);
+        let words = select_random_words(&mut rng, 5);
+        
+        let payload: Vec<PayloadTok> = words
+            .iter()
+            .map(|word| {
+                let tags = tag_word(word);
+                PayloadTok::new(word.clone(), &tags)
+            })
+            .collect();
+
+        let payload_set: HashSet<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
+        let bip39_words = load_bip39_words();
+        let bip39_set: HashSet<String> = bip39_words.iter().map(|w| w.to_lowercase()).collect();
+
+        let lex = setup_test_lexicon(payload_set, bip39_set);
+        let (text, _) = generate_text(&mut rng, &lex, &payload, 5, false);
+
+        let sentences = extract_sentences(&text);
+        
+        // Each sentence should have at least a few words
+        for sentence in &sentences {
+            let word_count = sentence.split_whitespace().count();
+            assert!(
+                word_count >= 3,
+                "Sentence too short ({} words): \"{}\"",
+                word_count,
+                sentence
+            );
+        }
+
+        // Should have generated at least one sentence
+        assert!(!sentences.is_empty(), "Should generate at least one sentence");
+    }
 }

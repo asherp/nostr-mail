@@ -5,3 +5,10 @@ edition = "2021"
 
 [dependencies]
 rand = "0.8"
+nlprule = "0.6"
+anyhow = "1.0"
+reqwest = { version = "0.13.1", features = ["blocking"] }
+clap = { version = "4.5.54", features = ["derive"] }
+regex = "1.12.2"
+flate2 = "1.1.8"
+csv = "1.4.0"

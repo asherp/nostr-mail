@@ -565,7 +565,7 @@ edit|V
 educate|V
 effort|N
 egg|N,V
-eight|Num,N
+eight|N,Adj
 either|Det
 elbow|N,V
 elder|Adj,N
@@ -887,7 +887,7 @@ huge|Adj
 human|Adj,N
 humble|Adj,V
 humor|N,V
-hundred|Num,N
+hundred|N,Adj
 hungry|Adj
 hunt|V
 hurdle|N,V
@@ -1123,7 +1123,7 @@ method|N
 middle|Adj,N,V
 midnight|N
 milk|N,V
-million|Num,N
+million|N,Adj
 mimic|V
 mind|N,V
 minimum|N,Adj
@@ -1235,7 +1235,7 @@ olive|N,Adj
 olympic|Adj
 omit|V
 once|Adv
-one|Num,N,Adj,Pron
+one|N,Adj
 onion|N
 online|Adj,Adv
 only|Adv
@@ -1553,7 +1553,7 @@ sea|N,Adj
 search|V
 season|N,V
 seat|N,V
-second|Num,N,V,Adj,Adv
+second|N,Adj
 secret|Adj,N
 section|N,V
 security|N,Adj
@@ -1571,7 +1571,7 @@ service|N,V,Adj
 session|N
 settle|V
 setup|N
-seven|Num
+seven|N,Adj
 shadow|N,V
 shaft|N,V
 shallow|Adj,N,V
@@ -1612,7 +1612,7 @@ sing|V
 siren|N
 sister|N
 situate|V
-six|Num,N
+six|N,Adj
 size|V
 skate|N,V
 sketch|N,V
@@ -1781,7 +1781,7 @@ taxi|N,V
 teach|V
 team|N,V,Adj
 tell|V
-ten|Num
+ten|N,Adj
 tenant|N,V
 tennis|N
 tent|N,V,Adj
@@ -1798,7 +1798,7 @@ they|Pron
 thing|N
 this|Det
 thought|N,V,Adj
-three|Num,N
+three|N,Adj
 thrive|V
 throw|V
 thumb|N,V
@@ -1878,12 +1878,12 @@ tunnel|N,V
 turkey|N
 turn|V
 turtle|N,V
-twelve|Num
-twenty|Num
+twelve|N,Adj
+twenty|N,Adj
 twice|Adv
 twin|N,Adj,V
 twist|V
-two|Num,N
+two|N,Adj
 type|V
 typical|Adj
 ugly|Adj
@@ -2043,6 +2043,6 @@ you|Pron,N
 young|Adj,N
 youth|N,Adj
 zebra|N,Adj
-zero|Num,N,V,Adj
+zero|N,Adj
 zone|N,V
 zoo|N

@@ -49,8 +49,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy the binary from builder
+# Copy binaries from builder
 COPY --from=builder /app/target/release/bip39-encode /app/bip39-encode
+COPY --from=builder /app/target/release/tag_words /app/tag_words
 
 # Copy nlprule binary files
 COPY --from=builder /opt/nlprule-data /opt/nlprule-data

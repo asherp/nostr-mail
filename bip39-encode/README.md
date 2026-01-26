@@ -19,7 +19,14 @@ This tool uses a small, controlled grammar to generate sentences that embed BIP3
 ### Main Program
 
 ```bash
-cargo run
+# Default: subject grammar + compact length-mode
+cargo run -- --random 12
+
+# Body grammar defaults to natural length-mode (sample from grammar length distribution)
+cargo run -- --random 12 --grammar body
+
+# You can always override explicitly
+cargo run -- --random 12 --grammar body --length-mode compact
 ```
 
 ### Word Frequency Tool
@@ -30,7 +37,8 @@ Generate word lists from frequency data:
 # Download and use COCA word frequency data (recommended)
 cargo run --bin get_top_words -- -n 1000 --download-coca -o output.txt
 
-# Use cached file (faster on subsequent runs)
+# Re-running the same command will reuse the cached download automatically
+# (use --force-download to refresh)
 cargo run --bin get_top_words -- -n 1000 --download-coca -o output.txt
 
 # Use a local wordfrequency.info format file
@@ -107,6 +115,35 @@ The `get_top_words` tool:
 2. **Grammar expansion**: The CFG generates a stream of POS slots
 3. **Slot filling**: Payload tokens are embedded when they fit a slot's POS, otherwise cover words are used
 4. **Decoding**: Extract BIP39 words by filtering the output against the BIP39 word list
+
+## Compact vs Natural (sentence length strategy)
+
+There are (at least) two reasonable ways to drive sentence generation, depending on the UX you want:
+
+- **Compact mode (minimize length)**:
+  - Generate the *shortest possible* sentence that can fit the payload.
+  - Practical approach: try \(k = k_{\min}, k_{\min}+1, \dots\) and stop at the first feasible \(k\).
+  - Within that fixed \(k\), pick the highest-probability sequence (tie-break by probability for readability).
+
+- **Natural mode (maximize grammatical “naturalness”)**:
+  - Prefer sentence lengths and POS sequences that are more probable under the grammar.
+  - Practical approach: sample (or choose) \(k\) from the grammar’s length distribution, then sample a POS sequence proportionally to its probability.
+
+If you want a single continuous “compactness ↔ naturalness” knob, a simple scoring function works well:
+
+\[
+\text{score} = \log P(\text{sequence}) - \lambda \cdot \text{length}
+\]
+
+Higher \(\lambda\) yields shorter, more compact text; lower \(\lambda\) yields more natural (but sometimes longer) text.
+
+**CLI default behavior:** if you don't pass `--length-mode`, the program defaults to:
+- `--grammar subject` → `compact`
+- `--grammar body` → `natural`
+
+## Grammar note: unbounded PP chaining via VP
+
+The English grammar (`languages/english/body.cfg`) is set up so that **VP can optionally end with one-or-more PPs** (e.g., “… in the house on the hill …”). This removes the previous hard maximum sentence length (formerly capped at 13 POS terminals) while keeping `PP` itself as a simple unit (`Prep NP`).
 
 ## Example Output
 

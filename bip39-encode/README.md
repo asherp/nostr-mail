@@ -27,7 +27,45 @@ cargo run -- --random 12 --grammar body
 
 # You can always override explicitly
 cargo run -- --random 12 --grammar body --length-mode compact
+
+# Provide words directly instead of random selection
+cargo run -- abandon ability able about above absent
+
+# Use a specific language (default: english)
+cargo run -- --random 12 --language english
+
+# Generate multiple variations and select the most compact
+cargo run -- --random 12 --variations 5
+
+# Use a seed for reproducible output
+cargo run -- --random 12 --seed 12345
+
+# Show grammar rules
+cargo run -- --show-grammar --grammar body
+
+# Verbose output for debugging
+cargo run -- --random 12 --verbose
 ```
+
+#### Command-Line Options
+
+- `--random <N>`: Generate sentences from N random BIP39 words
+- `--grammar <grammar>`: Grammar to use: `subject` (default) or `body`
+  - `subject`: Short sentences, may include prefixes (Re:, Fwd:, etc.)
+  - `body`: Longer sentences, no prefixes
+- `--highlight <mode>`: Highlight BIP39 words: `none`, `bars` (default), or `highlight`
+- `--seed <N>`: Seed for deterministic random generation
+- `--variations <N>`: Generate N variations and select the most compact (default: 1)
+- `--language, -l <lang>`: Language for wordlist: `english` (default), `french`, `german`
+- `--k-min <N>`: Minimum sentence length in POS slots including Dot (default: 3)
+- `--k-max <N>`: Maximum sentence length in POS slots including Dot (default: 20)
+- `--length-mode <mode>`: Sentence length selection: `compact` or `natural`
+  - Default: `subject` → `compact`, `body` → `natural`
+  - `compact`: Try k from k_min to k_max, shortest first
+  - `natural`: Sample k from grammar's length distribution
+- `--show-grammar`: Display the grammar rules (then continue execution)
+- `--verbose, -v`: Show detailed debugging information
+- `--help, -h`: Show help message
 
 ### Word Frequency Tool
 
@@ -141,9 +179,17 @@ Higher \(\lambda\) yields shorter, more compact text; lower \(\lambda\) yields m
 - `--grammar subject` → `compact`
 - `--grammar body` → `natural`
 
-## Grammar note: unbounded PP chaining via VP
+## Grammar Files
 
-The English grammar (`languages/english/body.cfg`) is set up so that **VP can optionally end with one-or-more PPs** (e.g., “… in the house on the hill …”). This removes the previous hard maximum sentence length (formerly capped at 13 POS terminals) while keeping `PP` itself as a simple unit (`Prep NP`).
+Grammars are defined in CFG format files located in `languages/{language}/` directories:
+- `subject.cfg`: Grammar for email subject lines (shorter, may include prefixes)
+- `body.cfg`: Grammar for email body text (longer, more natural sentences)
+
+The grammar parser uses the Pest parser generator to parse these CFG files. Grammar rules support weighted productions for probabilistic selection.
+
+### Grammar note: unbounded PP chaining via VP
+
+The English grammar (`languages/english/body.cfg`) is set up so that **VP can optionally end with one-or-more PPs** (e.g., “… in the house on the hill …"). This removes the previous hard maximum sentence length (formerly capped at 13 POS terminals) while keeping `PP` itself as a simple unit (`Prep NP`).
 
 ## Example Output
 
@@ -156,16 +202,26 @@ The embedded BIP39 words in this example are: `abandon`, `ability`, `able`, `abo
 ## Project Structure
 
 - `src/main.rs`: Main implementation with CFG grammar, lexicon, and generation logic
+- `src/lib.rs`: Library module providing `GrammarChecker` for nlprule integration
+- `src/grammar.rs`: Grammar parser and CFG implementation using pest
+- `src/grammar_parser.pest`: Pest grammar definition for parsing CFG files
 - `src/bin/get_top_words.rs`: Word frequency analysis tool for generating word lists
-- `cover_POS.txt`: Cover lexicon with POS tags (format: `word|POS1,POS2`)
-- `bip39_POS.txt`: BIP39 word list with POS tags
+- `src/bin/tag_words.rs`: POS tagging tool using nlprule
+- `languages/english/subject.cfg`: CFG grammar definition for subject lines
+- `languages/english/body.cfg`: CFG grammar definition for body text
+- `languages/english/cover_POS.txt`: Cover lexicon with POS tags (format: `word|POS1,POS2`)
+- `languages/english/english_bip39_POS.txt`: BIP39 word list with POS tags
 - `Cargo.toml`: Rust project configuration with dependencies
 
 ## Dependencies
 
 - `rand = "0.8"`: For random selection of cover words and grammar productions
-- `nlprule = "0.6"`: For natural language processing
+- `nlprule = "0.6"`: For natural language processing and POS tagging
 - `anyhow = "1.0"`: For error handling
+- `pest = "2.7"`: For parsing CFG grammar files
+- `pest_derive = "2.7"`: Derive macro for pest parser
+- `serde = "1.0"`: Serialization framework
+- `serde_json = "1.0"`: JSON support for serde
 - `reqwest = "0.11"`: For downloading word frequency data (get_top_words)
 - `clap = "4.4"`: For command-line argument parsing (get_top_words)
 - `regex = "1.10"`: For POS tag parsing (get_top_words)
@@ -180,6 +236,18 @@ The `get_top_words` tool uses word frequency data from:
 
 The downloaded data is cached locally as `lemmas_60k.txt` in the current directory (or temp directory) and reused for 7 days before automatically refreshing.
 
+## Language Support
+
+The program supports multiple languages via the `--language` flag. Each language requires:
+- A grammar file: `languages/{language}/{subject,body}.cfg`
+- A POS-tagged BIP39 wordlist: `languages/{language}/{language}_bip39_POS.txt`
+- A cover lexicon: `languages/{language}/cover_POS.txt`
+
+Currently supported languages:
+- `english` (default)
+- `french` (requires POS-tagged wordlist)
+- `german` (requires POS-tagged wordlist)
+
 ## Notes
 
 - The current lexicon is minimal and should be expanded for production use
@@ -187,3 +255,5 @@ The downloaded data is cached locally as `lemmas_60k.txt` in the current directo
 - Payload words that don't fit available slots will trigger a warning
 - Word frequency data is cached locally to avoid repeated downloads
 - The `get_top_words` tool outputs words in the same format as `cover_POS.txt` for easy integration
+- Grammar files use Pest parser syntax - see `src/grammar_parser.pest` for the grammar definition
+- The `--mode` flag is deprecated in favor of `--grammar`

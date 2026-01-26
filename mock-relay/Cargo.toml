@@ -31,3 +31,7 @@ path = "src/main.rs"
 [[example]]
 name = "generate_fake_events"
 path = "examples/generate_fake_events.rs"
+
+[[bin]]
+name = "test_connection"
+path = "test_connection.rs"

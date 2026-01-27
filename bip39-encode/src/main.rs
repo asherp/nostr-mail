@@ -22,7 +22,27 @@ static PRINTED_SENTENCE_KINDS: OnceLock<()> = OnceLock::new();
 enum HighlightMode {
     None,
     Bars,
-    Highlight,
+    Color(u8),  // ANSI color code (30-37 for foreground colors)
+    Madlib,
+}
+
+/// Parse color name or ANSI code to color value
+fn parse_color(color_str: &str) -> Result<u8, String> {
+    match color_str.to_lowercase().as_str() {
+        "black" => Ok(30),
+        "red" => Ok(31),
+        "green" => Ok(32),
+        "yellow" => Ok(33),
+        "blue" => Ok(34),
+        "magenta" => Ok(35),
+        "cyan" => Ok(36),
+        "white" => Ok(37),
+        _ => {
+            // Try parsing as a number
+            color_str.parse::<u8>()
+                .map_err(|_| format!("Invalid color: {}. Use a color name (red, green, blue, etc.) or ANSI code (30-37)", color_str))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +69,7 @@ enum Pos {
     To,
     Prep,
     Adv,
+    Conj,
     Dot,
     Prefix,
 }
@@ -227,7 +248,7 @@ fn start_nonterminal_for_pos(pos: Pos) -> &'static str {
     // The planner will find sequences that match naturally
     match pos {
         Pos::N | Pos::V | Pos::Adj | Pos::Adv | Pos::Prep | Pos::Det |
-        Pos::Modal | Pos::Aux | Pos::Cop | Pos::To | Pos::Dot | Pos::Prefix => "S",
+        Pos::Modal | Pos::Aux | Pos::Cop | Pos::To | Pos::Conj | Pos::Dot | Pos::Prefix => "S",
     }
 }
 
@@ -238,7 +259,7 @@ struct SequenceCache {
 
 impl SequenceCache {
     /// Load sequences for all start symbols we might use, up to k_max
-    fn load(mode: GenerationMode, k_max: usize) -> Result<Self, Box<dyn std::error::Error>> {
+    fn load(mode: GenerationMode, k_max: usize, verbose: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let grammar_path = match mode {
             GenerationMode::Subject => "languages/english/subject.cfg",
             GenerationMode::Body => "languages/english/body.cfg",
@@ -272,7 +293,7 @@ impl SequenceCache {
             }
         }
         
-        print_sentence_kinds_once(grammar_label, k_max, &by_start_symbol);
+        print_sentence_kinds_once(grammar_label, k_max, &by_start_symbol, verbose);
 
         Ok(SequenceCache { by_start_symbol })
     }
@@ -290,8 +311,9 @@ fn print_sentence_kinds_once(
     grammar_label: &str,
     k_max: usize,
     by_start_symbol: &HashMap<String, Vec<Vec<SequenceWithProbability>>>,
+    verbose: bool,
 ) {
-    if by_start_symbol.is_empty() {
+    if by_start_symbol.is_empty() || !verbose {
         return;
     }
 
@@ -870,8 +892,10 @@ fn fill_slots<R: Rng>(
             }
             _ => {
                 // Certain slots should never use payload words (grammatical function words)
-                let must_use_cover =
-                    matches!(slot, Pos::Aux | Pos::Cop | Pos::To | Pos::Prefix | Pos::Modal);
+                let must_use_cover = matches!(
+                    slot,
+                    Pos::Aux | Pos::Cop | Pos::To | Pos::Prefix | Pos::Modal | Pos::Conj
+                );
                 
                 // Check if this slot has a forced placement
                 let payload_word_idx = if let Some(forced) = forced_placements {
@@ -1110,7 +1134,7 @@ fn generate_text<R: Rng>(
     let payload_set: HashSet<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
 
     // Load precomputed sequences
-    let cache = match SequenceCache::load(mode, k_max) {
+    let cache = match SequenceCache::load(mode, k_max, verbose) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error loading sequence cache: {}", e);
@@ -1347,25 +1371,54 @@ fn generate_text<R: Rng>(
             *first = capitalize(first);
         }
 
-        // Print sentence as it's generated if verbose
-        if verbose {
-            let sentence_text: String = sentence_words.iter()
-                .map(|w| {
-                    let word_clean = normalize_token_for_bip39(w);
-                    if !word_clean.is_empty() && payload_set.contains(&word_clean) {
+            // Print sentence as it's generated if verbose
+            if verbose {
+                let sentence_text: String = sentence_words.iter()
+                    .map(|w| {
+                        let word_clean = normalize_token_for_bip39(w);
+                        if !word_clean.is_empty() && payload_set.contains(&word_clean) {
                         match highlight_mode {
                             HighlightMode::None => w.clone(),
                             HighlightMode::Bars => wrap_payload_with_bars(w),
-                            HighlightMode::Highlight => wrap_payload_with_highlight(w),
+                            HighlightMode::Color(color) => wrap_payload_with_color(w, color),
+                            HighlightMode::Madlib => {
+                                    // Find the payload token to get its POS tag
+                                    if let Some(payload_tok) = payload.iter().find(|t| t.word.to_lowercase() == word_clean) {
+                                        // Use the first allowed POS tag for madlib
+                                        if let Some(&first_pos) = payload_tok.allowed.iter().next() {
+                                            let pos_str = match first_pos {
+                                                Pos::Det => "Det",
+                                                Pos::Adj => "Adj",
+                                                Pos::N => "N",
+                                                Pos::V => "V",
+                                                Pos::Modal => "Modal",
+                                                Pos::Aux => "Aux",
+                                                Pos::Cop => "Cop",
+                                                Pos::To => "To",
+                                                Pos::Prep => "Prep",
+                                                Pos::Adv => "Adv",
+                                                Pos::Conj => "Conj",
+                                                Pos::Dot => "Dot",
+                                                Pos::Prefix => "Prefix",
+                                            };
+                                            let punct: String = w.chars().filter(|c| !c.is_alphabetic()).collect();
+                                            format!("[{}]{}", pos_str, punct)
+                                        } else {
+                                            w.clone()
+                                        }
+                                    } else {
+                                        w.clone()
+                                    }
+                                }
+                            }
+                        } else {
+                            w.clone()
                         }
-                    } else {
-                        w.clone()
-                    }
-                })
-                .collect::<Vec<String>>()
-                .join(" ");
-            eprintln!("{}", sentence_text);
-        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join(" ");
+                eprintln!("{}", sentence_text);
+            }
         
         words = sentence_words;
     } else {
@@ -1601,6 +1654,7 @@ fn generate_text<R: Rng>(
                     Pos::To => "To".to_string(),
                     Pos::Prep => "Prep".to_string(),
                     Pos::Adv => "Adv".to_string(),
+                        Pos::Conj => "Conj".to_string(),
                     Pos::Dot => "Dot".to_string(),
                     Pos::Prefix => "Prefix".to_string(),
                 }
@@ -1642,6 +1696,7 @@ fn generate_text<R: Rng>(
                     Pos::To => "To".to_string(),
                     Pos::Prep => "Prep".to_string(),
                     Pos::Adv => "Adv".to_string(),
+                    Pos::Conj => "Conj".to_string(),
                     Pos::Dot => "Dot".to_string(),
                     Pos::Prefix => "Prefix".to_string(),
                 }
@@ -1672,6 +1727,7 @@ fn generate_text<R: Rng>(
                         Pos::To => "To",
                         Pos::Prep => "Prep",
                         Pos::Adv => "Adv",
+                        Pos::Conj => "Conj",
                         Pos::Dot => "Dot", // Shouldn't happen here
                         Pos::Prefix => "Prefix",
                     };
@@ -1690,6 +1746,7 @@ fn generate_text<R: Rng>(
                                 Pos::To => "To",
                                 Pos::Prep => "Prep",
                                 Pos::Adv => "Adv",
+                                Pos::Conj => "Conj",
                                 Pos::Dot => "Dot",
                                 Pos::Prefix => "Prefix",
                             }.to_string()
@@ -1718,10 +1775,39 @@ fn generate_text<R: Rng>(
                     .map(|w| {
                         let word_clean = normalize_token_for_bip39(w);
                         if !word_clean.is_empty() && payload_set.contains(&word_clean) {
-                            match highlight_mode {
-                                HighlightMode::None => w.clone(),
-                                HighlightMode::Bars => wrap_payload_with_bars(w),
-                                HighlightMode::Highlight => wrap_payload_with_highlight(w),
+                        match highlight_mode {
+                            HighlightMode::None => w.clone(),
+                            HighlightMode::Bars => wrap_payload_with_bars(w),
+                            HighlightMode::Color(color) => wrap_payload_with_color(w, color),
+                            HighlightMode::Madlib => {
+                                    // Find the payload token to get its POS tag
+                                    if let Some(payload_tok) = payload.iter().find(|t| t.word.to_lowercase() == word_clean) {
+                                        // Use the first allowed POS tag for madlib
+                                        if let Some(&first_pos) = payload_tok.allowed.iter().next() {
+                                            let pos_str = match first_pos {
+                                                Pos::Det => "Det",
+                                                Pos::Adj => "Adj",
+                                                Pos::N => "N",
+                                                Pos::V => "V",
+                                                Pos::Modal => "Modal",
+                                                Pos::Aux => "Aux",
+                                                Pos::Cop => "Cop",
+                                                Pos::To => "To",
+                                                Pos::Prep => "Prep",
+                                                Pos::Adv => "Adv",
+                                                Pos::Conj => "Conj",
+                                                Pos::Dot => "Dot",
+                                                Pos::Prefix => "Prefix",
+                                            };
+                                            let punct: String = w.chars().filter(|c| !c.is_alphabetic()).collect();
+                                            format!("[{}]{}", pos_str, punct)
+                                        } else {
+                                            w.clone()
+                                        }
+                                    } else {
+                                        w.clone()
+                                    }
+                                }
                             }
                         } else {
                             w.clone()
@@ -1758,21 +1844,59 @@ fn generate_text<R: Rng>(
     }
 
     // Apply highlighting to BIP39 words according to highlight_mode.
-    let rendered_words: Vec<String> = words
-        .iter()
-        .map(|word| {
+    let rendered_words: Vec<String> = if highlight_mode == HighlightMode::Madlib {
+        // For madlib mode, we need slot information which isn't available here
+        // So we'll handle it differently - replace payload words with [POS] based on payload tokens
+        words.iter().map(|word| {
+            let word_clean = normalize_token_for_bip39(word);
+            if !word_clean.is_empty() && payload_set.contains(&word_clean) {
+                // Find the payload token to get its POS tag
+                if let Some(payload_tok) = payload.iter().find(|t| t.word.to_lowercase() == word_clean) {
+                    // Use the first allowed POS tag for madlib
+                    if let Some(&first_pos) = payload_tok.allowed.iter().next() {
+                        let pos_str = match first_pos {
+                            Pos::Det => "Det",
+                            Pos::Adj => "Adj",
+                            Pos::N => "N",
+                            Pos::V => "V",
+                            Pos::Modal => "Modal",
+                            Pos::Aux => "Aux",
+                            Pos::Cop => "Cop",
+                            Pos::To => "To",
+                            Pos::Prep => "Prep",
+                            Pos::Adv => "Adv",
+                            Pos::Conj => "Conj",
+                            Pos::Dot => "Dot",
+                            Pos::Prefix => "Prefix",
+                        };
+                        // Preserve punctuation
+                        let punct: String = word.chars().filter(|c| !c.is_alphabetic()).collect();
+                        format!("[{}]{}", pos_str, punct)
+                    } else {
+                        word.clone()
+                    }
+                } else {
+                    word.clone()
+                }
+            } else {
+                word.clone()
+            }
+        }).collect()
+    } else {
+        words.iter().map(|word| {
             let word_clean = normalize_token_for_bip39(word);
             if !word_clean.is_empty() && payload_set.contains(&word_clean) {
                 match highlight_mode {
                     HighlightMode::None => word.clone(),
                     HighlightMode::Bars => wrap_payload_with_bars(word),
-                    HighlightMode::Highlight => wrap_payload_with_highlight(word),
+                    HighlightMode::Color(color) => wrap_payload_with_color(word, color),
+                    HighlightMode::Madlib => unreachable!(), // Handled above
                 }
             } else {
                 word.clone()
             }
-        })
-        .collect();
+        }).collect()
+    };
 
     (rendered_words.join(" "), payload_set)
 }
@@ -1880,11 +2004,11 @@ fn wrap_payload_with_bars(word_with_punct: &str) -> String {
     format!("|{core}|{suffix}")
 }
 
-fn wrap_payload_with_highlight(word_with_punct: &str) -> String {
-    // Highlight the word using ANSI escape codes (green color) while keeping trailing punctuation outside.
+fn wrap_payload_with_color(word_with_punct: &str, color_code: u8) -> String {
+    // Highlight the word using ANSI escape codes while keeping trailing punctuation outside.
     // Example: "abandon." -> "\x1b[32mabandon\x1b[0m."
     // Example: "Abandon"  -> "\x1b[32mAbandon\x1b[0m"
-    // ANSI color codes: 32 = green, 33 = yellow, 34 = blue, 35 = magenta, 36 = cyan
+    // ANSI color codes: 30 = black, 31 = red, 32 = green, 33 = yellow, 34 = blue, 35 = magenta, 36 = cyan, 37 = white
     let mut core = word_with_punct.to_string();
     let mut suffix = String::new();
     while let Some(last) = core.chars().last() {
@@ -1894,7 +2018,7 @@ fn wrap_payload_with_highlight(word_with_punct: &str) -> String {
         core.pop();
         suffix.insert(0, last);
     }
-    format!("\x1b[32m{core}\x1b[0m{suffix}")
+    format!("\x1b[{}m{core}\x1b[0m{suffix}", color_code)
 }
 
 /// Build comprehensive POS mapping for all BIP39 words.
@@ -1912,25 +2036,20 @@ fn build_pos_mapping(language: &str) -> Result<HashMap<String, Vec<Pos>>, String
             continue;
         }
         
-        // Parse format: word|POS1,POS2,... or just word (backward compatibility)
+        // Parse format: word|POS1,POS2,...
+        // Require explicit POS tags - skip words without tags
         let (word, pos_tags) = if let Some(pipe_idx) = line.find('|') {
             let word = line[..pipe_idx].trim().to_lowercase();
             let pos_str = line[pipe_idx + 1..].trim();
             let pos_tags = parse_pos_tags(pos_str);
-            // If POS tags are empty (e.g., "word|"), fall back to heuristics
-            if pos_tags.is_empty() {
-                (word.clone(), assign_pos_tags(&word))
-            } else {
-                (word, pos_tags)
-            }
-        } else {
-            // Backward compatibility: no POS tags, use heuristics
-            let word = line.to_lowercase();
-            let pos_tags = assign_pos_tags(&word);
             (word, pos_tags)
+        } else {
+            // No POS tags - skip this word (require explicit tags)
+            continue;
         };
         
-        if !word.is_empty() {
+        // Only add words with valid POS tags
+        if !word.is_empty() && !pos_tags.is_empty() {
             mapping.insert(word, pos_tags);
         }
     }
@@ -1954,6 +2073,7 @@ fn parse_pos_tags(pos_str: &str) -> Vec<Pos> {
             "To" => Some(Pos::To),
             "Prep" => Some(Pos::Prep),
             "Adv" => Some(Pos::Adv),
+            "Conj" => Some(Pos::Conj),
             "Dot" => Some(Pos::Dot),
             "Prefix" => Some(Pos::Prefix),
             _ => None,
@@ -1961,389 +2081,12 @@ fn parse_pos_tags(pos_str: &str) -> Vec<Pos> {
         .collect()
 }
 
-/// Assign POS tags to a word based on comprehensive heuristics.
-/// Returns a vector of allowed POS tags (can be multiple).
-fn assign_pos_tags(word: &str) -> Vec<Pos> {
-    let word_lower = word.to_lowercase();
-    
-    // Prepositions and adverbs (spatial/temporal)
-    let prep_adv_words: HashSet<&str> = [
-        "about", "above", "across", "after", "against", "along", "around",
-        "before", "behind", "below", "beneath", "beside", "between", "beyond",
-        "during", "inside", "outside", "through", "throughout", "under",
-        "underneath", "until", "within", "without", "again", "ahead", "almost",
-        "already", "also", "apart", "away", "else", "even", "ever", "here",
-        "now", "once", "only", "over", "quite", "rather", "since", "so",
-        "still", "then", "there", "thus", "together", "too", "very", "well",
-        "when", "where", "while", "yet"
-    ].iter().copied().collect();
-    
-    if prep_adv_words.contains(word_lower.as_str()) {
-        // Many of these can be both prep and adv
-        if ["about", "above", "across", "after", "against", "along", "around",
-            "before", "behind", "below", "beneath", "beside", "between", "beyond",
-            "during", "inside", "outside", "through", "throughout", "under",
-            "underneath", "until", "within", "without", "over", "since"].contains(&word_lower.as_str()) {
-            return vec![Pos::Prep, Pos::Adv];
-        }
-        return vec![Pos::Adv];
-    }
-    
-    // Determiners
-    let det_words: HashSet<&str> = [
-        "all", "any", "each", "either", "few", "more", "most", "much",
-        "neither", "other", "some", "such", "that", "this", "what", "which",
-        "several",
-    ].iter().copied().collect();
-    
-    if det_words.contains(word_lower.as_str()) {
-        // Treat determiners as determiners only. This prevents cover-Adj lists from
-        // producing phrases like "a several ..." and forces payload determiners to
-        // embed via Det slots (which is now supported).
-        return vec![Pos::Det];
-    }
-    
-    // Verbs (action words, often can be nouns too)
-    let verb_endings = ["ed", "ing", "ate", "ify", "ize", "ise"];
-    let is_verb_ending = verb_endings.iter().any(|ending| word_lower.ends_with(ending));
-    
-    // Common verb patterns
-    let verb_patterns = [
-        "abandon", "absorb", "abuse", "accuse", "achieve", "acquire", "act", "adapt",
-        "add", "adjust", "admit", "advance", "afford", "agree", "aim", "allow", "alter",
-        "announce", "answer", "appear", "approve", "argue", "arrange", "arrest", "arrive",
-        "ask", "assault", "assist", "assume", "attack", "attend", "attract", "avoid",
-        "awake", "become", "begin", "behave", "believe", "betray", "bind", "blame",
-        "bless", "boil", "boost", "borrow", "bounce", "bring", "build", "burst",
-        "call", "cancel", "carry", "catch", "cause", "change", "charge", "chase",
-        "chat", "check", "choose", "claim", "clap", "clarify", "clean", "click",
-        "climb", "close", "collect", "combine", "come", "conduct", "confirm", "connect",
-        "consider", "control", "convince", "cook", "copy", "correct", "cost", "cover",
-        "crack", "crash", "crawl", "create", "cross", "crouch", "cruise", "crush",
-        "cry", "dance", "dash", "deal", "debate", "decide", "decline", "decorate",
-        "decrease", "define", "defy", "delay", "deliver", "demand", "deny", "depart",
-        "depend", "deposit", "derive", "describe", "design", "destroy", "detect",
-        "develop", "devote", "dial", "differ", "direct", "disagree", "discover",
-        "dismiss", "display", "divert", "divide", "divorce", "draw", "dream", "dress",
-        "drift", "drill", "drink", "drive", "drop", "dry", "earn", "eat", "edit",
-        "educate", "embark", "embody", "embrace", "emerge", "employ", "empower",
-        "enable", "enact", "end", "endorse", "enforce", "engage", "enhance", "enjoy",
-        "enlist", "enrich", "enroll", "ensure", "enter", "equal", "equip", "erase",
-        "erode", "erupt", "escape", "evoke", "evolve", "exchange", "excite", "exclude",
-        "excuse", "execute", "exercise", "exhaust", "exhibit", "exist", "exit",
-        "expand", "expect", "expire", "explain", "expose", "express", "extend",
-        "face", "fade", "fall", "feed", "feel", "fetch", "fight", "fill", "find",
-        "finish", "fire", "fit", "fix", "flash", "flee", "flip", "float", "fly",
-        "focus", "fold", "follow", "forget", "found", "frame", "freeze", "gain",
-        "gather", "gaze", "get", "give", "glance", "glare", "glide", "glow", "go",
-        "govern", "grab", "grant", "grow", "grunt", "guard", "guess", "guide",
-        "handle", "hang", "happen", "harvest", "have", "head", "hear", "help",
-        "hide", "hire", "hit", "hold", "hope", "hover", "hunt", "hurry", "hurt",
-        "identify", "ignore", "imitate", "impose", "improve", "include", "increase",
-        "indicate", "inflict", "inform", "inhale", "inherit", "inject", "inspire",
-        "install", "invest", "invite", "involve", "isolate", "join", "judge", "jump",
-        "keep", "kick", "kill", "kiss", "knock", "know", "label", "laugh", "launch",
-        "lay", "lead", "learn", "leave", "lend", "let", "level", "lift", "light",
-        "like", "limit", "link", "list", "listen", "live", "load", "lock", "look",
-        "lose", "love", "make", "manage", "march", "mark", "marry", "match", "matter",
-        "mean", "measure", "meet", "melt", "mention", "merge", "mind", "miss", "mix",
-        "modify", "monitor", "move", "multiply", "name", "need", "neglect", "obey",
-        "oblige", "observe", "obtain", "occur", "offer", "open", "operate", "oppose",
-        "order", "organize", "orient", "own", "pack", "paddle", "paint", "park",
-        "part", "pass", "pause", "pay", "pave", "perform", "permit", "pick", "place",
-        "plan", "plant", "play", "pledge", "pluck", "plug", "plunge", "point",
-        "polish", "pop", "pose", "position", "possess", "post", "pour", "practice",
-        "praise", "pray", "predict", "prefer", "prepare", "present", "press",
-        "prevent", "print", "process", "produce", "profit", "program", "progress",
-        "project", "promise", "promote", "proof", "propose", "protect", "protest",
-        "prove", "provide", "pull", "pump", "punch", "purchase", "push", "put",
-        "qualify", "question", "quit", "quote", "race", "raise", "rally", "range",
-        "rank", "rate", "reach", "react", "read", "realize", "recall", "receive",
-        "recognize", "record", "recover", "recycle", "reduce", "refer", "reflect",
-        "refuse", "regret", "reject", "relate", "relax", "release", "rely", "remain",
-        "remember", "remind", "remove", "render", "renew", "rent", "repair", "repeat",
-        "replace", "reply", "report", "represent", "require", "rescue", "resemble",
-        "resist", "resolve", "respond", "rest", "restore", "restrict", "result",
-        "retire", "retreat", "return", "reveal", "review", "reward", "ride", "ring",
-        "rise", "risk", "roll", "rotate", "round", "rule", "run", "rush", "sail",
-        "save", "say", "scale", "scan", "scare", "scatter", "schedule", "scheme",
-        "score", "scrape", "scratch", "scream", "screen", "screw", "script", "scrub",
-        "seal", "search", "seat", "see", "seek", "seem", "select", "sell", "send",
-        "sense", "separate", "serve", "set", "settle", "shake", "shape", "share",
-        "shed", "shell", "shelter", "shift", "shine", "ship", "shock", "shoot",
-        "shop", "shoulder", "shout", "shove", "show", "shrug", "shuffle", "shut",
-        "sigh", "sign", "signal", "sing", "sink", "sit", "situate", "skate", "sketch",
-        "ski", "skill", "skip", "slap", "slam", "sleep", "slice", "slide", "slip",
-        "slow", "smash", "smell", "smile", "smoke", "snap", "sniff", "snow", "soak",
-        "solve", "sort", "sound", "spare", "spawn", "speak", "specify", "speed",
-        "spell", "spend", "spin", "spit", "split", "spoil", "sponsor", "spot",
-        "spray", "spread", "spring", "squeeze", "stabilize", "stack", "staff",
-        "stage", "stamp", "stand", "start", "state", "stay", "steal", "steer",
-        "stem", "step", "stick", "sting", "stir", "stock", "stop", "store", "storm",
-        "strain", "strand", "strap", "stream", "strengthen", "stress", "stretch",
-        "strike", "string", "strip", "strive", "stroke", "structure", "struggle",
-        "study", "stuff", "stumble", "style", "subject", "submit", "substitute",
-        "succeed", "suck", "suffer", "suggest", "suit", "sum", "summarize", "supply",
-        "support", "suppose", "suppress", "surface", "surge", "surprise", "surrender",
-        "surround", "survey", "survive", "suspect", "suspend", "sustain", "swallow",
-        "swap", "swear", "sweep", "swell", "swim", "swing", "switch", "symbolize",
-        "sympathize", "synchronize", "synthesize", "systematize", "table", "tackle",
-        "tag", "tail", "take", "talk", "tame", "tap", "target", "task", "taste",
-        "tax", "teach", "team", "tear", "tease", "tell", "tempt", "tend", "term",
-        "test", "testify", "thank", "think", "thrive", "throw", "thrust", "thumb",
-        "tick", "tide", "tie", "tighten", "tilt", "time", "tip", "tire", "title",
-        "toast", "tolerate", "tone", "top", "topple", "toss", "total", "touch",
-        "tour", "tow", "trace", "track", "trade", "trail", "train", "transfer",
-        "transform", "translate", "transmit", "transport", "trap", "travel", "treat",
-        "tremble", "trend", "trial", "trick", "trigger", "trim", "trip", "triumph",
-        "trouble", "trust", "try", "tuck", "tug", "tumble", "tune", "turn", "tutor",
-        "twist", "type", "undergo", "understand", "undertake", "undo", "unfold",
-        "unify", "unite", "unlock", "unpack", "unveil", "update", "upgrade",
-        "uphold", "upset", "urge", "use", "utilize", "utter", "vacate", "validate",
-        "value", "vanish", "vary", "venture", "verify", "veto", "vibrate", "view",
-        "violate", "visit", "visualize", "voice", "void", "volunteer", "vote",
-        "voyage", "wade", "wage", "wait", "wake", "walk", "wall", "wander", "want",
-        "warm", "warn", "wash", "waste", "watch", "water", "wave", "weaken", "wear",
-        "weave", "wed", "weed", "weep", "weigh", "welcome", "weld", "wet", "whip",
-        "whirl", "whisper", "whistle", "win", "wind", "wink", "wipe", "wire",
-        "wish", "withdraw", "withhold", "withstand", "witness", "wonder", "work",
-        "worry", "worship", "worth", "wrap", "wreck", "wrestle", "wring", "write",
-        "wrong"
-    ];
-    
-    let is_verb = verb_patterns.iter().any(|&v| word_lower == v) || is_verb_ending;
-    
-    // Common BIP39 nouns that should always be tagged as nouns (not adjectives)
-    // These words are incorrectly matched by adjective patterns
-    let noun_exceptions: HashSet<&str> = [
-        "donkey", "west", "slot", "crane", "horn", "danger", "city", "country",
-        "valley", "journey", "money", "story", "history", "victory", "factory",
-        "library", "category", "theory", "memory", "discovery", "delivery",
-        "company", "family", "army", "enemy", "party", "body", "copy", "key",
-        "way", "day", "may", "say", "play", "stay", "pay", "ray", "tray",
-        "delay", "display", "essay", "highway", "holiday", "relay", "spray",
-        "survey", "turkey", "valley", "alley", "attorney", "chimney", "honey",
-        "journey", "kidney", "money", "monkey", "turkey", "volley"
-    ].iter().copied().collect();
-    
-    // Check noun exceptions first (before adjective patterns)
-    if noun_exceptions.contains(word_lower.as_str()) {
-        return vec![Pos::N];
-    }
-    
-    // Nouns (things, people, places, concepts) - check BEFORE adjectives
-    let noun_endings = ["tion", "sion", "ness", "ment", "ity", "ty", "er", "or",
-                        "ist", "ism", "age", "ance", "ence", "dom", "hood", "ship",
-                        "ure", "ture", "sure"];
-    let is_noun_ending = noun_endings.iter().any(|ending| word_lower.ends_with(ending));
-    
-    // Check for consonant+y ending (like "donkey", "city") - these are usually nouns
-    let is_consonant_y = word_lower.len() >= 2 && word_lower.ends_with('y') && {
-        let prev_char = word_lower.chars().rev().nth(1).unwrap();
-        !matches!(prev_char, 'a' | 'e' | 'i' | 'o' | 'u')
-    };
-    
-    // Adjectives (descriptive words)
-    // Remove "y" from adj_endings since we handle it specially for consonant+y
-    let adj_endings = ["able", "ible", "ful", "less", "ic", "ical", "al", "ary",
-                       "ive", "ous", "ious", "ish", "ed", "ing", "en"];
-    let is_adj_ending = adj_endings.iter().any(|ending| word_lower.ends_with(ending));
-    
-    // Handle "y" ending specially: consonant+y is usually a noun, vowel+y can be adjective
-    let is_adj_y = word_lower.ends_with('y') && !is_consonant_y;
-    
-    let adj_patterns = [
-        "able", "absent", "abstract", "absurd", "actual", "afraid", "ahead",
-        "alone", "amazing", "ancient", "angry", "annual", "another", "anxious",
-        "apart", "armed", "arctic", "artificial", "asleep", "athletic", "atomic",
-        "attractive", "automatic", "available", "average", "awake", "aware",
-        "awesome", "awful", "awkward", "bad", "bare", "basic", "beautiful",
-        "best", "better", "big", "bitter", "black", "blank", "bleak", "blind",
-        "blue", "bold", "boring", "brave", "brief", "bright", "brilliant",
-        "brisk", "broken", "brown", "busy", "calm", "capable", "careful",
-        "casual", "certain", "cheap", "chief", "chosen", "chronic", "civil",
-        "clean", "clear", "clever", "close", "cloudy", "cold", "common",
-        "complete", "complex", "confident", "conscious", "considerable",
-        "constant", "cool", "correct", "crucial", "cruel", "curious", "current",
-        "cute", "damp", "dangerous", "daring", "dark", "dead", "dear", "decent",
-        "deep", "definite", "delicate", "delicious", "dense", "dependent",
-        "desperate", "determined", "different", "difficult", "digital", "direct",
-        "dirty", "disabled", "disappointed", "disastrous", "discrete", "distant",
-        "distinct", "distinguished", "disturbed", "diverse", "divine", "divorced",
-        "domestic", "dominant", "double", "doubtful", "dramatic", "drastic",
-        "dreadful", "dry", "dumb", "durable", "dutch", "dying", "dynamic",
-        "eager", "early", "east", "easy", "economic", "edible", "effective",
-        "efficient", "elder", "elderly", "electric", "elegant", "eligible",
-        "elite", "embarrassed", "empty", "endless", "enormous", "enough",
-        "entire", "equal", "equivalent", "essential", "eternal", "ethnic",
-        "even", "eventual", "every", "evident", "evil", "exact", "excellent",
-        "exceptional", "excessive", "excited", "exciting", "exclusive",
-        "exotic", "expensive", "experienced", "explicit", "express", "extensive",
-        "extra", "extraordinary", "extreme", "faint", "fair", "faithful",
-        "fake", "false", "familiar", "famous", "fantastic", "far", "fascinating",
-        "fast", "fat", "fatal", "faulty", "favorite", "federal", "female",
-        "few", "fierce", "final", "financial", "fine", "firm", "fiscal",
-        "fit", "fixed", "flat", "flexible", "fluent", "fluid", "focused",
-        "foolish", "foreign", "formal", "former", "fortunate", "forward",
-        "fragile", "free", "frequent", "fresh", "friendly", "frightened",
-        "front", "frozen", "full", "fun", "funny", "furious", "future",
-        "gay", "general", "generous", "gentle", "genuine", "giant", "gifted",
-        "glad", "glorious", "golden", "good", "gorgeous", "grateful", "grave",
-        "gray", "great", "greedy", "green", "gross", "growing", "guilty",
-        "half", "handsome", "happy", "hard", "harmful", "harsh", "hateful",
-        "head", "healthy", "heavy", "helpful", "helpless", "hidden", "high",
-        "hilarious", "holy", "honest", "honorable", "hopeful", "hopeless",
-        "horrible", "hot", "huge", "human", "humble", "hungry", "hurt",
-        "ideal", "identical", "idle", "ignorant", "ill", "illegal", "illiterate",
-        "imaginary", "immediate", "immense", "immune", "impatient", "imperfect",
-        "impersonal", "important", "impossible", "impressed", "impressive",
-        "improved", "inadequate", "inappropriate", "incapable", "incompetent",
-        "incomplete", "incredible", "indeed", "independent", "indian", "indifferent",
-        "indirect", "indispensable", "individual", "indoor", "industrial",
-        "inevitable", "inexpensive", "infant", "inferior", "infinite", "influential",
-        "informal", "inherent", "initial", "injured", "innocent", "innovative",
-        "insecure", "inside", "insightful", "insignificant", "inspired",
-        "instant", "institutional", "instrumental", "insufficient", "intact",
-        "integral", "intellectual", "intelligent", "intended", "intense",
-        "intensive", "intentional", "interested", "interesting", "interim",
-        "interior", "intermediate", "internal", "international", "intimate",
-        "intolerant", "intricate", "intrigued", "intrinsic", "introductory",
-        "invalid", "invaluable", "invasive", "inventive", "invisible", "involved",
-        "irrelevant", "irresponsible", "irritated", "isolated", "jealous",
-        "joint", "jolly", "joyful", "judicial", "junior", "just", "keen",
-        "key", "kind", "known", "large", "last", "late", "latin", "latter",
-        "lazy", "leading", "left", "legal", "legitimate", "leisure", "lengthy",
-        "less", "level", "liable", "liberal", "light", "like", "likely",
-        "limited", "linear", "linguistic", "liquid", "literary", "little",
-        "live", "lively", "living", "local", "logical", "lonely", "long",
-        "loose", "lost", "loud", "lovely", "low", "loyal", "lucky", "lunar",
-        "luxury", "mad", "magic", "magnetic", "magnificent", "main", "major",
-        "male", "mammal", "manageable", "managerial", "mandatory", "manipulative",
-        "manual", "many", "marginal", "marine", "marked", "married", "marvelous",
-        "mass", "massive", "master", "maternal", "mathematical", "mature",
-        "maximum", "mean", "meaningful", "mechanical", "medical", "medieval",
-        "medium", "melodic", "memorable", "mental", "mere", "merry", "messy",
-        "metallic", "methodical", "meticulous", "middle", "mighty", "mild",
-        "military", "minimal", "minimum", "minor", "minute", "miraculous",
-        "miserable", "misleading", "missing", "mistaken", "mixed", "mobile",
-        "moderate", "modern", "modest", "molecular", "momentary", "monetary",
-        "monthly", "moral", "more", "most", "mother", "motion", "motivated",
-        "motor", "mountain", "moving", "much", "multiple", "musical", "mutual",
-        "mysterious", "naive", "naked", "narrow", "nasty", "national", "native",
-        "natural", "naughty", "near", "nearby", "neat", "necessary", "negative",
-        "neglected", "neighboring", "nervous", "net", "neutral", "new", "next",
-        "nice", "noble", "noisy", "nominal", "non", "normal", "north", "notable",
-        "noted", "notorious", "novel", "nuclear", "numerous", "obedient",
-        "objective", "obligatory", "obscure", "observant", "obsolete", "obvious",
-        "occasional", "occupational", "odd", "off", "offensive", "official",
-        "okay", "old", "olympic", "only", "open", "operational", "opposite",
-        "optical", "optimistic", "optional", "oral", "orange", "ordinary",
-        "organic", "organizational", "original", "other", "outdoor", "outer",
-        "outgoing", "outstanding", "outside", "outward", "oval", "over",
-        "overall", "overhead", "overseas", "overwhelming", "own", "pacific",
-        "packed", "painful", "pale", "parallel", "parental", "parliamentary",
-        "partial", "particular", "passionate", "passive", "past", "patient",
-        "peaceful", "peculiar", "perfect", "permanent", "persistent", "personal",
-        "pet", "philosophical", "physical", "pink", "plain", "planned",
-        "plastic", "pleasant", "pleased", "plenty", "plus", "poetic", "poignant",
-        "polar", "polite", "political", "poor", "popular", "portable", "positive",
-        "possible", "post", "potential", "powerful", "practical", "precious",
-        "precise", "predictable", "preferred", "pregnant", "preliminary",
-        "premium", "prepared", "present", "presidential", "pretty", "previous",
-        "primary", "prime", "primitive", "principal", "prior", "private",
-        "privileged", "probable", "productive", "professional", "profitable",
-        "profound", "progressive", "prominent", "promising", "proper", "proposed",
-        "prosperous", "proud", "provincial", "psychiatric", "psychological",
-        "public", "pure", "purple", "purposeful", "puzzled", "qualified",
-        "quantitative", "quantum", "quick", "quiet", "racial", "radical",
-        "random", "rapid", "rare", "rational", "raw", "ready", "real", "realistic",
-        "rear", "reasonable", "recent", "reckless", "recognized", "recommended",
-        "record", "recovered", "red", "reduced", "redundant", "regional",
-        "registered", "regular", "regulatory", "related", "relative", "relevant",
-        "reliable", "relieved", "religious", "reluctant", "remarkable",
-        "remote", "renewed", "representative", "republican", "required",
-        "residential", "resistant", "respectable", "respective", "responsible",
-        "restless", "restricted", "resulting", "retired", "revolutionary",
-        "rich", "ridiculous", "right", "rigid", "ripe", "rising", "rival",
-        "romantic", "rotten", "rough", "round", "royal", "rubber", "rude",
-        "ruling", "rural", "sad", "safe", "satisfied", "satisfying", "savage",
-        "scared", "scary", "scientific", "seasonal", "secondary", "secret",
-        "secure", "select", "selected", "selective", "self", "senior",
-        "sensible", "sensitive", "separate", "serious", "several", "severe",
-        "sexual", "shallow", "sharp", "sheer", "shiny", "shocked", "short",
-        "shy", "sick", "significant", "silent", "silly", "silver", "similar",
-        "simple", "simultaneous", "sincere", "single", "skilled", "sleepy",
-        "slight", "slim", "slow", "small", "smart", "smooth", "so", "social",
-        "soft", "solar", "sole", "solid", "solo", "some", "sophisticated",
-        "sorry", "sound", "south", "southern", "spare", "spatial", "special",
-        "specific", "spectacular", "speculative", "spiritual", "splendid",
-        "spontaneous", "square", "stable", "stale", "standard", "standing",
-        "static", "statistical", "steady", "steep", "sticky", "stiff", "still",
-        "stirring", "stock", "stolen", "straight", "strange", "strategic",
-        "strict", "striking", "strong", "structural", "stuck", "stupid",
-        "subject", "subjective", "subsequent", "substantial", "subtle",
-        "successful", "successive", "such", "sudden", "sufficient", "suitable",
-        "sunny", "super", "superb", "superior", "supervised", "supplementary",
-        "supreme", "sure", "surprised", "surprising", "surrounding", "suspicious",
-        "sustainable", "sweet", "swift", "symbolic", "sympathetic", "synthetic",
-        "systematic", "tall", "tame", "tan", "tangible", "tart", "tasteful",
-        "tasty", "taxable", "technical", "technological", "tedious", "teenage",
-        "temporary", "tender", "tense", "terminal", "terrible", "terrific",
-        "territorial", "terrorist", "test", "thankful", "that", "theoretical",
-        "thick", "thin", "thirsty", "thorough", "thoughtful", "threatening",
-        "tight", "tiny", "tired", "tiresome", "tolerant", "top", "total",
-        "tough", "tourist", "toxic", "traditional", "tragic", "trained",
-        "transparent", "traumatic", "tremendous", "tricky", "tropical",
-        "troubled", "true", "trusted", "trusting", "trustworthy", "truthful",
-        "turbulent", "typical", "ugly", "ultimate", "unable", "unacceptable",
-        "unaware", "uncertain", "uncomfortable", "uncommon", "unconscious",
-        "under", "underground", "underlying", "understandable", "understood",
-        "undesirable", "uneasy", "unemployed", "unequal", "unexpected",
-        "unfair", "unfamiliar", "unfortunate", "unhappy", "unhealthy",
-        "uniform", "uninterested", "unique", "universal", "unknown", "unlawful",
-        "unlike", "unlikely", "unnecessary", "unpleasant", "unprecedented",
-        "unrealistic", "unreasonable", "unrelated", "unreliable", "unsatisfied",
-        "unsuccessful", "unsuitable", "unsure", "unusual", "unwilling", "upper",
-        "upset", "upstairs", "urban", "urgent", "useful", "useless", "usual",
-        "vague", "valid", "valuable", "variable", "varied", "various", "vast",
-        "verbal", "vertical", "very", "viable", "vibrant", "vicious", "victorious",
-        "video", "vigorous", "violent", "virtual", "visible", "visual", "vital",
-        "vivid", "vocal", "voluntary", "vulnerable", "warm", "wary", "wasteful",
-        "watery", "weak", "wealthy", "weary", "weekly", "weird", "welcome",
-        "well", "western", "wet", "what", "whatever", "which",
-        "whichever", "white", "whole", "wide", "widespread", "wild", "willing",
-        "wise", "witty", "wonderful", "wooden", "woolen", "working", "world",
-        "worldwide", "worried", "worse", "worst", "worth", "worthwhile",
-        "worthy", "wounded", "wrong", "yellow", "young", "youthful", "zealous"
-    ];
-    
-    // Exclude noun exceptions from adj_patterns check
-    let is_adj_pattern = adj_patterns.iter().any(|&a| word_lower == a) && !noun_exceptions.contains(word_lower.as_str());
-    let is_adj = is_adj_pattern || is_adj_ending || is_adj_y;
-    
-    // Return only one POS tag per word, prioritizing: Verb > Noun > Adjective
-    // Changed priority: check nouns before adjectives to fix incorrect tagging
-    if is_verb {
-        return vec![Pos::V];
-    }
-    
-    // Check nouns before adjectives (fixes issues like "donkey", "west", "slot", etc.)
-    if is_noun_ending || is_consonant_y {
-        return vec![Pos::N];
-    }
-    
-    if is_adj {
-        return vec![Pos::Adj];
-    }
-    
-    // Default to noun if no pattern matches
-    vec![Pos::N]
-}
 
 /// Get POS tags for a word from the comprehensive mapping.
 /// Returns a vector of allowed POS tags.
+/// Used for tagging payload (BIP39) words. Cover words use explicit POS tags from cover_POS.txt.
 fn tag_word(word: &str) -> Vec<Pos> {
-    // For now, use English POS mapping for tagging (used for cover words)
+    // For now, use English POS mapping for tagging payload words
     // TODO: Make this language-aware if needed
     static POS_MAP: OnceLock<HashMap<String, Vec<Pos>>> = OnceLock::new();
     
@@ -2353,12 +2096,8 @@ fn tag_word(word: &str) -> Vec<Pos> {
     });
     
     let word_lower = word.to_lowercase();
-    mapping.get(&word_lower)
-        .cloned()
-        .unwrap_or_else(|| {
-            // Fallback: use heuristics if word not found
-            assign_pos_tags(&word_lower)
-        })
+    // Require explicit POS tags - return empty if word not found
+    mapping.get(&word_lower).cloned().unwrap_or_default()
 }
 
 /// Load all BIP39 words from the wordlist file.
@@ -2382,17 +2121,6 @@ fn load_bip39_words(language: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Load safe words from the safe-word-list file.
-/// Returns words filtered to exclude BIP39 words.
-fn load_safe_words(bip39_set: &HashSet<String>) -> Vec<String> {
-    let safe_words = include_str!("../safe-words.txt");
-    safe_words
-        .lines()
-        .map(|line| line.trim().to_lowercase())
-        .filter(|word| !word.is_empty())
-        .filter(|word| !bip39_set.contains(word))
-        .collect()
-}
 
 /// Load cover words with POS tags from cover_POS.txt
 /// Returns a HashMap mapping POS to Vec of words
@@ -2492,7 +2220,11 @@ fn print_usage(program_name: &str) {
     eprintln!("  --grammar <grammar>      Grammar to use: 'subject' (default) or 'body'");
     eprintln!("                          subject: Short sentences, may include prefixes (Re:, Fwd:, etc.)");
     eprintln!("                          body: Longer sentences, no prefixes");
-    eprintln!("  --highlight <mode>      Highlight BIP39 words: 'none', 'bars' (default), or 'highlight'");
+    eprintln!("  --highlight <color>      Highlight BIP39 words with color (default: bars | |)");
+    eprintln!("                          Colors: black, red, green, yellow, blue, magenta, cyan, white");
+    eprintln!("                          Or ANSI codes: 30-37");
+    eprintln!("                          Use 'none' to disable highlighting");
+    eprintln!("  --madlib                Replace BIP39 words with [POS] placeholders");
     eprintln!("  --seed <N>              Seed for deterministic random generation");
     eprintln!("  --variations <N>         Generate N variations and select the most compact (default: 1)");
     eprintln!("  --language, -l <lang>    Language for wordlist: 'english' (default), 'french', 'german'");
@@ -2585,10 +2317,18 @@ fn parse_args() -> Result<(Vec<String>, Option<usize>, bool, Option<u64>, usize,
                 highlight_mode = match args[i + 1].as_str() {
                     "none" => HighlightMode::None,
                     "bars" => HighlightMode::Bars,
-                    "highlight" => HighlightMode::Highlight,
-                    _ => return Err(format!("Invalid highlight mode: {}. Use 'none', 'bars', or 'highlight'", args[i + 1])),
+                    color_str => {
+                        match parse_color(color_str) {
+                            Ok(color_code) => HighlightMode::Color(color_code),
+                            Err(e) => return Err(e),
+                        }
+                    }
                 };
                 i += 2;
+            }
+            "--madlib" => {
+                highlight_mode = HighlightMode::Madlib;
+                i += 1;
             }
             "--seed" => {
                 if i + 1 >= args.len() {
@@ -2704,6 +2444,10 @@ fn get_wordlist_path(language: &str) -> Result<String, String> {
 
 // --- CLI usage ---
 fn main() {
+    // Add blank lines at program start
+    println!();
+    println!();
+    
     let (mut words, random_count, verbose, seed, variations, highlight_mode, generation_mode, language, show_grammar, k_min, k_max, length_mode) = match parse_args() {
         Ok(args) => args,
         Err(e) => {
@@ -2742,7 +2486,7 @@ fn main() {
                         by_start_symbol.insert(start_symbol.to_string(), sequences_by_k);
                     }
                 }
-                print_sentence_kinds_once(mode_str, k_max, &by_start_symbol);
+                print_sentence_kinds_once(mode_str, k_max, &by_start_symbol, true);
                 println!(); // Add blank line after grammar
             }
             Err(e) => {
@@ -2790,7 +2534,9 @@ fn main() {
     if let Some(count) = random_count {
         words = match select_random_words(&mut rng, count, &language) {
             Ok(selected_words) => {
-                eprintln!("Selected {} random BIP39 words: {}", count, selected_words.join(" "));
+                if verbose {
+                    eprintln!("Selected {} random BIP39 words: {}", count, selected_words.join(" "));
+                }
                 selected_words
             }
             Err(e) => {
@@ -2850,6 +2596,11 @@ fn main() {
         .get(&Pos::To)
         .map(|v| v.iter().map(|s| s.as_str()).collect())
         .unwrap_or_else(|| vec!["to"]);
+
+    let conj_words: Vec<&str> = cover_by_pos
+        .get(&Pos::Conj)
+        .map(|v| v.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_else(|| vec!["and", "but", "or"]);
     
     // Subject grammar can emit Prefix (e.g., "re", "fwd") so ensure we always have
     // some safe defaults even if cover_POS.txt doesn't provide them.
@@ -2858,52 +2609,31 @@ fn main() {
         .map(|v| v.iter().map(|s| s.as_str()).collect())
         .unwrap_or_else(|| vec!["re", "fwd", "fw", "update"]);
     
-    // Load safe words from safe-word-list (filtered to exclude BIP39 words)
-    let safe_words = load_safe_words(&bip39_set);
+    // Extract content words from cover_POS.txt (with fallbacks for backward compatibility)
+    let adj_words: Vec<&str> = cover_by_pos
+        .get(&Pos::Adj)
+        .map(|v| v.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_else(|| vec!["clear", "simple", "bright", "quiet", "steady"]);
     
-    // Categorize safe words by POS
-    let mut adj_words: Vec<String> = Vec::new();
-    let mut n_words: Vec<String> = Vec::new();
-    let mut v_words: Vec<String> = Vec::new();
-    let mut prep_words: Vec<String> = Vec::new();
-    let mut adv_words: Vec<String> = Vec::new();
+    let n_words: Vec<&str> = cover_by_pos
+        .get(&Pos::N)
+        .map(|v| v.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_else(|| vec!["user", "note", "server", "system"]);
     
-    for word in &safe_words {
-        let tags = tag_word(word);
-        // Skip words with no POS tags
-        if tags.is_empty() {
-            continue;
-        }
-        for tag in tags {
-            match tag {
-                Pos::Adj => adj_words.push(word.clone()),
-                Pos::N => n_words.push(word.clone()),
-                Pos::V => v_words.push(word.clone()),
-                Pos::Prep => prep_words.push(word.clone()),
-                Pos::Adv => adv_words.push(word.clone()),
-                _ => {} // Skip Det, Dot, Prefix, Modal, Aux, Cop, To (loaded from cover_POS.txt)
-            }
-        }
-    }
+    let v_words: Vec<&str> = cover_by_pos
+        .get(&Pos::V)
+        .map(|v| v.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_else(|| vec!["check", "send", "hold", "verify", "process"]);
     
-    // Remove duplicates while preserving order (words can have multiple POS tags)
-    adj_words.sort();
-    adj_words.dedup();
-    n_words.sort();
-    n_words.dedup();
-    v_words.sort();
-    v_words.dedup();
-    prep_words.sort();
-    prep_words.dedup();
-    adv_words.sort();
-    adv_words.dedup();
+    let prep_words: Vec<&str> = cover_by_pos
+        .get(&Pos::Prep)
+        .map(|v| v.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_else(|| vec!["about", "above", "along", "beneath", "throughout"]);
     
-    // Convert to slices for the lexicon
-    let adj_words_slice: Vec<&str> = adj_words.iter().map(|s| s.as_str()).collect();
-    let n_words_slice: Vec<&str> = n_words.iter().map(|s| s.as_str()).collect();
-    let v_words_slice: Vec<&str> = v_words.iter().map(|s| s.as_str()).collect();
-    let prep_words_slice: Vec<&str> = prep_words.iter().map(|s| s.as_str()).collect();
-    let adv_words_slice: Vec<&str> = adv_words.iter().map(|s| s.as_str()).collect();
+    let adv_words: Vec<&str> = cover_by_pos
+        .get(&Pos::Adv)
+        .map(|v| v.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_else(|| vec!["soon", "well", "quite", "very"]);
     
     // Validate all cover words against BIP39 wordlist
     let all_cover_words: Vec<&str> = det_words.iter()
@@ -2911,19 +2641,20 @@ fn main() {
         .chain(aux_words.iter())
         .chain(cop_words.iter())
         .chain(to_words.iter())
+        .chain(conj_words.iter())
         .chain(prefix_words.iter())
-        .chain(adj_words_slice.iter())
-        .chain(n_words_slice.iter())
-        .chain(v_words_slice.iter())
-        .chain(prep_words_slice.iter())
-        .chain(adv_words_slice.iter())
+        .chain(adj_words.iter())
+        .chain(n_words.iter())
+        .chain(v_words.iter())
+        .chain(prep_words.iter())
+        .chain(adv_words.iter())
         .copied()
         .collect();
     
     validate_cover_words(&all_cover_words, &bip39_set);
     
     if verbose {
-        eprintln!("Loaded {} safe words (excluding BIP39):", safe_words.len());
+        eprintln!("Loaded cover words from cover_POS.txt:");
         eprintln!("  Adjectives: {}", adj_words.len());
         eprintln!("  Nouns: {}", n_words.len());
         eprintln!("  Verbs: {}", v_words.len());
@@ -2937,12 +2668,16 @@ fn main() {
     let lex = Lexicon::new(payload_set, bip39_set.clone())
         .with_words(Pos::Det, &det_words)
         .with_words(Pos::Modal, &modal_words)
+        .with_words(Pos::Aux, &aux_words)
+        .with_words(Pos::Cop, &cop_words)
+        .with_words(Pos::To, &to_words)
+        .with_words(Pos::Conj, &conj_words)
         .with_words(Pos::Prefix, &prefix_words)
-        .with_words(Pos::Adj, &adj_words_slice)
-        .with_words(Pos::N, &n_words_slice)
-        .with_words(Pos::V, &v_words_slice)
-        .with_words(Pos::Prep, &prep_words_slice)
-        .with_words(Pos::Adv, &adv_words_slice);
+        .with_words(Pos::Adj, &adj_words)
+        .with_words(Pos::N, &n_words)
+        .with_words(Pos::V, &v_words)
+        .with_words(Pos::Prep, &prep_words)
+        .with_words(Pos::Adv, &adv_words);
 
     let input_word_count = payload.len();
     let expected_words: Vec<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
@@ -2977,37 +2712,40 @@ fn main() {
         let variation_elapsed = variation_start.elapsed();
         
         // Validate that the generated text contains exactly the input BIP39 words in order
-        let extracted_bip39_words: Vec<String> = {
-            text
-                .split_whitespace()
-                .map(normalize_token_for_bip39)
-                .filter(|w| !w.is_empty() && payload_set_from_gen.contains(w))
-                .collect()
-        };
-        
-        if extracted_bip39_words != expected_words {
-            if verbose || variations == 1 {
-                eprintln!("Variation {}: ERROR - Generated BIP39 words do not match input words!", variation + 1);
-                eprintln!("  Expected: {:?}", expected_words);
-                eprintln!("  Got:      {:?}", extracted_bip39_words);
-                eprintln!("  Text:     {}", text.chars().take(500).collect::<String>());
-                eprintln!("  Payload set size: {}", payload_set_from_gen.len());
-                eprintln!("  Sample payload words: {:?}", payload_set_from_gen.iter().take(5).collect::<Vec<_>>());
-                // Debug: show what words are being extracted
-                let all_normalized: Vec<String> = text
+        // Skip validation in madlib mode since words are replaced with [POS] placeholders
+        if highlight_mode != HighlightMode::Madlib {
+            let extracted_bip39_words: Vec<String> = {
+                text
                     .split_whitespace()
                     .map(normalize_token_for_bip39)
-                    .filter(|w| !w.is_empty())
-                    .collect();
-                eprintln!("  All normalized words (first 20): {:?}", all_normalized.iter().take(20).collect::<Vec<_>>());
-                let matching_words: Vec<String> = all_normalized
-                    .iter()
-                    .filter(|w| payload_set_from_gen.contains(*w))
-                    .cloned()
-                    .collect();
-                eprintln!("  Matching words: {:?}", matching_words);
+                    .filter(|w| !w.is_empty() && payload_set_from_gen.contains(w))
+                    .collect()
+            };
+            
+            if extracted_bip39_words != expected_words {
+                if verbose || variations == 1 {
+                    eprintln!("Variation {}: ERROR - Generated BIP39 words do not match input words!", variation + 1);
+                    eprintln!("  Expected: {:?}", expected_words);
+                    eprintln!("  Got:      {:?}", extracted_bip39_words);
+                    eprintln!("  Text:     {}", text.chars().take(500).collect::<String>());
+                    eprintln!("  Payload set size: {}", payload_set_from_gen.len());
+                    eprintln!("  Sample payload words: {:?}", payload_set_from_gen.iter().take(5).collect::<Vec<_>>());
+                    // Debug: show what words are being extracted
+                    let all_normalized: Vec<String> = text
+                        .split_whitespace()
+                        .map(normalize_token_for_bip39)
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    eprintln!("  All normalized words (first 20): {:?}", all_normalized.iter().take(20).collect::<Vec<_>>());
+                    let matching_words: Vec<String> = all_normalized
+                        .iter()
+                        .filter(|w| payload_set_from_gen.contains(*w))
+                        .cloned()
+                        .collect();
+                    eprintln!("  Matching words: {:?}", matching_words);
+                }
+                continue;
             }
-            continue;
         }
 
         // Save this valid variation for optional printing
@@ -3019,14 +2757,27 @@ fn main() {
         let mut bip39_chars = 0;
         let mut non_bip39_chars = 0;
         
-        for word in &words {
-            let normalized = normalize_token_for_bip39(word);
-            if !normalized.is_empty() && payload_set_from_gen.contains(&normalized) {
-                // Count characters in BIP39 word (use normalized length)
-                bip39_chars += normalized.chars().count();
-            } else {
-                // Count characters in non-BIP39 word (use normalized length, excluding punctuation)
-                non_bip39_chars += normalized.chars().count();
+        // In madlib mode, count [POS] placeholders as BIP39 chars
+        if highlight_mode == HighlightMode::Madlib {
+            for word in &words {
+                if word.starts_with('[') && word.contains(']') {
+                    // Count [POS] placeholder as BIP39 (approximate length)
+                    bip39_chars += 5; // Approximate: "[N]" = 3 chars, but use 5 for weighting
+                } else {
+                    let normalized = normalize_token_for_bip39(word);
+                    non_bip39_chars += normalized.chars().count();
+                }
+            }
+        } else {
+            for word in &words {
+                let normalized = normalize_token_for_bip39(word);
+                if !normalized.is_empty() && payload_set_from_gen.contains(&normalized) {
+                    // Count characters in BIP39 word (use normalized length)
+                    bip39_chars += normalized.chars().count();
+                } else {
+                    // Count characters in non-BIP39 word (use normalized length, excluding punctuation)
+                    non_bip39_chars += normalized.chars().count();
+                }
             }
         }
         
@@ -3053,10 +2804,12 @@ fn main() {
     }
     let total_generation_time = generation_start.elapsed();
 
-    // Output timing information
-    eprintln!("Generation time: {:.3}s ({} variation(s))", total_generation_time.as_secs_f64(), variations);
-    if variations > 1 {
-        eprintln!("Average time per variation: {:.3}s", total_generation_time.as_secs_f64() / variations as f64);
+    // Output timing information (only in verbose mode)
+    if verbose {
+        eprintln!("Generation time: {:.3}s ({} variation(s))", total_generation_time.as_secs_f64(), variations);
+        if variations > 1 {
+            eprintln!("Average time per variation: {:.3}s", total_generation_time.as_secs_f64() / variations as f64);
+        }
     }
 
     // Output variations (if requested) or the best variation (default)
@@ -3068,6 +2821,9 @@ fn main() {
             eprintln!("  - The grammar cannot accommodate all input words");
             eprintln!("  - There are POS tagging issues with some words");
             eprintln!("  - The word extraction logic is failing");
+            if highlight_mode == HighlightMode::Madlib {
+                eprintln!("  Note: Validation is skipped in madlib mode, so this error should not occur.");
+            }
             eprintln!("\nTry running with --verbose to see detailed error messages.");
             std::process::exit(1);
         }
@@ -3147,6 +2903,7 @@ fn main() {
                     Pos::To => "To",
                     Pos::Prep => "Prepositions",
                     Pos::Adv => "Adverbs",
+                    Pos::Conj => "Conjunctions",
                     Pos::Dot => "Punctuation",
                     Pos::Prefix => "Prefixes",
                 };
@@ -3232,7 +2989,7 @@ mod tests {
     #[test]
     fn test_plan_sentence_max_j() {
         // Load cache
-        let cache = SequenceCache::load(GenerationMode::Body, 20).expect("Failed to load cache");
+        let cache = SequenceCache::load(GenerationMode::Body, 20, false).expect("Failed to load cache");
         let mut rng = StdRng::seed_from_u64(42);
         
         // Create payload with N, V, N
@@ -3403,6 +3160,10 @@ mod tests {
     fn setup_test_lexicon(payload_set: HashSet<String>, bip39_set: HashSet<String>) -> Lexicon {
         let det_words = ["the", "a", "an", "each", "some"];
         let modal_words = ["should", "could", "would", "might", "may"];
+        let aux_words = ["do", "does"];
+        let cop_words = ["is", "are"];
+        let to_words = ["to"];
+        let conj_words = ["and", "but", "or"];
         let prefix_words = ["re", "fwd", "fw", "update"];
         let adj_words = ["bright", "clear", "simple", "secure", "quiet", "steady"];
         let n_words = ["wallet", "user", "server", "system", "note"];
@@ -3413,6 +3174,10 @@ mod tests {
         Lexicon::new(payload_set, bip39_set)
             .with_words(Pos::Det, &det_words)
             .with_words(Pos::Modal, &modal_words)
+            .with_words(Pos::Aux, &aux_words)
+            .with_words(Pos::Cop, &cop_words)
+            .with_words(Pos::To, &to_words)
+            .with_words(Pos::Conj, &conj_words)
             .with_words(Pos::Prefix, &prefix_words)
             .with_words(Pos::Adj, &adj_words)
             .with_words(Pos::N, &n_words)
@@ -3597,7 +3362,7 @@ mod tests {
 
     #[test]
     fn test_compute_k_candidates_compact_mode() {
-        let cache = SequenceCache::load(GenerationMode::Body, 20).expect("Failed to load cache");
+        let cache = SequenceCache::load(GenerationMode::Body, 20, false).expect("Failed to load cache");
         let mut rng = StdRng::seed_from_u64(42);
         
         // Compact mode should return k_min..=k_max in order
@@ -3629,7 +3394,7 @@ mod tests {
 
     #[test]
     fn test_compute_k_candidates_natural_mode() {
-        let cache = SequenceCache::load(GenerationMode::Body, 20).expect("Failed to load cache");
+        let cache = SequenceCache::load(GenerationMode::Body, 20, false).expect("Failed to load cache");
         let mut rng = StdRng::seed_from_u64(42);
         
         // Natural mode should ignore k_min and sample from all available k values
@@ -3663,7 +3428,7 @@ mod tests {
 
     #[test]
     fn test_compute_k_candidates_natural_mode_prefix() {
-        let cache = SequenceCache::load(GenerationMode::Subject, 20).expect("Failed to load cache");
+        let cache = SequenceCache::load(GenerationMode::Subject, 20, false).expect("Failed to load cache");
         let mut rng = StdRng::seed_from_u64(42);
         
         // Natural mode with require_prefix should start at k=2 (k_min ignored)
@@ -3697,7 +3462,7 @@ mod tests {
 
     #[test]
     fn test_compute_k_candidates_natural_mode_weight_ordering() {
-        let cache = SequenceCache::load(GenerationMode::Body, 20).expect("Failed to load cache");
+        let cache = SequenceCache::load(GenerationMode::Body, 20, false).expect("Failed to load cache");
         let mut rng = StdRng::seed_from_u64(42);
         
         // Test that after the sampled k, remaining k's are in descending weight order

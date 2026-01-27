@@ -147,6 +147,21 @@ impl Grammar {
         let grammar_str = std::fs::read_to_string(grammar_path)?;
         Self::from_str(&grammar_str)
     }
+
+    /// Convenience helper used by tests (and callers that don't care about caching yet).
+    ///
+    /// Historically this project had an on-disk cache here; the test suite still expects
+    /// this API to exist. For now, we compute deterministically from the grammar file
+    /// each call.
+    #[allow(dead_code)]
+    pub fn precompute_sequences_with_probability_cached_from_file(
+        grammar_path: impl AsRef<Path>,
+        start_symbol: &str,
+        max_k: usize,
+    ) -> Result<Vec<Vec<SequenceWithProbability>>, Box<dyn std::error::Error>> {
+        let grammar = Self::from_file(grammar_path)?;
+        Ok(grammar.precompute_sequences_with_probability(start_symbol, max_k))
+    }
     
     /// Load subject grammar from the embedded subject.cfg file
     pub fn subject() -> Result<Self, Box<dyn std::error::Error>> {
@@ -389,6 +404,7 @@ impl Grammar {
                                 Pos::Adv => "Adv".to_string(),
                                 Pos::Dot => "Dot".to_string(),
                                 Pos::Prefix => "Prefix".to_string(),
+                                Pos::Conj => "Conj".to_string(),
                             }
                         }
                         Sym::NT(nt) => nt.clone(),
@@ -440,6 +456,7 @@ fn parse_symbol_sequence(pair: pest::iterators::Pair<Rule>) -> Result<Vec<Sym>, 
                             "Adv" => Pos::Adv,
                             "Dot" => Pos::Dot,
                             "Prefix" => Pos::Prefix,
+                            "Conj" => Pos::Conj,
                             _ => return Err(format!("Unknown terminal: {}", sym_type.as_str()).into()),
                         };
                         Sym::T(pos)
@@ -487,6 +504,7 @@ mod tests {
                 Pos::Adv => "Adv",
                 Pos::Dot => "Dot",
                 Pos::Prefix => "Prefix",
+                Pos::Conj => "Conj",
             }
         }).collect::<Vec<_>>().join(" ")
     }

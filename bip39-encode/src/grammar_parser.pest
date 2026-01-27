@@ -31,7 +31,7 @@ symbol = { (terminal | non_terminal) ~ optional? }
 // Terminals must match as whole tokens (not prefixes of longer non-terminals like NP/VP/PP).
 // The trailing boundary `!ASCII_ALPHANUMERIC` prevents e.g. "N" from matching the "N" in "NP".
 terminal = @{
-    ("Det" | "Adj" | "N" | "V" | "Modal" | "Aux" | "Cop" | "To" | "Prep" | "Adv" | "Dot" | "Prefix")
+    ("Det" | "Adj" | "N" | "V" | "Modal" | "Aux" | "Cop" | "To" | "Prep" | "Adv" | "Dot" | "Prefix" | "Conj")
     ~ !ASCII_ALPHANUMERIC
 }
 

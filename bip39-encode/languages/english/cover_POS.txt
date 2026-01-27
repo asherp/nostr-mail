@@ -1,4 +1,4 @@
-a|Det,N
+a|Det
 abroad|Adv,Adj
 accept|V
 active|Adj
@@ -191,8 +191,6 @@ fourth|N
 free|Adj
 freeze|N
 from|Prep
-fw|N
-fwd|N
 fyi|N
 full|Adj
 fully|Adv
@@ -408,7 +406,6 @@ rank|N
 rarely|Adv
 rating|N,V
 ratio|N
-re|N
 reach|N
 react|V,N
 read|V,N
@@ -548,7 +545,7 @@ thus|Adv
 tie|V,N
 tight|Adj
 tire|N
-to|Prep
+to|To,Prep
 too|Adv
 touch|V,N
 tough|Adj
@@ -609,6 +606,5 @@ yet|Adv
 yield|N
 your|N
 yours|N
-Re:|Prefix
-Fwd:|Prefix
-Fw:|Prefix
+re:|Prefix
+fwd:|Prefix

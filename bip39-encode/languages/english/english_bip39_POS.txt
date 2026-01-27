@@ -1373,7 +1373,7 @@ problem|N,Adj
 process|V
 produce|V
 profit|V
-program|V
+program|N,V
 project|V
 promote|V
 proof|N,Adj,V

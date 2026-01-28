@@ -2023,9 +2023,16 @@ fn wrap_payload_with_color(word_with_punct: &str, color_code: u8) -> String {
 
 /// Build comprehensive POS mapping for all BIP39 words.
 /// Returns a HashMap mapping each word to its allowed POS tags.
-/// Reads POS tags from the file format: word|POS1,POS2,...
+/// Supports both YAML format (word -> POS weights) and legacy text format (word|POS1,POS2).
 fn build_pos_mapping(language: &str) -> Result<HashMap<String, Vec<Pos>>, String> {
     let wordlist_path = get_wordlist_path(language)?;
+    
+    // Check if it's a YAML file
+    if wordlist_path.ends_with(".yaml") || wordlist_path.ends_with(".yml") {
+        return build_pos_mapping_from_yaml(&wordlist_path);
+    }
+    
+    // Legacy text format
     let wordlist = std::fs::read_to_string(&wordlist_path)
         .map_err(|e| format!("Failed to read wordlist file '{}': {}", wordlist_path, e))?;
     let mut mapping = HashMap::new();
@@ -2055,6 +2062,63 @@ fn build_pos_mapping(language: &str) -> Result<HashMap<String, Vec<Pos>>, String
     }
     
     Ok(mapping)
+}
+
+/// Build POS mapping from YAML format.
+/// YAML structure: { word: { POS: weight, ... }, ... }
+/// Weights are normalized and POS tags are extracted.
+fn build_pos_mapping_from_yaml(path: &str) -> Result<HashMap<String, Vec<Pos>>, String> {
+    let yaml_content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read YAML file '{}': {}", path, e))?;
+    
+    // Parse YAML as HashMap<String, HashMap<String, f64>>
+    // Outer key = word, inner key = POS tag, value = weight
+    let yaml_data: HashMap<String, HashMap<String, f64>> = serde_yaml::from_str(&yaml_content)
+        .map_err(|e| format!("Failed to parse YAML file '{}': {}", path, e))?;
+    
+    let mut mapping = HashMap::new();
+    
+    for (word, pos_weights) in yaml_data {
+        let word_lower = word.to_lowercase();
+        let mut pos_tags = Vec::new();
+        
+        // Extract POS tags (weights are normalized later if needed)
+        // For now, we just collect all POS tags with non-zero weights
+        for (pos_str, weight) in pos_weights {
+            if weight > 0.0 {
+                if let Some(pos) = parse_pos_tag(&pos_str) {
+                    pos_tags.push(pos);
+                }
+            }
+        }
+        
+        // Only add words with valid POS tags
+        if !word_lower.is_empty() && !pos_tags.is_empty() {
+            mapping.insert(word_lower, pos_tags);
+        }
+    }
+    
+    Ok(mapping)
+}
+
+/// Parse a single POS tag string to Pos enum.
+fn parse_pos_tag(pos_str: &str) -> Option<Pos> {
+    match pos_str.trim() {
+        "Det" => Some(Pos::Det),
+        "Adj" => Some(Pos::Adj),
+        "N" => Some(Pos::N),
+        "V" => Some(Pos::V),
+        "Modal" => Some(Pos::Modal),
+        "Aux" => Some(Pos::Aux),
+        "Cop" => Some(Pos::Cop),
+        "To" => Some(Pos::To),
+        "Prep" => Some(Pos::Prep),
+        "Adv" => Some(Pos::Adv),
+        "Conj" => Some(Pos::Conj),
+        "Dot" => Some(Pos::Dot),
+        "Prefix" => Some(Pos::Prefix),
+        _ => None,
+    }
 }
 
 /// Parse POS tags from a comma-separated string (e.g., "Prep,Adv" -> [Pos::Prep, Pos::Adv]).
@@ -2101,9 +2165,16 @@ fn tag_word(word: &str) -> Vec<Pos> {
 }
 
 /// Load all BIP39 words from the wordlist file.
-/// Handles both formats: word|POS (new) and word (old, backward compatibility).
+/// Supports both YAML format (extracts keys) and legacy text format.
 fn load_bip39_words(language: &str) -> Result<Vec<String>, String> {
     let wordlist_path = get_wordlist_path(language)?;
+    
+    // Check if it's a YAML file
+    if wordlist_path.ends_with(".yaml") || wordlist_path.ends_with(".yml") {
+        return load_bip39_words_from_yaml(&wordlist_path);
+    }
+    
+    // Legacy text format
     let wordlist = std::fs::read_to_string(&wordlist_path)
         .map_err(|e| format!("Failed to read wordlist file '{}': {}", wordlist_path, e))?;
     Ok(wordlist
@@ -2119,6 +2190,21 @@ fn load_bip39_words(language: &str) -> Result<Vec<String>, String> {
         })
         .filter(|word: &String| !word.is_empty())
         .collect())
+}
+
+/// Load BIP39 words from YAML file (extracts keys).
+fn load_bip39_words_from_yaml(path: &str) -> Result<Vec<String>, String> {
+    let yaml_content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read YAML file '{}': {}", path, e))?;
+    
+    // Parse YAML as HashMap<String, HashMap<String, f64>>
+    // Extract just the keys (words)
+    let yaml_data: HashMap<String, HashMap<String, f64>> = serde_yaml::from_str(&yaml_content)
+        .map_err(|e| format!("Failed to parse YAML file '{}': {}", path, e))?;
+    
+    let mut words: Vec<String> = yaml_data.keys().cloned().collect();
+    words.sort(); // Keep consistent ordering
+    Ok(words)
 }
 
 
@@ -2429,17 +2515,23 @@ fn parse_args() -> Result<(Vec<String>, Option<usize>, bool, Option<u64>, usize,
 }
 
 /// Get the wordlist file path for a given language.
-/// Returns the path to the POS-tagged wordlist file.
-/// Exits with error if POS-tagged file doesn't exist.
+/// Returns the path to the YAML wordlist file.
+/// Exits with error if YAML file doesn't exist.
 fn get_wordlist_path(language: &str) -> Result<String, String> {
-    let pos_path = format!("languages/{}/{}_bip39_POS.txt", language, language);
+    let yaml_path = format!("languages/{}/{}_bip39.yaml", language, language);
     
-    if std::path::Path::new(&pos_path).exists() {
-        return Ok(pos_path);
+    if std::path::Path::new(&yaml_path).exists() {
+        return Ok(yaml_path);
     }
     
-    Err(format!("POS-tagged wordlist file not found for language '{}'. Expected: {}\nOnly languages with POS-tagged wordlists are supported.", 
-                language, pos_path))
+    // Fallback to old .txt format for backward compatibility
+    let txt_path = format!("languages/{}/{}_bip39_POS.txt", language, language);
+    if std::path::Path::new(&txt_path).exists() {
+        return Ok(txt_path);
+    }
+    
+    Err(format!("Wordlist file not found for language '{}'. Expected: {} or {}\nOnly languages with YAML or POS-tagged wordlists are supported.", 
+                language, yaml_path, txt_path))
 }
 
 // --- CLI usage ---

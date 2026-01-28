@@ -1,0 +1,2097 @@
+a:
+  Det: 1.0
+
+abroad:
+  Adv: 0.8
+  Adj: 0.2
+
+accept:
+  V: 1.0
+
+active:
+  Adj: 1.0
+
+admire:
+  V: 1.0
+
+adopt:
+  V: 1.0
+
+advise:
+  V: 1.0
+
+affect:
+  V: 0.95
+  N: 0.05
+
+after:
+  Prep: 0.6
+  Adv: 0.4
+
+agency:
+  N: 1.0
+
+agenda:
+  N: 1.0
+
+ago:
+  Adv: 0.6
+  Adj: 0.4
+
+aid:
+  N: 0.6
+  V: 0.4
+
+aide:
+  N: 1.0
+
+alive:
+  Adj: 1.0
+
+ally:
+  N: 0.6
+  V: 0.4
+
+along:
+  Prep: 0.6
+  Adv: 0.4
+
+an:
+  Det: 1.0
+
+and:
+  Conj: 1.0
+
+anyone:
+  Pron: 1.0
+
+anyway:
+  Adv: 1.0
+
+appeal:
+  N: 0.5
+  V: 0.5
+
+apply:
+  V: 1.0
+
+appointment:
+  N: 1.0
+
+are:
+  V: 1.0
+
+arise:
+  V: 1.0
+
+aside:
+  Adv: 0.9
+  N: 0.1
+
+asleep:
+  Adj: 1.0
+
+assert:
+  V: 1.0
+
+assess:
+  V: 1.0
+
+assign:
+  V: 1.0
+
+assure:
+  V: 1.0
+
+attach:
+  V: 1.0
+
+award:
+  N: 0.6
+  V: 0.4
+
+back:
+  N: 0.4
+  V: 0.3
+  Adj: 0.2
+  Adv: 0.1
+
+bad:
+  Adj: 1.0
+
+badly:
+  Adv: 1.0
+
+bake:
+  V: 0.6
+  N: 0.4
+
+ban:
+  N: 0.5
+  V: 0.5
+
+band:
+  N: 1.0
+
+bank:
+  N: 0.8
+  V: 0.2
+
+basis:
+  N: 1.0
+
+bear:
+  V: 0.6
+  N: 0.4
+
+beat:
+  V: 0.6
+  N: 0.4
+
+bed:
+  N: 0.9
+  V: 0.1
+
+beer:
+  N: 1.0
+
+being:
+  N: 0.6
+  V: 0.4
+
+belief:
+  N: 1.0
+
+bell:
+  N: 1.0
+
+belong:
+  V: 1.0
+
+bend:
+  V: 1.0
+
+beside:
+  Prep: 0.6
+  Adv: 0.4
+
+bet:
+  V: 0.6
+  N: 0.4
+
+big:
+  Adj: 1.0
+
+bill:
+  N: 1.0
+
+bit:
+  N: 1.0
+
+bite:
+  V: 0.6
+  N: 0.4
+
+block:
+  N: 0.6
+  V: 0.4
+
+blow:
+  V: 0.6
+  N: 0.4
+
+bond:
+  N: 0.8
+  V: 0.2
+
+boom:
+  N: 0.7
+  V: 0.3
+
+boot:
+  N: 0.8
+  V: 0.2
+
+born:
+  V: 0.6
+  Adj: 0.4
+
+both:
+  Det: 0.6
+  Pron: 0.4
+
+bother:
+  V: 1.0
+
+bottle:
+  N: 1.0
+
+bowl:
+  N: 1.0
+
+branch:
+  N: 0.8
+  V: 0.2
+
+break:
+  V: 0.6
+  N: 0.4
+
+breast:
+  N: 1.0
+
+breath:
+  N: 1.0
+
+broad:
+  Adj: 1.0
+
+buck:
+  N: 1.0
+
+bunch:
+  N: 1.0
+
+burn:
+  V: 1.0
+
+bury:
+  V: 1.0
+
+but:
+  Conj: 1.0
+
+button:
+  N: 1.0
+
+buy:
+  V: 1.0
+
+campus:
+  N: 1.0
+
+cancer:
+  N: 1.0
+
+cap:
+  N: 0.7
+  V: 0.3
+
+care:
+  N: 0.6
+  V: 0.4
+
+career:
+  N: 1.0
+
+cast:
+  V: 0.5
+  N: 0.5
+
+cell:
+  N: 1.0
+
+center:
+  N: 1.0
+
+chain:
+  N: 0.8
+  V: 0.2
+
+chance:
+  N: 1.0
+
+chart:
+  N: 0.7
+  V: 0.3
+
+cheek:
+  N: 1.0
+
+chip:
+  N: 0.8
+  V: 0.2
+
+church:
+  N: 1.0
+
+cite:
+  V: 1.0
+
+class:
+  N: 1.0
+
+clear:
+  Adj: 1.0
+
+closer:
+  Adj: 0.5
+  Adv: 0.4
+  N: 0.1
+
+clue:
+  N: 1.0
+
+coal:
+  N: 1.0
+
+coat:
+  N: 0.8
+  V: 0.2
+
+cold:
+  Adj: 1.0
+
+comedy:
+  N: 1.0
+
+commit:
+  V: 1.0
+
+cookie:
+  N: 1.0
+
+cop:
+  N: 1.0
+
+cope:
+  V: 1.0
+
+corner:
+  N: 1.0
+
+could:
+  Modal: 1.0
+
+count:
+  V: 0.6
+  N: 0.4
+
+county:
+  N: 1.0
+
+court:
+  N: 1.0
+
+cow:
+  N: 1.0
+
+create:
+  V: 1.0
+
+crisis:
+  N: 1.0
+
+cut:
+  V: 0.5
+  N: 0.3
+  Adj: 0.2
+
+daily:
+  Adj: 0.5
+  Adv: 0.5
+
+dare:
+  V: 0.7
+  N: 0.3
+
+dark:
+  Adj: 1.0
+
+data:
+  N: 1.0
+
+date:
+  N: 0.6
+  V: 0.4
+
+dead:
+  Adj: 1.0
+
+dealer:
+  N: 1.0
+
+dear:
+  Adj: 1.0
+
+death:
+  N: 1.0
+
+debt:
+  N: 1.0
+
+deck:
+  N: 1.0
+
+deep:
+  Adj: 1.0
+
+deeply:
+  Adv: 1.0
+
+defeat:
+  V: 0.6
+  N: 0.4
+
+defend:
+  V: 1.0
+
+depict:
+  V: 1.0
+
+desire:
+  N: 0.6
+  V: 0.4
+
+die:
+  V: 0.6
+  N: 0.4
+
+dig:
+  V: 0.6
+  N: 0.4
+
+dining:
+  N: 0.6
+  V: 0.4
+
+dirty:
+  Adj: 0.6
+  V: 0.4
+
+do:
+  Aux: 1.0
+
+does:
+  Aux: 1.0
+
+doubt:
+  N: 0.5
+  V: 0.5
+
+down:
+  Adv: 0.35
+  Prep: 0.25
+  Adj: 0.2
+  N: 0.1
+  V: 0.1
+
+dozen:
+  Adj: 1.0
+
+drag:
+  V: 0.6
+  N: 0.4
+
+driver:
+  N: 1.0
+
+drug:
+  N: 1.0
+
+due:
+  Adj: 0.5
+  N: 0.3
+  Adv: 0.2
+
+each:
+  Det: 1.0
+
+ear:
+  N: 1.0
+
+ease:
+  N: 0.5
+  V: 0.5
+
+eat:
+  V: 1.0
+
+editor:
+  N: 1.0
+
+effect:
+  N: 0.9
+  V: 0.1
+
+elect:
+  V: 0.6
+  Adj: 0.4
+
+email:
+  N: 0.6
+  V: 0.4
+
+ethnic:
+  Adj: 1.0
+
+even:
+  Adv: 1.0
+
+event:
+  N: 1.0
+
+ever:
+  Adv: 1.0
+
+every:
+  Det: 1.0
+
+exceed:
+  V: 1.0
+
+except:
+  Prep: 1.0
+
+expert:
+  N: 0.6
+  Adj: 0.4
+
+extent:
+  N: 1.0
+
+fact:
+  N: 1.0
+
+factor:
+  N: 1.0
+
+fail:
+  V: 0.8
+  N: 0.2
+
+fair:
+  Adj: 0.7
+  N: 0.3
+
+fairly:
+  Adv: 1.0
+
+far:
+  Adv: 0.6
+  Adj: 0.4
+
+farmer:
+  N: 1.0
+
+fast:
+  Adj: 0.5
+  Adv: 0.5
+
+fate:
+  N: 1.0
+
+favor:
+  N: 0.6
+  V: 0.4
+
+fear:
+  N: 0.6
+  V: 0.4
+
+fellow:
+  N: 0.6
+  Adj: 0.4
+
+fewer:
+  Det: 0.5
+  Adj: 0.5
+
+fifth:
+  Adj: 0.5
+  N: 0.5
+
+fifty:
+  N: 0.5
+  Adj: 0.5
+
+fight:
+  V: 0.6
+  N: 0.4
+
+fill:
+  V: 0.6
+  N: 0.4
+
+five:
+  N: 0.5
+  Adj: 0.5
+
+flesh:
+  N: 1.0
+
+flow:
+  N: 0.5
+  V: 0.5
+
+folk:
+  N: 0.8
+  Adj: 0.2
+
+for:
+  Prep: 1.0
+
+form:
+  N: 0.5
+  V: 0.5
+
+formal:
+  Adj: 1.0
+
+former:
+  Adj: 0.8
+  N: 0.2
+
+forth:
+  Adv: 1.0
+
+four:
+  N: 0.5
+  Adj: 0.5
+
+fourth:
+  Adj: 0.5
+  N: 0.5
+
+free:
+  Adj: 0.7
+  V: 0.3
+
+freeze:
+  V: 0.7
+  N: 0.3
+
+from:
+  Prep: 1.0
+
+full:
+  Adj: 1.0
+
+fully:
+  Adv: 1.0
+
+fund:
+  N: 0.6
+  V: 0.4
+
+"fwd:":
+  Prefix: 1.0
+
+fyi:
+  N: 1.0
+
+gang:
+  N: 1.0
+
+gear:
+  N: 1.0
+
+gender:
+  N: 1.0
+
+gene:
+  N: 1.0
+
+gently:
+  Adv: 1.0
+
+get:
+  V: 1.0
+
+gifted:
+  Adj: 1.0
+
+given:
+  Adj: 1.0
+
+global:
+  Adj: 1.0
+
+goal:
+  N: 1.0
+
+golden:
+  Adj: 1.0
+
+golf:
+  N: 1.0
+
+grade:
+  N: 0.6
+  V: 0.4
+
+grand:
+  Adj: 0.7
+  N: 0.3
+
+grave:
+  N: 0.5
+  Adj: 0.5
+
+gray:
+  Adj: 0.7
+  N: 0.3
+
+ground:
+  N: 0.7
+  V: 0.2
+  Adj: 0.1
+
+growth:
+  N: 1.0
+
+guest:
+  N: 1.0
+
+guilty:
+  Adj: 1.0
+
+guy:
+  N: 1.0
+
+hall:
+  N: 1.0
+
+handle:
+  V: 0.6
+  N: 0.4
+
+hang:
+  V: 0.6
+  N: 0.4
+
+happen:
+  V: 1.0
+
+hardly:
+  Adv: 1.0
+
+hate:
+  V: 1.0
+
+hear:
+  V: 1.0
+
+heat:
+  N: 0.6
+  V: 0.4
+
+heaven:
+  N: 1.0
+
+heel:
+  N: 1.0
+
+hell:
+  N: 1.0
+
+here:
+  Adv: 1.0
+
+hey:
+  Intj: 1.0
+
+hi:
+  Intj: 1.0
+
+hide:
+  V: 0.6
+  N: 0.4
+
+highly:
+  Adv: 1.0
+
+hit:
+  V: 0.6
+  N: 0.4
+
+holy:
+  Adj: 1.0
+
+honest:
+  Adj: 1.0
+
+honor:
+  N: 0.6
+  V: 0.4
+
+hot:
+  Adj: 1.0
+
+house:
+  N: 0.9
+  V: 0.1
+
+how:
+  Adv: 1.0
+
+hunter:
+  N: 1.0
+
+ideal:
+  Adj: 0.6
+  N: 0.4
+
+imply:
+  V: 1.0
+
+important:
+  Adj: 1.0
+
+indeed:
+  Adv: 1.0
+
+insist:
+  V: 1.0
+
+intend:
+  V: 1.0
+
+is:
+  V: 1.0
+
+its:
+  Det: 1.0
+
+itself:
+  Pron: 1.0
+
+jail:
+  N: 1.0
+
+jet:
+  N: 1.0
+
+joint:
+  N: 0.5
+  Adj: 0.5
+
+jury:
+  N: 1.0
+
+kill:
+  V: 0.6
+  N: 0.4
+
+killer:
+  N: 1.0
+
+king:
+  N: 1.0
+
+lack:
+  N: 0.5
+  V: 0.5
+
+land:
+  N: 0.7
+  V: 0.3
+
+lap:
+  N: 0.8
+  V: 0.2
+
+last:
+  Adj: 0.4
+  V: 0.3
+  Adv: 0.3
+
+late:
+  Adj: 0.6
+  Adv: 0.4
+
+latter:
+  Adj: 0.8
+  N: 0.2
+
+launch:
+  V: 0.6
+  N: 0.4
+
+lawyer:
+  N: 1.0
+
+lay:
+  V: 1.0
+
+lead:
+  V: 0.6
+  N: 0.4
+
+league:
+  N: 1.0
+
+lean:
+  V: 0.5
+  Adj: 0.4
+  N: 0.1
+
+least:
+  Adv: 0.5
+  Det: 0.3
+  Adj: 0.2
+
+legacy:
+  N: 1.0
+
+less:
+  Adv: 0.4
+  Det: 0.4
+  Adj: 0.2
+
+let:
+  V: 1.0
+
+lie:
+  V: 0.6
+  N: 0.4
+
+likely:
+  Adj: 0.6
+  Adv: 0.4
+
+line:
+  N: 0.7
+  V: 0.3
+
+lip:
+  N: 1.0
+
+listen:
+  V: 1.0
+
+living:
+  Adj: 0.5
+  N: 0.3
+  V: 0.2
+
+locate:
+  V: 1.0
+
+look:
+  V: 0.6
+  N: 0.4
+
+loose:
+  Adj: 1.0
+
+lose:
+  V: 1.0
+
+loss:
+  N: 1.0
+
+lost:
+  Adj: 1.0
+
+lot:
+  N: 1.0
+
+lots:
+  N: 1.0
+
+lovely:
+  Adv: 1.0
+
+lover:
+  N: 1.0
+
+low:
+  Adj: 1.0
+
+lower:
+  V: 0.5
+  Adj: 0.4
+  N: 0.1
+
+luck:
+  N: 1.0
+
+lung:
+  N: 1.0
+
+mainly:
+  Adv: 1.0
+
+maker:
+  N: 1.0
+
+makeup:
+  N: 1.0
+
+male:
+  Adj: 1.0
+
+mall:
+  N: 1.0
+
+manner:
+  N: 1.0
+
+many:
+  Det: 0.6
+  Adj: 0.4
+
+map:
+  N: 0.7
+  V: 0.3
+
+mark:
+  N: 0.5
+  V: 0.5
+
+marry:
+  V: 1.0
+
+may:
+  Modal: 1.0
+
+maybe:
+  Adv: 1.0
+
+mayor:
+  N: 1.0
+
+meal:
+  N: 1.0
+
+medium:
+  N: 0.5
+  Adj: 0.5
+
+meet:
+  V: 0.9
+  N: 0.1
+
+meeting:
+  N: 1.0
+
+mental:
+  Adj: 1.0
+
+mere:
+  Adj: 1.0
+
+merely:
+  Adv: 1.0
+
+mess:
+  N: 1.0
+
+meter:
+  N: 1.0
+
+might:
+  Modal: 1.0
+
+mine:
+  N: 1.0
+
+mode:
+  N: 1.0
+
+modern:
+  Adj: 1.0
+
+modest:
+  Adj: 1.0
+
+money:
+  N: 1.0
+
+mood:
+  N: 1.0
+
+most:
+  Det: 1.0
+
+mostly:
+  Adv: 1.0
+
+mount:
+  V: 0.5
+  N: 0.5
+
+mouth:
+  N: 1.0
+
+murder:
+  N: 0.6
+  V: 0.4
+
+naked:
+  Adj: 1.0
+
+native:
+  Adj: 0.6
+  N: 0.4
+
+nearby:
+  Adj: 0.6
+  Adv: 0.4
+
+nearly:
+  Adv: 1.0
+
+new:
+  Adj: 1.0
+
+newly:
+  Adv: 1.0
+
+nine:
+  N: 0.5
+  Adj: 0.5
+
+nobody:
+  Pron: 1.0
+
+nod:
+  V: 0.6
+  N: 0.4
+
+none:
+  Pron: 1.0
+
+nor:
+  Conj: 1.0
+
+not:
+  Adv: 1.0
+
+notion:
+  N: 1.0
+
+occupy:
+  V: 1.0
+
+odd:
+  Adj: 1.0
+
+odds:
+  N: 1.0
+
+onto:
+  Prep: 1.0
+
+origin:
+  N: 1.0
+
+others:
+  N: 1.0
+
+ought:
+  Modal: 1.0
+
+our:
+  Det: 1.0
+
+out:
+  Adv: 0.35
+  Prep: 0.25
+  Adj: 0.2
+  N: 0.1
+  V: 0.1
+
+owe:
+  V: 1.0
+
+pace:
+  N: 0.7
+  V: 0.3
+
+pack:
+  V: 0.6
+  N: 0.4
+
+pain:
+  N: 1.0
+
+paint:
+  V: 0.6
+  N: 0.4
+
+pale:
+  Adj: 1.0
+
+pan:
+  N: 1.0
+
+pant:
+  N: 1.0
+
+part:
+  N: 1.0
+
+partly:
+  Adv: 1.0
+
+past:
+  N: 0.3
+  Adj: 0.3
+  Prep: 0.3
+  Adv: 0.1
+
+pay:
+  V: 0.7
+  N: 0.3
+
+peak:
+  N: 0.8
+  V: 0.2
+
+peer:
+  N: 0.6
+  V: 0.4
+
+per:
+  Prep: 1.0
+
+period:
+  N: 1.0
+
+phase:
+  N: 0.8
+  V: 0.2
+
+pick:
+  V: 0.6
+  N: 0.4
+
+pie:
+  N: 1.0
+
+pile:
+  N: 0.6
+  V: 0.4
+
+pine:
+  N: 1.0
+
+plan:
+  N: 0.5
+  V: 0.5
+
+plane:
+  N: 1.0
+
+plant:
+  N: 0.6
+  V: 0.4
+
+player:
+  N: 1.0
+
+plenty:
+  N: 1.0
+
+plot:
+  N: 0.6
+  V: 0.4
+
+plus:
+  Prep: 0.4
+  Adj: 0.3
+  N: 0.2
+  Conj: 0.1
+
+pocket:
+  N: 1.0
+
+poetry:
+  N: 1.0
+
+policy:
+  N: 1.0
+
+poll:
+  N: 0.7
+  V: 0.3
+
+poor:
+  Adj: 0.8
+  N: 0.2
+
+pop:
+  N: 0.4
+  V: 0.4
+  Adj: 0.2
+
+porch:
+  N: 1.0
+
+port:
+  N: 1.0
+
+pose:
+  V: 0.6
+  N: 0.4
+
+pot:
+  N: 1.0
+
+pound:
+  N: 0.6
+  V: 0.4
+
+pour:
+  V: 0.6
+  N: 0.4
+
+pray:
+  V: 1.0
+
+prayer:
+  N: 1.0
+
+press:
+  V: 0.6
+  N: 0.4
+
+priest:
+  N: 1.0
+
+prime:
+  Adj: 1.0
+
+prior:
+  Adj: 0.5
+  N: 0.3
+  Adv: 0.2
+
+prompt:
+  V: 0.4
+  Adj: 0.3
+  N: 0.3
+
+proper:
+  Adj: 1.0
+
+prove:
+  V: 1.0
+
+pure:
+  Adj: 1.0
+
+pursue:
+  V: 1.0
+
+quiet:
+  Adj: 1.0
+
+quite:
+  Adv: 1.0
+
+racial:
+  Adj: 1.0
+
+rank:
+  N: 0.5
+  V: 0.4
+  Adj: 0.1
+
+rarely:
+  Adv: 1.0
+
+rating:
+  N: 0.6
+  V: 0.4
+
+ratio:
+  N: 1.0
+
+"re:":
+  Prefix: 1.0
+
+reach:
+  V: 0.7
+  N: 0.3
+
+react:
+  V: 1.0
+
+read:
+  V: 0.6
+  N: 0.4
+
+reader:
+  N: 1.0
+
+really:
+  Adv: 1.0
+
+recent:
+  Adj: 1.0
+
+red:
+  Adj: 0.7
+  N: 0.3
+
+refer:
+  V: 1.0
+
+regard:
+  N: 0.5
+  V: 0.5
+
+regarding:
+  Prep: 1.0
+
+regime:
+  N: 1.0
+
+relate:
+  V: 1.0
+
+reminder:
+  N: 1.0
+
+remote:
+  Adj: 1.0
+
+reply:
+  V: 0.6
+  N: 0.4
+
+request:
+  N: 0.6
+  V: 0.4
+
+resort:
+  N: 1.0
+
+rest:
+  N: 0.6
+  V: 0.4
+
+retain:
+  V: 1.0
+
+rid:
+  V: 0.8
+  Adj: 0.2
+
+rise:
+  V: 0.6
+  N: 0.4
+
+rock:
+  N: 0.7
+  V: 0.3
+
+role:
+  N: 1.0
+
+roll:
+  V: 0.6
+  N: 0.4
+
+root:
+  N: 0.7
+  V: 0.3
+
+rope:
+  N: 1.0
+
+row:
+  N: 0.7
+  V: 0.3
+
+rub:
+  V: 0.7
+  N: 0.3
+
+rush:
+  V: 0.5
+  N: 0.3
+  Adj: 0.2
+
+sacred:
+  Adj: 1.0
+
+safety:
+  N: 1.0
+
+sake:
+  N: 1.0
+
+salary:
+  N: 1.0
+
+sale:
+  N: 1.0
+
+sales:
+  N: 1.0
+
+saving:
+  N: 0.4
+  Adj: 0.3
+  Prep: 0.2
+  V: 0.1
+
+scared:
+  Adj: 0.6
+  V: 0.4
+
+schedule:
+  N: 0.6
+  V: 0.4
+
+scope:
+  N: 1.0
+
+score:
+  N: 0.5
+  V: 0.5
+
+scream:
+  V: 0.6
+  N: 0.4
+
+sector:
+  N: 1.0
+
+secure:
+  Adj: 0.5
+  V: 0.5
+
+see:
+  V: 1.0
+
+seem:
+  V: 1.0
+
+seize:
+  V: 1.0
+
+self:
+  N: 1.0
+
+send:
+  V: 0.6
+  N: 0.4
+
+serve:
+  V: 0.6
+  N: 0.4
+
+set:
+  V: 0.5
+  N: 0.3
+  Adj: 0.2
+
+severe:
+  Adj: 1.0
+
+shade:
+  N: 0.8
+  V: 0.2
+
+shake:
+  V: 0.6
+  N: 0.4
+
+shall:
+  Modal: 1.0
+
+shape:
+  N: 0.6
+  V: 0.4
+
+sharp:
+  Adj: 1.0
+
+sheet:
+  N: 1.0
+
+shelf:
+  N: 1.0
+
+shirt:
+  N: 1.0
+
+shore:
+  N: 1.0
+
+shot:
+  N: 0.5
+  Adj: 0.3
+  V: 0.2
+
+should:
+  Modal: 1.0
+
+shout:
+  V: 0.6
+  N: 0.4
+
+show:
+  V: 0.6
+  N: 0.4
+
+shower:
+  N: 1.0
+
+shut:
+  V: 0.6
+  Adj: 0.4
+
+sigh:
+  N: 1.0
+
+signal:
+  N: 0.5
+  V: 0.3
+  Adj: 0.2
+
+simply:
+  Adv: 1.0
+
+sin:
+  N: 1.0
+
+singer:
+  N: 1.0
+
+single:
+  Adj: 1.0
+
+sink:
+  N: 1.0
+
+sir:
+  N: 1.0
+
+sit:
+  V: 1.0
+
+site:
+  N: 1.0
+
+sky:
+  N: 1.0
+
+slave:
+  N: 1.0
+
+slip:
+  V: 0.6
+  N: 0.4
+
+slowly:
+  Adv: 1.0
+
+smell:
+  V: 0.6
+  N: 0.4
+
+soil:
+  N: 1.0
+
+some:
+  Det: 1.0
+
+son:
+  N: 1.0
+
+speech:
+  N: 1.0
+
+stair:
+  N: 1.0
+
+stake:
+  N: 0.7
+  V: 0.3
+
+star:
+  N: 0.8
+  V: 0.2
+
+stare:
+  V: 0.6
+  N: 0.4
+
+status:
+  N: 1.0
+
+steady:
+  Adj: 0.7
+  V: 0.3
+
+steal:
+  V: 0.6
+  N: 0.4
+
+stir:
+  V: 0.6
+  N: 0.4
+
+stop:
+  V: 0.6
+  N: 0.4
+
+store:
+  N: 0.6
+  V: 0.4
+
+storm:
+  N: 0.6
+  V: 0.4
+
+stream:
+  N: 0.6
+  V: 0.4
+
+stress:
+  N: 0.6
+  V: 0.4
+
+string:
+  N: 0.6
+  V: 0.4
+
+strip:
+  V: 0.6
+  N: 0.4
+
+stroke:
+  N: 0.7
+  V: 0.3
+
+studio:
+  N: 1.0
+
+study:
+  N: 0.6
+  V: 0.4
+
+stupid:
+  Adj: 1.0
+
+sue:
+  V: 1.0
+
+summit:
+  N: 1.0
+
+surely:
+  Adv: 1.0
+
+sweep:
+  V: 0.7
+  N: 0.3
+
+tactic:
+  N: 1.0
+
+take:
+  V: 0.6
+  N: 0.4
+
+tale:
+  N: 1.0
+
+tall:
+  Adj: 1.0
+
+tap:
+  N: 0.5
+  V: 0.5
+
+tax:
+  N: 0.7
+  V: 0.3
+
+tea:
+  N: 1.0
+
+tear:
+  V: 0.6
+  N: 0.4
+
+teen:
+  N: 0.8
+  Adj: 0.2
+
+tend:
+  V: 1.0
+
+terms:
+  N: 1.0
+
+terror:
+  N: 1.0
+
+than:
+  Conj: 1.0
+
+thanks:
+  N: 1.0
+
+the:
+  Det: 1.0
+
+their:
+  Det: 1.0
+
+them:
+  Pron: 1.0
+
+these:
+  Det: 1.0
+
+thick:
+  Adj: 1.0
+
+thin:
+  Adj: 1.0
+
+think:
+  V: 0.5
+  N: 0.3
+  Adj: 0.2
+
+third:
+  Adj: 0.5
+  N: 0.5
+
+thirty:
+  N: 0.5
+  Adj: 0.5
+
+those:
+  Det: 1.0
+
+though:
+  Conj: 1.0
+
+threat:
+  N: 1.0
+
+throat:
+  N: 1.0
+
+thus:
+  Adv: 1.0
+
+tie:
+  V: 0.6
+  N: 0.4
+
+tight:
+  Adj: 1.0
+
+tire:
+  N: 1.0
+
+to:
+  To: 0.6
+  Prep: 0.4
+
+too:
+  Adv: 1.0
+
+touch:
+  V: 0.6
+  N: 0.4
+
+tough:
+  Adj: 1.0
+
+tour:
+  N: 0.6
+  V: 0.4
+
+trace:
+  V: 0.6
+  N: 0.4
+
+trail:
+  N: 0.7
+  V: 0.3
+
+treaty:
+  N: 1.0
+
+troop:
+  N: 1.0
+
+union:
+  N: 1.0
+
+unless:
+  Conj: 0.6
+  Prep: 0.4
+
+unlike:
+  Prep: 0.6
+  Adj: 0.4
+
+urgent:
+  Adj: 1.0
+
+user:
+  N: 1.0
+
+value:
+  N: 0.6
+  V: 0.4
+
+vary:
+  V: 1.0
+
+versus:
+  Prep: 1.0
+
+via:
+  Prep: 1.0
+
+victim:
+  N: 1.0
+
+viewer:
+  N: 1.0
+
+virtue:
+  N: 1.0
+
+vision:
+  N: 1.0
+
+voter:
+  N: 1.0
+
+wake:
+  V: 0.6
+  N: 0.4
+
+wander:
+  V: 1.0
+
+war:
+  N: 1.0
+
+warn:
+  V: 1.0
+
+watch:
+  V: 0.6
+  N: 0.4
+
+weak:
+  Adj: 1.0
+
+week:
+  N: 1.0
+
+weekly:
+  Adv: 1.0
+
+weigh:
+  V: 1.0
+
+weight:
+  N: 1.0
+
+well:
+  Adv: 0.5
+  Adj: 0.2
+  N: 0.2
+  Intj: 0.1
+
+which:
+  Det: 0.5
+  Pron: 0.5
+
+while:
+  Conj: 0.6
+  N: 0.3
+  V: 0.1
+
+white:
+  Adj: 1.0
+
+who:
+  Pron: 1.0
+
+whole:
+  Adj: 1.0
+
+whom:
+  Pron: 1.0
+
+whose:
+  Pron: 1.0
+
+why:
+  Adv: 1.0
+
+widely:
+  Adv: 1.0
+
+wind:
+  N: 0.6
+  V: 0.4
+
+wipe:
+  V: 1.0
+
+with:
+  Prep: 1.0
+
+within:
+  Prep: 0.6
+  Adv: 0.4
+
+wooden:
+  Adj: 1.0
+
+worker:
+  N: 1.0
+
+works:
+  N: 0.6
+  V: 0.4
+
+would:
+  Modal: 1.0
+
+wound:
+  N: 0.6
+  V: 0.4
+
+writer:
+  N: 1.0
+
+yeah:
+  Intj: 0.8
+  Adv: 0.2
+
+yell:
+  V: 0.6
+  N: 0.4
+
+yes:
+  Intj: 0.6
+  Adv: 0.3
+  N: 0.1
+
+yesterday:
+  Adv: 0.6
+  N: 0.4
+
+yet:
+  Adv: 1.0
+
+yield:
+  V: 0.6
+  N: 0.4
+
+your:
+  Det: 1.0
+
+yours:
+  Pron: 1.0
+

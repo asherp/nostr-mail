@@ -101,6 +101,57 @@ cargo run --bin tag_words -- -i input_words.txt -o output_POS.txt
 cargo run --bin tag_words -- -i input_words.txt -o output_POS.txt --alternative
 ```
 
+### POS Weight Generation Tool
+
+Generate POS tag weights from nlprule analysis:
+
+```bash
+# Generate weights for cover words
+cargo run --bin validate_pos_weights -- \
+  --file languages/english/cover.yaml \
+  --output cover_nlprule_weights.yaml
+
+# Generate weights for payload words
+cargo run --bin validate_pos_weights -- \
+  --file languages/english/payload.yaml \
+  --output payload_nlprule_weights.yaml
+
+# Test with limited words (for faster testing)
+cargo run --bin validate_pos_weights -- \
+  --file languages/english/cover.yaml \
+  --max-words 10 \
+  --output test_weights.yaml
+
+# Adjust minimum weight threshold and decimal places
+cargo run --bin validate_pos_weights -- \
+  --file languages/english/cover.yaml \
+  --threshold 0.05 \
+  --round 2 \
+  --output cover_weights.yaml
+```
+
+**Using Docker:**
+
+```bash
+# Generate weights for cover words
+docker compose run --rm bip39-encode cargo run --bin validate_pos_weights -- \
+  --file languages/english/cover.yaml \
+  --output cover_nlprule_weights.yaml
+
+# Generate weights for payload words
+docker compose run --rm bip39-encode cargo run --bin validate_pos_weights -- \
+  --file languages/english/payload.yaml \
+  --output payload_nlprule_weights.yaml
+```
+
+The weight generation tool:
+- Tests each word in multiple sentence contexts using nlprule
+- Calculates observed POS tag frequencies
+- Normalizes weights to sum to 1.0
+- Outputs a YAML file with the same structure as the input
+- Filters out weights below a threshold (default: 0.01)
+- Rounds weights to specified decimal places (default: 3)
+
 **Workflow: Generate shortest words and tag them:**
 
 ```bash

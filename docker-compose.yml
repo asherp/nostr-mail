@@ -1,159 +1,92 @@
-version: '2.4'
+
+volumes:
+  cargo-cache:
+  target-cache:
 
 services:
-  notebook:
-    image: ${NOSTR_MAIL_IMAGE_TAG}
-    ports:
-      - "8888:8888"
+  email-server:
+    image: nostrmail/dev
     build:
-      context: .
-      dockerfile: Dockerfile
-    environment:
-      TZ: ${TZ:-America/New_York}
-      DASH_DEBUG: ${DASH_DEBUG}
-      NOSTR_PRIV_KEY: ${NOSTR_PRIV_KEY}
-      NOSTR_CONTACTS: ${NOSTR_CONTACTS}
-      PRIV_KEY_ALICE: ${PRIV_KEY_ALICE}
-      EMAIL_ADDRESS_ALICE: ${EMAIL_ADDRESS_ALICE}
-      PRIV_KEY_BOB: ${PRIV_KEY_BOB}
-      EMAIL_ADDRESS_BOB: ${EMAIL_ADDRESS_BOB}
-      EMAIL_ADDRESS: ${EMAIL_ADDRESS}
-      EMAIL_PASSWORD: ${EMAIL_PASSWORD}
-      IMAP_HOST: ${IMAP_HOST}
-      IMAP_PORT: ${IMAP_PORT}
-      SMTP_HOST: ${SMTP_HOST}
-      SMTP_PORT: ${SMTP_PORT}
-      NOSTRMAIL_CACHE: /nostrmail/cache
+      context: ./mock-email
+      dockerfile: ../dev.Dockerfile
+    ports:
+      - "2525:2525"  # SMTP port
+      - "1143:1143"  # IMAP port
     volumes:
       - type: bind
-        source: .
-        target: /nostrmail
-    container_name: nostr-notebook
-    command:
-      - jupyter
-      - notebook
-      - .
-      - --port=8888
-      - --no-browser
-      - --ip=0.0.0.0
-      - --allow-root
-    working_dir: /nostrmail
-  docs:
-    image: ${NOSTR_MAIL_IMAGE_TAG}
-    ports:
-      - "8000:8000"
+        source: ./mock-email
+        target: /app
+      - cargo-cache:/root/.cargo/registry
+      - cargo-cache:/root/.cargo/git
+      - target-cache:/app/target
+    container_name: mock-email-server
+    command: ["cargo", "watch", "-q", "-c", "-w", "src", "-x", "run -- --smtp-port 2525 --imap-port 1143 --log-level info"]
+  
+  relay-server:
+    image: nostrmail/dev
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ./mock-relay
+      dockerfile: ../dev.Dockerfile
+    ports:
+      - "8080:8080"  # WebSocket port
     volumes:
       - type: bind
-        source: .
-        target: /nostrmail
-    container_name: nostr-mail-docs
-    command:
-      - mkdocs
-      - serve
-      - -a
-      - 0.0.0.0:8000
-  nostrmail:
-    image: ${NOSTR_MAIL_IMAGE_TAG}
-    ports:
-      - "8050:8050"
+        source: ./mock-relay
+        target: /app
+      - cargo-cache:/root/.cargo/registry
+      - cargo-cache:/root/.cargo/git
+      - target-cache:/app/target
+    container_name: mock-relay-server
+    command: ["cargo", "watch", "-q", "-c", "-w", "src", "-x", "run --bin mock-relay -- --generate-fake-events 10 --seed 0 --output-events events.json --port 8080"]
+
+  http-server:
     build:
-      context: .
+      context: ./tauri-app/backend
       dockerfile: Dockerfile
-    environment:
-      TZ: ${TZ:-America/New_York}
-      DASH_DEBUG: False
-      NOSTR_CONTACTS: ${NOSTR_CONTACTS}
-      NOSTR_PRIV_KEY: ${NOSTR_PRIV_KEY}
-      EMAIL_ADDRESS: ${EMAIL_ADDRESS}
-      EMAIL_PASSWORD: ${EMAIL_PASSWORD}
-      IMAP_HOST: ${IMAP_HOST}
-      IMAP_PORT: ${IMAP_PORT}
-      SMTP_HOST: ${SMTP_HOST}
-      SMTP_PORT: ${SMTP_PORT}
-      DEV_TOOLS_HOT_RELOAD: False
-      NOSTRMAIL_CACHE: /nostrmail/cache
+    ports:
+      - "1420:1420"  # HTTP API port
     volumes:
       - type: bind
-        source: .
-        target: /nostrmail
-    container_name: nostr-mail
-    command:
-      - python
-      - -u
-      - dashboard.py
-    working_dir: /nostrmail/nostrmail
-  alice:
-    image: ${NOSTR_MAIL_IMAGE_TAG}
-    ports:
-      - "8051:8050"
-    build:
-      context: .
-      dockerfile: Dockerfile
+        source: ./tauri-app/backend
+        target: /app
+      - cargo-cache:/root/.cargo/registry
+      - cargo-cache:/root/.cargo/git
+      - target-cache:/app/target
+    container_name: nostr-mail-http-server
+    command: ["cargo", "watch", "-q", "-c", "-w", "src", "-x", "run --bin http-server --release"]
     environment:
-      TZ: ${TZ:-America/New_York}
-      DASH_DEBUG: ${DASH_DEBUG}
-      NOSTR_CONTACTS: ${NOSTR_CONTACTS}
-      NOSTR_PRIV_KEY: ${PRIV_KEY_ALICE}
-      EMAIL_ADDRESS: ${EMAIL_ADDRESS_ALICE}
-      EMAIL_PASSWORD: ${EMAIL_PASSWORD_ALICE}
-      IMAP_HOST: ${IMAP_HOST}
-      IMAP_PORT: ${IMAP_PORT}
-      SMTP_HOST: ${SMTP_HOST}
-      SMTP_PORT: ${SMTP_PORT}
-      DEV_TOOLS_HOT_RELOAD: ${DEV_TOOLS_HOT_RELOAD}
-      NOSTRMAIL_CACHE: /nostrmail/cache
+      - RUST_LOG=info
+
+  frontend:
+    build:
+      context: ./tauri-app/frontend
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8080"  # Frontend web server port (8081 to avoid conflict with relay-server on 8080)
+    container_name: nostr-mail-frontend
+
+  glossia:
+    build:
+      context: ./glossia
+      dockerfile: Dockerfile.dev
     volumes:
       - type: bind
-        source: .
-        target: /nostrmail
-    container_name: nostr-mail-alice
-    command:
-      - python
-      - -u
-      - dashboard.py
-    working_dir: /nostrmail/nostrmail
-  bob:
-    image: ${NOSTR_MAIL_IMAGE_TAG}
-    ports:
-      - "8052:8050"
+        source: ./glossia
+        target: /app
+      - cargo-cache:/root/.cargo/registry
+      - cargo-cache:/root/.cargo/git
+      - target-cache:/app/target
+    container_name: glossia
+    # Default: run with cargo watch for hot reloading
+    # Override with: docker compose run --rm glossia cargo run --bin glossia -- "your text here"
+    command: ["cargo", "watch", "-q", "-c", "-w", "src", "-x", "run --bin glossia --"]
+
+  glossia-prod:
     build:
-      context: .
+      context: ./glossia
       dockerfile: Dockerfile
-    environment:
-      TZ: ${TZ:-America/New_York}
-      DASH_DEBUG: ${DASH_DEBUG}
-      NOSTR_CONTACTS: ${NOSTR_CONTACTS}
-      NOSTR_PRIV_KEY: ${PRIV_KEY_BOB}
-      EMAIL_ADDRESS: ${EMAIL_ADDRESS_BOB}
-      EMAIL_PASSWORD: ${EMAIL_PASSWORD_BOB}
-      IMAP_HOST: ${IMAP_HOST}
-      IMAP_PORT: ${IMAP_PORT}
-      SMTP_HOST: ${SMTP_HOST}
-      SMTP_PORT: ${SMTP_PORT}
-      DEV_TOOLS_HOT_RELOAD: ${DEV_TOOLS_HOT_RELOAD}
-      NOSTRMAIL_CACHE: /nostrmail/cache
-    volumes:
-      - type: bind
-        source: .
-        target: /nostrmail
-    container_name: nostr-mail-bob
-    command:
-      - python
-      - -u
-      - dashboard.py
-    working_dir: /nostrmail/nostrmail
-  app:
-    build: 
-      context: app
-      dockerfile: Dockerfile
-    environment:
-      - DISPLAY=${HOST_DISPLAY}
-      - LIBGL_ALWAYS_SOFTWARE=1
-    volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix
-    command: python main.py
+    container_name: glossia-prod
+    # Usage: docker compose run --rm glossia-prod cargo run --bin glossia -- "your text here"
+    # Or: docker compose run --rm glossia-prod (runs default example)
 
 

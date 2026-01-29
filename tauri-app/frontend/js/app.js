@@ -435,16 +435,45 @@ NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
 // Load keypair
 NostrMailApp.prototype.loadKeypair = async function() {
     try {
-        const stored = localStorage.getItem('nostr_keypair');
         let keypair = null;
-        if (stored) {
-            keypair = JSON.parse(stored);
-            appState.setKeypair(keypair);
-        } else {
-            // No keypair in localStorage - don't auto-generate
-            // User must explicitly generate one via the "Generate New Keypair" button
-            appState.setKeypair(null);
-            console.log('[APP] No keypair found in localStorage. User must generate one in settings.');
+        
+        // Always check config file first - it overrides localStorage
+        try {
+            const defaultPrivateKey = await TauriService.getDefaultPrivateKeyFromConfig();
+            if (defaultPrivateKey && defaultPrivateKey.trim() !== '') {
+                console.log('[APP] Found default private key from config file - overriding localStorage');
+                // Validate the private key
+                const isValid = await TauriService.validatePrivateKey(defaultPrivateKey);
+                if (isValid) {
+                    // Get public key from private key
+                    const publicKey = await TauriService.getPublicKeyFromPrivate(defaultPrivateKey);
+                    keypair = { private_key: defaultPrivateKey, public_key: publicKey };
+                    // Save to localStorage and appState (overriding any existing keypair)
+                    localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
+                    appState.setKeypair(keypair);
+                    console.log('[APP] Loaded default keypair from config file');
+                } else {
+                    console.log('[APP] Default private key from config is invalid');
+                    // Fall through to localStorage fallback
+                }
+            }
+        } catch (error) {
+            console.error('[APP] Failed to get default private key from config:', error);
+            // Fall through to localStorage fallback
+        }
+        
+        // If no keypair from config, try localStorage
+        if (!keypair) {
+            const stored = localStorage.getItem('nostr_keypair');
+            if (stored) {
+                keypair = JSON.parse(stored);
+                appState.setKeypair(keypair);
+            } else {
+                // No keypair in localStorage and no default from config - don't auto-generate
+                // User must explicitly generate one via the "Generate New Keypair" button
+                appState.setKeypair(null);
+                console.log('[APP] No keypair found in localStorage or config. User must generate one in settings.');
+            }
         }
         
         // Only proceed with keypair-dependent operations if keypair exists
@@ -890,8 +919,10 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     notificationService.showSuccess('Inbox synced successfully');
                 } catch (error) {
                     console.error('[JS] Error syncing inbox:', error);
-                    notificationService.showError('Failed to sync inbox: ' + error.message);
-                    // Restore button state on error
+                    const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
+                    notificationService.showError('Failed to sync inbox: ' + errorMessage);
+                } finally {
+                    // Always restore button state
                     domManager.enable('refreshInbox');
                     domManager.setHTML('refreshInbox', '<i class="fas fa-sync"></i> Refresh');
                 }
@@ -1006,6 +1037,22 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (testEmailConnectionBtn) {
             testEmailConnectionBtn.addEventListener('click', () => window.emailService?.testEmailConnection());
         }
+        
+        // Add event listener for folder dropdown change
+        const folderSelect = document.getElementById('imap-folder-select');
+        if (folderSelect) {
+            folderSelect.addEventListener('change', async () => {
+                const selectedFolder = folderSelect.value;
+                console.log('[APP] Folder changed to:', selectedFolder);
+                // Reload emails when folder changes
+                if (window.emailService) {
+                    // Reset offset and reload emails
+                    window.emailService.inboxOffset = 0;
+                    await window.emailService.loadEmails();
+                }
+            });
+        }
+        
         // Add this block to wire up the add relay button
         const addRelayBtn = domManager.get('addRelayBtn');
         if (addRelayBtn) {
@@ -1346,7 +1393,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     notificationService.showSuccess('Sent emails synced successfully');
                 } catch (error) {
                     console.error('[JS] Error syncing sent emails:', error);
-                    notificationService.showError('Failed to sync sent emails: ' + error.message);
+                    const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
+                    notificationService.showError('Failed to sync sent emails: ' + errorMessage);
                     // Restore button state on error (loadSentEmails won't run if sync fails)
                     refreshSent.disabled = false;
                     refreshSent.innerHTML = originalRefreshBtnHTML;
@@ -2354,6 +2402,11 @@ NostrMailApp.prototype.switchTab = async function(tabName) {
     }
     if (tabName === 'inbox') {
         if (window.emailService) {
+            // Load folders when inbox tab is opened
+            window.emailService.listImapFolders().catch(err => {
+                console.error('[APP] Error loading folders:', err);
+            });
+            // Load emails based on selected folder
             window.emailService.loadEmails();
         }
     }

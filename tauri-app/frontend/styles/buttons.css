@@ -177,6 +177,66 @@ body.dark-mode .draft-actions .btn-danger.btn-small:hover {
     border-color: #a71e2a;
 }
 
+/* Select dropdown styled as button */
+select.btn-select {
+    padding: var(--spacing-sm) var(--spacing-lg);
+    border: 2px solid #e9ecef;
+    border-radius: var(--radius-md);
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    background-color: #f8f9fa;
+    color: #6c757d;
+    min-width: 150px;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%236c757d' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");
+    background-repeat: no-repeat;
+    background-position: right var(--spacing-sm) center;
+    background-size: 16px;
+    padding-right: calc(var(--spacing-lg) + 20px);
+}
+
+select.btn-select:hover:not(:disabled) {
+    background-color: #e9ecef;
+    color: #495057;
+    border-color: #e9ecef;
+}
+
+select.btn-select:focus {
+    outline: none;
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+}
+
+select.btn-select:disabled {
+    background-color: #e9ecef;
+    color: #adb5bd;
+    cursor: not-allowed;
+    opacity: 0.6;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23adb5bd' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");
+}
+
+body.dark-mode select.btn-select {
+    background-color: #232946;
+    color: #e0e0e0;
+    border-color: #232946;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23e0e0e0' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");
+}
+
+body.dark-mode select.btn-select:hover:not(:disabled) {
+    background-color: #181a20;
+    border-color: #181a20;
+    color: #e0e0e0;
+}
+
+body.dark-mode select.btn-select:disabled {
+    background-color: #1f2937;
+    color: #6b7280;
+    border-color: #1f2937;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");
+}
+
 /* Sign button signed state */
 #sign-btn.signed {
     background-color: #d4edda;

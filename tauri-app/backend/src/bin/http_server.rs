@@ -230,6 +230,27 @@ async fn invoke_handler(
                 Err(e) => Err(e),
             }
         },
+        "sync_sent_emails" => {
+            let email_config: nostr_mail_lib::EmailConfig = match serde_json::from_value(
+                request.args.get("config")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}))
+            ) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    return Json(InvokeResponse {
+                        success: false,
+                        data: None,
+                        error: Some(format!("Invalid email config format: {}", e)),
+                    });
+                }
+            };
+            
+            match nostr_mail_lib::http_sync_sent_emails(app_state.clone(), email_config).await {
+                Ok(count) => Ok(serde_json::json!(count)),
+                Err(e) => Err(e),
+            }
+        },
         _ => Err(format!("Unknown command: {}", request.command)),
     };
     
@@ -272,13 +293,13 @@ async fn main() {
         .layer(ServiceBuilder::new().layer(cors))
         .with_state(app_state);
     
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:1420")
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:1420")
         .await
         .expect("Failed to bind to port 1420");
     
-    println!("[HTTP] Server listening on http://127.0.0.1:1420");
-    println!("[HTTP] Health check: http://127.0.0.1:1420/health");
-    println!("[HTTP] Invoke endpoint: http://127.0.0.1:1420/invoke");
+    println!("[HTTP] Server listening on http://0.0.0.0:1420");
+    println!("[HTTP] Health check: http://0.0.0.0:1420/health");
+    println!("[HTTP] Invoke endpoint: http://0.0.0.0:1420/invoke");
     
     axum::serve(listener, app)
         .await

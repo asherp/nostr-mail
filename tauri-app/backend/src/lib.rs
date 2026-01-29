@@ -1961,10 +1961,29 @@ async fn test_imap_connection(email_config: EmailConfig) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn list_imap_folders(email_config: EmailConfig) -> Result<Vec<String>, String> {
+    println!("[RUST] list_imap_folders called for: {}@{}:{}", 
+        email_config.email_address, email_config.imap_host, email_config.imap_port);
+    email::list_imap_folders(&email_config)
+        .await
+        .map_err(|e| {
+            println!("[RUST] list_imap_folders failed: {}", e);
+            e.to_string()
+        })
+}
+
+#[tauri::command]
 async fn test_smtp_connection(email_config: EmailConfig) -> Result<(), String> {
     email::test_smtp_connection(&email_config)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_default_private_key_from_config() -> Result<Option<String>, String> {
+    println!("[RUST] get_default_private_key_from_config called");
+    database::Database::get_default_private_key_from_config()
+        .map_err(|e| format!("Failed to get default private key from config: {}", e))
 }
 
 #[tauri::command]
@@ -2417,6 +2436,30 @@ fn db_find_emails_by_message_id(message_id: String, state: tauri::State<AppState
     let emails = db.find_emails_by_message_id(&message_id).map_err(|e| e.to_string())?;
     let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
     Ok(mapped)
+}
+
+#[tauri::command]
+fn db_check_duplicate_message_ids(state: tauri::State<AppState>) -> Result<Vec<(String, i64)>, String> {
+    println!("[RUST] db_check_duplicate_message_ids: Checking for duplicate message_ids");
+    let db = state.get_database()?;
+    let duplicates = db.check_duplicate_message_ids().map_err(|e| e.to_string())?;
+    println!("[RUST] db_check_duplicate_message_ids: Found {} duplicate message_ids", duplicates.len());
+    for (msg_id, count) in &duplicates {
+        println!("[RUST] db_check_duplicate_message_ids: message_id '{}' appears {} times", msg_id, count);
+    }
+    Ok(duplicates)
+}
+
+#[tauri::command]
+fn db_get_all_sent_message_ids(user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<(i64, String, String, String)>, String> {
+    println!("[RUST] db_get_all_sent_message_ids: Getting all sent message_ids for user_email: {:?}", user_email);
+    let db = state.get_database()?;
+    let results = db.get_all_sent_message_ids(user_email.as_deref()).map_err(|e| e.to_string())?;
+    println!("[RUST] db_get_all_sent_message_ids: Found {} sent emails", results.len());
+    for (id, msg_id, from, received_at) in &results {
+        println!("[RUST] db_get_all_sent_message_ids: id={}, message_id='{}', from='{}', received_at='{}'", id, msg_id, from, received_at);
+    }
+    Ok(results)
 }
 
 #[tauri::command]
@@ -3579,9 +3622,9 @@ async fn fetch_nostr_emails_smart(email_config: EmailConfig, state: tauri::State
 }
 
 #[tauri::command]
-async fn sync_nostr_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+async fn sync_nostr_emails(config: EmailConfig, folder: Option<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
-    email::sync_nostr_emails_to_db(&config, &db).await.map_err(|e| e.to_string())
+    email::sync_nostr_emails_to_db(&config, folder.as_deref(), &db).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3598,7 +3641,7 @@ async fn sync_all_emails(config: EmailConfig, state: tauri::State<'_, AppState>)
     let db = state.get_database().map_err(|e| e.to_string())?;
     
     // Sync both inbox and sent emails
-    let inbox_result = email::sync_nostr_emails_to_db(&config, &db).await;
+    let inbox_result = email::sync_nostr_emails_to_db(&config, None, &db).await;
     let sent_result = email::sync_sent_emails_to_db(&config, &db).await;
     
     match (inbox_result, sent_result) {
@@ -4924,7 +4967,9 @@ pub fn run() {
         update_contact_picture_data_url,
         test_imap_connection,
         test_smtp_connection,
+        list_imap_folders,
         check_message_confirmation,
+        get_default_private_key_from_config,
         generate_qr_code,
         init_database,
         db_save_contact,
@@ -4952,6 +4997,8 @@ pub fn run() {
         db_find_emails_by_message_id,
         db_get_sent_emails,
         db_search_sent_emails,
+        db_check_duplicate_message_ids,
+        db_get_all_sent_message_ids,
         db_save_dm,
         db_get_dms_for_conversation,
         db_get_decrypted_dms_for_conversation,
@@ -5255,4 +5302,10 @@ pub async fn http_get_relay_status(app_state: std::sync::Arc<AppState>) -> Resul
 // In HTTP mode, we can't emit Tauri events, so this will return an error
 pub async fn http_start_live_event_subscription(_app_state: std::sync::Arc<AppState>, _private_key: String) -> Result<(), String> {
     Err("Live event subscriptions are not supported in HTTP mode. Please use the Tauri app for real-time updates.".to_string())
+}
+
+pub async fn http_sync_sent_emails(app_state: std::sync::Arc<AppState>, email_config: EmailConfig) -> Result<usize, String> {
+    println!("[HTTP] sync_sent_emails called");
+    let db = app_state.get_database().map_err(|e| e.to_string())?;
+    email::sync_sent_emails_to_db(&email_config, &db).await.map_err(|e| e.to_string())
 } 

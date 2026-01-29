@@ -1836,7 +1836,68 @@ impl Database {
         
         Ok(())
     }
-
+    
+    /// Get the default private key from the config file (first profile's private key)
+    pub fn get_default_private_key_from_config() -> Result<Option<String>> {
+        // Determine config path: use NOSTR_MAIL_CONFIG if set, otherwise use platform-specific approach
+        let is_test_mode = std::env::var("NOSTR_MAIL_CONFIG").is_ok();
+        
+        let config_path = if is_test_mode {
+            std::env::var("NOSTR_MAIL_CONFIG").unwrap()
+        } else {
+            #[cfg(target_os = "android")]
+            {
+                // On Android, config is embedded, so we can't read it here
+                return Ok(None);
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                // On desktop, use default path
+                let default_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("nostr-mail-config.json");
+                default_path.to_string_lossy().to_string()
+            }
+        };
+        
+        // Try to read and parse the config file
+        use std::fs;
+        let content = match fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => {
+                // Config file doesn't exist or can't be read - that's okay
+                return Ok(None);
+            }
+        };
+        
+        // Parse JSON to extract first profile's private key
+        use serde_json;
+        #[derive(Deserialize)]
+        struct ConfigProfile {
+            private_key: String,
+        }
+        
+        #[derive(Deserialize)]
+        struct ConfigData {
+            profiles: Option<Vec<ConfigProfile>>,
+        }
+        
+        match serde_json::from_str::<ConfigData>(&content) {
+            Ok(config_data) => {
+                if let Some(profiles) = config_data.profiles {
+                    if let Some(first_profile) = profiles.first() {
+                        println!("[DB] Found default private key from config file (first profile)");
+                        return Ok(Some(first_profile.private_key.clone()));
+                    }
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                println!("[DB] Failed to parse config file for default private key: {}", e);
+                Ok(None)
+            }
+        }
+    }
+    
     pub fn get_setting(&self, pubkey: &str, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT value FROM user_settings WHERE pubkey = ? AND key = ?")?;
@@ -1948,8 +2009,9 @@ impl Database {
         struct ConfigProfile {
             #[allow(dead_code)]
             pubkey: String,
-            #[allow(dead_code)]
             private_key: String,
+            #[allow(dead_code)]
+            name: Option<String>,
         }
         
         #[derive(Deserialize)]
@@ -2229,7 +2291,7 @@ impl Database {
     pub fn find_emails_by_message_id(&self, message_id: &str) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified
              FROM emails WHERE message_id = ? ORDER BY received_at DESC"
         )?;
         
@@ -2262,6 +2324,62 @@ impl Database {
             emails.push(row?);
         }
         Ok(emails)
+    }
+
+    /// Check for duplicate message_ids in the database (for debugging)
+    pub fn check_duplicate_message_ids(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT message_id, COUNT(*) as count 
+             FROM emails 
+             GROUP BY message_id 
+             HAVING COUNT(*) > 1 
+             ORDER BY count DESC"
+        )?;
+        
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        
+        let mut duplicates = Vec::new();
+        for row in rows {
+            duplicates.push(row?);
+        }
+        Ok(duplicates)
+    }
+
+    /// Get all message_ids for sent emails (for debugging)
+    pub fn get_all_sent_message_ids(&self, user_email: Option<&str>) -> Result<Vec<(i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut query = String::from(
+            "SELECT id, message_id, from_address, received_at FROM emails WHERE is_draft = 0"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        
+        if let Some(email) = user_email {
+            let email_lower = email.to_lowercase();
+            let email_normalized = if email_lower.contains("@gmail.com") {
+                email_lower.split('+').next().unwrap_or(&email_lower).split('@').next().unwrap_or(&email_lower).to_string() + "@gmail.com"
+            } else {
+                email_lower
+            };
+            query.push_str(" AND (LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?)))");
+            params.push(Box::new(email.clone()));
+            params.push(Box::new(email_normalized));
+        }
+        
+        query.push_str(" ORDER BY received_at DESC");
+        
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     // Draft operations

@@ -1,4 +1,4 @@
-name: Deploy MkDocs Site
+name: Deploy Site
 
 on:
   push:
@@ -10,10 +10,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v5
       with:
         python-version: '3.x'
 
@@ -22,13 +22,32 @@ jobs:
         python -m pip install pip==24.0
         pip install mkdocs markdown-include pygments mkdocs-material
 
+    - name: Build MkDocs into /docs subpath
+      run: |
+        # Build MkDocs with site_url pointing to /docs/
+        mkdocs build --site-dir _site_docs
+
+    - name: Assemble final site
+      run: |
+        mkdir -p _site/docs _site/assets
+        # Landing page as root
+        cp docs/landing/index.html _site/index.html
+        # Logo assets for the landing page
+        cp tauri-app/frontend/assets/nostr-mail-logo.png _site/assets/
+        cp tauri-app/frontend/assets/nostr-mail-logo-white.png _site/assets/
+        # MkDocs docs under /docs/
+        cp -r _site_docs/* _site/docs/
+        # Preserve CNAME for custom domain
+        echo "nostr-mail.com" > _site/CNAME
+
     - name: Deploy to GitHub Pages
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/asherp/nostr-mail.git
-        mkdocs gh-deploy --force
 
-
-
-
+        cd _site
+        git init
+        git add -A
+        git commit -m "Deploy landing page + docs"
+        git push --force origin HEAD:gh-pages

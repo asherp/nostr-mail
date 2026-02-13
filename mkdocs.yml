@@ -1,7 +1,7 @@
 site_name: nostr-mail
 repo_name: nostr-mail
 repo_url: https://github.com/asherp/nostr-mail
-site_url: https://nostr-mail.com
+site_url: https://nostr-mail.com/docs/
 
 
 repo_url: https://github.com/asherp/nostr-mail
@@ -12,6 +12,7 @@ nav:
 - Getting Started:
   - Installation: installation.md
   - Quick Start: quick-start.md
+  - Nostr Clients: nostr-clients.md
 - User Guides:
   - Compose Page: pages/compose.md
   - Inbox Page: pages/inbox.md

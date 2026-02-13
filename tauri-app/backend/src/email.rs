@@ -2483,21 +2483,28 @@ pub fn decrypt_nostr_email_content(config: &EmailConfig, raw_headers: &str, subj
         subject.to_string()
     };
     
-    // Try to decrypt body
-    let decrypted_body = if body.contains("BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE") {
-        // Remove the ASCII armor if present
+    // Try to decrypt body - check for both NIP-04 and NIP-44 ASCII armor
+    let decrypted_body = if body.contains("BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE") || body.contains("BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE") {
+        // Remove the ASCII armor if present (handle both NIP-04 and NIP-44)
         let clean_body = body
             .replace("-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----", "")
             .replace("-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----", "")
+            .replace("-----BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE-----", "")
+            .replace("-----END NOSTR NIP-44 ENCRYPTED MESSAGE-----", "")
             .trim()
             .to_string();
+        
+        // Detect format for logging
+        let detected_format = crypto::detect_encryption_format(&clean_body);
+        println!("[RUST] Detected encryption format: {} for email body", detected_format);
+        
         match crypto::decrypt_message(private_key, &sender_pubkey, &clean_body) {
             Ok(decrypted) => {
-                println!("[RUST] Successfully decrypted body: '{}'", decrypted); // <-- Print decrypted body
+                println!("[RUST] Successfully decrypted body using format: {}", detected_format);
                 decrypted
             }
             Err(e) => {
-                println!("[RUST] Failed to decrypt body: {}", e);
+                println!("[RUST] Failed to decrypt body (detected format: {}): {}", detected_format, e);
                 body.to_string()
             }
         }
@@ -2536,23 +2543,311 @@ pub fn is_likely_encrypted_content(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    #[test]
-    fn test_email_config_creation() {
-        let config = EmailConfig {
-            email_address: "test@example.com".to_string(),
-            password: "password".to_string(),
-            smtp_host: "smtp.gmail.com".to_string(),
+    use crate::types::EmailConfig;
+
+    fn make_config() -> EmailConfig {
+        EmailConfig {
+            email_address: "sender@example.com".to_string(),
+            password: "pass".to_string(),
+            smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
-            imap_host: "imap.gmail.com".to_string(),
+            imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             use_tls: true,
-        };
-        
-        assert_eq!(config.email_address, "test@example.com");
+            private_key: None,
+        }
+    }
+
+    #[test]
+    fn test_email_config_creation() {
+        let config = make_config();
+        assert_eq!(config.email_address, "sender@example.com");
         assert_eq!(config.smtp_port, 587);
     }
-} 
+
+    // =====================
+    // decode_header_value
+    // =====================
+
+    #[test]
+    fn test_decode_header_value_plain_ascii() {
+        assert_eq!(decode_header_value("Hello World"), "Hello World");
+    }
+
+    #[test]
+    fn test_decode_header_value_right_single_quote() {
+        let input = "It\u{00E2}\u{0080}\u{0099}s a test";
+        let result = decode_header_value(input);
+        assert_eq!(result, "It's a test");
+    }
+
+    #[test]
+    fn test_decode_header_value_left_right_double_quotes() {
+        let input = "\u{00E2}\u{0080}\u{009C}quoted\u{00E2}\u{0080}\u{009D}";
+        let result = decode_header_value(input);
+        assert_eq!(result, "\"quoted\"");
+    }
+
+    #[test]
+    fn test_decode_header_value_em_dash() {
+        let input = "word\u{00E2}\u{0080}\u{0094}word";
+        let result = decode_header_value(input);
+        assert!(result.contains("\u{2014}")); // em dash
+    }
+
+    #[test]
+    fn test_decode_header_value_en_dash() {
+        let input = "word\u{00E2}\u{0080}\u{0093}word";
+        let result = decode_header_value(input);
+        assert!(result.contains("\u{2013}")); // en dash
+    }
+
+    #[test]
+    fn test_decode_header_value_replacement_char() {
+        let input = "It\u{FFFD}s fine";
+        let result = decode_header_value(input);
+        assert_eq!(result, "It's fine");
+    }
+
+    #[test]
+    fn test_decode_header_value_contraction_doesnt() {
+        assert_eq!(decode_header_value("doesn\u{00E2}"), "doesn't");
+    }
+
+    #[test]
+    fn test_decode_header_value_contraction_wont() {
+        assert_eq!(decode_header_value("won\u{00E2}"), "won't");
+    }
+
+    #[test]
+    fn test_decode_header_value_contraction_cant() {
+        assert_eq!(decode_header_value("can\u{00E2}"), "can't");
+    }
+
+    #[test]
+    fn test_decode_header_value_contraction_isnt() {
+        assert_eq!(decode_header_value("isn\u{00E2}"), "isn't");
+    }
+
+    #[test]
+    fn test_decode_header_value_contraction_shouldnt() {
+        assert_eq!(decode_header_value("shouldn\u{00E2}"), "shouldn't");
+    }
+
+    #[test]
+    fn test_decode_header_value_pattern_a_space_t() {
+        // When the input is "word\u{00E2} t", the contraction replacement for
+        // "can\u{00E2}" fires first, turning it into "can't t do it".
+        // The final "\u{00E2} t" -> "'t" replacement only matches standalone patterns.
+        // Test the standalone pattern where no contraction prefix matches:
+        let input = "he said\u{00E2} t do it";
+        let result = decode_header_value(input);
+        assert!(result.contains("'t"));
+    }
+
+    #[test]
+    fn test_decode_header_value_empty_string() {
+        assert_eq!(decode_header_value(""), "");
+    }
+
+    #[test]
+    fn test_decode_header_value_no_encoding_issues() {
+        let input = "Normal subject line without any issues";
+        assert_eq!(decode_header_value(input), input);
+    }
+
+    // =====================
+    // XNostrPubkey / XNostrSig header types
+    // =====================
+
+    #[test]
+    fn test_x_nostr_pubkey_header_name() {
+        let name = XNostrPubkey::name();
+        assert_eq!(name.to_string(), "X-Nostr-Pubkey");
+    }
+
+    #[test]
+    fn test_x_nostr_pubkey_parse() {
+        let header = XNostrPubkey::parse("abc123hex").unwrap();
+        assert_eq!(header.0, "abc123hex");
+    }
+
+    #[test]
+    fn test_x_nostr_pubkey_display() {
+        let header = XNostrPubkey("mypubkey".to_string());
+        let display = header.display();
+        // Verify it creates a valid HeaderValue (use Debug formatting)
+        let formatted = format!("{:?}", display);
+        assert!(formatted.contains("mypubkey"));
+    }
+
+    #[test]
+    fn test_x_nostr_sig_header_name() {
+        let name = XNostrSig::name();
+        assert_eq!(name.to_string(), "X-Nostr-Sig");
+    }
+
+    #[test]
+    fn test_x_nostr_sig_parse() {
+        let header = XNostrSig::parse("sig_data_hex").unwrap();
+        assert_eq!(header.0, "sig_data_hex");
+    }
+
+    #[test]
+    fn test_x_nostr_sig_display() {
+        let header = XNostrSig("mysig".to_string());
+        let display = header.display();
+        // Verify it creates a valid HeaderValue (use Debug formatting)
+        let formatted = format!("{:?}", display);
+        assert!(formatted.contains("mysig"));
+    }
+
+    // =====================
+    // construct_email_headers
+    // =====================
+
+    #[test]
+    fn test_construct_email_headers_basic() {
+        let config = make_config();
+
+        let result = construct_email_headers(
+            &config,
+            "recipient@example.com",
+            "Test Subject",
+            "Hello body",
+            None,
+            None,
+            None,
+        );
+
+        assert!(result.is_ok());
+        let headers = result.unwrap();
+        assert!(headers.contains("From:"));
+        assert!(headers.contains("To:"));
+        assert!(headers.contains("Subject: Test Subject"));
+    }
+
+    #[test]
+    fn test_construct_email_headers_with_message_id() {
+        let config = make_config();
+
+        let result = construct_email_headers(
+            &config,
+            "recipient@example.com",
+            "Subject",
+            "Body",
+            None,
+            Some("<custom-id@example.com>"),
+            None,
+        );
+
+        assert!(result.is_ok());
+        let headers = result.unwrap();
+        let headers_lower = headers.to_lowercase();
+        assert!(headers_lower.contains("message-id"));
+    }
+
+    #[test]
+    fn test_construct_email_headers_with_private_key() {
+        let keypair = crate::crypto::generate_keypair().unwrap();
+
+        let config = EmailConfig {
+            private_key: Some(keypair.private_key.clone()),
+            ..make_config()
+        };
+
+        let result = construct_email_headers(
+            &config,
+            "recipient@example.com",
+            "Test",
+            "Body content",
+            None,
+            None,
+            None,
+        );
+
+        assert!(result.is_ok());
+        let headers = result.unwrap();
+        assert!(headers.contains("X-Nostr-Pubkey:"), "Missing X-Nostr-Pubkey header");
+        assert!(headers.contains("X-Nostr-Sig:"), "Missing X-Nostr-Sig header");
+    }
+
+    #[test]
+    fn test_construct_email_headers_with_empty_attachments() {
+        let config = make_config();
+
+        let empty_attachments: Vec<crate::types::EmailAttachment> = vec![];
+        let result = construct_email_headers(
+            &config,
+            "recipient@example.com",
+            "Subject",
+            "Body",
+            None,
+            None,
+            Some(&empty_attachments),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_construct_email_headers_with_attachments() {
+        let config = make_config();
+
+        let attachments = vec![crate::types::EmailAttachment {
+            filename: "test.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            data: "dGVzdA==".to_string(),
+            size: 4,
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        }];
+
+        let result = construct_email_headers(
+            &config,
+            "recipient@example.com",
+            "With Attachment",
+            "Body",
+            None,
+            None,
+            Some(&attachments),
+        );
+
+        assert!(result.is_ok());
+        let headers = result.unwrap();
+        assert!(headers.contains("Content-Type:"));
+    }
+
+    // =====================
+    // detect_encryption_format (from crypto, used by email)
+    // =====================
+
+    #[test]
+    fn test_detect_encryption_format_empty() {
+        assert_eq!(crypto::detect_encryption_format(""), "unknown");
+    }
+
+    #[test]
+    fn test_detect_encryption_format_nip04() {
+        let content = "SGVsbG8gV29ybGQ=?iv=dGVzdGl2";
+        assert_eq!(crypto::detect_encryption_format(content), "nip04");
+    }
+
+    #[test]
+    fn test_detect_encryption_format_nip04_with_armor() {
+        let content = "-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----\nSGVsbG8gV29ybGQ=?iv=dGVzdGl2\n-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----";
+        assert_eq!(crypto::detect_encryption_format(content), "nip04");
+    }
+
+    #[test]
+    fn test_detect_encryption_format_unknown_plain_text() {
+        assert_eq!(crypto::detect_encryption_format("Hello, world!"), "unknown");
+    }
+}
 
 pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database::Database) -> Result<Vec<EmailMessage>> {
     use chrono::Utc;
@@ -4363,4 +4658,4 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
         
         emails_result
     };
-} 
+}

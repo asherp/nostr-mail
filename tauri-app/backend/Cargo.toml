@@ -80,3 +80,6 @@ path = "src/bin/http_server.rs"
 [[bin]]
 name = "verify_sig"
 path = "src/bin/verify_sig.rs"
+
+[dev-dependencies]
+tempfile = "3"

@@ -2781,4 +2781,976 @@ impl Database {
         )?;
         Ok(())
     }
-} 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Helper: create a temporary database with NOSTR_MAIL_CONFIG pointed at an empty config file.
+    /// Returns the Database and the TempDir (must be kept alive for the duration of the test).
+    fn create_test_db() -> (Database, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        // Write a minimal config so Database::new does not try to load the real one
+        let config_path = dir.path().join("test-config.json");
+        let mut f = std::fs::File::create(&config_path).unwrap();
+        writeln!(f, r#"{{"relays":[]}}"#).unwrap();
+
+        // Point the env var at this config
+        std::env::set_var("NOSTR_MAIL_CONFIG", config_path.to_str().unwrap());
+
+        let db_path = dir.path().join("test.db");
+        let db = Database::new(&db_path).expect("failed to create database");
+        (db, dir)
+    }
+
+    fn make_contact(pubkey: &str) -> Contact {
+        let now = Utc::now();
+        Contact {
+            id: None,
+            pubkey: pubkey.to_string(),
+            name: Some("Test User".to_string()),
+            email: Some("test@example.com".to_string()),
+            picture_url: None,
+            picture_data_url: None,
+            about: Some("about text".to_string()),
+            created_at: now,
+            updated_at: now,
+            is_public: Some(true),
+        }
+    }
+
+    fn make_email(message_id: &str) -> Email {
+        let now = Utc::now();
+        Email {
+            id: None,
+            message_id: message_id.to_string(),
+            from_address: "sender@example.com".to_string(),
+            to_address: "recipient@example.com".to_string(),
+            subject: "Test Subject".to_string(),
+            body: "Test body content".to_string(),
+            body_plain: Some("Test body content".to_string()),
+            body_html: None,
+            received_at: now,
+            is_nostr_encrypted: false,
+            sender_pubkey: Some("sender_pub".to_string()),
+            recipient_pubkey: Some("recipient_pub".to_string()),
+            raw_headers: Some("From: sender@example.com".to_string()),
+            is_draft: false,
+            is_read: false,
+            updated_at: None,
+            created_at: now,
+            signature_valid: None,
+            transport_auth_verified: None,
+        }
+    }
+
+    fn make_dm(event_id: &str, sender: &str, recipient: &str) -> DirectMessage {
+        let now = Utc::now();
+        DirectMessage {
+            id: None,
+            event_id: event_id.to_string(),
+            sender_pubkey: sender.to_string(),
+            recipient_pubkey: recipient.to_string(),
+            content: "Hello from DM".to_string(),
+            created_at: now,
+            received_at: now,
+        }
+    }
+
+    // =====================
+    // Database creation
+    // =====================
+
+    #[test]
+    fn test_database_new_creates_tables() {
+        let (db, _dir) = create_test_db();
+        // Verify we can call methods that query all the tables without error
+        let contacts = db.get_all_contacts("nonexistent_user").unwrap();
+        assert!(contacts.is_empty());
+
+        let relays = db.get_all_relays().unwrap();
+        // Should be empty because config has no relays and we set NOSTR_MAIL_CONFIG
+        assert!(relays.is_empty());
+
+        let settings = db.get_all_settings("any_pubkey").unwrap();
+        assert!(settings.is_empty());
+    }
+
+    #[test]
+    fn test_database_new_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("cfg.json");
+        std::fs::write(&config_path, r#"{"relays":[]}"#).unwrap();
+        std::env::set_var("NOSTR_MAIL_CONFIG", config_path.to_str().unwrap());
+
+        let db_path = dir.path().join("test.db");
+        // Create twice on same path -- should not error
+        let _db1 = Database::new(&db_path).unwrap();
+        let _db2 = Database::new(&db_path).unwrap();
+    }
+
+    // =====================
+    // Contact CRUD
+    // =====================
+
+    #[test]
+    fn test_save_and_get_contact() {
+        let (db, _dir) = create_test_db();
+        let contact = make_contact("pk_abc123");
+
+        let id = db.save_contact(&contact).unwrap();
+        assert!(id > 0);
+
+        let retrieved = db.get_contact("pk_abc123").unwrap();
+        assert!(retrieved.is_some());
+        let c = retrieved.unwrap();
+        assert_eq!(c.pubkey, "pk_abc123");
+        assert_eq!(c.name, Some("Test User".to_string()));
+        assert_eq!(c.email, Some("test@example.com".to_string()));
+        assert_eq!(c.about, Some("about text".to_string()));
+    }
+
+    #[test]
+    fn test_save_contact_upsert() {
+        let (db, _dir) = create_test_db();
+        let mut contact = make_contact("pk_upsert");
+        db.save_contact(&contact).unwrap();
+
+        // Update name and save again
+        contact.name = Some("Updated Name".to_string());
+        db.save_contact(&contact).unwrap();
+
+        let retrieved = db.get_contact("pk_upsert").unwrap().unwrap();
+        assert_eq!(retrieved.name, Some("Updated Name".to_string()));
+    }
+
+    #[test]
+    fn test_get_all_contacts_with_user_contacts() {
+        let (db, _dir) = create_test_db();
+        let c1 = make_contact("pk_1");
+        let c2 = make_contact("pk_2");
+        db.save_contact(&c1).unwrap();
+        db.save_contact(&c2).unwrap();
+
+        // Without user-contact relationships, get_all_contacts returns nothing for any user
+        let all = db.get_all_contacts("user_x").unwrap();
+        assert_eq!(all.len(), 0);
+
+        // Add user-contact relationships
+        db.add_user_contact("user_x", "pk_1", true).unwrap();
+        db.add_user_contact("user_x", "pk_2", false).unwrap();
+
+        let all = db.get_all_contacts("user_x").unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_contact() {
+        let (db, _dir) = create_test_db();
+        let contact = make_contact("pk_delete_me");
+        db.save_contact(&contact).unwrap();
+
+        assert!(db.get_contact("pk_delete_me").unwrap().is_some());
+        db.delete_contact("pk_delete_me").unwrap();
+        assert!(db.get_contact("pk_delete_me").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_user_follows_contact() {
+        let (db, _dir) = create_test_db();
+        let contact = make_contact("pk_follow");
+        db.save_contact(&contact).unwrap();
+        db.add_user_contact("user_a", "pk_follow", true).unwrap();
+
+        assert!(db.user_follows_contact("user_a", "pk_follow").unwrap());
+        assert!(!db.user_follows_contact("user_b", "pk_follow").unwrap());
+    }
+
+    #[test]
+    fn test_remove_user_contact_and_cleanup() {
+        let (db, _dir) = create_test_db();
+        let contact = make_contact("pk_cleanup");
+        db.save_contact(&contact).unwrap();
+        db.add_user_contact("user_a", "pk_cleanup", true).unwrap();
+
+        let (success, deleted) = db.remove_user_contact_and_cleanup("user_a", "pk_cleanup").unwrap();
+        assert!(success);
+        assert!(deleted); // no other users following => contact deleted
+        assert!(db.get_contact("pk_cleanup").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_remove_user_contact_no_cleanup_when_others_follow() {
+        let (db, _dir) = create_test_db();
+        let contact = make_contact("pk_shared");
+        db.save_contact(&contact).unwrap();
+        db.add_user_contact("user_a", "pk_shared", true).unwrap();
+        db.add_user_contact("user_b", "pk_shared", true).unwrap();
+
+        let (success, deleted) = db.remove_user_contact_and_cleanup("user_a", "pk_shared").unwrap();
+        assert!(success);
+        assert!(!deleted); // user_b still follows
+        assert!(db.get_contact("pk_shared").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_get_public_contact_pubkeys() {
+        let (db, _dir) = create_test_db();
+        db.save_contact(&make_contact("pk_pub")).unwrap();
+        db.save_contact(&make_contact("pk_priv")).unwrap();
+        db.add_user_contact("user_z", "pk_pub", true).unwrap();
+        db.add_user_contact("user_z", "pk_priv", false).unwrap();
+
+        let public = db.get_public_contact_pubkeys("user_z").unwrap();
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0], "pk_pub");
+    }
+
+    #[test]
+    fn test_batch_save_contacts() {
+        let (db, _dir) = create_test_db();
+        let contacts = vec![make_contact("pk_b1"), make_contact("pk_b2"), make_contact("pk_b3")];
+        db.batch_save_contacts("user_batch", &contacts, true).unwrap();
+
+        let all = db.get_all_contacts("user_batch").unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    // =====================
+    // Email CRUD
+    // =====================
+
+    #[test]
+    fn test_save_and_get_email() {
+        let (db, _dir) = create_test_db();
+        let email = make_email("msg-001@example.com");
+
+        let id = db.save_email(&email).unwrap();
+        assert!(id > 0);
+
+        let retrieved = db.get_email("msg-001@example.com").unwrap();
+        assert!(retrieved.is_some());
+        let e = retrieved.unwrap();
+        assert_eq!(e.message_id, "msg-001@example.com");
+        assert_eq!(e.subject, "Test Subject");
+        assert_eq!(e.from_address, "sender@example.com");
+    }
+
+    #[test]
+    fn test_get_email_normalizes_angle_brackets() {
+        let (db, _dir) = create_test_db();
+        let email = make_email("msg-brackets@example.com");
+        db.save_email(&email).unwrap();
+
+        // Query with angle brackets should still find it
+        let result = db.get_email("<msg-brackets@example.com>").unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_save_email_upsert() {
+        let (db, _dir) = create_test_db();
+        let mut email = make_email("msg-upsert@example.com");
+        db.save_email(&email).unwrap();
+
+        email.subject = "Updated Subject".to_string();
+        db.save_email(&email).unwrap();
+
+        let retrieved = db.get_email("msg-upsert@example.com").unwrap().unwrap();
+        assert_eq!(retrieved.subject, "Updated Subject");
+    }
+
+    #[test]
+    fn test_get_emails_with_filters() {
+        let (db, _dir) = create_test_db();
+        let mut e1 = make_email("msg-e1@example.com");
+        e1.is_nostr_encrypted = true;
+        e1.to_address = "inbox@example.com".to_string();
+        db.save_email(&e1).unwrap();
+
+        let mut e2 = make_email("msg-e2@example.com");
+        e2.is_nostr_encrypted = false;
+        e2.to_address = "inbox@example.com".to_string();
+        db.save_email(&e2).unwrap();
+
+        // nostr_only = true
+        let nostr_only = db.get_emails(None, None, Some(true), None).unwrap();
+        assert_eq!(nostr_only.len(), 1);
+        assert_eq!(nostr_only[0].message_id, "msg-e1@example.com");
+
+        // filter by user email
+        let by_email = db.get_emails(None, None, None, Some("inbox@example.com")).unwrap();
+        assert_eq!(by_email.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_email_direct() {
+        let (db, _dir) = create_test_db();
+        let email = make_email("msg-direct@example.com");
+        let id = db.insert_email_direct(&email).unwrap();
+        assert!(id > 0);
+
+        let retrieved = db.get_email("msg-direct@example.com").unwrap();
+        assert!(retrieved.is_some());
+    }
+
+    #[test]
+    fn test_mark_as_read() {
+        let (db, _dir) = create_test_db();
+        let email = make_email("msg-read@example.com");
+        db.save_email(&email).unwrap();
+
+        db.mark_as_read("msg-read@example.com").unwrap();
+
+        let retrieved = db.get_email("msg-read@example.com").unwrap().unwrap();
+        assert!(retrieved.is_read);
+    }
+
+    // =====================
+    // DirectMessage CRUD
+    // =====================
+
+    #[test]
+    fn test_save_and_get_dm() {
+        let (db, _dir) = create_test_db();
+        let dm = make_dm("event_001", "sender_pk", "recipient_pk");
+        let id = db.save_dm(&dm).unwrap();
+        assert!(id > 0);
+
+        let dms = db.get_dms_for_conversation("sender_pk", "recipient_pk").unwrap();
+        assert_eq!(dms.len(), 1);
+        assert_eq!(dms[0].event_id, "event_001");
+        assert_eq!(dms[0].content, "Hello from DM");
+    }
+
+    #[test]
+    fn test_get_dms_bidirectional() {
+        let (db, _dir) = create_test_db();
+        db.save_dm(&make_dm("ev_1", "alice", "bob")).unwrap();
+        db.save_dm(&make_dm("ev_2", "bob", "alice")).unwrap();
+
+        // Both directions should be returned
+        let dms = db.get_dms_for_conversation("alice", "bob").unwrap();
+        assert_eq!(dms.len(), 2);
+    }
+
+    #[test]
+    fn test_save_dm_batch() {
+        let (db, _dir) = create_test_db();
+        let dms = vec![
+            make_dm("batch_ev1", "alice", "bob"),
+            make_dm("batch_ev2", "alice", "bob"),
+            make_dm("batch_ev3", "bob", "alice"),
+        ];
+        let inserted = db.save_dm_batch(&dms).unwrap();
+        assert_eq!(inserted, 3);
+
+        // Inserting the same batch again should skip all (idempotent)
+        let inserted_again = db.save_dm_batch(&dms).unwrap();
+        assert_eq!(inserted_again, 0);
+    }
+
+    #[test]
+    fn test_get_dm_encrypted_content_by_event_id() {
+        let (db, _dir) = create_test_db();
+        let dm = make_dm("ev_content", "s", "r");
+        db.save_dm(&dm).unwrap();
+
+        let content = db.get_dm_encrypted_content_by_event_id("ev_content").unwrap();
+        assert_eq!(content, "Hello from DM");
+    }
+
+    #[test]
+    fn test_get_latest_dm_created_at() {
+        let (db, _dir) = create_test_db();
+        assert!(db.get_latest_dm_created_at().unwrap().is_none());
+
+        db.save_dm(&make_dm("ev_latest", "a", "b")).unwrap();
+        assert!(db.get_latest_dm_created_at().unwrap().is_some());
+    }
+
+    // =====================
+    // Relay CRUD
+    // =====================
+
+    #[test]
+    fn test_save_and_get_relays() {
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        let relay = DbRelay {
+            id: None,
+            url: "wss://relay.example.com".to_string(),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let id = db.save_relay(&relay).unwrap();
+        assert!(id > 0);
+
+        let relays = db.get_all_relays().unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].url, "wss://relay.example.com");
+        assert!(relays[0].is_active);
+    }
+
+    #[test]
+    fn test_delete_relay() {
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        let relay = DbRelay {
+            id: None,
+            url: "wss://relay.delete.me".to_string(),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        };
+        db.save_relay(&relay).unwrap();
+
+        db.delete_relay("wss://relay.delete.me").unwrap();
+        let relays = db.get_all_relays().unwrap();
+        assert!(relays.is_empty());
+    }
+
+    #[test]
+    fn test_save_relay_update() {
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        let relay = DbRelay {
+            id: None,
+            url: "wss://relay.update.me".to_string(),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let id = db.save_relay(&relay).unwrap();
+
+        // Update via save with explicit id
+        let updated = DbRelay {
+            id: Some(id),
+            url: "wss://relay.update.me".to_string(),
+            is_active: false,
+            created_at: now,
+            updated_at: now,
+        };
+        db.save_relay(&updated).unwrap();
+
+        let relays = db.get_all_relays().unwrap();
+        assert_eq!(relays.len(), 1);
+        assert!(!relays[0].is_active);
+    }
+
+    // =====================
+    // UserSettings CRUD
+    // =====================
+
+    #[test]
+    fn test_save_and_get_setting() {
+        let (db, _dir) = create_test_db();
+        db.save_setting("pubkey_a", "theme", "dark").unwrap();
+
+        let value = db.get_setting("pubkey_a", "theme").unwrap();
+        assert_eq!(value, Some("dark".to_string()));
+    }
+
+    #[test]
+    fn test_get_setting_not_found() {
+        let (db, _dir) = create_test_db();
+        let value = db.get_setting("nonexistent", "key").unwrap();
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_save_setting_upsert() {
+        let (db, _dir) = create_test_db();
+        db.save_setting("pk", "key1", "value1").unwrap();
+        db.save_setting("pk", "key1", "value2").unwrap();
+
+        let value = db.get_setting("pk", "key1").unwrap();
+        assert_eq!(value, Some("value2".to_string()));
+    }
+
+    #[test]
+    fn test_get_all_settings() {
+        let (db, _dir) = create_test_db();
+        db.save_setting("pk_all", "a", "1").unwrap();
+        db.save_setting("pk_all", "b", "2").unwrap();
+        db.save_setting("pk_all", "c", "3").unwrap();
+
+        let settings = db.get_all_settings("pk_all").unwrap();
+        assert_eq!(settings.len(), 3);
+        assert_eq!(settings.get("a").unwrap(), "1");
+        assert_eq!(settings.get("b").unwrap(), "2");
+        assert_eq!(settings.get("c").unwrap(), "3");
+    }
+
+    #[test]
+    fn test_delete_settings_for_pubkey() {
+        let (db, _dir) = create_test_db();
+        db.save_setting("pk_del", "x", "1").unwrap();
+        db.save_setting("pk_del", "y", "2").unwrap();
+        db.save_setting("pk_other", "z", "3").unwrap();
+
+        db.delete_settings_for_pubkey("pk_del").unwrap();
+
+        assert!(db.get_all_settings("pk_del").unwrap().is_empty());
+        // Other pubkey's settings should be untouched
+        assert_eq!(db.get_all_settings("pk_other").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_settings_isolation_between_pubkeys() {
+        let (db, _dir) = create_test_db();
+        db.save_setting("pk_1", "theme", "dark").unwrap();
+        db.save_setting("pk_2", "theme", "light").unwrap();
+
+        assert_eq!(db.get_setting("pk_1", "theme").unwrap(), Some("dark".to_string()));
+        assert_eq!(db.get_setting("pk_2", "theme").unwrap(), Some("light".to_string()));
+    }
+
+    // =====================
+    // Conversation CRUD
+    // =====================
+
+    #[test]
+    fn test_save_and_get_conversation() {
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        let conv = DbConversation {
+            id: None,
+            user_pubkey: "user_pk".to_string(),
+            contact_pubkey: "contact_pk".to_string(),
+            contact_name: Some("Alice".to_string()),
+            last_message_event_id: "ev_last".to_string(),
+            last_timestamp: 1700000000,
+            message_count: 5,
+            cached_at: now,
+        };
+
+        let id = db.save_conversation(&conv).unwrap();
+        assert!(id > 0);
+
+        let conversations = db.get_conversations("user_pk").unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].contact_pubkey, "contact_pk");
+        assert_eq!(conversations[0].contact_name, Some("Alice".to_string()));
+        assert_eq!(conversations[0].message_count, 5);
+    }
+
+    #[test]
+    fn test_save_conversation_upsert() {
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        let conv = DbConversation {
+            id: None,
+            user_pubkey: "u".to_string(),
+            contact_pubkey: "c".to_string(),
+            contact_name: Some("Bob".to_string()),
+            last_message_event_id: "ev1".to_string(),
+            last_timestamp: 100,
+            message_count: 1,
+            cached_at: now,
+        };
+        db.save_conversation(&conv).unwrap();
+
+        // Upsert with new data
+        let conv2 = DbConversation {
+            id: None,
+            user_pubkey: "u".to_string(),
+            contact_pubkey: "c".to_string(),
+            contact_name: Some("Bob Updated".to_string()),
+            last_message_event_id: "ev2".to_string(),
+            last_timestamp: 200,
+            message_count: 3,
+            cached_at: now,
+        };
+        db.save_conversation(&conv2).unwrap();
+
+        let convs = db.get_conversations("u").unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].last_message_event_id, "ev2");
+        assert_eq!(convs[0].message_count, 3);
+    }
+
+    #[test]
+    fn test_get_conversation_single() {
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        let conv = DbConversation {
+            id: None,
+            user_pubkey: "u1".to_string(),
+            contact_pubkey: "c1".to_string(),
+            contact_name: None,
+            last_message_event_id: "ev".to_string(),
+            last_timestamp: 50,
+            message_count: 2,
+            cached_at: now,
+        };
+        db.save_conversation(&conv).unwrap();
+
+        let result = db.get_conversation("u1", "c1").unwrap();
+        assert!(result.is_some());
+
+        let none = db.get_conversation("u1", "c_nonexistent").unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_delete_conversation() {
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        let conv = DbConversation {
+            id: None,
+            user_pubkey: "u_del".to_string(),
+            contact_pubkey: "c_del".to_string(),
+            contact_name: None,
+            last_message_event_id: "ev".to_string(),
+            last_timestamp: 50,
+            message_count: 1,
+            cached_at: now,
+        };
+        db.save_conversation(&conv).unwrap();
+        db.delete_conversation("u_del", "c_del").unwrap();
+
+        let convs = db.get_conversations("u_del").unwrap();
+        assert!(convs.is_empty());
+    }
+
+    #[test]
+    fn test_clear_conversations() {
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        for i in 0..3 {
+            let conv = DbConversation {
+                id: None,
+                user_pubkey: "u_clear".to_string(),
+                contact_pubkey: format!("c_{}", i),
+                contact_name: None,
+                last_message_event_id: format!("ev_{}", i),
+                last_timestamp: 100 + i,
+                message_count: 1,
+                cached_at: now,
+            };
+            db.save_conversation(&conv).unwrap();
+        }
+
+        db.clear_conversations("u_clear").unwrap();
+        let convs = db.get_conversations("u_clear").unwrap();
+        assert!(convs.is_empty());
+    }
+
+    // =====================
+    // Attachment CRUD
+    // =====================
+
+    #[test]
+    fn test_save_and_get_attachment() {
+        let (db, _dir) = create_test_db();
+        // First save an email to get an email_id
+        let email = make_email("msg-attach@example.com");
+        let email_id = db.save_email(&email).unwrap();
+
+        let now = Utc::now();
+        let attachment = Attachment {
+            id: None,
+            email_id,
+            filename: "document.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            data: "base64encodeddata".to_string(),
+            size: 1024,
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+            created_at: now,
+        };
+
+        let att_id = db.save_attachment(&attachment).unwrap();
+        assert!(att_id > 0);
+
+        let attachments = db.get_attachments_for_email(email_id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "document.pdf");
+        assert_eq!(attachments[0].size, 1024);
+    }
+
+    #[test]
+    fn test_delete_attachment() {
+        let (db, _dir) = create_test_db();
+        let email = make_email("msg-att-del@example.com");
+        let email_id = db.save_email(&email).unwrap();
+
+        let now = Utc::now();
+        let attachment = Attachment {
+            id: None,
+            email_id,
+            filename: "temp.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            data: "dGVzdA==".to_string(),
+            size: 4,
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+            created_at: now,
+        };
+        let att_id = db.save_attachment(&attachment).unwrap();
+
+        db.delete_attachment(att_id).unwrap();
+        let attachments = db.get_attachments_for_email(email_id).unwrap();
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn test_delete_attachments_for_email() {
+        let (db, _dir) = create_test_db();
+        let email = make_email("msg-att-delall@example.com");
+        let email_id = db.save_email(&email).unwrap();
+
+        let now = Utc::now();
+        for i in 0..3 {
+            let attachment = Attachment {
+                id: None,
+                email_id,
+                filename: format!("file{}.txt", i),
+                content_type: "text/plain".to_string(),
+                data: "data".to_string(),
+                size: 4,
+                is_encrypted: false,
+                encryption_method: None,
+                algorithm: None,
+                original_filename: None,
+                original_type: None,
+                original_size: None,
+                created_at: now,
+            };
+            db.save_attachment(&attachment).unwrap();
+        }
+
+        assert_eq!(db.get_attachments_for_email(email_id).unwrap().len(), 3);
+        db.delete_attachments_for_email(email_id).unwrap();
+        assert!(db.get_attachments_for_email(email_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_attachment_strips_original_metadata() {
+        // The save_attachment method should strip original_filename/original_type/original_size
+        // for security reasons
+        let (db, _dir) = create_test_db();
+        let email = make_email("msg-att-meta@example.com");
+        let email_id = db.save_email(&email).unwrap();
+
+        let now = Utc::now();
+        let attachment = Attachment {
+            id: None,
+            email_id,
+            filename: "encrypted.enc".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            data: "encrypted_data".to_string(),
+            size: 100,
+            is_encrypted: true,
+            encryption_method: Some("aes-256-gcm".to_string()),
+            algorithm: Some("nip44".to_string()),
+            original_filename: Some("secret.doc".to_string()), // should be stripped
+            original_type: Some("application/msword".to_string()), // should be stripped
+            original_size: Some(50), // should be stripped
+            created_at: now,
+        };
+        let att_id = db.save_attachment(&attachment).unwrap();
+
+        let retrieved = db.get_attachment(att_id).unwrap().unwrap();
+        // Security: original metadata should NOT be stored
+        assert!(retrieved.original_filename.is_none());
+        assert!(retrieved.original_type.is_none());
+        assert!(retrieved.original_size.is_none());
+    }
+
+    // =====================
+    // Utility operations
+    // =====================
+
+    #[test]
+    fn test_clear_all_data() {
+        let (db, _dir) = create_test_db();
+        db.save_contact(&make_contact("pk_clear")).unwrap();
+        db.save_email(&make_email("msg-clear@example.com")).unwrap();
+        db.save_setting("pk_clear", "key", "val").unwrap();
+
+        db.clear_all_data().unwrap();
+
+        assert!(db.get_contact("pk_clear").unwrap().is_none());
+        assert!(db.get_email("msg-clear@example.com").unwrap().is_none());
+        assert!(db.get_all_settings("pk_clear").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_compute_content_hash_deterministic() {
+        let hash1 = Database::compute_content_hash("hello world");
+        let hash2 = Database::compute_content_hash("hello world");
+        assert_eq!(hash1, hash2);
+
+        let hash3 = Database::compute_content_hash("different content");
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_normalize_message_id() {
+        assert_eq!(Database::normalize_message_id("<abc@example.com>"), "abc@example.com");
+        assert_eq!(Database::normalize_message_id("abc@example.com"), "abc@example.com");
+        assert_eq!(Database::normalize_message_id("  <abc@example.com>  "), "abc@example.com");
+    }
+
+    #[test]
+    fn test_normalize_gmail_address() {
+        assert_eq!(Database::normalize_gmail_address("user@gmail.com"), "user@gmail.com");
+        assert_eq!(Database::normalize_gmail_address("user+alias@gmail.com"), "user@gmail.com");
+        assert_eq!(Database::normalize_gmail_address("u.s.e.r@gmail.com"), "user@gmail.com");
+        assert_eq!(Database::normalize_gmail_address("u.s.e.r+tag@gmail.com"), "user@gmail.com");
+        // Non-Gmail should be lowered but not modified
+        assert_eq!(Database::normalize_gmail_address("User@example.com"), "user@example.com");
+    }
+
+    #[test]
+    fn test_find_pubkeys_by_email() {
+        let (db, _dir) = create_test_db();
+        let mut contact = make_contact("pk_email_search");
+        contact.email = Some("findme@example.com".to_string());
+        db.save_contact(&contact).unwrap();
+
+        let pubkeys = db.find_pubkeys_by_email("findme@example.com").unwrap();
+        assert_eq!(pubkeys.len(), 1);
+        assert_eq!(pubkeys[0], "pk_email_search");
+
+        let empty = db.find_pubkeys_by_email("nope@example.com").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_find_pubkeys_by_email_setting() {
+        let (db, _dir) = create_test_db();
+        db.save_setting("pk_setting_search", "email_address", "mysetting@example.com").unwrap();
+
+        let pubkeys = db.find_pubkeys_by_email_setting("mysetting@example.com").unwrap();
+        assert_eq!(pubkeys.len(), 1);
+        assert_eq!(pubkeys[0], "pk_setting_search");
+    }
+
+    #[test]
+    fn test_get_database_size() {
+        let (db, _dir) = create_test_db();
+        let size = db.get_database_size().unwrap();
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn test_update_conversation_from_messages() {
+        let (db, _dir) = create_test_db();
+        db.save_dm(&make_dm("ev_conv_1", "alice", "bob")).unwrap();
+        db.save_dm(&make_dm("ev_conv_2", "bob", "alice")).unwrap();
+
+        // After saving DMs, conversations should be auto-updated
+        let convs_alice = db.get_conversations("alice").unwrap();
+        assert!(!convs_alice.is_empty());
+        assert_eq!(convs_alice[0].message_count, 2);
+    }
+
+    #[test]
+    fn test_save_and_get_drafts() {
+        let (db, _dir) = create_test_db();
+        let mut draft = make_email("draft-001@example.com");
+        draft.is_draft = true;
+        draft.from_address = "me@example.com".to_string();
+
+        let id = db.save_draft(&draft).unwrap();
+        assert!(id > 0);
+
+        let drafts = db.get_drafts(None, None, Some("me@example.com")).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert!(drafts[0].is_draft);
+        assert_eq!(drafts[0].from_address, "me@example.com");
+    }
+
+    #[test]
+    fn test_get_drafts_empty() {
+        let (db, _dir) = create_test_db();
+        let drafts = db.get_drafts(None, None, None).unwrap();
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn test_save_draft_update() {
+        let (db, _dir) = create_test_db();
+        let mut draft = make_email("draft-update@example.com");
+        draft.is_draft = true;
+        draft.from_address = "me@example.com".to_string();
+        let id = db.save_draft(&draft).unwrap();
+
+        // Update via save_draft with id
+        let mut updated = make_email("draft-update@example.com");
+        updated.id = Some(id);
+        updated.is_draft = true;
+        updated.subject = "Updated Draft Subject".to_string();
+        updated.from_address = "me@example.com".to_string();
+        db.save_draft(&updated).unwrap();
+
+        let drafts = db.get_drafts(None, None, Some("me@example.com")).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].subject, "Updated Draft Subject");
+    }
+
+    #[test]
+    fn test_update_signature_valid() {
+        let (db, _dir) = create_test_db();
+        let email = make_email("msg-sig@example.com");
+        db.save_email(&email).unwrap();
+
+        db.update_signature_valid("msg-sig@example.com", Some(true)).unwrap();
+        let retrieved = db.get_email("msg-sig@example.com").unwrap().unwrap();
+        assert_eq!(retrieved.signature_valid, Some(true));
+
+        db.update_signature_valid("msg-sig@example.com", Some(false)).unwrap();
+        let retrieved = db.get_email("msg-sig@example.com").unwrap().unwrap();
+        assert_eq!(retrieved.signature_valid, Some(false));
+    }
+
+    #[test]
+    fn test_get_all_dm_pubkeys() {
+        let (db, _dir) = create_test_db();
+        db.save_dm(&make_dm("ev_pk1", "alice", "bob")).unwrap();
+        db.save_dm(&make_dm("ev_pk2", "carol", "alice")).unwrap();
+
+        let pubkeys = db.get_all_dm_pubkeys().unwrap();
+        assert!(pubkeys.contains(&"alice".to_string()));
+        assert!(pubkeys.contains(&"bob".to_string()));
+        assert!(pubkeys.contains(&"carol".to_string()));
+        assert_eq!(pubkeys.len(), 3);
+    }
+
+    #[test]
+    fn test_update_email_pubkeys() {
+        let (db, _dir) = create_test_db();
+        let email = make_email("msg-pubkey-update@example.com");
+        let id = db.save_email(&email).unwrap();
+
+        db.update_email_sender_pubkey("msg-pubkey-update@example.com", "new_sender_pk").unwrap();
+        db.update_email_recipient_pubkey("msg-pubkey-update@example.com", "new_recipient_pk").unwrap();
+
+        let retrieved = db.get_email("msg-pubkey-update@example.com").unwrap().unwrap();
+        assert_eq!(retrieved.sender_pubkey, Some("new_sender_pk".to_string()));
+        assert_eq!(retrieved.recipient_pubkey, Some("new_recipient_pk".to_string()));
+
+        // Also test by_id variants
+        db.update_email_sender_pubkey_by_id(id, "id_sender_pk").unwrap();
+        db.update_email_recipient_pubkey_by_id(id, "id_recipient_pk").unwrap();
+        let retrieved = db.get_email("msg-pubkey-update@example.com").unwrap().unwrap();
+        assert_eq!(retrieved.sender_pubkey, Some("id_sender_pk".to_string()));
+        assert_eq!(retrieved.recipient_pubkey, Some("id_recipient_pk".to_string()));
+    }
+}

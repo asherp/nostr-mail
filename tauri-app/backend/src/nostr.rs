@@ -1018,10 +1018,189 @@ pub async fn fetch_conversation_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_nip05_validation_format() {
         // This is a placeholder test since we're not actually making HTTP requests
         assert!(validate_nip05("test", "user@domain.com").await.is_ok());
     }
-} 
+
+    // =====================
+    // parse_pubkey (private, tested indirectly)
+    // =====================
+
+    #[test]
+    fn test_parse_pubkey_with_npub() {
+        // Generate a keypair to get a valid npub
+        let keys = Keys::generate();
+        let npub = keys.public_key().to_bech32().unwrap();
+
+        let result = parse_pubkey(&npub);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), keys.public_key());
+    }
+
+    #[test]
+    fn test_parse_pubkey_with_hex() {
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+
+        let result = parse_pubkey(&hex);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), keys.public_key());
+    }
+
+    #[test]
+    fn test_parse_pubkey_invalid_format() {
+        let result = parse_pubkey("not-a-valid-key");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Unknown pubkey format"));
+    }
+
+    #[test]
+    fn test_parse_pubkey_empty_string() {
+        let result = parse_pubkey("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_pubkey_short_hex() {
+        // 63 hex chars instead of 64
+        let result = parse_pubkey("abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456789");
+        assert!(result.is_err());
+    }
+
+    // =====================
+    // create_auth_event
+    // =====================
+
+    #[test]
+    fn test_create_auth_event_basic() {
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+
+        let result = create_auth_event(&nsec, "wss://relay.example.com", "challenge123");
+        assert!(result.is_ok());
+
+        let event = result.unwrap();
+        assert_eq!(event.kind, Kind::from(22242u16));
+        assert!(event.content.is_empty()); // AUTH events have empty content
+    }
+
+    #[test]
+    fn test_create_auth_event_tags() {
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+
+        let event = create_auth_event(&nsec, "wss://relay.example.com", "test_challenge").unwrap();
+
+        // Verify the tags contain relay and challenge
+        let tags_vec: Vec<Vec<String>> = event.tags.iter().map(|t| t.clone().to_vec()).collect();
+
+        let has_relay_tag = tags_vec.iter().any(|t| t.len() >= 2 && t[0] == "relay" && t[1] == "wss://relay.example.com");
+        let has_challenge_tag = tags_vec.iter().any(|t| t.len() >= 2 && t[0] == "challenge" && t[1] == "test_challenge");
+
+        assert!(has_relay_tag, "Event should have relay tag");
+        assert!(has_challenge_tag, "Event should have challenge tag");
+    }
+
+    #[test]
+    fn test_create_auth_event_normalizes_relay_url() {
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+
+        // URL with trailing slash should be normalized
+        let event = create_auth_event(&nsec, "wss://relay.example.com/", "ch").unwrap();
+
+        let tags_vec: Vec<Vec<String>> = event.tags.iter().map(|t| t.clone().to_vec()).collect();
+        let relay_tag = tags_vec.iter().find(|t| t.len() >= 2 && t[0] == "relay").unwrap();
+        assert_eq!(relay_tag[1], "wss://relay.example.com"); // no trailing slash
+    }
+
+    #[test]
+    fn test_create_auth_event_signed_by_correct_key() {
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+
+        let event = create_auth_event(&nsec, "wss://relay.example.com", "ch").unwrap();
+        assert_eq!(event.pubkey, keys.public_key());
+    }
+
+    #[test]
+    fn test_create_auth_event_invalid_key() {
+        let result = create_auth_event("nsec1invalid", "wss://relay.example.com", "ch");
+        assert!(result.is_err());
+    }
+
+    // =====================
+    // parse_profile_from_event
+    // =====================
+
+    #[test]
+    fn test_parse_profile_from_event_valid() {
+        let event = NostrEvent {
+            id: "abc123".to_string(),
+            pubkey: "npub1test".to_string(),
+            created_at: 1700000000,
+            kind: 0,
+            tags: vec![],
+            content: r#"{"name":"Alice","about":"Hello","picture":"https://img.example.com/pic.jpg"}"#.to_string(),
+            sig: "sig".to_string(),
+        };
+
+        let profile = parse_profile_from_event(&event).unwrap();
+        assert_eq!(profile.pubkey, "npub1test");
+        assert_eq!(profile.fields.get("name").unwrap().as_str().unwrap(), "Alice");
+        assert_eq!(profile.fields.get("about").unwrap().as_str().unwrap(), "Hello");
+    }
+
+    #[test]
+    fn test_parse_profile_from_event_wrong_kind() {
+        let event = NostrEvent {
+            id: "abc".to_string(),
+            pubkey: "npub1test".to_string(),
+            created_at: 1700000000,
+            kind: 1, // text note, not profile
+            tags: vec![],
+            content: r#"{"name":"Alice"}"#.to_string(),
+            sig: "sig".to_string(),
+        };
+
+        let result = parse_profile_from_event(&event);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not a profile event"));
+    }
+
+    #[test]
+    fn test_parse_profile_from_event_empty_content() {
+        let event = NostrEvent {
+            id: "abc".to_string(),
+            pubkey: "npub1test".to_string(),
+            created_at: 1700000000,
+            kind: 0,
+            tags: vec![],
+            content: "{}".to_string(),
+            sig: "sig".to_string(),
+        };
+
+        let profile = parse_profile_from_event(&event).unwrap();
+        assert!(profile.fields.is_empty());
+    }
+
+    #[test]
+    fn test_parse_profile_from_event_invalid_json() {
+        let event = NostrEvent {
+            id: "abc".to_string(),
+            pubkey: "npub1test".to_string(),
+            created_at: 1700000000,
+            kind: 0,
+            tags: vec![],
+            content: "not json".to_string(),
+            sig: "sig".to_string(),
+        };
+
+        let result = parse_profile_from_event(&event);
+        assert!(result.is_err());
+    }
+}

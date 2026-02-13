@@ -442,4 +442,253 @@ impl AppState {
         
         Ok(())
     }
-} 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Helper: point NOSTR_MAIL_CONFIG at a minimal config file inside a temp dir
+    /// and return the temp dir (keep alive for test lifetime).
+    fn setup_test_env() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let config_path = dir.path().join("test-config.json");
+        let mut f = std::fs::File::create(&config_path).unwrap();
+        writeln!(f, r#"{{"relays":[]}}"#).unwrap();
+        std::env::set_var("NOSTR_MAIL_CONFIG", config_path.to_str().unwrap());
+        dir
+    }
+
+    // =====================
+    // AppState::new
+    // =====================
+
+    #[test]
+    fn test_appstate_new_initial_state() {
+        let state = AppState::new();
+
+        // Relays should be empty
+        let relays = state.relays.lock().unwrap();
+        assert!(relays.is_empty());
+
+        // Image cache should be empty
+        let cache = state.image_cache.lock().unwrap();
+        assert!(cache.is_empty());
+
+        // Database should be None
+        let db = state.database.lock().unwrap();
+        assert!(db.is_none());
+
+        // Nostr client should be None
+        let client = state.nostr_client.lock().unwrap();
+        assert!(client.is_none());
+
+        // Current keys should be None
+        let keys = state.current_keys.lock().unwrap();
+        assert!(keys.is_none());
+
+        // Failed relays should be empty
+        let failed = state.failed_relays.lock().unwrap();
+        assert!(failed.is_empty());
+
+        // Relay auth status should be empty
+        let auth = state.relay_auth_status.lock().unwrap();
+        assert!(auth.is_empty());
+
+        // Pending auth challenges should be empty
+        let pending = state.pending_auth_challenges.lock().unwrap();
+        assert!(pending.is_empty());
+
+        // Current private key should be None
+        let pk = state.current_private_key.lock().unwrap();
+        assert!(pk.is_none());
+    }
+
+    // =====================
+    // AppState::get_current_keys
+    // =====================
+
+    #[test]
+    fn test_get_current_keys_none_initially() {
+        let state = AppState::new();
+        assert!(state.get_current_keys().is_none());
+    }
+
+    #[test]
+    fn test_get_current_keys_after_set() {
+        let state = AppState::new();
+        let keys = nostr_sdk::prelude::Keys::generate();
+        *state.current_keys.lock().unwrap() = Some(keys.clone());
+
+        let retrieved = state.get_current_keys();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().public_key(), keys.public_key());
+    }
+
+    // =====================
+    // AppState::get_database
+    // =====================
+
+    #[test]
+    fn test_get_database_before_init() {
+        let state = AppState::new();
+        let result = state.get_database();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Database not initialized");
+    }
+
+    // =====================
+    // AppState::init_database
+    // =====================
+
+    #[test]
+    fn test_init_database_success() {
+        let dir = setup_test_env();
+        let state = AppState::new();
+        let db_path = dir.path().join("state_test.db");
+
+        let result = state.init_database(&db_path);
+        assert!(result.is_ok());
+
+        // Database should now be accessible
+        let db_result = state.get_database();
+        assert!(db_result.is_ok());
+    }
+
+    #[test]
+    fn test_init_database_then_get() {
+        let dir = setup_test_env();
+        let state = AppState::new();
+        let db_path = dir.path().join("state_test2.db");
+
+        state.init_database(&db_path).unwrap();
+        let db = state.get_database().unwrap();
+
+        // Verify the database is functional
+        let relays = db.get_all_relays().unwrap();
+        assert!(relays.is_empty()); // empty config -> no seeded relays
+    }
+
+    #[test]
+    fn test_init_database_can_be_called_twice() {
+        let dir = setup_test_env();
+        let state = AppState::new();
+        let db_path = dir.path().join("state_test3.db");
+
+        state.init_database(&db_path).unwrap();
+        // Calling again should succeed (reinitializes)
+        state.init_database(&db_path).unwrap();
+
+        let db = state.get_database();
+        assert!(db.is_ok());
+    }
+
+    // =====================
+    // AppState relay/failed_relays state
+    // =====================
+
+    #[test]
+    fn test_relay_state_manipulation() {
+        let state = AppState::new();
+
+        // Add relays to in-memory state
+        {
+            let mut relays = state.relays.lock().unwrap();
+            relays.push(Relay {
+                url: "wss://relay1.example.com".to_string(),
+                is_active: true,
+            });
+            relays.push(Relay {
+                url: "wss://relay2.example.com".to_string(),
+                is_active: false,
+            });
+        }
+
+        let relays = state.relays.lock().unwrap();
+        assert_eq!(relays.len(), 2);
+        assert!(relays[0].is_active);
+        assert!(!relays[1].is_active);
+    }
+
+    #[test]
+    fn test_failed_relays_tracking() {
+        let state = AppState::new();
+
+        {
+            let mut failed = state.failed_relays.lock().unwrap();
+            failed.insert("wss://bad-relay.example.com".to_string(), "Connection refused".to_string());
+        }
+
+        let failed = state.failed_relays.lock().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed.get("wss://bad-relay.example.com").unwrap(),
+            "Connection refused"
+        );
+    }
+
+    #[test]
+    fn test_relay_auth_status_tracking() {
+        let state = AppState::new();
+
+        {
+            let mut auth = state.relay_auth_status.lock().unwrap();
+            auth.insert("wss://authed.example.com".to_string(), true);
+            auth.insert("wss://unauthed.example.com".to_string(), false);
+        }
+
+        let auth = state.relay_auth_status.lock().unwrap();
+        assert_eq!(*auth.get("wss://authed.example.com").unwrap(), true);
+        assert_eq!(*auth.get("wss://unauthed.example.com").unwrap(), false);
+    }
+
+    #[test]
+    fn test_pending_auth_challenges() {
+        let state = AppState::new();
+
+        {
+            let mut pending = state.pending_auth_challenges.lock().unwrap();
+            pending.insert("wss://relay.example.com".to_string(), "challenge_abc".to_string());
+        }
+
+        let pending = state.pending_auth_challenges.lock().unwrap();
+        assert_eq!(
+            pending.get("wss://relay.example.com").unwrap(),
+            "challenge_abc"
+        );
+    }
+
+    #[test]
+    fn test_current_private_key_storage() {
+        let state = AppState::new();
+
+        // Initially None
+        assert!(state.current_private_key.lock().unwrap().is_none());
+
+        // Set a value
+        *state.current_private_key.lock().unwrap() = Some("nsec1testkey".to_string());
+        assert_eq!(
+            state.current_private_key.lock().unwrap().as_deref(),
+            Some("nsec1testkey")
+        );
+    }
+
+    #[test]
+    fn test_image_cache() {
+        let state = AppState::new();
+
+        {
+            let mut cache = state.image_cache.lock().unwrap();
+            cache.insert("pubkey123".to_string(), CachedImage {
+                data_url: "data:image/png;base64,abc".to_string(),
+                timestamp: 1700000000,
+            });
+        }
+
+        let cache = state.image_cache.lock().unwrap();
+        let cached = cache.get("pubkey123").unwrap();
+        assert_eq!(cached.data_url, "data:image/png;base64,abc");
+        assert_eq!(cached.timestamp, 1700000000);
+    }
+}

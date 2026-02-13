@@ -28,8 +28,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Checkout submodules
+        env:
+          GLOSSIA_DEPLOY_KEY: ${{ secrets.GLOSSIA_DEPLOY_KEY }}
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          echo "$GLOSSIA_DEPLOY_KEY" > ~/.ssh/glossia_key
+          chmod 600 ~/.ssh/glossia_key
+          printf "Host github.com\n  IdentityFile ~/.ssh/glossia_key\n  StrictHostKeyChecking no\n" > ~/.ssh/config
+          git submodule update --init --recursive
+          rm -f ~/.ssh/glossia_key
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable

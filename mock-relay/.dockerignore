@@ -1,0 +1,9 @@
+target/
+examples/
+test_connection.rs
+*.log
+relay.log
+events.json
+.git
+.gitignore
+README.md

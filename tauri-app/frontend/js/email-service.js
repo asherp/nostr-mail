@@ -1623,7 +1623,12 @@ class EmailService {
 
     async syncInboxEmails() {
         try {
-            const newCount = await TauriService.syncNostrEmails();
+            // Get selected folder from dropdown
+            const folderSelect = document.getElementById('imap-folder-select');
+            const selectedFolder = folderSelect && folderSelect.value ? folderSelect.value : null;
+            console.log(`[JS] Syncing inbox emails from folder: ${selectedFolder || 'All Folders'}`);
+            
+            const newCount = await TauriService.syncNostrEmails(selectedFolder);
             console.log(`[JS] Synced ${newCount} new inbox emails from network`);
             return newCount;
         } catch (error) {
@@ -1639,7 +1644,16 @@ class EmailService {
             return newCount;
         } catch (error) {
             console.error('[JS] Error in syncSentEmails:', error);
-            throw error;
+            console.error('[JS] Error details:', {
+                message: error?.message,
+                toString: error?.toString(),
+                string: String(error),
+                type: typeof error,
+                error: error
+            });
+            // Ensure we throw an Error object with a proper message
+            const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
+            throw new Error(errorMessage);
         }
     }
 
@@ -3693,6 +3707,117 @@ ${attachmentsHtml}
             domManager.enable('testEmailConnectionBtn');
             domManager.setHTML('testEmailConnectionBtn', '<i class="fas fa-envelope"></i> Test Email Connection');
         }
+    }
+
+    // List IMAP folders
+    async listImapFolders() {
+        console.log('[EMAIL-SERVICE] listImapFolders called');
+        if (!appState.hasSettings()) {
+            notificationService.showError('Please save your settings first');
+            return;
+        }
+        
+        // Validate that required settings are present
+        const settings = appState.getSettings();
+        console.log('[EMAIL-SERVICE] Settings:', { 
+            hasEmail: !!settings.email_address, 
+            hasPassword: !!settings.password, 
+            hasImapHost: !!settings.imap_host 
+        });
+        
+        if (!settings.email_address || !settings.email_address.trim()) {
+            notificationService.showError('Email address is required.');
+            return;
+        }
+        
+        if (!settings.password || !settings.password.trim()) {
+            notificationService.showError('Password is required.');
+            return;
+        }
+        
+        if (!settings.imap_host || !settings.imap_host.trim()) {
+            notificationService.showError('IMAP host is required.');
+            return;
+        }
+        
+        try {
+            const selectElement = document.getElementById('imap-folder-select');
+            console.log('[EMAIL-SERVICE] Elements found:', { 
+                selectElement: !!selectElement
+            });
+            
+            if (selectElement) {
+                selectElement.disabled = true;
+                selectElement.innerHTML = '<option disabled>Loading folders...</option>';
+            }
+            
+            const emailConfig = {
+                email_address: settings.email_address,
+                password: settings.password,
+                smtp_host: settings.smtp_host || '',
+                smtp_port: settings.smtp_port || 587,
+                imap_host: settings.imap_host,
+                imap_port: settings.imap_port || 993,
+                use_tls: settings.use_tls !== false,
+            };
+            
+            console.log('[JS] Listing IMAP folders with config:', {
+                imap_host: emailConfig.imap_host,
+                imap_port: emailConfig.imap_port,
+                use_tls: emailConfig.use_tls,
+                email: emailConfig.email_address
+            });
+            
+            const folders = await TauriService.listImapFolders(emailConfig);
+            
+            if (selectElement) {
+                selectElement.innerHTML = '';
+                if (folders && folders.length > 0) {
+                    // Add a default "All Folders" option
+                    const allOption = document.createElement('option');
+                    allOption.value = '';
+                    allOption.textContent = 'All Folders';
+                    selectElement.appendChild(allOption);
+                    
+                    // Filter out "Sent" folder (case-insensitive)
+                    const filteredFolders = folders.filter(folder => 
+                        folder.toLowerCase() !== 'sent'
+                    );
+                    
+                    filteredFolders.forEach(folder => {
+                        const option = document.createElement('option');
+                        option.value = folder;
+                        option.textContent = folder;
+                        selectElement.appendChild(option);
+                    });
+                    selectElement.disabled = false;
+                } else {
+                    const option = document.createElement('option');
+                    option.disabled = true;
+                    option.textContent = 'No folders found';
+                    selectElement.appendChild(option);
+                }
+            }
+            
+            console.log(`[EMAIL-SERVICE] Loaded ${folders?.length || 0} folders`);
+            
+        } catch (error) {
+            console.error('Failed to list IMAP folders:', error);
+            notificationService.showError('Failed to list IMAP folders: ' + error);
+            
+            const selectElement = document.getElementById('imap-folder-select');
+            if (selectElement) {
+                selectElement.disabled = true;
+                selectElement.innerHTML = '<option disabled>Failed to load folders</option>';
+            }
+        }
+    }
+
+    getSelectedFolder() {
+        const selectElement = document.getElementById('imap-folder-select');
+        if (!selectElement) return null;
+        
+        return selectElement.value || null;
     }
 
     // Handle email provider selection

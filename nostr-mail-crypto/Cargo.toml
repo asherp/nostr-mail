@@ -1,0 +1,31 @@
+[package]
+name = "nostr-mail-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly crypto library for nostr-mail: client-side NIP-04/NIP-44 encryption, Schnorr signatures, and key management"
+authors = ["Asher Pembroke"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-wasm-bindgen = "0.6"
+nostr = { version = "0.42", default-features = false, features = ["std", "nip04", "nip44"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+getrandom = { version = "0.2", features = ["js"] }
+console_error_panic_hook = "0.1"
+secp256k1 = { version = "0.28", features = ["rand", "global-context"] }
+js-sys = "0.3"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true

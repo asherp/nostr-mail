@@ -1,0 +1,4 @@
+[submodule "glossia"]
+	path = glossia
+	url = git@github.com:asherp/glossia.git
+	branch = nostr-mail-integration

@@ -92,6 +92,9 @@ const TauriService = {
     getPublicKeyFromPrivate: async function(privateKey) {
         return await this.invoke('get_public_key_from_private', { privateKey });
     },
+    getDefaultPrivateKeyFromConfig: async function() {
+        return await this.invoke('get_default_private_key_from_config');
+    },
     signData: async function(privateKey, data) {
         return await this.invoke('sign_data', { privateKey, data });
     },
@@ -227,6 +230,9 @@ const TauriService = {
     testSmtpConnection: async function(emailConfig) {
         return await this.invoke('test_smtp_connection', { emailConfig });
     },
+    listImapFolders: async function(emailConfig) {
+        return await this.invoke('list_imap_folders', { emailConfig });
+    },
     fetchImage: async function(url) {
         return await this.invoke('fetch_image', { url });
     },
@@ -320,13 +326,19 @@ const TauriService = {
     initDatabase: async function() {
         return await this.invoke('init_database');
     },
-    syncNostrEmails: async function() {
+    syncNostrEmails: async function(folder = null) {
         const settings = window.appState?.getSettings();
         const keypair = window.appState?.getKeypair();
         
         if (!settings || !keypair) {
             throw new Error('Settings or keypair not available');
         }
+        
+        // Ensure use_tls is explicitly set - default to true if not set
+        // Most modern email servers require TLS, and the backend enforces it
+        const useTls = settings.use_tls !== undefined && settings.use_tls !== null 
+            ? settings.use_tls 
+            : true; // Default to true for security
         
         const emailConfig = {
             email_address: settings.email_address,
@@ -335,11 +347,11 @@ const TauriService = {
             smtp_port: settings.smtp_port,
             imap_host: settings.imap_host,
             imap_port: settings.imap_port,
-            use_tls: settings.use_tls,
+            use_tls: useTls,
             private_key: keypair.private_key
         };
         
-        return await this.invoke('sync_nostr_emails', { config: emailConfig });
+        return await this.invoke('sync_nostr_emails', { config: emailConfig, folder });
     },
 
     syncSentEmails: async function() {

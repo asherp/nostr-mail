@@ -1,0 +1,9 @@
+target/
+tests/
+*.log
+email.log
+emails.json
+.git
+.gitignore
+README.md
+CONNECTING.md

@@ -1,0 +1,1129 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nostr-mail - Encrypted Email with Nostr Keys</title>
+  <meta name="description" content="A modern, cross-platform email encryption tool that bridges Nostr and email protocols. End-to-end encrypted email using secp256k1 key pairs.">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <style>
+    /* ===== CSS Custom Properties ===== */
+    :root {
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      --font-mono: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+      --radius: 12px;
+      --radius-sm: 8px;
+      --transition: 0.3s ease;
+      --max-width: 1200px;
+      --gradient-primary: linear-gradient(135deg, #7c3aed, #3b82f6);
+      --gradient-hero: linear-gradient(135deg, #7c3aed 0%, #6d28d9 25%, #4f46e5 50%, #3b82f6 75%, #2563eb 100%);
+      --gradient-card: linear-gradient(135deg, rgba(124,58,237,0.08), rgba(59,130,246,0.08));
+    }
+
+    /* Dark theme (default) */
+    [data-theme="dark"] {
+      --bg-primary: #0f0f1a;
+      --bg-secondary: #1a1a2e;
+      --bg-card: #1e1e32;
+      --bg-card-hover: #252542;
+      --text-primary: #f0f0f5;
+      --text-secondary: #a0a0b8;
+      --text-muted: #6b6b85;
+      --border-color: #2d2d48;
+      --border-hover: #4a4a6a;
+      --accent-purple: #a78bfa;
+      --accent-blue: #60a5fa;
+      --table-row-alt: #16162a;
+      --hero-overlay: rgba(15, 15, 26, 0.6);
+      --shadow-card: 0 4px 24px rgba(0,0,0,0.3);
+      --shadow-card-hover: 0 8px 40px rgba(124,58,237,0.15);
+      --logo-url: url('assets/nostr-mail-logo-white.png');
+    }
+
+    /* Light theme */
+    [data-theme="light"] {
+      --bg-primary: #f8f9fc;
+      --bg-secondary: #ffffff;
+      --bg-card: #ffffff;
+      --bg-card-hover: #f3f0ff;
+      --text-primary: #1a1a2e;
+      --text-secondary: #4a4a6a;
+      --text-muted: #8888a0;
+      --border-color: #e0e0ee;
+      --border-hover: #c0c0d8;
+      --accent-purple: #7c3aed;
+      --accent-blue: #3b82f6;
+      --table-row-alt: #f3f0ff;
+      --hero-overlay: rgba(248, 249, 252, 0.65);
+      --shadow-card: 0 4px 24px rgba(0,0,0,0.06);
+      --shadow-card-hover: 0 8px 40px rgba(124,58,237,0.1);
+      --logo-url: url('assets/nostr-mail-logo.png');
+    }
+
+    /* ===== Reset & Base ===== */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html {
+      scroll-behavior: smooth;
+      font-size: 16px;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.7;
+      overflow-x: hidden;
+      transition: background var(--transition), color var(--transition);
+    }
+
+    a { color: var(--accent-purple); text-decoration: none; transition: color var(--transition); }
+    a:hover { color: var(--accent-blue); }
+
+    img { max-width: 100%; height: auto; }
+
+    .container {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ===== Utility ===== */
+    .gradient-text {
+      background: var(--gradient-primary);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    /* ===== Navbar ===== */
+    .navbar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 1000;
+      padding: 16px 0;
+      background: transparent;
+      transition: background var(--transition), box-shadow var(--transition), padding var(--transition);
+    }
+
+    .navbar.scrolled {
+      background: var(--bg-secondary);
+      box-shadow: 0 2px 20px rgba(0,0,0,0.15);
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .navbar .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .navbar-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .navbar-brand img {
+      height: 36px;
+      width: auto;
+    }
+
+    .navbar-links {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      list-style: none;
+    }
+
+    .navbar-links a {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: color var(--transition);
+    }
+
+    .navbar-links a:hover { color: var(--text-primary); }
+
+    .theme-toggle {
+      background: none;
+      border: 1px solid var(--border-color);
+      color: var(--text-secondary);
+      cursor: pointer;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+      transition: all var(--transition);
+    }
+
+    .theme-toggle:hover {
+      border-color: var(--accent-purple);
+      color: var(--accent-purple);
+    }
+
+    .mobile-menu-btn {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--text-primary);
+      font-size: 1.4rem;
+      cursor: pointer;
+      padding: 8px;
+    }
+
+    /* ===== Hero ===== */
+    .hero {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      position: relative;
+      overflow: hidden;
+      padding-top: 80px;
+    }
+
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: -50%;
+      left: -50%;
+      width: 200%;
+      height: 200%;
+      background: radial-gradient(ellipse at 30% 50%, rgba(124,58,237,0.12) 0%, transparent 50%),
+                  radial-gradient(ellipse at 70% 50%, rgba(59,130,246,0.1) 0%, transparent 50%);
+      animation: heroGlow 12s ease-in-out infinite alternate;
+    }
+
+    @keyframes heroGlow {
+      0% { transform: translate(0, 0) scale(1); }
+      100% { transform: translate(-3%, 3%) scale(1.05); }
+    }
+
+    .hero .container {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      gap: 60px;
+    }
+
+    .hero-content {
+      flex: 1;
+      max-width: 640px;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 16px;
+      background: var(--gradient-card);
+      border: 1px solid var(--border-color);
+      border-radius: 100px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--accent-purple);
+      margin-bottom: 24px;
+    }
+
+    .hero-badge i { font-size: 0.7rem; }
+
+    .hero h1 {
+      font-size: clamp(2.4rem, 5vw, 3.6rem);
+      font-weight: 800;
+      line-height: 1.15;
+      margin-bottom: 20px;
+      letter-spacing: -0.02em;
+    }
+
+    .hero p {
+      font-size: 1.15rem;
+      color: var(--text-secondary);
+      margin-bottom: 36px;
+      max-width: 520px;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 28px;
+      border-radius: var(--radius-sm);
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all var(--transition);
+      text-decoration: none;
+    }
+
+    .btn-primary {
+      background: var(--gradient-primary);
+      color: #fff;
+      box-shadow: 0 4px 20px rgba(124,58,237,0.3);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 28px rgba(124,58,237,0.45);
+      color: #fff;
+    }
+
+    .btn-secondary {
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border: 1px solid var(--border-color);
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--accent-purple);
+      transform: translateY(-2px);
+      color: var(--text-primary);
+    }
+
+    .hero-visual {
+      flex: 1;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      max-width: 480px;
+    }
+
+    .hero-logo-img {
+      width: 320px;
+      height: auto;
+      filter: drop-shadow(0 0 60px rgba(124,58,237,0.25));
+    }
+    }
+
+    /* ===== Section Common ===== */
+    .section {
+      padding: 100px 0;
+    }
+
+    .section-header {
+      text-align: center;
+      margin-bottom: 60px;
+    }
+
+    .section-header h2 {
+      font-size: clamp(1.8rem, 3.5vw, 2.6rem);
+      font-weight: 800;
+      margin-bottom: 16px;
+      letter-spacing: -0.02em;
+    }
+
+    .section-header p {
+      font-size: 1.1rem;
+      color: var(--text-secondary);
+      max-width: 600px;
+      margin: 0 auto;
+    }
+
+    /* ===== Features ===== */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 24px;
+    }
+
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius);
+      padding: 32px;
+      transition: all var(--transition);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .feature-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: var(--gradient-primary);
+      opacity: 0;
+      transition: opacity var(--transition);
+    }
+
+    .feature-card:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--border-hover);
+      box-shadow: var(--shadow-card-hover);
+      transform: translateY(-4px);
+    }
+
+    .feature-card:hover::before { opacity: 1; }
+
+    .feature-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: var(--radius-sm);
+      background: var(--gradient-card);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.3rem;
+      margin-bottom: 20px;
+    }
+
+    .feature-icon i {
+      background: var(--gradient-primary);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .feature-card h3 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .feature-card p {
+      color: var(--text-secondary);
+      font-size: 0.92rem;
+      line-height: 1.65;
+    }
+
+    /* ===== How It Works ===== */
+    .how-it-works {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border-color);
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .steps {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 40px;
+      position: relative;
+    }
+
+    .steps .step {
+      flex: 0 1 280px;
+    }
+
+    .step {
+      text-align: center;
+      position: relative;
+    }
+
+    .step-number {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      background: var(--gradient-primary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.5rem;
+      font-weight: 800;
+      color: #fff;
+      margin: 0 auto 20px;
+      box-shadow: 0 4px 20px rgba(124,58,237,0.3);
+    }
+
+    .step h3 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .step p {
+      color: var(--text-secondary);
+      font-size: 0.92rem;
+      max-width: 280px;
+      margin: 0 auto;
+    }
+
+    .step-connector {
+      display: none;
+    }
+
+    @media (min-width: 900px) {
+      .step-connector {
+        display: block;
+        position: absolute;
+        top: 32px;
+        right: -24px;
+        color: var(--text-muted);
+        font-size: 1.4rem;
+      }
+    }
+
+    /* ===== Comparison Table ===== */
+    .comparison-table-wrapper {
+      overflow-x: auto;
+      border-radius: var(--radius);
+      border: 1px solid var(--border-color);
+      box-shadow: var(--shadow-card);
+    }
+
+    .comparison-table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 500px;
+    }
+
+    .comparison-table thead th {
+      background: var(--gradient-primary);
+      color: #fff;
+      padding: 16px 24px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .comparison-table thead th:first-child {
+      border-radius: var(--radius) 0 0 0;
+    }
+
+    .comparison-table thead th:last-child {
+      border-radius: 0 var(--radius) 0 0;
+    }
+
+    .comparison-table tbody td {
+      padding: 14px 24px;
+      font-size: 0.92rem;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .comparison-table tbody tr:nth-child(even) {
+      background: var(--table-row-alt);
+    }
+
+    .comparison-table tbody tr:last-child td {
+      border-bottom: none;
+    }
+
+    .comparison-table tbody tr:last-child td:first-child {
+      border-radius: 0 0 0 var(--radius);
+    }
+
+    .comparison-table tbody tr:last-child td:last-child {
+      border-radius: 0 0 var(--radius) 0;
+    }
+
+    .comparison-table td:first-child {
+      font-weight: 600;
+    }
+
+    .check { color: #22c55e; font-weight: 700; font-size: 1.1rem; }
+    .cross { color: #ef4444; font-weight: 700; font-size: 1.1rem; }
+    .highlight-col { background: rgba(124,58,237,0.06); }
+
+    [data-theme="dark"] .highlight-col { background: rgba(124,58,237,0.1); }
+
+    /* ===== Tech Stack ===== */
+    .tech-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px;
+    }
+
+    .tech-item {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 18px 22px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      transition: all var(--transition);
+    }
+
+    .tech-item:hover {
+      border-color: var(--accent-purple);
+      transform: translateY(-2px);
+    }
+
+    .tech-item i {
+      font-size: 1.3rem;
+      width: 24px;
+      text-align: center;
+    }
+
+    .tech-item span {
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+
+    /* ===== CTA / Download ===== */
+    .cta-section {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border-color);
+    }
+
+    .cta-box {
+      text-align: center;
+      padding: 60px 40px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .cta-box::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: var(--gradient-primary);
+    }
+
+    .cta-box h2 {
+      font-size: clamp(1.6rem, 3vw, 2.2rem);
+      font-weight: 800;
+      margin-bottom: 16px;
+    }
+
+    .cta-box p {
+      color: var(--text-secondary);
+      font-size: 1.05rem;
+      margin-bottom: 36px;
+      max-width: 520px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    .cta-buttons {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .cta-buttons .btn i { font-size: 1.1rem; }
+
+    /* ===== Footer ===== */
+    .footer {
+      padding: 48px 0 32px;
+      border-top: 1px solid var(--border-color);
+    }
+
+    .footer-content {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+
+    .footer-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 1rem;
+      color: var(--text-primary);
+    }
+
+    .footer-brand img {
+      height: 28px;
+      width: auto;
+    }
+
+    .footer-links {
+      display: flex;
+      gap: 24px;
+      list-style: none;
+    }
+
+    .footer-links a {
+      color: var(--text-secondary);
+      font-size: 0.85rem;
+      transition: color var(--transition);
+    }
+
+    .footer-links a:hover { color: var(--text-primary); }
+
+    .footer-copy {
+      width: 100%;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      margin-top: 24px;
+      padding-top: 24px;
+      border-top: 1px solid var(--border-color);
+    }
+
+    /* ===== Animations on Scroll ===== */
+    .fade-in {
+      opacity: 0;
+      transform: translateY(28px);
+      transition: opacity 0.7s ease, transform 0.7s ease;
+    }
+
+    .fade-in.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    /* ===== Responsive ===== */
+    @media (max-width: 900px) {
+      .hero .container {
+        flex-direction: column;
+        text-align: center;
+      }
+
+      .hero-content { max-width: 100%; }
+      .hero p { margin-left: auto; margin-right: auto; }
+      .hero-actions { justify-content: center; }
+
+      .hero-visual {
+        max-width: 260px;
+        margin-top: 20px;
+      }
+
+      .hero-logo-img { width: 220px; }
+    }
+
+    @media (max-width: 768px) {
+      .navbar-links { display: none; }
+      .navbar-links.open {
+        display: flex;
+        flex-direction: column;
+        position: absolute;
+        top: 100%;
+        left: 0;
+        right: 0;
+        background: var(--bg-secondary);
+        border-bottom: 1px solid var(--border-color);
+        padding: 20px 24px;
+        gap: 16px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+      }
+
+      .mobile-menu-btn { display: block; }
+
+      .section { padding: 64px 0; }
+
+      .features-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .steps {
+        gap: 32px;
+      }
+
+      .steps .step {
+        flex: 1 1 100%;
+      }
+
+      .cta-box {
+        padding: 40px 24px;
+      }
+
+      .footer-content {
+        flex-direction: column;
+        text-align: center;
+      }
+
+      .footer-links {
+        justify-content: center;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- ===== Navbar ===== -->
+  <nav class="navbar" id="navbar">
+    <div class="container">
+      <a href="#" class="navbar-brand">
+        <img src="assets/nostr-mail-logo-white.png" alt="nostr-mail logo" class="logo-dark">
+        <img src="assets/nostr-mail-logo.png" alt="nostr-mail logo" class="logo-light" style="display:none;">
+        nostr-mail
+      </a>
+      <ul class="navbar-links" id="navLinks">
+        <li><a href="#features">Features</a></li>
+        <li><a href="#how-it-works">How It Works</a></li>
+        <li><a href="#comparison">Comparison</a></li>
+        <li><a href="#tech">Tech Stack</a></li>
+        <li><a href="#download">Download</a></li>
+        <li>
+          <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">
+            <i class="fas fa-sun"></i>
+          </button>
+        </li>
+      </ul>
+      <button class="mobile-menu-btn" id="mobileMenuBtn" aria-label="Open menu">
+        <i class="fas fa-bars"></i>
+      </button>
+    </div>
+  </nav>
+
+  <!-- ===== Hero ===== -->
+  <section class="hero" id="hero">
+    <div class="container">
+      <div class="hero-content">
+        <div class="hero-badge">
+          <i class="fas fa-circle"></i> Open Source &middot; End-to-End Encrypted
+        </div>
+        <h1>
+          Private email,<br>
+          powered by <span class="gradient-text">Nostr</span>.
+        </h1>
+        <p>
+          A modern, cross-platform email encryption tool that bridges Nostr and email protocols. Discover contacts through the decentralized social key registry and send encrypted emails with a single click.
+        </p>
+        <div class="hero-actions">
+          <a href="https://github.com/asherp/nostr-mail/releases/download/v1.0.4-beta/rw.91769.NostrMail_1.0.4-beta_aarch64.dmg" class="btn btn-primary" target="_blank" rel="noopener">
+            <i class="fab fa-apple"></i> Download for macOS
+          </a>
+          <a href="https://github.com/asherp/nostr-mail/releases/download/v1.0.4-beta/app-universal-release.apk" class="btn btn-primary" target="_blank" rel="noopener">
+            <i class="fab fa-android"></i> Download for Android
+          </a>
+          <a href="https://github.com/asherp/nostr-mail" class="btn btn-secondary" target="_blank" rel="noopener">
+            <i class="fab fa-github"></i> GitHub
+          </a>
+        </div>
+      </div>
+      <div class="hero-visual">
+        <img src="assets/nostr-mail-logo-white.png"
+             alt="nostr-mail logo"
+             class="hero-logo-img hero-logo-dark">
+        <img src="assets/nostr-mail-logo.png"
+             alt="nostr-mail logo"
+             class="hero-logo-img hero-logo-light"
+             style="display:none;">
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Features ===== -->
+  <section class="section" id="features">
+    <div class="container">
+      <div class="section-header fade-in">
+        <h2>Built for <span class="gradient-text">Privacy</span></h2>
+        <p>Everything you need to take control of your email communications, with the power of Nostr's decentralized key infrastructure.</p>
+      </div>
+      <div class="features-grid">
+        <div class="feature-card fade-in">
+          <div class="feature-icon"><i class="fas fa-lock"></i></div>
+          <h3>End-to-End Encryption</h3>
+          <p>Emails are encrypted using NIP-44 (or NIP-04) with secp256k1 key pairs. Only the sender and recipient can read the content -- not even your email server.</p>
+        </div>
+        <div class="feature-card fade-in">
+          <div class="feature-icon"><i class="fas fa-laptop"></i></div>
+          <h3>Cross-Platform</h3>
+          <p>Built with Tauri for native performance on Windows, macOS, Linux, and Android. One codebase, every platform.</p>
+        </div>
+        <div class="feature-card fade-in">
+          <div class="feature-icon"><i class="fas fa-address-book"></i></div>
+          <h3>Contact Discovery</h3>
+          <p>Discover contacts through Nostr's decentralized social key registry. No manual key exchange -- just follow someone and start sending encrypted mail.</p>
+        </div>
+        <div class="feature-card fade-in">
+          <div class="feature-icon"><i class="fas fa-comment-dots"></i></div>
+          <h3>Direct Messages</h3>
+          <p>Send and receive encrypted direct messages through the Nostr relay network, alongside your email -- all from one interface.</p>
+        </div>
+        <div class="feature-card fade-in">
+          <div class="feature-icon"><i class="fas fa-signature"></i></div>
+          <h3>Schnorr Signatures</h3>
+          <p>Sign outgoing emails with Schnorr signatures so recipients can verify authenticity and detect tampering.</p>
+        </div>
+        <div class="feature-card fade-in">
+          <div class="feature-icon"><i class="fas fa-paperclip"></i></div>
+          <h3>Encrypted Attachments</h3>
+          <p>Hybrid encryption for file attachments: AES-256 encrypts the payload, and NIP-44 protects the symmetric key.</p>
+        </div>
+        <div class="feature-card fade-in">
+          <div class="feature-icon"><i class="fas fa-moon"></i></div>
+          <h3>Dark Mode &amp; Responsive</h3>
+          <p>A modern, clean interface with dark and light themes. Responsive design looks great on desktops and mobile devices alike.</p>
+        </div>
+        <div class="feature-card fade-in">
+          <div class="feature-icon"><i class="fas fa-database"></i></div>
+          <h3>Offline Access</h3>
+          <p>SQLite local storage caches contacts, profiles, and messages so you can work offline and sync when you reconnect.</p>
+        </div>
+        <div class="feature-card fade-in">
+          <div class="feature-icon"><i class="fas fa-puzzle-piece"></i></div>
+          <h3>Nostr Client Compatible</h3>
+          <p>Works alongside existing Nostr clients like Amethyst, Damus, and others. Your keys, your network, your choice of tools.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== How It Works ===== -->
+  <section class="section how-it-works" id="how-it-works">
+    <div class="container">
+      <div class="section-header fade-in">
+        <h2>How <span class="gradient-text">nostr-mail</span> Works</h2>
+        <p>Bridging the gap between Nostr's key infrastructure and email's ubiquity.</p>
+      </div>
+      <div class="steps">
+        <div class="step fade-in">
+          <div class="step-number">1</div>
+          <h3>Generate or Import Keys</h3>
+          <p>Use your existing Nostr keypair (nsec) or generate a new one. Your private key never leaves your device.</p>
+          <span class="step-connector"><i class="fas fa-chevron-right"></i></span>
+        </div>
+        <div class="step fade-in">
+          <div class="step-number">2</div>
+          <h3>Discover Contacts</h3>
+          <p>Your Nostr follow list is loaded automatically. Each contact's public key is fetched from relays -- no manual key exchange needed.</p>
+          <span class="step-connector"><i class="fas fa-chevron-right"></i></span>
+        </div>
+        <div class="step fade-in">
+          <div class="step-number">3</div>
+          <h3>Compose &amp; Encrypt</h3>
+          <p>Write your email as usual. nostr-mail derives a shared secret from your private key and the recipient's public key, then encrypts the message.</p>
+          <span class="step-connector"><i class="fas fa-chevron-right"></i></span>
+        </div>
+        <div class="step fade-in">
+          <div class="step-number">4</div>
+          <h3>Send</h3>
+          <p>The encrypted payload is delivered through your configured SMTP server. Optionally, the subject is also sent as a Nostr direct message to notify the recipient.</p>
+          <span class="step-connector"><i class="fas fa-chevron-right"></i></span>
+        </div>
+        <div class="step fade-in">
+          <div class="step-number">5</div>
+          <h3>Receive &amp; Decrypt</h3>
+          <p>The recipient's nostr-mail client fetches the email via IMAP, derives the same shared secret from their private key and the sender's public key, and decrypts the message.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Comparison ===== -->
+  <section class="section" id="comparison">
+    <div class="container">
+      <div class="section-header fade-in">
+        <h2>Why <span class="gradient-text">nostr-mail</span>?</h2>
+        <p>Nostr and email each solve problems the other can't. nostr-mail combines the best of both.</p>
+      </div>
+      <div class="comparison-table-wrapper fade-in">
+        <table class="comparison-table">
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>Nostr</th>
+              <th>Email</th>
+              <th>nostr-mail</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Social Key Registry</td>
+              <td><span class="check"><i class="fas fa-check"></i></span></td>
+              <td><span class="cross"><i class="fas fa-xmark"></i></span></td>
+              <td class="highlight-col"><span class="check"><i class="fas fa-check"></i></span></td>
+            </tr>
+            <tr>
+              <td>PGP Encryption</td>
+              <td><span class="check"><i class="fas fa-check"></i></span></td>
+              <td><span class="check"><i class="fas fa-check"></i></span></td>
+              <td class="highlight-col"><span class="check"><i class="fas fa-check"></i></span></td>
+            </tr>
+            <tr>
+              <td>Long Form Content</td>
+              <td><span class="cross"><i class="fas fa-xmark"></i></span></td>
+              <td><span class="check"><i class="fas fa-check"></i></span></td>
+              <td class="highlight-col"><span class="check"><i class="fas fa-check"></i></span></td>
+            </tr>
+            <tr>
+              <td>Archival Storage</td>
+              <td><span class="cross"><i class="fas fa-xmark"></i></span></td>
+              <td><span class="check"><i class="fas fa-check"></i></span></td>
+              <td class="highlight-col"><span class="check"><i class="fas fa-check"></i></span></td>
+            </tr>
+            <tr>
+              <td>Ubiquitous</td>
+              <td><span class="cross"><i class="fas fa-xmark"></i></span></td>
+              <td><span class="check"><i class="fas fa-check"></i></span></td>
+              <td class="highlight-col"><span class="check"><i class="fas fa-check"></i></span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Tech Stack ===== -->
+  <section class="section how-it-works" id="tech">
+    <div class="container">
+      <div class="section-header fade-in">
+        <h2><span class="gradient-text">Tech Stack</span></h2>
+        <p>No framework bloat. Built on a lean, auditable stack you can trust.</p>
+      </div>
+      <div class="tech-grid fade-in">
+        <div class="tech-item">
+          <i class="fab fa-rust" style="color:#dea584;"></i>
+          <span>Rust Backend</span>
+        </div>
+        <div class="tech-item">
+          <i class="fas fa-window-maximize" style="color:#60a5fa;"></i>
+          <span>Tauri Framework</span>
+        </div>
+        <div class="tech-item">
+          <i class="fab fa-js-square" style="color:#f7df1e;"></i>
+          <span>Vanilla JavaScript</span>
+        </div>
+        <div class="tech-item">
+          <i class="fas fa-database" style="color:#22c55e;"></i>
+          <span>SQLite Storage</span>
+        </div>
+        <div class="tech-item">
+          <i class="fas fa-shield-halved" style="color:#a78bfa;"></i>
+          <span>NIP-44 / NIP-04</span>
+        </div>
+        <div class="tech-item">
+          <i class="fas fa-envelope" style="color:#f97316;"></i>
+          <span>SMTP &amp; IMAP</span>
+        </div>
+        <div class="tech-item">
+          <i class="fas fa-key" style="color:#eab308;"></i>
+          <span>secp256k1 Keys</span>
+        </div>
+        <div class="tech-item">
+          <i class="fas fa-tower-broadcast" style="color:#ec4899;"></i>
+          <span>Nostr Relays</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Download / CTA ===== -->
+  <section class="section cta-section" id="download">
+    <div class="container">
+      <div class="cta-box fade-in">
+        <h2>Ready to take back your <span class="gradient-text">email privacy</span>?</h2>
+        <p>Get started with nostr-mail today. Open source, free forever, and built for people who care about owning their communications.</p>
+        <div class="cta-buttons">
+          <a href="https://github.com/asherp/nostr-mail/releases/download/v1.0.4-beta/rw.91769.NostrMail_1.0.4-beta_aarch64.dmg" class="btn btn-primary" target="_blank" rel="noopener">
+            <i class="fab fa-apple"></i> Download for macOS
+          </a>
+          <a href="https://github.com/asherp/nostr-mail/releases/download/v1.0.4-beta/app-universal-release.apk" class="btn btn-primary" target="_blank" rel="noopener">
+            <i class="fab fa-android"></i> Download for Android
+          </a>
+          <a href="https://github.com/asherp/nostr-mail" class="btn btn-secondary" target="_blank" rel="noopener">
+            <i class="fab fa-github"></i> GitHub
+          </a>
+          <a href="/docs/" class="btn btn-secondary" target="_blank" rel="noopener">
+            <i class="fas fa-book"></i> Documentation
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-content">
+        <div class="footer-brand">
+          <img src="assets/nostr-mail-logo-white.png" alt="nostr-mail" class="logo-dark">
+          <img src="assets/nostr-mail-logo.png" alt="nostr-mail" class="logo-light" style="display:none;">
+          nostr-mail
+        </div>
+        <ul class="footer-links">
+          <li><a href="https://github.com/asherp/nostr-mail" target="_blank" rel="noopener"><i class="fab fa-github"></i> GitHub</a></li>
+          <li><a href="/docs/" target="_blank" rel="noopener"><i class="fas fa-book"></i> Docs</a></li>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#comparison">Comparison</a></li>
+        </ul>
+        <div class="footer-copy">
+          &copy; 2025 nostr-mail &middot; Open source under MIT License
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <!-- ===== JavaScript ===== -->
+  <script>
+    (function () {
+      'use strict';
+
+      // --- Theme toggle ---
+      const html = document.documentElement;
+      const themeBtn = document.getElementById('themeToggle');
+      const stored = localStorage.getItem('nostrmail-theme');
+      if (stored) html.setAttribute('data-theme', stored);
+
+      function applyThemeImages() {
+        const isDark = html.getAttribute('data-theme') === 'dark';
+        document.querySelectorAll('.logo-dark, .hero-logo-dark').forEach(function (el) {
+          el.style.display = isDark ? '' : 'none';
+        });
+        document.querySelectorAll('.logo-light, .hero-logo-light').forEach(function (el) {
+          el.style.display = isDark ? 'none' : '';
+        });
+        var icon = themeBtn.querySelector('i');
+        icon.className = isDark ? 'fas fa-sun' : 'fas fa-moon';
+      }
+
+      applyThemeImages();
+
+      themeBtn.addEventListener('click', function () {
+        var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+        html.setAttribute('data-theme', next);
+        localStorage.setItem('nostrmail-theme', next);
+        applyThemeImages();
+      });
+
+      // --- Navbar scroll ---
+      var navbar = document.getElementById('navbar');
+      window.addEventListener('scroll', function () {
+        navbar.classList.toggle('scrolled', window.scrollY > 40);
+      }, { passive: true });
+
+      // --- Mobile menu ---
+      var mobileBtn = document.getElementById('mobileMenuBtn');
+      var navLinks = document.getElementById('navLinks');
+      mobileBtn.addEventListener('click', function () {
+        navLinks.classList.toggle('open');
+        var icon = mobileBtn.querySelector('i');
+        icon.className = navLinks.classList.contains('open') ? 'fas fa-xmark' : 'fas fa-bars';
+      });
+
+      // Close mobile menu on link click
+      navLinks.querySelectorAll('a').forEach(function (link) {
+        link.addEventListener('click', function () {
+          navLinks.classList.remove('open');
+          mobileBtn.querySelector('i').className = 'fas fa-bars';
+        });
+      });
+
+      // --- Scroll fade-in ---
+      var faders = document.querySelectorAll('.fade-in');
+      var observerOptions = { threshold: 0.12, rootMargin: '0px 0px -40px 0px' };
+      var observer = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add('visible');
+            observer.unobserve(entry.target);
+          }
+        });
+      }, observerOptions);
+      faders.forEach(function (el) { observer.observe(el); });
+    })();
+  </script>
+</body>
+</html>

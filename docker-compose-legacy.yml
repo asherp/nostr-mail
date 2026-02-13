@@ -1,0 +1,157 @@
+version: '2.4'
+
+services:
+  notebook:
+    image: ${NOSTR_MAIL_IMAGE_TAG}
+    ports:
+      - "8888:8888"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      TZ: ${TZ:-America/New_York}
+      DASH_DEBUG: ${DASH_DEBUG}
+      NOSTR_PRIV_KEY: ${NOSTR_PRIV_KEY}
+      NOSTR_CONTACTS: ${NOSTR_CONTACTS}
+      PRIV_KEY_ALICE: ${PRIV_KEY_ALICE}
+      EMAIL_ADDRESS_ALICE: ${EMAIL_ADDRESS_ALICE}
+      PRIV_KEY_BOB: ${PRIV_KEY_BOB}
+      EMAIL_ADDRESS_BOB: ${EMAIL_ADDRESS_BOB}
+      EMAIL_ADDRESS: ${EMAIL_ADDRESS}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD}
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      NOSTRMAIL_CACHE: /nostrmail/cache
+    volumes:
+      - type: bind
+        source: .
+        target: /nostrmail
+    container_name: nostr-notebook
+    command:
+      - jupyter
+      - notebook
+      - .
+      - --port=8888
+      - --no-browser
+      - --ip=0.0.0.0
+      - --allow-root
+    working_dir: /nostrmail
+  docs:
+    image: ${NOSTR_MAIL_IMAGE_TAG}
+    ports:
+      - "8000:8000"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - type: bind
+        source: .
+        target: /nostrmail
+    container_name: nostr-mail-docs
+    command:
+      - mkdocs
+      - serve
+      - -a
+      - 0.0.0.0:8000
+  nostrmail:
+    image: ${NOSTR_MAIL_IMAGE_TAG}
+    ports:
+      - "8050:8050"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      TZ: ${TZ:-America/New_York}
+      DASH_DEBUG: False
+      NOSTR_CONTACTS: ${NOSTR_CONTACTS}
+      NOSTR_PRIV_KEY: ${NOSTR_PRIV_KEY}
+      EMAIL_ADDRESS: ${EMAIL_ADDRESS}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD}
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      DEV_TOOLS_HOT_RELOAD: False
+      NOSTRMAIL_CACHE: /nostrmail/cache
+    volumes:
+      - type: bind
+        source: .
+        target: /nostrmail
+    container_name: nostr-mail
+    command:
+      - python
+      - -u
+      - dashboard.py
+    working_dir: /nostrmail/nostrmail
+  alice:
+    image: ${NOSTR_MAIL_IMAGE_TAG}
+    ports:
+      - "8051:8050"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      TZ: ${TZ:-America/New_York}
+      DASH_DEBUG: ${DASH_DEBUG}
+      NOSTR_CONTACTS: ${NOSTR_CONTACTS}
+      NOSTR_PRIV_KEY: ${PRIV_KEY_ALICE}
+      EMAIL_ADDRESS: ${EMAIL_ADDRESS_ALICE}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD_ALICE}
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      DEV_TOOLS_HOT_RELOAD: ${DEV_TOOLS_HOT_RELOAD}
+      NOSTRMAIL_CACHE: /nostrmail/cache
+    volumes:
+      - type: bind
+        source: .
+        target: /nostrmail
+    container_name: nostr-mail-alice
+    command:
+      - python
+      - -u
+      - dashboard.py
+    working_dir: /nostrmail/nostrmail
+  bob:
+    image: ${NOSTR_MAIL_IMAGE_TAG}
+    ports:
+      - "8052:8050"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      TZ: ${TZ:-America/New_York}
+      DASH_DEBUG: ${DASH_DEBUG}
+      NOSTR_CONTACTS: ${NOSTR_CONTACTS}
+      NOSTR_PRIV_KEY: ${PRIV_KEY_BOB}
+      EMAIL_ADDRESS: ${EMAIL_ADDRESS_BOB}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD_BOB}
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      DEV_TOOLS_HOT_RELOAD: ${DEV_TOOLS_HOT_RELOAD}
+      NOSTRMAIL_CACHE: /nostrmail/cache
+    volumes:
+      - type: bind
+        source: .
+        target: /nostrmail
+    container_name: nostr-mail-bob
+    command:
+      - python
+      - -u
+      - dashboard.py
+    working_dir: /nostrmail/nostrmail
+  app:
+    build: 
+      context: app
+      dockerfile: Dockerfile
+    environment:
+      - DISPLAY=${HOST_DISPLAY}
+      - LIBGL_ALWAYS_SOFTWARE=1
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    command: python main.py

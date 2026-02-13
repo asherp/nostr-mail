@@ -1,4 +1,11 @@
+* adding mock data relays
 
+Workflow for android
+1. develop using `cargo tauri android dev` with emulator
+2. when ready, bump version and `cargo tauri android build`
+3. `adb install -r /path/to/app-universal-release.apk`
+4. navigate to `chrome://inspect/#devices`  debug tools to see javascript console of installed app
+    
 * when changing email addresses, app has trouble decrypting emails in db
 * mac build instructions
 * building on a mac for android, you'll need:

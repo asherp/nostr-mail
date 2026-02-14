@@ -16,6 +16,9 @@ __pycache__/
 # Cursor IDE
 .cursor/
 
+# Claude Code
+.claude/
+
 # Mock relay events
 events.json
 relay.log

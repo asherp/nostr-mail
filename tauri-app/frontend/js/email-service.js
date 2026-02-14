@@ -3879,6 +3879,150 @@ ${attachmentsHtml}
         }
     }
 
+    // Get BIP39 encoding settings from the dropdown
+    getBip39Settings() {
+        const select = document.getElementById('bip39-encoding-select');
+        const value = select ? select.value : '';
+        if (!value) return null;
+        const parts = value.split(':');
+        // Format: "language:wordlist:dialect" (e.g. "english:bip39:body")
+        // Fallback for legacy "language:wordlist" format
+        return {
+            language: parts[0],
+            wordlist: parts[1],
+            dialect: parts[2] || 'body',
+        };
+    }
+
+    // Wrap raw ciphertext in ASCII armor
+    armorCiphertext(ciphertext, encryptionAlgorithm) {
+        const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
+        return [
+            `-----BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE-----`,
+            ciphertext.trim(),
+            `-----END NOSTR ${armorType} ENCRYPTED MESSAGE-----`
+        ].join('\n');
+    }
+
+    // Encode already-encrypted email fields using glossia grammar steganography
+    async encodeEmailFields() {
+        const bip39Settings = this.getBip39Settings();
+        if (!bip39Settings) {
+            notificationService.showError('Select a Glossia encoding first');
+            return false;
+        }
+
+        const currentSubject = domManager.getValue('subject') || '';
+        const currentBody = domManager.getValue('messageBody') || '';
+
+        if (!currentSubject && !currentBody) {
+            notificationService.showError('Nothing to encode');
+            return false;
+        }
+
+        const encodeBtn = domManager.get('encodeBtn');
+        if (encodeBtn) encodeBtn.disabled = true;
+
+        try {
+            // Use WASM GlossiaService if available, fall back to Tauri IPC
+            const useWasm = window.GlossiaService && window.GlossiaService.isReady();
+            const encodeFn = useWasm
+                ? (ct, lang, wl, m) => window.GlossiaService.encode(ct, lang, wl, m)
+                : (ct, lang, wl, m) => TauriService.encodeBip39(ct, lang, wl, m);
+            console.log('[JS] Encoding via', useWasm ? 'WASM' : 'Tauri IPC');
+
+            // Encode subject: strip any non-armor content — the subject is raw ciphertext (no armor wrapper)
+            if (currentSubject) {
+                console.log('[JS] Encoding subject with glossia...');
+                const encoded = await encodeFn(
+                    currentSubject.trim(), bip39Settings.language, bip39Settings.wordlist, 'subject'
+                );
+                domManager.setValue('subject', encoded);
+            }
+
+            // Encode body: strip ASCII armor to get raw ciphertext, then encode
+            if (currentBody) {
+                console.log('[JS] Encoding body with glossia...');
+                const armorMatch = currentBody.match(
+                    /-----BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE-----\s*([\s\S]+?)\s*-----END NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE-----/
+                );
+                const rawCipher = armorMatch ? armorMatch[1].replace(/\s+/g, '') : currentBody.trim();
+                const encoded = await encodeFn(
+                    rawCipher, bip39Settings.language, bip39Settings.wordlist, 'body'
+                );
+                domManager.setValue('messageBody', encoded);
+            }
+
+            notificationService.showSuccess('Encoded with glossia');
+            return true;
+        } catch (error) {
+            console.error('[JS] Encode error:', error);
+            notificationService.showError('Failed to encode: ' + error);
+            return false;
+        } finally {
+            if (encodeBtn) encodeBtn.disabled = false;
+        }
+    }
+
+    // Decode glossia-encoded email fields back to ASCII-armored ciphertext
+    async decodeEmailFields() {
+        const bip39Settings = this.getBip39Settings();
+        if (!bip39Settings) {
+            notificationService.showError('Select the Glossia encoding that was used');
+            return false;
+        }
+
+        const currentSubject = domManager.getValue('subject') || '';
+        const currentBody = domManager.getValue('messageBody') || '';
+
+        if (!currentSubject && !currentBody) {
+            notificationService.showError('Nothing to decode');
+            return false;
+        }
+
+        const settings = appState.getSettings();
+        const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+
+        const encodeBtn = domManager.get('encodeBtn');
+        if (encodeBtn) encodeBtn.disabled = true;
+
+        try {
+            // Use WASM GlossiaService if available, fall back to Tauri IPC
+            const useWasm = window.GlossiaService && window.GlossiaService.isReady();
+            const decodeFn = useWasm
+                ? (t, lang, wl, alg) => window.GlossiaService.decode(t, lang, wl, alg)
+                : (t, lang, wl, alg) => TauriService.decodeBip39(t, lang, wl, alg);
+            console.log('[JS] Decoding via', useWasm ? 'WASM' : 'Tauri IPC');
+
+            if (currentSubject) {
+                console.log('[JS] Decoding subject with glossia...');
+                const decoded = await decodeFn(
+                    currentSubject, bip39Settings.language, bip39Settings.wordlist, encryptionAlgorithm
+                );
+                domManager.setValue('subject', decoded);
+            }
+
+            if (currentBody) {
+                console.log('[JS] Decoding body with glossia...');
+                const decoded = await decodeFn(
+                    currentBody, bip39Settings.language, bip39Settings.wordlist, encryptionAlgorithm
+                );
+                // Re-wrap in ASCII armor
+                const armored = this.armorCiphertext(decoded, encryptionAlgorithm);
+                domManager.setValue('messageBody', armored);
+            }
+
+            notificationService.showSuccess('Decoded from glossia');
+            return true;
+        } catch (error) {
+            console.error('[JS] Decode error:', error);
+            notificationService.showError('Failed to decode: ' + error);
+            return false;
+        } finally {
+            if (encodeBtn) encodeBtn.disabled = false;
+        }
+    }
+
     // Encrypt subject and body fields using NIP-04
     async encryptEmailFields() {
         console.log('[JS] encryptEmailFields called');
@@ -3935,7 +4079,7 @@ ${attachmentsHtml}
         const settings = appState.getSettings();
         const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
         console.log('[JS] Using encryption algorithm:', encryptionAlgorithm);
-        
+
         const encryptBtn = domManager.get('encryptBtn');
         let iconSpan, labelSpan;
         if (encryptBtn) {
@@ -4039,7 +4183,7 @@ ${attachmentsHtml}
                     console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
                     domManager.setValue('subject', encryptedSubject.trim());
                 }
-                
+
                 // 4. JSON.stringify(manifest) → encrypt entire manifest with NIP → ASCII armor
                 console.log('[JS] Creating encrypted manifest...');
                 const manifestJson = JSON.stringify(manifest);
@@ -4048,14 +4192,8 @@ ${attachmentsHtml}
                 const encryptedManifest = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, manifestJson, encryptionAlgorithm);
                 console.log('[JS] Manifest encrypted, size:', encryptedManifest.length);
                 
-                // Add ASCII armor around the encrypted manifest
-                const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
-                const armoredManifest = [
-                    `-----BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE-----`,
-                    encryptedManifest.trim(),
-                    `-----END NOSTR ${armorType} ENCRYPTED MESSAGE-----`
-                ].join('\n');
-                
+                // Wrap in ASCII armor
+                const armoredManifest = this.armorCiphertext(encryptedManifest, encryptionAlgorithm);
                 domManager.setValue('messageBody', armoredManifest.trim());
                 
                 // Clear signature when encrypting (body state changed)
@@ -4078,21 +4216,16 @@ ${attachmentsHtml}
                     console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
                     domManager.setValue('subject', encryptedSubject.trim());
                 }
-                
-                // Encrypt body directly with NIP and wrap in ASCII armor
+
+                // Encrypt body directly with NIP
                 let encryptedBody = body;
                 if (body) {
                     console.log('[JS] Encrypting body...');
                     encryptedBody = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, body, encryptionAlgorithm);
                     console.log('[JS] Body encrypted:', encryptedBody.substring(0, 50) + '...');
-                    
-                    // Add ASCII armor around the encrypted body
-                    const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
-                    const armoredBody = [
-                        `-----BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE-----`,
-                        encryptedBody.trim(),
-                        `-----END NOSTR ${armorType} ENCRYPTED MESSAGE-----`
-                    ].join('\n');
+
+                    // Wrap in ASCII armor
+                    const armoredBody = this.armorCiphertext(encryptedBody, encryptionAlgorithm);
                     domManager.setValue('messageBody', armoredBody.trim());
                 }
                 
@@ -4144,24 +4277,16 @@ ${attachmentsHtml}
                 encryptedSubject = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, subject, encryptionAlgorithm);
                 console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
             }
-            
-            // Encrypt body directly with NIP and wrap in ASCII armor
+
+            // Encrypt body
             let encryptedBody = body;
             if (body) {
                 console.log('[JS] Encrypting body in memory...');
                 encryptedBody = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, body, encryptionAlgorithm);
                 console.log('[JS] Body encrypted:', encryptedBody.substring(0, 50) + '...');
-                
-                // Add ASCII armor around the encrypted body
-                const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
-                const armoredBody = [
-                    `-----BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE-----`,
-                    encryptedBody.trim(),
-                    `-----END NOSTR ${armorType} ENCRYPTED MESSAGE-----`
-                ].join('\n');
-                encryptedBody = armoredBody.trim();
+                encryptedBody = this.armorCiphertext(encryptedBody, encryptionAlgorithm).trim();
             }
-            
+
             return { encryptedSubject, encryptedBody };
         } catch (error) {
             console.error('[JS] Encryption error in memory:', error);

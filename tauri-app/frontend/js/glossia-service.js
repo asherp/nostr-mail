@@ -1,0 +1,139 @@
+// Glossia WASM Service
+// Loads glossia's native WASM module for in-browser steganographic encode/decode.
+// Falls through to TauriService if WASM is not loaded.
+
+const GlossiaService = {
+    _wasm: null,
+    _ready: false,
+    _initPromise: null,
+
+    async init() {
+        if (this._initPromise) return this._initPromise;
+        this._initPromise = this._doInit();
+        return this._initPromise;
+    },
+
+    async _doInit() {
+        try {
+            const wasm = await import('./pkg/glossia.js');
+            await wasm.default();   // initialize wasm-pack --target web module
+            this._wasm = wasm;
+            this._ready = true;
+            console.log('[GlossiaService] WASM module loaded (glossia native)');
+        } catch (e) {
+            console.warn('[GlossiaService] WASM not available, will fall back to Tauri:', e.message);
+            this._ready = false;
+        }
+    },
+
+    isReady() {
+        return this._ready;
+    },
+
+    // ---- NIP-04 binary packing helpers ----
+    // NIP-04 ciphertext is "base64?iv=base64". To encode efficiently as binary
+    // (rather than ASCII), we pack it as [payload_len(2 bytes BE), payload_bytes, iv_bytes]
+    // and pass the packed blob as base64 to glossia's generic encoder.
+
+    _packNip04(ciphertext) {
+        const trimmed = ciphertext.trim();
+        const ivIndex = trimmed.indexOf('?iv=');
+        if (ivIndex === -1) return trimmed; // NIP-44 (pure base64), pass through
+
+        const payloadB64 = trimmed.substring(0, ivIndex);
+        const ivB64 = trimmed.substring(ivIndex + 4);
+        const payloadBytes = Uint8Array.from(atob(payloadB64), c => c.charCodeAt(0));
+        const ivBytes = Uint8Array.from(atob(ivB64), c => c.charCodeAt(0));
+
+        const len = payloadBytes.length;
+        const combined = new Uint8Array(2 + payloadBytes.length + ivBytes.length);
+        combined[0] = (len >> 8) & 0xFF;
+        combined[1] = len & 0xFF;
+        combined.set(payloadBytes, 2);
+        combined.set(ivBytes, 2 + payloadBytes.length);
+
+        return btoa(String.fromCharCode(...combined));
+    },
+
+    _unpackNip04(decoded, algorithm) {
+        if (algorithm !== 'nip04') return decoded; // NIP-44, return as-is
+
+        const bytes = Uint8Array.from(atob(decoded), c => c.charCodeAt(0));
+        if (bytes.length < 2) throw new Error('Decoded data too short for NIP-04');
+
+        const payloadLen = (bytes[0] << 8) | bytes[1];
+        if (2 + payloadLen > bytes.length) {
+            throw new Error(`Invalid NIP-04 payload length: ${payloadLen} (total: ${bytes.length})`);
+        }
+
+        const payloadB64 = btoa(String.fromCharCode(...bytes.slice(2, 2 + payloadLen)));
+        const ivB64 = btoa(String.fromCharCode(...bytes.slice(2 + payloadLen)));
+        return payloadB64 + '?iv=' + ivB64;
+    },
+
+    // ---- Backward-compatible API (used by email-service.js) ----
+
+    encode(ciphertext, language, wordlist, mode) {
+        const input = this._packNip04(ciphertext);
+        const seed = BigInt(Math.floor(Math.random() * 2 ** 32));
+        const resultJson = this._wasm.encode(input, language, wordlist, mode, seed);
+        const result = JSON.parse(resultJson);
+        if (result.error) throw new Error(result.error);
+        return result.encoded_text;
+    },
+
+    decode(text, language, wordlist, algorithm) {
+        const resultJson = this._wasm.decode(text, language, wordlist);
+        const result = JSON.parse(resultJson);
+        if (result.error) throw new Error(result.error);
+        return this._unpackNip04(result.decoded_text, algorithm);
+    },
+
+    // ---- New APIs from glossia native WASM ----
+
+    encodeCharacters(input, language, wordlist, grammarDialect, seed) {
+        const s = seed !== undefined ? BigInt(seed) : BigInt(Math.floor(Math.random() * 2 ** 32));
+        const resultJson = this._wasm.encode_characters(input, language, wordlist, grammarDialect, s);
+        return JSON.parse(resultJson);
+    },
+
+    encodeRandomWords(count, language, wordlist, grammarDialect, seed) {
+        const s = seed !== undefined ? BigInt(seed) : BigInt(Math.floor(Math.random() * 2 ** 32));
+        const resultJson = this._wasm.encode_random_words(count, language, wordlist, grammarDialect, s);
+        return JSON.parse(resultJson);
+    },
+
+    detectDialect(text) {
+        return JSON.parse(this._wasm.detect_dialect_from_text(text));
+    },
+
+    getAllDialects() {
+        return JSON.parse(this._wasm.get_all_dialects());
+    },
+
+    getLanguages() {
+        return JSON.parse(this._wasm.get_languages());
+    },
+
+    getWordlists(language) {
+        return JSON.parse(this._wasm.get_wordlists(language));
+    },
+
+    getWordlistSize(language, wordlist) {
+        return JSON.parse(this._wasm.get_wordlist_size(language, wordlist));
+    },
+
+    getBitsPerWord(language, wordlist) {
+        return JSON.parse(this._wasm.get_bits_per_word(language, wordlist));
+    },
+
+    randomWords(count, language, wordlist, seed) {
+        const s = seed !== undefined ? BigInt(seed) : BigInt(Math.floor(Math.random() * 2 ** 32));
+        return JSON.parse(this._wasm.random_words(count, language, wordlist, s));
+    },
+};
+
+window.GlossiaService = GlossiaService;
+
+// Auto-init on load
+GlossiaService.init();

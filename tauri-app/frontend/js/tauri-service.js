@@ -81,37 +81,64 @@ const TauriService = {
         console.log('=== End Tauri API Test ===');
     },
     generateKeypair: async function() {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return window.CryptoService.generateKeypair();
+        }
         return await this.invoke('generate_keypair');
     },
     validatePrivateKey: async function(privateKey) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return window.CryptoService.validatePrivateKey(privateKey);
+        }
         return await this.invoke('validate_private_key', { privateKey });
     },
     validatePublicKey: async function(publicKey) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return window.CryptoService.validatePublicKey(publicKey);
+        }
         return await this.invoke('validate_public_key', { publicKey });
     },
     getPublicKeyFromPrivate: async function(privateKey) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return window.CryptoService.getPublicKeyFromPrivate(privateKey);
+        }
         return await this.invoke('get_public_key_from_private', { privateKey });
     },
     getDefaultPrivateKeyFromConfig: async function() {
         return await this.invoke('get_default_private_key_from_config');
     },
     signData: async function(privateKey, data) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return await window.CryptoService.signData(privateKey, data);
+        }
         return await this.invoke('sign_data', { privateKey, data });
     },
     verifySignature: async function(publicKey, signature, data) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return await window.CryptoService.verifySignature(publicKey, signature, data);
+        }
         return await this.invoke('verify_signature', { publicKey, signature, data });
     },
     recheckEmailSignature: async function(messageId) {
         return await this.invoke('recheck_email_signature', { messageId });
     },
     encryptNip44Message: async function(privateKey, publicKey, message) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return await window.CryptoService.encryptMessageWithAlgorithm(privateKey, publicKey, message, 'nip44');
+        }
         return await this.invoke('encrypt_nip04_message', { privateKey, publicKey, message });
     },
     encryptNip04MessageLegacy: async function(privateKey, publicKey, message) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return await window.CryptoService.encryptMessageWithAlgorithm(privateKey, publicKey, message, 'nip04');
+        }
         return await this.invoke('encrypt_nip04_message_legacy', { privateKey, publicKey, message });
     },
-    
+
     encryptMessageWithAlgorithm: async function(privateKey, publicKey, message, algorithm) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return await window.CryptoService.encryptMessageWithAlgorithm(privateKey, publicKey, message, algorithm);
+        }
         return await this.invoke('encrypt_message_with_algorithm', { privateKey, publicKey, message, algorithm });
     },
     sendDirectMessage: async function(privateKey, recipientPubkey, message, relays) {
@@ -137,9 +164,21 @@ const TauriService = {
     },
     
     sendEncryptedDirectMessage: async function(privateKey, recipientPubkey, encryptedMessage, relays) {
-        // Get encryption algorithm from settings
-        const settings = window.appState?.getSettings();
-        const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+        // Detect the actual encryption format of the already-encrypted content
+        // Don't rely on current settings, as the content may have been encrypted with a different algorithm
+        const detectedFormat = window.Utils?.detectEncryptionFormat(encryptedMessage) || 'unknown';
+        
+        // Use detected format, fallback to current setting if detection fails
+        let encryptionAlgorithm;
+        if (detectedFormat === 'nip04' || detectedFormat === 'nip44') {
+            encryptionAlgorithm = detectedFormat;
+            console.log('[JS] Detected encryption format:', detectedFormat, 'for already-encrypted content');
+        } else {
+            // Fallback to current setting if format detection fails
+            const settings = window.appState?.getSettings();
+            encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+            console.log('[JS] Could not detect encryption format, using current setting:', encryptionAlgorithm);
+        }
         
         // Explicitly send already-encrypted content
         const request = {
@@ -419,6 +458,9 @@ const TauriService = {
         return await this.invoke('db_get_email', { messageId: messageId });
     },
     decryptDmContent: async function(privateKey, senderPubkey, encryptedContent) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return await window.CryptoService.decryptDmContent(privateKey, senderPubkey, encryptedContent);
+        }
         return await this.invoke('decrypt_dm_content', { privateKey, senderPubkey, encryptedContent });
     },
     filterNewContacts: async function(userPubkey, pubkeys) {
@@ -523,6 +565,14 @@ const TauriService = {
     
     updateEmailRecipientPubkeyById: async function(id, recipientPubkey) {
         return await this.invoke('db_update_email_recipient_pubkey_by_id', { id, recipientPubkey });
+    },
+
+    encodeBip39: async function(ciphertext, language, wordlist, mode) {
+        return await this.invoke('encode_bip39', { ciphertext, language, wordlist, mode });
+    },
+
+    decodeBip39: async function(text, language, wordlist, algorithm) {
+        return await this.invoke('decode_bip39', { text, language, wordlist, algorithm });
     }
 };
 window.TauriService = TauriService; 

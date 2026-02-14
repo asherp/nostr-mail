@@ -24,12 +24,26 @@
     <link rel="stylesheet" href="styles.css">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "nostr-tools/nip04": "https://esm.sh/nostr-tools@2.10.4/nip04",
+            "nostr-tools/nip44": "https://esm.sh/nostr-tools@2.10.4/nip44",
+            "nostr-tools/nip19": "https://esm.sh/nostr-tools@2.10.4/nip19",
+            "nostr-tools/pure":  "https://esm.sh/nostr-tools@2.10.4/pure",
+            "nostr-tools/utils": "https://esm.sh/nostr-tools@2.10.4/utils",
+            "@noble/curves/secp256k1": "https://esm.sh/@noble/curves@1.8.1/secp256k1"
+        }
+    }
+    </script>
     <script src="storage-service.js"></script>
     <script src="js/database-service.js"></script>
     <script src="js/contacts-service.js"></script>
     <script src="js/dm-service.js"></script>
     <script src="js/dom-manager.js"></script>
     <script src="js/tauri-service.js"></script>
+    <script type="module" src="js/crypto-service.js"></script>
+    <script type="module" src="js/glossia-service.js"></script>
     <script src="js/email-service.js"></script>
     <script src="js/utils.js"></script>
     <script src="js/app-state.js"></script>
@@ -130,11 +144,26 @@
                             </div>
                         </div>
                     </div>
-                    
+
+                    <div class="form-group" id="bip39-encoding-group">
+                        <label for="bip39-encoding-select">Glossia Encoding:</label>
+                        <select id="bip39-encoding-select">
+                            <option value="">ASCII Armor (base64)</option>
+                            <option value="english:bip39">English - BIP39</option>
+                            <option value="latin:bip39">Latin</option>
+                            <!-- Latin HP requires cover file fallback fix in glossia -->
+                            <!-- <option value="latin:hp">Latin - Harry Potter</option> -->
+                        </select>
+                    </div>
+
                     <div class="form-actions">
                         <button id="encrypt-btn" class="btn btn-secondary" type="button">
                             <span class="encrypt-btn-icon"><i class="fas fa-lock"></i></span>
                             <span class="encrypt-btn-label">Encrypt</span>
+                        </button>
+                        <button id="encode-btn" class="btn btn-secondary" type="button" disabled>
+                            <span class="encode-btn-icon"><i class="fas fa-language"></i></span>
+                            <span class="encode-btn-label">Encode</span>
                         </button>
                         <button id="sign-btn" class="btn btn-secondary" type="button">
                             <span class="sign-btn-icon"><i class="fas fa-pen"></i></span>

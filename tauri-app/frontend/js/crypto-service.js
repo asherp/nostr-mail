@@ -6,7 +6,6 @@ const CryptoService = {
     _nip44: null,
     _nip19: null,
     _pure: null,
-    _utils: null,
     _schnorr: null,
     _ready: false,
     _initPromise: null,
@@ -19,19 +18,17 @@ const CryptoService = {
 
     async _doInit() {
         try {
-            const [nip04, nip44, nip19, pure, utils, noble] = await Promise.all([
+            const [nip04, nip44, nip19, pure, noble] = await Promise.all([
                 import('nostr-tools/nip04'),
                 import('nostr-tools/nip44'),
                 import('nostr-tools/nip19'),
                 import('nostr-tools/pure'),
-                import('nostr-tools/utils'),
                 import('@noble/curves/secp256k1'),
             ]);
             this._nip04 = nip04;
             this._nip44 = nip44;
             this._nip19 = nip19;
             this._pure = pure;
-            this._utils = utils;
             this._schnorr = noble.schnorr;
             this._ready = true;
             console.log('[CryptoService] loaded — nostr-tools crypto ready');
@@ -48,21 +45,25 @@ const CryptoService = {
     // ---- Key helpers ----
 
     _hexToBytes(hex) {
-        return this._utils.hexToBytes(hex);
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < hex.length; i += 2) {
+            bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+        }
+        return bytes;
     },
 
     _bytesToHex(bytes) {
-        return this._utils.bytesToHex(bytes);
+        return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
     },
 
-    /** Decode an nsec1 bech32 string to a hex secret key. */
-    _nsecToHex(nsec) {
+    /** Decode an nsec1 bech32 string to Uint8Array secret key. */
+    _nsecToBytes(nsec) {
         const { type, data } = this._nip19.decode(nsec);
         if (type !== 'nsec') throw new Error('Not an nsec key');
-        return this._bytesToHex(data);
+        return data;
     },
 
-    /** Decode an npub1 bech32 string to a hex public key. */
+    /** Decode an npub1 bech32 string to hex public key string. */
     _npubToHex(npub) {
         const { type, data } = this._nip19.decode(npub);
         if (type !== 'npub') throw new Error('Not an npub key');
@@ -99,15 +100,14 @@ const CryptoService = {
     },
 
     getPublicKeyFromPrivate(privateKey) {
-        const skHex = this._nsecToHex(privateKey);
-        const pkHex = this._pure.getPublicKey(this._hexToBytes(skHex));
+        const skBytes = this._nsecToBytes(privateKey);
+        const pkHex = this._pure.getPublicKey(skBytes);
         return this._nip19.npubEncode(pkHex);
     },
 
     async encryptMessageWithAlgorithm(privateKey, publicKey, message, algorithm) {
-        const skHex = this._nsecToHex(privateKey);
+        const skBytes = this._nsecToBytes(privateKey);
         const pkHex = this._npubToHex(publicKey);
-        const skBytes = this._hexToBytes(skHex);
 
         const algo = (algorithm || 'nip44').toLowerCase();
         if (algo === 'nip04') {
@@ -119,9 +119,8 @@ const CryptoService = {
     },
 
     async decryptDmContent(privateKey, senderPubkey, encryptedContent) {
-        const skHex = this._nsecToHex(privateKey);
+        const skBytes = this._nsecToBytes(privateKey);
         const pkHex = this._npubToHex(senderPubkey);
-        const skBytes = this._hexToBytes(skHex);
 
         // Try NIP-44 first
         try {
@@ -162,8 +161,7 @@ const CryptoService = {
     },
 
     async signData(privateKey, data) {
-        const skHex = this._nsecToHex(privateKey);
-        const skBytes = this._hexToBytes(skHex);
+        const skBytes = this._nsecToBytes(privateKey);
 
         // SHA-256 hash the data
         const encoder = new TextEncoder();
@@ -191,8 +189,7 @@ const CryptoService = {
     async encryptSettingValue(privateKey, value) {
         if (!value) return '';
 
-        const skHex = this._nsecToHex(privateKey);
-        const skBytes = this._hexToBytes(skHex);
+        const skBytes = this._nsecToBytes(privateKey);
 
         // Derive key: SHA-256("nostr-mail-settings-encryption-v1:" + secret_bytes)
         const prefix = new TextEncoder().encode('nostr-mail-settings-encryption-v1:');
@@ -221,8 +218,7 @@ const CryptoService = {
     async decryptSettingValue(privateKey, encryptedValue) {
         if (!encryptedValue) return '';
 
-        const skHex = this._nsecToHex(privateKey);
-        const skBytes = this._hexToBytes(skHex);
+        const skBytes = this._nsecToBytes(privateKey);
 
         // Derive key: same as encryptSettingValue
         const prefix = new TextEncoder().encode('nostr-mail-settings-encryption-v1:');

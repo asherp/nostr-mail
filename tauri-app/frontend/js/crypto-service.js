@@ -67,7 +67,8 @@ const CryptoService = {
     _npubToHex(npub) {
         const { type, data } = this._nip19.decode(npub);
         if (type !== 'npub') throw new Error('Not an npub key');
-        return this._bytesToHex(data);
+        // nip19.decode returns data as hex string for npub
+        return data;
     },
 
     // ---- Public API (mirrors TauriService crypto methods) ----

@@ -4009,8 +4009,8 @@ ${attachmentsHtml}
                     currentBody, bip39Settings.language, bip39Settings.wordlist, fallbackAlgorithm
                 );
                 // Detect format from decoded ciphertext and re-wrap in ASCII armor
-                const detectedAlgo = decoded.includes('?iv=') ? 'nip04' : 'nip44';
-                const armored = this.armorCiphertext(decoded, detectedAlgo);
+                const detectedAlgo = Utils.detectEncryptionFormat(decoded);
+                const armored = this.armorCiphertext(decoded, detectedAlgo === 'nip04' ? 'nip04' : 'nip44');
                 domManager.setValue('messageBody', armored);
             }
 

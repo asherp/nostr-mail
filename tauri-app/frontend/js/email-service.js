@@ -3980,8 +3980,9 @@ ${attachmentsHtml}
             return false;
         }
 
+        // Fallback algorithm for Tauri IPC path (WASM auto-detects)
         const settings = appState.getSettings();
-        const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+        const fallbackAlgorithm = settings?.encryption_algorithm || 'nip44';
 
         const encodeBtn = domManager.get('encodeBtn');
         if (encodeBtn) encodeBtn.disabled = true;
@@ -3997,7 +3998,7 @@ ${attachmentsHtml}
             if (currentSubject) {
                 console.log('[JS] Decoding subject with glossia...');
                 const decoded = await decodeFn(
-                    currentSubject, bip39Settings.language, bip39Settings.wordlist, encryptionAlgorithm
+                    currentSubject, bip39Settings.language, bip39Settings.wordlist, fallbackAlgorithm
                 );
                 domManager.setValue('subject', decoded);
             }
@@ -4005,10 +4006,11 @@ ${attachmentsHtml}
             if (currentBody) {
                 console.log('[JS] Decoding body with glossia...');
                 const decoded = await decodeFn(
-                    currentBody, bip39Settings.language, bip39Settings.wordlist, encryptionAlgorithm
+                    currentBody, bip39Settings.language, bip39Settings.wordlist, fallbackAlgorithm
                 );
-                // Re-wrap in ASCII armor
-                const armored = this.armorCiphertext(decoded, encryptionAlgorithm);
+                // Detect format from decoded ciphertext and re-wrap in ASCII armor
+                const detectedAlgo = decoded.includes('?iv=') ? 'nip04' : 'nip44';
+                const armored = this.armorCiphertext(decoded, detectedAlgo);
                 domManager.setValue('messageBody', armored);
             }
 

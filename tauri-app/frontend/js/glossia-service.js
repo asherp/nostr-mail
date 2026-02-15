@@ -84,20 +84,24 @@ const GlossiaService = {
         return btoa(String.fromCharCode(...combined));
     },
 
-    _unpackNip04(decoded, algorithm) {
-        if (algorithm !== 'nip04') return decoded; // NIP-44, return as-is
-
-        const bytes = Uint8Array.from(atob(decoded), c => c.charCodeAt(0));
-        if (bytes.length < 2) throw new Error('Decoded data too short for NIP-04');
-
-        const payloadLen = (bytes[0] << 8) | bytes[1];
-        if (2 + payloadLen > bytes.length) {
-            throw new Error(`Invalid NIP-04 payload length: ${payloadLen} (total: ${bytes.length})`);
-        }
-
-        const payloadB64 = btoa(String.fromCharCode(...bytes.slice(2, 2 + payloadLen)));
-        const ivB64 = btoa(String.fromCharCode(...bytes.slice(2 + payloadLen)));
-        return payloadB64 + '?iv=' + ivB64;
+    /** Try to unpack NIP-04 binary format [len(2), payload, iv(16)].
+     *  Returns "base64?iv=base64" if it looks like packed NIP-04, otherwise
+     *  returns the decoded base64 as-is (NIP-44). */
+    _autoUnpack(decoded) {
+        try {
+            const bytes = Uint8Array.from(atob(decoded), c => c.charCodeAt(0));
+            if (bytes.length >= 2) {
+                const payloadLen = (bytes[0] << 8) | bytes[1];
+                const ivLen = bytes.length - 2 - payloadLen;
+                // NIP-04 AES-CBC uses a 16-byte IV
+                if (payloadLen > 0 && ivLen === 16) {
+                    const payloadB64 = btoa(String.fromCharCode(...bytes.slice(2, 2 + payloadLen)));
+                    const ivB64 = btoa(String.fromCharCode(...bytes.slice(2 + payloadLen)));
+                    return payloadB64 + '?iv=' + ivB64;
+                }
+            }
+        } catch (_) { /* not valid base64 or unpacking failed */ }
+        return decoded;
     },
 
     // ---- Backward-compatible API (used by email-service.js) ----
@@ -111,11 +115,11 @@ const GlossiaService = {
         return result.encoded_text;
     },
 
-    decode(text, language, wordlist, algorithm) {
+    decode(text, language, wordlist, _algorithm) {
         const resultJson = this._wasm.decode(text, language, wordlist);
         const result = JSON.parse(resultJson);
         if (result.error) throw new Error(result.error);
-        return this._unpackNip04(result.decoded_text, algorithm);
+        return this._autoUnpack(result.decoded_text);
     },
 
     // ---- New APIs from glossia native WASM ----

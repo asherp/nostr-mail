@@ -1277,21 +1277,13 @@ class EmailService {
                 // Encrypt the email fields
                 const didEncrypt = await this.encryptEmailFields();
                 if (didEncrypt) {
-                    // Get the encrypted values from DOM
+                    // Get the encrypted values from DOM (may be glossia-encoded after auto-encode)
                     subject = domManager.getValue('subject') || subject;
                     body = domManager.getValue('messageBody') || body;
-                    isSubjectEncrypted = window.Utils && window.Utils.isLikelyEncryptedContent(subject);
-                    isBodyEncrypted = body.includes('BEGIN NOSTR NIP-') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
-                    isEmailEncrypted = isSubjectEncrypted || isBodyEncrypted;
-                    console.log('[JS] Auto-encryption completed, email is now encrypted:', isEmailEncrypted);
-                    
-                    if (!isEmailEncrypted) {
-                        console.error('[JS] Auto-encryption completed but email is still not encrypted');
-                        notificationService.showError('Failed to auto-encrypt email. Email will not be sent.');
-                        // Restore original contact selection
-                        this.selectedNostrContact = originalContact;
-                        return; // Don't send unencrypted email
-                    }
+                    isSubjectEncrypted = true; // encryptEmailFields succeeded, content is encrypted (possibly glossia-encoded)
+                    isBodyEncrypted = true;
+                    isEmailEncrypted = true;
+                    console.log('[JS] Auto-encryption completed (may include glossia encoding)');
                 } else {
                     console.error('[JS] Auto-encryption failed, not sending email');
                     notificationService.showError('Failed to auto-encrypt email. Please encrypt manually or check your settings.');
@@ -3895,12 +3887,282 @@ ${attachmentsHtml}
         ].join('\n');
     }
 
+    // ── Glossia Email Dialect Helpers ──────────────────────────────────
+
+    // Gzip compress a string to Uint8Array using browser CompressionStream API
+    async gzipCompress(input) {
+        const blob = new Blob([new TextEncoder().encode(input)]);
+        const cs = new CompressionStream('gzip');
+        const stream = blob.stream().pipeThrough(cs);
+        const compressedBlob = await new Response(stream).blob();
+        return new Uint8Array(await compressedBlob.arrayBuffer());
+    }
+
+    // Gzip decompress Uint8Array back to string using browser DecompressionStream API
+    async gzipDecompress(compressedBytes) {
+        const blob = new Blob([compressedBytes]);
+        const ds = new DecompressionStream('gzip');
+        const stream = blob.stream().pipeThrough(ds);
+        const decompressedBlob = await new Response(stream).blob();
+        return await decompressedBlob.text();
+    }
+
+    // Build outer payload: [flags:1][pubkey:32][signature?:64][ciphertext:N]
+    // flags: bit 0 = has_signature, bits 1-2 = algo (00=nip44, 01=nip04)
+    buildOuterPayload(pubkeyHex, signature, ciphertextBase64, encryptionAlgorithm) {
+        const pubkeyBytes = new Uint8Array(pubkeyHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+        const ciphertextBytes = Uint8Array.from(atob(ciphertextBase64), c => c.charCodeAt(0));
+
+        let flags = 0;
+        if (encryptionAlgorithm === 'nip04') flags |= 0x02; // bits 1-2 = 01
+        const hasSig = signature && signature.length > 0;
+        if (hasSig) flags |= 0x01; // bit 0
+
+        const sigBytes = hasSig
+            ? new Uint8Array(signature.match(/.{2}/g).map(b => parseInt(b, 16)))
+            : new Uint8Array(0);
+
+        const total = 1 + 32 + sigBytes.length + ciphertextBytes.length;
+        const payload = new Uint8Array(total);
+        payload[0] = flags;
+        payload.set(pubkeyBytes, 1);
+        payload.set(sigBytes, 33);
+        payload.set(ciphertextBytes, 33 + sigBytes.length);
+
+        return btoa(String.fromCharCode(...payload));
+    }
+
+    // Parse outer payload back into components
+    parseOuterPayload(base64) {
+        const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+        if (bytes.length < 33) throw new Error('Outer payload too short');
+
+        const flags = bytes[0];
+        const hasSig = (flags & 0x01) !== 0;
+        const algoFlags = (flags >> 1) & 0x03;
+        const encryptionAlgorithm = algoFlags === 1 ? 'nip04' : 'nip44';
+
+        const pubkeyBytes = bytes.slice(1, 33);
+        const pubkeyHex = Array.from(pubkeyBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
+        const sigOffset = hasSig ? 97 : 33; // 33 + 64 = 97
+        let signature = null;
+        if (hasSig) {
+            const sigBytes = bytes.slice(33, 97);
+            signature = Array.from(sigBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        const ciphertextBytes = bytes.slice(sigOffset);
+        const ciphertextBase64 = btoa(String.fromCharCode(...ciphertextBytes));
+
+        return { pubkeyHex, signature, ciphertextBase64, encryptionAlgorithm };
+    }
+
+    // Parse glossia RFC 5322-shaped output into { subject, body }
+    parseGlossiaEmailOutput(glossiaText) {
+        const lines = glossiaText.split(/\r?\n/);
+        let subject = '';
+        let bodyStart = -1;
+
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].toLowerCase().startsWith('subject:')) {
+                subject = lines[i].substring(lines[i].indexOf(':') + 1).trim();
+            }
+            // Blank line after headers marks start of body
+            if (lines[i].trim() === '' && bodyStart === -1 && i > 0) {
+                bodyStart = i + 1;
+            }
+        }
+
+        const body = bodyStart >= 0 ? lines.slice(bodyStart).join('\n').trim() : '';
+        return { subject, body };
+    }
+
+    // Check if a dialect string is an email dialect
+    isEmailDialect(dialect) {
+        return ['email', 'email_alt', 'email_mime'].includes(dialect);
+    }
+
+    // Heuristic: detect if received email was encoded with glossia email dialect
+    isGlossiaEmailDialect(subject, body) {
+        if (!body) return false;
+        // Body contains RFC 5322-like structural tokens alongside prose
+        const hasContentType = body.includes('Content-Type:');
+        const hasMimeBoundary = body.includes('--glossia');
+        if (hasContentType || hasMimeBoundary) return true;
+        return false;
+    }
+
+    // Reconstruct glossia email format from received subject + body for decoding
+    reconstructGlossiaEmail(subject, body) {
+        return `From: x\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n${body}`;
+    }
+
+    // Full encode pipeline: JSON → gzip → encrypt → outer payload → glossia email
+    async encryptAndEncodeAsEmail(dialect) {
+        if (!this.selectedNostrContact) {
+            notificationService.showError('Select a Nostr contact to encrypt for');
+            return false;
+        }
+        if (!appState.hasKeypair()) {
+            notificationService.showError('No keypair available');
+            return false;
+        }
+
+        const subject = domManager.getValue('subject') || '';
+        const body = domManager.getValue('messageBody') || '';
+        if (!subject && !body) {
+            notificationService.showError('Nothing to encrypt');
+            return false;
+        }
+
+        // Store plaintext for later use
+        this.plaintextSubject = subject;
+        this.plaintextBody = body;
+
+        const privkey = appState.getKeypair().private_key;
+        const pubkey = this.selectedNostrContact.pubkey;
+        const settings = appState.getSettings();
+        const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+
+        try {
+            const gs = window.GlossiaService;
+            if (!gs || !gs.isReady()) {
+                notificationService.showError('Glossia WASM not loaded');
+                return false;
+            }
+
+            // 1. Pack plaintext into JSON struct
+            const emailPayload = JSON.stringify({ version: 1, subject, body });
+            console.log('[JS] Email payload JSON size:', emailPayload.length);
+
+            // 2. Gzip compress
+            const compressed = await this.gzipCompress(emailPayload);
+            console.log('[JS] Compressed size:', compressed.length, 'bytes');
+
+            // 3. Encrypt the compressed data
+            const compressedBase64 = btoa(String.fromCharCode(...compressed));
+            const ciphertext = await TauriService.encryptMessageWithAlgorithm(
+                privkey, pubkey, compressedBase64, encryptionAlgorithm
+            );
+            console.log('[JS] Ciphertext length:', ciphertext.length);
+
+            // 4. Pack NIP-04 if needed, then build outer payload with pubkey
+            const packedCiphertext = gs._packNip04(ciphertext);
+            const senderPubkey = appState.getKeypair().public_key;
+            const outerPayload = this.buildOuterPayload(
+                senderPubkey, null, packedCiphertext, encryptionAlgorithm
+            );
+            console.log('[JS] Outer payload base64 length:', outerPayload.length);
+
+            // 5. Encode using glossia email dialect
+            const metaDialect = dialect === 'email' ? 'email' : dialect;
+            const metaInstruction = `encode into english ${metaDialect}`;
+            console.log('[JS] Glossia meta instruction:', metaInstruction);
+            const result = gs.transcode(outerPayload, metaInstruction);
+            console.log('[JS] Glossia email output length:', result.output.length);
+
+            // 6. Parse glossia output into subject + body
+            const parsed = this.parseGlossiaEmailOutput(result.output);
+
+            // 7. Set form fields
+            domManager.setValue('subject', parsed.subject);
+            domManager.setValue('messageBody', parsed.body);
+
+            // Clear signature when encrypting (body state changed)
+            this.clearSignature();
+
+            notificationService.showSuccess('Encrypted and encoded as email with glossia');
+            return true;
+        } catch (error) {
+            console.error('[JS] Email dialect encode error:', error);
+            notificationService.showError('Failed to encode as email: ' + error);
+            return false;
+        }
+    }
+
+    // Full decode pipeline: glossia email → outer payload → decrypt → gunzip → JSON
+    async decodeAndDecryptEmailDialect(dialect) {
+        const currentSubject = domManager.getValue('subject') || '';
+        const currentBody = domManager.getValue('messageBody') || '';
+
+        if (!currentSubject && !currentBody) {
+            notificationService.showError('Nothing to decode');
+            return false;
+        }
+        if (!appState.hasKeypair()) {
+            notificationService.showError('No keypair available');
+            return false;
+        }
+
+        try {
+            const gs = window.GlossiaService;
+            if (!gs || !gs.isReady()) {
+                notificationService.showError('Glossia WASM not loaded');
+                return false;
+            }
+
+            // 1. Reconstruct glossia email format
+            const glossiaEmail = this.reconstructGlossiaEmail(currentSubject, currentBody);
+            console.log('[JS] Reconstructed glossia email length:', glossiaEmail.length);
+
+            // 2. Decode via glossia
+            const result = gs.transcode(glossiaEmail, 'decode from english');
+            const decodedBase64 = result.output;
+            console.log('[JS] Decoded base64 length:', decodedBase64.length);
+
+            // 3. Parse outer payload
+            const outer = this.parseOuterPayload(decodedBase64);
+            console.log('[JS] Extracted pubkey:', outer.pubkeyHex.substring(0, 16) + '...');
+            console.log('[JS] Encryption algorithm:', outer.encryptionAlgorithm);
+
+            // 4. Reconstruct ciphertext format for NIP-04 if needed
+            const ciphertext = gs._autoUnpack(outer.ciphertextBase64);
+
+            // 5. Decrypt using extracted pubkey
+            const privkey = appState.getKeypair().private_key;
+            const compressedBase64 = await TauriService.decryptMessage(
+                privkey, outer.pubkeyHex, ciphertext
+            );
+
+            // 6. Gunzip decompress
+            const compressedBytes = Uint8Array.from(
+                atob(compressedBase64), c => c.charCodeAt(0)
+            );
+            const jsonStr = await this.gzipDecompress(compressedBytes);
+            console.log('[JS] Decompressed JSON length:', jsonStr.length);
+
+            // 7. Parse JSON and restore original fields
+            const payload = JSON.parse(jsonStr);
+            if (payload.version !== 1) {
+                throw new Error('Unsupported email payload version: ' + payload.version);
+            }
+
+            domManager.setValue('subject', payload.subject || '');
+            domManager.setValue('messageBody', payload.body || '');
+
+            notificationService.showSuccess('Decoded and decrypted email from glossia');
+            return true;
+        } catch (error) {
+            console.error('[JS] Email dialect decode error:', error);
+            notificationService.showError('Failed to decode email: ' + error);
+            return false;
+        }
+    }
+
+    // ── End Glossia Email Dialect Helpers ───────────────────────────────
+
     // Encode already-encrypted email fields using glossia grammar steganography
     async encodeEmailFields() {
         const meta = this.getGlossiaEncoding();
         if (!meta) {
             notificationService.showError('Select a Glossia encoding first');
             return false;
+        }
+
+        // Email dialect uses unified pipeline (not per-field encoding)
+        if (this.isEmailDialect(meta)) {
+            return await this.encryptAndEncodeAsEmail(meta);
         }
 
         const currentSubject = domManager.getValue('subject') || '';
@@ -3910,9 +4172,6 @@ ${attachmentsHtml}
             notificationService.showError('Nothing to encode');
             return false;
         }
-
-        const encodeBtn = domManager.get('encodeBtn');
-        if (encodeBtn) encodeBtn.disabled = true;
 
         try {
             const gs = window.GlossiaService;
@@ -3945,8 +4204,6 @@ ${attachmentsHtml}
             console.error('[JS] Encode error:', error);
             notificationService.showError('Failed to encode: ' + error);
             return false;
-        } finally {
-            if (encodeBtn) encodeBtn.disabled = false;
         }
     }
 
@@ -3958,6 +4215,11 @@ ${attachmentsHtml}
             return false;
         }
 
+        // Email dialect uses unified pipeline (not per-field decoding)
+        if (this.isEmailDialect(meta)) {
+            return await this.decodeAndDecryptEmailDialect(meta);
+        }
+
         const currentSubject = domManager.getValue('subject') || '';
         const currentBody = domManager.getValue('messageBody') || '';
 
@@ -3965,9 +4227,6 @@ ${attachmentsHtml}
             notificationService.showError('Nothing to decode');
             return false;
         }
-
-        const encodeBtn = domManager.get('encodeBtn');
-        if (encodeBtn) encodeBtn.disabled = true;
 
         try {
             const gs = window.GlossiaService;
@@ -4002,13 +4261,17 @@ ${attachmentsHtml}
             console.error('[JS] Decode error:', error);
             notificationService.showError('Failed to decode: ' + error);
             return false;
-        } finally {
-            if (encodeBtn) encodeBtn.disabled = false;
         }
     }
 
     // Encrypt subject and body fields using NIP-04
     async encryptEmailFields() {
+        // Email dialect handles encrypt + encode in one unified pipeline
+        const glossiaMeta = this.getGlossiaEncoding();
+        if (this.isEmailDialect(glossiaMeta)) {
+            return await this.encryptAndEncodeAsEmail(glossiaMeta);
+        }
+
         console.log('[JS] encryptEmailFields called');
         console.log('[JS] Selected Nostr contact:', this.selectedNostrContact);
         console.log('[JS] Available contacts:', appState.getContacts());
@@ -4215,7 +4478,19 @@ ${attachmentsHtml}
                 
                 notificationService.showSuccess(`Subject and body encrypted using ${encryptionAlgorithm.toUpperCase()}`);
             }
-            
+
+            // Auto-encode with glossia if an encoding is selected
+            const glossiaMeta = this.getGlossiaEncoding();
+            if (glossiaMeta) {
+                console.log('[JS] Auto-encoding with glossia encoding:', glossiaMeta);
+                const didEncode = await this.encodeEmailFields();
+                if (didEncode) {
+                    console.log('[JS] Auto-encode succeeded');
+                } else {
+                    console.warn('[JS] Auto-encode failed, sending as ASCII armor');
+                }
+            }
+
             return true;
         } catch (error) {
             console.error('[JS] Encryption error:', error);

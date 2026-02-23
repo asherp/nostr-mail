@@ -33,9 +33,10 @@ const GlossiaService = {
         if (!select) return;
 
         const metaKeywords = [
-            { value: '',        label: 'ASCII Armor (base64)' },
-            { value: 'english', label: 'English' },
             { value: 'latin',   label: 'Latin' },
+            { value: 'english', label: 'English' },
+            { value: 'email',   label: 'Email' },
+            { value: '',        label: 'Base64' },
         ];
 
         select.innerHTML = '';

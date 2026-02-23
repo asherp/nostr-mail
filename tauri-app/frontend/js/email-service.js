@@ -3879,19 +3879,10 @@ ${attachmentsHtml}
         }
     }
 
-    // Get BIP39 encoding settings from the dropdown
-    getBip39Settings() {
+    // Get glossia meta encoding keyword from the dropdown
+    getGlossiaEncoding() {
         const select = document.getElementById('bip39-encoding-select');
-        const value = select ? select.value : '';
-        if (!value) return null;
-        const parts = value.split(':');
-        // Format: "language:wordlist:dialect" (e.g. "english:bip39:body")
-        // Fallback for legacy "language:wordlist" format
-        return {
-            language: parts[0],
-            wordlist: parts[1],
-            dialect: parts[2] || 'body',
-        };
+        return select ? select.value : '';
     }
 
     // Wrap raw ciphertext in ASCII armor
@@ -3906,8 +3897,8 @@ ${attachmentsHtml}
 
     // Encode already-encrypted email fields using glossia grammar steganography
     async encodeEmailFields() {
-        const bip39Settings = this.getBip39Settings();
-        if (!bip39Settings) {
+        const meta = this.getGlossiaEncoding();
+        if (!meta) {
             notificationService.showError('Select a Glossia encoding first');
             return false;
         }
@@ -3924,33 +3915,28 @@ ${attachmentsHtml}
         if (encodeBtn) encodeBtn.disabled = true;
 
         try {
-            // Use WASM GlossiaService if available, fall back to Tauri IPC
-            const useWasm = window.GlossiaService && window.GlossiaService.isReady();
-            const encodeFn = useWasm
-                ? (ct, lang, wl, m) => window.GlossiaService.encode(ct, lang, wl, m)
-                : (ct, lang, wl, m) => TauriService.encodeBip39(ct, lang, wl, m);
-            console.log('[JS] Encoding via', useWasm ? 'WASM' : 'Tauri IPC');
+            const gs = window.GlossiaService;
+            if (!gs || !gs.isReady()) {
+                notificationService.showError('Glossia WASM not loaded');
+                return false;
+            }
 
-            // Encode subject: strip any non-armor content — the subject is raw ciphertext (no armor wrapper)
+            // Encode subject
             if (currentSubject) {
-                console.log('[JS] Encoding subject with glossia...');
-                const encoded = await encodeFn(
-                    currentSubject.trim(), bip39Settings.language, bip39Settings.wordlist, 'subject'
-                );
-                domManager.setValue('subject', encoded);
+                console.log('[JS] Encoding subject with transcode("encode into ' + meta + ' subject")...');
+                const result = gs.transcode(currentSubject.trim(), `encode into ${meta} subject`);
+                domManager.setValue('subject', result.output);
             }
 
             // Encode body: strip ASCII armor to get raw ciphertext, then encode
             if (currentBody) {
-                console.log('[JS] Encoding body with glossia...');
+                console.log('[JS] Encoding body with transcode("encode into ' + meta + '")...');
                 const armorMatch = currentBody.match(
                     /-----BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE-----\s*([\s\S]+?)\s*-----END NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE-----/
                 );
                 const rawCipher = armorMatch ? armorMatch[1].replace(/\s+/g, '') : currentBody.trim();
-                const encoded = await encodeFn(
-                    rawCipher, bip39Settings.language, bip39Settings.wordlist, 'body'
-                );
-                domManager.setValue('messageBody', encoded);
+                const result = gs.transcode(rawCipher, `encode into ${meta}`);
+                domManager.setValue('messageBody', result.output);
             }
 
             notificationService.showSuccess('Encoded with glossia');
@@ -3966,8 +3952,8 @@ ${attachmentsHtml}
 
     // Decode glossia-encoded email fields back to ASCII-armored ciphertext
     async decodeEmailFields() {
-        const bip39Settings = this.getBip39Settings();
-        if (!bip39Settings) {
+        const meta = this.getGlossiaEncoding();
+        if (!meta) {
             notificationService.showError('Select the Glossia encoding that was used');
             return false;
         }
@@ -3980,38 +3966,34 @@ ${attachmentsHtml}
             return false;
         }
 
-        // Fallback algorithm for Tauri IPC path (WASM auto-detects)
-        const settings = appState.getSettings();
-        const fallbackAlgorithm = settings?.encryption_algorithm || 'nip44';
-
         const encodeBtn = domManager.get('encodeBtn');
         if (encodeBtn) encodeBtn.disabled = true;
 
         try {
-            // Use WASM GlossiaService if available, fall back to Tauri IPC
-            const useWasm = window.GlossiaService && window.GlossiaService.isReady();
-            const decodeFn = useWasm
-                ? (t, lang, wl, alg) => window.GlossiaService.decode(t, lang, wl, alg)
-                : (t, lang, wl, alg) => TauriService.decodeBip39(t, lang, wl, alg);
-            console.log('[JS] Decoding via', useWasm ? 'WASM' : 'Tauri IPC');
+            const gs = window.GlossiaService;
+            if (!gs || !gs.isReady()) {
+                notificationService.showError('Glossia WASM not loaded');
+                return false;
+            }
 
             if (currentSubject) {
-                console.log('[JS] Decoding subject with glossia...');
-                const decoded = await decodeFn(
-                    currentSubject, bip39Settings.language, bip39Settings.wordlist, fallbackAlgorithm
-                );
-                domManager.setValue('subject', decoded);
+                console.log('[JS] Decoding subject with transcode("decode from ' + meta + '")...');
+                const result = gs.transcode(currentSubject, `decode from ${meta}`);
+                domManager.setValue('subject', result.output);
             }
 
             if (currentBody) {
-                console.log('[JS] Decoding body with glossia...');
-                const decoded = await decodeFn(
-                    currentBody, bip39Settings.language, bip39Settings.wordlist, fallbackAlgorithm
-                );
-                // Detect format from decoded ciphertext and re-wrap in ASCII armor
+                console.log('[JS] Decoding body with transcode("decode from ' + meta + '")...');
+                const result = gs.transcode(currentBody, `decode from ${meta}`);
+                const decoded = result.output;
+                // Re-wrap in ASCII armor only if decoded content is actual ciphertext
                 const detectedAlgo = Utils.detectEncryptionFormat(decoded);
-                const armored = this.armorCiphertext(decoded, detectedAlgo === 'nip04' ? 'nip04' : 'nip44');
-                domManager.setValue('messageBody', armored);
+                if (detectedAlgo === 'nip04' || detectedAlgo === 'nip44') {
+                    const armored = this.armorCiphertext(decoded, detectedAlgo);
+                    domManager.setValue('messageBody', armored);
+                } else {
+                    domManager.setValue('messageBody', decoded);
+                }
             }
 
             notificationService.showSuccess('Decoded from glossia');

@@ -27,32 +27,25 @@ const GlossiaService = {
         }
     },
 
-    /** Populate the glossia encoding dropdown from available dialects. */
+    /** Populate the glossia encoding dropdown with meta encoding keywords. */
     _populateDialectDropdown() {
         const select = document.getElementById('bip39-encoding-select');
         if (!select) return;
 
-        try {
-            const languages = this.getAllDialects();
-            // Keep the first option (ASCII Armor / no encoding)
-            const firstOption = select.options[0];
-            select.innerHTML = '';
-            select.appendChild(firstOption);
+        const metaKeywords = [
+            { value: '',        label: 'ASCII Armor (base64)' },
+            { value: 'english', label: 'English' },
+            { value: 'latin',   label: 'Latin' },
+        ];
 
-            // Skip character-level dialects (CS) — they're for signatures, not email body
-            for (const lang of languages) {
-                for (const d of lang.dialects) {
-                    if (d.is_character_level) continue;
-                    const opt = document.createElement('option');
-                    opt.value = `${lang.language}:${d.payload_wordlist}:${d.dialect}`;
-                    opt.textContent = `${lang.language_display} - ${d.display_name}`;
-                    select.appendChild(opt);
-                }
-            }
-            console.log('[GlossiaService] Populated dialect dropdown with', select.options.length - 1, 'options');
-        } catch (e) {
-            console.warn('[GlossiaService] Failed to populate dialect dropdown:', e.message);
+        select.innerHTML = '';
+        for (const kw of metaKeywords) {
+            const opt = document.createElement('option');
+            opt.value = kw.value;
+            opt.textContent = kw.label;
+            select.appendChild(opt);
         }
+        console.log('[GlossiaService] Populated encoding dropdown with', select.options.length - 1, 'meta keywords');
     },
 
     isReady() {
@@ -120,6 +113,16 @@ const GlossiaService = {
         const result = JSON.parse(resultJson);
         if (result.error) throw new Error(result.error);
         return this._autoUnpack(result.decoded_text);
+    },
+
+    // ---- Transcode API (meta-instruction based) ----
+
+    transcode(input, metaInstruction) {
+        const seed = BigInt(Math.floor(Math.random() * 2 ** 32));
+        const resultJson = this._wasm.transcode(input, metaInstruction, seed);
+        const result = JSON.parse(resultJson);
+        if (result.error) throw new Error(result.error);
+        return result;
     },
 
     // ---- New APIs from glossia native WASM ----

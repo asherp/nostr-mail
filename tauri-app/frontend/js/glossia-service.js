@@ -35,7 +35,7 @@ const GlossiaService = {
         const metaKeywords = [
             { value: 'latin',   label: 'Latin' },
             { value: 'english', label: 'English' },
-            { value: 'email',   label: 'Email' },
+            { value: 'english bip39', label: 'English - BIP39' },
             { value: '',        label: 'Base64' },
         ];
 

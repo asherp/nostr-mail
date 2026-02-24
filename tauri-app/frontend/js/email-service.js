@@ -3284,7 +3284,7 @@ ${attachmentsHtml}
             
             // Format the body with quoted original message
             // Split by lines and add > prefix to each line
-            const originalBody = decryptedBody || email.body || '';
+            const originalBody = email.body || '';
             let replyBody = '';
             
             if (originalBody.trim()) {
@@ -4034,33 +4034,26 @@ ${attachmentsHtml}
 
             // 1. Pack plaintext into JSON struct
             const emailPayload = JSON.stringify({ version: 1, subject, body });
-            console.log('[JS] Email payload JSON size:', emailPayload.length);
 
             // 2. Gzip compress
             const compressed = await this.gzipCompress(emailPayload);
-            console.log('[JS] Compressed size:', compressed.length, 'bytes');
 
             // 3. Encrypt the compressed data
             const compressedBase64 = btoa(String.fromCharCode(...compressed));
             const ciphertext = await TauriService.encryptMessageWithAlgorithm(
                 privkey, pubkey, compressedBase64, encryptionAlgorithm
             );
-            console.log('[JS] Ciphertext length:', ciphertext.length);
 
             // 4. Pack NIP-04 if needed, then build outer payload with pubkey
             const packedCiphertext = gs._packNip04(ciphertext);
-            const senderPubkey = appState.getKeypair().public_key;
+            const senderNpub = appState.getKeypair().public_key;
+            const senderHex = window.CryptoService._npubToHex(senderNpub);
             const outerPayload = this.buildOuterPayload(
-                senderPubkey, null, packedCiphertext, encryptionAlgorithm
+                senderHex, null, packedCiphertext, encryptionAlgorithm
             );
-            console.log('[JS] Outer payload base64 length:', outerPayload.length);
-
-            // 5. Encode using glossia email dialect
-            const metaDialect = dialect === 'email' ? 'email' : dialect;
-            const metaInstruction = `encode into english ${metaDialect}`;
-            console.log('[JS] Glossia meta instruction:', metaInstruction);
-            const result = gs.transcode(outerPayload, metaInstruction);
-            console.log('[JS] Glossia email output length:', result.output.length);
+            // 5. Encode using glossia email dialect via explicit pipeline
+            const target = `english/bip39/${dialect}`;
+            const result = gs.pipelineExecute(outerPayload, 'base64', target);
 
             // 6. Parse glossia output into subject + body
             const parsed = this.parseGlossiaEmailOutput(result.output);
@@ -4104,33 +4097,40 @@ ${attachmentsHtml}
 
             // 1. Reconstruct glossia email format
             const glossiaEmail = this.reconstructGlossiaEmail(currentSubject, currentBody);
-            console.log('[JS] Reconstructed glossia email length:', glossiaEmail.length);
 
-            // 2. Decode via glossia
-            const result = gs.transcode(glossiaEmail, 'decode from english');
+            // 2. Decode via glossia (english/bip39/email → base64)
+            const result = gs.pipelineExecute(glossiaEmail, 'english/bip39/email', 'base64');
             const decodedBase64 = result.output;
-            console.log('[JS] Decoded base64 length:', decodedBase64.length);
 
             // 3. Parse outer payload
             const outer = this.parseOuterPayload(decodedBase64);
-            console.log('[JS] Extracted pubkey:', outer.pubkeyHex.substring(0, 16) + '...');
-            console.log('[JS] Encryption algorithm:', outer.encryptionAlgorithm);
 
             // 4. Reconstruct ciphertext format for NIP-04 if needed
             const ciphertext = gs._autoUnpack(outer.ciphertextBase64);
 
-            // 5. Decrypt using extracted pubkey
+            // 5. Decrypt: try extracted sender pubkey first (recipient flow),
+            //    then selected contact pubkey (sender self-test / sent-folder flow)
             const privkey = appState.getKeypair().private_key;
-            const compressedBase64 = await TauriService.decryptMessage(
-                privkey, outer.pubkeyHex, ciphertext
-            );
+            const senderNpub = window.CryptoService._nip19.npubEncode(outer.pubkeyHex);
+            let compressedBase64;
+            try {
+                compressedBase64 = await TauriService.decryptDmContent(
+                    privkey, senderNpub, ciphertext
+                );
+            } catch (_) {
+                // Sender pubkey didn't work — try the selected contact (other party)
+                const contactPubkey = this.selectedNostrContact?.pubkey;
+                if (!contactPubkey) throw new Error('Decryption failed and no contact selected to try');
+                compressedBase64 = await TauriService.decryptDmContent(
+                    privkey, contactPubkey, ciphertext
+                );
+            }
 
             // 6. Gunzip decompress
             const compressedBytes = Uint8Array.from(
                 atob(compressedBase64), c => c.charCodeAt(0)
             );
             const jsonStr = await this.gzipDecompress(compressedBytes);
-            console.log('[JS] Decompressed JSON length:', jsonStr.length);
 
             // 7. Parse JSON and restore original fields
             const payload = JSON.parse(jsonStr);
@@ -4160,11 +4160,6 @@ ${attachmentsHtml}
             return false;
         }
 
-        // Email dialect uses unified pipeline (not per-field encoding)
-        if (this.isEmailDialect(meta)) {
-            return await this.encryptAndEncodeAsEmail(meta);
-        }
-
         const currentSubject = domManager.getValue('subject') || '';
         const currentBody = domManager.getValue('messageBody') || '';
 
@@ -4180,10 +4175,11 @@ ${attachmentsHtml}
                 return false;
             }
 
-            // Encode subject
+            // Encode subject (bitpack NIP-04 ciphertext for compactness)
             if (currentSubject) {
-                console.log('[JS] Encoding subject with transcode("encode into ' + meta + ' subject")...');
-                const result = gs.transcode(currentSubject.trim(), `encode into ${meta} subject`);
+                console.log('[JS] Encoding subject with transcode("encode into ' + meta + ' payload_only")...');
+                const packed = gs._packNip04(currentSubject.trim());
+                const result = gs.transcode(packed, `encode into ${meta} payload_only`);
                 domManager.setValue('subject', result.output);
             }
 
@@ -4215,11 +4211,6 @@ ${attachmentsHtml}
             return false;
         }
 
-        // Email dialect uses unified pipeline (not per-field decoding)
-        if (this.isEmailDialect(meta)) {
-            return await this.decodeAndDecryptEmailDialect(meta);
-        }
-
         const currentSubject = domManager.getValue('subject') || '';
         const currentBody = domManager.getValue('messageBody') || '';
 
@@ -4238,7 +4229,8 @@ ${attachmentsHtml}
             if (currentSubject) {
                 console.log('[JS] Decoding subject with transcode("decode from ' + meta + '")...');
                 const result = gs.transcode(currentSubject, `decode from ${meta}`);
-                domManager.setValue('subject', result.output);
+                // Unpack NIP-04 binary format if the subject was bitpacked on encode
+                domManager.setValue('subject', gs._autoUnpack(result.output));
             }
 
             if (currentBody) {
@@ -4266,12 +4258,6 @@ ${attachmentsHtml}
 
     // Encrypt subject and body fields using NIP-04
     async encryptEmailFields() {
-        // Email dialect handles encrypt + encode in one unified pipeline
-        const glossiaMeta = this.getGlossiaEncoding();
-        if (this.isEmailDialect(glossiaMeta)) {
-            return await this.encryptAndEncodeAsEmail(glossiaMeta);
-        }
-
         console.log('[JS] encryptEmailFields called');
         console.log('[JS] Selected Nostr contact:', this.selectedNostrContact);
         console.log('[JS] Available contacts:', appState.getContacts());

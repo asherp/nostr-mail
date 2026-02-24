@@ -754,16 +754,36 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     }
                     const privkey = appState.getKeypair().private_key;
                     const pubkey = window.emailService?.selectedNostrContact?.pubkey;
-                    const armoredBody = domManager.getValue('messageBody') || '';
-                    const encryptedSubject = domManager.getValue('subject') || '';
-                    // Regex for both NIP-04 and NIP-44 armored messages
-                    const match = armoredBody.match(/-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----/);
+                    let currentBody = domManager.getValue('messageBody') || '';
+                    let currentSubject = domManager.getValue('subject') || '';
+
+                    // Auto-decode glossia if body doesn't have ASCII armor markers
                     let decryptedAny = false;
-                    if (privkey && pubkey) {
-                        // Decrypt subject if it looks encrypted
-                        if (window.Utils && window.Utils.isLikelyEncryptedContent(encryptedSubject)) {
+                    const hasArmor = /-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----/.test(currentBody);
+                    if (!hasArmor && currentBody) {
+                        const glossiaMeta = window.emailService?.getGlossiaEncoding();
+                        if (glossiaMeta) {
+                            console.log('[JS] No ASCII armor found, attempting glossia decode first...');
                             try {
-                                const decryptedSubject = await TauriService.decryptDmContent(privkey, pubkey, encryptedSubject);
+                                const decoded = await window.emailService.decodeEmailFields();
+                                if (decoded) {
+                                    currentBody = domManager.getValue('messageBody') || '';
+                                    currentSubject = domManager.getValue('subject') || '';
+                                }
+                            } catch (err) {
+                                console.warn('[JS] Glossia decode failed, proceeding with raw content:', err);
+                            }
+                        }
+                    }
+
+                    if (privkey && pubkey) {
+                        // Standard armor-based decryption
+                        // Regex for both NIP-04 and NIP-44 armored messages
+                        const match = currentBody.match(/-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----/);
+                        // Decrypt subject if it looks encrypted
+                        if (window.Utils && window.Utils.isLikelyEncryptedContent(currentSubject)) {
+                            try {
+                                const decryptedSubject = await TauriService.decryptDmContent(privkey, pubkey, currentSubject);
                                 domManager.setValue('subject', decryptedSubject);
                                 notificationService.showSuccess('Subject decrypted');
                                 decryptedAny = true;
@@ -822,7 +842,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
         } else {
             console.error('[JS] Encrypt button not found in DOM');
         }
-        
+
         // Sign button
         const signBtn = domManager.get('signBtn');
         if (signBtn) {

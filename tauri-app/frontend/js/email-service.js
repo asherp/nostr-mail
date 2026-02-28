@@ -4177,9 +4177,9 @@ ${attachmentsHtml}
 
             // Encode subject (bitpack NIP-04 ciphertext for compactness)
             if (currentSubject) {
-                console.log('[JS] Encoding subject with transcode("encode into ' + meta + ' payload_only")...');
+                console.log('[JS] Encoding subject with transcode("encode into ' + meta + ' raw")...');
                 const packed = gs._packNip04(currentSubject.trim());
-                const result = gs.transcode(packed, `encode into ${meta} payload_only`);
+                const result = gs.transcode(packed, `encode into ${meta} raw`);
                 domManager.setValue('subject', result.output);
             }
 
@@ -4227,8 +4227,8 @@ ${attachmentsHtml}
             }
 
             if (currentSubject) {
-                console.log('[JS] Decoding subject with transcode("decode from ' + meta + '")...');
-                const result = gs.transcode(currentSubject, `decode from ${meta}`);
+                console.log('[JS] Decoding subject with transcode("decode from ' + meta + ' raw")...');
+                const result = gs.transcode(currentSubject, `decode from ${meta} raw`);
                 // Base-N codec returns hex; convert to base64 for NIP decrypt
                 const subjectOut = gs._isHex(result.output) ? gs._hexToBase64(result.output) : result.output;
                 // Unpack NIP-04 binary format if the subject was bitpacked on encode

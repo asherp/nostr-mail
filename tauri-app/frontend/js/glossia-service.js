@@ -98,6 +98,17 @@ const GlossiaService = {
         return decoded;
     },
 
+    /** Convert a hex string to base64. */
+    _hexToBase64(hex) {
+        const bytes = hex.match(/.{1,2}/g).map(b => parseInt(b, 16));
+        return btoa(String.fromCharCode(...bytes));
+    },
+
+    /** Returns true if the string is all hex characters with even length. */
+    _isHex(str) {
+        return str.length > 0 && str.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(str);
+    },
+
     // ---- Backward-compatible API (used by email-service.js) ----
 
     encode(ciphertext, language, wordlist, mode) {

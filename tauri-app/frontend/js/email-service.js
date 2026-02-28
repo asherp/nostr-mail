@@ -4229,14 +4229,17 @@ ${attachmentsHtml}
             if (currentSubject) {
                 console.log('[JS] Decoding subject with transcode("decode from ' + meta + '")...');
                 const result = gs.transcode(currentSubject, `decode from ${meta}`);
+                // Base-N codec returns hex; convert to base64 for NIP decrypt
+                const subjectOut = gs._isHex(result.output) ? gs._hexToBase64(result.output) : result.output;
                 // Unpack NIP-04 binary format if the subject was bitpacked on encode
-                domManager.setValue('subject', gs._autoUnpack(result.output));
+                domManager.setValue('subject', gs._autoUnpack(subjectOut));
             }
 
             if (currentBody) {
                 console.log('[JS] Decoding body with transcode("decode from ' + meta + '")...');
                 const result = gs.transcode(currentBody, `decode from ${meta}`);
-                const decoded = result.output;
+                // Base-N codec returns hex; convert to base64 for NIP decrypt
+                const decoded = gs._isHex(result.output) ? gs._hexToBase64(result.output) : result.output;
                 // Re-wrap in ASCII armor only if decoded content is actual ciphertext
                 const detectedAlgo = Utils.detectEncryptionFormat(decoded);
                 if (detectedAlgo === 'nip04' || detectedAlgo === 'nip44') {

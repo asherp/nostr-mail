@@ -3871,10 +3871,76 @@ ${attachmentsHtml}
         }
     }
 
-    // Get glossia meta encoding keyword from the dropdown
+    // Get glossia meta encoding keyword for body/ciphertext from settings
     getGlossiaEncoding() {
-        const select = document.getElementById('bip39-encoding-select');
-        return select ? select.value : '';
+        const settings = window.appState?.getSettings();
+        return settings?.glossia_encoding_body ?? 'latin';
+    }
+
+    // Get glossia meta encoding keyword for signature from settings
+    getGlossiaEncodingSignature() {
+        const settings = window.appState?.getSettings();
+        return settings?.glossia_encoding_signature ?? 'latin';
+    }
+
+    // Get glossia meta encoding keyword for pubkey from settings
+    getGlossiaEncodingPubkey() {
+        const settings = window.appState?.getSettings();
+        return settings?.glossia_encoding_pubkey ?? 'latin';
+    }
+
+    // Parse raw sig+pubkey blocks from body (Hex/no-glossia mode).
+    // Strips Seal block (with npub) from end, then Signature block if present.
+    parseRawSignedBody(fullBody) {
+        let body = fullBody;
+        let pubkeyHex = null;
+        let signatureHex = null;
+
+        // New format: Seal\n@name\nnpub1... or Seal\nnpub1...
+        const sealMatch = body.match(/\n\nSeal\n(?:@[^\n]*\n)?`?(npub1[a-z0-9]+)`?\s*$/);
+        // Legacy: **Seal**\n@name\n`npub1...`
+        const legacySealMatch = !sealMatch && body.match(/\n\n\*\*Seal\*\*\n(?:@[^\n]*\n)?`?(npub1[a-z0-9]+)`?\s*$/);
+        // Old format: bare npub as last paragraph
+        const npubMatch = sealMatch || legacySealMatch || body.match(/\n\n`?(npub1[a-z0-9]+)`?\s*$/);
+        if (npubMatch) {
+            try {
+                pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
+                body = body.substring(0, npubMatch.index);
+            } catch (_) { /* not a valid npub */ }
+        }
+
+        // Strip sig_nostr armored block from end (multi-line > quoted)
+        if (pubkeyHex) {
+            const gs = window.GlossiaService;
+            if (gs && gs.isReady()) {
+                // Match multi-line > quoted block or bare armor block
+                const sigArmorRegex = /\n\n((?:>\s*[^\n]*\n?)*-{3,}[^\n]*\n[\s\S]*?-{3,}[^\n]*)\s*$/;
+                const sigMatch = body.match(sigArmorRegex);
+                if (sigMatch) {
+                    try {
+                        // Strip > prefixes from each line
+                        const sigText = sigMatch[1].split('\n').map(l => l.replace(/^>\s*/, '')).join('\n').trim();
+                        const sigResult = gs.transcode(sigText, `decode from sig nostr`);
+                        let sigDecoded = sigResult.output;
+                        if (!gs._isHex(sigDecoded)) {
+                            sigDecoded = gs._base64ToHex(sigDecoded);
+                        }
+                        if (sigDecoded.length === 128) {
+                            signatureHex = sigDecoded;
+                            body = body.substring(0, sigMatch.index);
+                        }
+                    } catch (_) { /* not a sig_nostr block */ }
+                }
+            }
+
+            // Strip Signature header if present
+            const sigHeaderMatch = body.match(/\n\n(?:\*\*Signature\*\*|Signature)\s*$/);
+            if (sigHeaderMatch) {
+                body = body.substring(0, sigHeaderMatch.index);
+            }
+        }
+
+        return { body, pubkeyHex, signatureHex };
     }
 
     // Wrap raw ciphertext in ASCII armor
@@ -4237,9 +4303,55 @@ ${attachmentsHtml}
 
             if (currentBody) {
                 console.log('[JS] Decoding body with transcode("decode from ' + meta + '")...');
-                const result = gs.transcode(currentBody, `decode from ${meta}`);
+
+                // Strip embedded pubkey/signature blocks before decoding body
+                let bodyToDecode = currentBody;
+                let extractedPubkey = null;
+                let extractedSignature = null;
+                try {
+                    const metaPubkey = this.getGlossiaEncodingPubkey();
+                    const metaSig = this.getGlossiaEncodingSignature();
+                    const parsed = gs.parseSignedBody(currentBody, metaPubkey, metaSig);
+                    if (parsed.pubkeyHex) {
+                        bodyToDecode = parsed.body;
+                        extractedPubkey = parsed.pubkeyHex;
+                        extractedSignature = parsed.signatureHex;
+                        console.log('[JS] Extracted pubkey from body:', extractedPubkey.substring(0, 16) + '...');
+                        if (extractedSignature) {
+                            console.log('[JS] Extracted signature from body:', extractedSignature.substring(0, 32) + '...');
+                        }
+                    }
+                } catch (parseErr) {
+                    console.warn('[JS] Failed to parse signed body, decoding as-is:', parseErr);
+                }
+
+                const result = gs.transcode(bodyToDecode, `decode from ${meta}`);
                 // Base-N codec returns hex; convert to base64 for NIP decrypt
                 const decoded = gs._isHex(result.output) ? gs._hexToBase64(result.output) : result.output;
+
+                // Verify signature against raw ciphertext if present
+                if (extractedSignature && extractedPubkey) {
+                    try {
+                        const npub = window.CryptoService._nip19.npubEncode(extractedPubkey);
+                        const isValid = await TauriService.verifySignature(npub, extractedSignature, decoded);
+                        console.log('[JS] Glossia body signature verification:', isValid ? 'VALID' : 'INVALID');
+                        this._lastBodySignatureValid = isValid;
+                        this._lastBodySenderPubkey = extractedPubkey;
+                        if (isValid) {
+                            notificationService.showSuccess('Signature verified (from body)');
+                        } else {
+                            notificationService.showWarning('Signature in body is INVALID');
+                        }
+                    } catch (verifyErr) {
+                        console.error('[JS] Signature verification failed:', verifyErr);
+                        this._lastBodySignatureValid = false;
+                        this._lastBodySenderPubkey = extractedPubkey;
+                    }
+                } else if (extractedPubkey) {
+                    this._lastBodySignatureValid = null; // unsigned but pubkey present
+                    this._lastBodySenderPubkey = extractedPubkey;
+                }
+
                 // Re-wrap in ASCII armor only if decoded content is actual ciphertext
                 const detectedAlgo = Utils.detectEncryptionFormat(decoded);
                 if (detectedAlgo === 'nip04' || detectedAlgo === 'nip44') {

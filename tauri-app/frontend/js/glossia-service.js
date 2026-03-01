@@ -20,33 +20,10 @@ const GlossiaService = {
             this._wasm = wasm;
             this._ready = true;
             console.log('[GlossiaService] WASM module loaded (glossia native)');
-            this._populateDialectDropdown();
         } catch (e) {
             console.warn('[GlossiaService] WASM not available, will fall back to Tauri:', e.message);
             this._ready = false;
         }
-    },
-
-    /** Populate the glossia encoding dropdown with meta encoding keywords. */
-    _populateDialectDropdown() {
-        const select = document.getElementById('bip39-encoding-select');
-        if (!select) return;
-
-        const metaKeywords = [
-            { value: 'latin',   label: 'Latin' },
-            { value: 'english', label: 'English' },
-            { value: 'english bip39', label: 'English - BIP39' },
-            { value: '',        label: 'Base64' },
-        ];
-
-        select.innerHTML = '';
-        for (const kw of metaKeywords) {
-            const opt = document.createElement('option');
-            opt.value = kw.value;
-            opt.textContent = kw.label;
-            select.appendChild(opt);
-        }
-        console.log('[GlossiaService] Populated encoding dropdown with', select.options.length - 1, 'meta keywords');
     },
 
     isReady() {
@@ -135,6 +112,141 @@ const GlossiaService = {
         const result = JSON.parse(resultJson);
         if (result.error) throw new Error(result.error);
         return result;
+    },
+
+    // ---- Pubkey / Signature encoding helpers ----
+
+    /** Encode a 32-byte hex pubkey.
+     *  With glossia encoding (meta): raw payload words.
+     *  Without (Hex mode): bech32 npub. */
+    encodePubkey(pubkeyHex, meta) {
+        if (!meta) return window.CryptoService._nip19.npubEncode(pubkeyHex);
+        const b64 = this._hexToBase64(pubkeyHex);
+        const result = this.transcode(b64, `encode into ${meta} raw`);
+        return result.output;
+    },
+
+    /** Encode a 64-byte hex signature.
+     *  With glossia encoding (meta): raw payload words.
+     *  Without (Hex mode): sig_nostr ASCII armor. */
+    encodeSignature(sigHex, meta) {
+        if (meta) {
+            const b64 = this._hexToBase64(sigHex);
+            const result = this.transcode(b64, `encode into ${meta} raw`);
+            return result.output;
+        }
+        const result = this.transcode(sigHex, `encode into sig nostr`);
+        return result.output;
+    },
+
+    /** Convert base64 string to hex. */
+    _base64ToHex(b64) {
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    },
+
+    /**
+     * Parse a glossia-encoded body to extract embedded pubkey and optional signature.
+     * Blocks are separated by \n\n; pubkey is last, signature (if present) is second-to-last.
+     * Returns { body, pubkeyHex, signatureHex } or { body } if no pubkey found.
+     */
+    parseSignedBody(fullBody, metaPubkey, metaSig) {
+        // Support old single-meta call signature for backwards compat
+        if (metaSig === undefined) metaSig = metaPubkey;
+
+        const paragraphs = fullBody.split('\n\n');
+        if (paragraphs.length < 2) {
+            return { body: fullBody, pubkeyHex: null, signatureHex: null };
+        }
+
+        let pubkeyHex = null;
+        let signatureHex = null;
+
+        // Extract pubkey from last paragraph.
+        // Format: "Seal\n@name\nfirst\nsecond" or "Seal\nfirst\nsecond"
+        // Legacy: "`pubkey`" or bare pubkey words
+        try {
+            let lastPara = paragraphs[paragraphs.length - 1].trim();
+            // Strip Seal header and @name line, collect remaining lines as pubkey
+            const lines = lastPara.split('\n');
+            // Filter out Seal header and @name lines
+            const pubkeyLines = lines.filter(l => {
+                const t = l.trim();
+                return t && t !== 'Seal' && t !== '**Seal**' && !t.startsWith('@');
+            });
+            // Join remaining lines, strip legacy tick marks
+            let pubkeyLine = pubkeyLines.join('').replace(/`/g, '');
+
+            if (!metaPubkey) {
+                // Bech32 mode: try nip19 decode
+                const { type, data } = window.CryptoService._nip19.decode(pubkeyLine);
+                if (type === 'npub') {
+                    pubkeyHex = data;
+                }
+            } else {
+                const result = this.transcode(pubkeyLine, `decode from ${metaPubkey} raw`);
+                let decoded = result.output;
+                if (!this._isHex(decoded)) {
+                    decoded = this._base64ToHex(decoded);
+                }
+                if (decoded.length === 64) {
+                    pubkeyHex = decoded;
+                }
+            }
+
+            if (pubkeyHex) {
+                paragraphs.pop();
+
+                // Strip @name paragraph if present (when Seal has blank line after it)
+                if (paragraphs.length >= 1) {
+                    const maybeAt = paragraphs[paragraphs.length - 1].trim();
+                    if (maybeAt.startsWith('@')) {
+                        paragraphs.pop();
+                    }
+                }
+
+                // Strip Seal header if present as its own paragraph
+                if (paragraphs.length >= 1) {
+                    const maybeSeal = paragraphs[paragraphs.length - 1].trim();
+                    if (maybeSeal === 'Seal' || maybeSeal === '**Seal**') {
+                        paragraphs.pop();
+                    }
+                }
+
+                // Try decode next paragraph as signature
+                // Multi-line > quoted: join lines, strip > prefixes
+                if (paragraphs.length >= 2) {
+                    try {
+                        let sigPara = paragraphs[paragraphs.length - 1].trim();
+                        sigPara = sigPara.split('\n').map(l => l.replace(/^>\s*/, '')).join(' ').trim();
+                        const sigInstruction = metaSig ? `decode from ${metaSig} raw` : `decode from sig nostr`;
+                        const sigResult = this.transcode(sigPara, sigInstruction);
+                        let sigDecoded = sigResult.output;
+                        if (!this._isHex(sigDecoded)) {
+                            sigDecoded = this._base64ToHex(sigDecoded);
+                        }
+                        if (sigDecoded.length === 128) {
+                            signatureHex = sigDecoded;
+                            paragraphs.pop();
+                        }
+                    } catch (_) { /* no signature block */ }
+                }
+
+                // Strip Signature header if present
+                if (paragraphs.length >= 1) {
+                    const maybeSigHeader = paragraphs[paragraphs.length - 1].trim();
+                    if (maybeSigHeader === 'Signature' || maybeSigHeader === '**Signature**') {
+                        paragraphs.pop();
+                    }
+                }
+            }
+        } catch (_) { /* no pubkey block */ }
+
+        return {
+            body: paragraphs.join('\n\n'),
+            pubkeyHex,
+            signatureHex
+        };
     },
 
     // ---- New APIs from glossia native WASM ----

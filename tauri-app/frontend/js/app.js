@@ -229,18 +229,21 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
         send_matching_dm: true,
         sync_cutoff_days: 365,
         emails_per_page: 50,
-        require_signature: true
+        require_signature: true,
+        glossia_encoding_body: 'latin',
+        glossia_encoding_signature: 'latin',
+        glossia_encoding_pubkey: 'latin'
     };
-    
+
     // Set default settings in appState
     appState.setSettings(defaultSettings);
-    
+
     // Clear localStorage settings
     localStorage.removeItem('nostr_mail_settings');
-    
+
     // Populate form with default values
     this.populateSettingsForm();
-    
+
     // Clear public key display
     this.renderProfilePubkey();
     
@@ -279,12 +282,15 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         hide_undecryptable_emails: true,
         automatically_encrypt: true,
         automatically_sign: true,
-        hide_unsigned_messages: true
+        hide_unsigned_messages: true,
+        glossia_encoding_body: 'latin',
+        glossia_encoding_signature: 'latin',
+        glossia_encoding_pubkey: 'latin'
     };
-    
+
     // Set default settings in appState
     appState.setSettings(defaultSettings);
-    
+
     // Update last loaded pubkey tracker BEFORE populating form
     // This ensures autosave knows which pubkey to save to
     appState.setLastLoadedPubkey(pubkey);
@@ -340,7 +346,10 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                 automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                 automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
-                hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false' // Default to true if not set
+                hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false', // Default to true if not set
+                glossia_encoding_body: dbSettings.glossia_encoding_body ?? dbSettings.glossia_encoding ?? 'latin',
+                glossia_encoding_signature: dbSettings.glossia_encoding_signature ?? dbSettings.glossia_encoding ?? 'latin',
+                glossia_encoding_pubkey: dbSettings.glossia_encoding_pubkey ?? dbSettings.glossia_encoding ?? 'latin'
             };
             
             appState.setSettings(settings);
@@ -737,7 +746,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         if (iconSpan) iconSpan.className = 'fas fa-unlock';
                         if (labelSpan) labelSpan.textContent = 'Decrypt';
                         encryptBtn.dataset.encrypted = 'true';
-                        // Disable editing
+                        // Disable editing while encrypted
                         if (subjectInput) subjectInput.disabled = true;
                         if (messageBodyInput) messageBodyInput.disabled = true;
                         // Update DM checkbox visibility
@@ -781,11 +790,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         // Regex for both NIP-04 and NIP-44 armored messages
                         const match = currentBody.match(/-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----/);
                         // Decrypt subject if it looks encrypted
+                        let detectedScheme = null;
                         if (window.Utils && window.Utils.isLikelyEncryptedContent(currentSubject)) {
                             try {
+                                detectedScheme = Utils.detectEncryptionFormat(currentSubject);
                                 const decryptedSubject = await TauriService.decryptDmContent(privkey, pubkey, currentSubject);
                                 domManager.setValue('subject', decryptedSubject);
-                                notificationService.showSuccess('Subject decrypted');
                                 decryptedAny = true;
                             } catch (err) {
                                 notificationService.showError('Failed to decrypt subject: ' + err);
@@ -793,6 +803,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         }
                         // Decrypt body if armored
                         if (match) {
+                            if (!detectedScheme || detectedScheme === 'unknown') {
+                                detectedScheme = match[1] === '04' ? 'nip04' : 'nip44';
+                            }
                             try {
                                 // Use the new manifest-aware decryption function
                                 await window.emailService.decryptBodyContent();
@@ -803,7 +816,6 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                 try {
                                     const decrypted = await TauriService.decryptDmContent(privkey, pubkey, encryptedContent);
                                     domManager.setValue('messageBody', decrypted);
-                                    notificationService.showSuccess('Body decrypted');
                                     decryptedAny = true;
                                     // Clear signature when decrypting (body state changed)
                                     if (window.emailService) window.emailService.clearSignature();
@@ -812,7 +824,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                 }
                             }
                         }
-                        if (!decryptedAny) {
+                        if (decryptedAny) {
+                            const scheme = detectedScheme && detectedScheme !== 'unknown'
+                                ? detectedScheme.toUpperCase().replace('NIP', 'NIP-')
+                                : 'NIP';
+                            notificationService.showSuccess(`Decrypted with ${scheme}`);
+                        } else {
                             notificationService.showError('No encrypted message found in subject or body');
                         }
                     } else {
@@ -852,55 +869,137 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 const iconSpan = signBtn.querySelector('.sign-btn-icon i');
                 const labelSpan = signBtn.querySelector('.sign-btn-label');
                 const isSigned = signBtn.dataset.signed === 'true';
-                
+
+                const keypair = appState.getKeypair();
+                if (!keypair || !keypair.private_key) {
+                    notificationService.showError('No keypair available for signing.');
+                    return;
+                }
+
+                const gs = window.GlossiaService;
+                const metaSig = window.emailService?.getGlossiaEncodingSignature();
+                const metaPubkey = window.emailService?.getGlossiaEncodingPubkey();
+
                 if (!isSigned) {
-                    // Sign mode
+                    // Sign: immediately sign the current body and append glossia blocks
                     console.log('[JS] Sign button clicked');
-                    const subjectValue = domManager.getValue('subject') || '';
-                    const messageBodyValue = domManager.getValue('messageBody') || '';
-                    
-                    // Require both subject and body to sign
-                    if (!subjectValue || !messageBodyValue) {
-                        notificationService.showError('Both subject and message body must be filled to sign.');
+                    const bodyValue = domManager.getValue('messageBody') || '';
+                    if (!bodyValue) {
+                        notificationService.showError('Message body must be filled to sign.');
                         return;
                     }
-                    
-                    const keypair = appState.getKeypair();
-                    if (!keypair || !keypair.private_key) {
-                        return;
-                    }
-                    
+
                     try {
-                        // Sign the email body in whatever state it's in (encrypted or decrypted)
-                        const contentToSign = messageBodyValue; // Sign the current body state
-                        const signature = await TauriService.signData(keypair.private_key, contentToSign);
-                        
-                        console.log('[JS] Email signed successfully, signature:', signature.substring(0, 32) + '...');
-                        
-                        // Store signature for later use
-                        signBtn.dataset.signature = signature;
+                        const signature = await TauriService.signData(keypair.private_key, bodyValue);
+                        const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
+                        let encodedSig, encodedPubkey;
+
+                        if (gs && gs.isReady()) {
+                            // Glossia available: encode sig+pubkey with per-field settings
+                            encodedSig = gs.encodeSignature(signature, metaSig);
+                            encodedPubkey = gs.encodePubkey(pubkeyHex, metaPubkey);
+                        } else {
+                            // Glossia not loaded: append raw hex
+                            encodedSig = signature;
+                            encodedPubkey = pubkeyHex;
+                        }
+
+                        // Look up sender display name from profile cache or contacts
+                        let displayName = null;
+                        try {
+                            const cached = localStorage.getItem('nostr_mail_profiles');
+                            if (cached) {
+                                const profile = JSON.parse(cached)[keypair.public_key];
+                                displayName = profile?.fields?.name || profile?.fields?.display_name || null;
+                            }
+                        } catch (_) {}
+                        if (!displayName) {
+                            const contacts = appState.getContacts() || [];
+                            const selfContact = contacts.find(c => c.pubkey === pubkeyHex);
+                            displayName = selfContact?.name || null;
+                        }
+
+                        // Word-wrap signature with > quote prefix (≈72 chars per line)
+                        const wrapQuoted = (text, width = 72) => {
+                            const words = text.split(/\s+/);
+                            const lines = [];
+                            let line = '';
+                            for (const word of words) {
+                                if (line && (line.length + 1 + word.length) > width) {
+                                    lines.push('> ' + line);
+                                    line = word;
+                                } else {
+                                    line = line ? line + ' ' + word : word;
+                                }
+                            }
+                            if (line) lines.push('> ' + line);
+                            return lines.join('\n');
+                        };
+                        // Hex sig already has its own armor/wrapping; glossia gets > quoted
+                        let sigBlock;
+                        if (metaSig) {
+                            sigBlock = '\n\nSignature\n\n' + wrapQuoted(encodedSig);
+                        } else {
+                            sigBlock = '\n\n' + encodedSig;
+                        }
+
+                        // Split glossia-encoded pubkey evenly across two lines (not bech32)
+                        let pubkeyDisplay = encodedPubkey;
+                        if (metaPubkey) {
+                            const mid = Math.ceil(encodedPubkey.length / 2);
+                            pubkeyDisplay = encodedPubkey.slice(0, mid) + '\n' + encodedPubkey.slice(mid);
+                        }
+
+                        const newBody = bodyValue
+                            + sigBlock
+                            + '\n\nSeal\n'
+                            + (displayName ? '\n@' + displayName : '')
+                            + '\n' + pubkeyDisplay;
+                        domManager.setValue('messageBody', newBody);
+
                         signBtn.dataset.signed = 'true';
-                        
+                        signBtn.dataset.signature = signature;
                         if (iconSpan) iconSpan.className = 'fas fa-check-circle';
                         if (labelSpan) labelSpan.textContent = 'Signed';
                         signBtn.classList.add('signed');
-                        
-                        notificationService.showSuccess('Email signed successfully. Signature will be added when sending.');
+
+                        console.log('[JS] Body signed, sig+pubkey blocks appended');
+                        notificationService.showSuccess('Signed and appended to body.');
                     } catch (error) {
-                        console.error('[JS] Failed to sign email:', error);
-                        notificationService.showError('Failed to sign email: ' + error);
+                        console.error('[JS] Failed to sign:', error);
+                        notificationService.showError('Failed to sign: ' + error);
                     }
                 } else {
-                    // Unsigned mode
+                    // Unsign: strip the pubkey/sig blocks from body if present
                     console.log('[JS] Unsign button clicked');
+                    const bodyValue = domManager.getValue('messageBody') || '';
+                    if (bodyValue) {
+                        try {
+                            if (gs && gs.isReady()) {
+                                const parsed = gs.parseSignedBody(bodyValue, metaPubkey, metaSig);
+                                if (parsed.pubkeyHex) {
+                                    domManager.setValue('messageBody', parsed.body);
+                                    console.log('[JS] Stripped sig+pubkey blocks from body');
+                                }
+                            } else {
+                                // Glossia not loaded: strip raw hex blocks from bottom
+                                const parsed = window.emailService?.parseRawSignedBody(bodyValue);
+                                if (parsed && parsed.pubkeyHex) {
+                                    domManager.setValue('messageBody', parsed.body);
+                                    console.log('[JS] Stripped raw hex sig+pubkey blocks from body');
+                                }
+                            }
+                        } catch (err) {
+                            console.warn('[JS] Could not strip signature blocks:', err);
+                        }
+                    }
+
                     signBtn.dataset.signed = 'false';
                     delete signBtn.dataset.signature;
-                    
                     if (iconSpan) iconSpan.className = 'fas fa-pen';
                     if (labelSpan) labelSpan.textContent = 'Sign';
                     signBtn.classList.remove('signed');
-                    
-                    notificationService.showInfo('Email signature removed.');
+                    notificationService.showInfo('Signature removed.');
                 }
             });
         } else {
@@ -2664,7 +2763,10 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 hide_undecryptable_emails: (loadedSettings && loadedSettings.hide_undecryptable_emails !== undefined) ? loadedSettings.hide_undecryptable_emails : (domManager.get('hide-undecryptable-emails-preference')?.checked !== false),
                 automatically_encrypt: (loadedSettings && loadedSettings.automatically_encrypt !== undefined) ? loadedSettings.automatically_encrypt : (domManager.get('automatically-encrypt-preference')?.checked !== false),
                 automatically_sign: (loadedSettings && loadedSettings.automatically_sign !== undefined) ? loadedSettings.automatically_sign : (domManager.get('automatically-sign-preference')?.checked !== false),
-                hide_unsigned_messages: (loadedSettings && loadedSettings.hide_unsigned_messages !== undefined) ? loadedSettings.hide_unsigned_messages : (domManager.get('hide-unsigned-messages-preference')?.checked !== false)
+                hide_unsigned_messages: (loadedSettings && loadedSettings.hide_unsigned_messages !== undefined) ? loadedSettings.hide_unsigned_messages : (domManager.get('hide-unsigned-messages-preference')?.checked !== false),
+                glossia_encoding_body: (loadedSettings && loadedSettings.glossia_encoding_body != null) ? loadedSettings.glossia_encoding_body : (domManager.getValue('glossiaEncodingBody') ?? 'latin'),
+                glossia_encoding_signature: (loadedSettings && loadedSettings.glossia_encoding_signature != null) ? loadedSettings.glossia_encoding_signature : (domManager.getValue('glossiaEncodingSignature') ?? 'latin'),
+                glossia_encoding_pubkey: (loadedSettings && loadedSettings.glossia_encoding_pubkey != null) ? loadedSettings.glossia_encoding_pubkey : (domManager.getValue('glossiaEncodingPubkey') ?? 'latin')
             };
         } else {
             // Use form values (normal case)
@@ -2697,7 +2799,10 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 hide_undecryptable_emails: domManager.get('hide-undecryptable-emails-preference')?.checked !== false, // Default to true
                 automatically_encrypt: autoEncryptEnabled,
                 automatically_sign: autoSignPref?.checked !== false, // Default to true (will be true if auto-encrypt is enabled)
-                hide_unsigned_messages: domManager.get('hide-unsigned-messages-preference')?.checked !== false // Default to true
+                hide_unsigned_messages: domManager.get('hide-unsigned-messages-preference')?.checked !== false, // Default to true
+                glossia_encoding_body: domManager.getValue('glossiaEncodingBody') ?? 'latin',
+                glossia_encoding_signature: domManager.getValue('glossiaEncodingSignature') ?? 'latin',
+                glossia_encoding_pubkey: domManager.getValue('glossiaEncodingPubkey') ?? 'latin'
             };
         }
         
@@ -2736,6 +2841,9 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('automatically_encrypt', (settings.automatically_encrypt !== undefined ? settings.automatically_encrypt : true).toString());
             settingsMap.set('automatically_sign', (settings.automatically_sign !== undefined ? settings.automatically_sign : true).toString());
             settingsMap.set('hide_unsigned_messages', (settings.hide_unsigned_messages !== undefined ? settings.hide_unsigned_messages : true).toString());
+            settingsMap.set('glossia_encoding_body', settings.glossia_encoding_body ?? 'latin');
+            settingsMap.set('glossia_encoding_signature', settings.glossia_encoding_signature ?? 'latin');
+            settingsMap.set('glossia_encoding_pubkey', settings.glossia_encoding_pubkey ?? 'latin');
             
             const settingsObj = Object.fromEntries(settingsMap);
             // Get private key for encryption
@@ -2830,7 +2938,10 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'automatically-sign-preference',
         'hide-unsigned-messages-preference',
         'syncCutoffDays',
-        'emailsPerPage'
+        'emailsPerPage',
+        'glossiaEncodingBody',
+        'glossiaEncodingSignature',
+        'glossiaEncodingPubkey'
     ];
     
     settingsFields.forEach(fieldId => {
@@ -2974,6 +3085,9 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         }
         
         domManager.setValue('encryptionAlgorithm', settings.encryption_algorithm || 'nip44');
+        domManager.setValue('glossiaEncodingBody', settings.glossia_encoding_body ?? 'latin');
+        domManager.setValue('glossiaEncodingSignature', settings.glossia_encoding_signature ?? 'latin');
+        domManager.setValue('glossiaEncodingPubkey', settings.glossia_encoding_pubkey ?? 'latin');
         domManager.setValue('emailAddress', settings.email_address || '');
         domManager.setValue('emailPassword', settings.password || '');
         domManager.setValue('smtpHost', settings.smtp_host || '');

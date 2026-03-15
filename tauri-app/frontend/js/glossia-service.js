@@ -86,6 +86,23 @@ const GlossiaService = {
         return str.length > 0 && str.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(str);
     },
 
+    /** Decode glossia text directly to binary (Uint8Array).
+     *  Auto-detects dialect, then calls WASM decode_to_bytes.
+     *  Returns null if detection fails or no payload words found. */
+    decodeToBytes(text) {
+        if (!this._ready) return null;
+        const detections = this.detectDialect(text);
+        if (!Array.isArray(detections) || detections.length === 0) return null;
+        const { language, wordlist } = detections[0];
+        if (!language || !wordlist) return null;
+        try {
+            return this._wasm.decode_to_bytes(text, language, wordlist);
+        } catch (e) {
+            console.warn('[GlossiaService] decodeToBytes failed:', e);
+            return null;
+        }
+    },
+
     // ---- Backward-compatible API (used by email-service.js) ----
 
     encode(ciphertext, language, wordlist, mode) {
@@ -135,7 +152,8 @@ const GlossiaService = {
             const result = this.transcode(b64, `encode into ${meta} raw`);
             return result.output;
         }
-        const result = this.transcode(sigHex, `encode into sig nostr`);
+        const b64 = this._hexToBase64(sigHex);
+        const result = this.transcode(b64, `encode into cs/hex/sig_nostr`);
         return result.output;
     },
 
@@ -205,10 +223,10 @@ const GlossiaService = {
                     }
                 }
 
-                // Strip Seal header if present as its own paragraph
+                // Strip Seal header (or display name) if present as its own paragraph
                 if (paragraphs.length >= 1) {
                     const maybeSeal = paragraphs[paragraphs.length - 1].trim();
-                    if (maybeSeal === 'Seal' || maybeSeal === '**Seal**') {
+                    if (maybeSeal && !maybeSeal.includes('\n')) {
                         paragraphs.pop();
                     }
                 }
@@ -232,10 +250,10 @@ const GlossiaService = {
                     } catch (_) { /* no signature block */ }
                 }
 
-                // Strip Signature header if present
-                if (paragraphs.length >= 1) {
+                // Strip signature label if present (could be "Signature" or user's profile name)
+                if (signatureHex && paragraphs.length >= 1) {
                     const maybeSigHeader = paragraphs[paragraphs.length - 1].trim();
-                    if (maybeSigHeader === 'Signature' || maybeSigHeader === '**Signature**') {
+                    if (maybeSigHeader && !maybeSigHeader.includes('\n')) {
                         paragraphs.pop();
                     }
                 }

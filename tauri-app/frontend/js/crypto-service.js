@@ -161,12 +161,49 @@ const CryptoService = {
         return 'unknown';
     },
 
+    // Convert ciphertext to binary bytes for signing/verification.
+    // Tries glossia decode first (returns raw bytes directly), then
+    // falls back to base64/NIP-04 decoding for non-glossia content.
+    // Returns Uint8Array.
+    ciphertextToBytes(ciphertext) {
+        if (ciphertext instanceof Uint8Array) return ciphertext;
+
+        // Try glossia decode → binary (skips base64 round-trip)
+        const gs = window.GlossiaService;
+        if (gs && gs.isReady()) {
+            const bytes = gs.decodeToBytes(ciphertext);
+            if (bytes && bytes.length > 0) return bytes;
+        }
+
+        // Fallback: base64 or NIP-04 string
+        const str = ciphertext.trim();
+        const ivIdx = str.indexOf('?iv=');
+        if (ivIdx !== -1) {
+            // NIP-04: decode both parts and concatenate
+            const mainB64 = str.slice(0, ivIdx);
+            const ivB64 = str.slice(ivIdx + 4);
+            const mainBytes = Uint8Array.from(atob(mainB64), c => c.charCodeAt(0));
+            const ivBytes = Uint8Array.from(atob(ivB64), c => c.charCodeAt(0));
+            const combined = new Uint8Array(mainBytes.length + ivBytes.length);
+            combined.set(mainBytes);
+            combined.set(ivBytes, mainBytes.length);
+            return combined;
+        }
+        // NIP-44 or other pure base64
+        try {
+            return Uint8Array.from(atob(str), c => c.charCodeAt(0));
+        } catch (_) {
+            // Not base64 (plaintext) — encode as UTF-8
+            return new TextEncoder().encode(str);
+        }
+    },
+
     async signData(privateKey, data) {
         const skBytes = this._nsecToBytes(privateKey);
 
-        // SHA-256 hash the data
-        const encoder = new TextEncoder();
-        const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(data));
+        // Accept Uint8Array (binary) or string
+        const dataBytes = (data instanceof Uint8Array) ? data : new TextEncoder().encode(data);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', dataBytes);
         const messageHash = new Uint8Array(hashBuffer);
 
         // Schnorr sign
@@ -179,9 +216,9 @@ const CryptoService = {
         const pkBytes = this._hexToBytes(pkHex);
         const sigBytes = this._hexToBytes(signature);
 
-        // SHA-256 hash the data
-        const encoder = new TextEncoder();
-        const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(data));
+        // Accept Uint8Array (binary) or string
+        const dataBytes = (data instanceof Uint8Array) ? data : new TextEncoder().encode(data);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', dataBytes);
         const messageHash = new Uint8Array(hashBuffer);
 
         return this._schnorr.verify(sigBytes, messageHash, pkBytes);

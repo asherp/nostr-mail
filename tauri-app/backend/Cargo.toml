@@ -40,6 +40,8 @@ dirs = "5"
 zip = "2.1"
 tower = "0.4"
 sha2 = "0.10"
+glossia = { path = "../../glossia", default-features = false }
+rand = "0.8"
 
 # Android-specific dependencies (use rustls instead of native-tls)
 [target.'cfg(target_os = "android")'.dependencies]

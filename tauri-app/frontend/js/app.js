@@ -347,8 +347,8 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                 automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
                 hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false', // Default to true if not set
-                glossia_encoding_body: dbSettings.glossia_encoding_body ?? dbSettings.glossia_encoding ?? 'latin',
-                glossia_encoding_signature: dbSettings.glossia_encoding_signature ?? dbSettings.glossia_encoding ?? 'latin',
+                glossia_encoding_body: (dbSettings.glossia_encoding_body ?? dbSettings.glossia_encoding ?? 'latin') || 'latin',
+                glossia_encoding_signature: (dbSettings.glossia_encoding_signature ?? dbSettings.glossia_encoding ?? 'latin') || 'latin',
                 glossia_encoding_pubkey: dbSettings.glossia_encoding_pubkey ?? dbSettings.glossia_encoding ?? 'latin'
             };
             
@@ -752,7 +752,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         // Update DM checkbox visibility
                         if (window.emailService) window.emailService.updateDmCheckboxVisibility();
                         // Clear signature when encrypting (body state changed)
+                        // Preserve _plainBody and _htmlBody since encryptEmailFields() just rebuilt them
+                        const savedPlainBody = window.emailService._plainBody;
+                        const savedHtmlBody = window.emailService._htmlBody;
                         window.emailService.clearSignature();
+                        window.emailService._plainBody = savedPlainBody;
+                        window.emailService._htmlBody = savedHtmlBody;
                     }
                 } else {
                     // Decrypt mode
@@ -768,7 +773,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
 
                     // Auto-decode glossia if body doesn't have ASCII armor markers
                     let decryptedAny = false;
-                    const hasArmor = /-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----/.test(currentBody);
+                    const hasArmor = /-{3,}\s*BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE\s*-{3,}/.test(currentBody);
                     if (!hasArmor && currentBody) {
                         const glossiaMeta = window.emailService?.getGlossiaEncoding();
                         if (glossiaMeta) {
@@ -788,7 +793,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     if (privkey && pubkey) {
                         // Standard armor-based decryption
                         // Regex for both NIP-04 and NIP-44 armored messages
-                        const match = currentBody.match(/-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----/);
+                        const match = currentBody.match(/-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)-----/);
                         // Decrypt subject if it looks encrypted
                         let detectedScheme = null;
                         if (window.Utils && window.Utils.isLikelyEncryptedContent(currentSubject)) {
@@ -881,7 +886,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 const metaPubkey = window.emailService?.getGlossiaEncodingPubkey();
 
                 if (!isSigned) {
-                    // Sign: immediately sign the current body and append glossia blocks
+                    // Sign: sign the canonical ciphertext (decoded binary) if encrypted,
+                    // otherwise sign the plaintext body as-is
                     console.log('[JS] Sign button clicked');
                     const bodyValue = domManager.getValue('messageBody') || '';
                     if (!bodyValue) {
@@ -890,7 +896,17 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     }
 
                     try {
-                        const signature = await TauriService.signData(keypair.private_key, bodyValue);
+                        // Extract content from ASCII armor if present, otherwise use body as-is.
+                        // ciphertextToBytes handles glossia decode → binary, base64 → binary,
+                        // and NIP-04 (base64?iv=base64) → binary automatically.
+                        let dataToSign = bodyValue;
+                        const armorMatch = bodyValue.match(/-{3,}\s*BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
+                        if (armorMatch) {
+                            dataToSign = armorMatch[1].trim().replace(/\s+/g, '');
+                        }
+                        const dataBytes = window.CryptoService.ciphertextToBytes(dataToSign);
+                        console.log('[JS] Signing data (binary length:', dataBytes.length, ')');
+                        const signature = await TauriService.signData(keypair.private_key, dataBytes);
                         const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
                         let encodedSig, encodedPubkey;
 
@@ -904,19 +920,21 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             encodedPubkey = pubkeyHex;
                         }
 
-                        // Look up sender display name from profile cache or contacts
+                        // Look up sender name and display name from profile cache or contacts
+                        let profileName = null;
                         let displayName = null;
                         try {
                             const cached = localStorage.getItem('nostr_mail_profiles');
                             if (cached) {
                                 const profile = JSON.parse(cached)[keypair.public_key];
-                                displayName = profile?.fields?.name || profile?.fields?.display_name || null;
+                                profileName = profile?.fields?.name || null;
+                                displayName = profile?.fields?.display_name || null;
                             }
                         } catch (_) {}
-                        if (!displayName) {
+                        if (!profileName && !displayName) {
                             const contacts = appState.getContacts() || [];
                             const selfContact = contacts.find(c => c.pubkey === pubkeyHex);
-                            displayName = selfContact?.name || null;
+                            profileName = selfContact?.name || null;
                         }
 
                         // Word-wrap signature with > quote prefix (≈72 chars per line)
@@ -938,7 +956,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         // Hex sig already has its own armor/wrapping; glossia gets > quoted
                         let sigBlock;
                         if (metaSig) {
-                            sigBlock = '\n\nSignature\n\n' + wrapQuoted(encodedSig);
+                            sigBlock = '\n\n' + (profileName || 'Signature') + '\n\n' + wrapQuoted(encodedSig);
                         } else {
                             sigBlock = '\n\n' + encodedSig;
                         }
@@ -952,46 +970,75 @@ NostrMailApp.prototype.setupEventListeners = function() {
 
                         const newBody = bodyValue
                             + sigBlock
-                            + '\n\nSeal\n'
-                            + (displayName ? '\n@' + displayName : '')
+                            + '\n\n' + (displayName || 'Seal') + '\n'
                             + '\n' + pubkeyDisplay;
                         domManager.setValue('messageBody', newBody);
 
+                        // Verify the signature we just appended before showing checkmark
+                        const fullBody = domManager.getValue('messageBody');
+                        // For plaintext signed verification, pass the original body text
+                        const verifyResult = await window.emailService.verifyBodySignature(fullBody, dataToSign);
+                        if (!verifyResult.found || !verifyResult.signed) {
+                            domManager.setValue('messageBody', bodyValue);
+                            notificationService.showError('Could not verify signature. Body restored.');
+                            return;
+                        }
+                        if (!verifyResult.isValid) {
+                            domManager.setValue('messageBody', bodyValue);
+                            notificationService.showError('Signature verification failed. Body restored.');
+                            return;
+                        }
+
                         signBtn.dataset.signed = 'true';
                         signBtn.dataset.signature = signature;
+                        signBtn.dataset.originalBody = bodyValue;
                         if (iconSpan) iconSpan.className = 'fas fa-check-circle';
                         if (labelSpan) labelSpan.textContent = 'Signed';
                         signBtn.classList.add('signed');
 
-                        console.log('[JS] Body signed, sig+pubkey blocks appended');
-                        notificationService.showSuccess('Signed and appended to body.');
+                        // Build HTML alternative body for multipart email
+                        if (window.emailService) {
+                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(bodyValue, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey);
+                            // Build ASCII-armored plaintext body for text/plain MIME part
+                            const encBtn = domManager.get('encryptBtn');
+                            const isEncrypted = encBtn && encBtn.dataset.encrypted === 'true';
+                            const encAlgo = isEncrypted ? (appState.getSettings()?.encryption_algorithm || 'nip44') : null;
+                            // For plaintext signed emails, glossia-encode the body text
+                            let plainBodyText = bodyValue;
+                            if (!isEncrypted && gs && gs.isReady()) {
+                                const metaBody = window.emailService?.getGlossiaEncoding();
+                                if (metaBody) {
+                                    try {
+                                        const encoded = gs.transcode(bodyValue, `encode into ${metaBody}`);
+                                        plainBodyText = encoded.output;
+                                    } catch (e) {
+                                        console.warn('[JS] Failed to glossia-encode plaintext body:', e);
+                                    }
+                                }
+                            }
+                            window.emailService._plainBody = window.emailService.buildPlainBody(
+                                plainBodyText, encodedSig, encodedPubkey, profileName, displayName,
+                                isEncrypted, encAlgo
+                            );
+                            // Show armored format in textarea for plaintext signed emails
+                            if (!isEncrypted && window.emailService._plainBody) {
+                                domManager.setValue('messageBody', window.emailService._plainBody);
+                            }
+                        }
+
+                        console.log('[JS] Signature verified successfully');
+                        notificationService.showSuccess('Signed and verified.');
                     } catch (error) {
                         console.error('[JS] Failed to sign:', error);
                         notificationService.showError('Failed to sign: ' + error);
                     }
                 } else {
-                    // Unsign: strip the pubkey/sig blocks from body if present
+                    // Unsign: restore the original body saved at sign time
                     console.log('[JS] Unsign button clicked');
-                    const bodyValue = domManager.getValue('messageBody') || '';
-                    if (bodyValue) {
-                        try {
-                            if (gs && gs.isReady()) {
-                                const parsed = gs.parseSignedBody(bodyValue, metaPubkey, metaSig);
-                                if (parsed.pubkeyHex) {
-                                    domManager.setValue('messageBody', parsed.body);
-                                    console.log('[JS] Stripped sig+pubkey blocks from body');
-                                }
-                            } else {
-                                // Glossia not loaded: strip raw hex blocks from bottom
-                                const parsed = window.emailService?.parseRawSignedBody(bodyValue);
-                                if (parsed && parsed.pubkeyHex) {
-                                    domManager.setValue('messageBody', parsed.body);
-                                    console.log('[JS] Stripped raw hex sig+pubkey blocks from body');
-                                }
-                            }
-                        } catch (err) {
-                            console.warn('[JS] Could not strip signature blocks:', err);
-                        }
+                    if (signBtn.dataset.originalBody !== undefined) {
+                        domManager.setValue('messageBody', signBtn.dataset.originalBody);
+                        delete signBtn.dataset.originalBody;
+                        console.log('[JS] Restored original body from sign-time snapshot');
                     }
 
                     signBtn.dataset.signed = 'false';
@@ -999,6 +1046,13 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     if (iconSpan) iconSpan.className = 'fas fa-pen';
                     if (labelSpan) labelSpan.textContent = 'Sign';
                     signBtn.classList.remove('signed');
+
+                    // Clear HTML and plain alternative bodies
+                    if (window.emailService) {
+                        window.emailService._htmlBody = null;
+                        window.emailService._plainBody = null;
+                    }
+
                     notificationService.showInfo('Signature removed.');
                 }
             });

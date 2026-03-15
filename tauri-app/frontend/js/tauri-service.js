@@ -234,7 +234,7 @@ const TauriService = {
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
     },
-    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null) {
+    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -244,10 +244,13 @@ const TauriService = {
         }
         if (attachments) {
             args.attachments = attachments;
+        }
+        if (htmlBody) {
+            args.htmlBody = htmlBody;
         }
         return await this.invoke('send_email', args);
     },
-    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null) {
+    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -257,6 +260,9 @@ const TauriService = {
         }
         if (attachments) {
             args.attachments = attachments;
+        }
+        if (htmlBody) {
+            args.htmlBody = htmlBody;
         }
         return await this.invoke('construct_email_headers', args);
     },
@@ -442,8 +448,8 @@ const TauriService = {
      * You can use camelCase in JS and it will map to the expected snake_case Rust parameter.
      * See: https://tauri.app/v1/guides/features/command/#naming-conventions
      */
-    getDbEmails: async function(limit = 50, offset = 0, nostrOnly = true, userEmail = null) {
-        return await this.invoke('db_get_emails', { limit, offset, nostrOnly, userEmail: userEmail });
+    getDbEmails: async function(limit = 50, offset = 0, nostrOnly = null, userEmail = null, userPubkey = null) {
+        return await this.invoke('db_get_emails', { limit, offset, nostrOnly, userEmail, userPubkey });
     },
     searchEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
         return await this.invoke('db_search_emails', { searchQuery, userEmail, privateKey, limit, offset });

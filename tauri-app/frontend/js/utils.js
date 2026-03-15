@@ -4,6 +4,95 @@
 // Remove all import/export statements. Attach Utils to window. Replace any usage of imported symbols with window equivalents if needed.
 
 class Utils {
+    /**
+     * Render an HTML email body inside a sandboxed iframe.
+     * Call after the container element is in the DOM.
+     * @param {string} containerId - ID of the container div
+     * @param {string} htmlContent - Raw HTML body of the email
+     */
+    static renderHtmlBodyInIframe(containerId, htmlContent) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        // Clear existing content
+        container.innerHTML = '';
+        container.style.whiteSpace = 'normal';
+        const iframe = document.createElement('iframe');
+        iframe.sandbox = 'allow-same-origin';
+        iframe.style.width = '100%';
+        iframe.style.border = 'none';
+        iframe.style.overflow = 'hidden';
+        iframe.style.minHeight = '100px';
+        container.appendChild(iframe);
+        const doc = iframe.contentDocument || iframe.contentWindow.document;
+        // Inject dark mode aware base styles + the email HTML
+        const isDark = document.body.classList.contains('dark-mode');
+        doc.open();
+        const darkOverrides = isDark ? `
+            h4 { color: #9ca3af !important; }
+            blockquote, .seal-block { background: #1f2937 !important; border-color: #60a5fa !important; }
+            blockquote p, blockquote strong, .seal-block p, .seal-block strong { color: #e0e0e0 !important; }
+            blockquote code, .seal-block code { color: #93c5fd !important; }
+            div[style*="border-left"][style*="color:#888"],
+            div[style*="border-left"][style*="color: #888"] { color: #9ca3af !important; }
+            hr { border-color: #374151 !important; }
+        ` : '';
+        doc.write(`<!DOCTYPE html><html><head><style>
+            body { margin: 0; padding: 8px; font-family: sans-serif; line-height: 1.6;
+                   color: ${isDark ? '#e0e0e0' : '#111827'};
+                   background: ${isDark ? '#232946' : '#fff'}; }
+            img { max-width: 100%; height: auto; }
+            a { color: ${isDark ? '#93c5fd' : '#2563eb'}; }
+            ${darkOverrides}
+        </style></head><body>${htmlContent}</body></html>`);
+        doc.close();
+        // Auto-resize iframe to fit content
+        const resize = () => {
+            if (doc.body) {
+                iframe.style.height = doc.body.scrollHeight + 'px';
+            }
+        };
+        iframe.addEventListener('load', resize);
+        // Also resize after a short delay for late-loading content
+        setTimeout(resize, 100);
+        setTimeout(resize, 500);
+    }
+
+    /**
+     * Post-process a body container to wrap SIGNATURE and SEAL armor blocks
+     * in styled divs with a verification indicator placeholder.
+     * Works on plain-text bodies rendered as escaped HTML with <br> tags.
+     */
+    static decorateArmorBlocks(containerId) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        // Work on innerHTML — armor delimiters are escaped text with <br> newlines
+        let html = container.innerHTML;
+        // Match nested armor blocks (plaintext signed or encrypted+signed) that end with END NOSTR MESSAGE
+        // Must match before sigSealPattern to prevent partial matches on nested SIGNATURE/SEAL
+        const signedMsgPattern = /(-{3,}\s*BEGIN NOSTR (?:SIGNED|NIP-\d+ ENCRYPTED) MESSAGE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR MESSAGE\s*-{3,})/g;
+        let blockIndex = 0;
+        html = html.replace(signedMsgPattern, (match) => {
+            const id = `inline-sig-block-${blockIndex++}`;
+            return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
+        });
+        // Match signature block (optionally followed by seal block)
+        // Each block: ---+ BEGIN NOSTR (SIGNATURE|SEAL) ---+ ... ---+ END NOSTR (SIGNATURE|SEAL) ---+
+        const sigSealPattern = /(-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SIGNATURE\s*-{3,}(?:<br>)*(?:\s*<br>)*(?:\s*-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SEAL\s*-{3,})?)/g;
+        html = html.replace(sigSealPattern, (match) => {
+            const id = `inline-sig-block-${blockIndex++}`;
+            return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
+        });
+        // Also wrap standalone seal blocks (pubkey without signature)
+        const sealOnlyPattern = /(?<!<\/div>)(-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SEAL\s*-{3,})/g;
+        html = html.replace(sealOnlyPattern, (match) => {
+            const id = `inline-sig-block-${blockIndex++}`;
+            return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
+        });
+        if (blockIndex > 0) {
+            container.innerHTML = html;
+        }
+    }
+
     // Helper function to escape HTML
     static escapeHtml(text) {
         const div = document.createElement('div');
@@ -305,6 +394,53 @@ class Utils {
                                 content.includes('To:');
         
         return isBase64 && !hasEmailPatterns;
+    }
+
+    /**
+     * Detect encryption format from encrypted content
+     * Returns 'nip04', 'nip44', or 'unknown'
+     * @param {string} content - The encrypted content to analyze
+     * @returns {string} - The detected encryption format
+     */
+    static detectEncryptionFormat(content) {
+        if (!content || typeof content !== 'string') {
+            return 'unknown';
+        }
+
+        // Remove ASCII armor if present (for body content)
+        let cleanContent = content
+            .replace(/-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----/g, '')
+            .replace(/-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----/g, '')
+            .replace(/-----BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE-----/g, '')
+            .replace(/-----END NOSTR NIP-44 ENCRYPTED MESSAGE-----/g, '')
+            .trim();
+
+        // Check for NIP-04 format: base64?iv=base64
+        const nip04Pattern = /^[A-Za-z0-9+/=]+\?iv=[A-Za-z0-9+/=]+$/;
+        if (nip04Pattern.test(cleanContent)) {
+            return 'nip04';
+        }
+
+        // Check for NIP-44 format: versioned format (starts with version byte 1 or 2)
+        // NIP-44 is base64 encoded, and when decoded, the first byte indicates version
+        const base64Pattern = /^[A-Za-z0-9+/=]+$/;
+        if (base64Pattern.test(cleanContent)) {
+            try {
+                // Decode base64 to check version byte
+                const decoded = atob(cleanContent);
+                if (decoded.length > 0) {
+                    const versionByte = decoded.charCodeAt(0);
+                    // NIP-44 v1 uses version byte 1 (0x01), v2 uses version byte 2 (0x02)
+                    if (versionByte === 1 || versionByte === 2) {
+                        return 'nip44';
+                    }
+                }
+            } catch (e) {
+                // Not valid base64 or can't decode, fall through to unknown
+            }
+        }
+
+        return 'unknown';
     }
 } 
 window.Utils = Utils; 

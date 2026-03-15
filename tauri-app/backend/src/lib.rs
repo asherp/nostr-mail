@@ -375,6 +375,7 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         subject: email.subject.clone(),
         body: email.body.clone(),
         raw_body: email.body.clone(),
+        html_body: email.body_html.clone(),
         date: email.received_at,
         transport_auth_verified: email.transport_auth_verified,
         is_read: email.is_read,
@@ -433,6 +434,18 @@ async fn send_direct_message_persistent(
         },
         MessageContent::Encrypted(encrypted) => {
             println!("[RUST] Using pre-encrypted content");
+            // Detect the actual encryption format of the already-encrypted content
+            let detected_format = crypto::detect_encryption_format(&encrypted);
+            println!("[RUST] Detected encryption format: {} (algorithm parameter: {:?})", detected_format, encryption_algorithm);
+            
+            // Warn if detected format doesn't match the algorithm parameter
+            if let Some(alg_param) = encryption_algorithm {
+                let alg_normalized = alg_param.to_lowercase();
+                if detected_format != "unknown" && detected_format != alg_normalized {
+                    println!("[RUST] WARNING: Format mismatch! Detected format: {}, but algorithm parameter says: {}", detected_format, alg_normalized);
+                }
+            }
+            
             encrypted.clone()
         }
     };
@@ -1299,25 +1312,25 @@ async fn publish_nostr_event(private_key: String, content: String, kind: u16, ta
 }
 
 #[tauri::command]
-async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, _state: tauri::State<'_, AppState>) -> Result<(), String> {
-    println!("[RUST] send_email called with {} attachments", attachments.as_ref().map(|a| a.len()).unwrap_or(0));
-    
+async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, _state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] send_email called with {} attachments, html_body: {}", attachments.as_ref().map(|a| a.len()).unwrap_or(0), html_body.is_some());
+
     // Send the email via SMTP
     // Note: We don't save to database here - sent emails will be fetched from the server's sent folder via IMAP sync
     // This avoids duplicate entries and ensures we have the server's version with proper headers
-    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref())
+    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref())
         .await
         .map_err(|e| e.to_string())?;
-    
+
     println!("[RUST] send_email: Email sent successfully. It will appear in sent folder after IMAP sync.");
-    
+
     Ok(())
 }
 
 #[tauri::command]
-async fn construct_email_headers(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>) -> Result<String, String> {
-    println!("[RUST] construct_email_headers called with {} attachments", attachments.as_ref().map(|a| a.len()).unwrap_or(0));
-    email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref())
+async fn construct_email_headers(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>) -> Result<String, String> {
+    println!("[RUST] construct_email_headers called with {} attachments, html_body: {}", attachments.as_ref().map(|a| a.len()).unwrap_or(0), html_body.is_some());
+    email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref())
         .map_err(|e| e.to_string())
 }
 
@@ -2186,7 +2199,7 @@ fn db_get_email(message_id: String, state: tauri::State<AppState>) -> Result<Opt
 }
 
 #[tauri::command]
-fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
+fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
     println!("[RUST] db_get_emails called");
     if let Some(ref email) = user_email {
         println!("[RUST] db_get_emails: Filtering for user_email: {}", email);
@@ -2194,7 +2207,7 @@ fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<boo
         println!("[RUST] db_get_emails: No user_email filter provided");
     }
     let db = state.get_database()?;
-    let emails = db.get_emails(limit, offset, nostr_only, user_email.as_deref()).map_err(|e| e.to_string())?;
+    let emails = db.get_emails(limit, offset, nostr_only, user_email.as_deref(), user_pubkey.as_deref()).map_err(|e| e.to_string())?;
     let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
     println!("[RUST] Sending {} emails to frontend:", mapped.len());
     for (i, email) in mapped.iter().enumerate() {
@@ -2245,7 +2258,7 @@ async fn db_search_emails(
     
     // Process emails in batches until we have enough results
     loop {
-        let batch_emails = db.get_emails(Some(batch_size as i64), Some(db_offset), Some(true), user_email.as_deref())
+        let batch_emails = db.get_emails(Some(batch_size as i64), Some(db_offset), Some(true), user_email.as_deref(), None)
             .map_err(|e| e.to_string())?;
         
         if batch_emails.is_empty() {
@@ -2963,7 +2976,9 @@ fn db_get_decrypted_dms_for_conversation(
             },
             Err(e) => {
                 eprintln!(
-                    "[DM DECRYPT] Failed to decrypt message: sender={}, recipient={}, error={}",
+                    "[DM DECRYPT] Failed to decrypt message: db_id={:?}, event_id={}, sender={}, recipient={}, error={}",
+                    msg.id,
+                    msg.event_id,
                     msg.sender_pubkey,
                     msg.recipient_pubkey,
                     e
@@ -3028,7 +3043,7 @@ fn db_get_conversations_with_decrypted_last_message(
                 match crate::nostr::decrypt_dm_content(&private_key, decrypt_sender_pubkey, &encrypted_content) {
                     Ok(decrypted) => decrypted,
                     Err(e) => {
-                        println!("[RUST] Failed to decrypt last message for conversation {}: {}", conv.contact_pubkey, e);
+                        println!("[RUST] Failed to decrypt last message for conversation {}: event_id={}, error={}", conv.contact_pubkey, conv.last_message_event_id, e);
                         "[Failed to decrypt]".to_string()
                     }
                 }
@@ -3604,6 +3619,131 @@ fn encrypt_nip04_message_legacy(private_key: String, public_key: String, message
 fn encrypt_message_with_algorithm(private_key: String, public_key: String, message: String, algorithm: String) -> Result<String, String> {
     println!("[RUST] encrypt_message_with_algorithm called with algorithm: {}", algorithm);
     crypto::encrypt_message(&private_key, &public_key, &message, Some(&algorithm)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn encode_bip39(ciphertext: String, language: String, wordlist: String, mode: String) -> Result<String, String> {
+    use std::collections::HashSet;
+    use glossia::generator::{PayloadTok, Lexicon, GenerationMode, SentenceLengthMode};
+    use base64::Engine;
+
+    println!("[RUST] encode_bip39 called with language: {}, wordlist: {}, mode: {}", language, wordlist, mode);
+
+    // 1. Base64-decode the ciphertext to get raw binary bytes
+    //    NIP-04 format: base64?iv=base64 — decode both parts, prefix payload length as 2 bytes
+    //    NIP-44 format: plain base64
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let raw_bytes = if let Some((payload_b64, iv_b64)) = ciphertext.trim().split_once("?iv=") {
+        let payload_bytes = b64.decode(payload_b64)
+            .map_err(|e| format!("Failed to base64-decode NIP-04 payload: {}", e))?;
+        let iv_bytes = b64.decode(iv_b64)
+            .map_err(|e| format!("Failed to base64-decode NIP-04 IV: {}", e))?;
+        // Pack as: [payload_len_hi, payload_len_lo, payload_bytes..., iv_bytes...]
+        let payload_len = payload_bytes.len() as u16;
+        let mut combined = Vec::with_capacity(2 + payload_bytes.len() + iv_bytes.len());
+        combined.extend_from_slice(&payload_len.to_be_bytes());
+        combined.extend_from_slice(&payload_bytes);
+        combined.extend_from_slice(&iv_bytes);
+        println!("[RUST] NIP-04 format: {} payload + {} IV = {} combined bytes",
+            payload_bytes.len(), iv_bytes.len(), combined.len());
+        combined
+    } else {
+        b64.decode(ciphertext.trim())
+            .map_err(|e| format!("Failed to base64-decode ciphertext: {}", e))?
+    };
+    println!("[RUST] Total raw bytes to encode: {}", raw_bytes.len());
+
+    // 2. Encode raw bytes to BIP39 payload words
+    let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
+        .map_err(|e| format!("Failed to load wordlist: {}", e))?;
+    let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
+    let tree = glossia::WordlistTree::new(payload_words);
+    let encoded_words = glossia::codec::encode(&raw_bytes, &tree)
+        .map_err(|e| format!("BIP39 encoding failed: {:?}", e))?;
+
+    // 3. Build POS mapping and tag each encoded word
+    //    Fall back to Pos::N for words with unrecognized POS tags (e.g. Pron)
+    let pos_mapping = glossia::generator::data::build_pos_mapping_for_wordlist(&language, &wordlist)
+        .map_err(|e| format!("Failed to build POS mapping: {}", e))?;
+    let payload: Vec<PayloadTok> = encoded_words.iter().map(|word| {
+        let tags = pos_mapping.get(&word.to_lowercase()).cloned().unwrap_or_default();
+        if tags.is_empty() {
+            PayloadTok::new(word.clone(), &[glossia::types::Pos::N])
+        } else {
+            PayloadTok::new(word.clone(), &tags)
+        }
+    }).collect();
+    let payload_set: HashSet<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
+
+    // 4. Load cover words and build Lexicon
+    let (cover_by_pos, refined_cover) = glossia::generator::data::load_cover_words_by_pos_for_wordlist(&wordlist_set, &language, &wordlist);
+    let mut lex = Lexicon::new(payload_set, wordlist_set);
+    for (pos, words) in &cover_by_pos {
+        let word_refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        lex = lex.with_words(*pos, &word_refs);
+    }
+    lex = lex.with_refined_cover(refined_cover);
+
+    // 5. Generate grammatically correct text
+    let generation_mode = match mode.as_str() {
+        "subject" => GenerationMode::Subject,
+        _ => GenerationMode::Body,
+    };
+    println!("[RUST] Encoding {} payload words with {:?} mode", payload.len(), generation_mode);
+    let mut rng = rand::thread_rng();
+    let (text, _) = glossia::generator::core::generate_text(
+        &mut rng, &lex, &payload, false, generation_mode, &language,
+        3, 20, SentenceLengthMode::Compact, " ",
+    );
+
+    Ok(text)
+}
+
+#[tauri::command]
+fn decode_bip39(text: String, language: String, wordlist: String, algorithm: String) -> Result<String, String> {
+    use std::collections::HashSet;
+    use base64::Engine;
+
+    println!("[RUST] decode_bip39 called with language: {}, wordlist: {}, algorithm: {}", language, wordlist, algorithm);
+
+    // 1. Load wordlist and build tree
+    let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
+        .map_err(|e| format!("Failed to load wordlist: {}", e))?;
+    let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
+    let tree = glossia::WordlistTree::new(payload_words);
+
+    // 2. Filter text to extract only payload words (preserving order)
+    let extracted: Vec<String> = text.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()).to_lowercase())
+        .filter(|w| !w.is_empty() && wordlist_set.contains(w))
+        .collect();
+
+    if extracted.is_empty() {
+        return Err("No BIP39 words found in text".to_string());
+    }
+
+    // 3. Decode back to raw bytes
+    let bytes = glossia::codec::decode(&extracted, &tree)
+        .map_err(|e| format!("BIP39 decoding failed: {:?}", e))?;
+
+    // 4. Reconstruct the original ciphertext string
+    let b64 = base64::engine::general_purpose::STANDARD;
+    if algorithm == "nip04" {
+        // NIP-04: unpack [payload_len(2 bytes), payload_bytes..., iv_bytes...]
+        if bytes.len() < 2 {
+            return Err("Decoded data too short for NIP-04 format".to_string());
+        }
+        let payload_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+        if 2 + payload_len > bytes.len() {
+            return Err(format!("Invalid NIP-04 payload length: {} (total bytes: {})", payload_len, bytes.len()));
+        }
+        let payload_b64 = b64.encode(&bytes[2..2 + payload_len]);
+        let iv_b64 = b64.encode(&bytes[2 + payload_len..]);
+        Ok(format!("{}?iv={}", payload_b64, iv_b64))
+    } else {
+        // NIP-44: plain base64
+        Ok(b64.encode(&bytes))
+    }
 }
 
 #[tauri::command]
@@ -5027,6 +5167,8 @@ pub fn run() {
         encrypt_nip04_message,
         encrypt_nip04_message_legacy,
         encrypt_message_with_algorithm,
+        encode_bip39,
+        decode_bip39,
         db_save_relay,
         db_get_all_relays,
         db_delete_relay,
@@ -5140,15 +5282,17 @@ pub async fn http_db_get_emails(
     app_state: std::sync::Arc<AppState>,
     limit: usize,
     offset: usize,
-    nostr_only: bool,
+    nostr_only: Option<bool>,
     user_email: Option<String>,
+    user_pubkey: Option<String>,
 ) -> Result<Vec<DbEmail>, String> {
     let db = app_state.get_database()?;
     db.get_emails(
         Some(limit as i64),
         Some(offset as i64),
-        Some(nostr_only),
+        nostr_only,
         user_email.as_deref(),
+        user_pubkey.as_deref(),
     )
     .map_err(|e| e.to_string())
 }

@@ -23,11 +23,31 @@
     background-color: white;
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
-    max-width: 500px;
     width: 90%;
     max-height: 80vh;
     overflow: hidden;
 }
+
+#headersModal .modal {
+    height: 90vh;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+}
+
+#headersModal .modal-body {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+#headersModal .preview-tab-panel.active {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+}
+
 
 .modal-header {
     padding: var(--spacing-lg) var(--spacing-xl);
@@ -79,23 +99,97 @@
 
 /* Headers preview modal specific styles */
 .headers-preview {
-    background-color: #f8f9fa;
-    border: 1px solid #e9ecef;
-    border-radius: 8px;
-    padding: 20px;
     font-family: 'Courier New', monospace;
     font-size: 14px;
     line-height: 1.5;
     white-space: pre-wrap;
     word-wrap: break-word;
-    max-height: 400px;
-    overflow-y: auto;
 }
 
-body.dark-mode .headers-preview {
+.headers-preview pre {
+    margin: 0;
+}
+
+.preview-tab-panel[data-panel="raw"] {
+    background-color: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: 8px;
+    padding: 20px;
+}
+
+body.dark-mode .preview-tab-panel[data-panel="raw"] {
     background-color: #2d3748;
     border-color: #4a5568;
     color: #e2e8f0;
+}
+
+/* Preview modal tabs */
+.preview-tabs {
+    display: flex;
+    margin: 0;
+}
+
+.preview-tab {
+    padding: 6px 16px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    background: none;
+    font-size: 0.9em;
+    font-weight: 500;
+    color: #888;
+    cursor: pointer;
+    transition: color 0.2s, background-color 0.2s;
+}
+
+.preview-tab:hover {
+    color: #333;
+}
+
+.preview-tab.active {
+    color: #4a90d9;
+    background-color: rgba(74, 144, 217, 0.1);
+}
+
+body.dark-mode .preview-tabs {
+    border-bottom-color: #4a5568;
+}
+
+body.dark-mode .preview-tab {
+    color: #888;
+}
+
+body.dark-mode .preview-tab:hover {
+    color: #ccc;
+}
+
+body.dark-mode .preview-tab.active {
+    color: #7eb8f7;
+    background-color: rgba(126, 184, 247, 0.15);
+}
+
+.preview-tab-panel {
+    display: none;
+}
+
+.preview-tab-panel.active {
+    display: block;
+}
+
+.preview-tab-panel[data-panel="content"] {
+    background-color: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: 8px;
+    padding: 20px;
+}
+
+body.dark-mode .preview-tab-panel[data-panel="content"] {
+    background-color: #2d3748;
+    border-color: #4a5568;
+    color: #e2e8f0;
+}
+
+body.dark-mode .preview-tab-panel[data-panel="content"] .seal-block {
+    background: #1a202c !important;
 }
 
 .modal-footer {

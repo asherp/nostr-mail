@@ -1219,7 +1219,7 @@ impl Database {
         Ok(None)
     }
 
-    pub fn get_emails(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>) -> Result<Vec<Email>> {
+    pub fn get_emails(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>, user_pubkey: Option<&str>) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.unwrap_or(50);
         let offset = offset.unwrap_or(0);
@@ -1229,13 +1229,29 @@ impl Database {
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
-        if let Some(nostr_only) = nostr_only {
-            where_clauses.push("is_nostr_encrypted = ?");
-            params.push(Box::new(nostr_only));
+        if let Some(true) = nostr_only {
+            // "Nostr Emails Only": show nostr-encrypted, signed, or from contacts
+            if let Some(pubkey) = user_pubkey {
+                where_clauses.push(
+                    "(is_nostr_encrypted = 1 OR signature_valid IS NOT NULL \
+                     OR sender_pubkey IN (SELECT contact_pubkey FROM user_contacts WHERE user_pubkey = ?) \
+                     OR LOWER(TRIM(from_address)) IN (\
+                         SELECT LOWER(TRIM(c.email)) FROM contacts c \
+                         INNER JOIN user_contacts uc ON c.pubkey = uc.contact_pubkey \
+                         WHERE uc.user_pubkey = ? AND c.email IS NOT NULL AND c.email != ''\
+                     ))"
+                );
+                params.push(Box::new(pubkey.to_string()));
+                params.push(Box::new(pubkey.to_string()));
+            } else {
+                // No user_pubkey: fall back to just nostr-encrypted or signed
+                where_clauses.push("(is_nostr_encrypted = 1 OR signature_valid IS NOT NULL)");
+            }
         }
+        // When nostr_only is None ("All Emails"), no filter is applied
         if let Some(email) = user_email {
             where_clauses.push("LOWER(TRIM(to_address)) = LOWER(TRIM(?))");
-            params.push(Box::new(email));
+            params.push(Box::new(email.to_string()));
         }
         if !where_clauses.is_empty() {
             query.push_str(" WHERE ");
@@ -3076,14 +3092,49 @@ mod tests {
         e2.to_address = "inbox@example.com".to_string();
         db.save_email(&e2).unwrap();
 
-        // nostr_only = true
-        let nostr_only = db.get_emails(None, None, Some(true), None).unwrap();
+        // nostr_only = true (no user_pubkey: only encrypted emails)
+        let nostr_only = db.get_emails(None, None, Some(true), None, None).unwrap();
         assert_eq!(nostr_only.len(), 1);
         assert_eq!(nostr_only[0].message_id, "msg-e1@example.com");
 
-        // filter by user email
-        let by_email = db.get_emails(None, None, None, Some("inbox@example.com")).unwrap();
-        assert_eq!(by_email.len(), 2);
+        // nostr_only = None ("All Emails"): no filtering on nostr fields
+        let all = db.get_emails(None, None, None, Some("inbox@example.com"), None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Add a signed (non-encrypted) email
+        let mut e3 = make_email("msg-e3@example.com");
+        e3.is_nostr_encrypted = false;
+        e3.signature_valid = Some(true);
+        e3.to_address = "inbox@example.com".to_string();
+        db.save_email(&e3).unwrap();
+
+        // nostr_only = true should include signed emails
+        let nostr_filtered = db.get_emails(None, None, Some(true), Some("inbox@example.com"), None).unwrap();
+        assert_eq!(nostr_filtered.len(), 2); // e1 (encrypted) + e3 (signed)
+
+        // Add a contact and an email from that contact
+        let contact = make_contact("contact_pk_1");
+        db.save_contact(&contact).unwrap();
+        db.add_user_contact("my_pubkey", "contact_pk_1", true).unwrap();
+
+        let mut e4 = make_email("msg-e4@example.com");
+        e4.is_nostr_encrypted = false;
+        e4.signature_valid = None;
+        e4.sender_pubkey = Some("contact_pk_1".to_string());
+        e4.to_address = "inbox@example.com".to_string();
+        db.save_email(&e4).unwrap();
+
+        // nostr_only with user_pubkey should include contact's email
+        let with_contacts = db.get_emails(None, None, Some(true), Some("inbox@example.com"), Some("my_pubkey")).unwrap();
+        assert_eq!(with_contacts.len(), 3); // e1 (encrypted) + e3 (signed) + e4 (from contact)
+
+        // Without user_pubkey, contact email is not included
+        let without_contacts = db.get_emails(None, None, Some(true), Some("inbox@example.com"), None).unwrap();
+        assert_eq!(without_contacts.len(), 2); // e1 + e3 only
+
+        // "All Emails" shows everything
+        let all_emails = db.get_emails(None, None, None, Some("inbox@example.com"), None).unwrap();
+        assert_eq!(all_emails.len(), 4);
     }
 
     #[test]

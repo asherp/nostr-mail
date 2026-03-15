@@ -28,6 +28,7 @@ pub struct EmailMessage {
     pub subject: String,
     pub body: String,
     pub raw_body: String,
+    pub html_body: Option<String>,
     pub date: DateTime<Utc>,
     pub is_read: bool,
     pub raw_headers: String,

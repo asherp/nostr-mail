@@ -25,31 +25,38 @@ pub fn encrypt_message(private_key: &str, public_key: &str, message: &str, algor
     
     // Determine encryption algorithm (default to NIP-44)
     let algorithm = algorithm.unwrap_or("nip44");
+    println!("[CRYPTO] Encrypting message with algorithm: {} (message length: {} bytes)", algorithm, message.len());
     
     match algorithm {
         "nip04" => {
             // Use NIP-04 encryption (legacy)
+            println!("[CRYPTO] Using NIP-04 encryption (legacy format)");
             let encrypted = nip04::encrypt(&secret_key, &public_key, message)?;
+            println!("[CRYPTO] NIP-04 encryption successful, encrypted length: {} chars", encrypted.len());
             Ok(encrypted)
         },
         "nip44" => {
             // Use NIP-44 encryption (the proper way)
+            println!("[CRYPTO] Using NIP-44 encryption (modern format)");
             let encrypted = nip44::encrypt(
                 &secret_key,
                 &public_key,
                 message,
                 nip44::Version::default()
             )?;
+            println!("[CRYPTO] NIP-44 encryption successful, encrypted length: {} chars", encrypted.len());
             Ok(encrypted)
         },
         _ => {
             // Default to NIP-44 for unknown algorithms
+            println!("[CRYPTO] Unknown algorithm '{}', defaulting to NIP-44", algorithm);
             let encrypted = nip44::encrypt(
                 &secret_key,
                 &public_key,
                 message,
                 nip44::Version::default()
             )?;
+            println!("[CRYPTO] NIP-44 encryption successful (default), encrypted length: {} chars", encrypted.len());
             Ok(encrypted)
         }
     }
@@ -60,14 +67,77 @@ pub fn decrypt_message(private_key: &str, public_key: &str, encrypted_message: &
     let secret_key = SecretKey::from_bech32(private_key)?;
     let public_key = PublicKey::from_bech32(public_key)?;
     
-    // Use NIP-44 decryption (the proper way)
-    let decrypted = nip44::decrypt(
-        &secret_key,
-        &public_key,
-        encrypted_message
-    )?;
+    // Try NIP-44 first (newer standard)
+    match nip44::decrypt(&secret_key, &public_key, encrypted_message) {
+        Ok(decrypted) => {
+            println!("[CRYPTO] Successfully decrypted with NIP-44");
+            return Ok(decrypted);
+        }
+        Err(e) => {
+            println!("[CRYPTO] NIP-44 decryption failed: {:?}, trying NIP-04", e);
+        }
+    }
     
-    Ok(decrypted)
+    // Try NIP-04 format: base64(encrypted_content)?iv=base64(iv)
+    match nip04::decrypt(&secret_key, &public_key, encrypted_message) {
+        Ok(decrypted) => {
+            println!("[CRYPTO] Successfully decrypted with NIP-04");
+            return Ok(decrypted);
+        }
+        Err(e) => {
+            println!("[CRYPTO] NIP-04 decryption also failed: {:?}", e);
+        }
+    }
+    
+    Err(anyhow::anyhow!("Failed to decrypt with both NIP-04 and NIP-44. Content length: {}, Has '?iv=': {}", 
+        encrypted_message.len(), 
+        encrypted_message.contains("?iv=")))
+}
+
+/// Detect encryption format from encrypted content
+/// Returns "nip04", "nip44", or "unknown"
+pub fn detect_encryption_format(content: &str) -> String {
+    if content.is_empty() {
+        return "unknown".to_string();
+    }
+
+    // Remove ASCII armor if present (for body content)
+    let cleaned = content
+        .replace("-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----", "")
+        .replace("-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----", "")
+        .replace("-----BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE-----", "")
+        .replace("-----END NOSTR NIP-44 ENCRYPTED MESSAGE-----", "");
+    let clean_content = cleaned.trim();
+
+    // Check for NIP-04 format: base64?iv=base64
+    if clean_content.contains("?iv=") {
+        // Split on ?iv= to verify format
+        if let Some(pos) = clean_content.find("?iv=") {
+            let before_iv = &clean_content[..pos];
+            let after_iv = &clean_content[pos + 4..];
+            // Check if both parts are valid base64-like strings
+            if before_iv.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=') &&
+               after_iv.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=') {
+                return "nip04".to_string();
+            }
+        }
+    }
+
+    // Check for NIP-44 format: versioned format (starts with version byte 1 or 2)
+    // NIP-44 is base64 encoded, and when decoded, the first byte indicates version
+    if clean_content.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=') {
+        if let Ok(decoded) = general_purpose::STANDARD.decode(&clean_content) {
+            if !decoded.is_empty() {
+                let version_byte = decoded[0];
+                // NIP-44 v1 uses version byte 1 (0x01), v2 uses version byte 2 (0x02)
+                if version_byte == 1 || version_byte == 2 {
+                    return "nip44".to_string();
+                }
+            }
+        }
+    }
+
+    "unknown".to_string()
 }
 
 // Additional utility functions for working with nostr-sdk
@@ -121,6 +191,59 @@ pub fn sign_data(private_key: &str, data: &str) -> Result<String> {
     
     // Return signature as hex string (schnorr signatures are 64 bytes)
     Ok(hex::encode(signature.as_ref()))
+}
+
+/// Sign raw binary data using nostr schnorr signature
+pub fn sign_data_bytes(private_key: &str, data: &[u8]) -> Result<String> {
+    use ::secp256k1::{Message, Secp256k1, SecretKey as SecpSecretKey, Keypair, rand::rngs::OsRng};
+    use sha2::{Sha256, Digest};
+
+    let secret_key = SecretKey::from_bech32(private_key)?;
+    let secp = Secp256k1::new();
+    let secp_secret_key = SecpSecretKey::from_slice(&secret_key.secret_bytes())?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let message_hash = hasher.finalize();
+    let message = Message::from_digest_slice(&message_hash)?;
+
+    let keypair = Keypair::from_secret_key(&secp, &secp_secret_key);
+    let mut rng = OsRng;
+    let signature = secp.sign_schnorr_with_rng(&message, &keypair, &mut rng);
+
+    Ok(hex::encode(signature.as_ref()))
+}
+
+/// Verify a signature for raw binary data
+pub fn verify_signature_bytes(public_key: &str, signature: &str, data: &[u8]) -> Result<bool> {
+    use ::secp256k1::{Message, Secp256k1, XOnlyPublicKey};
+    use sha2::{Sha256, Digest};
+
+    let pubkey = PublicKey::from_bech32(public_key)?;
+    let secp = Secp256k1::verification_only();
+
+    let sig_bytes = hex::decode(signature).map_err(|e| anyhow::anyhow!("Invalid hex signature: {}", e))?;
+    if sig_bytes.len() != 64 {
+        return Ok(false);
+    }
+    let sig = ::secp256k1::schnorr::Signature::from_slice(&sig_bytes)?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let message_hash = hasher.finalize();
+    let message = Message::from_digest_slice(&message_hash)?;
+
+    let pubkey_hex = pubkey.to_hex();
+    let pubkey_bytes = hex::decode(&pubkey_hex).map_err(|e| anyhow::anyhow!("Invalid pubkey hex: {}", e))?;
+    if pubkey_bytes.len() != 32 {
+        return Ok(false);
+    }
+    let xonly_pubkey = XOnlyPublicKey::from_slice(&pubkey_bytes)?;
+
+    match secp.verify_schnorr(&sig, &message, &xonly_pubkey) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Verify a signature for arbitrary data (email body)

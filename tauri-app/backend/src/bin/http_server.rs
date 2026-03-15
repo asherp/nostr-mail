@@ -138,18 +138,21 @@ async fn invoke_handler(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
             let nostr_only = request.args.get("nostrOnly")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+                .and_then(|v| v.as_bool());
             let user_email = request.args.get("userEmail")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            
+            let user_pubkey = request.args.get("userPubkey")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
             match nostr_mail_lib::http_db_get_emails(
                 app_state.clone(),
                 limit,
                 offset,
                 nostr_only,
                 user_email,
+                user_pubkey,
             ).await {
                 Ok(emails) => Ok(serde_json::to_value(emails).unwrap()),
                 Err(e) => Err(e),

@@ -31,6 +31,8 @@ class EmailService {
         this.sentSearchOffset = 0; // Track pagination offset for sent search results
         this.searchHasMore = false; // Track if there are more search results
         this.sentSearchHasMore = false; // Track if there are more sent search results
+        this._htmlBody = null; // HTML alternative body for multipart emails
+        this._plainBody = null; // BIP39-armored plaintext body for text/plain MIME part
     }
 
     // Get appropriate background color for Nostr contact input based on dark mode
@@ -537,7 +539,7 @@ class EmailService {
         if (!body) return;
         
         // Check if body contains encrypted content
-        const encryptedBodyMatch = body.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+        const encryptedBodyMatch = body.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
         if (!encryptedBodyMatch) {
             console.log('[JS] Body is not encrypted');
             return;
@@ -839,11 +841,148 @@ class EmailService {
             if (iconSpan) iconSpan.className = 'fas fa-pen';
             if (labelSpan) labelSpan.textContent = 'Sign';
             signBtn.classList.remove('signed');
-            
+
             console.log('[JS] Signature cleared due to body state change');
         }
+        this._htmlBody = null;
+        this._plainBody = null;
     }
-    
+
+    // Inject a signature verification badge into an HTML email body.
+    // Finds the signature <h4> header and inserts a badge span after the header text.
+    injectHtmlSigBadge(htmlString, inlineSigResult) {
+        if (!inlineSigResult || !htmlString) return htmlString;
+        try {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(htmlString, 'text/html');
+            // Find all h4 elements — the signature header is the one before the border-left div
+            const h4s = doc.querySelectorAll('h4');
+            for (const h4 of h4s) {
+                const next = h4.nextElementSibling;
+                // Signature div has border-left style with italic text (not the seal blockquote)
+                if (next && next.tagName === 'DIV' && next.style.borderLeft && next.style.fontStyle === 'italic') {
+                    const badge = doc.createElement('span');
+                    if (inlineSigResult.isValid) {
+                        badge.style.cssText = 'display:inline-block;margin-left:8px;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:600;background:#d4edda;color:#155724;border:1px solid #c3e6cb;';
+                        badge.textContent = '\u2713 Verified';
+                    } else {
+                        badge.style.cssText = 'display:inline-block;margin-left:8px;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:600;background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;';
+                        badge.textContent = '\u2717 Invalid';
+                    }
+                    badge.className = 'sig-inline-badge';
+                    h4.appendChild(badge);
+                    break;
+                }
+            }
+            return doc.documentElement.outerHTML;
+        } catch (e) {
+            console.warn('[JS] injectHtmlSigBadge failed:', e);
+            return htmlString;
+        }
+    }
+
+    // Build HTML alternative body from plaintext components
+    buildHtmlAlt(bodyText, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey) {
+        const escHtml = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const bodyHtml = escHtml(bodyText).replace(/\n/g, '<br>');
+
+        let sigHtml = '';
+        if (encodedSig) {
+            const sigLabel = profileName ? escHtml(profileName) : 'Signature';
+            sigHtml = `
+  <hr style="border:none;border-top:1px solid #ccc;margin:1.5em 0;">
+  <h4 style="margin:0 0 0.5em;color:#666;font-size:0.9em;">${sigLabel}</h4>
+  <div style="border-left:2px solid #ccc;padding-left:1em;color:#888;font-style:italic;overflow-wrap:break-word;">
+    ${escHtml(encodedSig)}
+  </div>`;
+        }
+
+        let sealHtml = '';
+        if (encodedPubkey) {
+            const nameHtml = displayName ? `<p style="margin:0 0 0.5em;"><strong>@${escHtml(displayName)}</strong></p>` : '';
+            sealHtml = `
+  <h4 style="margin:1.5em 0 0.5em;color:#666;font-size:0.9em;">Seal</h4>
+  <blockquote class="seal-block" style="border-left:4px solid #4a90d9;background:#f0f4f8;padding:1em;margin:0;border-radius:4px;">
+    ${nameHtml}
+    <code style="overflow-wrap:break-word;font-size:0.85em;">${escHtml(encodedPubkey)}</code>
+  </blockquote>`;
+        }
+
+        return `<div style="font-family:sans-serif;line-height:1.6;">
+  <div>${bodyHtml}</div>${sigHtml}${sealHtml}
+</div>`;
+    }
+
+    // Build ASCII-armored plaintext body for text/plain MIME part.
+    // Same glossia-encoded content as buildHtmlAlt, but with ASCII armor instead of HTML formatting.
+    buildPlainBody(bodyText, encodedSig, encodedPubkey, profileName, displayName, isEncrypted, encryptionAlgorithm) {
+        const parts = [];
+
+        // Word-wrap text to ~72 chars per line
+        const wordWrap = (text, width = 72) => {
+            const words = text.split(/\s+/);
+            const lines = [];
+            let line = '';
+            for (const word of words) {
+                if (line && (line.length + 1 + word.length) > width) {
+                    lines.push(line);
+                    line = word;
+                } else {
+                    line = line ? line + ' ' + word : word;
+                }
+            }
+            if (line) lines.push(line);
+            return lines.join('\n');
+        };
+
+        // Signed emails (encrypted or plaintext): nested armor with sig+seal inside
+        if (bodyText && encodedSig) {
+            let beginTag;
+            if (isEncrypted) {
+                const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
+                beginTag = `----- BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE -----`;
+            } else {
+                beginTag = '----- BEGIN NOSTR SIGNED MESSAGE -----';
+            }
+            const lines = [beginTag];
+            lines.push(wordWrap(bodyText));
+            lines.push('----- BEGIN NOSTR SIGNATURE -----');
+            if (profileName) lines.push(`@${profileName}`);
+            lines.push(wordWrap(encodedSig));
+            if (encodedPubkey) {
+                lines.push('----- BEGIN NOSTR SEAL -----');
+                if (displayName) lines.push(`@${displayName}`);
+                lines.push(wordWrap(encodedPubkey));
+            }
+            lines.push('----- END NOSTR MESSAGE -----');
+            parts.push(lines.join('\n'));
+            return parts.join('\n\n');
+        }
+
+        // Unsigned: body only
+        if (isEncrypted && bodyText) {
+            const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
+            parts.push([
+                `----- BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE -----`,
+                wordWrap(bodyText),
+                `----- END NOSTR ${armorType} ENCRYPTED MESSAGE -----`
+            ].join('\n'));
+        } else if (bodyText) {
+            parts.push(bodyText);
+        }
+
+        // Unsigned pubkey-only seal (no signature)
+        if (encodedPubkey) {
+            const sealLines = ['----- BEGIN NOSTR SEAL -----'];
+            if (displayName) sealLines.push(`@${displayName}`);
+            sealLines.push(wordWrap(encodedPubkey));
+            sealLines.push('----- END NOSTR SEAL -----');
+            parts.push(sealLines.join('\n'));
+        }
+
+        return parts.join('\n\n');
+    }
+
     // Reset encrypt button state
     resetEncryptButtonState() {
         const encryptBtn = document.getElementById('encrypt-btn');
@@ -1034,9 +1173,10 @@ class EmailService {
                 const attachmentData = this.prepareAttachmentsForEmail();
                 console.log('[JS] Sending email with attachments:', attachmentData);
                 
-                await TauriService.sendEmail(emailConfig, toAddress, subject, body, null, messageId, attachmentData);
+                const plainBody = this._plainBody || body;
+                await TauriService.sendEmail(emailConfig, toAddress, subject, plainBody, null, messageId, attachmentData, this._htmlBody);
             }
-            
+
             console.log('[JS] Email sent successfully');
 
             // Trigger a sync of sent emails in the background (non-blocking)
@@ -1175,7 +1315,7 @@ class EmailService {
             };
             
             // Construct headers (sender's pubkey will be extracted from private_key in backend)
-            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId);
+            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId, null, this._htmlBody);
             
             // Debug: Log what headers we actually received
             console.log('[JS] Headers received from backend:');
@@ -1193,31 +1333,68 @@ class EmailService {
         }
     }
 
-    // Show headers in a modal
+    // Show headers and content preview in a tabbed modal
     showHeadersModal(headers) {
-        console.log('[JS] showHeadersModal called with headers:');
-        console.log(headers);
-        console.log('[JS] Headers type:', typeof headers);
-        console.log('[JS] Headers contains Message-ID in modal:', headers.includes('Message-ID'));
-        
+        console.log('[JS] showHeadersModal called with headers');
+
         // HTML escape the headers to prevent Message-ID from being interpreted as HTML tags
         const escapedHeaders = headers
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;');
-        
-        console.log('[JS] Escaped headers:');
-        console.log(escapedHeaders);
-        
+
+        // Envelope fields
+        const escHtml = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const settings = appState.getSettings() || {};
+        const fromAddr = escHtml(settings.email_address || '');
+        const toAddr = escHtml(domManager.getValue('toAddress') || '');
+        const subject = escHtml(domManager.getValue('subject') || '');
+
+        const envelopeHtml = `
+            <div style="margin-bottom:1em;font-size:0.95em;line-height:1.8;">
+                <div><strong>From:</strong> ${fromAddr}</div>
+                <div><strong>To:</strong> ${toAddr}</div>
+                <div><strong>Subject:</strong> ${subject}</div>
+            </div>
+            <hr style="border:none;border-top:1px solid #ccc;margin:0 0 1em;">`;
+
+        // Content tab: show HTML body if available, otherwise the plaintext body
+        let bodyHtml;
+        const hasHtml = !!this._htmlBody;
+        if (hasHtml) {
+            bodyHtml = '<div id="preview-html-body" class="email-detail-body"></div>';
+        } else {
+            const body = (domManager.getValue('messageBody') || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+            bodyHtml = `<div style="font-family:sans-serif;line-height:1.6;">${body}</div>`;
+        }
+        const contentHtml = envelopeHtml + bodyHtml;
+
+        // Raw source: headers + plaintext body + raw HTML source
+        const escBody = escHtml(this._plainBody || domManager.getValue('messageBody') || '');
+        const rawHtmlSource = this._htmlBody ? escHtml(this._htmlBody) : '';
+        let rawSource = escapedHeaders + '\n\n' + escBody;
+        if (rawHtmlSource) {
+            rawSource += '\n\n--- text/html ---\n\n' + rawHtmlSource;
+        }
+
         const modalHtml = `
             <div class="modal-overlay" id="headersModal">
-                <div class="modal-content">
+                <div class="modal-content modal">
                     <div class="modal-header">
-                        <h3>Email Headers Preview</h3>
+                        <h3>Preview</h3>
+                        <div class="preview-tabs">
+                            <button class="preview-tab active" data-tab="content">Content</button>
+                            <button class="preview-tab" data-tab="raw">Raw</button>
+                        </div>
                         <button class="modal-close" onclick="document.getElementById('headersModal').remove()">&times;</button>
                     </div>
                     <div class="modal-body">
-                        <div class="headers-preview">
-                            <pre>${escapedHeaders}</pre>
+                        <div class="preview-tab-panel active" data-panel="content">
+                            ${contentHtml}
+                        </div>
+                        <div class="preview-tab-panel" data-panel="raw">
+                            <div class="headers-preview">
+                                <pre>${rawSource}</pre>
+                            </div>
                         </div>
                     </div>
                     <div class="modal-footer">
@@ -1226,28 +1403,31 @@ class EmailService {
                 </div>
             </div>
         `;
-        
-        console.log('[JS] Modal HTML being inserted:');
-        console.log(modalHtml);
-        
+
         // Remove any existing modal
         const existingModal = document.getElementById('headersModal');
         if (existingModal) {
             existingModal.remove();
         }
-        
+
         // Add modal to page
         document.body.insertAdjacentHTML('beforeend', modalHtml);
-        
-        // After insertion, check what's actually in the pre tag
-        setTimeout(() => {
-            const preElement = document.querySelector('#headersModal pre');
-            if (preElement) {
-                console.log('[JS] Content in pre element after insertion:');
-                console.log(preElement.textContent);
-                console.log('[JS] Pre element contains Message-ID:', preElement.textContent.includes('Message-ID'));
-            }
-        }, 100);
+
+        // Render HTML body in iframe if present
+        if (hasHtml) {
+            Utils.renderHtmlBodyInIframe('preview-html-body', this._htmlBody);
+        }
+
+        // Wire up tab switching
+        const modal = document.getElementById('headersModal');
+        modal.querySelectorAll('.preview-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                modal.querySelectorAll('.preview-tab').forEach(t => t.classList.remove('active'));
+                modal.querySelectorAll('.preview-tab-panel').forEach(p => p.classList.remove('active'));
+                tab.classList.add('active');
+                modal.querySelector(`.preview-tab-panel[data-panel="${tab.dataset.tab}"]`).classList.add('active');
+            });
+        });
     }
 
     async sendEncryptedEmail(emailConfig, contact, subject, body, messageId) {
@@ -1333,7 +1513,8 @@ class EmailService {
             // Send encrypted email with the encrypted subject and body
             const attachmentData = this.prepareAttachmentsForEmail();
             console.log('[JS] Sending encrypted email with attachments:', attachmentData);
-            await TauriService.sendEmail(emailConfig, contact.email, subject, body, null, messageId, attachmentData);
+            const plainBody = this._plainBody || body;
+            await TauriService.sendEmail(emailConfig, contact.email, subject, plainBody, null, messageId, attachmentData, this._htmlBody);
             console.log('[JS] Encrypted email sent successfully');
         } catch (error) {
             console.error('[JS] Error sending encrypted email:', error);
@@ -1375,20 +1556,17 @@ class EmailService {
             };
             // Read filter preference from settings
             const emailFilter = settings.email_filter || 'nostr';
-            const onlyNostr = emailFilter === 'nostr';
+            const nostrOnly = emailFilter === 'nostr' ? true : null;
             // Get page size from settings (default to 50)
             const pageSize = settings.emails_per_page || 50;
             // Always pass the user's email address for filtering (only as recipient)
             const userEmail = settings.email_address ? settings.email_address : null;
-            console.log('[JS] getDbEmails userEmail:', userEmail);
-            console.log('[JS] Email filter preference:', emailFilter, 'onlyNostr:', onlyNostr);
+            // Pass user pubkey for contact-based filtering
+            const userPubkey = keypair ? keypair.public_key : null;
+            console.log('[JS] getDbEmails userEmail:', userEmail, 'userPubkey:', userPubkey);
+            console.log('[JS] Email filter preference:', emailFilter, 'nostrOnly:', nostrOnly);
             console.log('[JS] Loading emails with offset:', this.inboxOffset, 'pageSize:', pageSize);
-            let emails;
-            if (onlyNostr) {
-                emails = await TauriService.getDbEmails(pageSize, this.inboxOffset, true, userEmail);
-            } else {
-                emails = await TauriService.getDbEmails(pageSize, this.inboxOffset, false, userEmail);
-            }
+            const emails = await TauriService.getDbEmails(pageSize, this.inboxOffset, nostrOnly, userEmail, userPubkey);
             
             // Load attachments for each email in parallel with timeout
             console.log(`[JS] Loading attachments for ${emails.length} inbox emails`);
@@ -2308,7 +2486,7 @@ class EmailService {
                 let previewSubject = email.subject;
 
                 // Detect any NOSTR NIP-X ENCRYPTED MESSAGE
-                const armorRegex = /-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/;
+                const armorRegex = /-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}/;
                 if (email.body && armorRegex.test(email.body)) {
                     const keypair = appState.getKeypair();
                     if (!keypair) {
@@ -2327,7 +2505,7 @@ class EmailService {
                             }
                         }
                         // Decrypt body - try manifest format first, then fallback to legacy
-                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                         if (encryptedBodyMatch) {
                             const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
                             try {
@@ -2375,14 +2553,20 @@ class EmailService {
                         }
                     }
                 } else {
-                    previewText = Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
-                    if (email.body && email.body.length > 100) previewText += '...';
+                    // Decode glossia signed message body for preview
+                    let previewBody = email.body || '';
+                    const signedMsg = this.decodeGlossiaSignedMessage(previewBody);
+                    if (signedMsg && signedMsg.plaintextBody) {
+                        previewBody = signedMsg.plaintextBody;
+                    }
+                    previewText = Utils.escapeHtml(previewBody ? previewBody.substring(0, 100) : '');
+                    if (previewBody && previewBody.length > 100) previewText += '...';
                     showSubject = true;
                 }
 
                 // Check if email is decryptable (for filtering)
                 // Only hide if the body cannot be decrypted (subject decryption failure is less critical)
-                const isDecryptable = !previewText.includes('Unable to decrypt') && 
+                const isDecryptable = !previewText.includes('Unable to decrypt') &&
                                     !previewText.includes('Your private key could not decrypt this message') &&
                                     !previewText.includes('could not decrypt') &&
                                     !previewText.includes('Could not decrypt') &&
@@ -2786,35 +2970,64 @@ class EmailService {
                 const emailBody = email.body || '';
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
                 console.log('Sender pubkey for email:', senderPubkey);
-                const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
-                // Match on the original body, not cleaned version
-                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                const isEncryptedSubjectBase64 = Utils.isLikelyEncryptedContent(email.subject);
+                // Permissive regex: matches both base64 and glossia word content between armor markers
+                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                 let decryptedSubject = email.subject;
                 let decryptedBody = emailBody;
                 let originalSubject = email.subject;
                 let decryptionAttempted = false;
                 const keypair = appState.getKeypair();
-                if ((senderPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+
+                // Only try subject decryption if body is encrypted (has armor)
+                let subjectCiphertext = null;
+                if (encryptedBodyMatch) {
+                    if (isEncryptedSubjectBase64) {
+                        subjectCiphertext = email.subject;
+                    } else {
+                        subjectCiphertext = this.decodeGlossiaSubject(email.subject);
+                        if (subjectCiphertext) {
+                            console.log('[JS] Inbox: glossia-decoded subject to ciphertext');
+                        }
+                    }
+                }
+                const isEncryptedSubject = !!subjectCiphertext;
+
+                // Try glossia decode for body if armor content is not base64
+                let bodyCiphertext = null;
+                let bodyIsGlossia = false;
+                if (encryptedBodyMatch) {
+                    const armorContent = encryptedBodyMatch[2].trim();
+                    if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
+                        bodyCiphertext = armorContent.replace(/\s+/g, '');
+                    } else {
+                        const glossiaResult = this.decodeGlossiaArmoredBody(emailBody);
+                        if (glossiaResult) {
+                            bodyCiphertext = glossiaResult.ciphertext;
+                            bodyIsGlossia = true;
+                            console.log('[JS] Inbox: glossia-decoded body armor, dialect:', glossiaResult.dialect);
+                        }
+                    }
+                }
+
+                if ((isEncryptedSubject || bodyCiphertext) && keypair) {
                     (async () => {
                         let manifestResult = null;
                         try {
-                            if (isEncryptedSubject) {
-                                decryptedSubject = await this.decryptNostrMessageWithFallback(email, email.subject, keypair);
-                                // Check if decryption returned an error message
+                            if (isEncryptedSubject && subjectCiphertext) {
+                                decryptedSubject = await this.decryptNostrMessageWithFallback(email, subjectCiphertext, keypair);
                                 if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
                                     decryptedSubject = 'Unable to decrypt';
                                 }
                             }
-                            if (encryptedBodyMatch) {
-                                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                            if (bodyCiphertext) {
                                 try {
-                                    // Try manifest decryption first
                                     console.log('[JS] Attempting manifest decryption for detail view...');
-                                    manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                                    manifestResult = await this.decryptManifestMessage(email, bodyCiphertext, keypair);
                                     console.log('[JS] Detail view manifest result:', manifestResult);
                                     console.log('[JS] Manifest result type:', manifestResult.type);
                                     console.log('[JS] Manifest result body length:', manifestResult.body ? manifestResult.body.length : 'no body');
-                                    
+
                                     if (manifestResult.type === 'manifest') {
                                         console.log('[JS] Using manifest body for detail view:', manifestResult.body.substring(0, 100));
                                         decryptedBody = manifestResult.body;
@@ -2822,10 +3035,8 @@ class EmailService {
                                         console.log('[JS] Using legacy body for detail view:', manifestResult.body.substring(0, 100));
                                         decryptedBody = manifestResult.body;
                                     } else {
-                                        // Fallback to legacy decryption
                                         console.log('[JS] Falling back to legacy decryption for detail view...');
-                                        decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                        // Check if decryption returned an error message
+                                        decryptedBody = await this.decryptNostrMessageWithFallback(email, bodyCiphertext, keypair);
                                         if (decryptedBody && (decryptedBody.startsWith('Unable to decrypt') || decryptedBody.includes('Unable to decrypt'))) {
                                             decryptedSubject = 'Unable to decrypt';
                                             decryptedBody = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
@@ -2833,10 +3044,8 @@ class EmailService {
                                     }
                                 } catch (e) {
                                     console.error('[JS] Manifest decryption failed for detail view:', e);
-                                    // If manifest fails, try legacy decryption
                                     try {
-                                        decryptedBody = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                        // Check if decryption returned an error message
+                                        decryptedBody = await this.decryptNostrMessageWithFallback(email, bodyCiphertext, keypair);
                                         if (decryptedBody && (decryptedBody.startsWith('Unable to decrypt') || decryptedBody.includes('Unable to decrypt'))) {
                                             decryptedSubject = 'Unable to decrypt';
                                             decryptedBody = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
@@ -2848,19 +3057,38 @@ class EmailService {
                                     }
                                 }
                             }
-                            await updateDetail(decryptedSubject, decryptedBody, manifestResult);
+                            // Verify inline signature against raw body content
+                            let inlineSigResult = null;
+                            try {
+                                inlineSigResult = await this.verifyInlineSignature(emailBody);
+                            } catch (e) {
+                                console.warn('[JS] Inline signature verification error:', e);
+                            }
+                            await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, inlineSigResult);
                         } catch (err) {
                             console.error('[JS] Error decrypting email detail:', err);
                             // For inbox emails, decryption failure means our private key couldn't decrypt
-                            await updateDetail('Unable to decrypt', 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.', null);
+                            await updateDetail('Unable to decrypt', 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.', null, true);
                         }
                     })();
                 } else {
                     (async () => {
-                        await updateDetail(decryptedSubject, decryptedBody, null);
+                        let inlineSigResult = null;
+                        try {
+                            inlineSigResult = await this.verifyInlineSignature(emailBody);
+                        } catch (e) {
+                            console.warn('[JS] Inline signature verification error:', e);
+                        }
+                        // Decode glossia signed message body for display
+                        let displayBody = decryptedBody;
+                        const signedMsg = this.decodeGlossiaSignedMessage(emailBody);
+                        if (signedMsg && signedMsg.plaintextBody) {
+                            displayBody = signedMsg.plaintextBody;
+                        }
+                        await updateDetail(decryptedSubject, displayBody, null, false, inlineSigResult);
                     })();
                 }
-                const updateDetail = async (subject, body, cachedManifestResult) => {
+                const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null) => {
                     // Render attachments - decrypt metadata for display
                     console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
                     
@@ -2887,14 +3115,24 @@ class EmailService {
                                 let manifestResult = cachedManifestResult;
                                 
                                 if (!manifestResult || manifestResult.type !== 'manifest') {
-                                    const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                                    // Permissive regex: matches both base64 and glossia word content
+                                    const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                                     if (encryptedBodyMatch) {
-                                        const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                                        const keypair = appState.getKeypair();
-                                        manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                                        const armorContent = encryptedBodyMatch[2].trim();
+                                        let encryptedContent;
+                                        if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
+                                            encryptedContent = armorContent.replace(/\s+/g, '');
+                                        } else {
+                                            const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
+                                            encryptedContent = glossiaResult ? glossiaResult.ciphertext : null;
+                                        }
+                                        if (encryptedContent) {
+                                            const keypair = appState.getKeypair();
+                                            manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                                        }
                                     }
                                 }
-                                
+
                                 if (manifestResult && manifestResult.type === 'manifest' && manifestResult.manifest && manifestResult.manifest.attachments) {
                                     attachmentDisplayData = email.attachments.map(dbAttachment => {
                                         const opaqueId = dbAttachment.filename.replace(/\.dat$/, '');
@@ -2999,7 +3237,11 @@ class EmailService {
                     
                     // Add signature verification indicator
                     let signatureIndicator = '';
-                    if (email.signature_valid === true) {
+                    if (inlineSigResult && inlineSigResult.isValid === true) {
+                        signatureIndicator = `<span class="signature-indicator verified" title="Inline signature verified"><i class="fas fa-check-circle"></i> Signature Verified</span>`;
+                    } else if (inlineSigResult && inlineSigResult.isValid === false) {
+                        signatureIndicator = `<span class="signature-indicator invalid" title="Inline signature invalid"><i class="fas fa-times-circle"></i> Signature Invalid</span>`;
+                    } else if (email.signature_valid === true) {
                         signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
                     } else if (email.signature_valid === false) {
                         signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
@@ -3082,12 +3324,38 @@ ${signatureIndicator}
 </details>
 </div>
 <pre id="inbox-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
-<div class="email-detail-body" id="inbox-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
-<pre id="inbox-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}</pre>
+<div class="email-detail-body" id="inbox-email-body-info">${email.html_body ? '' : Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
+<pre id="inbox-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
 ${attachmentsHtml}
 </div>
 <button id="inbox-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
+                    if (email.html_body && wasDecrypted) {
+                        // Patch the HTML body: replace glossia-encoded div content with decrypted text
+                        try {
+                            const parser = new DOMParser();
+                            const doc = parser.parseFromString(email.html_body, 'text/html');
+                            const contentDiv = doc.querySelector('body > div > div') || doc.querySelector('body > div');
+                            if (contentDiv) {
+                                contentDiv.innerHTML = Utils.escapeHtml(body).replace(/\n/g, '<br>');
+                            }
+                            let patchedHtml = doc.documentElement.outerHTML;
+                            if (inlineSigResult) patchedHtml = this.injectHtmlSigBadge(patchedHtml, inlineSigResult);
+                            Utils.renderHtmlBodyInIframe('inbox-email-body-info', patchedHtml);
+                        } catch (e) {
+                            console.error('[JS] Failed to patch inbox HTML body with decrypted text:', e);
+                            Utils.renderHtmlBodyInIframe('inbox-email-body-info', email.html_body);
+                        }
+                    } else if (email.html_body) {
+                        let htmlToRender = email.html_body;
+                        if (inlineSigResult) htmlToRender = this.injectHtmlSigBadge(htmlToRender, inlineSigResult);
+                        Utils.renderHtmlBodyInIframe('inbox-email-body-info', htmlToRender);
+                    }
+                    // Decorate and verify inline signature blocks in the body
+                    if (!email.html_body) {
+                        Utils.decorateArmorBlocks('inbox-email-body-info');
+                        this.verifyAndAnnotateSignatureBlocks(body, 'inbox-email-body-info');
+                    }
                     const toggleRawBtn = document.getElementById('inbox-toggle-raw-btn');
                     const headerInfo = document.getElementById('inbox-email-header-info');
                     const rawHeaderInfo = document.getElementById('inbox-raw-header-info');
@@ -3889,6 +4157,158 @@ ${attachmentsHtml}
         return settings?.glossia_encoding_pubkey ?? 'latin';
     }
 
+    /**
+     * Extract and decode glossia-encoded content from an ASCII-armored body.
+     * Uses a permissive regex that matches both base64 and glossia word content.
+     * Returns { ciphertext, nip, isGlossia, dialect } or null if no armor found.
+     */
+    decodeGlossiaArmoredBody(plainBody) {
+        // Permissive armor regex: handles both "-----BEGIN" and "----- BEGIN" (with optional spaces)
+        // Content stops at END NOSTR ... ENCRYPTED MESSAGE, END NOSTR MESSAGE, or BEGIN NOSTR SIGNATURE
+        const armorRegex = /-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/;
+        const match = plainBody.replace(/\r\n/g, '\n').match(armorRegex);
+        if (!match) return null;
+
+        const nip = match[1]; // e.g. "NIP-04" or "NIP-44"
+        const content = match[2].trim();
+
+        // If content is already base64 (no spaces), return as-is
+        if (/^[A-Za-z0-9+/=\n?]+$/.test(content.replace(/\s+/g, ''))) {
+            return { ciphertext: content.replace(/\s+/g, ''), nip, isGlossia: false };
+        }
+
+        // Content has spaces/words → glossia-encoded
+        const gs = window.GlossiaService;
+        if (!gs || !gs.isReady()) {
+            console.warn('[JS] decodeGlossiaArmoredBody: GlossiaService not ready');
+            return null;
+        }
+
+        try {
+            const detections = gs.detectDialect(content);
+            console.log('[JS] decodeGlossiaArmoredBody: detected dialects:', detections);
+            if (!Array.isArray(detections) || detections.length === 0) {
+                console.warn('[JS] decodeGlossiaArmoredBody: no dialect detected');
+                return null;
+            }
+            // Use the best match (first element) — language field maps to meta instruction
+            const dialect = detections[0].language;
+            if (!dialect) {
+                console.warn('[JS] decodeGlossiaArmoredBody: no language in detection result');
+                return null;
+            }
+
+            const result = gs.transcode(content, `decode from ${dialect}`);
+            let decoded = result.output;
+
+            // Convert hex to base64 if needed
+            if (gs._isHex(decoded)) {
+                decoded = gs._hexToBase64(decoded);
+            }
+
+            // Unpack NIP-04 binary format if applicable
+            decoded = gs._autoUnpack(decoded);
+
+            return { ciphertext: decoded, nip, isGlossia: true, dialect };
+        } catch (e) {
+            console.error('[JS] decodeGlossiaArmoredBody: glossia decode failed:', e);
+            return null;
+        }
+    }
+
+    /**
+     * Parse a BEGIN NOSTR SIGNED MESSAGE armor block.
+     * Extracts glossia-encoded body, signature content, and seal content.
+     * Decodes the glossia body back to the original UTF-8 plaintext.
+     * Returns { plaintextBody, glossiaBody, sigContent, sealContent, profileName, displayName } or null.
+     */
+    decodeGlossiaSignedMessage(plainBody) {
+        if (!plainBody) return null;
+        const normalized = plainBody.replace(/\r\n/g, '\n');
+
+        // Match the nested armor format
+        const armorRegex = /-{3,}\s*BEGIN NOSTR SIGNED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR MESSAGE\s*-{3,}/;
+        const match = normalized.match(armorRegex);
+        if (!match) return null;
+
+        const glossiaBody = match[1].trim();
+        const rawSigContent = match[2].trim();
+        const rawSealContent = match[3] ? match[3].trim() : null;
+
+        // Strip @name lines from sig/seal
+        let profileName = null;
+        const sigLines = rawSigContent.split('\n');
+        const sigNameLine = sigLines.find(l => l.trim().startsWith('@'));
+        if (sigNameLine) profileName = sigNameLine.trim().replace(/^@/, '');
+        const sigContent = sigLines.filter(l => !l.trim().startsWith('@')).join(' ').trim();
+
+        let displayName = null;
+        let sealContent = null;
+        if (rawSealContent) {
+            const sealLines = rawSealContent.split('\n');
+            const sealNameLine = sealLines.find(l => l.trim().startsWith('@'));
+            if (sealNameLine) displayName = sealNameLine.trim().replace(/^@/, '');
+            sealContent = sealLines.filter(l => !l.trim().startsWith('@')).join(' ').trim();
+        }
+
+        // Decode glossia body → original UTF-8 plaintext
+        let plaintextBody = null;
+        const gs = window.GlossiaService;
+        if (gs && gs.isReady()) {
+            try {
+                const bytes = gs.decodeToBytes(glossiaBody);
+                if (bytes) {
+                    plaintextBody = new TextDecoder().decode(bytes);
+                }
+            } catch (e) {
+                console.warn('[JS] decodeGlossiaSignedMessage: decodeToBytes failed:', e);
+            }
+        }
+
+        return { plaintextBody, glossiaBody, sigContent, sealContent, profileName, displayName };
+    }
+
+    /**
+     * Decode a glossia-encoded subject line.
+     * Subjects use payload_only encoding (bare words, no grammar) via "raw" mode.
+     * Returns the decrypted ciphertext string, or null if not glossia-encoded.
+     */
+    decodeGlossiaSubject(subject) {
+        if (!subject || typeof subject !== 'string') return null;
+
+        // If already base64-like, not glossia
+        if (Utils.isLikelyEncryptedContent(subject)) return null;
+
+        const gs = window.GlossiaService;
+        if (!gs || !gs.isReady()) return null;
+
+        try {
+            const detections = gs.detectDialect(subject);
+            console.log('[JS] decodeGlossiaSubject: detected dialects:', detections);
+            if (!Array.isArray(detections) || detections.length === 0) return null;
+            // Require high hit rate — glossia subjects use payload_only (all words are payload),
+            // so real glossia subjects should have hit_rate ≈ 1.0.
+            // Normal English text may partially match BIP39/Latin wordlists.
+            if (detections[0].hit_rate < 0.8) return null;
+            // Use the best match — language field maps to meta instruction
+            const dialect = detections[0].language;
+            if (!dialect) return null;
+
+            const result = gs.transcode(subject, `decode from ${dialect} raw`);
+            let decoded = result.output;
+
+            if (gs._isHex(decoded)) {
+                decoded = gs._hexToBase64(decoded);
+            }
+
+            decoded = gs._autoUnpack(decoded);
+            return decoded;
+        } catch (e) {
+            console.error('[JS] decodeGlossiaSubject: glossia decode failed:', e);
+            return null;
+        }
+    }
+
     // Parse raw sig+pubkey blocks from body (Hex/no-glossia mode).
     // Strips Seal block (with npub) from end, then Signature block if present.
     parseRawSignedBody(fullBody) {
@@ -3896,8 +4316,8 @@ ${attachmentsHtml}
         let pubkeyHex = null;
         let signatureHex = null;
 
-        // New format: Seal\n@name\nnpub1... or Seal\nnpub1...
-        const sealMatch = body.match(/\n\nSeal\n(?:@[^\n]*\n)?`?(npub1[a-z0-9]+)`?\s*$/);
+        // New format: Seal\nnpub1... or DisplayName\nnpub1... (or legacy @name line)
+        const sealMatch = body.match(/\n\n[^\n]+\n\n?`?(npub1[a-z0-9]+)`?\s*$/);
         // Legacy: **Seal**\n@name\n`npub1...`
         const legacySealMatch = !sealMatch && body.match(/\n\n\*\*Seal\*\*\n(?:@[^\n]*\n)?`?(npub1[a-z0-9]+)`?\s*$/);
         // Old format: bare npub as last paragraph
@@ -3909,7 +4329,7 @@ ${attachmentsHtml}
             } catch (_) { /* not a valid npub */ }
         }
 
-        // Strip sig_nostr armored block from end (multi-line > quoted)
+        // Strip sig_bip39 armored block from end (multi-line > quoted)
         if (pubkeyHex) {
             const gs = window.GlossiaService;
             if (gs && gs.isReady()) {
@@ -3941,6 +4361,474 @@ ${attachmentsHtml}
         }
 
         return { body, pubkeyHex, signatureHex };
+    }
+
+    // Shared signature verification: parse body for sig+pubkey blocks and verify.
+    // Returns { found, signed, isValid, pubkeyHex, signatureHex, body }
+    async verifyBodySignature(fullBody, dataToVerify) {
+        const gs = window.GlossiaService;
+        const metaPubkey = this.getGlossiaEncodingPubkey();
+        const metaSig = this.getGlossiaEncodingSignature();
+        let parsed;
+        if (gs && gs.isReady()) {
+            parsed = gs.parseSignedBody(fullBody, metaPubkey, metaSig);
+        } else {
+            parsed = this.parseRawSignedBody(fullBody);
+        }
+        if (!parsed?.pubkeyHex) return { found: false };
+        if (!parsed.signatureHex) return { found: true, signed: false, pubkeyHex: parsed.pubkeyHex, body: parsed.body };
+
+        const npub = window.CryptoService._nip19.npubEncode(parsed.pubkeyHex);
+        const dataBytes = window.CryptoService.ciphertextToBytes(dataToVerify);
+        const isValid = await TauriService.verifySignature(npub, parsed.signatureHex, dataBytes);
+        return { found: true, signed: true, isValid, pubkeyHex: parsed.pubkeyHex, signatureHex: parsed.signatureHex, body: parsed.body };
+    }
+
+    /**
+     * Extract inline signature and pubkey from ASCII-armored email body,
+     * and verify the signature against the raw encrypted message content.
+     * Returns { signatureHex, pubkeyHex, isValid, rawSignedContent } or null.
+     */
+    async verifyInlineSignature(plainBody) {
+        if (!plainBody) { console.log('[JS] verifyInlineSignature: no body, returning null'); return null; }
+
+        console.log('[JS] verifyInlineSignature: body length=', plainBody.length, 'preview=', plainBody.substring(0, 200));
+        const gs = window.GlossiaService;
+
+        // 1. Extract and decode the signed data (ciphertext if encrypted, plaintext body otherwise)
+        const glossiaResult = this.decodeGlossiaArmoredBody(plainBody);
+        console.log('[JS] verifyInlineSignature: glossiaResult=', glossiaResult ? 'found' : 'null');
+        let dataBytes;
+        let ciphertext;
+        if (glossiaResult) {
+            ciphertext = glossiaResult.ciphertext; // base64 (or base64?iv=base64 for NIP-04)
+            dataBytes = window.CryptoService.ciphertextToBytes(ciphertext);
+            console.log('[JS] verifyInlineSignature: encrypted mode, ciphertext length=', ciphertext.length);
+        }
+        // Try the new signed message armor format (plaintext glossia-encoded body)
+        if (!glossiaResult) {
+            const signedMsg = this.decodeGlossiaSignedMessage(plainBody);
+            if (signedMsg && signedMsg.plaintextBody && signedMsg.sigContent && signedMsg.sealContent) {
+                console.log('[JS] verifyInlineSignature: signed message armor found, plaintext length=', signedMsg.plaintextBody.length);
+                dataBytes = new TextEncoder().encode(signedMsg.plaintextBody);
+
+                // Decode sig and pubkey from the parsed content
+                let signatureHex = null;
+                let pubkeyHex = null;
+                try {
+                    if (gs && gs.isReady()) {
+                        const sigDetections = gs.detectDialect(signedMsg.sigContent);
+                        const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
+                        if (sigDialect) {
+                            const result = gs.transcode(signedMsg.sigContent, `decode from ${sigDialect} raw`);
+                            let decoded = result.output;
+                            if (!gs._isHex(decoded)) decoded = gs._base64ToHex(decoded);
+                            if (decoded.length === 128) signatureHex = decoded;
+                        }
+                        const pkDetections = gs.detectDialect(signedMsg.sealContent);
+                        const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
+                        if (pkDialect) {
+                            const result = gs.transcode(signedMsg.sealContent, `decode from ${pkDialect} raw`);
+                            let decoded = result.output;
+                            if (!gs._isHex(decoded)) decoded = gs._base64ToHex(decoded);
+                            if (decoded.length === 64) pubkeyHex = decoded;
+                        }
+                    }
+                    // Fallback: try npub in seal content
+                    if (!pubkeyHex) {
+                        const npubMatch = signedMsg.sealContent.match(/(npub1[a-z0-9]+)/);
+                        if (npubMatch) pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
+                    }
+                    // Fallback: raw hex sig
+                    if (!signatureHex && /^[0-9a-fA-F]{128}$/.test(signedMsg.sigContent)) {
+                        signatureHex = signedMsg.sigContent;
+                    }
+                } catch (e) {
+                    console.warn('[JS] verifyInlineSignature: signed message decode error:', e);
+                }
+
+                if (!signatureHex || !pubkeyHex) {
+                    console.log('[JS] verifyInlineSignature: could not decode sig/pubkey from signed message');
+                    return null;
+                }
+                try {
+                    const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
+                    const isValid = await TauriService.verifySignature(npub, signatureHex, dataBytes);
+                    console.log('[JS] verifyInlineSignature (signed message):', isValid ? 'VALID' : 'INVALID');
+                    return { signatureHex, pubkeyHex, isValid, ciphertext: null };
+                } catch (e) {
+                    console.error('[JS] verifyInlineSignature: signed message verification failed:', e);
+                    return { signatureHex, pubkeyHex, isValid: false, ciphertext: null };
+                }
+            }
+        }
+        // For plaintext (unencrypted) emails without signed message armor,
+        // strip signature and seal armor blocks to get just the message body
+        if (!glossiaResult) {
+            const bodyOnly = plainBody
+                .replace(/\r\n/g, '\n')
+                .replace(/-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SIGNATURE\s*-{3,}/g, '')
+                .replace(/-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SEAL\s*-{3,}/g, '')
+                .trim();
+            console.log('[JS] verifyInlineSignature: plaintext mode, bodyOnly length=', bodyOnly.length, 'preview=', bodyOnly.substring(0, 100));
+            if (!bodyOnly) { console.log('[JS] verifyInlineSignature: empty body after stripping blocks'); return null; }
+            dataBytes = new TextEncoder().encode(bodyOnly);
+        }
+
+        // 2. Extract signature from SIGNATURE armor block
+        // Sig content ends at END NOSTR SIGNATURE, BEGIN NOSTR SEAL, or END NOSTR MESSAGE
+        const sigMatch = plainBody.match(
+            /-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR SIGNATURE|BEGIN NOSTR SEAL|END NOSTR MESSAGE)\s*-{3,}/
+        );
+        if (!sigMatch) { console.log('[JS] verifyInlineSignature: no SIGNATURE armor block found'); return null; }
+
+        // Strip @name line from signature content
+        const sigContent = sigMatch[1].trim().split('\n')
+            .filter(l => !l.trim().startsWith('@'))
+            .join(' ').trim();
+        console.log('[JS] verifyInlineSignature: sigContent=', sigContent.substring(0, 80));
+
+        // 3. Extract pubkey from SEAL armor block
+        // Seal content ends at END NOSTR SEAL or END NOSTR MESSAGE
+        const sealMatch = plainBody.match(
+            /-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:SEAL|MESSAGE))\s*-{3,}/
+        );
+        if (!sealMatch) { console.log('[JS] verifyInlineSignature: no SEAL armor block found'); return null; }
+
+        // Extract npub or glossia-encoded pubkey from seal content
+        const sealContent = sealMatch[1].trim().split('\n')
+            .filter(l => !l.trim().startsWith('@'))
+            .join(' ').trim();
+        console.log('[JS] verifyInlineSignature: sealContent=', sealContent.substring(0, 80));
+
+        let pubkeyHex = null;
+        let signatureHex = null;
+
+        // Decode pubkey
+        try {
+            // Try npub first
+            const npubMatch = sealContent.match(/(npub1[a-z0-9]+)/);
+            if (npubMatch) {
+                pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
+                console.log('[JS] verifyInlineSignature: decoded npub to hex=', pubkeyHex);
+            } else if (gs && gs.isReady()) {
+                // Auto-detect dialect and glossia decode
+                const pkDetections = gs.detectDialect(sealContent);
+                const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
+                console.log('[JS] verifyInlineSignature: pubkey dialect=', pkDialect);
+                if (pkDialect) {
+                    const result = gs.transcode(sealContent, `decode from ${pkDialect} raw`);
+                    let decoded = result.output;
+                    console.log('[JS] verifyInlineSignature: pubkey decoded=', decoded.substring(0, 40), 'len=', decoded.length);
+                    if (!gs._isHex(decoded)) decoded = gs._base64ToHex(decoded);
+                    console.log('[JS] verifyInlineSignature: pubkey hex=', decoded.substring(0, 40), 'len=', decoded.length);
+                    if (decoded.length === 64) pubkeyHex = decoded;
+                }
+            }
+        } catch (e) {
+            console.error('[JS] verifyInlineSignature: pubkey decode failed:', e);
+        }
+
+        if (!pubkeyHex) { console.log('[JS] verifyInlineSignature: could not decode pubkey'); return null; }
+
+        // Decode signature (auto-detect dialect)
+        try {
+            if (gs && gs.isReady()) {
+                const sigDetections = gs.detectDialect(sigContent);
+                const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
+                console.log('[JS] verifyInlineSignature: sig dialect=', sigDialect);
+                if (sigDialect) {
+                    const result = gs.transcode(sigContent, `decode from ${sigDialect} raw`);
+                    let decoded = result.output;
+                    console.log('[JS] verifyInlineSignature: sig decoded len=', decoded.length);
+                    if (!gs._isHex(decoded)) decoded = gs._base64ToHex(decoded);
+                    console.log('[JS] verifyInlineSignature: sig hex len=', decoded.length);
+                    if (decoded.length === 128) signatureHex = decoded;
+                }
+            } else {
+                console.log('[JS] verifyInlineSignature: GlossiaService not ready, gs=', !!gs, 'isReady=', gs?.isReady?.());
+            }
+        } catch (e) {
+            console.error('[JS] verifyInlineSignature: signature decode failed:', e);
+        }
+
+        if (!signatureHex) { console.log('[JS] verifyInlineSignature: could not decode signature hex (expected len 128)'); return null; }
+
+        // 4. Verify signature against signed data (ciphertext binary or plaintext UTF-8)
+        try {
+            const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
+            const isValid = await TauriService.verifySignature(npub, signatureHex, dataBytes);
+            console.log('[JS] verifyInlineSignature:', isValid ? 'VALID' : 'INVALID');
+            return { signatureHex, pubkeyHex, isValid, ciphertext };
+        } catch (e) {
+            console.error('[JS] verifyInlineSignature: verification failed:', e);
+            return { signatureHex, pubkeyHex, isValid: false, ciphertext };
+        }
+    }
+
+    /**
+     * Find all signature+seal block pairs in the plain body text,
+     * verify each, and update the corresponding DOM indicators
+     * created by Utils.decorateArmorBlocks().
+     */
+    async verifyAndAnnotateSignatureBlocks(bodyText, containerId) {
+        if (!bodyText) return;
+        const gs = window.GlossiaService;
+
+        // First, handle nested armor blocks (plaintext signed or encrypted+signed) that end with END NOSTR MESSAGE
+        const signedMsgRegex = /-{3,}\s*BEGIN NOSTR (?:SIGNED|NIP-\d+ ENCRYPTED) MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR MESSAGE\s*-{3,}/g;
+        let signedBlockIndex = 0;
+        let smMatch;
+        while ((smMatch = signedMsgRegex.exec(bodyText)) !== null) {
+            const armorBody = smMatch[1].trim();
+            const rawSigContent = smMatch[2].trim();
+            const rawSealContent = smMatch[3] ? smMatch[3].trim() : null;
+            // Detect whether this is encrypted or plaintext signed
+            const isEncryptedArmor = /-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}/.test(smMatch[0]);
+
+            const el = document.getElementById(`inline-sig-block-${signedBlockIndex}`);
+            signedBlockIndex++;
+            if (!el) continue;
+            const indicator = el.querySelector('.inline-sig-indicator');
+
+            // Decode body content for verification
+            let dataBytes = null;
+            if (isEncryptedArmor) {
+                // Encrypted: body is ciphertext (base64 or glossia-encoded)
+                try {
+                    const stripped = armorBody.replace(/\s+/g, '');
+                    if (/^[A-Za-z0-9+/=?]+$/.test(stripped)) {
+                        // Raw base64 ciphertext
+                        dataBytes = window.CryptoService.ciphertextToBytes(stripped);
+                    } else if (gs && gs.isReady()) {
+                        // Glossia-encoded ciphertext: decode to base64/ciphertext string
+                        const detections = gs.detectDialect(armorBody);
+                        const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : null;
+                        if (dialect) {
+                            const result = gs.transcode(armorBody, `decode from ${dialect}`);
+                            let decoded = result.output;
+                            if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
+                            decoded = gs._autoUnpack(decoded);
+                            dataBytes = window.CryptoService.ciphertextToBytes(decoded);
+                        }
+                    }
+                } catch (_) {}
+            } else {
+                // Plaintext signed: glossia body → UTF-8 bytes
+                if (gs && gs.isReady()) {
+                    try {
+                        const bytes = gs.decodeToBytes(armorBody);
+                        if (bytes) dataBytes = bytes;
+                    } catch (_) {}
+                }
+            }
+            if (!dataBytes) {
+                if (indicator) {
+                    indicator.className = 'inline-sig-indicator invalid';
+                    indicator.innerHTML = '<i class="fas fa-question-circle"></i> Cannot decode body';
+                }
+                continue;
+            }
+
+            // Decode sig
+            const sigLines = rawSigContent.split('\n').filter(l => !l.trim().startsWith('@'));
+            const sigContent = sigLines.join(' ').trim();
+            let signatureHex = null;
+            try {
+                if (gs && gs.isReady()) {
+                    const sigDetections = gs.detectDialect(sigContent);
+                    const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
+                    if (sigDialect) {
+                        const result = gs.transcode(sigContent, `decode from ${sigDialect} raw`);
+                        let decoded = result.output;
+                        if (!gs._isHex(decoded)) decoded = gs._base64ToHex(decoded);
+                        if (decoded.length === 128) signatureHex = decoded;
+                    }
+                }
+                if (!signatureHex && /^[0-9a-fA-F]{128}$/.test(sigContent)) signatureHex = sigContent;
+            } catch (_) {}
+
+            // Decode pubkey
+            let pubkeyHex = null;
+            if (rawSealContent) {
+                const sealLines = rawSealContent.split('\n').filter(l => !l.trim().startsWith('@'));
+                const sealContent = sealLines.join(' ').trim();
+                try {
+                    const npubMatch = sealContent.match(/(npub1[a-z0-9]+)/);
+                    if (npubMatch) {
+                        pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
+                    } else if (gs && gs.isReady()) {
+                        const pkDetections = gs.detectDialect(sealContent);
+                        const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
+                        if (pkDialect) {
+                            const result = gs.transcode(sealContent, `decode from ${pkDialect} raw`);
+                            let decoded = result.output;
+                            if (!gs._isHex(decoded)) decoded = gs._base64ToHex(decoded);
+                            if (decoded.length === 64) pubkeyHex = decoded;
+                        }
+                    }
+                } catch (_) {}
+            }
+
+            if (!signatureHex || !pubkeyHex) {
+                if (indicator) {
+                    indicator.className = 'inline-sig-indicator invalid';
+                    indicator.innerHTML = '<i class="fas fa-question-circle"></i> Cannot decode';
+                }
+                continue;
+            }
+
+            try {
+                const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
+                const isValid = await TauriService.verifySignature(npub, signatureHex, dataBytes);
+                if (indicator) {
+                    if (isValid) {
+                        indicator.className = 'inline-sig-indicator verified';
+                        indicator.innerHTML = '<i class="fas fa-check-circle"></i> Signature Verified';
+                        el.classList.add('verified');
+                    } else {
+                        indicator.className = 'inline-sig-indicator invalid';
+                        indicator.innerHTML = '<i class="fas fa-times-circle"></i> Signature Invalid';
+                        el.classList.add('invalid');
+                    }
+                }
+            } catch (e) {
+                console.error('[JS] verifyAndAnnotateSignatureBlocks: signed message verification error:', e);
+                if (indicator) {
+                    indicator.className = 'inline-sig-indicator invalid';
+                    indicator.innerHTML = '<i class="fas fa-times-circle"></i> Verification Error';
+                    el.classList.add('invalid');
+                }
+            }
+        }
+
+        // Then handle traditional signature+seal pairs
+        const sigSealRegex = /(-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*END NOSTR SIGNATURE\s*-{3,})[\s\n]*(-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*END NOSTR SEAL\s*-{3,})/g;
+
+        // Also find the encrypted message block (ciphertext) to verify against
+        const encMsgRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/g;
+        const ciphertexts = [];
+        let encMatch;
+        while ((encMatch = encMsgRegex.exec(bodyText)) !== null) {
+            const armorContent = encMatch[1].trim();
+            let ct = null;
+            if (/^[A-Za-z0-9+/=\n?\s]+$/.test(armorContent.replace(/\s+/g, ''))) {
+                ct = armorContent.replace(/\s+/g, '');
+            } else if (gs && gs.isReady()) {
+                try {
+                    const result = gs.transcode(armorContent, 'decode');
+                    ct = result.output;
+                } catch (_) {}
+            }
+            if (ct) ciphertexts.push(ct);
+        }
+
+        let blockIndex = signedBlockIndex;
+        let match;
+        while ((match = sigSealRegex.exec(bodyText)) !== null) {
+            const sigContent = match[2].trim().split('\n')
+                .filter(l => !l.trim().startsWith('@'))
+                .join(' ').trim();
+            const sealContent = match[4].trim().split('\n')
+                .filter(l => !l.trim().startsWith('@'))
+                .join(' ').trim();
+
+            const el = document.getElementById(`inline-sig-block-${blockIndex}`);
+            blockIndex++;
+            if (!el) continue;
+
+            const indicator = el.querySelector('.inline-sig-indicator');
+
+            let pubkeyHex = null;
+            let signatureHex = null;
+
+            // Decode pubkey
+            try {
+                const npubMatch = sealContent.match(/(npub1[a-z0-9]+)/);
+                if (npubMatch) {
+                    pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
+                } else if (gs && gs.isReady()) {
+                    const pkDetections = gs.detectDialect(sealContent);
+                    const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
+                    if (pkDialect) {
+                        const result = gs.transcode(sealContent, `decode from ${pkDialect} raw`);
+                        let decoded = result.output;
+                        if (!gs._isHex(decoded)) decoded = gs._base64ToHex(decoded);
+                        if (decoded.length === 64) pubkeyHex = decoded;
+                    }
+                }
+            } catch (_) {}
+
+            // Decode signature
+            try {
+                if (gs && gs.isReady()) {
+                    const sigDetections = gs.detectDialect(sigContent);
+                    const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
+                    if (sigDialect) {
+                        const result = gs.transcode(sigContent, `decode from ${sigDialect} raw`);
+                        let decoded = result.output;
+                        if (!gs._isHex(decoded)) decoded = gs._base64ToHex(decoded);
+                        if (decoded.length === 128) signatureHex = decoded;
+                    }
+                }
+            } catch (_) {}
+
+            if (!pubkeyHex || !signatureHex) {
+                if (indicator) {
+                    indicator.className = 'inline-sig-indicator invalid';
+                    indicator.innerHTML = '<i class="fas fa-question-circle"></i> Cannot decode';
+                }
+                continue;
+            }
+
+            // Verify against the most recent ciphertext preceding this sig block
+            // Use the last ciphertext found before this match position, or the latest one
+            const ciphertext = ciphertexts.length > 0 ? ciphertexts[Math.min(blockIndex - 1, ciphertexts.length - 1)] : null;
+
+            let dataBytes;
+            if (ciphertext) {
+                dataBytes = window.CryptoService.ciphertextToBytes(ciphertext);
+            } else {
+                // Plaintext email: signed data is the body text with sig/seal blocks stripped
+                // Normalize \r\n to \n to match what the textarea produced at sign time
+                const bodyOnly = bodyText
+                    .replace(/\r\n/g, '\n')
+                    .replace(/-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SIGNATURE\s*-{3,}/g, '')
+                    .replace(/-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SEAL\s*-{3,}/g, '')
+                    .trim();
+                if (!bodyOnly) {
+                    if (indicator) {
+                        indicator.className = 'inline-sig-indicator invalid';
+                        indicator.innerHTML = '<i class="fas fa-question-circle"></i> No content to verify';
+                    }
+                    continue;
+                }
+                dataBytes = new TextEncoder().encode(bodyOnly);
+            }
+
+            try {
+                const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
+                const isValid = await TauriService.verifySignature(npub, signatureHex, dataBytes);
+                if (indicator) {
+                    if (isValid) {
+                        indicator.className = 'inline-sig-indicator verified';
+                        indicator.innerHTML = '<i class="fas fa-check-circle"></i> Signature Verified';
+                        el.classList.add('verified');
+                    } else {
+                        indicator.className = 'inline-sig-indicator invalid';
+                        indicator.innerHTML = '<i class="fas fa-times-circle"></i> Signature Invalid';
+                        el.classList.add('invalid');
+                    }
+                }
+            } catch (e) {
+                console.error('[JS] verifyAndAnnotateSignatureBlocks: verification error:', e);
+                if (indicator) {
+                    indicator.className = 'inline-sig-indicator invalid';
+                    indicator.innerHTML = '<i class="fas fa-times-circle"></i> Verification Error';
+                    el.classList.add('invalid');
+                }
+            }
+        }
     }
 
     // Wrap raw ciphertext in ASCII armor
@@ -4253,7 +5141,7 @@ ${attachmentsHtml}
             if (currentBody) {
                 console.log('[JS] Encoding body with transcode("encode into ' + meta + '")...');
                 const armorMatch = currentBody.match(
-                    /-----BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE-----\s*([\s\S]+?)\s*-----END NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE-----/
+                    /-{3,}\s*BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/
                 );
                 const rawCipher = armorMatch ? armorMatch[1].replace(/\s+/g, '') : currentBody.trim();
                 const result = gs.transcode(rawCipher, `encode into ${meta}`);
@@ -4445,7 +5333,10 @@ ${attachmentsHtml}
             console.log(`[JS] Body size: ${bodySize} bytes (${(bodySize / 1024).toFixed(1)} KB)`);
             console.log(`[JS] Has attachments: ${hasAttachments}`);
             console.log(`[JS] Should use manifest: ${shouldUseManifest}`);
-            
+
+            // Capture raw encrypted body ciphertext for _plainBody generation
+            let rawEncryptedBody = null;
+
             if (shouldUseManifest) {
                 // Use manifest-based encryption when attachments are present or body is large
                 const reason = hasAttachments ? 'has attachments' : 'large body (>64KB)';
@@ -4539,7 +5430,8 @@ ${attachmentsHtml}
                 
                 const encryptedManifest = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, manifestJson, encryptionAlgorithm);
                 console.log('[JS] Manifest encrypted, size:', encryptedManifest.length);
-                
+                rawEncryptedBody = encryptedManifest;
+
                 // Wrap in ASCII armor
                 const armoredManifest = this.armorCiphertext(encryptedManifest, encryptionAlgorithm);
                 domManager.setValue('messageBody', armoredManifest.trim());
@@ -4571,6 +5463,7 @@ ${attachmentsHtml}
                     console.log('[JS] Encrypting body...');
                     encryptedBody = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, body, encryptionAlgorithm);
                     console.log('[JS] Body encrypted:', encryptedBody.substring(0, 50) + '...');
+                    rawEncryptedBody = encryptedBody;
 
                     // Wrap in ASCII armor
                     const armoredBody = this.armorCiphertext(encryptedBody, encryptionAlgorithm);
@@ -4590,6 +5483,48 @@ ${attachmentsHtml}
                 } else {
                     console.warn('[JS] Auto-encode failed, sending as ASCII armor');
                 }
+            }
+
+            // Rebuild _plainBody with ASCII-armored encrypted content
+            // Use the glossia-encoded body from DOM (after auto-encode) with the same
+            // encoded sig/pubkey that _htmlBody uses, just formatted as ASCII armor.
+            if (rawEncryptedBody) {
+                // The DOM body now has the glossia-encoded ciphertext (or ASCII armor if no glossia)
+                const encodedBody = domManager.getValue('messageBody') || '';
+
+                // Re-encode sig/pubkey with user's per-field settings (same as sign handler)
+                const gs = window.GlossiaService;
+                const signBtn = document.getElementById('sign-btn');
+                const sigHex = signBtn?.dataset?.signature || null;
+                const kp = appState.getKeypair();
+                const pkHex = kp ? window.CryptoService._npubToHex(kp.public_key) : null;
+                let encodedSig = null, encodedPubkey = null;
+                if (gs && gs.isReady()) {
+                    const metaSig = this.getGlossiaEncodingSignature();
+                    const metaPubkey = this.getGlossiaEncodingPubkey();
+                    if (sigHex) encodedSig = gs.encodeSignature(sigHex, metaSig);
+                    if (pkHex) encodedPubkey = gs.encodePubkey(pkHex, metaPubkey);
+                }
+                let profileName = null, senderDisplayName = null;
+                try {
+                    const cached = localStorage.getItem('nostr_mail_profiles');
+                    if (cached) {
+                        const profile = JSON.parse(cached)[kp?.public_key];
+                        profileName = profile?.fields?.name || null;
+                        senderDisplayName = profile?.fields?.display_name || null;
+                    }
+                } catch (_) {}
+                this._plainBody = this.buildPlainBody(
+                    encodedBody, encodedSig, encodedPubkey, profileName, senderDisplayName,
+                    true, encryptionAlgorithm
+                );
+                // Also rebuild _htmlBody with the encrypted content + sig/seal
+                const metaSig = this.getGlossiaEncodingSignature();
+                const metaPubkey = this.getGlossiaEncodingPubkey();
+                this._htmlBody = this.buildHtmlAlt(
+                    encodedBody, encodedSig, encodedPubkey, profileName, senderDisplayName,
+                    metaSig, metaPubkey
+                );
             }
 
             return true;
@@ -4802,22 +5737,33 @@ ${attachmentsHtml}
             dateDisplay = emailDate.toLocaleDateString();
         }
         
-        let previewText = email.body ? Utils.escapeHtml(email.body.substring(0, 100)) : '';
+        // Decode glossia signed message body for preview
+        let sentPreviewBody = email.body || '';
+        const sentSignedMsg = this.decodeGlossiaSignedMessage(sentPreviewBody);
+        if (sentSignedMsg && sentSignedMsg.plaintextBody) {
+            sentPreviewBody = sentSignedMsg.plaintextBody;
+        }
+        let previewText = sentPreviewBody ? Utils.escapeHtml(sentPreviewBody.substring(0, 100)) : '';
         let showSubject = true;
         let previewSubject = email.subject;
-        
+
         // Detect any NOSTR NIP-X ENCRYPTED MESSAGE (same as inbox)
-        const armorRegex = /-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/;
+        const armorRegex = /-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}/;
         if (email.body && armorRegex.test(email.body)) {
             const keypair = appState.getKeypair();
             if (!keypair) {
                 previewText = 'Unable to decrypt: no keypair';
             } else {
-                        // Decrypt subject if it looks encrypted (ASCII armor not required)
+                        // Decrypt subject — try base64 first, then glossia decode
+                        let subjectCiphertext = null;
                         if (Utils.isLikelyEncryptedContent(email.subject)) {
+                            subjectCiphertext = email.subject;
+                        } else {
+                            subjectCiphertext = this.decodeGlossiaSubject(email.subject);
+                        }
+                        if (subjectCiphertext) {
                             try {
-                                const decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
-                                // Check if decryption returned an error message
+                                const decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, subjectCiphertext, keypair);
                                 if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
                                     previewSubject = 'Could not decrypt';
                                 } else if (decryptedSubject) {
@@ -4830,9 +5776,17 @@ ${attachmentsHtml}
                             }
                         }
                         // Decrypt body - try manifest format first, then fallback to legacy
-                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                 if (encryptedBodyMatch) {
-                    const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                    // Extract ciphertext: base64 as-is, glossia needs decoding
+                    const armorContent = encryptedBodyMatch[1].trim();
+                    let encryptedContent;
+                    if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
+                        encryptedContent = armorContent.replace(/\s+/g, '');
+                    } else {
+                        const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
+                        encryptedContent = glossiaResult ? glossiaResult.ciphertext : armorContent.replace(/\s+/g, '');
+                    }
                     try {
                         // Try sent manifest decryption first
                         const manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
@@ -4875,27 +5829,10 @@ ${attachmentsHtml}
                 }
             }
         } else {
-            // If subject looks like encrypted base64, try to decrypt (no ASCII armor required)
-            if (Utils.isLikelyEncryptedContent(email.subject)) {
-                const keypair = appState.getKeypair();
-                if (keypair) {
-                    try {
-                        const decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, email.subject, keypair);
-                        // Check if decryption returned an error message
-                        if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
-                            previewSubject = 'Could not decrypt';
-                        } else if (decryptedSubject) {
-                            previewSubject = decryptedSubject;
-                        } else {
-                            previewSubject = 'Could not decrypt';
-                        }
-                    } catch (e) {
-                        previewSubject = 'Could not decrypt';
-                    }
-                }
-            }
-            previewText = Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
-            if (email.body && email.body.length > 100) previewText += '...';
+            // Body has no armor — not encrypted, show plaintext as-is
+            // (sentSignedMsg already decoded above if signed message armor present)
+            previewText = Utils.escapeHtml(sentPreviewBody ? sentPreviewBody.substring(0, 100) : '');
+            if (sentPreviewBody && sentPreviewBody.length > 100) previewText += '...';
             showSubject = true;
         }
         
@@ -5173,11 +6110,13 @@ ${attachmentsHtml}
         // Check if recipient_pubkey is missing and email is encrypted
         // Note: We specifically check for recipient_pubkey, not nostr_pubkey (which might be sender's pubkey)
         const hasRecipientPubkey = !!(email.recipient_pubkey);
-        const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
         const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-        const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+        // Permissive regex: matches both base64 and glossia word content between armor markers
+        const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
+        // Only check subject encryption if body has armor (encrypted body implies subject may also be encrypted)
+        const isEncryptedSubject = encryptedBodyMatch && (Utils.isLikelyEncryptedContent(email.subject) || !!this.decodeGlossiaSubject(email.subject));
         const isEncrypted = isEncryptedSubject || encryptedBodyMatch;
-        
+
         console.log(`[JS] _loadSentEmailDetail: Email ${email.id}, encrypted: ${isEncrypted}, hasRecipientPubkey: ${hasRecipientPubkey}, recipient_pubkey: ${email.recipient_pubkey || 'none'}`);
         
         // If encrypted but no recipient_pubkey, automatically search through all contacts
@@ -5318,12 +6257,20 @@ ${signatureIndicator}
 </div>
 <div class="error" style="margin-bottom: 15px;">Cannot decrypt: Recipient pubkey not found in contacts. The email could not be decrypted with any known contact pubkey.</div>
 <pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(rawHeaders)}</pre>
-<div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(rawBody).replace(/\n/g, '<br>')}</div>
-<pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(rawBody)}</pre>
+<div class="email-detail-body" id="sent-email-body-info">${email.html_body ? '' : Utils.escapeHtml(rawBody).replace(/\n/g, '<br>')}</div>
+<pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(rawBody)}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
 </div>
 <button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
-                
+                // This is the error path (no recipient pubkey) - show raw HTML if available
+                if (email.html_body) {
+                    Utils.renderHtmlBodyInIframe('sent-email-body-info', email.html_body);
+                }
+                if (!email.html_body) {
+                    Utils.decorateArmorBlocks('sent-email-body-info');
+                    this.verifyAndAnnotateSignatureBlocks(rawBody, 'sent-email-body-info');
+                }
+
                 // Add event listeners for invalid signature indicator in sender header
                 if (email.signature_valid === false) {
                     const sigIndicator = sentDetailContent.querySelector('.email-sender-header .signature-indicator.invalid');
@@ -5420,10 +6367,11 @@ ${signatureIndicator}
         }
         
         // Define updateDetail function first (before it's called)
-        const updateDetail = async (subject, body, cachedManifestResult) => {
+        const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null) => {
             // Render attachments - decrypt metadata for display
             console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
             console.log(`[JS] Email object:`, email);
+            console.log(`[JS] email.html_body present:`, !!email.html_body, `length:`, email.html_body ? email.html_body.length : 0);
             console.log(`[JS] Email.attachments type:`, typeof email.attachments, Array.isArray(email.attachments));
             
             // Ensure attachments array exists
@@ -5483,11 +6431,10 @@ ${signatureIndicator}
                             console.log('[JS] Email body length:', email.body ? email.body.length : 0);
                             console.log('[JS] Email body preview:', email.body ? email.body.substring(0, 200) : 'null');
                             
-                            // Extract encrypted content from the body
-                            const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                            // Extract encrypted content from the body (permissive regex)
+                            const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                             if (!encryptedBodyMatch) {
                                 console.warn('[JS] No encrypted content found in email body using regex, trying raw body');
-                                // Try using the body directly if it's already base64 encoded
                                 const keypair = appState.getKeypair();
                                 try {
                                     manifestResult = await this.decryptSentManifestMessage(email, email.body.replace(/\s+/g, ''), keypair);
@@ -5496,10 +6443,17 @@ ${signatureIndicator}
                                     throw new Error('No encrypted content found in email body');
                                 }
                             } else {
-                                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                                const armorContent = encryptedBodyMatch[2].trim();
+                                let encryptedContent;
+                                if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
+                                    encryptedContent = armorContent.replace(/\s+/g, '');
+                                } else {
+                                    const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
+                                    encryptedContent = glossiaResult ? glossiaResult.ciphertext : armorContent.replace(/\s+/g, '');
+                                }
                                 console.log('[JS] Extracted encrypted content, length:', encryptedContent.length);
                                 const keypair = appState.getKeypair();
-                                
+
                                 // Decrypt the manifest to get original attachment metadata
                                 manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
                             }
@@ -5627,13 +6581,19 @@ ${signatureIndicator}
             
             // Add signature verification indicator
             let signatureIndicator = '';
-            // Check signature_valid - handle both boolean and null/undefined cases
-            if (email.signature_valid === true || email.signature_valid === 1) {
+            console.log('[JS] Sent updateDetail: inlineSigResult=', inlineSigResult, 'email.signature_valid=', email.signature_valid);
+            // Check inline signature result first (from body armor verification)
+            if (inlineSigResult && inlineSigResult.isValid === true) {
+                signatureIndicator = `<span class="signature-indicator verified" title="Inline signature verified"><i class="fas fa-check-circle"></i> Signature Verified</span>`;
+            } else if (inlineSigResult && inlineSigResult.isValid === false) {
+                signatureIndicator = `<span class="signature-indicator invalid" title="Inline signature invalid"><i class="fas fa-times-circle"></i> Signature Invalid</span>`;
+            } else if (email.signature_valid === true || email.signature_valid === 1) {
                 signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
             } else if (email.signature_valid === false || email.signature_valid === 0) {
                 signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
             }
-            
+            console.log('[JS] Sent updateDetail: signatureIndicator=', signatureIndicator ? 'SET' : 'EMPTY');
+
             // Get sender info (for sent emails, sender is us)
             // IMPORTANT: For sent emails, we are the sender, so we must use OUR pubkey, not email.recipient_pubkey
             // Always use profile cache directly (same as loadProfile) to ensure we get our own profile
@@ -5750,13 +6710,40 @@ ${signatureIndicator}
 </details>
 </div>
 <pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
-<div class="email-detail-body" id="sent-email-body-info">${Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
-<pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}</pre>
+<div class="email-detail-body" id="sent-email-body-info">${email.html_body ? '' : Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
+<pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
 ${attachmentsHtml}
 </div>
 <button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
-            
+            if (email.html_body && wasDecrypted) {
+                // Patch the HTML body: replace glossia-encoded div content with decrypted text
+                try {
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(email.html_body, 'text/html');
+                    // Find the first content div (contains the glossia prose or ciphertext)
+                    const contentDiv = doc.querySelector('body > div > div') || doc.querySelector('body > div');
+                    if (contentDiv) {
+                        contentDiv.innerHTML = Utils.escapeHtml(body).replace(/\n/g, '<br>');
+                    }
+                    let patchedHtml = doc.documentElement.outerHTML;
+                    if (inlineSigResult) patchedHtml = this.injectHtmlSigBadge(patchedHtml, inlineSigResult);
+                    Utils.renderHtmlBodyInIframe('sent-email-body-info', patchedHtml);
+                } catch (e) {
+                    console.error('[JS] Failed to patch HTML body with decrypted text:', e);
+                    Utils.renderHtmlBodyInIframe('sent-email-body-info', email.html_body);
+                }
+            } else if (email.html_body) {
+                let htmlToRender = email.html_body;
+                if (inlineSigResult) htmlToRender = this.injectHtmlSigBadge(htmlToRender, inlineSigResult);
+                Utils.renderHtmlBodyInIframe('sent-email-body-info', htmlToRender);
+            }
+            // Decorate and verify inline signature blocks in the sent body
+            if (!email.html_body) {
+                Utils.decorateArmorBlocks('sent-email-body-info');
+                this.verifyAndAnnotateSignatureBlocks(body, 'sent-email-body-info');
+            }
+
             // Add event listeners for invalid signature indicator in sender header
             if (email.signature_valid === false) {
                 const sigIndicator = sentDetailContent.querySelector('.email-sender-header .signature-indicator.invalid');
@@ -5925,61 +6912,91 @@ ${attachmentsHtml}
                 const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
                 // For sent emails, use recipient_pubkey for decryption
                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
-                const isEncryptedSubject = Utils.isLikelyEncryptedContent(email.subject);
-                // Use generic NIP-X regex (same as inbox)
-                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
-                
+                const isEncryptedSubjectBase64 = Utils.isLikelyEncryptedContent(email.subject);
+                // Permissive regex: matches both base64 and glossia word content between armor markers
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
+
                 let decryptedSubject = email.subject;
                 let decryptedBody = cleanedBody;
                 const keypair = appState.getKeypair();
-                
+
                 // Add timeout wrapper to prevent hanging
                 const decryptWithTimeout = async (promise, timeoutMs = 30000) => {
                     return Promise.race([
                         promise,
-                        new Promise((_, reject) => 
+                        new Promise((_, reject) =>
                             setTimeout(() => reject(new Error('Decryption timeout after ' + timeoutMs + 'ms')), timeoutMs)
                         )
                     ]);
                 };
-                
-                if ((recipientPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+
+                // Only try subject decryption if body is encrypted (has armor)
+                let subjectCiphertext = null;
+                if (encryptedBodyMatch) {
+                    if (isEncryptedSubjectBase64) {
+                        subjectCiphertext = email.subject;
+                    } else {
+                        subjectCiphertext = this.decodeGlossiaSubject(email.subject);
+                        if (subjectCiphertext) {
+                            console.log('[JS] Sent: glossia-decoded subject to ciphertext');
+                        }
+                    }
+                }
+                const isEncryptedSubject = !!subjectCiphertext;
+
+                // Try glossia decode for body if armor content is not base64
+                let bodyCiphertext = null;
+                let bodyIsGlossia = false;
+                if (encryptedBodyMatch) {
+                    const armorContent = encryptedBodyMatch[2].trim();
+                    // Check if content is already base64
+                    if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
+                        bodyCiphertext = armorContent.replace(/\s+/g, '');
+                    } else {
+                        // Try glossia decode on the full body (uses decodeGlossiaArmoredBody)
+                        const glossiaResult = this.decodeGlossiaArmoredBody(cleanedBody);
+                        if (glossiaResult) {
+                            bodyCiphertext = glossiaResult.ciphertext;
+                            bodyIsGlossia = true;
+                            console.log('[JS] Sent: glossia-decoded body armor, dialect:', glossiaResult.dialect);
+                        }
+                    }
+                }
+
+                const hasEncryptedContent = isEncryptedSubject || bodyCiphertext;
+                if (hasEncryptedContent && keypair) {
                     try {
-                        // Decrypt subject if it looks encrypted (ASCII armor not required)
-                        if (isEncryptedSubject) {
+                        // Decrypt subject
+                        if (isEncryptedSubject && subjectCiphertext) {
                             console.log('[JS] Decrypting subject...');
                             decryptedSubject = await decryptWithTimeout(
-                                this.decryptNostrSentMessageWithFallback(email, email.subject, keypair),
-                                10000 // 10 second timeout for subject
+                                this.decryptNostrSentMessageWithFallback(email, subjectCiphertext, keypair),
+                                10000
                             );
                         }
                         let manifestResult = null;
-                        if (encryptedBodyMatch) {
-                            const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
+                        if (bodyCiphertext) {
                             try {
                                 console.log('[JS] Decrypting manifest...');
-                                // Try sent manifest decryption first - decrypt once and reuse for attachments
                                 manifestResult = await decryptWithTimeout(
-                                    this.decryptSentManifestMessage(email, encryptedContent, keypair),
-                                    30000 // 30 second timeout for manifest
+                                    this.decryptSentManifestMessage(email, bodyCiphertext, keypair),
+                                    30000
                                 );
                                 if (manifestResult.type === 'manifest') {
                                     decryptedBody = manifestResult.body;
                                 } else if (manifestResult.type === 'legacy') {
                                     decryptedBody = manifestResult.body;
                                 } else {
-                                    // Fallback to legacy decryption
                                     decryptedBody = await decryptWithTimeout(
-                                        this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair),
+                                        this.decryptNostrSentMessageWithFallback(email, bodyCiphertext, keypair),
                                         10000
                                     );
                                 }
                             } catch (e) {
                                 console.error('[JS] Failed to decrypt manifest:', e);
-                                // If manifest fails, try legacy decryption
                                 try {
                                     decryptedBody = await decryptWithTimeout(
-                                        this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair),
+                                        this.decryptNostrSentMessageWithFallback(email, bodyCiphertext, keypair),
                                         10000
                                     );
                                 } catch (legacyErr) {
@@ -5988,14 +7005,34 @@ ${attachmentsHtml}
                                 }
                             }
                         }
+                        // Verify inline signature against raw body content
+                        let inlineSigResult = null;
+                        try {
+                            inlineSigResult = await this.verifyInlineSignature(email.body);
+                        } catch (e) {
+                            console.warn('[JS] Inline signature verification error:', e);
+                        }
                         // Pass manifestResult to updateDetail to avoid re-decrypting
-                        await updateDetail(decryptedSubject, decryptedBody, manifestResult);
+                        await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, inlineSigResult);
                     } catch (err) {
                         console.error('[JS] Error decrypting sent email:', err);
-                        await updateDetail('Could not decrypt', 'Could not decrypt: ' + err.message, null);
+                        await updateDetail('Could not decrypt', 'Could not decrypt: ' + err.message, null, true);
                     }
                 } else {
-                    await updateDetail(decryptedSubject, decryptedBody, null);
+                    // Non-encrypted sent email: still verify inline signature
+                    let inlineSigResult = null;
+                    try {
+                        inlineSigResult = await this.verifyInlineSignature(email.body);
+                    } catch (e) {
+                        console.warn('[JS] Inline signature verification error:', e);
+                    }
+                    // Decode glossia signed message body for display
+                    let displayBody = decryptedBody;
+                    const signedMsg = this.decodeGlossiaSignedMessage(email.body);
+                    if (signedMsg && signedMsg.plaintextBody) {
+                        displayBody = signedMsg.plaintextBody;
+                    }
+                    await updateDetail(decryptedSubject, displayBody, null, false, inlineSigResult);
                 }
             } catch (error) {
             console.error('Error loading sent email detail:', error);
@@ -6091,7 +7128,7 @@ ${attachmentsHtml}
                     if (decryptedSubject && !decryptedSubject.startsWith('Unable to decrypt')) {
                         // Subject decryption successful, try body too
                         const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-                        const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                        const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                         
                         if (encryptedBodyMatch) {
                             const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
@@ -6126,7 +7163,7 @@ ${attachmentsHtml}
             } else {
                 // Subject not encrypted, try body
                 const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                 
                 if (encryptedBodyMatch) {
                     const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
@@ -6258,7 +7295,7 @@ ${attachmentsHtml}
                 console.log(`[JS] Attempting to decrypt attachment using manifest (hasManifestEncryption: ${hasManifestEncryption}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
                 // Extract encrypted content from email body
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
                     return;
@@ -6356,7 +7393,7 @@ ${attachmentsHtml}
                 console.log(`[JS] Attempting to decrypt manifest for ZIP (hasManifestAttachments: ${hasManifestAttachments}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
                 // Extract and decrypt manifest
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachments: no encrypted manifest found');
                     return;
@@ -6502,7 +7539,7 @@ ${attachmentsHtml}
                 console.log(`[JS] Attempting to decrypt attachment using manifest (hasManifestEncryption: ${hasManifestEncryption}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
                 // Extract encrypted content from email body
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
                     return;
@@ -6596,7 +7633,7 @@ ${attachmentsHtml}
             if (hasManifestAttachments || (hasEncryptedContent && email.attachments.some(att => att.filename.endsWith('.dat')))) {
                 console.log(`[JS] Attempting to decrypt manifest for ZIP (hasManifestAttachments: ${hasManifestAttachments}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachments: no encrypted manifest found');
                     return;
@@ -6830,7 +7867,7 @@ ${attachmentsHtml}
                             if (Utils.isLikelyEncryptedContent(draft.subject)) {
                                 previewSubject = await this.decryptNostrMessageWithFallback(draft, draft.subject, keypair);
                             }
-                            const encryptedBodyMatch = draft.body.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                            const encryptedBodyMatch = draft.body.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                             if (encryptedBodyMatch) {
                                 const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
                                 try {
@@ -7021,12 +8058,12 @@ ${attachmentsHtml}
                 // For drafts, use recipient_pubkey for decryption (drafts are emails we're preparing to send)
                 const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey; // Fallback for backward compatibility
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(draft.subject);
-                const encryptedBodyMatch = cleanedBody.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
                 let decryptedSubject = draft.subject;
                 let decryptedBody = cleanedBody;
                 const keypair = appState.getKeypair();
                 
-                if ((draftRecipientPubkey || (isEncryptedSubject || encryptedBodyMatch)) && keypair) {
+                if ((isEncryptedSubject || encryptedBodyMatch) && keypair) {
                     (async () => {
                         try {
                             if (isEncryptedSubject) {

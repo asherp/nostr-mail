@@ -146,6 +146,7 @@ pub fn construct_email_headers(
     _nostr_npub: Option<&str>,
     message_id: Option<&str>,
     attachments: Option<&Vec<EmailAttachment>>,
+    html_body: Option<&str>,
 ) -> Result<String> {
     println!("[RUST] construct_email_headers: Constructing email headers");
     println!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
@@ -177,10 +178,11 @@ pub fn construct_email_headers(
                 println!("[RUST] construct_email_headers: Adding sender pubkey to headers: {}", sender_pubkey);
                 builder = builder.header(XNostrPubkey(sender_pubkey));
                 
-                // Sign the email body and add signature to headers
-                match crypto::sign_data(private_key, body) {
+                // Sign the binary ciphertext extracted from the body
+                let binary = extract_ciphertext_binary(body);
+                match crypto::sign_data_bytes(private_key, &binary) {
                     Ok(signature) => {
-                        println!("[RUST] construct_email_headers: Signing email body, signature length: {}", signature.len());
+                        println!("[RUST] construct_email_headers: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
                         builder = builder.header(XNostrSig(signature));
                     }
                     Err(e) => {
@@ -194,40 +196,66 @@ pub fn construct_email_headers(
         }
     }
     
+    // Build the text (and optional HTML) body part
+    let text_part = SinglePart::builder()
+        .header(ContentType::TEXT_PLAIN)
+        .body(body.to_string());
+
+    let body_part: Option<MultiPart> = if let Some(html) = html_body {
+        println!("[RUST] construct_email_headers: Building multipart/alternative with HTML body");
+        let html_part = SinglePart::builder()
+            .header(ContentType::TEXT_HTML)
+            .body(html.to_string());
+        Some(MultiPart::alternative()
+            .singlepart(text_part)
+            .singlepart(html_part))
+    } else {
+        None
+    };
+
     // Build email with or without attachments (for header construction)
     let email = if let Some(attachments) = attachments {
         if attachments.is_empty() {
-            // No attachments, simple text email
-            builder.body(body.to_string())?
+            if let Some(alt) = body_part {
+                builder.multipart(alt)?
+            } else {
+                builder.body(body.to_string())?
+            }
         } else {
             println!("[RUST] construct_email_headers: Building multipart email with {} attachments", attachments.len());
-            
-            // Create multipart email with text body and attachments
-            let mut multipart = MultiPart::mixed()
-                .singlepart(SinglePart::builder()
+
+            // Create multipart/mixed; nest alternative or plain text inside
+            let mut multipart = if let Some(alt) = body_part {
+                MultiPart::mixed().multipart(alt)
+            } else {
+                MultiPart::mixed().singlepart(SinglePart::builder()
                     .header(ContentType::TEXT_PLAIN)
-                    .body(body.to_string()));
-            
+                    .body(body.to_string()))
+            };
+
             // Add each attachment (for header construction, we don't need the actual data)
             for attachment in attachments {
                 println!("[RUST] construct_email_headers: Adding attachment header: {}", attachment.filename);
-                
+
                 // Parse content type
                 let content_type = attachment.content_type.parse::<ContentType>()
                     .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
-                
+
                 // Create attachment part with empty data for header construction
                 let attachment_part = Attachment::new(attachment.filename.clone())
                     .body(Vec::new(), content_type);
-                
+
                 multipart = multipart.singlepart(attachment_part);
             }
-            
+
             builder.multipart(multipart)?
         }
     } else {
-        // No attachments, simple text email
-        builder.body(body.to_string())?
+        if let Some(alt) = body_part {
+            builder.multipart(alt)?
+        } else {
+            builder.body(body.to_string())?
+        }
     };
     
     // Convert the email to a string to get the raw headers
@@ -281,6 +309,7 @@ pub async fn send_email(
     _nostr_npub: Option<&str>,
     message_id: Option<&str>,
     attachments: Option<&Vec<EmailAttachment>>,
+    html_body: Option<&str>,
 ) -> Result<String> {
     println!("[RUST] send_email: Starting email send process");
     println!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
@@ -307,10 +336,11 @@ pub async fn send_email(
                 println!("[RUST] send_email: Adding sender pubkey to headers: {}", sender_pubkey);
                 builder = builder.header(XNostrPubkey(sender_pubkey));
                 
-                // Sign the email body and add signature to headers
-                match crypto::sign_data(private_key, body) {
+                // Sign the binary ciphertext extracted from the body
+                let binary = extract_ciphertext_binary(body);
+                match crypto::sign_data_bytes(private_key, &binary) {
                     Ok(signature) => {
-                        println!("[RUST] send_email: Signing email body, signature length: {}", signature.len());
+                        println!("[RUST] send_email: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
                         builder = builder.header(XNostrSig(signature));
                     }
                     Err(e) => {
@@ -324,24 +354,47 @@ pub async fn send_email(
         }
     }
     
+    // Build the text (and optional HTML) body part
+    let text_part = SinglePart::builder()
+        .header(ContentType::TEXT_PLAIN)
+        .body(body.to_string());
+
+    let body_part: Option<MultiPart> = if let Some(html) = html_body {
+        println!("[RUST] send_email: Building multipart/alternative with HTML body");
+        let html_part = SinglePart::builder()
+            .header(ContentType::TEXT_HTML)
+            .body(html.to_string());
+        Some(MultiPart::alternative()
+            .singlepart(text_part)
+            .singlepart(html_part))
+    } else {
+        None
+    };
+
     // Build email with or without attachments
     let email = if let Some(attachments) = attachments {
         if attachments.is_empty() {
-            // No attachments, simple text email
-            builder.body(body.to_string())?
+            if let Some(alt) = body_part {
+                builder.multipart(alt)?
+            } else {
+                builder.body(body.to_string())?
+            }
         } else {
             println!("[RUST] send_email: Building multipart email with {} attachments", attachments.len());
-            
-            // Create multipart email with text body and attachments
-            let mut multipart = MultiPart::mixed()
-                .singlepart(SinglePart::builder()
+
+            // Create multipart/mixed; nest alternative or plain text inside
+            let mut multipart = if let Some(alt) = body_part {
+                MultiPart::mixed().multipart(alt)
+            } else {
+                MultiPart::mixed().singlepart(SinglePart::builder()
                     .header(ContentType::TEXT_PLAIN)
-                    .body(body.to_string()));
-            
+                    .body(body.to_string()))
+            };
+
             // Add each attachment
             for attachment in attachments {
                 println!("[RUST] send_email: Adding attachment: {} ({})", attachment.filename, attachment.size);
-                
+
                 // Decode base64 data
                 let attachment_data = match general_purpose::STANDARD.decode(&attachment.data) {
                     Ok(data) => data,
@@ -350,23 +403,26 @@ pub async fn send_email(
                         continue;
                     }
                 };
-                
+
                 // Parse content type
                 let content_type = attachment.content_type.parse::<ContentType>()
                     .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
-                
+
                 // Create attachment part
                 let attachment_part = Attachment::new(attachment.filename.clone())
                     .body(attachment_data, content_type);
-                
+
                 multipart = multipart.singlepart(attachment_part);
             }
-            
+
             builder.multipart(multipart)?
         }
     } else {
-        // No attachments, simple text email
-        builder.body(body.to_string())?
+        if let Some(alt) = body_part {
+            builder.multipart(alt)?
+        } else {
+            builder.body(body.to_string())?
+        }
     };
 
     let creds = Credentials::new(config.email_address.clone(), config.password.clone());
@@ -474,6 +530,29 @@ pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &st
     };
     
     result
+}
+
+/// Extract the text/html body from a parsed email (multipart/alternative).
+/// Returns None if no HTML part is found.
+fn extract_html_body(email: &mailparse::ParsedMail) -> Option<String> {
+    println!("[RUST] extract_html_body: top-level mimetype={}, subparts={}", email.ctype.mimetype, email.subparts.len());
+    for (i, subpart) in email.subparts.iter().enumerate() {
+        let ctype = &subpart.ctype;
+        println!("[RUST] extract_html_body: subpart[{}] mimetype={}", i, ctype.mimetype);
+        if ctype.mimetype == "text/html" {
+            let body = subpart.get_body().ok();
+            println!("[RUST] extract_html_body: found text/html, body length={}", body.as_ref().map(|b| b.len()).unwrap_or(0));
+            return body;
+        }
+        // Recurse into nested multipart
+        if ctype.mimetype.starts_with("multipart/") {
+            if let Some(html) = extract_html_body(subpart) {
+                return Some(html);
+            }
+        }
+    }
+    println!("[RUST] extract_html_body: no text/html found");
+    None
 }
 
 /// Helper function to ensure the nostr-mail folder exists on the IMAP server
@@ -1010,6 +1089,7 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     subject: final_subject,
                     body: final_body.clone(),
                     raw_body: final_body.clone(),
+                    html_body: None,
                     date,
                     is_read: true, // We'll assume all fetched emails are read for now
                     raw_headers: raw_headers.clone(),
@@ -1161,6 +1241,7 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     subject: _final_subject,
                     body: _final_body.clone(),
                     raw_body: _final_body.clone(),
+                    html_body: None,
                     date,
                     is_read: true,
                     raw_headers: raw_headers.clone(),
@@ -1362,40 +1443,25 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
         }
     };
     
-    // Use Gmail's date filtering in X-GM-RAW search to reduce server load
-    // IMPORTANT: Gmail interprets "after:YYYY/MM/DD" as midnight (00:00) Pacific Time, not UTC!
-    // To avoid timezone issues, we use Unix timestamps instead, which are timezone-independent
-    // Format: X-GM-RAW "content search AND after:unix_timestamp"
-    // Unix timestamps are in seconds since epoch (1970-01-01 00:00:00 UTC)
-    let date_filter = if latest.is_some() {
-        // Convert cutoff timestamp to Unix timestamp (seconds)
-        let unix_timestamp = cutoff.timestamp();
-        // Subtract a small buffer (1 hour) to account for any timing edge cases
-        let search_timestamp = unix_timestamp - 3600;
-        println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Filtering for emails after: {} (using Unix timestamp: {} to avoid timezone issues)", cutoff, search_timestamp);
-        format!(" AND after:{}", search_timestamp)
+    // Build IMAP SINCE date filter
+    let cutoff_with_buffer = cutoff - chrono::Duration::hours(1);
+    let since_filter = if latest.is_some() {
+        let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+        println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Filtering for emails after: {} (SINCE {})", cutoff, since_date);
+        format!(" SINCE {}", since_date)
     } else {
         String::new()
     };
-    
-    // Use more specific search terms with date filtering to avoid fetching old emails
-    // Try multiple search strategies to catch all Nostr emails:
-    let mut search_terms = vec![
-        format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
-        format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
+
+    // Search strategies:
+    // 1. IMAP TEXT searches all MIME parts (headers + body), so it finds ASCII armor in text/plain
+    // 2. IMAP HEADER search for the X-Nostr-Pubkey custom header
+    let search_terms = vec![
+        // Primary: standard IMAP TEXT search finds ASCII armor in text/plain part
+        format!("TEXT \"BEGIN NOSTR\"{}", since_filter),
+        // Standard IMAP HEADER search for custom header
+        format!("HEADER X-Nostr-Pubkey \"\"{}", since_filter),
     ];
-    
-    // Add header searches - try multiple approaches
-    if !date_filter.is_empty() {
-        // With date filter, try different header search syntaxes
-        search_terms.push(format!("X-GM-RAW \"has:X-Nostr-Pubkey{}\"", date_filter));
-        // Also search for "npub" which is in the header value - this might be more reliable
-        search_terms.push(format!("X-GM-RAW \"npub{}\"", date_filter));
-    } else {
-        // Without date filter
-        search_terms.push("X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string());
-        search_terms.push("X-GM-RAW \"npub\"".to_string());
-    }
     
     let mut all_message_numbers: HashSet<u32> = HashSet::new();
     
@@ -1424,12 +1490,10 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
         if days_since_latest <= 7 {
             println!("[RUST] fetch_nostr_emails_from_gmail_optimized: No results with date filter, trying without date filter (latest was {} days ago)", days_since_latest);
             let fallback_search_terms = vec![
-                "X-GM-RAW \"BEGIN NOSTR NIP-\"".to_string(),
-                "X-GM-RAW \"END NOSTR NIP-\"".to_string(),
-                "X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string(),
-                "X-GM-RAW \"npub\"".to_string(),
+                "TEXT \"BEGIN NOSTR\"".to_string(),
+                "HEADER X-Nostr-Pubkey \"\"".to_string(),
             ];
-            
+
             let mut fallback_message_numbers: HashSet<u32> = HashSet::new();
             for search_term in fallback_search_terms {
                 match session.search(&search_term) {
@@ -1612,6 +1676,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         continue;
                     }
                     
+                    let html_body = extract_html_body(&email);
                     let email_message = EmailMessage {
                         id: email_id.to_string(),
                         from,
@@ -1619,6 +1684,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         subject,
                         body: body_text.clone(),
                         raw_body: body_text.clone(),
+                        html_body,
                         date,
                         is_read: true,
                         raw_headers: raw_headers.clone(),
@@ -1657,45 +1723,23 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
     // If latest is provided, use it directly; otherwise search all emails
     let cutoff = latest.unwrap_or_else(|| Utc::now() - chrono::Duration::days(365 * 5));
     
-    // Use Gmail's date filtering in X-GM-RAW search to reduce server load
-    // IMPORTANT: Gmail interprets "after:YYYY/MM/DD" as midnight (00:00) Pacific Time, not UTC!
-    // To avoid timezone issues, we use Unix timestamps instead, which are timezone-independent
-    // Format: X-GM-RAW "content search AND after:unix_timestamp"
-    // Unix timestamps are in seconds since epoch (1970-01-01 00:00:00 UTC)
-    let date_filter = if latest.is_some() {
-        // Convert cutoff timestamp to Unix timestamp (seconds)
-        let unix_timestamp = cutoff.timestamp();
-        // Subtract a small buffer (1 hour) to account for any timing edge cases
-        let search_timestamp = unix_timestamp - 3600;
-        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for emails after: {} (using Unix timestamp: {} to avoid timezone issues)", cutoff, search_timestamp);
-        format!(" AND after:{}", search_timestamp)
+    // Build IMAP SINCE date filter
+    let cutoff_with_buffer = cutoff - chrono::Duration::hours(1);
+    let since_filter = if latest.is_some() {
+        let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for emails after: {} (SINCE {})", cutoff, since_date);
+        format!(" SINCE {}", since_date)
     } else {
         String::new()
     };
-    
-    // Use more specific search terms with date filtering to avoid fetching old emails
-    // Gmail X-GM-RAW syntax supports various search operators
-    // Try multiple search strategies to catch all Nostr emails:
-    // 1. Search body content for encrypted message markers (partial match should work)
-    // 2. Search for header using has: operator (Gmail-specific)
-    // 3. Search for "npub" which appears in X-Nostr-Pubkey header values
-    let mut search_terms = vec![
-        format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
-        format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
+
+    // Search strategies:
+    // 1. IMAP TEXT searches all MIME parts, finds ASCII armor in text/plain
+    // 2. IMAP HEADER search for the X-Nostr-Pubkey custom header
+    let search_terms = vec![
+        format!("TEXT \"BEGIN NOSTR\"{}", since_filter),
+        format!("HEADER X-Nostr-Pubkey \"\"{}", since_filter),
     ];
-    
-    // Add header searches - try multiple approaches
-    if !date_filter.is_empty() {
-        // With date filter, try different header search syntaxes
-        // Note: Gmail's has: operator searches for header existence
-        search_terms.push(format!("X-GM-RAW \"has:X-Nostr-Pubkey{}\"", date_filter));
-        // Also search for "npub" which is in the header value - this might be more reliable
-        search_terms.push(format!("X-GM-RAW \"npub{}\"", date_filter));
-    } else {
-        // Without date filter
-        search_terms.push("X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string());
-        search_terms.push("X-GM-RAW \"npub\"".to_string());
-    }
     
     let mut all_message_numbers: HashSet<u32> = HashSet::new();
     
@@ -1724,10 +1768,8 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
         if days_since_latest <= 7 {
             println!("[RUST] fetch_sent_emails_from_gmail_optimized: No results with date filter, trying without date filter (latest was {} days ago)", days_since_latest);
             let fallback_search_terms = vec![
-                "X-GM-RAW \"BEGIN NOSTR NIP-\"".to_string(),
-                "X-GM-RAW \"END NOSTR NIP-\"".to_string(),
-                "X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string(),
-                "X-GM-RAW \"npub\"".to_string(), // Search for npub in header values
+                "TEXT \"BEGIN NOSTR\"".to_string(),
+                "HEADER X-Nostr-Pubkey \"\"".to_string(),
             ];
             
             let mut fallback_message_numbers: HashSet<u32> = HashSet::new();
@@ -1893,6 +1935,7 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                         None // No pubkey, can't verify
                     };
                     
+                    let html_body = extract_html_body(&email);
                     let email_message = EmailMessage {
                         id: email_id.to_string(),
                         from,
@@ -1900,6 +1943,7 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                         subject,
                         body: body_text.clone(),
                         raw_body: body_text.clone(),
+                        html_body,
                         date,
                         is_read: true,
                         raw_headers: raw_headers.clone(),
@@ -2108,21 +2152,81 @@ fn normalize_body_for_verification(body: &str) -> String {
         .join("\n")
 }
 
-/// Verify email signature
+/// Extract binary ciphertext from the email body for signing/verification.
+/// For ASCII-armored bodies: extracts the base64 payload, strips whitespace, decodes to bytes.
+/// For non-armored bodies: returns the UTF-8 bytes of the body text.
+fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
+    // Try to extract base64 content from ASCII armor
+    // Pattern: ---BEGIN NOSTR NIP-XX ENCRYPTED MESSAGE--- ... ---END ...---
+    if let Some(start) = body.find("BEGIN NOSTR NIP-") {
+        if let Some(end) = body.find("END NOSTR NIP-") {
+            // Find the end of the BEGIN line (after the dashes)
+            if let Some(begin_end) = body[start..].find("---") {
+                let content_start = start + begin_end + 3;
+                // Find the start of the END line (before the dashes)
+                if let Some(end_dashes) = body[..end].rfind("---") {
+                    let content = body[content_start..end_dashes].trim();
+                    // Strip all whitespace from the base64 content
+                    let b64_clean: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+
+                    if !b64_clean.is_empty() {
+                        // Check for NIP-04 format: base64?iv=base64
+                        if let Some((payload_b64, iv_b64)) = b64_clean.split_once("?iv=") {
+                            if let (Ok(payload), Ok(iv)) = (
+                                general_purpose::STANDARD.decode(payload_b64),
+                                general_purpose::STANDARD.decode(iv_b64),
+                            ) {
+                                let mut combined = payload;
+                                combined.extend_from_slice(&iv);
+                                println!("[RUST] extract_ciphertext_binary: NIP-04 binary, {} bytes", combined.len());
+                                return combined;
+                            }
+                        }
+                        // NIP-44: pure base64
+                        if let Ok(decoded) = general_purpose::STANDARD.decode(&b64_clean) {
+                            println!("[RUST] extract_ciphertext_binary: NIP-44 binary, {} bytes", decoded.len());
+                            return decoded;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Non-armored body: return UTF-8 bytes
+    println!("[RUST] extract_ciphertext_binary: plain text, {} bytes", body.len());
+    body.as_bytes().to_vec()
+}
+
+/// Verify email signature using binary ciphertext extraction.
+/// Extracts the binary payload from ASCII armor (or uses raw text bytes),
+/// then verifies the schnorr signature against SHA-256(binary).
 pub fn verify_email_signature(sender_pubkey: &str, signature: &str, body: &str) -> bool {
-    // Normalize the body to match what was signed (handle line ending differences)
-    let normalized_body = normalize_body_for_verification(body);
-    println!("[RUST] verify_email_signature: Verifying signature for pubkey: {}, original body length: {}, normalized body length: {}, signature: {}", 
-        sender_pubkey, body.len(), normalized_body.len(), signature);
-    println!("[RUST] verify_email_signature: Original body first 100 chars: {}", body.chars().take(100).collect::<String>());
-    println!("[RUST] verify_email_signature: Normalized body first 100 chars: {}", normalized_body.chars().take(100).collect::<String>());
-    match crypto::verify_signature(sender_pubkey, signature, &normalized_body) {
+    let binary = extract_ciphertext_binary(body);
+    println!("[RUST] verify_email_signature: Verifying signature for pubkey: {}, binary length: {}, signature: {}",
+        sender_pubkey, binary.len(), signature);
+    match crypto::verify_signature_bytes(sender_pubkey, signature, &binary) {
         Ok(valid) => {
-            println!("[RUST] verify_email_signature: Signature verification result: {}", valid);
-            valid
+            if !valid {
+                // Fallback: try old text-based verification for backwards compat with pre-binary emails
+                let normalized_body = normalize_body_for_verification(body);
+                match crypto::verify_signature(sender_pubkey, signature, &normalized_body) {
+                    Ok(text_valid) => {
+                        println!("[RUST] verify_email_signature: binary={}, text_fallback={}", valid, text_valid);
+                        text_valid
+                    },
+                    Err(e) => {
+                        println!("[RUST] verify_email_signature: binary=false, text_fallback error: {}", e);
+                        false
+                    }
+                }
+            } else {
+                println!("[RUST] verify_email_signature: binary signature valid");
+                true
+            }
         },
         Err(e) => {
-            println!("[RUST] verify_email_signature: Error verifying signature: {}", e);
+            println!("[RUST] verify_email_signature: Error verifying binary signature: {}", e);
             false
         }
     }
@@ -2718,6 +2822,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(result.is_ok());
@@ -2738,6 +2843,7 @@ mod tests {
             "Body",
             None,
             Some("<custom-id@example.com>"),
+            None,
             None,
         );
 
@@ -2764,6 +2870,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(result.is_ok());
@@ -2785,6 +2892,7 @@ mod tests {
             None,
             None,
             Some(&empty_attachments),
+            None,
         );
 
         assert!(result.is_ok());
@@ -2815,6 +2923,7 @@ mod tests {
             None,
             None,
             Some(&attachments),
+            None,
         );
 
         assert!(result.is_ok());
@@ -2938,6 +3047,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 subject,
                                 body: _final_body.clone(),
                                 raw_body: _final_body.clone(),
+                                html_body: extract_html_body(&email),
                                 date,
                                 is_read: true,
                                 raw_headers: raw_headers.clone(),
@@ -3024,6 +3134,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                     subject,
                                     body: _final_body.clone(),
                                     raw_body: _final_body.clone(),
+                                    html_body: extract_html_body(&email),
                                     date,
                                     is_read: true,
                                     raw_headers: raw_headers.clone(),
@@ -3170,7 +3281,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 subject: email.subject.clone(), // still encrypted
                 body: email.body.clone(),       // still encrypted
                 body_plain: None,
-                body_html: None,
+                body_html: email.html_body.clone(),
                 received_at: email.date,
                 is_nostr_encrypted: true,
                 sender_pubkey: email.sender_pubkey.clone(),
@@ -3196,7 +3307,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 subject: email.subject.clone(), // still encrypted
                 body: email.body.clone(),       // still encrypted
                 body_plain: None,
-                body_html: None,
+                body_html: email.html_body.clone(),
                 received_at: email.date,
                 is_nostr_encrypted: true,
                 sender_pubkey: email.sender_pubkey.clone(),
@@ -3315,7 +3426,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                     subject: email.subject.clone(), // Update with IMAP subject (might be more recent)
                     body: email.body.clone(),       // Update with IMAP body (might be more recent)
                     body_plain: existing_email.body_plain.clone(), // Preserve decrypted body if exists
-                    body_html: existing_email.body_html.clone(),   // Preserve HTML if exists
+                    body_html: existing_email.body_html.clone().or_else(|| email.html_body.clone()), // Preserve HTML if exists, otherwise use IMAP HTML
                     received_at: email.date, // Update with IMAP date
                     is_nostr_encrypted: true,
                     sender_pubkey: email.sender_pubkey.clone(),
@@ -3349,7 +3460,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                 subject: email.subject.clone(), // still encrypted
                 body: email.body.clone(),       // still encrypted
                 body_plain: None,
-                body_html: None,
+                body_html: email.html_body.clone(),
                 received_at: email.date,
                 is_nostr_encrypted: true,
                 sender_pubkey: email.sender_pubkey.clone(),
@@ -3436,6 +3547,7 @@ pub struct RawNostrEmail {
     pub to: String,
     pub subject: String,
     pub body: String,
+    pub html_body: Option<String>,
     pub date: chrono::DateTime<chrono::Utc>,
     pub sender_pubkey: Option<String>,
     pub recipient_pubkey: Option<String>,
@@ -3485,16 +3597,17 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
             }
         };
         
-        let date_filter = if latest.is_some() {
-            let unix_timestamp = cutoff.timestamp() - 3600; // 1 hour buffer
-            format!(" AND after:{}", unix_timestamp)
+        let cutoff_with_buffer = cutoff - chrono::Duration::hours(1);
+        let since_filter = if latest.is_some() {
+            let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+            format!(" SINCE {}", since_date)
         } else {
             String::new()
         };
-        
+
         let search_terms = vec![
-            format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
-            format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
+            format!("TEXT \"BEGIN NOSTR\"{}", since_filter),
+            format!("HEADER X-Nostr-Pubkey \"\"{}", since_filter),
         ];
         
         let mut all_emails = Vec::new();
@@ -3582,6 +3695,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             to,
                             subject,
                             body: body_text,
+                            html_body: extract_html_body(&email),
                             date,
                             sender_pubkey: sender_pubkey.clone(),
                             recipient_pubkey: None,
@@ -3685,6 +3799,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         to,
                         subject,
                         body: body_text,
+                            html_body: extract_html_body(&email),
                         date,
                         sender_pubkey: sender_pubkey.clone(),
                         recipient_pubkey: None,
@@ -3725,16 +3840,17 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                 }
             };
             
-            let date_filter = if latest.is_some() {
-                let unix_timestamp = cutoff.timestamp() - 3600; // 1 hour buffer
-                format!(" AND after:{}", unix_timestamp)
+            let cutoff_with_buffer = cutoff - chrono::Duration::hours(1);
+            let since_filter = if latest.is_some() {
+                let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+                format!(" SINCE {}", since_date)
             } else {
                 String::new()
             };
-            
+
             let search_terms = vec![
-                format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
-                format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
+                format!("TEXT \"BEGIN NOSTR\"{}", since_filter),
+                format!("HEADER X-Nostr-Pubkey \"\"{}", since_filter),
             ];
             
             let mut all_emails = Vec::new();
@@ -3811,6 +3927,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                                 to,
                                 subject,
                                 body: body_text,
+                            html_body: extract_html_body(&email),
                                 date,
                                 sender_pubkey: sender_pubkey.clone(),
                                 recipient_pubkey: None,
@@ -3914,6 +4031,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             to,
                             subject,
                             body: body_text,
+                            html_body: extract_html_body(&email),
                             date,
                             sender_pubkey: sender_pubkey.clone(),
                             recipient_pubkey: None,
@@ -3963,6 +4081,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                     to: em.to,
                     subject: em.subject,
                     body: em.body,
+                    html_body: em.html_body,
                     date: em.date,
                     sender_pubkey: em.sender_pubkey.clone(),
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
@@ -4039,6 +4158,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                             to,
                             subject,
                             body: body_text,
+                            html_body: extract_html_body(&email),
                             date,
                             sender_pubkey: sender_pubkey.clone(),
                             recipient_pubkey: None, // Will be populated during sync if contact exists
@@ -4075,6 +4195,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                     to: em.to,
                     subject: em.subject,
                     body: em.body,
+                    html_body: em.html_body,
                     date: em.date,
                     sender_pubkey: em.sender_pubkey.clone(),
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
@@ -4164,6 +4285,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                                 to,
                                 subject,
                                 body: body_text,
+                            html_body: extract_html_body(&email),
                                 date,
                                 sender_pubkey: sender_pubkey.clone(),
                                 recipient_pubkey: None,
@@ -4323,6 +4445,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                         to: em.to,
                         subject: em.subject,
                         body: em.body,
+                    html_body: em.html_body,
                         date: em.date,
                         sender_pubkey: sender_pubkey,
                         recipient_pubkey: recipient_pubkey,
@@ -4419,6 +4542,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 to,
                                 subject,
                                 body: body_text,
+                            html_body: extract_html_body(&email),
                                 date,
                                 sender_pubkey: sender_pubkey.clone(),
                                 recipient_pubkey: None, // Will be populated during sync if contact exists
@@ -4544,6 +4668,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                         to: em.to,
                         subject: em.subject,
                         body: em.body,
+                    html_body: em.html_body,
                         date: em.date,
                         sender_pubkey: em.sender_pubkey.clone(),
                         recipient_pubkey,
@@ -4630,6 +4755,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 to,
                                 subject,
                                 body: body_text,
+                            html_body: extract_html_body(&email),
                                 date,
                                 sender_pubkey: sender_pubkey.clone(),
                                 recipient_pubkey,

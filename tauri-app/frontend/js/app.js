@@ -347,8 +347,8 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                 automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
                 hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false', // Default to true if not set
-                glossia_encoding_body: (dbSettings.glossia_encoding_body ?? dbSettings.glossia_encoding ?? 'latin') || 'latin',
-                glossia_encoding_signature: (dbSettings.glossia_encoding_signature ?? dbSettings.glossia_encoding ?? 'latin') || 'latin',
+                glossia_encoding_body: dbSettings.glossia_encoding_body ?? dbSettings.glossia_encoding ?? 'latin',
+                glossia_encoding_signature: dbSettings.glossia_encoding_signature ?? dbSettings.glossia_encoding ?? 'latin',
                 glossia_encoding_pubkey: dbSettings.glossia_encoding_pubkey ?? dbSettings.glossia_encoding ?? 'latin'
             };
             
@@ -793,17 +793,40 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     if (privkey && pubkey) {
                         // Standard armor-based decryption
                         // Regex for both NIP-04 and NIP-44 armored messages
-                        const match = currentBody.match(/-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)-----/);
-                        // Decrypt subject if it looks encrypted
+                        const match = currentBody.match(/-{3,}\s*BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                        // Decrypt subject if it looks encrypted (base64 or glossia-encoded)
                         let detectedScheme = null;
-                        if (window.Utils && window.Utils.isLikelyEncryptedContent(currentSubject)) {
-                            try {
-                                detectedScheme = Utils.detectEncryptionFormat(currentSubject);
-                                const decryptedSubject = await TauriService.decryptDmContent(privkey, pubkey, currentSubject);
-                                domManager.setValue('subject', decryptedSubject);
-                                decryptedAny = true;
-                            } catch (err) {
-                                notificationService.showError('Failed to decrypt subject: ' + err);
+                        if (currentSubject && currentSubject.length >= 20) {
+                            let subjectCiphertext = currentSubject;
+                            const isBase64Subject = window.Utils && window.Utils.isLikelyEncryptedContent(currentSubject);
+                            if (!isBase64Subject) {
+                                // Try glossia-decoding subject to recover ciphertext
+                                const gs = window.GlossiaService;
+                                if (gs && gs.isReady()) {
+                                    try {
+                                        const meta = window.emailService?.getGlossiaEncoding() || null;
+                                        const instruction = meta ? `decode from ${meta} raw` : 'decode raw';
+                                        const result = gs.transcode(currentSubject, instruction);
+                                        let decoded = result.output;
+                                        if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
+                                        subjectCiphertext = gs._autoUnpack ? gs._autoUnpack(decoded) : decoded;
+                                    } catch (e) {
+                                        console.warn('[JS] Glossia subject decode failed:', e);
+                                        subjectCiphertext = null;
+                                    }
+                                } else {
+                                    subjectCiphertext = null;
+                                }
+                            }
+                            if (subjectCiphertext && window.Utils && window.Utils.isLikelyEncryptedContent(subjectCiphertext)) {
+                                try {
+                                    detectedScheme = Utils.detectEncryptionFormat(subjectCiphertext);
+                                    const decryptedSubject = await TauriService.decryptDmContent(privkey, pubkey, subjectCiphertext);
+                                    domManager.setValue('subject', decryptedSubject);
+                                    decryptedAny = true;
+                                } catch (err) {
+                                    notificationService.showError('Failed to decrypt subject: ' + err);
+                                }
                             }
                         }
                         // Decrypt body if armored
@@ -900,7 +923,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         // ciphertextToBytes handles glossia decode → binary, base64 → binary,
                         // and NIP-04 (base64?iv=base64) → binary automatically.
                         let dataToSign = bodyValue;
-                        const armorMatch = bodyValue.match(/-{3,}\s*BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)\s*-{3,}/);
+                        const armorMatch = bodyValue.match(/-{3,}\s*BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                         if (armorMatch) {
                             dataToSign = armorMatch[1].trim().replace(/\s+/g, '');
                         }
@@ -953,31 +976,54 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             if (line) lines.push('> ' + line);
                             return lines.join('\n');
                         };
-                        // Hex sig already has its own armor/wrapping; glossia gets > quoted
-                        let sigBlock;
-                        if (metaSig) {
-                            sigBlock = '\n\n' + (profileName || 'Signature') + '\n\n' + wrapQuoted(encodedSig);
+                        // If body is already encrypted armor, rebuild with nested sig+seal
+                        // via buildPlainBody; otherwise append sig+pubkey blocks directly
+                        let newBody;
+                        if (armorMatch && window.emailService) {
+                            const encBtn = domManager.get('encryptBtn');
+                            const encAlgo = (encBtn && encBtn.dataset.encrypted === 'true')
+                                ? (appState.getSettings()?.encryption_algorithm || 'nip44')
+                                : null;
+                            // Use the body text from inside the armor (before seal)
+                            newBody = window.emailService.buildPlainBody(
+                                armorMatch[1].trim(), encodedSig, encodedPubkey,
+                                profileName, displayName, true, encAlgo
+                            );
                         } else {
-                            sigBlock = '\n\n' + encodedSig;
-                        }
+                            // Hex sig already has its own armor/wrapping; glossia gets > quoted
+                            let sigBlock;
+                            if (metaSig) {
+                                sigBlock = '\n\n' + (profileName || 'Signature') + '\n\n' + wrapQuoted(encodedSig);
+                            } else {
+                                sigBlock = '\n\n' + encodedSig;
+                            }
 
-                        // Split glossia-encoded pubkey evenly across two lines (not bech32)
-                        let pubkeyDisplay = encodedPubkey;
-                        if (metaPubkey) {
-                            const mid = Math.ceil(encodedPubkey.length / 2);
-                            pubkeyDisplay = encodedPubkey.slice(0, mid) + '\n' + encodedPubkey.slice(mid);
-                        }
+                            // Split glossia-encoded pubkey evenly across two lines (not bech32)
+                            let pubkeyDisplay = encodedPubkey;
+                            if (metaPubkey) {
+                                const mid = Math.ceil(encodedPubkey.length / 2);
+                                pubkeyDisplay = encodedPubkey.slice(0, mid) + '\n' + encodedPubkey.slice(mid);
+                            }
 
-                        const newBody = bodyValue
-                            + sigBlock
-                            + '\n\n' + (displayName || 'Seal') + '\n'
-                            + '\n' + pubkeyDisplay;
+                            newBody = bodyValue
+                                + sigBlock
+                                + '\n\n' + (displayName || 'Seal') + '\n'
+                                + '\n' + pubkeyDisplay;
+                        }
                         domManager.setValue('messageBody', newBody);
 
-                        // Verify the signature we just appended before showing checkmark
-                        const fullBody = domManager.getValue('messageBody');
-                        // For plaintext signed verification, pass the original body text
-                        const verifyResult = await window.emailService.verifyBodySignature(fullBody, dataToSign);
+                        // Verify the signature we just created before showing checkmark
+                        let verifyResult;
+                        if (armorMatch) {
+                            // Encrypted armor: verify directly — parseSignedBody can't parse armor format
+                            const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
+                            const dataBytes = window.CryptoService.ciphertextToBytes(dataToSign);
+                            const isValid = await TauriService.verifySignature(npub, signature, dataBytes);
+                            verifyResult = { found: true, signed: true, isValid };
+                        } else {
+                            const fullBody = domManager.getValue('messageBody');
+                            verifyResult = await window.emailService.verifyBodySignature(fullBody, dataToSign);
+                        }
                         if (!verifyResult.found || !verifyResult.signed) {
                             domManager.setValue('messageBody', bodyValue);
                             notificationService.showError('Could not verify signature. Body restored.');
@@ -1003,8 +1049,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             const encBtn = domManager.get('encryptBtn');
                             const isEncrypted = encBtn && encBtn.dataset.encrypted === 'true';
                             const encAlgo = isEncrypted ? (appState.getSettings()?.encryption_algorithm || 'nip44') : null;
-                            // For plaintext signed emails, glossia-encode the body text
-                            let plainBodyText = bodyValue;
+                            // For plaintext signed emails, glossia-encode the body text;
+                            // for encrypted, use the body content from inside the armor
+                            let plainBodyText = (isEncrypted && armorMatch) ? armorMatch[1].trim() : bodyValue;
                             if (!isEncrypted && gs && gs.isReady()) {
                                 const metaBody = window.emailService?.getGlossiaEncoding();
                                 if (metaBody) {

@@ -87,7 +87,7 @@ const GlossiaService = {
     },
 
     /** Decode glossia text directly to binary (Uint8Array).
-     *  Auto-detects dialect, then calls WASM decode_to_bytes.
+     *  Auto-detects dialect, then calls WASM decode_raw_base_n and converts hex→bytes.
      *  Returns null if detection fails or no payload words found. */
     decodeToBytes(text) {
         if (!this._ready) return null;
@@ -96,9 +96,42 @@ const GlossiaService = {
         const { language, wordlist } = detections[0];
         if (!language || !wordlist) return null;
         try {
-            return this._wasm.decode_to_bytes(text, language, wordlist);
+            const json = JSON.parse(this._wasm.decode_raw_base_n(text, language, wordlist, 0));
+            if (json.error) return null;
+            const hex = json.decoded_hex;
+            const bytes = new Uint8Array(hex.length / 2);
+            for (let i = 0; i < bytes.length; i++) {
+                bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+            }
+            return bytes;
         } catch (e) {
             console.warn('[GlossiaService] decodeToBytes failed:', e);
+            return null;
+        }
+    },
+
+    /** Decode glossia prose text to binary (Uint8Array) via transcode.
+     *  Unlike decodeToBytes (which uses decode_raw_base_n for raw/payload-only words),
+     *  this handles full prose with grammar/cover words.
+     *  Auto-detects dialect, transcodes to hex, converts to bytes.
+     *  Returns null if detection or decode fails. */
+    transcodeToBytes(text) {
+        if (!this._ready) return null;
+        const detections = this.detectDialect(text);
+        if (!Array.isArray(detections) || detections.length === 0) return null;
+        const dialect = detections[0].language;
+        if (!dialect) return null;
+        try {
+            const result = this.transcode(text, `decode from ${dialect}`);
+            let hex = result.output;
+            if (!hex || !this._isHex(hex)) return null;
+            const bytes = new Uint8Array(hex.length / 2);
+            for (let i = 0; i < bytes.length; i++) {
+                bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+            }
+            return bytes;
+        } catch (e) {
+            console.warn('[GlossiaService] transcodeToBytes failed:', e);
             return null;
         }
     },
@@ -134,27 +167,56 @@ const GlossiaService = {
     // ---- Pubkey / Signature encoding helpers ----
 
     /** Encode a 32-byte hex pubkey.
-     *  With glossia encoding (meta): raw payload words.
+     *  With glossia encoding (meta): base_n payload words (no bitpacking).
      *  Without (Hex mode): bech32 npub. */
     encodePubkey(pubkeyHex, meta) {
         if (!meta) return window.CryptoService._nip19.npubEncode(pubkeyHex);
-        const b64 = this._hexToBase64(pubkeyHex);
-        const result = this.transcode(b64, `encode into ${meta} raw`);
-        return result.output;
+        const { language, wordlist } = this._resolveMetaLanguage(meta);
+        const json = JSON.parse(this._wasm.encode_raw_base_n(pubkeyHex, language, wordlist, '', 0n));
+        if (json.error) throw new Error(json.error);
+        return json.encoded_text;
     },
 
     /** Encode a 64-byte hex signature.
-     *  With glossia encoding (meta): raw payload words.
+     *  With glossia encoding (meta): base_n payload words (no bitpacking).
      *  Without (Hex mode): sig_nostr ASCII armor. */
     encodeSignature(sigHex, meta) {
         if (meta) {
-            const b64 = this._hexToBase64(sigHex);
-            const result = this.transcode(b64, `encode into ${meta} raw`);
-            return result.output;
+            const { language, wordlist } = this._resolveMetaLanguage(meta);
+            const json = JSON.parse(this._wasm.encode_raw_base_n(sigHex, language, wordlist, '', 0n));
+            if (json.error) throw new Error(json.error);
+            return json.encoded_text;
         }
         const b64 = this._hexToBase64(sigHex);
         const result = this.transcode(b64, `encode into cs/hex/sig_nostr`);
         return result.output;
+    },
+
+    /** Resolve a meta keyword (e.g. 'latin', 'english bip39', 'latin/bip39')
+     *  to { language, wordlist }. */
+    _resolveMetaLanguage(meta) {
+        const parts = meta.split(/[\s\/]+/).filter(Boolean);
+        const language = parts[0];
+        const wordlist = parts[1] || this._wasm.get_default_wordlist(language);
+        return { language, wordlist };
+    },
+
+    /** Decode base_n encoded payload words to hex.
+     *  Used for fixed-size fields (signatures, pubkeys) that use base_n not bitpack.
+     *  @param {string} text - payload words (bare or with cover words)
+     *  @param {string} meta - language meta (e.g. 'latin')
+     *  @param {number} [expectedBytes] - expected byte length (e.g. 32 for pubkey, 64 for sig);
+     *         left-pads with zeros if base_n decode lost leading zero bytes
+     *  @returns {string} hex string */
+    decodeRawBaseN(text, meta, expectedBytes) {
+        const { language, wordlist } = this._resolveMetaLanguage(meta);
+        const json = JSON.parse(this._wasm.decode_raw_base_n(text, language, wordlist, expectedBytes || 0));
+        if (json.error) throw new Error(json.error);
+        let hex = json.decoded_hex;
+        if (expectedBytes && hex.length < expectedBytes * 2) {
+            hex = hex.padStart(expectedBytes * 2, '0');
+        }
+        return hex;
     },
 
     /** Convert base64 string to hex. */
@@ -202,11 +264,7 @@ const GlossiaService = {
                     pubkeyHex = data;
                 }
             } else {
-                const result = this.transcode(pubkeyLine, `decode from ${metaPubkey} raw`);
-                let decoded = result.output;
-                if (!this._isHex(decoded)) {
-                    decoded = this._base64ToHex(decoded);
-                }
+                const decoded = this.decodeRawBaseN(pubkeyLine, metaPubkey, 32);
                 if (decoded.length === 64) {
                     pubkeyHex = decoded;
                 }
@@ -237,11 +295,15 @@ const GlossiaService = {
                     try {
                         let sigPara = paragraphs[paragraphs.length - 1].trim();
                         sigPara = sigPara.split('\n').map(l => l.replace(/^>\s*/, '')).join(' ').trim();
-                        const sigInstruction = metaSig ? `decode from ${metaSig} raw` : `decode from sig nostr`;
-                        const sigResult = this.transcode(sigPara, sigInstruction);
-                        let sigDecoded = sigResult.output;
-                        if (!this._isHex(sigDecoded)) {
-                            sigDecoded = this._base64ToHex(sigDecoded);
+                        let sigDecoded;
+                        if (metaSig) {
+                            sigDecoded = this.decodeRawBaseN(sigPara, metaSig, 64);
+                        } else {
+                            const sigResult = this.transcode(sigPara, `decode from sig nostr`);
+                            sigDecoded = sigResult.output;
+                            if (!this._isHex(sigDecoded)) {
+                                sigDecoded = this._base64ToHex(sigDecoded);
+                            }
                         }
                         if (sigDecoded.length === 128) {
                             signatureHex = sigDecoded;

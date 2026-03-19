@@ -920,14 +920,25 @@ NostrMailApp.prototype.setupEventListeners = function() {
 
                     try {
                         // Extract content from ASCII armor if present, otherwise use body as-is.
-                        // ciphertextToBytes handles glossia decode → binary, base64 → binary,
-                        // and NIP-04 (base64?iv=base64) → binary automatically.
-                        let dataToSign = bodyValue;
+                        // For encrypted armor, body is bitpacked before glossia encoding,
+                        // so decodeToBytes returns packed cipher bytes directly.
                         const armorMatch = bodyValue.match(/-{3,}\s*BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                        let dataBytes;
                         if (armorMatch) {
-                            dataToSign = armorMatch[1].trim().replace(/\s+/g, '');
+                            const armorBody = armorMatch[1].trim();
+                            const gs = window.GlossiaService;
+                            // Body is bitpacked then prose-encoded, so use transcodeToBytes
+                            // (handles grammar/cover words) to get packed cipher bytes
+                            const decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(armorBody) : null;
+                            if (decoded) {
+                                dataBytes = decoded;
+                            } else {
+                                // Fallback: raw base64 content (strip whitespace)
+                                dataBytes = window.CryptoService.ciphertextToBytes(armorBody.replace(/\s+/g, ''));
+                            }
+                        } else {
+                            dataBytes = window.CryptoService.ciphertextToBytes(bodyValue);
                         }
-                        const dataBytes = window.CryptoService.ciphertextToBytes(dataToSign);
                         console.log('[JS] Signing data (binary length:', dataBytes.length, ')');
                         const signature = await TauriService.signData(keypair.private_key, dataBytes);
                         const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
@@ -1017,12 +1028,11 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         if (armorMatch) {
                             // Encrypted armor: verify directly — parseSignedBody can't parse armor format
                             const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
-                            const dataBytes = window.CryptoService.ciphertextToBytes(dataToSign);
                             const isValid = await TauriService.verifySignature(npub, signature, dataBytes);
                             verifyResult = { found: true, signed: true, isValid };
                         } else {
                             const fullBody = domManager.getValue('messageBody');
-                            verifyResult = await window.emailService.verifyBodySignature(fullBody, dataToSign);
+                            verifyResult = await window.emailService.verifyBodySignature(fullBody, dataBytes);
                         }
                         if (!verifyResult.found || !verifyResult.signed) {
                             domManager.setValue('messageBody', bodyValue);
@@ -1044,7 +1054,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
 
                         // Build HTML alternative body for multipart email
                         if (window.emailService) {
-                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(bodyValue, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey);
+                            // For encrypted, use body content from inside armor (not the full armor text)
+                            const htmlBodyText = armorMatch ? armorMatch[1].trim() : bodyValue;
+                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(htmlBodyText, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey);
                             // Build ASCII-armored plaintext body for text/plain MIME part
                             const encBtn = domManager.get('encryptBtn');
                             const isEncrypted = encBtn && encBtn.dataset.encrypted === 'true';

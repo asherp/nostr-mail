@@ -7,6 +7,14 @@
 // Handles all email-related functionality including sending, fetching, and management
 
 class EmailService {
+    // ── Armor format constants and helpers ──
+
+    // Regex patterns for armor block detection (matches both new and legacy formats)
+    // New format: BEGIN NOSTR NIP-XX ENCRYPTED BODY, BEGIN NOSTR SIGNED BODY
+    // Legacy: BEGIN NOSTR NIP-XX ENCRYPTED MESSAGE, BEGIN NOSTR SIGNED MESSAGE
+    static ARMOR_BEGIN_ENCRYPTED = /(-{3,})\s*BEGIN NOSTR NIP-\d+ ENCRYPTED (?:MESSAGE|BODY)\s*\1/;
+    static ARMOR_BEGIN_ANY = /(-{3,})\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*\1/;
+
     constructor() {
         this.searchTimeout = null;
         this.searchUnlisten = null;
@@ -550,7 +558,7 @@ class EmailService {
         if (!body) return;
         
         // Check if body contains encrypted content
-        const encryptedBodyMatch = body.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+        const encryptedBodyMatch = body.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
         if (!encryptedBodyMatch) {
             console.log('[JS] Body is not encrypted');
             return;
@@ -970,9 +978,9 @@ class EmailService {
             let beginTag;
             if (isEncrypted) {
                 const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
-                beginTag = `----- BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE -----`;
+                beginTag = `----- BEGIN NOSTR ${armorType} ENCRYPTED BODY -----`;
             } else {
-                beginTag = '----- BEGIN NOSTR SIGNED MESSAGE -----';
+                beginTag = '----- BEGIN NOSTR SIGNED BODY -----';
             }
             const lines = [beginTag];
             lines.push(wordWrap(bodyText));
@@ -992,7 +1000,7 @@ class EmailService {
         // Unsigned encrypted: nest seal inside the armor block
         if (isEncrypted && bodyText) {
             const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
-            const lines = [`----- BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE -----`];
+            const lines = [`----- BEGIN NOSTR ${armorType} ENCRYPTED BODY -----`];
             lines.push(wordWrap(bodyText));
             if (encodedPubkey) {
                 lines.push('----- BEGIN NOSTR SEAL -----');
@@ -1078,7 +1086,7 @@ class EmailService {
         const encryptBtn = domManager.get('encryptBtn');
         const isEncrypted = encryptBtn && encryptBtn.dataset.encrypted === 'true';
         const isEncryptedContent = Utils.isLikelyEncryptedContent(subject) || Utils.isLikelyEncryptedContent(body) || 
-                                   (body && body.includes('BEGIN NOSTR NIP-'));
+                                   (body && body.includes('BEGIN NOSTR'));
         
         const recipientPubkey = this.getRecipientPubkey();
 
@@ -1370,14 +1378,21 @@ class EmailService {
             const sigMatch = headers.match(/X-Nostr-Sig:\s*(\S+)/i);
             if (pubkeyMatch && sigMatch) {
                 try {
-                    // Mirror Rust extract_ciphertext_binary exactly:
-                    // 1. If body has BEGIN NOSTR NIP- armor, extract base64 and decode
+                    // Mirror Rust extract_ciphertext_binary:
+                    // 1. If body has armor, extract content and decode (glossia or base64)
                     // 2. Otherwise, use raw UTF-8 bytes of the body
                     let dataBytes;
-                    const armorMatch = previewBody.match(/BEGIN NOSTR NIP-[\s\S]*?---\s*([\s\S]*?)\s*---[\s\S]*?END NOSTR NIP-/);
+                    const armorMatch = previewBody.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED (?:MESSAGE|BODY)\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?(?:MESSAGE|BODY)|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                     if (armorMatch) {
-                        const b64 = armorMatch[1].replace(/\s+/g, '');
-                        dataBytes = window.CryptoService.ciphertextToBytes(b64);
+                        const armorBody = armorMatch[1].trim();
+                        // Try glossia decode first (prose with cover words), then base64 fallback
+                        const gs = window.GlossiaService;
+                        const decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(armorBody) : null;
+                        if (decoded) {
+                            dataBytes = decoded;
+                        } else {
+                            dataBytes = window.CryptoService.ciphertextToBytes(armorBody.replace(/\s+/g, ''));
+                        }
                     } else {
                         dataBytes = new TextEncoder().encode(previewBody);
                     }
@@ -1536,7 +1551,7 @@ class EmailService {
             // Check if email is actually encrypted by examining the content
             // Subject should be encrypted (base64-like) or body should have NIP encryption markers
             let isSubjectEncrypted = window.Utils && window.Utils.isLikelyEncryptedContent(subject);
-            let isBodyEncrypted = body.includes('BEGIN NOSTR NIP-') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
+            let isBodyEncrypted = body.includes('BEGIN NOSTR') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
             let isEmailEncrypted = isSubjectEncrypted || isBodyEncrypted;
             
             // Auto-encrypt if enabled and email is not already encrypted
@@ -2582,7 +2597,7 @@ class EmailService {
                 let previewSubject = email.subject;
 
                 // Detect any NOSTR NIP-X ENCRYPTED MESSAGE
-                const armorRegex = /-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}/;
+                const armorRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/;
                 if (email.body && armorRegex.test(email.body)) {
                     const keypair = appState.getKeypair();
                     if (!keypair) {
@@ -2601,7 +2616,7 @@ class EmailService {
                             }
                         }
                         // Decrypt body - try manifest format first, then fallback to legacy
-                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                         if (encryptedBodyMatch) {
                             const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
                             try {
@@ -3068,7 +3083,7 @@ class EmailService {
                 console.log('Sender pubkey for email:', senderPubkey);
                 const isEncryptedSubjectBase64 = Utils.isLikelyEncryptedContent(email.subject);
                 // Permissive regex: matches both base64 and glossia word content between armor markers
-                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 let decryptedSubject = email.subject;
                 let decryptedBody = emailBody;
                 let originalSubject = email.subject;
@@ -3212,7 +3227,7 @@ class EmailService {
                                 
                                 if (!manifestResult || manifestResult.type !== 'manifest') {
                                     // Permissive regex: matches both base64 and glossia word content
-                                    const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                                    const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                                     if (encryptedBodyMatch) {
                                         const armorContent = encryptedBodyMatch[2].trim();
                                         let encryptedContent;
@@ -4261,7 +4276,7 @@ ${attachmentsHtml}
     decodeGlossiaArmoredBody(plainBody) {
         // Permissive armor regex: handles both "-----BEGIN" and "----- BEGIN" (with optional spaces)
         // Content stops at END NOSTR ... ENCRYPTED MESSAGE, END NOSTR MESSAGE, or BEGIN NOSTR SIGNATURE
-        const armorRegex = /-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/;
+        const armorRegex = /-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/;
         const match = plainBody.replace(/\r\n/g, '\n').match(armorRegex);
         if (!match) return null;
 
@@ -4313,7 +4328,7 @@ ${attachmentsHtml}
     }
 
     /**
-     * Parse a BEGIN NOSTR SIGNED MESSAGE armor block.
+     * Parse a BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)) armor block.
      * Extracts glossia-encoded body, signature content, and seal content.
      * Decodes the glossia body back to the original UTF-8 plaintext.
      * Returns { plaintextBody, glossiaBody, sigContent, sealContent, profileName, displayName } or null.
@@ -4323,7 +4338,7 @@ ${attachmentsHtml}
         const normalized = plainBody.replace(/\r\n/g, '\n');
 
         // Match the nested armor format
-        const armorRegex = /-{3,}\s*BEGIN NOSTR SIGNED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR MESSAGE\s*-{3,}/;
+        const armorRegex = /-{3,}\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR MESSAGE\s*-{3,}/;
         const match = normalized.match(armorRegex);
         if (!match) return null;
 
@@ -4494,7 +4509,7 @@ ${attachmentsHtml}
         // 1. Extract and decode the signed data (ciphertext if encrypted, plaintext body otherwise)
         let dataBytes;
         // Try to extract encrypted body from armor and decode via transcodeToBytes (bitpacked prose)
-        const encArmorMatch = plainBody.match(/-{3,}\s*BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+        const encArmorMatch = plainBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-(?:04|44) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
         if (encArmorMatch) {
             const armorBody = encArmorMatch[1].trim();
             const decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(armorBody) : null;
@@ -4688,7 +4703,7 @@ ${attachmentsHtml}
         const gs = window.GlossiaService;
 
         // First, handle nested armor blocks (plaintext signed or encrypted+signed) that end with END NOSTR MESSAGE
-        const signedMsgRegex = /-{3,}\s*BEGIN NOSTR (?:SIGNED|NIP-\d+ ENCRYPTED) MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR MESSAGE\s*-{3,}/g;
+        const signedMsgRegex = /-{3,}\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR MESSAGE\s*-{3,}/g;
         let signedBlockIndex = 0;
         let smMatch;
         while ((smMatch = signedMsgRegex.exec(bodyText)) !== null) {
@@ -4696,7 +4711,7 @@ ${attachmentsHtml}
             const rawSigContent = smMatch[2].trim();
             const rawSealContent = smMatch[3] ? smMatch[3].trim() : null;
             // Detect whether this is encrypted or plaintext signed
-            const isEncryptedArmor = /-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}/.test(smMatch[0]);
+            const isEncryptedArmor = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(smMatch[0]);
 
             const el = document.getElementById(`inline-sig-block-${signedBlockIndex}`);
             signedBlockIndex++;
@@ -4780,11 +4795,13 @@ ${attachmentsHtml}
 
             try {
                 const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
+                const shortNpub = npub.substring(0, 12) + '...' + npub.substring(npub.length - 6);
                 const isValid = await TauriService.verifySignature(npub, signatureHex, dataBytes);
                 if (indicator) {
                     if (isValid) {
                         indicator.className = 'inline-sig-indicator verified';
-                        indicator.innerHTML = '<i class="fas fa-check-circle"></i> Signature Verified';
+                        indicator.innerHTML = `<i class="fas fa-check-circle"></i> Signed by: ${shortNpub}`;
+                        indicator.title = `Verified signature from ${npub}`;
                         el.classList.add('verified');
                     } else {
                         indicator.className = 'inline-sig-indicator invalid';
@@ -4806,7 +4823,7 @@ ${attachmentsHtml}
         const sigSealRegex = /(-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*END NOSTR SIGNATURE\s*-{3,})[\s\n]*(-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*END NOSTR SEAL\s*-{3,})/g;
 
         // Also find the encrypted message block (ciphertext) to verify against
-        const encMsgRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/g;
+        const encMsgRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/g;
         const ciphertexts = [];
         let encMatch;
         while ((encMatch = encMsgRegex.exec(bodyText)) !== null) {
@@ -4904,11 +4921,13 @@ ${attachmentsHtml}
 
             try {
                 const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
+                const shortNpub = npub.substring(0, 12) + '...' + npub.substring(npub.length - 6);
                 const isValid = await TauriService.verifySignature(npub, signatureHex, dataBytes);
                 if (indicator) {
                     if (isValid) {
                         indicator.className = 'inline-sig-indicator verified';
-                        indicator.innerHTML = '<i class="fas fa-check-circle"></i> Signature Verified';
+                        indicator.innerHTML = `<i class="fas fa-check-circle"></i> Signed by: ${shortNpub}`;
+                        indicator.title = `Verified signature from ${npub}`;
                         el.classList.add('verified');
                     } else {
                         indicator.className = 'inline-sig-indicator invalid';
@@ -4931,9 +4950,9 @@ ${attachmentsHtml}
     armorCiphertext(ciphertext, encryptionAlgorithm) {
         const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
         return [
-            `-----BEGIN NOSTR ${armorType} ENCRYPTED MESSAGE-----`,
+            `-----BEGIN NOSTR ${armorType} ENCRYPTED BODY-----`,
             ciphertext.trim(),
-            `-----END NOSTR ${armorType} ENCRYPTED MESSAGE-----`
+            '-----END NOSTR MESSAGE-----'
         ].join('\n');
     }
 
@@ -5239,7 +5258,7 @@ ${attachmentsHtml}
             if (currentBody) {
                 console.log('[JS] Encoding body with transcode("encode into ' + meta + '")...');
                 const armorMatch = currentBody.match(
-                    /-{3,}\s*BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/
+                    /-{3,}\s*BEGIN NOSTR (?:NIP-(?:04|44) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/
                 );
                 const rawCipher = armorMatch ? armorMatch[1].replace(/\s+/g, '') : currentBody.trim();
                 const packed = gs._packNip04(rawCipher);
@@ -5855,7 +5874,7 @@ ${attachmentsHtml}
         let previewSubject = email.subject;
 
         // Detect any NOSTR NIP-X ENCRYPTED MESSAGE (same as inbox)
-        const armorRegex = /-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}/;
+        const armorRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/;
         if (email.body && armorRegex.test(email.body)) {
             const keypair = appState.getKeypair();
             if (!keypair) {
@@ -5883,7 +5902,7 @@ ${attachmentsHtml}
                             }
                         }
                         // Decrypt body - try manifest format first, then fallback to legacy
-                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 if (encryptedBodyMatch) {
                     // Extract ciphertext: base64 as-is, glossia needs decoding
                     const armorContent = encryptedBodyMatch[1].trim();
@@ -6217,9 +6236,9 @@ ${attachmentsHtml}
         // Check if recipient_pubkey is missing and email is encrypted
         // Note: We specifically check for recipient_pubkey, not nostr_pubkey (which might be sender's pubkey)
         const hasRecipientPubkey = !!(email.recipient_pubkey);
-        const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+        const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('BEGIN NOSTR')).join('\n').trim();
         // Permissive regex: matches both base64 and glossia word content between armor markers
-        const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+        const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
         // Only check subject encryption if body has armor (encrypted body implies subject may also be encrypted)
         const isEncryptedSubject = encryptedBodyMatch && (Utils.isLikelyEncryptedContent(email.subject) || !!this.decodeGlossiaSubject(email.subject));
         const isEncrypted = isEncryptedSubject || encryptedBodyMatch;
@@ -6539,7 +6558,7 @@ ${signatureIndicator}
                             console.log('[JS] Email body preview:', email.body ? email.body.substring(0, 200) : 'null');
                             
                             // Extract encrypted content from the body (permissive regex)
-                            const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                            const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                             if (!encryptedBodyMatch) {
                                 console.warn('[JS] No encrypted content found in email body using regex, trying raw body');
                                 const keypair = appState.getKeypair();
@@ -7016,12 +7035,12 @@ ${attachmentsHtml}
             
             // Now execute the decryption and update
             try {
-                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('BEGIN NOSTR')).join('\n').trim();
                 // For sent emails, use recipient_pubkey for decryption
                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
                 const isEncryptedSubjectBase64 = Utils.isLikelyEncryptedContent(email.subject);
                 // Permissive regex: matches both base64 and glossia word content between armor markers
-                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (NIP-\d+) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
 
                 let decryptedSubject = email.subject;
                 let decryptedBody = cleanedBody;
@@ -7234,8 +7253,8 @@ ${attachmentsHtml}
                     const decryptedSubject = await this.decryptNostrSentMessageWithFallback(testEmail, email.subject, keypair);
                     if (decryptedSubject && !decryptedSubject.startsWith('Unable to decrypt')) {
                         // Subject decryption successful, try body too
-                        const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-                        const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                        const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('BEGIN NOSTR')).join('\n').trim();
+                        const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                         
                         if (encryptedBodyMatch) {
                             const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
@@ -7269,8 +7288,8 @@ ${attachmentsHtml}
                 }
             } else {
                 // Subject not encrypted, try body
-                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
-                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('BEGIN NOSTR')).join('\n').trim();
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 
                 if (encryptedBodyMatch) {
                     const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
@@ -7396,13 +7415,13 @@ ${attachmentsHtml}
             // 1. Attachment is marked as manifest_aes, OR
             // 2. Email has encrypted content and we can decrypt the manifest
             const hasManifestEncryption = attachment.encryption_method === 'manifest_aes';
-            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR');
             
             if (hasManifestEncryption || (hasEncryptedContent && attachment.filename.endsWith('.dat'))) {
                 console.log(`[JS] Attempting to decrypt attachment using manifest (hasManifestEncryption: ${hasManifestEncryption}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
                 // Extract encrypted content from email body
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
                     return;
@@ -7493,14 +7512,14 @@ ${attachmentsHtml}
             // Try to decrypt manifest if email has encrypted content
             // This allows us to decrypt attachments even if they're not marked as manifest_aes
             const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
-            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR');
             let manifestResult = null;
             
             if (hasManifestAttachments || (hasEncryptedContent && email.attachments.some(att => att.filename.endsWith('.dat')))) {
                 console.log(`[JS] Attempting to decrypt manifest for ZIP (hasManifestAttachments: ${hasManifestAttachments}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
                 // Extract and decrypt manifest
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachments: no encrypted manifest found');
                     return;
@@ -7640,13 +7659,13 @@ ${attachmentsHtml}
             // 1. Attachment is marked as manifest_aes, OR
             // 2. Email has encrypted content and we can decrypt the manifest
             const hasManifestEncryption = attachment.encryption_method === 'manifest_aes';
-            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR');
             
             if (hasManifestEncryption || (hasEncryptedContent && attachment.filename.endsWith('.dat'))) {
                 console.log(`[JS] Attempting to decrypt attachment using manifest (hasManifestEncryption: ${hasManifestEncryption}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
                 // Extract encrypted content from email body
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
                     return;
@@ -7734,13 +7753,13 @@ ${attachmentsHtml}
             
             // Try to decrypt manifest if email has encrypted content
             const hasManifestAttachments = email.attachments.some(att => att.encryption_method === 'manifest_aes');
-            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR NIP-');
+            const hasEncryptedContent = email.body && email.body.includes('BEGIN NOSTR');
             let manifestResult = null;
             
             if (hasManifestAttachments || (hasEncryptedContent && email.attachments.some(att => att.filename.endsWith('.dat')))) {
                 console.log(`[JS] Attempting to decrypt manifest for ZIP (hasManifestAttachments: ${hasManifestAttachments}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachments: no encrypted manifest found');
                     return;
@@ -7964,7 +7983,7 @@ ${attachmentsHtml}
                 let previewSubject = draft.subject;
                 
                 // Handle encrypted content
-                if (draft.body && draft.body.includes('BEGIN NOSTR NIP-')) {
+                if (draft.body && draft.body.includes('BEGIN NOSTR')) {
                     const keypair = appState.getKeypair();
                     if (!keypair) {
                         previewText = 'Unable to decrypt: no keypair';
@@ -7974,7 +7993,7 @@ ${attachmentsHtml}
                             if (Utils.isLikelyEncryptedContent(draft.subject)) {
                                 previewSubject = await this.decryptNostrMessageWithFallback(draft, draft.subject, keypair);
                             }
-                            const encryptedBodyMatch = draft.body.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                            const encryptedBodyMatch = draft.body.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                             if (encryptedBodyMatch) {
                                 const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
                                 try {
@@ -8161,11 +8180,11 @@ ${attachmentsHtml}
             
             const draftsDetailContent = domManager.get('draftsDetailContent');
             if (draftsDetailContent) {
-                const cleanedBody = draft.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('ENCRYPTED MESSAGE')).join('\n').trim();
+                const cleanedBody = draft.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('BEGIN NOSTR')).join('\n').trim();
                 // For drafts, use recipient_pubkey for decryption (drafts are emails we're preparing to send)
                 const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey; // Fallback for backward compatibility
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(draft.subject);
-                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 let decryptedSubject = draft.subject;
                 let decryptedBody = cleanedBody;
                 const keypair = appState.getKeypair();

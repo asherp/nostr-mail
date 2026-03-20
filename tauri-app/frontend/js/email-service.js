@@ -2628,11 +2628,16 @@ class EmailService {
                     if (!keypair) {
                         previewText = 'Unable to decrypt: no keypair';
                     } else {
-                        // Decrypt subject if it looks encrypted
+                        // Decrypt subject if it looks encrypted (base64 or glossia-encoded)
+                        let subjectCipher = null;
                         if (Utils.isLikelyEncryptedContent(email.subject)) {
+                            subjectCipher = email.subject;
+                        } else {
+                            subjectCipher = this.decodeGlossiaSubject(email.subject);
+                        }
+                        if (subjectCipher) {
                             try {
-                                previewSubject = await this.decryptNostrMessageWithFallback(email, email.subject, keypair);
-                                // Check if decryption returned an error message
+                                previewSubject = await this.decryptNostrMessageWithFallback(email, subjectCipher, keypair);
                                 if (previewSubject && (previewSubject.startsWith('Unable to decrypt') || previewSubject.includes('Unable to decrypt'))) {
                                     previewSubject = 'Unable to decrypt';
                                 }
@@ -2643,8 +2648,18 @@ class EmailService {
                         // Decrypt body - try manifest format first, then fallback to legacy
                         const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                         if (encryptedBodyMatch) {
-                            const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                            try {
+                            const armorContent = encryptedBodyMatch[1].trim();
+                            let encryptedContent;
+                            if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
+                                encryptedContent = armorContent.replace(/\s+/g, '');
+                            } else {
+                                // Glossia-encoded body — decode to ciphertext
+                                const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
+                                encryptedContent = glossiaResult ? glossiaResult.ciphertext : null;
+                            }
+                            if (!encryptedContent) {
+                                // Glossia decode failed — can't decrypt
+                            } else try {
                                 // Try manifest decryption first
                                 console.log('[JS] Attempting manifest decryption for preview...');
                                 const manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
@@ -3677,8 +3692,16 @@ ${attachmentsHtml}
     // Reply to email - navigate to compose with pre-filled fields
     replyToEmail(email, decryptedSubject, decryptedBody) {
         try {
-            // Get the sender's email address (the "from" field)
-            const replyTo = email.from || '';
+            // Prefer Reply-To header over From address
+            let replyTo = email.from || '';
+            if (email.raw_headers) {
+                const match = email.raw_headers.match(/^Reply-To:\s*(.+)$/mi);
+                if (match) {
+                    // Extract bare email from "Name <email>" or plain "email" format
+                    const angleMatch = match[1].trim().match(/<([^>]+)>/);
+                    replyTo = angleMatch ? angleMatch[1] : match[1].trim();
+                }
+            }
             
             // Format the subject with "Re: " prefix (avoid duplicate "Re:")
             let replySubject = decryptedSubject || email.subject || '';

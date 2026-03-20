@@ -2167,8 +2167,9 @@ fn normalize_body_for_verification(body: &str) -> String {
 /// Finds the content between the BEGIN ENCRYPTED line and the next armor boundary
 /// (END, SIGNATURE, or SEAL marker). Returns None if no armor is found.
 fn extract_armor_body_content(body: &str) -> Option<&str> {
-    // Find the BEGIN ENCRYPTED line
-    let begin_idx = body.find("BEGIN NOSTR NIP-")?;
+    // Find the BEGIN line (encrypted or signed plaintext)
+    let begin_idx = body.find("BEGIN NOSTR NIP-")
+        .or_else(|| body.find("BEGIN NOSTR SIGNED"))?;
     // Find the end of that line (first newline after BEGIN)
     let line_end = body[begin_idx..].find('\n').map(|i| begin_idx + i + 1)?;
 

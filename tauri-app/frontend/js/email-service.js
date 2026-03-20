@@ -953,7 +953,7 @@ class EmailService {
 
     // Build ASCII-armored plaintext body for text/plain MIME part.
     // Same glossia-encoded content as buildHtmlAlt, but with ASCII armor instead of HTML formatting.
-    buildPlainBody(bodyText, encodedSig, encodedPubkey, profileName, displayName, isEncrypted, encryptionAlgorithm) {
+    buildPlainBody(bodyText, encodedSig, encodedPubkey, profileName, displayName, isEncrypted, encryptionAlgorithm, originalPlaintext) {
         const parts = [];
 
         // Word-wrap text to ~72 chars per line
@@ -981,6 +981,10 @@ class EmailService {
                 beginTag = `----- BEGIN NOSTR ${armorType} ENCRYPTED BODY -----`;
             } else {
                 beginTag = '----- BEGIN NOSTR SIGNED BODY -----';
+                // For signed plaintext, show original plaintext above the armor block
+                if (originalPlaintext) {
+                    parts.push(originalPlaintext);
+                }
             }
             const lines = [beginTag];
             lines.push(wordWrap(bodyText));
@@ -1382,20 +1386,41 @@ class EmailService {
                     // 1. If body has armor, extract content and decode (glossia or base64)
                     // 2. Otherwise, use raw UTF-8 bytes of the body
                     let dataBytes;
-                    const armorMatch = previewBody.match(/-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED (?:MESSAGE|BODY)\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?(?:MESSAGE|BODY)|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                    // Match encrypted or signed body armor
+                    const armorMatch = previewBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY)\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?(?:MESSAGE|BODY)|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                    console.log('[JS] Header sig verify: armorMatch=', !!armorMatch, 'previewBody preview=', previewBody.substring(0, 200));
                     if (armorMatch) {
                         const armorBody = armorMatch[1].trim();
-                        // Try glossia decode first (prose with cover words), then base64 fallback
+                        console.log('[JS] Header sig verify: armorBody=', armorBody.substring(0, 100));
                         const gs = window.GlossiaService;
-                        const decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(armorBody) : null;
+                        // Try glossia decode: transcodeToBytes handles binary (hex output),
+                        // but plaintext decodes to UTF-8 string (not hex), so fall back to transcode
+                        let decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(armorBody) : null;
+                        if (!decoded && gs && gs.isReady()) {
+                            // Plaintext signed body: transcode returns original text, encode as UTF-8
+                            try {
+                                const detections = gs.detectDialect(armorBody);
+                                if (Array.isArray(detections) && detections.length > 0 && detections[0].language) {
+                                    const result = gs.transcode(armorBody, `decode from ${detections[0].language}`);
+                                    if (result.output) {
+                                        decoded = new TextEncoder().encode(result.output);
+                                    }
+                                }
+                            } catch (e) {
+                                console.warn('[JS] Header sig verify: glossia transcode failed:', e);
+                            }
+                        }
+                        console.log('[JS] Header sig verify: glossia decoded=', decoded ? decoded.length + ' bytes' : 'null');
                         if (decoded) {
                             dataBytes = decoded;
                         } else {
                             dataBytes = window.CryptoService.ciphertextToBytes(armorBody.replace(/\s+/g, ''));
                         }
                     } else {
+                        console.log('[JS] Header sig verify: no armor match, using raw UTF-8 bytes');
                         dataBytes = new TextEncoder().encode(previewBody);
                     }
+                    console.log('[JS] Header sig verify: dataBytes length=', dataBytes.length);
                     const isValid = await TauriService.verifySignature(
                         pubkeyMatch[1], sigMatch[1], dataBytes
                     );
@@ -4363,16 +4388,17 @@ ${attachmentsHtml}
         }
 
         // Decode glossia body → original UTF-8 plaintext
+        // Use transcodeToBytes (full pipeline with header word), not decodeToBytes (raw base_n)
         let plaintextBody = null;
         const gs = window.GlossiaService;
         if (gs && gs.isReady()) {
             try {
-                const bytes = gs.decodeToBytes(glossiaBody);
+                const bytes = gs.transcodeToBytes(glossiaBody);
                 if (bytes) {
                     plaintextBody = new TextDecoder().decode(bytes);
                 }
             } catch (e) {
-                console.warn('[JS] decodeGlossiaSignedMessage: decodeToBytes failed:', e);
+                console.warn('[JS] decodeGlossiaSignedMessage: transcodeToBytes failed:', e);
             }
         }
 
@@ -4526,9 +4552,9 @@ ${attachmentsHtml}
         if (!encArmorMatch) {
             const signedMsg = this.decodeGlossiaSignedMessage(plainBody);
             if (signedMsg && signedMsg.sigContent && signedMsg.sealContent) {
-                // The sign handler signs ciphertextToBytes(originalPlaintext).
+                // The sign handler signs raw UTF-8 bytes of the original plaintext.
                 // The glossia body was produced by transcode(originalPlaintext, "encode into <dialect>").
-                // To verify: transcode back to get the original plaintext, then ciphertextToBytes on it.
+                // To verify: transcode back to get the original plaintext, then encode as UTF-8.
                 if (signedMsg.glossiaBody && gs && gs.isReady()) {
                     try {
                         const detections = gs.detectDialect(signedMsg.glossiaBody);
@@ -4536,7 +4562,7 @@ ${attachmentsHtml}
                             const dialect = detections[0].language;
                             const result = gs.transcode(signedMsg.glossiaBody, `decode from ${dialect}`);
                             const originalText = result.output;
-                            dataBytes = window.CryptoService.ciphertextToBytes(originalText);
+                            dataBytes = new TextEncoder().encode(originalText);
                             console.log('[JS] verifyInlineSignature: signed message, transcoded back to original, bytes length=', dataBytes.length);
                         }
                     } catch (e) {
@@ -4545,7 +4571,7 @@ ${attachmentsHtml}
                 }
                 // Fallback to decoded plaintext from decodeGlossiaSignedMessage
                 if (!dataBytes && signedMsg.plaintextBody) {
-                    dataBytes = window.CryptoService.ciphertextToBytes(signedMsg.plaintextBody);
+                    dataBytes = new TextEncoder().encode(signedMsg.plaintextBody);
                     console.log('[JS] verifyInlineSignature: signed message, using decoded plaintextBody, bytes length=', dataBytes.length);
                 }
 

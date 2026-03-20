@@ -773,7 +773,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
 
                     // Auto-decode glossia if body doesn't have ASCII armor markers
                     let decryptedAny = false;
-                    const hasArmor = /-{3,}\s*BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE\s*-{3,}/.test(currentBody);
+                    const hasArmor = /-{3,}\s*BEGIN NOSTR (?:NIP-(04|44) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(currentBody);
                     if (!hasArmor && currentBody) {
                         const glossiaMeta = window.emailService?.getGlossiaEncoding();
                         if (glossiaMeta) {
@@ -793,7 +793,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     if (privkey && pubkey) {
                         // Standard armor-based decryption
                         // Regex for both NIP-04 and NIP-44 armored messages
-                        const match = currentBody.match(/-{3,}\s*BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                        const match = currentBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-(04|44) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                         // Decrypt subject if it looks encrypted (base64 or glossia-encoded)
                         let detectedScheme = null;
                         if (currentSubject && currentSubject.length >= 20) {
@@ -922,7 +922,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         // Extract content from ASCII armor if present, otherwise use body as-is.
                         // For encrypted armor, body is bitpacked before glossia encoding,
                         // so decodeToBytes returns packed cipher bytes directly.
-                        const armorMatch = bodyValue.match(/-{3,}\s*BEGIN NOSTR NIP-(?:04|44) ENCRYPTED MESSAGE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                        const armorMatch = bodyValue.match(/-{3,}\s*BEGIN NOSTR (?:NIP-(?:04|44) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                         let dataBytes;
                         if (armorMatch) {
                             const armorBody = armorMatch[1].trim();
@@ -937,7 +937,36 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                 dataBytes = window.CryptoService.ciphertextToBytes(armorBody.replace(/\s+/g, ''));
                             }
                         } else {
-                            dataBytes = window.CryptoService.ciphertextToBytes(bodyValue);
+                            // Plaintext: glossia-encode first, then decode back to get
+                            // canonical bytes. The signature is on the decoded armor content,
+                            // not the raw plaintext — this survives transport.
+                            const gs2 = window.GlossiaService;
+                            const metaBody = window.emailService?.getGlossiaEncoding();
+                            if (gs2 && gs2.isReady() && metaBody) {
+                                const encoded = gs2.transcode(bodyValue, `encode into ${metaBody}`);
+                                // Round-trip: decode back to get canonical bytes
+                                const roundTripped = gs2.transcodeToBytes(encoded.output);
+                                if (roundTripped) {
+                                    dataBytes = roundTripped;
+                                } else {
+                                    // Plaintext: transcodeToBytes returns null (output is text, not hex)
+                                    // Use transcode to decode back to original text
+                                    try {
+                                        const det = gs2.detectDialect(encoded.output);
+                                        if (Array.isArray(det) && det.length > 0 && det[0].language) {
+                                            const decoded = gs2.transcode(encoded.output, `decode from ${det[0].language}`);
+                                            if (decoded.output) {
+                                                dataBytes = new TextEncoder().encode(decoded.output);
+                                            }
+                                        }
+                                    } catch (e) {
+                                        console.warn('[JS] Sign: glossia round-trip decode failed:', e);
+                                    }
+                                    if (!dataBytes) dataBytes = new TextEncoder().encode(bodyValue);
+                                }
+                            } else {
+                                dataBytes = new TextEncoder().encode(bodyValue);
+                            }
                         }
                         console.log('[JS] Signing data (binary length:', dataBytes.length, ')');
                         const signature = await TauriService.signData(keypair.private_key, dataBytes);
@@ -1077,7 +1106,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             }
                             window.emailService._plainBody = window.emailService.buildPlainBody(
                                 plainBodyText, encodedSig, encodedPubkey, profileName, displayName,
-                                isEncrypted, encAlgo
+                                isEncrypted, encAlgo, isEncrypted ? null : bodyValue
                             );
                             // Show armored format in textarea for plaintext signed emails
                             if (!isEncrypted && window.emailService._plainBody) {

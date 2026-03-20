@@ -14,7 +14,7 @@ mod database;
 
 use types::*;
 pub use state::{AppState, Relay};
-pub use types::KeyPair;
+pub use types::{KeyPair, EmailConfig};
 use storage::{Storage, Contact, UserProfile, AppSettings, EmailDraft};
 use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation};
 use crate::types::{EmailMessage, RelayStatus, RelayConnectionStatus};
@@ -3658,7 +3658,7 @@ fn encode_bip39(ciphertext: String, language: String, wordlist: String, mode: St
         .map_err(|e| format!("Failed to load wordlist: {}", e))?;
     let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
     let tree = glossia::WordlistTree::new(payload_words);
-    let encoded_words = glossia::codec::encode(&raw_bytes, &tree)
+    let encoded_words = glossia::codec::encode_base_n(&raw_bytes, &tree, "bip39")
         .map_err(|e| format!("BIP39 encoding failed: {:?}", e))?;
 
     // 3. Build POS mapping and tag each encoded word
@@ -3723,7 +3723,7 @@ fn decode_bip39(text: String, language: String, wordlist: String, algorithm: Str
     }
 
     // 3. Decode back to raw bytes
-    let bytes = glossia::codec::decode(&extracted, &tree)
+    let bytes = glossia::codec::decode_base_n(&extracted, &tree, "bip39")
         .map_err(|e| format!("BIP39 decoding failed: {:?}", e))?;
 
     // 4. Reconstruct the original ciphertext string
@@ -4716,75 +4716,45 @@ async fn db_delete_sent_email(message_id: String, user_email: Option<String>, st
     
     let db = state.get_database()?;
     
-    // First, try to delete from the email server
-    // Get the email from database to find the from_address
-    if let Ok(Some(email)) = db.get_email(&message_id) {
-        let from_email = email.from_address.trim().to_lowercase();
-        
-        // Try to find settings that match this email address
-        // We'll need to check settings for all pubkeys, but that's complex
-        // For now, let's try a simpler approach: get all unique pubkeys and check their settings
-        // Actually, let's just try to get settings - if user_email is provided, we can use it to match
-        // But settings are keyed by pubkey, not email...
-        
-        // Simplified approach: Try to construct EmailConfig if we have user_email
-        // The frontend should pass the correct user_email that matches the email's from_address
-        if let Some(ref user_email_param) = user_email {
-            if user_email_param.trim().to_lowercase() == from_email {
-                // Try to get settings from database by querying for email_address setting
-                // Use a helper function to find pubkeys with matching email
-                let pubkeys_vec = match db.find_pubkeys_by_email_setting(user_email_param) {
-                    Ok(p) => p,
-                    Err(_) => vec![],
-                };
-                
-                if !pubkeys_vec.is_empty() {
-                    // Try each pubkey's settings
-                    for pubkey in pubkeys_vec {
-                        if let Ok(all_settings) = db.get_all_settings(&pubkey) {
-                            let email_address = all_settings.get("email_address").cloned();
-                            let password = all_settings.get("password").cloned();
-                            let imap_host = all_settings.get("imap_host").cloned();
-                            let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
-                            let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
-                            
-                            // Only attempt server deletion if we have the necessary config
-                            if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
-                                if email_addr.to_lowercase() == from_email {
-                                    let email_config = crate::types::EmailConfig {
-                                        email_address: email_addr,
-                                        password: pwd,
-                                        smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
-                                        smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
-                                        imap_host: host,
-                                        imap_port: port,
-                                        use_tls,
-                                        private_key: all_settings.get("nostr_private_key").cloned(),
-                                    };
-                                    
-                                    println!("[RUST] db_delete_sent_email: Attempting to delete from email server");
-                                    // Use tokio::time::timeout to prevent hanging
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(30),
-                                        crate::email::delete_sent_email_from_server(&email_config, &message_id)
-                                    ).await {
-                                        Ok(Ok(_)) => {
-                                            println!("[RUST] db_delete_sent_email: Successfully deleted from email server");
-                                        }
-                                        Ok(Err(e)) => {
-                                            // Log error but continue with local deletion
-                                            println!("[RUST] db_delete_sent_email: Failed to delete from email server: {}, continuing with local deletion", e);
-                                        }
-                                        Err(_) => {
-                                            // Timeout occurred
-                                            println!("[RUST] db_delete_sent_email: Server deletion timed out after 30 seconds, continuing with local deletion");
-                                        }
-                                    }
-                                    break; // Found matching settings, stop searching
-                                }
-                            }
+    // Try to delete from email server using current user's IMAP settings
+    if let Some(ref user_email_param) = user_email {
+        let pubkeys_vec = db.find_pubkeys_by_email_setting(user_email_param).unwrap_or_default();
+        for pubkey in pubkeys_vec {
+            if let Ok(all_settings) = db.get_all_settings(&pubkey) {
+                let email_address = all_settings.get("email_address").cloned();
+                let password = all_settings.get("password").cloned();
+                let imap_host = all_settings.get("imap_host").cloned();
+                let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+                let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+                if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+                    let email_config = crate::types::EmailConfig {
+                        email_address: email_addr,
+                        password: pwd,
+                        smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+                        smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+                        imap_host: host,
+                        imap_port: port,
+                        use_tls,
+                        private_key: all_settings.get("nostr_private_key").cloned(),
+                    };
+
+                    println!("[RUST] db_delete_sent_email: Attempting to delete from email server");
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        crate::email::delete_sent_email_from_server(&email_config, &message_id)
+                    ).await {
+                        Ok(Ok(_)) => {
+                            println!("[RUST] db_delete_sent_email: Successfully deleted from email server");
+                        }
+                        Ok(Err(e)) => {
+                            println!("[RUST] db_delete_sent_email: Failed to delete from email server: {}, continuing with local deletion", e);
+                        }
+                        Err(_) => {
+                            println!("[RUST] db_delete_sent_email: Server deletion timed out after 30 seconds, continuing with local deletion");
                         }
                     }
+                    break;
                 }
             }
         }

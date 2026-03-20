@@ -112,9 +112,10 @@
                         <select id="nostr-contact-select" class="form-control" style="margin-bottom: 8px;">
                             <option value="">Select a Nostr contact with email...</option>
                         </select>
-                        <input type="email" id="to-address" placeholder="recipient@example.com">
-                        <div id="selected-recipient-pubkey" class="selected-pubkey-display" style="display: none;">
-                            <strong>Recipient pubkey:</strong> <span id="recipient-pubkey-value"></span>
+                        <input type="email" id="to-address" placeholder="recipient@example.com" autocorrect="off" autocapitalize="off" spellcheck="false">
+                        <div id="selected-recipient-pubkey" class="selected-pubkey-display">
+                            <label for="recipient-pubkey-value" style="font-size:0.85em; font-weight:bold; margin-bottom:2px;">Recipient pubkey:</label>
+                            <input type="text" id="recipient-pubkey-value" placeholder="npub1... or hex pubkey (optional)" style="font-family: monospace; font-size: 0.85em;" autocorrect="off" autocapitalize="off" spellcheck="false">
                         </div>
                     </div>
                     
@@ -558,6 +559,7 @@
                                     <select id="glossia-encoding-body">
                                         <option value="latin">Latin</option>
                                         <option value="english bip39">English - BIP39</option>
+                                        <option value="">Base64 (no encoding, ⚠ breaks on fwd/reply)</option>
                                     </select>
                                 </div>
                                 <div style="flex:1; min-width:120px;">
@@ -565,6 +567,7 @@
                                     <select id="glossia-encoding-signature">
                                         <option value="latin">Latin</option>
                                         <option value="english bip39">English - BIP39</option>
+                                        <option value="">Base64 (no encoding, ⚠ breaks on fwd/reply)</option>
                                     </select>
                                 </div>
                                 <div style="flex:1; min-width:120px;">

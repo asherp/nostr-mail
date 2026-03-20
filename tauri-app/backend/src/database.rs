@@ -2487,39 +2487,44 @@ impl Database {
 
     pub fn delete_draft(&self, message_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        // Delete attachments first (CASCADE should handle this, but explicit is safer)
-        if let Ok(Some(email)) = self.get_email(message_id) {
-            if let Some(email_id) = email.id {
-                self.delete_attachments_for_email(email_id)?;
-            }
+        let normalized_id = Self::normalize_message_id(message_id);
+
+        // Delete attachments first (inline lookup to avoid deadlock)
+        let email_id: Option<i64> = conn.query_row(
+            "SELECT id FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 1",
+            params![normalized_id],
+            |row| row.get(0),
+        ).ok();
+        if let Some(eid) = email_id {
+            conn.execute("DELETE FROM attachments WHERE email_id = ?", params![eid])?;
         }
+
         conn.execute(
-            "DELETE FROM emails WHERE message_id = ? AND is_draft = 1",
-            params![message_id],
+            "DELETE FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 1",
+            params![normalized_id],
         )?;
         Ok(())
     }
     
     pub fn delete_sent_email(&self, message_id: &str, user_email: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        // Delete attachments first
-        if let Ok(Some(email)) = self.get_email(message_id) {
-            if let Some(email_id) = email.id {
-                self.delete_attachments_for_email(email_id)?;
-            }
+        let normalized_id = Self::normalize_message_id(message_id);
+
+        // Delete attachments first (inline lookup to avoid deadlock)
+        let email_id: Option<i64> = conn.query_row(
+            "SELECT id FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?",
+            params![normalized_id],
+            |row| row.get(0),
+        ).ok();
+        if let Some(eid) = email_id {
+            conn.execute("DELETE FROM attachments WHERE email_id = ?", params![eid])?;
         }
-        
+
         // Delete the email (only if it's a sent email, not a draft)
-        let mut query = String::from("DELETE FROM emails WHERE message_id = ? AND is_draft = 0");
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(message_id)];
-        
-        // Optionally filter by user_email to ensure user can only delete their own sent emails
-        if let Some(email) = user_email {
-            query.push_str(" AND LOWER(TRIM(from_address)) = LOWER(TRIM(?))");
-            params.push(Box::new(email));
-        }
-        
-        conn.execute(&query, rusqlite::params_from_iter(params.iter()))?;
+        conn.execute(
+            "DELETE FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 0",
+            params![normalized_id],
+        )?;
         Ok(())
     }
 

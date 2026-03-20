@@ -67,13 +67,19 @@ class Utils {
         if (!container) return;
         // Work on innerHTML — armor delimiters are escaped text with <br> newlines
         let html = container.innerHTML;
-        // Match nested armor blocks (plaintext signed or encrypted+signed) that end with END NOSTR MESSAGE
-        // Must match before sigSealPattern to prevent partial matches on nested SIGNATURE/SEAL
-        const signedMsgPattern = /(-{3,}\s*BEGIN NOSTR (?:SIGNED|NIP-\d+ ENCRYPTED) MESSAGE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR MESSAGE\s*-{3,})/g;
+        // Match signed nested armor blocks (contain SIGNATURE section) that end with END NOSTR MESSAGE
+        // Must match before other patterns to prevent partial matches on nested SIGNATURE/SEAL
+        const signedMsgPattern = /(-{3,}\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}[\s\S]*?-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR MESSAGE\s*-{3,})/g;
         let blockIndex = 0;
         html = html.replace(signedMsgPattern, (match) => {
             const id = `inline-sig-block-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
+        });
+        // Match unsigned encrypted armor blocks (with seal but no signature) that end with END NOSTR MESSAGE
+        const unsignedEncMsgPattern = /(-{3,}\s*BEGIN NOSTR NIP-\d+ ENCRYPTED (?:MESSAGE|BODY)\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR MESSAGE\s*-{3,})/g;
+        html = html.replace(unsignedEncMsgPattern, (match) => {
+            const id = `inline-sig-block-${blockIndex++}`;
+            return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
         });
         // Match signature block (optionally followed by seal block)
         // Each block: ---+ BEGIN NOSTR (SIGNATURE|SEAL) ---+ ... ---+ END NOSTR (SIGNATURE|SEAL) ---+
@@ -407,12 +413,13 @@ class Utils {
             return 'unknown';
         }
 
-        // Remove ASCII armor if present (for body content)
+        // Remove ASCII armor if present (for body content) — handles both new and legacy formats
         let cleanContent = content
-            .replace(/-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----/g, '')
-            .replace(/-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----/g, '')
-            .replace(/-----BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE-----/g, '')
-            .replace(/-----END NOSTR NIP-44 ENCRYPTED MESSAGE-----/g, '')
+            .replace(/-----BEGIN NOSTR NIP-04 ENCRYPTED (?:MESSAGE|BODY)-----/g, '')
+            .replace(/-----END NOSTR NIP-04 ENCRYPTED (?:MESSAGE|BODY)-----/g, '')
+            .replace(/-----BEGIN NOSTR NIP-44 ENCRYPTED (?:MESSAGE|BODY)-----/g, '')
+            .replace(/-----END NOSTR NIP-44 ENCRYPTED (?:MESSAGE|BODY)-----/g, '')
+            .replace(/-----END NOSTR MESSAGE-----/g, '')
             .trim();
 
         // Check for NIP-04 format: base64?iv=base64

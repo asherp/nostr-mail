@@ -1788,7 +1788,7 @@ class DMService {
                 }
                 
                 // Extract encrypted content from email body
-                const encryptedBodyMatch = email.body.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR SIGNATURE)-----/);
+                const encryptedBodyMatch = email.body.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED (?:MESSAGE|BODY)-----\s*([A-Za-z0-9+/=\n?]+)\s*-----(?:END NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))?|BEGIN NOSTR SIGNATURE)-----/);
                 if (!encryptedBodyMatch) {
                     window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
                     return;

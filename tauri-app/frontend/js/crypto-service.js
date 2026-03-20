@@ -175,8 +175,8 @@ const CryptoService = {
             if (bytes && bytes.length > 0) return bytes;
         }
 
-        // Fallback: base64 or NIP-04 string
-        const str = ciphertext.trim();
+        // Fallback: base64 or NIP-04 string (strip internal whitespace)
+        const str = ciphertext.trim().replace(/\s+/g, '');
         const ivIdx = str.indexOf('?iv=');
         if (ivIdx !== -1) {
             // NIP-04: decode both parts and concatenate

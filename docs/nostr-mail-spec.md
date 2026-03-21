@@ -156,14 +156,13 @@ The following custom MIME headers are included for backwards compatibility and f
 ## 8. Decoder Algorithm
 
 1. **Scan** the `text/plain` body for armor block delimiters (`-{3,}\s*BEGIN NOSTR`)
-2. **Strip** email quoting prefixes (`>`, `> >`, etc.) from each line
-3. **Normalize** whitespace and line endings (`\r\n` -> `\n`)
-4. **Parse** the BEGIN tag to determine encryption type (NIP-04, NIP-44, or signed plaintext)
-5. **Detect** content encoding: base64 (no spaces) vs Glossia (word patterns)
-6. **Decode** content: base64 decode or Glossia transcode -> bytes
-7. **Unpack** NIP-04 if applicable (bitpacked binary -> `base64?iv=base64`)
-8. **Verify** signatures against `SHA-256(decoded_body_bytes)` using the SEAL pubkey
-9. **Decrypt** if encrypted, using recipient's private key and sender's pubkey
+2. **Normalize** whitespace and line endings (`\r\n` -> `\n`)
+3. **Parse** the BEGIN tag to determine encryption type (NIP-04, NIP-44, or signed plaintext)
+4. **Detect** content encoding: base64 (no spaces) vs Glossia (word patterns)
+5. **Decode** content: base64 decode or Glossia transcode -> bytes
+6. **Unpack** NIP-04 if applicable (bitpacked binary -> `base64?iv=base64`)
+7. **Verify** signatures against `SHA-256(decoded_body_bytes)` using the SEAL pubkey
+8. **Decrypt** if encrypted, using recipient's private key and sender's pubkey
 
 ## 9. Versioning
 

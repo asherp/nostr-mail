@@ -263,8 +263,7 @@ pub fn construct_email_headers(
     let email_bytes = email.formatted();
     let email_string = String::from_utf8(email_bytes)?;
     
-    println!("[RUST] construct_email_headers: Full email string:");
-    println!("{}", email_string);
+    println!("[RUST] construct_email_headers: Full email string length: {}", email_string.len());
     
     // Extract headers from the email string
     let lines: Vec<&str> = email_string.lines().collect();
@@ -539,6 +538,28 @@ pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &st
     }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
 }
 
+/// Extract the text/plain body from a parsed email, recursing into multipart parts.
+/// Returns None if no text/plain part is found.
+fn extract_text_body(email: &mailparse::ParsedMail) -> Option<String> {
+    // If this part itself is text/plain, return it
+    if email.ctype.mimetype == "text/plain" && email.subparts.is_empty() {
+        return email.get_body().ok();
+    }
+    for subpart in email.subparts.iter() {
+        let ctype = &subpart.ctype;
+        if ctype.mimetype == "text/plain" {
+            return subpart.get_body().ok();
+        }
+        // Recurse into nested multipart
+        if ctype.mimetype.starts_with("multipart/") {
+            if let Some(text) = extract_text_body(subpart) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
 /// Extract the text/html body from a parsed email (multipart/alternative).
 /// Returns None if no HTML part is found.
 fn extract_html_body(email: &mailparse::ParsedMail) -> Option<String> {
@@ -792,6 +813,128 @@ fn delete_sent_email_from_session_sync(
     }
 }
 
+/// Delete an inbox email from the IMAP server (move to trash).
+pub async fn delete_inbox_email_from_server(config: &EmailConfig, message_id: &str) -> Result<()> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+
+    println!("[RUST] delete_inbox_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
+
+    tokio::task::spawn_blocking(move || {
+        use std::net::TcpStream;
+        let addr = format!("{}:{}", host, port);
+        let is_gmail = host.contains("gmail.com");
+
+        let result = if use_tls {
+            let client = create_imap_tls_client!(&host, &addr)?;
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = delete_email_from_folder_sync(&mut session, is_gmail, &message_id, &["INBOX", "nostr-mail"]);
+            let _ = session.logout();
+            result
+        } else {
+            let tcp_stream = TcpStream::connect(&addr)?;
+            let client = imap::Client::new(tcp_stream);
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = delete_email_from_folder_sync(&mut session, is_gmail, &message_id, &["INBOX", "nostr-mail"]);
+            let _ = session.logout();
+            result
+        };
+        result
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+/// Delete an email from a specific IMAP folder by searching multiple folders in order.
+fn delete_email_from_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    is_gmail: bool,
+    message_id: &str,
+    source_folders: &[&str],
+) -> Result<()> {
+    // Try each source folder until we find and delete the email
+    let mut folder_selected = false;
+    for folder in source_folders {
+        println!("[RUST] delete_email_from_folder_sync: Trying folder: {}", folder);
+        if session.select(folder).is_ok() {
+            folder_selected = true;
+
+            // Search for the email by Message-ID
+            let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+            let full_msg_id = if normalized_msg_id.contains('@') {
+                format!("<{}>", normalized_msg_id)
+            } else {
+                format!("<{}@nostr-mail>", normalized_msg_id)
+            };
+
+            let search_queries = vec![
+                format!("HEADER Message-ID \"{}\"", full_msg_id),
+                format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+                format!("HEADER Message-ID \"{}\"", message_id.trim()),
+            ];
+
+            let mut matching_messages = std::collections::HashSet::new();
+            for search_query in &search_queries {
+                if let Ok(results) = session.search(search_query) {
+                    if !results.is_empty() {
+                        matching_messages.extend(results);
+                        println!("[RUST] delete_email_from_folder_sync: Found {} match(es) in {} with query: {}", matching_messages.len(), folder, search_query);
+                        break;
+                    }
+                }
+            }
+
+            if !matching_messages.is_empty() {
+                let message_seq = *matching_messages.iter().next().unwrap();
+                return move_to_trash(session, is_gmail, message_seq);
+            }
+        }
+    }
+
+    if !folder_selected {
+        return Err(anyhow::anyhow!("Could not select any source folder"));
+    }
+    Err(anyhow::anyhow!("Email not found on server"))
+}
+
+/// Move a message (by sequence number) to the trash folder.
+fn move_to_trash(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    is_gmail: bool,
+    message_seq: u32,
+) -> Result<()> {
+    let trash_folder = if is_gmail { "[Gmail]/Trash" } else { "Trash" };
+    let seq_str = format!("{}", message_seq);
+
+    println!("[RUST] move_to_trash: Moving message {} to {}", message_seq, trash_folder);
+
+    // Try MOVE first
+    if session.mv(&seq_str, trash_folder).is_ok() {
+        println!("[RUST] move_to_trash: Successfully moved via MOVE command");
+        return Ok(());
+    }
+
+    // Fallback: COPY + DELETE + EXPUNGE
+    let trash_folders = if is_gmail {
+        vec!["[Gmail]/Trash"]
+    } else {
+        vec!["Trash", "Deleted", "Deleted Items", "Junk"]
+    };
+
+    for folder in trash_folders {
+        if session.copy(&seq_str, folder).is_ok() {
+            session.store(&seq_str, "+FLAGS (\\Deleted)")?;
+            session.expunge()?;
+            println!("[RUST] move_to_trash: Successfully moved to {} via COPY", folder);
+            return Ok(());
+        }
+    }
+
+    Err(anyhow::anyhow!("Failed to move email to trash"))
+}
+
 /// List available IMAP folders/mailboxes
 pub async fn list_imap_folders(config: &EmailConfig) -> Result<Vec<String>> {
     let host = &config.imap_host;
@@ -1017,17 +1160,8 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     .unwrap_or_else(|_| Utc::now());
                 
                 // Extract body text - try multiple approaches
-                let body_text = if let Some(body_part) = email.subparts.first() {
-                    if let Ok(body_content) = body_part.get_body() {
-                        body_content
-                    } else {
-                        // Try to get the main body if subpart fails
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    }
-                } else {
-                    // No subparts, try to get the main body
-                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                };
+                let body_text = extract_text_body(&email)
+                    .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
 
                 println!("[RUST] Email {} - From: {}, Subject: {}, Body length: {}", 
                     email_id, from, subject, body_text.len());
@@ -1064,10 +1198,10 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
 
                 let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                 
-                // Verify signature if present
+                // Verify signature if present - signature is created on the original body, so verify against body_text
                 let signature_valid = if let Some(pubkey) = &sender_pubkey {
                     if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                        Some(verify_email_signature(pubkey, &sig, &final_body))
+                        Some(verify_email_signature(pubkey, &sig, &body_text))
                     } else {
                         None // No signature present
                     }
@@ -1179,15 +1313,8 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                 if date < cutoff_with_buffer {
                     continue;
                 }
-                let body_text = if let Some(body_part) = email.subparts.first() {
-                    if let Ok(body_content) = body_part.get_body() {
-                        body_content
-                    } else {
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    }
-                } else {
-                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                };
+                let body_text = extract_text_body(&email)
+                    .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                 let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
                 // Check if this is a Nostr email and try to decrypt it
                 let (_final_subject, _final_body) = if raw_headers.contains("X-Nostr-Pubkey:") {
@@ -1534,8 +1661,6 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
     // Store parsed emails with attachments for later use (keyed by message_id)
     let mut emails_with_attachments: Vec<(String, Vec<crate::database::Attachment>)> = Vec::new();
     
-    println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Filtering for emails after: {}", cutoff);
-    
     for (idx, message) in messages.iter().enumerate() {
         email_id += 1;
         // Get the actual message sequence number from message_numbers
@@ -1551,25 +1676,8 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
                 
-                println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Processing email {} - From: {}, Subject: {}, Date: {}", 
-                    email_id, from, subject, date);
-                
-                // Only keep emails after the cutoff (use <= to include emails on the exact cutoff timestamp)
-                if date <= cutoff {
-                    println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} is too old ({} <= {}), skipping", 
-                        email_id, date, cutoff);
-                    continue;
-                }
-                
-                let body_text = if let Some(body_part) = email.subparts.first() {
-                    if let Ok(body_content) = body_part.get_body() {
-                        body_content
-                    } else {
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    }
-                } else {
-                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                };
+                let body_text = extract_text_body(&email)
+                    .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                 
                 let raw_headers = email.headers.iter()
                     .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
@@ -1800,30 +1908,75 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
         }
     }
     
-    if message_numbers.is_empty() {
+    // Also search the nostr-mail folder for previously-moved sent emails
+    let mut nostr_folder_messages_raw: Vec<Vec<u8>> = Vec::new();
+    if let Ok(_) = session.select("nostr-mail") {
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Also searching nostr-mail folder for sent emails");
+        // Filter by FROM to only get emails we sent (not received ones also moved to nostr-mail)
+        let from_filter = format!(" FROM \"{}\"", config.email_address);
+        let nostr_search_terms = vec![
+            format!("TEXT \"BEGIN NOSTR\"{}{}", since_filter, from_filter),
+            format!("HEADER X-Nostr-Pubkey \"\"{}{}", since_filter, from_filter),
+        ];
+        let mut nostr_msg_numbers: HashSet<u32> = HashSet::new();
+        for search_term in &nostr_search_terms {
+            if let Ok(msgs) = session.search(search_term) {
+                println!("[RUST] fetch_sent_emails_from_gmail_optimized: nostr-mail folder search '{}' found {} messages", search_term, msgs.len());
+                nostr_msg_numbers.extend(msgs.iter().cloned());
+            }
+        }
+        if !nostr_msg_numbers.is_empty() {
+            let nostr_nums: Vec<u32> = nostr_msg_numbers.into_iter().collect();
+            if let Ok(fetched) = session.fetch(nostr_nums.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822") {
+                for msg in fetched.iter() {
+                    if let Some(body) = msg.body() {
+                        nostr_folder_messages_raw.push(body.to_vec());
+                    }
+                }
+                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fetched {} messages from nostr-mail folder", nostr_folder_messages_raw.len());
+            }
+        }
+        // Re-select sent folder for any remaining operations
+        let _ = session.select("[Gmail]/Sent Mail");
+    }
+
+    if message_numbers.is_empty() && nostr_folder_messages_raw.is_empty() {
         println!("[RUST] fetch_sent_emails_from_gmail_optimized: No sent messages found, returning empty result");
         return Ok((vec![], vec![]));
     }
-    
-    // Fetch all matching messages
-    let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
-    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Successfully fetched {} sent message objects", messages.len());
+
+    // Fetch all matching messages from sent folder
+    let mut all_message_bodies: Vec<(Vec<u8>, Option<u32>)> = Vec::new();
+    if !message_numbers.is_empty() {
+        let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Successfully fetched {} sent message objects", messages.len());
+        for (idx, message) in messages.iter().enumerate() {
+            if let Some(body) = message.body() {
+                let seq = message_numbers.get(idx).copied();
+                all_message_bodies.push((body.to_vec(), seq));
+            }
+        }
+    }
+    // Add nostr-mail folder messages (no sequence number since we don't need to move them)
+    for raw in nostr_folder_messages_raw {
+        all_message_bodies.push((raw, None));
+    }
     
     let mut emails = Vec::new();
     let mut email_id = 0;
     
     // Filter for emails after the cutoff timestamp (client-side filtering since Gmail only supports dates)
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for sent emails after: {}", cutoff);
-    
+
     // Store parsed emails with attachments for later use (keyed by message_id)
     let mut emails_with_attachments: Vec<(String, Vec<crate::database::Attachment>)> = Vec::new();
-    
-    for (idx, message) in messages.iter().enumerate() {
+
+    for (body_bytes, seq_num) in &all_message_bodies {
         email_id += 1;
-        // Get the actual message sequence number from message_numbers
-        let message_seq = message_numbers.get(idx).copied().unwrap_or(0);
-        if let Some(body) = message.body() {
-            if let Ok(email) = parse_mail(body) {
+        // seq_num is Some for sent folder messages (can be moved), None for nostr-mail folder messages (already moved)
+        let message_seq = seq_num.unwrap_or(0);
+        {
+            if let Ok(email) = parse_mail(body_bytes) {
                 let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
                 let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
                 let subject_raw = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
@@ -1833,25 +1986,8 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
                 
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Processing sent email {} - From: {}, Subject (raw): {:?}, Subject (decoded): {}, Date: {}", 
-                    email_id, from, subject_raw, subject, date);
-                
-                // Only keep emails after the cutoff timestamp (strict comparison)
-                if date <= cutoff {
-                    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} is not newer than cutoff ({} <= {}), skipping", 
-                        email_id, date, cutoff);
-                    continue;
-                }
-                
-                let body_text = if let Some(body_part) = email.subparts.first() {
-                    if let Ok(body_content) = body_part.get_body() {
-                        body_content
-                    } else {
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    }
-                } else {
-                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                };
+                let body_text = extract_text_body(&email)
+                    .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                 
                 let raw_headers = email.headers.iter()
                     .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
@@ -1879,8 +2015,8 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} is confirmed as Nostr email", email_id);
                     
                     // Move email to nostr-mail folder before processing
-                    // Note: We're in the sent folder context, so we need to ensure we're still there
-                    if message_seq > 0 {
+                    // Only move if from sent folder (seq_num is Some), skip if already in nostr-mail
+                    if seq_num.is_some() && message_seq > 0 {
                         let sent_folder = "[Gmail]/Sent Mail";
                         if let Err(e) = move_email_to_nostr_folder(session, message_seq, true, sent_folder) {
                             println!("[RUST] fetch_sent_emails_from_gmail_optimized: Failed to move email {} (seq {}) to nostr-mail folder: {}, continuing", email_id, message_seq, e);
@@ -1976,11 +2112,9 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
             } else {
                 println!("[RUST] fetch_sent_emails_from_gmail_optimized: Failed to parse sent email {}", email_id);
             }
-        } else {
-            println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent message {} has no body", email_id);
         }
     }
-    
+
     // Don't logout here - let the caller handle session cleanup
     // session.logout()?;
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Successfully processed {} sent Nostr emails with {} attachment sets", emails.len(), emails_with_attachments.len());
@@ -2007,12 +2141,8 @@ fn extract_attachments_from_parsed_email(email: &mailparse::ParsedMail, body_tex
         }
     }
     
-    println!("[RUST] extract_attachments_from_parsed_email: Checking email with {} subparts, manifest_encrypted: {}", email.subparts.len(), is_manifest_encrypted);
-    
     // Recursively extract attachments from all subparts
     extract_attachments_recursive(email, &mut attachments, is_manifest_encrypted, 0);
-    
-    println!("[RUST] extract_attachments_from_parsed_email: Extracted {} total attachments", attachments.len());
     
     attachments
 }
@@ -2027,40 +2157,31 @@ fn extract_attachments_recursive(
     use base64::{Engine as _, engine::general_purpose};
     use chrono::Utc;
     
-    let indent = "  ".repeat(depth);
-    println!("{}[RUST] Checking part at depth {}: {} subparts", indent, depth, part.subparts.len());
-    
     // Check Content-Type of this part
     let content_type = part.headers.get_first_value("Content-Type").unwrap_or_default();
     let content_disposition = part.headers.get_first_value("Content-Disposition").unwrap_or_default();
-    
-    println!("{}[RUST] Part Content-Type: {}, Content-Disposition: {}", indent, content_type, content_disposition);
-    
+
     // Check if this part itself is an attachment
-    let is_attachment = content_disposition.to_lowercase().contains("attachment") || 
+    let is_attachment = content_disposition.to_lowercase().contains("attachment") ||
                        content_disposition.to_lowercase().contains("filename");
-    
+
     let is_multipart = content_type.to_lowercase().starts_with("multipart/");
     let is_text = content_type.to_lowercase().starts_with("text/");
-    
+
     // If this is a multipart container, recurse into subparts
     if is_multipart {
-        println!("{}[RUST] Part is multipart, recursing into {} subparts", indent, part.subparts.len());
         for (_idx, subpart) in part.subparts.iter().enumerate() {
             extract_attachments_recursive(subpart, attachments, is_manifest_encrypted, depth + 1);
         }
     } else if is_attachment || (!is_text && !content_type.is_empty()) {
         // This part is an attachment (has Content-Disposition: attachment or is non-text)
-        println!("{}[RUST] Part looks like attachment: is_attachment={}, is_text={}, content_type={}", 
-            indent, is_attachment, is_text, content_type);
-        
+
         // Extract filename from Content-Disposition or Content-Type
         let filename = extract_filename_from_headers(&content_disposition, &content_type)
             .unwrap_or_else(|| format!("attachment_{}.dat", attachments.len()));
-        
+
         // Get attachment data
         if let Ok(attachment_data) = part.get_body_raw() {
-            println!("{}[RUST] Extracting attachment: {} ({} bytes)", indent, filename, attachment_data.len());
             
             // Encode as base64 for storage
             let data_base64 = general_purpose::STANDARD.encode(&attachment_data);
@@ -2082,13 +2203,8 @@ fn extract_attachments_recursive(
             };
             
             attachments.push(db_attachment);
-            println!("{}[RUST] Successfully extracted attachment: {} ({} bytes, encrypted: {})", 
-                indent, filename, attachment_data.len(), is_manifest_encrypted);
-        } else {
-            println!("{}[RUST] Failed to get attachment data for {}", indent, filename);
+            println!("[RUST] Extracted attachment: {} ({} bytes)", filename, attachment_data.len());
         }
-    } else {
-        println!("{}[RUST] Part is not an attachment (text or empty), skipping", indent);
     }
 }
 
@@ -2147,20 +2263,6 @@ pub fn extract_nostr_sig_from_headers(raw_headers: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Normalize email body for signature verification
-/// This ensures the body matches what was signed, handling:
-/// - Line ending differences (\r\n vs \n)
-/// - Trailing whitespace
-fn normalize_body_for_verification(body: &str) -> String {
-    // Replace \r\n with \n to normalize line endings
-    let normalized = body.replace("\r\n", "\n");
-    // Remove trailing whitespace from each line (but preserve structure)
-    normalized.lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Extract the body content from an ASCII-armored email.
@@ -2226,12 +2328,8 @@ fn try_glossia_decode_to_bytes(text: &str) -> Option<Vec<u8>> {
     };
     // decode_from_language returns hex when bytes aren't valid UTF-8 (i.e. binary ciphertext)
     if let Some(bytes) = glossia::hex_decode(&decoded) {
-        println!("[RUST] try_glossia_decode_to_bytes: decoded {} glossia words ({}, {}) -> {} bytes",
-            words.len(), best.language, best.wordlist, bytes.len());
         Some(bytes)
     } else {
-        // If it's valid UTF-8 text, it might be a text payload - return as bytes
-        println!("[RUST] try_glossia_decode_to_bytes: decoded to text ({} chars), treating as UTF-8", decoded.len());
         Some(decoded.into_bytes())
     }
 }
@@ -2244,18 +2342,8 @@ fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
     // Supports both legacy (BEGIN NOSTR NIP-XX ENCRYPTED MESSAGE) and new (BEGIN NOSTR NIP-XX ENCRYPTED BODY) formats
     if let Some(content) = extract_armor_body_content(body) {
         let content = content.trim();
-        println!("[RUST] extract_ciphertext_binary: armor content extracted, {} chars, preview: {}",
-            content.len(), &content[..content.len().min(120)]);
-
         // Try glossia decode first (handles BIP39/Latin encoded content)
         if let Some(bytes) = try_glossia_decode_to_bytes(content) {
-            println!("[RUST] extract_ciphertext_binary: glossia decoded to {} bytes, sha256: {:?}",
-                bytes.len(), {
-                    use sha2::{Sha256, Digest};
-                    let mut h = Sha256::new();
-                    h.update(&bytes);
-                    hex::encode(&h.finalize()[..8])
-                });
             return bytes;
         }
 
@@ -2271,13 +2359,11 @@ fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
                 ) {
                     let mut combined = payload;
                     combined.extend_from_slice(&iv);
-                    println!("[RUST] extract_ciphertext_binary: NIP-04 binary, {} bytes", combined.len());
                     return combined;
                 }
             }
             // NIP-44: pure base64
             if let Ok(decoded) = general_purpose::STANDARD.decode(&b64_clean) {
-                println!("[RUST] extract_ciphertext_binary: NIP-44 binary, {} bytes", decoded.len());
                 return decoded;
             }
         }
@@ -2292,38 +2378,14 @@ fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
 /// Extracts the binary payload from ASCII armor (or uses raw text bytes),
 /// then verifies the schnorr signature against SHA-256(binary).
 pub fn verify_email_signature(sender_pubkey: &str, signature: &str, body: &str) -> bool {
-    println!("[RUST] verify_email_signature: body passed ({} chars):\n{}", body.len(), &body[..body.len().min(500)]);
     let binary = extract_ciphertext_binary(body);
-    let binary_hash = {
-        use sha2::{Sha256, Digest};
-        let mut h = Sha256::new();
-        h.update(&binary);
-        hex::encode(&h.finalize()[..8])
-    };
-    println!("[RUST] verify_email_signature: binary {} bytes, sha256_prefix: {}, pubkey: {}, sig: {}",
-        binary.len(), binary_hash, sender_pubkey, signature);
     match crypto::verify_signature_bytes(sender_pubkey, signature, &binary) {
         Ok(valid) => {
-            if !valid {
-                // Fallback: try old text-based verification for backwards compat with pre-binary emails
-                let normalized_body = normalize_body_for_verification(body);
-                match crypto::verify_signature(sender_pubkey, signature, &normalized_body) {
-                    Ok(text_valid) => {
-                        println!("[RUST] verify_email_signature: binary={}, text_fallback={}", valid, text_valid);
-                        text_valid
-                    },
-                    Err(e) => {
-                        println!("[RUST] verify_email_signature: binary=false, text_fallback error: {}", e);
-                        false
-                    }
-                }
-            } else {
-                println!("[RUST] verify_email_signature: binary signature valid");
-                true
-            }
+            println!("[RUST] verify_email_signature: {} ({} bytes)", if valid { "valid" } else { "INVALID" }, binary.len());
+            valid
         },
         Err(e) => {
-            println!("[RUST] verify_email_signature: Error verifying binary signature: {}", e);
+            println!("[RUST] verify_email_signature: error: {}", e);
             false
         }
     }
@@ -3223,15 +3285,8 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now());
-                        let body_text = if let Some(body_part) = email.subparts.first() {
-                            if let Ok(body_content) = body_part.get_body() {
-                                body_content
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            }
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        };
+                        let body_text = extract_text_body(&email)
+                            .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
                         // Only keep Nostr emails
                         if raw_headers.contains("X-Nostr-Pubkey:") {
@@ -3311,15 +3366,8 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
                             if raw_headers.contains("X-Nostr-Pubkey:") {
                                 let (_final_subject, _final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
@@ -3851,37 +3899,19 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now());
-                        let body_text = if let Some(body_part) = email.subparts.first() {
-                            if let Ok(body_content) = body_part.get_body() {
-                                body_content
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            }
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        };
+                        let body_text = extract_text_body(&email)
+                            .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                         let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                         
-                        // Debug: Log body content for signature verification
-                        println!("[RUST] fetch_nostr_emails_from_folder: Body text length: {}, first 100 chars: {}, last 100 chars: {}", 
-                            body_text.len(), 
-                            body_text.chars().take(100).collect::<String>(),
-                            body_text.chars().rev().take(100).collect::<String>().chars().rev().collect::<String>());
-                        println!("[RUST] fetch_nostr_emails_from_folder: Body contains \\n: {}, contains \\r\\n: {}", 
-                            body_text.contains('\n'), body_text.contains("\r\n"));
-                        
                         let signature_valid = if let Some(pubkey) = &sender_pubkey {
                             if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                println!("[RUST] fetch_nostr_emails_from_folder: Found signature, verifying...");
                                 Some(verify_email_signature(pubkey, &sig, &body_text))
                             } else {
-                                println!("[RUST] fetch_nostr_emails_from_folder: No signature found in headers");
                                 None
                             }
                         } else {
-                            println!("[RUST] fetch_nostr_emails_from_folder: No sender pubkey found");
                             None
                         };
                         
@@ -3966,15 +3996,8 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                     let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now());
-                    let body_text = if let Some(body_part) = email.subparts.first() {
-                        if let Ok(body_content) = body_part.get_body() {
-                            body_content
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        }
-                    } else {
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    };
+                    let body_text = extract_text_body(&email)
+                        .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                     
                     let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                     let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
@@ -4094,15 +4117,8 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                             let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
@@ -4198,15 +4214,8 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now());
-                        let body_text = if let Some(body_part) = email.subparts.first() {
-                            if let Ok(body_content) = body_part.get_body() {
-                                body_content
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            }
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        };
+                        let body_text = extract_text_body(&email)
+                            .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                         let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
@@ -4333,15 +4342,8 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now());
-                        let body_text = if let Some(body_part) = email.subparts.first() {
-                            if let Ok(body_content) = body_part.get_body() {
-                                body_content
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            }
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        };
+                        let body_text = extract_text_body(&email)
+                            .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         let raw_headers = email.headers.iter()
                             .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
                             .collect::<Vec<_>>()
@@ -4458,15 +4460,8 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                             let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
@@ -4701,15 +4696,8 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             let raw_headers = email.headers.iter()
                                 .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
                                 .collect::<Vec<_>>()
@@ -4937,15 +4925,8 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                             let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);

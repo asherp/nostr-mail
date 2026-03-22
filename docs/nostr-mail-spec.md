@@ -97,6 +97,44 @@ Hello, this is a plaintext message.
 ----- END NOSTR SEAL -----
 ```
 
+### 3.5 Reply Format
+
+When replying to an encrypted message, only the new reply text is encrypted. The original message is appended as a `> ` quoted block outside the encryption boundary. This preserves the original message's signature for independent verification and avoids double-encryption.
+
+```
+----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----
+<reply ciphertext, encrypted independently>
+----- BEGIN NOSTR SIGNATURE -----
+@ReplyAuthor
+<reply signature>
+----- BEGIN NOSTR SEAL -----
+@ReplyAuthor
+<reply author pubkey>
+----- END NOSTR MESSAGE -----
+
+> ----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----
+> <original message ciphertext>
+> ----- BEGIN NOSTR SIGNATURE -----
+> @OriginalAuthor
+> <original signature>
+> ----- BEGIN NOSTR SEAL -----
+> @OriginalAuthor
+> <original author pubkey>
+> ----- END NOSTR MESSAGE -----
+```
+
+For reply chains, quote depth increases with each level:
+
+```
+<current reply armor>
+
+> <previous reply armor>
+>
+> > <original message armor>
+```
+
+Decoders MUST accept armor block delimiters preceded by any number of `> ` quote prefixes. Glossia decoders naturally ignore quote prefixes as non-payload words.
+
 ## 4. Composable Signing Model
 
 Signing is user-controlled and can be applied at any stage to the current body bytes:

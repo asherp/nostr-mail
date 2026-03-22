@@ -2528,6 +2528,27 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_inbox_email(&self, message_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let normalized_id = Self::normalize_message_id(message_id);
+
+        // Delete attachments first
+        let email_id: Option<i64> = conn.query_row(
+            "SELECT id FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 0",
+            params![normalized_id],
+            |row| row.get(0),
+        ).ok();
+        if let Some(eid) = email_id {
+            conn.execute("DELETE FROM attachments WHERE email_id = ?", params![eid])?;
+        }
+
+        conn.execute(
+            "DELETE FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 0",
+            params![normalized_id],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_as_read(&self, message_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

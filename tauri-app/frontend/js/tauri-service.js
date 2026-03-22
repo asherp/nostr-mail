@@ -526,8 +526,12 @@ const TauriService = {
         return await this.invoke('db_delete_draft', { messageId });
     },
     
-    deleteSentEmail: async function(messageId, userEmail) {
-        return await this.invoke('db_delete_sent_email', { messageId, userEmail });
+    deleteSentEmail: async function(messageId, deleteFromServer, userEmail) {
+        return await this.invoke('db_delete_sent_email', { messageId, deleteFromServer, userEmail });
+    },
+
+    deleteInboxEmail: async function(messageId, deleteFromServer, userEmail) {
+        return await this.invoke('db_delete_inbox_email', { messageId, deleteFromServer, userEmail });
     },
 
     markAsRead: async function(messageId) {

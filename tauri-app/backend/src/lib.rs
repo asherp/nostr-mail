@@ -2209,10 +2209,7 @@ fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<boo
     let db = state.get_database()?;
     let emails = db.get_emails(limit, offset, nostr_only, user_email.as_deref(), user_pubkey.as_deref()).map_err(|e| e.to_string())?;
     let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
-    println!("[RUST] Sending {} emails to frontend:", mapped.len());
-    for (i, email) in mapped.iter().enumerate() {
-        println!("[RUST] Email {}: {:#?}", i + 1, email);
-    }
+    println!("[RUST] Sending {} emails to frontend", mapped.len());
     Ok(mapped)
 }
 
@@ -2314,8 +2311,7 @@ async fn db_search_emails(
                     // Try to extract original filenames from manifest if email has manifest-encrypted attachments
                     let has_manifest_attachments = attachments.iter().any(|att| att.encryption_method.as_deref() == Some("manifest_aes"));
                     if has_manifest_attachments && email_config.private_key.is_some() {
-                        println!("[RUST] Inbox email {} has manifest-encrypted attachments, attempting to extract original filenames", email.id.unwrap_or(0));
-                        println!("[RUST] Decrypted body length: {}, preview: {}", decrypted_body.len(), &decrypted_body.chars().take(200).collect::<String>());
+                        println!("[RUST] Inbox email {} has manifest-encrypted attachments, decrypted body: {} chars", email.id.unwrap_or(0), decrypted_body.len());
                         
                         // Try to parse decrypted body as manifest JSON
                         match serde_json::from_str::<serde_json::Value>(&decrypted_body) {
@@ -2802,8 +2798,7 @@ async fn db_search_sent_emails(
                     // Try to extract original filenames from manifest if email has manifest-encrypted attachments
                     let has_manifest_attachments = attachments.iter().any(|att| att.encryption_method.as_deref() == Some("manifest_aes"));
                     if has_manifest_attachments && email_config.private_key.is_some() {
-                        println!("[RUST] Sent email {} has manifest-encrypted attachments, attempting to extract original filenames", email.id.unwrap_or(0));
-                        println!("[RUST] Decrypted body length: {}, preview: {}", decrypted_body.len(), &decrypted_body.chars().take(200).collect::<String>());
+                        println!("[RUST] Sent email {} has manifest-encrypted attachments, decrypted body: {} chars", email.id.unwrap_or(0), decrypted_body.len());
                         
                         // Try to parse decrypted body as manifest JSON
                         match serde_json::from_str::<serde_json::Value>(&decrypted_body) {
@@ -3115,7 +3110,6 @@ fn db_save_attachment(attachment: crate::database::Attachment, state: tauri::Sta
 
 #[tauri::command]
 fn db_get_attachments_for_email(email_id: i64, state: tauri::State<AppState>) -> Result<Vec<crate::database::Attachment>, String> {
-    println!("[RUST] db_get_attachments_for_email called for email_id: {}", email_id);
     let db = state.get_database()?;
     db.get_attachments_for_email(email_id).map_err(|e| e.to_string())
 }
@@ -4711,12 +4705,13 @@ fn db_delete_draft(message_id: String, state: tauri::State<AppState>) -> Result<
 }
 
 #[tauri::command]
-async fn db_delete_sent_email(message_id: String, user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    println!("[RUST] db_delete_sent_email called for message_id: {}", message_id);
-    
+async fn db_delete_sent_email(message_id: String, delete_from_server: Option<bool>, user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] db_delete_sent_email called for message_id: {}, delete_from_server: {:?}", message_id, delete_from_server);
+
     let db = state.get_database()?;
-    
+
     // Try to delete from email server using current user's IMAP settings
+    if delete_from_server.unwrap_or(true) {
     if let Some(ref user_email_param) = user_email {
         let pubkeys_vec = db.find_pubkeys_by_email_setting(user_email_param).unwrap_or_default();
         for pubkey in pubkeys_vec {
@@ -4759,9 +4754,64 @@ async fn db_delete_sent_email(message_id: String, user_email: Option<String>, st
             }
         }
     }
-    
+    }
+
     // Always delete locally, even if server deletion failed
     db.delete_sent_email(&message_id, user_email.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn db_delete_inbox_email(message_id: String, delete_from_server: Option<bool>, user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] db_delete_inbox_email called for message_id: {}, delete_from_server: {:?}", message_id, delete_from_server);
+
+    if delete_from_server.unwrap_or(false) {
+        if let Some(ref user_email_param) = user_email {
+            let db = state.get_database()?;
+            let pubkeys_vec = db.find_pubkeys_by_email_setting(user_email_param).unwrap_or_default();
+            for pubkey in pubkeys_vec {
+                if let Ok(all_settings) = db.get_all_settings(&pubkey) {
+                    let email_address = all_settings.get("email_address").cloned();
+                    let password = all_settings.get("password").cloned();
+                    let imap_host = all_settings.get("imap_host").cloned();
+                    let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+                    let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+                    if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+                        let email_config = crate::types::EmailConfig {
+                            email_address: email_addr,
+                            password: pwd,
+                            smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+                            smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+                            imap_host: host,
+                            imap_port: port,
+                            use_tls,
+                            private_key: all_settings.get("nostr_private_key").cloned(),
+                        };
+
+                        println!("[RUST] db_delete_inbox_email: Attempting to delete from email server");
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            crate::email::delete_inbox_email_from_server(&email_config, &message_id)
+                        ).await {
+                            Ok(Ok(_)) => {
+                                println!("[RUST] db_delete_inbox_email: Successfully deleted from email server");
+                            }
+                            Ok(Err(e)) => {
+                                println!("[RUST] db_delete_inbox_email: Failed to delete from email server: {}, continuing with local deletion", e);
+                            }
+                            Err(_) => {
+                                println!("[RUST] db_delete_inbox_email: Server deletion timed out after 30 seconds, continuing with local deletion");
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let db = state.get_database()?;
+    db.delete_inbox_email(&message_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -5158,6 +5208,7 @@ pub fn run() {
         db_get_drafts,
         db_delete_draft,
         db_delete_sent_email,
+        db_delete_inbox_email,
         db_mark_as_read,
         db_check_dm_matches_email_encrypted,
         db_get_matching_email_id,

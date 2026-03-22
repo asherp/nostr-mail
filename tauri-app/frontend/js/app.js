@@ -736,8 +736,10 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     const subjectValue = domManager.getValue('subject') || '';
                     const messageBodyValue = domManager.getValue('messageBody') || '';
                     
-                    // Always require both subject and body
-                    if (!subjectValue || !messageBodyValue) {
+                    // Check if there's actual content to encrypt (not just quoted original)
+                    const splitCheck = window.emailService ? window.emailService.splitReplyAndQuoted(messageBodyValue) : { replyText: messageBodyValue, quotedOriginal: '' };
+                    const effectiveBody = splitCheck.quotedOriginal ? splitCheck.replyText : messageBodyValue;
+                    if (!subjectValue || !effectiveBody) {
                         notificationService.showError('Both subject and message body must be filled to encrypt.');
                         return;
                     }
@@ -912,10 +914,17 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     // Sign: sign the canonical ciphertext (decoded binary) if encrypted,
                     // otherwise sign the plaintext body as-is
                     console.log('[JS] Sign button clicked');
-                    const bodyValue = domManager.getValue('messageBody') || '';
-                    if (!bodyValue) {
+                    const rawBodyValue = domManager.getValue('messageBody') || '';
+                    if (!rawBodyValue) {
                         notificationService.showError('Message body must be filled to sign.');
                         return;
+                    }
+
+                    // Split reply text from quoted original — only sign the reply
+                    const splitResult = window.emailService ? window.emailService.splitReplyAndQuoted(rawBodyValue) : { replyText: rawBodyValue, quotedOriginal: '' };
+                    const bodyValue = splitResult.quotedOriginal ? splitResult.replyText : rawBodyValue;
+                    if (splitResult.quotedOriginal && window.emailService) {
+                        window.emailService._quotedOriginalArmor = splitResult.quotedOriginal;
                     }
 
                     try {
@@ -1076,7 +1085,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
 
                         signBtn.dataset.signed = 'true';
                         signBtn.dataset.signature = signature;
-                        signBtn.dataset.originalBody = bodyValue;
+                        signBtn.dataset.originalBody = rawBodyValue;
                         if (iconSpan) iconSpan.className = 'fas fa-check-circle';
                         if (labelSpan) labelSpan.textContent = 'Signed';
                         signBtn.classList.add('signed');
@@ -1108,8 +1117,31 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                 plainBodyText, encodedSig, encodedPubkey, profileName, displayName,
                                 isEncrypted, encAlgo, isEncrypted ? null : bodyValue
                             );
-                            // Show armored format in textarea for plaintext signed emails
-                            if (!isEncrypted && window.emailService._plainBody) {
+                            // Append quoted original message armor outside the encryption
+                            if (window.emailService._quotedOriginalArmor) {
+                                const quoted = window.emailService._quotedOriginalArmor.split('\n').map(l => '> ' + l).join('\n');
+                                if (window.emailService._plainBody) {
+                                    window.emailService._plainBody += '\n\n' + quoted;
+                                }
+                                if (window.emailService._htmlBody) {
+                                    const parts = window.emailService.parseArmorComponents(window.emailService._quotedOriginalArmor);
+                                    if (parts) {
+                                        const quotedHtml = window.emailService.buildHtmlAlt(
+                                            parts.bodyText, parts.sigContent, parts.sealContent,
+                                            parts.profileName, parts.displayName
+                                        );
+                                        window.emailService._htmlBody += '<blockquote style="border-left:2px solid #ccc;margin:1em 0;padding:0 1em;">'
+                                            + quotedHtml + '</blockquote>';
+                                    } else {
+                                        window.emailService._htmlBody += '<blockquote style="border-left:2px solid #ccc;margin:1em 0;padding:0 1em;">'
+                                            + '<div style="font-family:sans-serif;line-height:1.6;">'
+                                            + Utils.escapeHtml(window.emailService._quotedOriginalArmor).replace(/\n/g, '<br>')
+                                            + '</div></blockquote>';
+                                    }
+                                }
+                            }
+                            // Show armored format in textarea (with quoted original if present)
+                            if (window.emailService._plainBody) {
                                 domManager.setValue('messageBody', window.emailService._plainBody);
                             }
                         }

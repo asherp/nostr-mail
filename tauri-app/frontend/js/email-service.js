@@ -41,6 +41,7 @@ class EmailService {
         this.sentSearchHasMore = false; // Track if there are more sent search results
         this._htmlBody = null; // HTML alternative body for multipart emails
         this._plainBody = null; // BIP39-armored plaintext body for text/plain MIME part
+        this._quotedOriginalArmor = null; // Original message armor to append as quote in replies
     }
 
     // Get appropriate background color for Nostr contact input based on dark mode
@@ -608,18 +609,28 @@ class EmailService {
                 nostr_pubkey: pubkey // Fallback for backward compatibility
             };
             
+            // Preserve quoted armor (reply chain) after the first armor block
+            const endArmorMatch = body.match(/-{3,}\s*END NOSTR MESSAGE\s*-{3,}/);
+            let trailingQuoted = '';
+            if (endArmorMatch) {
+                const afterArmor = body.substring(endArmorMatch.index + endArmorMatch[0].length).trim();
+                if (afterArmor) {
+                    trailingQuoted = '\n\n' + afterArmor;
+                }
+            }
+
             // Try manifest decryption first
             const manifestResult = await this.decryptManifestMessage(mockEmail, encryptedContent, { private_key: privkey });
-            
+
             if (manifestResult.type === 'manifest') {
                 console.log('[JS] Successfully decrypted manifest body');
-                domManager.setValue('messageBody', manifestResult.body);
+                domManager.setValue('messageBody', manifestResult.body + trailingQuoted);
                 window.notificationService.showSuccess('Body decrypted successfully');
                 // Clear signature when decrypting (body state changed)
                 this.clearSignature();
             } else if (manifestResult.type === 'legacy') {
                 console.log('[JS] Successfully decrypted legacy body');
-                domManager.setValue('messageBody', manifestResult.body);
+                domManager.setValue('messageBody', manifestResult.body + trailingQuoted);
                 window.notificationService.showSuccess('Body decrypted successfully');
                 // Clear signature when decrypting (body state changed)
                 this.clearSignature();
@@ -853,6 +864,7 @@ class EmailService {
         this.plaintextSubject = '';
         this.plaintextBody = '';
         this.currentMessageId = null; // Reset message ID when clearing draft
+        this._quotedOriginalArmor = null; // Clear quoted reply armor
         this.clearAttachments(); // Clear all attachments
         // Clear saved contact selection when clearing draft
         this.clearSavedContactSelection();
@@ -885,6 +897,8 @@ class EmailService {
         }
         this._htmlBody = null;
         this._plainBody = null;
+        // Note: _quotedOriginalArmor is NOT cleared here — it survives
+        // encrypt/sign cycles and is only cleared on form reset
     }
 
     // Inject a signature verification badge into an HTML email body.
@@ -949,6 +963,33 @@ class EmailService {
         return `<div style="font-family:sans-serif;line-height:1.6;">
   <div>${bodyHtml}</div>${sigHtml}${sealHtml}
 </div>`;
+    }
+
+    // Parse an ASCII armor block into its structural components (body, signature, seal).
+    // Works with both encrypted (NIP-XX) and signed armor formats.
+    parseArmorComponents(armorText) {
+        if (!armorText) return null;
+        const normalized = armorText.replace(/\r\n/g, '\n');
+        const regex = /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*)?(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR (?:(?:NIP-\d+ ENCRYPTED )?MESSAGE|SIGNATURE|SEAL)\s*-{3,}/;
+        const match = normalized.match(regex);
+        if (!match) return null;
+
+        const bodyText = match[1].trim();
+        let sigContent = null, profileName = null;
+        if (match[2]) {
+            const lines = match[2].trim().split('\n');
+            const nameLine = lines.find(l => l.trim().startsWith('@'));
+            if (nameLine) profileName = nameLine.trim().replace(/^@/, '');
+            sigContent = lines.filter(l => !l.trim().startsWith('@')).join('\n').trim();
+        }
+        let sealContent = null, displayName = null;
+        if (match[3]) {
+            const lines = match[3].trim().split('\n');
+            const nameLine = lines.find(l => l.trim().startsWith('@'));
+            if (nameLine) displayName = nameLine.trim().replace(/^@/, '');
+            sealContent = lines.filter(l => !l.trim().startsWith('@')).join('\n').trim();
+        }
+        return { bodyText, sigContent, sealContent, profileName, displayName };
     }
 
     // Build ASCII-armored plaintext body for text/plain MIME part.
@@ -2810,6 +2851,11 @@ class EmailService {
                         ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
                         <div class="email-preview">${previewText}</div>
                     </div>
+                    <div class="email-actions">
+                        <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteInboxEmailFromList('${Utils.escapeHtml(email.message_id || email.id)}')">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </div>
                 `;
                 
                 // Add hover and click handlers for invalid signature indicator
@@ -3214,6 +3260,15 @@ class EmailService {
                                 inlineSigResult = await this.verifyInlineSignature(emailBody);
                             } catch (e) {
                                 console.warn('[JS] Inline signature verification error:', e);
+                            }
+                            // Append any quoted armor after the first armor block
+                            // (replies append the original message outside encryption)
+                            const endArmorMatch = emailBody.match(/-{3,}\s*END NOSTR MESSAGE\s*-{3,}/);
+                            if (endArmorMatch) {
+                                const afterArmor = emailBody.substring(endArmorMatch.index + endArmorMatch[0].length).trim();
+                                if (afterArmor) {
+                                    decryptedBody = decryptedBody + '\n\n' + afterArmor;
+                                }
                             }
                             await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, inlineSigResult);
                         } catch (err) {
@@ -3710,16 +3765,18 @@ ${attachmentsHtml}
             }
             
             // Format the body with quoted original message
-            // Split by lines and add > prefix to each line
+            // The quoted armor is visible in the textarea while composing.
+            // On encrypt, only the reply text above the quotes is encrypted;
+            // the quoted armor is appended outside the encryption boundary.
             const originalBody = email.body || '';
             let replyBody = '';
-            
+
             if (originalBody.trim()) {
                 const quotedBody = originalBody
                     .split('\n')
                     .map(line => '> ' + line)
                     .join('\n');
-                
+
                 // Add a blank line before the quoted text
                 replyBody = '\n\n' + quotedBody;
             }
@@ -3963,13 +4020,11 @@ ${attachmentsHtml}
         }
     }
 
-    async deleteSentEmail(messageId) {
+    async deleteSentEmail(messageId, deleteFromServer) {
         try {
             const settings = appState.getSettings();
             const userEmail = settings?.email_address || null;
-            // Pass the message_id and user_email to backend
-            // Backend will handle server deletion if EmailConfig can be constructed
-            await TauriService.deleteSentEmail(messageId, userEmail);
+            await TauriService.deleteSentEmail(messageId, deleteFromServer, userEmail);
         } catch (error) {
             console.error('Error deleting sent email:', error);
             throw error;
@@ -3979,16 +4034,40 @@ ${attachmentsHtml}
     // Delete sent email from the sent list
     async deleteSentEmailFromList(messageId) {
         try {
-            if (await window.__TAURI__.dialog.confirm('Are you sure you want to delete this sent email?', { title: 'Delete Email', kind: 'warning' })) {
-                await this.deleteSentEmail(messageId);
-                notificationService.showSuccess('Sent email deleted successfully!');
-                
-                // Reload the sent emails list to reflect the deletion
-                await this.loadSentEmails();
-            }
+            const choice = await notificationService.showDeleteOptions(
+                'Delete Sent Email',
+                'Delete locally (will re-fetch on next sync) or delete everywhere (removes from email server too)?'
+            );
+            if (!choice) return; // cancelled
+
+            const deleteFromServer = choice === 'everywhere';
+            await this.deleteSentEmail(messageId, deleteFromServer);
+            notificationService.showSuccess(deleteFromServer ? 'Email deleted from server and local database.' : 'Email deleted locally.');
+            await this.loadSentEmails();
         } catch (error) {
             console.error('Error deleting sent email:', error);
             notificationService.showError('Failed to delete sent email: ' + error);
+        }
+    }
+
+    async deleteInboxEmailFromList(messageId) {
+        try {
+            const choice = await notificationService.showDeleteOptions(
+                'Delete Email',
+                'Delete locally (will re-fetch on next sync) or delete everywhere (removes from email server too)?'
+            );
+            if (!choice) return; // cancelled
+
+            const settings = appState.getSettings();
+            const userEmail = settings?.email_address || null;
+            const deleteFromServer = choice === 'everywhere';
+
+            await TauriService.deleteInboxEmail(messageId, deleteFromServer, userEmail);
+            notificationService.showSuccess(deleteFromServer ? 'Email deleted from server and local database.' : 'Email deleted locally.');
+            await this.loadEmails();
+        } catch (error) {
+            console.error('Error deleting inbox email:', error);
+            notificationService.showError('Failed to delete email: ' + error);
         }
     }
 
@@ -4751,8 +4830,11 @@ ${attachmentsHtml}
         if (!bodyText) return;
         const gs = window.GlossiaService;
 
+        // Quote prefix: lines in quoted replies start with "> "
+        // Allow zero or more levels of quoting before each delimiter line
+        const QP = '(?:>\\s*)*';
         // First, handle nested armor blocks (plaintext signed or encrypted+signed) that end with END NOSTR MESSAGE
-        const signedMsgRegex = /-{3,}\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR MESSAGE\s*-{3,}/g;
+        const signedMsgRegex = new RegExp(`${QP}-{3,}\\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}\\s*([\\s\\S]+?)\\s*${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}\\s*([\\s\\S]+?)\\s*(?:${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}\\s*([\\s\\S]+?)\\s*)?${QP}-{3,}\\s*END NOSTR MESSAGE\\s*-{3,}`, 'g');
         let signedBlockIndex = 0;
         let smMatch;
         while ((smMatch = signedMsgRegex.exec(bodyText)) !== null) {
@@ -4760,7 +4842,7 @@ ${attachmentsHtml}
             const rawSigContent = smMatch[2].trim();
             const rawSealContent = smMatch[3] ? smMatch[3].trim() : null;
             // Detect whether this is encrypted or plaintext signed
-            const isEncryptedArmor = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(smMatch[0]);
+            const isEncryptedArmor = new RegExp(`${QP}-{3,}\\s*BEGIN NOSTR (?:NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}`).test(smMatch[0]);
 
             const el = document.getElementById(`inline-sig-block-${signedBlockIndex}`);
             signedBlockIndex++;
@@ -4869,10 +4951,10 @@ ${attachmentsHtml}
         }
 
         // Then handle traditional signature+seal pairs
-        const sigSealRegex = /(-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*END NOSTR SIGNATURE\s*-{3,})[\s\n]*(-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*END NOSTR SEAL\s*-{3,})/g;
+        const sigSealRegex = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}\\s*([\\s\\S]+?)\\s*${QP}-{3,}\\s*END NOSTR SIGNATURE\\s*-{3,})[\\s\\n]*(${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}\\s*([\\s\\S]+?)\\s*${QP}-{3,}\\s*END NOSTR SEAL\\s*-{3,})`, 'g');
 
         // Also find the encrypted message block (ciphertext) to verify against
-        const encMsgRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/g;
+        const encMsgRegex = new RegExp(`${QP}-{3,}\\s*BEGIN NOSTR (?:NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}\\s*([\\s\\S]+?)\\s*${QP}-{3,}\\s*(?:END NOSTR (?:NIP-\\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\\s*-{3,}`, 'g');
         const ciphertexts = [];
         let encMatch;
         while ((encMatch = encMsgRegex.exec(bodyText)) !== null) {
@@ -4993,6 +5075,40 @@ ${attachmentsHtml}
                 }
             }
         }
+    }
+
+    // Split compose body into reply text and quoted original.
+    // Quoted lines start with "> " — the first contiguous block of quoted lines
+    // at the end of the body is treated as the quoted original message.
+    // Returns { replyText, quotedOriginal } where quotedOriginal has "> " prefixes stripped.
+    splitReplyAndQuoted(body) {
+        if (!body) return { replyText: '', quotedOriginal: '' };
+        const lines = body.split('\n');
+        // Find the first quoted line from the end
+        let lastNonQuoted = lines.length;
+        for (let i = lines.length - 1; i >= 0; i--) {
+            if (lines[i].startsWith('> ') || lines[i] === '>') {
+                lastNonQuoted = i;
+            } else if (lines[i].trim() === '') {
+                // blank lines between quoted blocks are part of the quote
+                continue;
+            } else {
+                break;
+            }
+        }
+        if (lastNonQuoted >= lines.length) {
+            // No quoted section found
+            return { replyText: body, quotedOriginal: '' };
+        }
+        const replyText = lines.slice(0, lastNonQuoted).join('\n').trimEnd();
+        const quotedLines = lines.slice(lastNonQuoted);
+        // Strip one level of "> " prefix to get the original armor
+        const stripped = quotedLines.map(l => {
+            if (l.startsWith('> ')) return l.substring(2);
+            if (l === '>') return '';
+            return l; // blank lines between quoted blocks
+        }).join('\n').trim();
+        return { replyText, quotedOriginal: stripped };
     }
 
     // Wrap raw ciphertext in ASCII armor
@@ -5464,7 +5580,14 @@ ${attachmentsHtml}
             return false;
         }
         const subject = domManager.getValue('subject') || '';
-        const body = domManager.getValue('messageBody') || '';
+        const rawBody = domManager.getValue('messageBody') || '';
+        // Split reply text from quoted original armor
+        // Only the reply text gets encrypted; quoted armor is appended outside
+        const { replyText, quotedOriginal } = this.splitReplyAndQuoted(rawBody);
+        const body = quotedOriginal ? replyText : rawBody; // only use split result when quotes found
+        if (quotedOriginal) {
+            this._quotedOriginalArmor = quotedOriginal;
+        }
         // Store plaintext versions for later use
         this.plaintextSubject = subject;
         this.plaintextBody = body;
@@ -5695,6 +5818,34 @@ ${attachmentsHtml}
                     metaSig, metaPubkey
                 );
                 console.log('[JS] encryptEmailFields: _htmlBody set, length=', this._htmlBody?.length, 'encodedPubkey=', !!encodedPubkey);
+
+                // Append quoted original message armor outside the encryption
+                if (this._quotedOriginalArmor) {
+                    console.log('[JS] encryptEmailFields: appending quoted original armor, length=', this._quotedOriginalArmor.length);
+                    const quoted = this._quotedOriginalArmor.split('\n').map(l => '> ' + l).join('\n');
+                    if (this._plainBody) {
+                        this._plainBody += '\n\n' + quoted;
+                    }
+                    if (this._htmlBody) {
+                        const parts = this.parseArmorComponents(this._quotedOriginalArmor);
+                        console.log('[JS] encryptEmailFields: parseArmorComponents result=', parts ? 'matched' : 'null', parts);
+                        if (parts) {
+                            const quotedHtml = this.buildHtmlAlt(
+                                parts.bodyText, parts.sigContent, parts.sealContent,
+                                parts.profileName, parts.displayName
+                            );
+                            console.log('[JS] encryptEmailFields: quoted HTML via buildHtmlAlt, length=', quotedHtml.length);
+                            this._htmlBody += '<blockquote style="border-left:2px solid #ccc;margin:1em 0;padding:0 1em;">'
+                                + quotedHtml + '</blockquote>';
+                        } else {
+                            console.log('[JS] encryptEmailFields: parseArmorComponents failed, using fallback');
+                            this._htmlBody += '<blockquote style="border-left:2px solid #ccc;margin:1em 0;padding:0 1em;">'
+                                + '<div style="font-family:sans-serif;line-height:1.6;">'
+                                + Utils.escapeHtml(this._quotedOriginalArmor).replace(/\n/g, '<br>')
+                                + '</div></blockquote>';
+                        }
+                    }
+                }
 
                 // Show armored format in textarea so user sees the full armor block
                 if (this._plainBody) {

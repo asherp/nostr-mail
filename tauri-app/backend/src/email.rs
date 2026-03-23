@@ -2276,10 +2276,10 @@ fn extract_armor_body_content(body: &str) -> Option<&str> {
     let line_end = body[begin_idx..].find('\n').map(|i| begin_idx + i + 1)?;
 
     // Content ends at the next armor marker line containing "---"
-    // Matches: END NOSTR ..., BEGIN NOSTR SIGNATURE, BEGIN NOSTR SEAL
+    // Matches: END NOSTR ..., BEGIN NOSTR SIGNATURE, BEGIN NOSTR SEAL (legacy)
     let content_region = &body[line_end..];
     let content_end = content_region.find("BEGIN NOSTR SIGNATURE")
-        .or_else(|| content_region.find("BEGIN NOSTR SEAL"))
+        .or_else(|| content_region.find("BEGIN NOSTR SEAL"))  // legacy compat
         .or_else(|| content_region.find("END NOSTR"))
         .unwrap_or(content_region.len());
 
@@ -3163,8 +3163,22 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_armor_body_content_with_signature_seal() {
-        // Real format: body content stops at BEGIN NOSTR SIGNATURE, not END NOSTR MESSAGE
+    fn test_extract_armor_body_content_with_combined_signature() {
+        // New format: combined SIGNATURE block with sig + pubkey, no separate SEAL
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            some glossia words here\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @alice\n\
+            signature words pubkey words\n\
+            ----- END NOSTR MESSAGE -----";
+        let content = extract_armor_body_content(body).unwrap();
+        assert_eq!(content, "some glossia words here",
+            "should extract only body content, not signature block");
+    }
+
+    #[test]
+    fn test_extract_armor_body_content_with_legacy_signature_seal() {
+        // Legacy format: separate SIGNATURE and SEAL blocks
         let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
             some glossia words here\n\
             ----- BEGIN NOSTR SIGNATURE -----\n\
@@ -3176,7 +3190,7 @@ mod tests {
             ----- END NOSTR MESSAGE -----";
         let content = extract_armor_body_content(body).unwrap();
         assert_eq!(content, "some glossia words here",
-            "should extract only body content, not sig/seal blocks");
+            "should extract only body content, not sig/seal blocks (legacy format)");
     }
 
     #[test]
@@ -3204,8 +3218,8 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_ciphertext_binary_glossia_with_sig_seal() {
-        // Full signed email: glossia body should decode correctly even with sig/seal blocks
+    fn test_extract_ciphertext_binary_glossia_with_combined_signature() {
+        // Full signed email: glossia body should decode correctly with combined signature block
         let original_bytes: Vec<u8> = (0..32).collect();
         let hex_input = glossia::hex_encode(&original_bytes);
         let (encoded, _, _, _) = glossia::encode_into_language(
@@ -3218,17 +3232,14 @@ mod tests {
             {}\n\
             ----- BEGIN NOSTR SIGNATURE -----\n\
             @alice\n\
-            some signature words\n\
-            ----- BEGIN NOSTR SEAL -----\n\
-            @alice\n\
-            some pubkey words\n\
+            some signature words some pubkey words\n\
             ----- END NOSTR MESSAGE -----",
             encoded
         );
 
         let result = extract_ciphertext_binary(&body);
         assert_eq!(result, original_bytes,
-            "glossia body should decode correctly when sig/seal blocks are present");
+            "glossia body should decode correctly with combined signature block");
     }
 }
 

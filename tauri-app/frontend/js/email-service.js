@@ -904,18 +904,24 @@ class EmailService {
     // Inject a signature verification badge into an HTML email body.
     // Finds the signature <h4> header and inserts a badge span after the header text.
     injectHtmlSigBadge(htmlString, inlineSigResult) {
-        if (!inlineSigResult || !htmlString) return htmlString;
+        // Accept a single result or an array of results
+        const results = Array.isArray(inlineSigResult) ? inlineSigResult : [inlineSigResult];
+        const validResults = results.filter(r => r != null);
+        if (validResults.length === 0 || !htmlString) return htmlString;
         try {
             const parser = new DOMParser();
             const doc = parser.parseFromString(htmlString, 'text/html');
             // Find all h4 elements — the signature header is the one before the border-left div
             const h4s = doc.querySelectorAll('h4');
+            let resultIdx = 0;
             for (const h4 of h4s) {
+                if (resultIdx >= validResults.length) break;
                 const next = h4.nextElementSibling;
                 // Signature div has border-left style with italic text (not the seal blockquote)
                 if (next && next.tagName === 'DIV' && next.style.borderLeft && next.style.fontStyle === 'italic') {
+                    const result = validResults[resultIdx];
                     const badge = doc.createElement('span');
-                    if (inlineSigResult.isValid) {
+                    if (result.isValid) {
                         badge.style.cssText = 'display:inline-block;margin-left:8px;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:600;background:#d4edda;color:#155724;border:1px solid #c3e6cb;';
                         badge.textContent = '\u2713 Verified';
                     } else {
@@ -924,7 +930,7 @@ class EmailService {
                     }
                     badge.className = 'sig-inline-badge';
                     h4.appendChild(badge);
-                    break;
+                    resultIdx++;
                 }
             }
             return doc.documentElement.outerHTML;
@@ -935,23 +941,25 @@ class EmailService {
     }
 
     // Build HTML alternative body from plaintext components
-    buildHtmlAlt(bodyText, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey) {
+    buildHtmlAlt(bodyText, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey) {
         const escHtml = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         const bodyHtml = escHtml(bodyText).replace(/\n/g, '<br>');
 
         let sigHtml = '';
-        if (encodedSig) {
+        const sigContent = encodedSigPubkey || encodedSig;
+        if (sigContent) {
             const sigLabel = profileName ? escHtml(profileName) : 'Signature';
             sigHtml = `
   <hr style="border:none;border-top:1px solid #ccc;margin:1.5em 0;">
   <h4 style="margin:0 0 0.5em;color:#666;font-size:0.9em;">${sigLabel}</h4>
   <div style="border-left:2px solid #ccc;padding-left:1em;color:#888;font-style:italic;overflow-wrap:break-word;">
-    ${escHtml(encodedSig)}
+    ${escHtml(sigContent)}
   </div>`;
         }
 
         let sealHtml = '';
-        if (encodedPubkey) {
+        // Only show separate seal block for unsigned messages (not when using combined sig+pubkey)
+        if (encodedPubkey && !encodedSigPubkey) {
             const nameHtml = displayName ? `<p style="margin:0 0 0.5em;"><strong>@${escHtml(displayName)}</strong></p>` : '';
             sealHtml = `
   <blockquote class="seal-block" style="border-left:4px solid #4a90d9;background:#f0f4f8;padding:1em;margin:1.5em 0 0;border-radius:4px;">
@@ -965,36 +973,98 @@ class EmailService {
 </div>`;
     }
 
-    // Parse an ASCII armor block into its structural components (body, signature, seal).
+    // Parse an ASCII armor block into its structural components (body, signature, pubkey).
     // Works with both encrypted (NIP-XX) and signed armor formats.
+    // New format: SIGNATURE block contains sig (64 bytes) then pubkey (32 bytes).
+    // Legacy format: separate SIGNATURE and SEAL blocks are also accepted.
     parseArmorComponents(armorText) {
         if (!armorText) return null;
         const normalized = armorText.replace(/\r\n/g, '\n');
-        const regex = /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*)?(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR (?:(?:NIP-\d+ ENCRYPTED )?MESSAGE|SIGNATURE|SEAL)\s*-{3,}/;
+
+        // Extract any plaintext that appears before the first armor delimiter
+        const armorStart = normalized.search(/-{3,}\s*BEGIN NOSTR /);
+        const prefixText = armorStart > 0 ? normalized.substring(0, armorStart).trim() : null;
+
+        // Try legacy format first (separate SEAL block)
+        const legacyRegex = /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*)?(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR (?:(?:NIP-\d+ ENCRYPTED )?MESSAGE|SIGNATURE|SEAL)\s*-{3,}/;
+        const legacyMatch = normalized.match(legacyRegex);
+        if (legacyMatch && legacyMatch[3]) {
+            // Legacy: separate SEAL block found
+            const bodyText = legacyMatch[1].trim();
+            let sigContent = null, profileName = null;
+            if (legacyMatch[2]) {
+                const lines = legacyMatch[2].trim().split('\n');
+                const nameLine = lines.find(l => l.trim().startsWith('@'));
+                if (nameLine) profileName = nameLine.trim().replace(/^@/, '');
+                sigContent = lines.filter(l => !l.trim().startsWith('@')).join('\n').trim();
+            }
+            const sealLines = legacyMatch[3].trim().split('\n');
+            const sealNameLine = sealLines.find(l => l.trim().startsWith('@'));
+            const displayName = sealNameLine ? sealNameLine.trim().replace(/^@/, '') : null;
+            const sealContent = sealLines.filter(l => !l.trim().startsWith('@')).join('\n').trim();
+            return { bodyText, sigContent, sealContent, profileName, displayName, prefixText };
+        }
+
+        // New format: combined SIGNATURE block (sig + pubkey on consecutive lines)
+        const regex = /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR (?:(?:NIP-\d+ ENCRYPTED )?MESSAGE|SIGNATURE)\s*-{3,}/;
         const match = normalized.match(regex);
         if (!match) return null;
 
         const bodyText = match[1].trim();
-        let sigContent = null, profileName = null;
+        let sigContent = null, sealContent = null, profileName = null, rawSigPubkey = null;
         if (match[2]) {
             const lines = match[2].trim().split('\n');
             const nameLine = lines.find(l => l.trim().startsWith('@'));
             if (nameLine) profileName = nameLine.trim().replace(/^@/, '');
-            sigContent = lines.filter(l => !l.trim().startsWith('@')).join('\n').trim();
+            const contentLines = lines.filter(l => !l.trim().startsWith('@'));
+            const allContent = contentLines.join('\n').trim();
+            rawSigPubkey = allContent;
+            const split = this._splitSigPubkey(allContent);
+            if (split) {
+                // Already decoded to hex
+                sigContent = split.sigHex;
+                sealContent = split.pubkeyHex;
+            } else {
+                // Decode failed — return raw content as sig, no pubkey
+                sigContent = allContent;
+            }
         }
-        let sealContent = null, displayName = null;
-        if (match[3]) {
-            const lines = match[3].trim().split('\n');
-            const nameLine = lines.find(l => l.trim().startsWith('@'));
-            if (nameLine) displayName = nameLine.trim().replace(/^@/, '');
-            sealContent = lines.filter(l => !l.trim().startsWith('@')).join('\n').trim();
+        return { bodyText, sigContent, sealContent, profileName, displayName: profileName, rawSigPubkey, prefixText };
+    }
+
+    // Split combined signature block content into sig (64 bytes) and pubkey (32 bytes).
+    // Decodes the full block as 96 bytes, splits at byte boundary.
+    // Returns { sigHex, pubkeyHex } with pre-decoded hex strings, or null if decode fails.
+    _splitSigPubkey(content) {
+        if (!content) return null;
+        const gs = window.GlossiaService;
+
+        // Try glossia decode: 96 bytes total → 192 hex chars
+        if (gs && gs.isReady()) {
+            try {
+                const detections = gs.detectDialect(content);
+                const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : null;
+                if (dialect) {
+                    const hex = gs.decodeRawBaseN(content, dialect, 96);
+                    if (hex && hex.length === 192) {
+                        return { sigHex: hex.substring(0, 128), pubkeyHex: hex.substring(128) };
+                    }
+                }
+            } catch (_) {}
         }
-        return { bodyText, sigContent, sealContent, profileName, displayName };
+
+        // Fallback: raw hex (no glossia encoding)
+        const stripped = content.replace(/\s+/g, '');
+        if (/^[0-9a-fA-F]{192}$/.test(stripped)) {
+            return { sigHex: stripped.substring(0, 128), pubkeyHex: stripped.substring(128) };
+        }
+
+        return null;
     }
 
     // Build ASCII-armored plaintext body for text/plain MIME part.
     // Same glossia-encoded content as buildHtmlAlt, but with ASCII armor instead of HTML formatting.
-    buildPlainBody(bodyText, encodedSig, encodedPubkey, profileName, displayName, isEncrypted, encryptionAlgorithm, originalPlaintext) {
+    buildPlainBody(bodyText, encodedSig, encodedPubkey, profileName, displayName, isEncrypted, encryptionAlgorithm, originalPlaintext, encodedSigPubkey) {
         const parts = [];
 
         // Word-wrap text to ~72 chars per line
@@ -1014,8 +1084,8 @@ class EmailService {
             return lines.join('\n');
         };
 
-        // Signed emails (encrypted or plaintext): nested armor with sig+seal inside
-        if (bodyText && encodedSig) {
+        // Signed emails (encrypted or plaintext): combined signature block with sig+pubkey
+        if (bodyText && (encodedSigPubkey || encodedSig)) {
             let beginTag;
             if (isEncrypted) {
                 const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
@@ -1031,18 +1101,22 @@ class EmailService {
             lines.push(wordWrap(bodyText));
             lines.push('----- BEGIN NOSTR SIGNATURE -----');
             if (profileName) lines.push(`@${profileName}`);
-            lines.push(wordWrap(encodedSig));
-            if (encodedPubkey) {
-                lines.push('----- BEGIN NOSTR SEAL -----');
-                if (displayName) lines.push(`@${displayName}`);
-                lines.push(wordWrap(encodedPubkey));
+            if (encodedSigPubkey) {
+                // Combined 96-byte payload (glossia mode)
+                lines.push(wordWrap(encodedSigPubkey));
+            } else {
+                // Hex mode: separate sig + pubkey encodings
+                lines.push(wordWrap(encodedSig));
+                if (encodedPubkey) {
+                    lines.push(wordWrap(encodedPubkey));
+                }
             }
             lines.push('----- END NOSTR MESSAGE -----');
             parts.push(lines.join('\n'));
             return parts.join('\n\n');
         }
 
-        // Unsigned encrypted: nest seal inside the armor block
+        // Unsigned encrypted: body + seal for sender identification (needed for decryption)
         if (isEncrypted && bodyText) {
             const armorType = encryptionAlgorithm === 'nip04' ? 'NIP-04' : 'NIP-44';
             const lines = [`----- BEGIN NOSTR ${armorType} ENCRYPTED BODY -----`];
@@ -1557,6 +1631,7 @@ class EmailService {
                         </div>
                     </div>
                     <div class="modal-footer">
+                        <button class="btn btn-primary" id="preview-send-btn" onclick="document.getElementById('headersModal').remove(); document.getElementById('send-btn').click();"><i class="fas fa-paper-plane"></i> Send</button>
                         <button class="btn btn-secondary" onclick="document.getElementById('headersModal').remove()">Close</button>
                     </div>
                 </div>
@@ -3263,14 +3338,25 @@ class EmailService {
                             }
                             // Append any quoted armor after the first armor block
                             // (replies append the original message outside encryption)
+                            let quotedSigResult = null;
                             const endArmorMatch = emailBody.match(/-{3,}\s*END NOSTR MESSAGE\s*-{3,}/);
                             if (endArmorMatch) {
                                 const afterArmor = emailBody.substring(endArmorMatch.index + endArmorMatch[0].length).trim();
                                 if (afterArmor) {
                                     decryptedBody = decryptedBody + '\n\n' + afterArmor;
+                                    // Verify quoted message signature
+                                    const strippedQuoted = this._stripQuotePrefixes(afterArmor);
+                                    if (strippedQuoted) {
+                                        try {
+                                            quotedSigResult = await this.verifyInlineSignature(strippedQuoted);
+                                        } catch (e) {
+                                            console.warn('[JS] Quoted signature verification error:', e);
+                                        }
+                                    }
                                 }
                             }
-                            await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, inlineSigResult);
+                            const sigResults = [inlineSigResult, quotedSigResult].some(r => r) ? [inlineSigResult, quotedSigResult] : null;
+                            await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, sigResults || inlineSigResult);
                         } catch (err) {
                             console.error('[JS] Error decrypting email detail:', err);
                             // For inbox emails, decryption failure means our private key couldn't decrypt
@@ -3285,13 +3371,30 @@ class EmailService {
                         } catch (e) {
                             console.warn('[JS] Inline signature verification error:', e);
                         }
+                        // Verify quoted message signature if present
+                        let quotedSigResult = null;
+                        const endArmorMatch = emailBody.match(/-{3,}\s*END NOSTR MESSAGE\s*-{3,}/);
+                        if (endArmorMatch) {
+                            const afterArmor = emailBody.substring(endArmorMatch.index + endArmorMatch[0].length).trim();
+                            if (afterArmor) {
+                                const strippedQuoted = this._stripQuotePrefixes(afterArmor);
+                                if (strippedQuoted) {
+                                    try {
+                                        quotedSigResult = await this.verifyInlineSignature(strippedQuoted);
+                                    } catch (e) {
+                                        console.warn('[JS] Quoted signature verification error:', e);
+                                    }
+                                }
+                            }
+                        }
                         // Decode glossia signed message body for display
                         let displayBody = decryptedBody;
                         const signedMsg = this.decodeGlossiaSignedMessage(emailBody);
                         if (signedMsg && signedMsg.plaintextBody) {
                             displayBody = signedMsg.plaintextBody;
                         }
-                        await updateDetail(decryptedSubject, displayBody, null, false, inlineSigResult);
+                        const sigResults = [inlineSigResult, quotedSigResult].some(r => r) ? [inlineSigResult, quotedSigResult] : null;
+                        await updateDetail(decryptedSubject, displayBody, null, false, sigResults || inlineSigResult);
                     })();
                 }
                 const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null) => {
@@ -4464,29 +4567,44 @@ ${attachmentsHtml}
         if (!plainBody) return null;
         const normalized = plainBody.replace(/\r\n/g, '\n');
 
-        // Match the nested armor format
-        const armorRegex = /-{3,}\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*(?:-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*)?-{3,}\s*END NOSTR MESSAGE\s*-{3,}/;
-        const match = normalized.match(armorRegex);
+        // Try legacy format first (separate SEAL block)
+        const legacyRegex = /-{3,}\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*END NOSTR MESSAGE\s*-{3,}/;
+        const legacyMatch = normalized.match(legacyRegex);
+
+        // New format: combined SIGNATURE block (sig + pubkey)
+        const armorRegex = /-{3,}\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*END NOSTR MESSAGE\s*-{3,}/;
+        const match = legacyMatch || normalized.match(armorRegex);
         if (!match) return null;
 
         const glossiaBody = match[1].trim();
         const rawSigContent = match[2].trim();
-        const rawSealContent = match[3] ? match[3].trim() : null;
+        const rawSealContent = legacyMatch ? match[3].trim() : null;
 
-        // Strip @name lines from sig/seal
+        // Strip @name lines from sig content
         let profileName = null;
         const sigLines = rawSigContent.split('\n');
         const sigNameLine = sigLines.find(l => l.trim().startsWith('@'));
         if (sigNameLine) profileName = sigNameLine.trim().replace(/^@/, '');
-        const sigContent = sigLines.filter(l => !l.trim().startsWith('@')).join(' ').trim();
 
-        let displayName = null;
-        let sealContent = null;
+        let sigContent, sealContent, displayName = null;
         if (rawSealContent) {
+            // Legacy: separate seal block
+            sigContent = sigLines.filter(l => !l.trim().startsWith('@')).join(' ').trim();
             const sealLines = rawSealContent.split('\n');
             const sealNameLine = sealLines.find(l => l.trim().startsWith('@'));
             if (sealNameLine) displayName = sealNameLine.trim().replace(/^@/, '');
             sealContent = sealLines.filter(l => !l.trim().startsWith('@')).join(' ').trim();
+        } else {
+            // New: combined block — decode and split sig and pubkey at byte boundary
+            const contentOnly = sigLines.filter(l => !l.trim().startsWith('@')).join('\n').trim();
+            const split = this._splitSigPubkey(contentOnly);
+            if (split) {
+                sigContent = split.sigHex;
+                sealContent = split.pubkeyHex;
+            } else {
+                sigContent = contentOnly;
+            }
+            displayName = profileName;
         }
 
         // Decode glossia body → original UTF-8 plaintext
@@ -4700,7 +4818,11 @@ ${attachmentsHtml}
                         const npubMatch = signedMsg.sealContent.match(/(npub1[a-z0-9]+)/);
                         if (npubMatch) pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
                     }
-                    // Fallback: raw hex sig
+                    // Fallback: raw hex pubkey (from combined block decode)
+                    if (!pubkeyHex && /^[0-9a-fA-F]{64}$/.test(signedMsg.sealContent)) {
+                        pubkeyHex = signedMsg.sealContent;
+                    }
+                    // Fallback: raw hex sig (from combined block decode)
                     if (!signatureHex && /^[0-9a-fA-F]{128}$/.test(signedMsg.sigContent)) {
                         signatureHex = signedMsg.sigContent;
                     }
@@ -4724,89 +4846,84 @@ ${attachmentsHtml}
             }
         }
         // For plaintext (unencrypted) emails without signed message armor,
-        // strip signature and seal armor blocks to get just the message body
+        // strip signature armor blocks to get just the message body
         if (!encArmorMatch) {
             const bodyOnly = plainBody
                 .replace(/\r\n/g, '\n')
-                .replace(/-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SIGNATURE\s*-{3,}/g, '')
-                .replace(/-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SEAL\s*-{3,}/g, '')
+                .replace(/-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR (?:SIGNATURE|MESSAGE)\s*-{3,}/g, '')
+                .replace(/-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR (?:SEAL|MESSAGE)\s*-{3,}/g, '')
                 .trim();
             console.log('[JS] verifyInlineSignature: plaintext mode, bodyOnly length=', bodyOnly.length, 'preview=', bodyOnly.substring(0, 100));
             if (!bodyOnly) { console.log('[JS] verifyInlineSignature: empty body after stripping blocks'); return null; }
             dataBytes = new TextEncoder().encode(bodyOnly);
         }
 
-        // 2. Extract signature from SIGNATURE armor block
-        // Sig content ends at END NOSTR SIGNATURE, BEGIN NOSTR SEAL, or END NOSTR MESSAGE
+        // 2. Extract signature block content (new format: sig+pubkey combined; legacy: sig only with separate SEAL)
         const sigMatch = plainBody.match(
-            /-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR SIGNATURE|BEGIN NOSTR SEAL|END NOSTR MESSAGE)\s*-{3,}/
+            /-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:SIGNATURE|MESSAGE)|BEGIN NOSTR SEAL)\s*-{3,}/
         );
         if (!sigMatch) { console.log('[JS] verifyInlineSignature: no SIGNATURE armor block found'); return null; }
 
-        // Strip @name line from signature content
-        const sigContent = sigMatch[1].trim().split('\n')
-            .filter(l => !l.trim().startsWith('@'))
-            .join(' ').trim();
-        console.log('[JS] verifyInlineSignature: sigContent=', sigContent.substring(0, 80));
+        const sigBlockLines = sigMatch[1].trim().split('\n').filter(l => !l.trim().startsWith('@'));
+        const sigBlockContent = sigBlockLines.join('\n').trim();
 
-        // 3. Extract pubkey from SEAL armor block
-        // Seal content ends at END NOSTR SEAL or END NOSTR MESSAGE
+        // 3. Check for legacy separate SEAL block
         const sealMatch = plainBody.match(
             /-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:SEAL|MESSAGE))\s*-{3,}/
         );
-        if (!sealMatch) { console.log('[JS] verifyInlineSignature: no SEAL armor block found'); return null; }
-
-        // Extract npub or glossia-encoded pubkey from seal content
-        const sealContent = sealMatch[1].trim().split('\n')
-            .filter(l => !l.trim().startsWith('@'))
-            .join(' ').trim();
-        console.log('[JS] verifyInlineSignature: sealContent=', sealContent.substring(0, 80));
 
         let pubkeyHex = null;
         let signatureHex = null;
 
-        // Decode pubkey
-        try {
-            // Try npub first
-            const npubMatch = sealContent.match(/(npub1[a-z0-9]+)/);
-            if (npubMatch) {
-                pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
-                console.log('[JS] verifyInlineSignature: decoded npub to hex=', pubkeyHex);
-            } else if (gs && gs.isReady()) {
-                // Auto-detect dialect and glossia decode
-                const pkDetections = gs.detectDialect(sealContent);
-                const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
-                console.log('[JS] verifyInlineSignature: pubkey dialect=', pkDialect);
-                if (pkDialect) {
-                    const decoded = gs.decodeRawBaseN(sealContent, pkDialect, 32);
-                    console.log('[JS] verifyInlineSignature: pubkey hex=', decoded.substring(0, 40), 'len=', decoded.length);
-                    if (decoded.length === 64) pubkeyHex = decoded;
+        if (sealMatch) {
+            // Legacy format: separate SEAL block — decode each independently
+            const sigContent = sigBlockContent.split('\n').join(' ').trim();
+            const sealContent = sealMatch[1].trim().split('\n')
+                .filter(l => !l.trim().startsWith('@'))
+                .join(' ').trim();
+
+            // Decode pubkey
+            try {
+                const npubMatch = sealContent.match(/(npub1[a-z0-9]+)/);
+                if (npubMatch) {
+                    pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
+                } else if (gs && gs.isReady()) {
+                    const pkDetections = gs.detectDialect(sealContent);
+                    const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
+                    if (pkDialect) {
+                        const decoded = gs.decodeRawBaseN(sealContent, pkDialect, 32);
+                        if (decoded.length === 64) pubkeyHex = decoded;
+                    }
                 }
+            } catch (e) {
+                console.error('[JS] verifyInlineSignature: pubkey decode failed:', e);
             }
-        } catch (e) {
-            console.error('[JS] verifyInlineSignature: pubkey decode failed:', e);
+
+            // Decode signature
+            try {
+                if (gs && gs.isReady()) {
+                    const sigDetections = gs.detectDialect(sigContent);
+                    const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
+                    if (sigDialect) {
+                        const decoded = gs.decodeRawBaseN(sigContent, sigDialect, 64);
+                        if (decoded.length === 128) signatureHex = decoded;
+                    }
+                }
+                if (!signatureHex && /^[0-9a-fA-F]{128}$/.test(sigContent)) signatureHex = sigContent;
+            } catch (e) {
+                console.error('[JS] verifyInlineSignature: signature decode failed:', e);
+            }
+        } else {
+            // New format: combined SIGNATURE block — decode as 96 bytes, split at byte boundary
+            const split = this._splitSigPubkey(sigBlockContent);
+            if (split) {
+                signatureHex = split.sigHex;
+                pubkeyHex = split.pubkeyHex;
+                console.log('[JS] verifyInlineSignature: split sigHex len=', signatureHex.length, 'pubkeyHex len=', pubkeyHex.length);
+            }
         }
 
         if (!pubkeyHex) { console.log('[JS] verifyInlineSignature: could not decode pubkey'); return null; }
-
-        // Decode signature (auto-detect dialect)
-        try {
-            if (gs && gs.isReady()) {
-                const sigDetections = gs.detectDialect(sigContent);
-                const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
-                console.log('[JS] verifyInlineSignature: sig dialect=', sigDialect);
-                if (sigDialect) {
-                    const decoded = gs.decodeRawBaseN(sigContent, sigDialect, 64);
-                    console.log('[JS] verifyInlineSignature: sig hex len=', decoded.length);
-                    if (decoded.length === 128) signatureHex = decoded;
-                }
-            } else {
-                console.log('[JS] verifyInlineSignature: GlossiaService not ready, gs=', !!gs, 'isReady=', gs?.isReady?.());
-            }
-        } catch (e) {
-            console.error('[JS] verifyInlineSignature: signature decode failed:', e);
-        }
-
         if (!signatureHex) { console.log('[JS] verifyInlineSignature: could not decode signature hex (expected len 128)'); return null; }
 
         // 4. Verify signature against signed data (ciphertext binary or plaintext UTF-8)
@@ -4834,6 +4951,7 @@ ${attachmentsHtml}
         // Allow zero or more levels of quoting before each delimiter line
         const QP = '(?:>\\s*)*';
         // First, handle nested armor blocks (plaintext signed or encrypted+signed) that end with END NOSTR MESSAGE
+        // Matches both new combined SIGNATURE block and legacy separate SEAL block
         const signedMsgRegex = new RegExp(`${QP}-{3,}\\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}\\s*([\\s\\S]+?)\\s*${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}\\s*([\\s\\S]+?)\\s*(?:${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}\\s*([\\s\\S]+?)\\s*)?${QP}-{3,}\\s*END NOSTR MESSAGE\\s*-{3,}`, 'g');
         let signedBlockIndex = 0;
         let smMatch;
@@ -4880,40 +4998,51 @@ ${attachmentsHtml}
                 continue;
             }
 
-            // Decode sig
-            const sigLines = rawSigContent.split('\n').filter(l => !l.trim().startsWith('@'));
-            const sigContent = sigLines.join(' ').trim();
+            // Split sig content: legacy has separate SEAL, new format has combined block
             let signatureHex = null;
-            try {
-                if (gs && gs.isReady()) {
-                    const sigDetections = gs.detectDialect(sigContent);
-                    const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
-                    if (sigDialect) {
-                        const decoded = gs.decodeRawBaseN(sigContent, sigDialect, 64);
-                        if (decoded.length === 128) signatureHex = decoded;
-                    }
-                }
-                if (!signatureHex && /^[0-9a-fA-F]{128}$/.test(sigContent)) signatureHex = sigContent;
-            } catch (_) {}
-
-            // Decode pubkey
             let pubkeyHex = null;
+
             if (rawSealContent) {
+                // Legacy: separate SEAL block — decode each independently
+                const sigContentLines = rawSigContent.split('\n').filter(l => !l.trim().startsWith('@'));
+                const sigText = sigContentLines.join(' ').trim();
                 const sealLines = rawSealContent.split('\n').filter(l => !l.trim().startsWith('@'));
-                const sealContent = sealLines.join(' ').trim();
+                const pubkeyText = sealLines.join(' ').trim();
+
                 try {
-                    const npubMatch = sealContent.match(/(npub1[a-z0-9]+)/);
+                    if (gs && gs.isReady()) {
+                        const sigDetections = gs.detectDialect(sigText);
+                        const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
+                        if (sigDialect) {
+                            const decoded = gs.decodeRawBaseN(sigText, sigDialect, 64);
+                            if (decoded.length === 128) signatureHex = decoded;
+                        }
+                    }
+                    if (!signatureHex && /^[0-9a-fA-F]{128}$/.test(sigText)) signatureHex = sigText;
+                } catch (_) {}
+
+                try {
+                    const npubMatch = pubkeyText.match(/(npub1[a-z0-9]+)/);
                     if (npubMatch) {
                         pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
                     } else if (gs && gs.isReady()) {
-                        const pkDetections = gs.detectDialect(sealContent);
+                        const pkDetections = gs.detectDialect(pubkeyText);
                         const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
                         if (pkDialect) {
-                            const decoded = gs.decodeRawBaseN(sealContent, pkDialect, 32);
+                            const decoded = gs.decodeRawBaseN(pubkeyText, pkDialect, 32);
                             if (decoded.length === 64) pubkeyHex = decoded;
                         }
                     }
                 } catch (_) {}
+            } else {
+                // New: combined block — decode as 96 bytes, split at byte boundary
+                const sigContentLines = rawSigContent.split('\n').filter(l => !l.trim().startsWith('@'));
+                const allContent = sigContentLines.join('\n').trim();
+                const split = window.emailService._splitSigPubkey(allContent);
+                if (split) {
+                    signatureHex = split.sigHex;
+                    pubkeyHex = split.pubkeyHex;
+                }
             }
 
             if (!signatureHex || !pubkeyHex) {
@@ -5037,8 +5166,8 @@ ${attachmentsHtml}
                 // Normalize \r\n to \n to match what the textarea produced at sign time
                 const bodyOnly = bodyText
                     .replace(/\r\n/g, '\n')
-                    .replace(/-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SIGNATURE\s*-{3,}/g, '')
-                    .replace(/-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR SEAL\s*-{3,}/g, '')
+                    .replace(/-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR (?:SIGNATURE|MESSAGE)\s*-{3,}/g, '')
+                    .replace(/-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR (?:SEAL|MESSAGE)\s*-{3,}/g, '')
                     .trim();
                 if (!bodyOnly) {
                     if (indicator) {
@@ -5080,6 +5209,17 @@ ${attachmentsHtml}
     // Split compose body into reply text and quoted original.
     // Quoted lines start with "> " — the first contiguous block of quoted lines
     // at the end of the body is treated as the quoted original message.
+    // Strip one level of "> " quote prefixes from text (for verifying quoted armor)
+    _stripQuotePrefixes(text) {
+        if (!text) return null;
+        const lines = text.split('\n').map(l => {
+            if (l.startsWith('> ')) return l.substring(2);
+            if (l === '>') return '';
+            return l;
+        });
+        return lines.join('\n').trim() || null;
+    }
+
     // Returns { replyText, quotedOriginal } where quotedOriginal has "> " prefixes stripped.
     splitReplyAndQuoted(body) {
         if (!body) return { replyText: '', quotedOriginal: '' };
@@ -5790,12 +5930,24 @@ ${attachmentsHtml}
                 const sigHex = signBtn?.dataset?.signature || null;
                 const kp = appState.getKeypair();
                 const pkHex = kp ? window.CryptoService._npubToHex(kp.public_key) : null;
-                let encodedSig = null, encodedPubkey = null;
+                let encodedSig = null, encodedPubkey = null, encodedSigPubkey = null;
                 if (gs && gs.isReady()) {
                     const metaSig = this.getGlossiaEncodingSignature();
                     const metaPubkey = this.getGlossiaEncodingPubkey();
-                    if (sigHex) encodedSig = gs.encodeSignature(sigHex, metaSig);
-                    if (pkHex) encodedPubkey = gs.encodePubkey(pkHex, metaPubkey);
+                    if (sigHex && pkHex) {
+                        // Encode sig+pubkey as single 96-byte payload for combined SIGNATURE block
+                        const result = gs.encodeSigPubkey(sigHex, pkHex, metaSig);
+                        if (result.combined) {
+                            encodedSigPubkey = result.encodedSigPubkey;
+                        } else {
+                            encodedSig = result.encodedSig;
+                            encodedPubkey = result.encodedPubkey;
+                        }
+                    }
+                    // For unsigned messages, encode pubkey separately for SEAL block
+                    if (!encodedPubkey && !encodedSigPubkey && pkHex) {
+                        encodedPubkey = gs.encodePubkey(pkHex, metaPubkey);
+                    }
                 }
                 let profileName = null, senderDisplayName = null;
                 try {
@@ -5808,14 +5960,14 @@ ${attachmentsHtml}
                 } catch (_) {}
                 this._plainBody = this.buildPlainBody(
                     encodedBody, encodedSig, encodedPubkey, profileName, senderDisplayName,
-                    true, encryptionAlgorithm
+                    true, encryptionAlgorithm, null, encodedSigPubkey
                 );
                 // Also rebuild _htmlBody with the encrypted content + sig/seal
                 const metaSig = this.getGlossiaEncodingSignature();
                 const metaPubkey = this.getGlossiaEncodingPubkey();
                 this._htmlBody = this.buildHtmlAlt(
                     encodedBody, encodedSig, encodedPubkey, profileName, senderDisplayName,
-                    metaSig, metaPubkey
+                    metaSig, metaPubkey, encodedSigPubkey
                 );
                 console.log('[JS] encryptEmailFields: _htmlBody set, length=', this._htmlBody?.length, 'encodedPubkey=', !!encodedPubkey);
 
@@ -5830,9 +5982,11 @@ ${attachmentsHtml}
                         const parts = this.parseArmorComponents(this._quotedOriginalArmor);
                         console.log('[JS] encryptEmailFields: parseArmorComponents result=', parts ? 'matched' : 'null', parts);
                         if (parts) {
+                            const htmlBodyText = parts.prefixText || parts.bodyText;
                             const quotedHtml = this.buildHtmlAlt(
-                                parts.bodyText, parts.sigContent, parts.sealContent,
-                                parts.profileName, parts.displayName
+                                htmlBodyText, parts.sigContent, parts.sealContent,
+                                parts.profileName, parts.displayName,
+                                null, null, parts.rawSigPubkey
                             );
                             console.log('[JS] encryptEmailFields: quoted HTML via buildHtmlAlt, length=', quotedHtml.length);
                             this._htmlBody += '<blockquote style="border-left:2px solid #ccc;margin:1em 0;padding:0 1em;">'
@@ -7338,8 +7492,25 @@ ${attachmentsHtml}
                         } catch (e) {
                             console.warn('[JS] Inline signature verification error:', e);
                         }
+                        // Verify quoted message signature if present
+                        let quotedSigResult = null;
+                        const sentEndArmorMatch = email.body.match(/-{3,}\s*END NOSTR MESSAGE\s*-{3,}/);
+                        if (sentEndArmorMatch) {
+                            const afterArmor = email.body.substring(sentEndArmorMatch.index + sentEndArmorMatch[0].length).trim();
+                            if (afterArmor) {
+                                const strippedQuoted = this._stripQuotePrefixes(afterArmor);
+                                if (strippedQuoted) {
+                                    try {
+                                        quotedSigResult = await this.verifyInlineSignature(strippedQuoted);
+                                    } catch (e) {
+                                        console.warn('[JS] Quoted signature verification error:', e);
+                                    }
+                                }
+                            }
+                        }
                         // Pass manifestResult to updateDetail to avoid re-decrypting
-                        await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, inlineSigResult);
+                        const sentSigResults = [inlineSigResult, quotedSigResult].some(r => r) ? [inlineSigResult, quotedSigResult] : null;
+                        await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, sentSigResults || inlineSigResult);
                     } catch (err) {
                         console.error('[JS] Error decrypting sent email:', err);
                         await updateDetail('Could not decrypt', 'Could not decrypt: ' + err.message, null, true);
@@ -7352,13 +7523,30 @@ ${attachmentsHtml}
                     } catch (e) {
                         console.warn('[JS] Inline signature verification error:', e);
                     }
+                    // Verify quoted message signature if present
+                    let quotedSigResult = null;
+                    const sentEndArmorMatch2 = email.body.match(/-{3,}\s*END NOSTR MESSAGE\s*-{3,}/);
+                    if (sentEndArmorMatch2) {
+                        const afterArmor = email.body.substring(sentEndArmorMatch2.index + sentEndArmorMatch2[0].length).trim();
+                        if (afterArmor) {
+                            const strippedQuoted = this._stripQuotePrefixes(afterArmor);
+                            if (strippedQuoted) {
+                                try {
+                                    quotedSigResult = await this.verifyInlineSignature(strippedQuoted);
+                                } catch (e) {
+                                    console.warn('[JS] Quoted signature verification error:', e);
+                                }
+                            }
+                        }
+                    }
                     // Decode glossia signed message body for display
                     let displayBody = decryptedBody;
                     const signedMsg = this.decodeGlossiaSignedMessage(email.body);
                     if (signedMsg && signedMsg.plaintextBody) {
                         displayBody = signedMsg.plaintextBody;
                     }
-                    await updateDetail(decryptedSubject, displayBody, null, false, inlineSigResult);
+                    const sentSigResults2 = [inlineSigResult, quotedSigResult].some(r => r) ? [inlineSigResult, quotedSigResult] : null;
+                    await updateDetail(decryptedSubject, displayBody, null, false, sentSigResults2 || inlineSigResult);
                 }
             } catch (error) {
             console.error('Error loading sent email detail:', error);

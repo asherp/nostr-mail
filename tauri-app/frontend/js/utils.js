@@ -85,15 +85,15 @@ class Utils {
             const id = `inline-sig-block-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
         });
-        // Match signature block (optionally followed by seal block)
-        // Each block: ---+ BEGIN NOSTR (SIGNATURE|SEAL) ---+ ... ---+ END NOSTR (SIGNATURE|SEAL) ---+
-        const sigSealPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR SIGNATURE\\s*-{3,}(?:<br>)*(?:\\s*<br>)*(?:\\s*${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR SEAL\\s*-{3,})?)`, 'g');
+        // Match standalone signature block (new format: ends with END NOSTR SIGNATURE or END NOSTR MESSAGE)
+        // Also match legacy format: SIGNATURE block followed by SEAL block
+        const sigSealPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SIGNATURE|MESSAGE)\\s*-{3,}(?:(?:<br>)*(?:\\s*<br>)*(?:\\s*${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SEAL|MESSAGE)\\s*-{3,}))?)`, 'g');
         html = html.replace(sigSealPattern, (match) => {
             const id = `inline-sig-block-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
         });
-        // Also wrap standalone seal blocks (pubkey without signature)
-        const sealOnlyPattern = new RegExp(`(?<!<\\/div>)(${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR SEAL\\s*-{3,})`, 'g');
+        // Legacy: wrap standalone seal blocks (pubkey without signature)
+        const sealOnlyPattern = new RegExp(`(?<!<\\/div>)(${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SEAL|MESSAGE)\\s*-{3,})`, 'g');
         html = html.replace(sealOnlyPattern, (match) => {
             const id = `inline-sig-block-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;

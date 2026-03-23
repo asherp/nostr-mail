@@ -980,12 +980,19 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         console.log('[JS] Signing data (binary length:', dataBytes.length, ')');
                         const signature = await TauriService.signData(keypair.private_key, dataBytes);
                         const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
-                        let encodedSig, encodedPubkey;
+                        let encodedSig, encodedPubkey, encodedSigPubkey = null;
 
                         if (gs && gs.isReady()) {
-                            // Glossia available: encode sig+pubkey with per-field settings
-                            encodedSig = gs.encodeSignature(signature, metaSig);
-                            encodedPubkey = gs.encodePubkey(pubkeyHex, metaPubkey);
+                            // Glossia available: encode sig+pubkey as single 96-byte payload
+                            const result = gs.encodeSigPubkey(signature, pubkeyHex, metaSig);
+                            if (result.combined) {
+                                encodedSigPubkey = result.encodedSigPubkey;
+                                encodedSig = null;
+                                encodedPubkey = null;
+                            } else {
+                                encodedSig = result.encodedSig;
+                                encodedPubkey = result.encodedPubkey;
+                            }
                         } else {
                             // Glossia not loaded: append raw hex
                             encodedSig = signature;
@@ -1009,24 +1016,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             profileName = selfContact?.name || null;
                         }
 
-                        // Word-wrap signature with > quote prefix (≈72 chars per line)
-                        const wrapQuoted = (text, width = 72) => {
-                            const words = text.split(/\s+/);
-                            const lines = [];
-                            let line = '';
-                            for (const word of words) {
-                                if (line && (line.length + 1 + word.length) > width) {
-                                    lines.push('> ' + line);
-                                    line = word;
-                                } else {
-                                    line = line ? line + ' ' + word : word;
-                                }
-                            }
-                            if (line) lines.push('> ' + line);
-                            return lines.join('\n');
-                        };
-                        // If body is already encrypted armor, rebuild with nested sig+seal
-                        // via buildPlainBody; otherwise append sig+pubkey blocks directly
+                        // Build armored body via buildPlainBody (handles both encrypted and plaintext per spec)
                         let newBody;
                         if (armorMatch && window.emailService) {
                             const encBtn = domManager.get('encryptBtn');
@@ -1036,42 +1026,33 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             // Use the body text from inside the armor (before seal)
                             newBody = window.emailService.buildPlainBody(
                                 armorMatch[1].trim(), encodedSig, encodedPubkey,
-                                profileName, displayName, true, encAlgo
+                                profileName, displayName, true, encAlgo, null, encodedSigPubkey
                             );
-                        } else {
-                            // Hex sig already has its own armor/wrapping; glossia gets > quoted
-                            let sigBlock;
-                            if (metaSig) {
-                                sigBlock = '\n\n' + (profileName || 'Signature') + '\n\n' + wrapQuoted(encodedSig);
-                            } else {
-                                sigBlock = '\n\n' + encodedSig;
+                        } else if (window.emailService) {
+                            // Plaintext: glossia-encode body and build SIGNED BODY armor per spec 3.2
+                            let plainBodyText = bodyValue;
+                            if (gs && gs.isReady()) {
+                                const metaBody = window.emailService?.getGlossiaEncoding();
+                                if (metaBody) {
+                                    try {
+                                        const encoded = gs.transcode(bodyValue, `encode into ${metaBody}`);
+                                        plainBodyText = encoded.output;
+                                    } catch (e) {
+                                        console.warn('[JS] Sign: glossia-encode plaintext body failed:', e);
+                                    }
+                                }
                             }
-
-                            // Split glossia-encoded pubkey evenly across two lines (not bech32)
-                            let pubkeyDisplay = encodedPubkey;
-                            if (metaPubkey) {
-                                const mid = Math.ceil(encodedPubkey.length / 2);
-                                pubkeyDisplay = encodedPubkey.slice(0, mid) + '\n' + encodedPubkey.slice(mid);
-                            }
-
-                            newBody = bodyValue
-                                + sigBlock
-                                + '\n\n' + (displayName || 'Seal') + '\n'
-                                + '\n' + pubkeyDisplay;
+                            newBody = window.emailService.buildPlainBody(
+                                plainBodyText, encodedSig, encodedPubkey,
+                                profileName, displayName, false, null, bodyValue, encodedSigPubkey
+                            );
                         }
                         domManager.setValue('messageBody', newBody);
 
                         // Verify the signature we just created before showing checkmark
-                        let verifyResult;
-                        if (armorMatch) {
-                            // Encrypted armor: verify directly — parseSignedBody can't parse armor format
-                            const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
-                            const isValid = await TauriService.verifySignature(npub, signature, dataBytes);
-                            verifyResult = { found: true, signed: true, isValid };
-                        } else {
-                            const fullBody = domManager.getValue('messageBody');
-                            verifyResult = await window.emailService.verifyBodySignature(fullBody, dataBytes);
-                        }
+                        const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
+                        const isValid = await TauriService.verifySignature(npub, signature, dataBytes);
+                        const verifyResult = { found: true, signed: true, isValid };
                         if (!verifyResult.found || !verifyResult.signed) {
                             domManager.setValue('messageBody', bodyValue);
                             notificationService.showError('Could not verify signature. Body restored.');
@@ -1094,7 +1075,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         if (window.emailService) {
                             // For encrypted, use body content from inside armor (not the full armor text)
                             const htmlBodyText = armorMatch ? armorMatch[1].trim() : bodyValue;
-                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(htmlBodyText, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey);
+                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(htmlBodyText, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey);
                             // Build ASCII-armored plaintext body for text/plain MIME part
                             const encBtn = domManager.get('encryptBtn');
                             const isEncrypted = encBtn && encBtn.dataset.encrypted === 'true';
@@ -1115,7 +1096,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             }
                             window.emailService._plainBody = window.emailService.buildPlainBody(
                                 plainBodyText, encodedSig, encodedPubkey, profileName, displayName,
-                                isEncrypted, encAlgo, isEncrypted ? null : bodyValue
+                                isEncrypted, encAlgo, isEncrypted ? null : bodyValue, encodedSigPubkey
                             );
                             // Append quoted original message armor outside the encryption
                             if (window.emailService._quotedOriginalArmor) {
@@ -1126,9 +1107,11 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                 if (window.emailService._htmlBody) {
                                     const parts = window.emailService.parseArmorComponents(window.emailService._quotedOriginalArmor);
                                     if (parts) {
+                                        const htmlBodyText = parts.prefixText || parts.bodyText;
                                         const quotedHtml = window.emailService.buildHtmlAlt(
-                                            parts.bodyText, parts.sigContent, parts.sealContent,
-                                            parts.profileName, parts.displayName
+                                            htmlBodyText, parts.sigContent, parts.sealContent,
+                                            parts.profileName, parts.displayName,
+                                            null, null, parts.rawSigPubkey
                                         );
                                         window.emailService._htmlBody += '<blockquote style="border-left:2px solid #ccc;margin:1em 0;padding:0 1em;">'
                                             + quotedHtml + '</blockquote>';

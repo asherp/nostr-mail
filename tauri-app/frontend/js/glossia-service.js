@@ -192,6 +192,26 @@ const GlossiaService = {
         return result.output;
     },
 
+    /** Encode sig (64 bytes) + pubkey (32 bytes) as a single 96-byte base_n payload.
+     *  This ensures correct round-trip: decode as 96 bytes, split at byte 64.
+     *  With glossia encoding (meta): single base_n word sequence.
+     *  Without (Hex mode): returns separate encodings (sig_nostr armor + npub). */
+    encodeSigPubkey(sigHex, pubkeyHex, meta) {
+        if (meta) {
+            const combinedHex = sigHex + pubkeyHex; // 192 hex chars = 96 bytes
+            const { language, wordlist } = this._resolveMetaLanguage(meta);
+            const json = JSON.parse(this._wasm.encode_raw_base_n(combinedHex, language, wordlist, '', 0n));
+            if (json.error) throw new Error(json.error);
+            return { encodedSigPubkey: json.encoded_text, combined: true };
+        }
+        // Hex mode: encode separately (structurally different formats)
+        return {
+            encodedSig: this.encodeSignature(sigHex, null),
+            encodedPubkey: this.encodePubkey(pubkeyHex, null),
+            combined: false
+        };
+    },
+
     /** Resolve a meta keyword (e.g. 'latin', 'english bip39', 'latin/bip39')
      *  to { language, wordlist }. */
     _resolveMetaLanguage(meta) {
@@ -270,7 +290,27 @@ const GlossiaService = {
                 }
             }
 
-            if (pubkeyHex) {
+            // Combined sig+pubkey format: last paragraph is a > quoted block
+            // containing a single 96-byte glossia payload (sig 64 + pubkey 32)
+            if (!pubkeyHex && window.emailService) {
+                let combinedText = paragraphs[paragraphs.length - 1].trim();
+                combinedText = combinedText.split('\n').map(l => l.replace(/^>\s*/, '')).join(' ').trim();
+                const split = window.emailService._splitSigPubkey(combinedText);
+                if (split) {
+                    signatureHex = split.sigHex;
+                    pubkeyHex = split.pubkeyHex;
+                    paragraphs.pop();
+                    // Strip the label paragraph (profile name or "Signature")
+                    if (paragraphs.length >= 2) {
+                        const maybeLabel = paragraphs[paragraphs.length - 1].trim();
+                        if (maybeLabel && !maybeLabel.includes('\n')) {
+                            paragraphs.pop();
+                        }
+                    }
+                }
+            }
+
+            if (pubkeyHex && !signatureHex) {
                 paragraphs.pop();
 
                 // Strip @name paragraph if present (when Seal has blank line after it)

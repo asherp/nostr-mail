@@ -17,10 +17,9 @@ All Nostr-Mail content is enclosed in ASCII armor blocks using `-----` delimiter
 |-----|------|----------|
 | `BEGIN NOSTR NIP-XX ENCRYPTED BODY` | Encrypted content | Ciphertext (NIP-04 or NIP-44) |
 | `BEGIN NOSTR SIGNED BODY` | Signed plaintext | Plaintext body content |
-| `BEGIN NOSTR SIGNATURE` | Proof of authorship | Schnorr signature bytes |
-| `BEGIN NOSTR SEAL` | Identity declaration | Sender's Nostr public key |
+| `BEGIN NOSTR SIGNATURE` | Proof of authorship + identity | Schnorr signature (64 bytes) followed by sender's pubkey (32 bytes) |
+| `BEGIN NOSTR SEAL` | Identity declaration | Sender's Nostr public key (unsigned messages only) |
 | `END NOSTR MESSAGE` | Closing tag | Terminates the outermost block |
-| `END NOSTR SIGNATURE` | Closing tag | Terminates standalone signature blocks |
 | `END NOSTR SEAL` | Closing tag | Terminates standalone seal blocks |
 
 The encryption type is embedded directly in the BEGIN tag (e.g., `BEGIN NOSTR NIP-44 ENCRYPTED BODY`), keeping the format self-describing without metadata lines.
@@ -39,6 +38,8 @@ Decoders MUST accept the following legacy tag names:
 
 Encoders MUST produce only the new format. Decoders MUST accept both old and new formats via `(?:MESSAGE|BODY)` alternations in regex patterns.
 
+Additionally, decoders MUST accept the legacy format where SIGNATURE and SEAL are separate blocks (i.e., a `BEGIN NOSTR SEAL` block following `BEGIN NOSTR SIGNATURE`). In the new format, the SIGNATURE block contains both signature and pubkey; the SEAL block is only used for unsigned messages.
+
 ## 3. Message Formats
 
 ### 3.1 Signed + Encrypted
@@ -48,10 +49,8 @@ Encoders MUST produce only the new format. Decoders MUST accept both old and new
 <ciphertext, optionally glossia-encoded>
 ----- BEGIN NOSTR SIGNATURE -----
 @ProfileName
-<signature bytes, optionally glossia-encoded>
------ BEGIN NOSTR SEAL -----
-@DisplayName
-<pubkey bytes, optionally glossia-encoded>
+<signature bytes, optionally glossia-encoded (64 bytes)>
+<pubkey bytes, optionally glossia-encoded (32 bytes)>
 ----- END NOSTR MESSAGE -----
 ```
 
@@ -66,10 +65,8 @@ The original plaintext appears above the armor block for readability. The armore
 <glossia-encoded plaintext>
 ----- BEGIN NOSTR SIGNATURE -----
 @ProfileName
-<signature bytes>
------ BEGIN NOSTR SEAL -----
-@DisplayName
-<pubkey bytes>
+<signature bytes (64 bytes)>
+<pubkey bytes (32 bytes)>
 ----- END NOSTR MESSAGE -----
 ```
 
@@ -83,6 +80,8 @@ The original plaintext appears above the armor block for readability. The armore
 <pubkey bytes>
 ----- END NOSTR MESSAGE -----
 ```
+
+The SEAL block provides the sender's pubkey, which is required for NIP-04/NIP-44 decryption and survives forwarding (unlike MIME headers).
 
 ### 3.4 Unsigned Plaintext (with optional Seal)
 
@@ -104,23 +103,21 @@ When replying to an encrypted message, only the new reply text is encrypted. The
 ```
 ----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----
 <reply ciphertext, encrypted independently>
------ BEGIN NOSTR SIGNATURE -----
-@ReplyAuthor
-<reply signature>
------ BEGIN NOSTR SEAL -----
-@ReplyAuthor
-<reply author pubkey>
------ END NOSTR MESSAGE -----
 
 > ----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----
 > <original message ciphertext>
 > ----- BEGIN NOSTR SIGNATURE -----
 > @OriginalAuthor
-> <original signature>
-> ----- BEGIN NOSTR SEAL -----
-> @OriginalAuthor
-> <original author pubkey>
+> <original signature (64 bytes)>
+> <original author pubkey (32 bytes)>
 > ----- END NOSTR MESSAGE -----
+
+----- BEGIN NOSTR SIGNATURE -----
+@ReplyAuthor
+<reply signature (64 bytes)>
+<reply author pubkey (32 bytes)>
+----- END NOSTR MESSAGE -----
+
 ```
 
 For reply chains, quote depth increases with each level:
@@ -179,7 +176,7 @@ The following custom MIME headers are included for backwards compatibility and f
 | `X-Nostr-Pubkey` | hex-encoded pubkey | Sender identification |
 | `X-Nostr-Sig` | hex-encoded signature | Message authentication |
 
-**Primary trust path**: In-body SEAL and SIGNATURE blocks (survive forwarding, quoting, and re-encoding).
+**Primary trust path**: In-body SIGNATURE blocks (signed) or SEAL blocks (unsigned) (survive forwarding, quoting, and re-encoding).
 
 **Secondary trust path**: X-Nostr-* MIME headers (for fast IMAP filtering and older client compatibility).
 
@@ -188,7 +185,7 @@ The following custom MIME headers are included for backwards compatibility and f
 | Layer | Source | Trust Level |
 |-------|--------|-------------|
 | Transport sender | Email `From:` header | None (spoofable) |
-| Cryptographic author | SEAL block (npub) | Verified via SIGNATURE block |
+| Cryptographic author | SIGNATURE block (pubkey) or SEAL block (npub) | Verified via signature (if signed) |
 | Client attribution | `X-Mailer` header | Informational only |
 
 ## 8. Decoder Algorithm
@@ -199,7 +196,7 @@ The following custom MIME headers are included for backwards compatibility and f
 4. **Detect** content encoding: base64 (no spaces) vs Glossia (word patterns)
 5. **Decode** content: base64 decode or Glossia transcode -> bytes
 6. **Unpack** NIP-04 if applicable (bitpacked binary -> `base64?iv=base64`)
-7. **Verify** signatures against `SHA-256(decoded_body_bytes)` using the SEAL pubkey
+7. **Verify** signatures against `SHA-256(decoded_body_bytes)` using the pubkey from the SIGNATURE block
 8. **Decrypt** if encrypted, using recipient's private key and sender's pubkey
 
 ## 9. Versioning

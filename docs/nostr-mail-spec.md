@@ -1,7 +1,7 @@
 # Nostr-Mail Protocol Specification
 
-**Version:** 0.1.0-draft
-**Date:** 2026-03-19
+**Version:** 0.2.0-draft
+**Date:** 2026-03-26
 
 ## 1. Overview
 
@@ -56,7 +56,9 @@ Additionally, decoders MUST accept the legacy format where SIGNATURE and SEAL ar
 
 ### 3.2 Signed Plaintext
 
-The original plaintext appears above the armor block for readability. The armored body contains the glossia-encoded plaintext, which is the verifiable payload.
+The armored body contains the glossia-encoded plaintext. Glossia encoding is required (not optional) for signed plaintext, because the signature is computed over the decoded binary bytes. Raw plaintext cannot be reliably round-tripped through email transport (line wrapping, whitespace normalization, quote prefixes), so glossia encoding is the canonical representation that ensures signature verification succeeds regardless of how the message is reformatted in transit.
+
+The original plaintext also appears above the armor block for readability in non-Nostr-Mail clients. Nostr-Mail clients SHOULD display the decoded glossia content from within the armor block rather than the plaintext above it, as the armor content is the verified payload.
 
 ```
 <plaintext body>
@@ -98,39 +100,80 @@ Hello, this is a plaintext message.
 
 ### 3.5 Reply Format
 
-When replying to an encrypted message, only the new reply text is encrypted. The original message is appended as a `> ` quoted block outside the encryption boundary. This preserves the original message's signature for independent verification and avoids double-encryption.
+When replying, only the new reply content is encrypted/signed independently. The original message is nested inside the outer armor block, before the reply's SIGNATURE. This preserves the original message's signature for independent verification and avoids double-encryption. Nesting depth is determined by BEGIN/END tag pairing, not by quote prefixes.
+
+#### 3.5.1 Encrypted Reply
 
 ```
 ----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----
 <reply ciphertext, encrypted independently>
-
-> ----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----
-> <original message ciphertext>
-> ----- BEGIN NOSTR SIGNATURE -----
-> @OriginalAuthor
-> <original signature (64 bytes)>
-> <original author pubkey (32 bytes)>
-> ----- END NOSTR MESSAGE -----
-
+----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----
+<original message ciphertext>
+----- BEGIN NOSTR SIGNATURE -----
+@OriginalAuthor
+<original signature (64 bytes)>
+<original author pubkey (32 bytes)>
+----- END NOSTR MESSAGE -----
 ----- BEGIN NOSTR SIGNATURE -----
 @ReplyAuthor
 <reply signature (64 bytes)>
 <reply author pubkey (32 bytes)>
 ----- END NOSTR MESSAGE -----
-
 ```
 
-For reply chains, quote depth increases with each level:
+#### 3.5.2 Signed Plaintext Reply
+
+In a signed plaintext reply, the new reply text appears above the armor block for readability. When composing a reply, any text above the outermost armor block in the original message (including the original's plaintext and any previously quoted text) is carried forward as email-quoted lines (prefixed with `> `). This quoted plaintext is informational only — the verifiable content is always inside the armor blocks.
 
 ```
-<current reply armor>
+<new reply plaintext>
 
-> <previous reply armor>
->
-> > <original message armor>
+> <previous plaintext, email-quoted>
+
+----- BEGIN NOSTR SIGNED BODY -----
+<reply glossia-encoded plaintext>
+----- BEGIN NOSTR SIGNED BODY -----
+<original glossia-encoded plaintext>
+----- BEGIN NOSTR SIGNATURE -----
+@OriginalAuthor
+<original signature (64 bytes)>
+<original author pubkey (32 bytes)>
+----- END NOSTR MESSAGE -----
+----- BEGIN NOSTR SIGNATURE -----
+@ReplyAuthor
+<reply signature (64 bytes)>
+<reply author pubkey (32 bytes)>
+----- END NOSTR MESSAGE -----
 ```
 
-Decoders MUST accept armor block delimiters preceded by any number of `> ` quote prefixes. Glossia decoders naturally ignore quote prefixes as non-payload words.
+#### 3.5.3 Reply Chains
+
+For reply chains, nesting increases with each level. Signatures close in innermost-first order:
+
+```
+----- BEGIN NOSTR ... -----
+<L3 reply body>
+----- BEGIN NOSTR ... -----
+<L2 reply body>
+----- BEGIN NOSTR ... -----
+<L1 original body>
+----- BEGIN NOSTR SIGNATURE -----
+@L1Author
+...
+----- END NOSTR MESSAGE -----
+----- BEGIN NOSTR SIGNATURE -----
+@L2Author
+...
+----- END NOSTR MESSAGE -----
+----- BEGIN NOSTR SIGNATURE -----
+@L3Author
+...
+----- END NOSTR MESSAGE -----
+```
+
+#### 3.5.4 Quote Prefix Handling
+
+Decoders MUST also accept armor block delimiters preceded by `> ` quote prefixes, since email clients may add quote prefixes when forwarding or replying. Glossia decoders naturally ignore quote prefixes as non-payload words.
 
 ## 4. Composable Signing Model
 
@@ -173,12 +216,85 @@ The following custom MIME headers are included for backwards compatibility and f
 
 | Header | Value | Purpose |
 |--------|-------|---------|
-| `X-Nostr-Pubkey` | hex-encoded pubkey | Sender identification |
+| `X-Nostr-Pubkey` | hex or npub (bech32) pubkey | Sender identification |
 | `X-Nostr-Sig` | hex-encoded signature | Message authentication |
+
+Decoders MUST accept both hex-encoded and npub (bech32-encoded, `npub1...`) formats for `X-Nostr-Pubkey`. Encoders MAY produce either format.
 
 **Primary trust path**: In-body SIGNATURE blocks (signed) or SEAL blocks (unsigned) (survive forwarding, quoting, and re-encoding).
 
 **Secondary trust path**: X-Nostr-* MIME headers (for fast IMAP filtering and older client compatibility).
+
+### 6.2 HTML Rendering
+
+The `text/html` part is a rendering aid for human readability. It mirrors the structure of the armor blocks in `text/plain` but presents decoded, readable content. Clients that understand Nostr-Mail SHOULD generate the HTML part according to the following rules.
+
+#### 6.2.1 General Structure
+
+Each armor block maps to a `<div>` in the HTML. Nested armor blocks (from replies) map to nested `<blockquote>` elements. Signature blocks are rendered as labeled sections below their associated body.
+
+```html
+<div>
+  <div>{body content}</div>
+  <blockquote>
+    {nested message HTML, recursively structured}
+  </blockquote>
+  <hr>
+  <h4>{signature author}</h4>
+  <div>{encoded signature + pubkey}</div>
+</div>
+```
+
+#### 6.2.2 Body Content
+
+- **Signed plaintext**: The body `<div>` contains the decoded glossia plaintext (human-readable text), so that non-Nostr-Mail clients can display the message content directly.
+- **Encrypted**: The body `<div>` contains the glossia-encoded ciphertext (since the plaintext is not available without decryption).
+
+#### 6.2.3 Reply Threading
+
+For replies, the outermost body `<div>` MUST contain only the new reply content — not the quoted text from previous messages. Previous messages appear as nested `<blockquote>` elements, each containing their own decoded body content and signature sections. This ensures the first visible content is the new reply, with conversation history indented below.
+
+```html
+<div>
+  <!-- Outermost: only the new reply text -->
+  <div>{L3 new reply plaintext}</div>
+  <blockquote>
+    <!-- L2 previous reply -->
+    <div>{L2 decoded plaintext}</div>
+    <blockquote>
+      <!-- L1 original message -->
+      <div>{L1 decoded plaintext}</div>
+      <hr>
+      <h4>{L1 author}</h4>
+      <div>{L1 encoded signature + pubkey}</div>
+    </blockquote>
+    <hr>
+    <h4>{L2 author}</h4>
+    <div>{L2 encoded signature + pubkey}</div>
+  </blockquote>
+  <hr>
+  <h4>{L3 author}</h4>
+  <div>{L3 encoded signature + pubkey}</div>
+</div>
+```
+
+#### 6.2.4 Signature Display
+
+Each signature section consists of:
+1. A horizontal rule (`<hr>`) separator
+2. A heading (`<h4>`) with the author's profile name (from the `@ProfileName` line in the SIGNATURE block)
+3. A `<div>` containing the glossia-encoded signature and pubkey bytes (preserving the encoded form, not decoded)
+
+Seal blocks (for unsigned messages) are rendered similarly, with the display name and encoded pubkey.
+
+#### 6.2.5 Inline Styles
+
+Since email clients strip `<style>` tags and external stylesheets, all styling MUST use inline `style` attributes. Recommended styles:
+
+- **Blockquote**: `border-left: 2px solid #ccc; margin: 1em 0; padding: 0 1em;`
+- **Signature div**: `border-left: 2px solid #ccc; padding-left: 1em; color: #888; font-style: italic; overflow-wrap: break-word;`
+- **Signature heading**: `margin: 0 0 0.5em; color: #666; font-size: 0.9em;`
+- **HR separator**: `border: none; border-top: 1px solid #ccc; margin: 1.5em 0;`
 
 ## 7. Identity Model
 

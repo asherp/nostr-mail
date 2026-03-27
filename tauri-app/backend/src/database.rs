@@ -1944,6 +1944,15 @@ impl Database {
         Ok(())
     }
 
+    // Delete all data associated with a pubkey (settings, contacts, conversations)
+    pub fn delete_account_data(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM user_settings WHERE pubkey = ?", params![pubkey])?;
+        conn.execute("DELETE FROM user_contacts WHERE user_pubkey = ?", params![pubkey])?;
+        conn.execute("DELETE FROM conversations WHERE user_pubkey = ?", params![pubkey])?;
+        Ok(())
+    }
+
     /// Load config data from JSON string (events, profiles, relays)
     fn load_config_data_from_str(&self, content: &str) -> Result<()> {
         self.parse_and_load_config_data(content)

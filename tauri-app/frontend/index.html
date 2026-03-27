@@ -46,6 +46,7 @@
     <script src="js/email-service.js"></script>
     <script src="js/utils.js"></script>
     <script src="js/app-state.js"></script>
+    <script src="js/profile-manager.js"></script>
     <script src="js/notification-service.js"></script>
     <script src="js/app.js"></script>
 </head>
@@ -89,6 +90,24 @@
             </nav>
             
             <div class="sidebar-footer">
+                <div class="profile-switcher" id="profile-switcher">
+                    <div class="profile-switcher-active" id="profile-switcher-active" title="Switch account">
+                        <div class="profile-switcher-avatar" id="profile-switcher-avatar"></div>
+                        <div class="profile-switcher-info">
+                            <span class="profile-switcher-name" id="profile-switcher-name">No Account</span>
+                            <span class="profile-switcher-npub" id="profile-switcher-npub"></span>
+                        </div>
+                        <i class="fas fa-chevron-up profile-switcher-toggle"></i>
+                    </div>
+                    <div class="profile-switcher-dropdown" id="profile-switcher-dropdown" style="display:none;">
+                        <div class="profile-switcher-list" id="profile-switcher-list"></div>
+                        <div class="profile-switcher-actions">
+                            <button class="profile-switcher-add" id="profile-switcher-add">
+                                <i class="fas fa-plus"></i> Add Account
+                            </button>
+                        </div>
+                    </div>
+                </div>
                 <span class="version-text">v1.0.4-beta</span>
             </div>
         </aside>

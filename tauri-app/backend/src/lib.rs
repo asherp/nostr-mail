@@ -3378,6 +3378,13 @@ fn db_clear_all_data(state: tauri::State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn db_delete_account_data(pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_delete_account_data called for pubkey: {}", pubkey);
+    let db = state.get_database()?;
+    db.delete_account_data(&pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn follow_user(private_key: String, pubkey_to_follow: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     use nostr_sdk::prelude::*;
     
@@ -5182,6 +5189,7 @@ pub fn run() {
         db_save_settings_batch,
         db_get_database_size,
         db_clear_all_data,
+        db_delete_account_data,
         follow_user,
         publish_follow_list,
         encrypt_nip04_message,

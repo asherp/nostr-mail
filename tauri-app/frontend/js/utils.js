@@ -17,7 +17,7 @@ class Utils {
         container.innerHTML = '';
         container.style.whiteSpace = 'normal';
         const iframe = document.createElement('iframe');
-        iframe.sandbox = 'allow-same-origin';
+        iframe.sandbox = 'allow-same-origin allow-scripts';
         iframe.style.width = '100%';
         iframe.style.border = 'none';
         iframe.style.overflow = 'hidden';
@@ -42,6 +42,12 @@ class Utils {
                    background: ${isDark ? '#232946' : '#fff'}; }
             img { max-width: 100%; height: auto; }
             a { color: ${isDark ? '#93c5fd' : '#2563eb'}; }
+            blockquote { cursor: pointer; }
+            blockquote.collapsed > *:not(.collapse-hint) { display: none; }
+            .collapse-hint {
+                font-size: 0.8em; color: ${isDark ? '#9ca3af' : '#6b7280'};
+                user-select: none; padding: 2px 0;
+            }
             ${darkOverrides}
         </style></head><body>${htmlContent}</body></html>`);
         doc.close();
@@ -55,6 +61,24 @@ class Utils {
         // Also resize after a short delay for late-loading content
         setTimeout(resize, 100);
         setTimeout(resize, 500);
+        // Collapsible blockquotes: click to toggle nested reply chains
+        const setupCollapsible = () => {
+            const bqs = doc.querySelectorAll('blockquote');
+            bqs.forEach(bq => {
+                const hint = doc.createElement('div');
+                hint.className = 'collapse-hint';
+                hint.textContent = '\u2026';
+                hint.style.display = 'none';
+                bq.insertBefore(hint, bq.firstChild);
+                bq.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const collapsed = bq.classList.toggle('collapsed');
+                    hint.style.display = collapsed ? '' : 'none';
+                    setTimeout(resize, 10);
+                });
+            });
+        };
+        setTimeout(setupCollapsible, 50);
     }
 
     /**

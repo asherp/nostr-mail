@@ -1202,20 +1202,37 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         return;
                     }
 
-                    // Split reply text from quoted original
-                    const splitResult = window.emailService ? window.emailService.splitReplyAndQuoted(rawBodyValue) : { replyText: rawBodyValue, quotedOriginal: '' };
-                    let bodyValue = splitResult.quotedOriginal ? splitResult.replyText : rawBodyValue;
+                    // Parse armor structure from the full body.
+                    // parseArmorComponents handles depth-counting to properly extract
+                    // the outermost body, nested quoted armor, sig, and seal.
+                    const armorParts = window.emailService ? window.emailService.parseArmorComponents(rawBodyValue) : null;
+                    // isArmored = the body starts with armor (user's own encrypted/signed body).
+                    // If prefixText exists, armor is a quoted original (plaintext reply case).
+                    const isArmored = !!(armorParts && armorParts.bodyText && !armorParts.prefixText);
+                    let bodyValue;
                     let quotedPlaintext = null;
-                    if (splitResult.quotedOriginal && window.emailService) {
-                        const qParts = window.emailService.parseArmorComponents(splitResult.quotedOriginal);
-                        if (qParts && qParts.prefixText) {
-                            quotedPlaintext = qParts.prefixText;
-                            const armorStart = splitResult.quotedOriginal.indexOf('-----');
-                            window.emailService._quotedOriginalArmor = armorStart >= 0
-                                ? splitResult.quotedOriginal.substring(armorStart).trim()
-                                : splitResult.quotedOriginal;
-                        } else {
-                            window.emailService._quotedOriginalArmor = splitResult.quotedOriginal;
+
+                    if (isArmored) {
+                        // Armored content: extract body and quoted armor from parsed structure
+                        bodyValue = armorParts.bodyText;
+                        if (window.emailService) {
+                            window.emailService._quotedOriginalArmor = armorParts.quotedArmor || null;
+                        }
+                    } else {
+                        // Not armored: use splitReplyAndQuoted for plaintext reply detection
+                        const splitResult = window.emailService ? window.emailService.splitReplyAndQuoted(rawBodyValue) : { replyText: rawBodyValue, quotedOriginal: '' };
+                        bodyValue = splitResult.quotedOriginal ? splitResult.replyText : rawBodyValue;
+                        if (splitResult.quotedOriginal && window.emailService) {
+                            const qParts = window.emailService.parseArmorComponents(splitResult.quotedOriginal);
+                            if (qParts && qParts.prefixText) {
+                                quotedPlaintext = qParts.prefixText;
+                                const armorStart = splitResult.quotedOriginal.indexOf('-----');
+                                window.emailService._quotedOriginalArmor = armorStart >= 0
+                                    ? splitResult.quotedOriginal.substring(armorStart).trim()
+                                    : splitResult.quotedOriginal;
+                            } else {
+                                window.emailService._quotedOriginalArmor = splitResult.quotedOriginal;
+                            }
                         }
                     }
 
@@ -1223,19 +1240,17 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         // Extract content from ASCII armor if present, otherwise use body as-is.
                         // For encrypted armor, body is bitpacked before glossia encoding,
                         // so decodeToBytes returns packed cipher bytes directly.
-                        const armorMatch = bodyValue.match(/-{3,}\s*BEGIN NOSTR (?:NIP-(?:04|44) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                         let dataBytes;
-                        if (armorMatch) {
-                            const armorBody = armorMatch[1].trim();
+                        if (isArmored) {
                             const gs = window.GlossiaService;
                             // Body is bitpacked then prose-encoded, so use transcodeToBytes
                             // (handles grammar/cover words) to get packed cipher bytes
-                            const decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(armorBody) : null;
+                            const decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(bodyValue) : null;
                             if (decoded) {
                                 dataBytes = decoded;
                             } else {
                                 // Fallback: raw base64 content (strip whitespace)
-                                dataBytes = window.CryptoService.ciphertextToBytes(armorBody.replace(/\s+/g, ''));
+                                dataBytes = window.CryptoService.ciphertextToBytes(bodyValue.replace(/\s+/g, ''));
                             }
                         } else {
                             // Plaintext: glossia-encode reply text only, then decode back to get
@@ -1270,8 +1285,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             }
                         }
                         // Concatenate all nested quoted body bytes for signature coverage
-                        if (splitResult.quotedOriginal && window.emailService) {
-                            const allQuotedBytes = window.emailService._extractAllBodyBytes(splitResult.quotedOriginal);
+                        const quotedArmorForSig = window.emailService?._quotedOriginalArmor || null;
+                        if (quotedArmorForSig && window.emailService) {
+                            const allQuotedBytes = window.emailService._extractAllBodyBytes(quotedArmorForSig);
                             if (allQuotedBytes) {
                                 dataBytes = window.emailService._concatBytes(dataBytes, allQuotedBytes);
                             }
@@ -1317,14 +1333,13 @@ NostrMailApp.prototype.setupEventListeners = function() {
 
                         // Build armored body via buildPlainBody (handles both encrypted and plaintext per spec)
                         let newBody;
-                        if (armorMatch && window.emailService) {
+                        if (isArmored && window.emailService) {
                             const encBtn = domManager.get('encryptBtn');
                             const encAlgo = (encBtn && encBtn.dataset.encrypted === 'true')
                                 ? (appState.getSettings()?.encryption_algorithm || 'nip44')
                                 : null;
-                            // Use the body text from inside the armor (before seal)
                             newBody = window.emailService.buildPlainBody(
-                                armorMatch[1].trim(), encodedSig, encodedPubkey,
+                                bodyValue, encodedSig, encodedPubkey,
                                 profileName, displayName, true, encAlgo, null, encodedSigPubkey,
                                 window.emailService._quotedOriginalArmor
                             );
@@ -1359,12 +1374,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         const isValid = await TauriService.verifySignature(npub, signature, dataBytes);
                         const verifyResult = { found: true, signed: true, isValid };
                         if (!verifyResult.found || !verifyResult.signed) {
-                            domManager.setValue('messageBody', bodyValue);
+                            domManager.setValue('messageBody', rawBodyValue);
                             notificationService.showError('Could not verify signature. Body restored.');
                             return;
                         }
                         if (!verifyResult.isValid) {
-                            domManager.setValue('messageBody', bodyValue);
+                            domManager.setValue('messageBody', rawBodyValue);
                             notificationService.showError('Signature verification failed. Body restored.');
                             return;
                         }
@@ -1382,9 +1397,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             const quotedHtmlContent = window.emailService.buildRecursiveQuotedHtml(
                                 window.emailService._quotedOriginalArmor, quotedPlaintext
                             );
-                            // For encrypted, use body content from inside armor (not the full armor text)
-                            const htmlBodyText = armorMatch ? armorMatch[1].trim() : bodyValue;
-                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(htmlBodyText, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey, quotedHtmlContent);
+                            // bodyValue is already the body content from parseArmorComponents (no armor tags)
+                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(bodyValue, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey, quotedHtmlContent);
                             // Build ASCII-armored plaintext body for text/plain MIME part
                             const encBtn = domManager.get('encryptBtn');
                             const isEncrypted = encBtn && encBtn.dataset.encrypted === 'true';
@@ -1394,7 +1408,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             const origPlainForMime = (!isEncrypted && quotedPlaintext)
                                 ? bodyValue + '\n\n' + quotedPlaintext
                                 : (isEncrypted ? null : bodyValue);
-                            let plainBodyText = (isEncrypted && armorMatch) ? armorMatch[1].trim() : bodyValue;
+                            let plainBodyText = bodyValue;
                             if (!isEncrypted && gs && gs.isReady()) {
                                 const metaBody = window.emailService?.getGlossiaEncoding();
                                 if (metaBody) {

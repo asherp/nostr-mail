@@ -5481,4 +5481,71 @@ pub async fn http_sync_sent_emails(app_state: std::sync::Arc<AppState>, email_co
     println!("[HTTP] sync_sent_emails called");
     let db = app_state.get_database().map_err(|e| e.to_string())?;
     email::sync_sent_emails_to_db(&email_config, &db).await.map_err(|e| e.to_string())
-} 
+}
+
+pub async fn http_db_get_all_settings(
+    app_state: std::sync::Arc<AppState>,
+    pubkey: String,
+    private_key: Option<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    println!("[HTTP] db_get_all_settings called for pubkey: {}", pubkey);
+    let db = app_state.get_database()?;
+    let mut settings = db.get_all_settings(&pubkey).map_err(|e| e.to_string())?;
+
+    let sensitive_keys = vec!["password"];
+    if let Some(ref priv_key) = private_key {
+        for key in sensitive_keys {
+            if let Some(encrypted_value) = settings.get(key) {
+                if !encrypted_value.is_empty() {
+                    match crypto::decrypt_setting_value(priv_key, encrypted_value) {
+                        Ok(decrypted) => {
+                            println!("[HTTP] Decrypted sensitive setting: {}", key);
+                            settings.insert(key.to_string(), decrypted);
+                        }
+                        Err(e) => {
+                            println!("[HTTP] Failed to decrypt setting {} (may be plaintext): {}", key, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(settings)
+}
+
+pub async fn http_db_save_settings_batch(
+    app_state: std::sync::Arc<AppState>,
+    pubkey: String,
+    settings: std::collections::HashMap<String, String>,
+    private_key: Option<String>,
+) -> Result<(), String> {
+    println!("[HTTP] db_save_settings_batch called for pubkey: {}, {} settings", pubkey, settings.len());
+    let db = app_state.get_database()?;
+
+    let sensitive_keys = vec!["password"];
+    for (key, value) in settings.iter() {
+        let value_to_save = if sensitive_keys.contains(&key.as_str()) {
+            if let Some(ref priv_key) = private_key {
+                match crypto::encrypt_setting_value(priv_key, value) {
+                    Ok(encrypted) => {
+                        println!("[HTTP] Encrypted sensitive setting: {}", key);
+                        encrypted
+                    }
+                    Err(e) => {
+                        eprintln!("[HTTP] Failed to encrypt setting {}: {}", key, e);
+                        return Err(format!("Failed to encrypt setting {}: {}", key, e));
+                    }
+                }
+            } else {
+                eprintln!("[HTTP] WARNING: Saving sensitive setting '{}' without encryption (no private key provided)", key);
+                value.clone()
+            }
+        } else {
+            value.clone()
+        };
+
+        db.save_setting(&pubkey, key, &value_to_save).map_err(|e| format!("Failed to save setting {}: {}", key, e))?;
+    }
+    Ok(())
+}

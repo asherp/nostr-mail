@@ -233,6 +233,68 @@ async fn invoke_handler(
                 Err(e) => Err(e),
             }
         },
+        "db_get_all_settings" => {
+            let pubkey = match request.args.get("pubkey")
+                .and_then(|v| v.as_str()) {
+                Some(pk) => pk.to_string(),
+                None => {
+                    return Json(InvokeResponse {
+                        success: false,
+                        data: None,
+                        error: Some("Missing pubkey parameter".to_string()),
+                    });
+                }
+            };
+            let private_key = request.args.get("privateKey")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            match nostr_mail_lib::http_db_get_all_settings(app_state.clone(), pubkey, private_key).await {
+                Ok(settings) => Ok(serde_json::to_value(settings).unwrap()),
+                Err(e) => Err(e),
+            }
+        },
+        "db_save_settings_batch" => {
+            let pubkey = match request.args.get("pubkey")
+                .and_then(|v| v.as_str()) {
+                Some(pk) => pk.to_string(),
+                None => {
+                    return Json(InvokeResponse {
+                        success: false,
+                        data: None,
+                        error: Some("Missing pubkey parameter".to_string()),
+                    });
+                }
+            };
+            let settings: std::collections::HashMap<String, String> = match request.args.get("settings")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose() {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return Json(InvokeResponse {
+                        success: false,
+                        data: None,
+                        error: Some("Missing settings parameter".to_string()),
+                    });
+                }
+                Err(e) => {
+                    return Json(InvokeResponse {
+                        success: false,
+                        data: None,
+                        error: Some(format!("Invalid settings format: {}", e)),
+                    });
+                }
+            };
+            let private_key = request.args.get("privateKey")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            match nostr_mail_lib::http_db_save_settings_batch(app_state.clone(), pubkey, settings, private_key).await {
+                Ok(_) => Ok(serde_json::json!({ "success": true })),
+                Err(e) => Err(e),
+            }
+        },
         "sync_sent_emails" => {
             let email_config: nostr_mail_lib::EmailConfig = match serde_json::from_value(
                 request.args.get("config")

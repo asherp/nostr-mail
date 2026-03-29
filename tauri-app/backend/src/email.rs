@@ -2268,6 +2268,25 @@ pub fn extract_nostr_sig_from_headers(raw_headers: &str) -> Option<String> {
 /// Extract the body content from an ASCII-armored email.
 /// Finds the content between the BEGIN ENCRYPTED line and the next armor boundary
 /// (END, SIGNATURE, or SEAL marker). Returns None if no armor is found.
+/// Find the offset of `marker` in `text` where it appears on a non-quoted line.
+/// A non-quoted line is one where the "-----" prefix starts at the beginning of the line,
+/// not after a ">" quote prefix. This skips markers inside nested quoted replies.
+fn find_unquoted_marker(text: &str, marker: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(pos) = text[search_from..].find(marker) {
+        let abs_pos = search_from + pos;
+        // Walk back from the marker to find the start of this line
+        let line_start = text[..abs_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prefix = text[line_start..abs_pos].trim_start();
+        // Non-quoted: line prefix should be only dashes (e.g. "-----"), not "> -----"
+        if !prefix.starts_with('>') {
+            return Some(abs_pos);
+        }
+        search_from = abs_pos + marker.len();
+    }
+    None
+}
+
 fn extract_armor_body_content(body: &str) -> Option<&str> {
     // Find the BEGIN line (encrypted or signed plaintext)
     let begin_idx = body.find("BEGIN NOSTR NIP-")
@@ -2275,12 +2294,13 @@ fn extract_armor_body_content(body: &str) -> Option<&str> {
     // Find the end of that line (first newline after BEGIN)
     let line_end = body[begin_idx..].find('\n').map(|i| begin_idx + i + 1)?;
 
-    // Content ends at the next armor marker line containing "---"
-    // Matches: END NOSTR ..., BEGIN NOSTR SIGNATURE, BEGIN NOSTR SEAL (legacy)
+    // Content ends at the next non-quoted armor marker line.
+    // Skip quoted markers like "> ----- BEGIN NOSTR SIGNATURE -----" in nested replies;
+    // only match markers where "-----" starts at the beginning of a line (no ">" prefix).
     let content_region = &body[line_end..];
-    let content_end = content_region.find("BEGIN NOSTR SIGNATURE")
-        .or_else(|| content_region.find("BEGIN NOSTR SEAL"))  // legacy compat
-        .or_else(|| content_region.find("END NOSTR"))
+    let content_end = find_unquoted_marker(content_region, "BEGIN NOSTR SIGNATURE")
+        .or_else(|| find_unquoted_marker(content_region, "BEGIN NOSTR SEAL"))
+        .or_else(|| find_unquoted_marker(content_region, "END NOSTR"))
         .unwrap_or(content_region.len());
 
     // Walk back past the dash prefix on the marker line (e.g. "----- BEGIN...")
@@ -2334,38 +2354,160 @@ fn try_glossia_decode_to_bytes(text: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Extract binary ciphertext from the email body for signing/verification.
-/// For ASCII-armored bodies: extracts glossia-encoded or base64 payload and decodes to bytes.
-/// For non-armored bodies: returns the UTF-8 bytes of the body text.
-fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
-    // Try to extract content from ASCII armor
-    // Supports both legacy (BEGIN NOSTR NIP-XX ENCRYPTED MESSAGE) and new (BEGIN NOSTR NIP-XX ENCRYPTED BODY) formats
-    if let Some(content) = extract_armor_body_content(body) {
-        let content = content.trim();
-        // Try glossia decode first (handles BIP39/Latin encoded content)
-        if let Some(bytes) = try_glossia_decode_to_bytes(content) {
-            return bytes;
+/// Decode a single section of armor body content (non-quoted lines only) to bytes.
+/// Tries glossia decode, then base64 decode. Returns None if all fail.
+fn decode_armor_section(content: &str) -> Option<Vec<u8>> {
+    let content = content.trim();
+    if content.is_empty() {
+        return None;
+    }
+    // Try glossia decode first (handles BIP39/Latin encoded content)
+    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
+        return Some(bytes);
+    }
+    // Strip all whitespace from the base64 content
+    let b64_clean: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    if !b64_clean.is_empty() {
+        // Check for NIP-04 format: base64?iv=base64
+        if let Some((payload_b64, iv_b64)) = b64_clean.split_once("?iv=") {
+            if let (Ok(payload), Ok(iv)) = (
+                general_purpose::STANDARD.decode(payload_b64),
+                general_purpose::STANDARD.decode(iv_b64),
+            ) {
+                let mut combined = payload;
+                combined.extend_from_slice(&iv);
+                return Some(combined);
+            }
+        }
+        // NIP-44: pure base64
+        if let Ok(decoded) = general_purpose::STANDARD.decode(&b64_clean) {
+            return Some(decoded);
+        }
+    }
+    None
+}
+
+/// Split armor body content into non-quoted lines and quoted lines.
+/// Returns (body_only, quoted_content) where quoted_content has "> " prefixes stripped.
+fn split_body_and_quoted(content: &str) -> (String, Option<String>) {
+    let mut body_lines = Vec::new();
+    let mut quoted_lines = Vec::new();
+    let mut in_quoted = false;
+    for line in content.lines() {
+        if line.starts_with("> ") || line == ">" {
+            in_quoted = true;
+            quoted_lines.push(if line.starts_with("> ") { &line[2..] } else { "" });
+        } else if in_quoted && line.trim().is_empty() {
+            quoted_lines.push("");
+        } else {
+            in_quoted = false;
+            body_lines.push(line);
+        }
+    }
+    let body_only = body_lines.join("\n");
+    let quoted = if quoted_lines.is_empty() {
+        None
+    } else {
+        Some(quoted_lines.join("\n").trim().to_string())
+    };
+    (body_only, quoted)
+}
+
+/// Parse armor structure with depth counting, separating outermost body from nested armor.
+/// Returns (body_text, nested_armor) where nested_armor has one level of "> " prefix stripped.
+/// Handles both non-quoted nested armor (reply chains) and > quoted nested armor.
+fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
+    let body = body.replace("\r\n", "\n");
+    let lines: Vec<&str> = body.lines().collect();
+
+    let contains_begin_body = |l: &str| {
+        l.contains("BEGIN NOSTR NIP-") || l.contains("BEGIN NOSTR SIGNED")
+    };
+    let contains_sig_seal = |l: &str| {
+        l.contains("BEGIN NOSTR SIGNATURE") || l.contains("BEGIN NOSTR SEAL")
+    };
+    let contains_end = |l: &str| l.contains("END NOSTR");
+
+    let mut depth: i32 = 0;
+    let mut in_body = false;
+    let mut in_nested = false;
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut nested_lines: Vec<&str> = Vec::new();
+
+    for line in &lines {
+        if !in_body && !in_nested {
+            if contains_begin_body(line) {
+                depth = 1;
+                in_body = true;
+            }
+            continue;
         }
 
-        // Strip all whitespace from the base64 content
-        let b64_clean: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+        if in_body {
+            if contains_begin_body(line) {
+                depth += 1;
+                in_nested = true;
+                in_body = false;
+                nested_lines.push(line);
+                continue;
+            }
+            if depth == 1 && (contains_sig_seal(line) || contains_end(line)) {
+                break;
+            }
+            body_lines.push(line);
+            continue;
+        }
 
-        if !b64_clean.is_empty() {
-            // Check for NIP-04 format: base64?iv=base64
-            if let Some((payload_b64, iv_b64)) = b64_clean.split_once("?iv=") {
-                if let (Ok(payload), Ok(iv)) = (
-                    general_purpose::STANDARD.decode(payload_b64),
-                    general_purpose::STANDARD.decode(iv_b64),
-                ) {
-                    let mut combined = payload;
-                    combined.extend_from_slice(&iv);
-                    return combined;
+        if in_nested {
+            nested_lines.push(line);
+            if contains_begin_body(line) {
+                depth += 1;
+            }
+            if contains_end(line) {
+                depth -= 1;
+                if depth == 1 {
+                    in_nested = false;
+                    in_body = true;
                 }
             }
-            // NIP-44: pure base64
-            if let Ok(decoded) = general_purpose::STANDARD.decode(&b64_clean) {
-                return decoded;
+        }
+    }
+
+    let body_text = body_lines.join("\n").trim().to_string();
+    if body_text.is_empty() {
+        return None;
+    }
+
+    let nested = if nested_lines.is_empty() {
+        None
+    } else {
+        let stripped: Vec<&str> = nested_lines.iter().map(|l| {
+            if l.starts_with("> ") { &l[2..] }
+            else if *l == ">" { "" }
+            else { *l }
+        }).collect();
+        Some(stripped.join("\n").trim().to_string())
+    };
+
+    Some((body_text, nested))
+}
+
+/// Extract binary ciphertext from the email body for signing/verification.
+/// For ASCII-armored bodies: extracts glossia-encoded or base64 payload and decodes to bytes.
+/// For nested reply chains, uses depth-counting to separate each level and concatenates
+/// decoded bytes from all levels (matching the JS signing behavior).
+/// For non-armored bodies: returns the UTF-8 bytes of the body text.
+fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
+    // Use depth-counting parser to properly handle nested reply armor
+    if let Some((body_text, nested_armor)) = parse_armor_depth(body) {
+        if let Some(mut bytes) = decode_armor_section(&body_text) {
+            if let Some(ref nested) = nested_armor {
+                let nested_bytes = extract_ciphertext_binary(nested);
+                println!("[RUST] extract_ciphertext_binary: concatenating {} outer + {} nested bytes",
+                    bytes.len(), nested_bytes.len());
+                bytes.extend_from_slice(&nested_bytes);
             }
+            return bytes;
         }
     }
 

@@ -941,7 +941,7 @@ class EmailService {
     // Build HTML alternative body from plaintext components
     buildHtmlAlt(bodyText, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey, quotedHtml) {
         const escHtml = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-        const bodyHtml = escHtml(bodyText).replace(/\n/g, '<br>');
+        const bodyHtml = escHtml(bodyText).replace(/\n/g, ' ');
 
         let sigHtml = '';
         const sigContent = encodedSigPubkey || encodedSig;
@@ -950,7 +950,7 @@ class EmailService {
             sigHtml = `
   <hr style="border:none;border-top:1px solid #ccc;margin:1.5em 0;">
   <h4 style="margin:0 0 0.5em;color:#666;font-size:0.9em;">${sigLabel}</h4>
-  <div style="border-left:2px solid #ccc;padding-left:1em;color:#888;font-style:italic;overflow-wrap:break-word;">
+  <div class="sig-content" style="border-left:2px solid #ccc;padding-left:1em;color:#888;font-style:italic;overflow-wrap:break-word;">
     ${escHtml(sigContent)}
   </div>`;
         }
@@ -1807,11 +1807,18 @@ class EmailService {
                 } catch (e) {
                     console.warn('[JS] Preview inline signature verification failed:', e);
                 }
-                Utils.renderHtmlBodyInIframe('preview-html-body', htmlToRender);
+                // Pre-decrypt from plaintext armor for lock toggle
+                let decryptResults = null;
+                try {
+                    decryptResults = await this.decryptAllEncryptedBlocks(plainBody, this.selectedNostrContact?.pubkey);
+                } catch (e) {
+                    console.warn('[JS] Preview pre-decrypt failed:', e);
+                }
+                Utils.renderHtmlBodyInIframe('preview-html-body', htmlToRender, { decryptedTexts: decryptResults });
             };
             renderHtmlWithSigBadge();
         } else if (hasHtml) {
-            Utils.renderHtmlBodyInIframe('preview-html-body', this._htmlBody);
+            Utils.renderHtmlBodyInIframe('preview-html-body', this._htmlBody, {});
         }
 
         // Wire up tab switching
@@ -2966,6 +2973,22 @@ class EmailService {
                                 }
                             }
                         }
+                        // Fallback: if regex-based extraction failed (e.g. nested reply chains),
+                        // try the depth-counting parser which handles nesting correctly
+                        if (previewText.includes('could not decrypt') || previewText.includes('Unable to decrypt')) {
+                            try {
+                                const parts = this.parseArmorComponents(email.body);
+                                if (parts && parts.isEncryptedBody) {
+                                    const fallbackPub = email.sender_pubkey || email.nostr_pubkey;
+                                    const text = await this._decryptFromArmorParts(parts, fallbackPub);
+                                    previewText = Utils.escapeHtml(text.substring(0, 100));
+                                    if (text.length > 100) previewText += '...';
+                                    showSubject = true;
+                                }
+                            } catch (e) {
+                                console.warn('[JS] Armor parse fallback for preview failed:', e);
+                            }
+                        }
                     }
                 } else {
                     // Decode glossia signed message body for preview
@@ -3485,7 +3508,14 @@ class EmailService {
                             } catch (e) {
                                 console.warn('[JS] Signature verification error:', e);
                             }
-                            await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, sigResults);
+                            // Pre-decrypt all encrypted blocks from plaintext armor
+                            let decryptResults = null;
+                            try {
+                                decryptResults = await this.decryptAllEncryptedBlocks(emailBody, senderPubkey);
+                            } catch (e) {
+                                console.warn('[JS] Pre-decrypt blocks error:', e);
+                            }
+                            await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, sigResults, decryptResults);
                         } catch (err) {
                             console.error('[JS] Error decrypting email detail:', err);
                             // For inbox emails, decryption failure means our private key couldn't decrypt
@@ -3511,7 +3541,7 @@ class EmailService {
                         await updateDetail(decryptedSubject, displayBody, null, false, sigResults);
                     })();
                 }
-                const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null) => {
+                const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {
                     // Render attachments - decrypt metadata for display
                     console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
                     
@@ -3755,26 +3785,10 @@ ${attachmentsHtml}
 </div>
 <button id="inbox-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
-                    if (email.html_body && wasDecrypted) {
-                        // Patch the HTML body: replace glossia-encoded div content with decrypted text
-                        try {
-                            const parser = new DOMParser();
-                            const doc = parser.parseFromString(email.html_body, 'text/html');
-                            const contentDiv = doc.querySelector('body > div > div') || doc.querySelector('body > div');
-                            if (contentDiv) {
-                                contentDiv.innerHTML = Utils.escapeHtml(body).replace(/\n/g, '<br>');
-                            }
-                            let patchedHtml = doc.documentElement.outerHTML;
-                            if (inlineSigResult) patchedHtml = this.injectHtmlSigBadge(patchedHtml, inlineSigResult);
-                            Utils.renderHtmlBodyInIframe('inbox-email-body-info', patchedHtml);
-                        } catch (e) {
-                            console.error('[JS] Failed to patch inbox HTML body with decrypted text:', e);
-                            Utils.renderHtmlBodyInIframe('inbox-email-body-info', email.html_body);
-                        }
-                    } else if (email.html_body) {
+                    if (email.html_body) {
                         let htmlToRender = email.html_body;
                         if (inlineSigResult) htmlToRender = this.injectHtmlSigBadge(htmlToRender, inlineSigResult);
-                        Utils.renderHtmlBodyInIframe('inbox-email-body-info', htmlToRender);
+                        Utils.renderHtmlBodyInIframe('inbox-email-body-info', htmlToRender, { decryptedTexts: decryptResults, startDecrypted: true });
                     }
                     // Decorate and verify inline signature blocks in the body
                     if (!email.html_body) {
@@ -4628,10 +4642,120 @@ ${attachmentsHtml}
     }
 
     /**
-     * Extract and decode glossia-encoded content from an ASCII-armored body.
-     * Uses a permissive regex that matches both base64 and glossia word content.
-     * Returns { ciphertext, nip, isGlossia, dialect } or null if no armor found.
+     * Pre-decrypt all encrypted blocks from plaintext armor, recursively.
+     * Mirrors verifyAllSignatures: works from canonical text/plain, returns
+     * results in innermost-first order (one entry per armor level, null for non-encrypted).
+     * @param {string} plainBody - Raw text/plain body with armor blocks
+     * @param {string} fallbackPubkey - npub/hex pubkey for when seal pubkey matches user's own
+     * @returns {Promise<Array<{decryptedText: string}|{error: string}|null>>}
      */
+    async decryptAllEncryptedBlocks(plainBody, fallbackPubkey) {
+        if (!plainBody) return [];
+
+        const parts = this.parseArmorComponents(plainBody);
+        if (!parts) return [];
+
+        // Decrypt outer block (null for non-encrypted blocks to preserve position)
+        let outerResult = null;
+        if (parts.isEncryptedBody) {
+            try {
+                const text = await this._decryptFromArmorParts(parts, fallbackPubkey);
+                outerResult = { decryptedText: text };
+            } catch (e) {
+                outerResult = { error: e.message };
+            }
+        }
+
+        // Recurse into nested quoted armor
+        let innerResults = [];
+        if (parts.quotedArmor) {
+            innerResults = await this.decryptAllEncryptedBlocks(parts.quotedArmor, fallbackPubkey);
+        }
+
+        // Innermost-first; null entries preserved for positional alignment with DOM
+        return [...innerResults, outerResult];
+    }
+
+    /**
+     * Decrypt a single encrypted block using parsed armor components.
+     * Extracts pubkey from sealContent, decodes glossia body, decrypts.
+     */
+    async _decryptFromArmorParts(parts, fallbackPubkey) {
+        const keypair = appState.getKeypair();
+        if (!keypair) throw new Error('No active keypair');
+
+        // Get pubkey from parsed seal/signature (already hex from _splitSigPubkey, or raw text from seal block)
+        let otherPubkeyHex = parts.sealContent;
+        if (otherPubkeyHex && !/^[0-9a-fA-F]{64}$/.test(otherPubkeyHex)) {
+            otherPubkeyHex = this._decodePubkeyText(otherPubkeyHex);
+        }
+        if (!otherPubkeyHex) throw new Error('No pubkey in seal/signature');
+
+        // Determine which pubkey to use for decryption
+        const userPubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
+        let decryptPubkeyHex;
+        if (otherPubkeyHex === userPubkeyHex) {
+            if (!fallbackPubkey) throw new Error('Cannot determine recipient pubkey');
+            decryptPubkeyHex = fallbackPubkey.startsWith('npub1')
+                ? window.CryptoService._npubToHex(fallbackPubkey) : fallbackPubkey;
+        } else {
+            decryptPubkeyHex = otherPubkeyHex;
+        }
+
+        // Decode glossia body → ciphertext
+        const gs = window.GlossiaService;
+        let ciphertext;
+        const stripped = parts.bodyText.replace(/\s+/g, '');
+        if (/^[A-Za-z0-9+/=?]+$/.test(stripped)) {
+            ciphertext = stripped;
+        } else if (gs && gs.isReady()) {
+            const detections = gs.detectDialect(parts.bodyText);
+            if (!Array.isArray(detections) || detections.length === 0) throw new Error('Cannot detect dialect');
+            const dialect = detections[0].language;
+            const result = gs.transcode(parts.bodyText, `decode from ${dialect}`);
+            let decoded = result.output;
+            if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
+            ciphertext = gs._autoUnpack(decoded);
+        } else {
+            throw new Error('GlossiaService not ready');
+        }
+
+        // Decrypt
+        const decryptNpub = window.CryptoService._nip19.npubEncode(decryptPubkeyHex);
+        const decrypted = await TauriService.decryptDmContent(keypair.private_key, decryptNpub, ciphertext);
+        if (!decrypted || decrypted.startsWith('Unable to decrypt')) throw new Error(decrypted || 'Decryption failed');
+        return Utils.fixUtf8Encoding(decrypted);
+    }
+
+    /**
+     * Decode an encoded pubkey text (npub, glossia, or raw hex) to hex.
+     * @returns {string|null} 64-char hex pubkey or null
+     */
+    _decodePubkeyText(text) {
+        if (!text) return null;
+        // Try npub
+        const npubMatch = text.match(/(npub1[a-z0-9]+)/);
+        if (npubMatch) {
+            try { return window.CryptoService._npubToHex(npubMatch[1]); } catch (_) {}
+        }
+        // Try raw hex
+        const stripped = text.replace(/\s+/g, '');
+        if (/^[0-9a-fA-F]{64}$/.test(stripped)) return stripped;
+        // Try glossia decode
+        const gs = window.GlossiaService;
+        if (gs && gs.isReady()) {
+            try {
+                const detections = gs.detectDialect(text);
+                const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : null;
+                if (dialect) {
+                    const hex = gs.decodeRawBaseN(text, dialect, 32);
+                    if (hex && hex.length === 64) return hex;
+                }
+            } catch (_) {}
+        }
+        return null;
+    }
+
     decodeGlossiaArmoredBody(plainBody) {
         // Permissive armor regex: handles both "-----BEGIN" and "----- BEGIN" (with optional spaces)
         // Content stops at END NOSTR ... ENCRYPTED MESSAGE, END NOSTR MESSAGE, or BEGIN NOSTR SIGNATURE
@@ -5014,6 +5138,44 @@ ${attachmentsHtml}
     }
 
     /**
+     * Build a JSON proof blob for third-party signature verification
+     * and return an HTML copy button that writes it to the clipboard.
+     */
+    _buildProofButton(pubkeyHex, signatureHex, dataBytes) {
+        const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
+        // Convert dataBytes to base64
+        let dataBase64 = '';
+        if (dataBytes instanceof Uint8Array) {
+            let binary = '';
+            for (let i = 0; i < dataBytes.length; i++) binary += String.fromCharCode(dataBytes[i]);
+            dataBase64 = btoa(binary);
+        }
+        const proof = {
+            nostr_mail_proof: {
+                version: 1,
+                pubkey_hex: pubkeyHex,
+                npub: npub,
+                signature_hex: signatureHex,
+                data_base64: dataBase64,
+                algorithm: 'schnorr-secp256k1',
+                hash: 'sha256',
+                note: 'Verify: SHA-256(base64decode(data_base64)) then schnorr.verify(signature_hex, hash, pubkey_hex)'
+            }
+        };
+        const json = JSON.stringify(proof, null, 2);
+        const btn = document.createElement('button');
+        btn.className = 'proof-copy-btn';
+        btn.title = 'Copy signature proof JSON for third-party verification';
+        btn.innerHTML = '<i class="fas fa-copy"></i>';
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            await Utils.copyToClipboard(json);
+            window.notificationService.showSuccess('Signature proof copied to clipboard');
+        });
+        return btn;
+    }
+
+    /**
      * Find all signature+seal block pairs in the plain body text,
      * verify each, and update the corresponding DOM indicators
      * created by Utils.decorateArmorBlocks().
@@ -5138,6 +5300,7 @@ ${attachmentsHtml}
                         indicator.innerHTML = `<i class="fas fa-check-circle"></i> Signed by: ${shortNpub}`;
                         indicator.title = `Verified signature from ${npub}`;
                         el.classList.add('verified');
+                        indicator.after(this._buildProofButton(pubkeyHex, signatureHex, dataBytes));
                     } else {
                         indicator.className = 'inline-sig-indicator invalid';
                         indicator.innerHTML = '<i class="fas fa-times-circle"></i> Signature Invalid';
@@ -5264,6 +5427,7 @@ ${attachmentsHtml}
                         indicator.innerHTML = `<i class="fas fa-check-circle"></i> Signed by: ${shortNpub}`;
                         indicator.title = `Verified signature from ${npub}`;
                         el.classList.add('verified');
+                        indicator.after(this._buildProofButton(pubkeyHex, signatureHex, dataBytes));
                     } else {
                         indicator.className = 'inline-sig-indicator invalid';
                         indicator.innerHTML = '<i class="fas fa-times-circle"></i> Signature Invalid';
@@ -5880,8 +6044,16 @@ ${attachmentsHtml}
             }
             
             if (!this.selectedNostrContact) {
-                notificationService.showError('Select a Nostr contact to encrypt for');
-                return false;
+                // Last resort: build a temporary contact from manually-entered npub + email
+                const manualPubkey = this.getRecipientPubkey();
+                const manualEmail = domManager.getValue('toAddress');
+                if (manualPubkey) {
+                    this.selectedNostrContact = { pubkey: manualPubkey, email: manualEmail || '', name: '' };
+                    console.log('[JS] Created contact from manual pubkey input:', manualPubkey.substring(0, 20) + '...');
+                } else {
+                    notificationService.showError('Select a Nostr contact to encrypt for');
+                    return false;
+                }
             }
         }
         if (!appState.hasKeypair()) {
@@ -6449,6 +6621,22 @@ ${attachmentsHtml}
                         }
                     }
                 }
+                // Fallback: if regex-based extraction failed (e.g. nested reply chains),
+                // try the depth-counting parser which handles nesting correctly
+                if (previewText === 'Could not decrypt' || previewText.includes('could not decrypt') || previewText.includes('Could not decrypt')) {
+                    try {
+                        const parts = this.parseArmorComponents(email.body);
+                        if (parts && parts.isEncryptedBody) {
+                            const fallbackPub = email.recipient_pubkey || email.nostr_pubkey;
+                            const text = await this._decryptFromArmorParts(parts, fallbackPub);
+                            previewText = Utils.escapeHtml(text.substring(0, 100));
+                            if (text.length > 100) previewText += '...';
+                            showSubject = true;
+                        }
+                    } catch (e) {
+                        console.warn('[JS] Armor parse fallback for sent preview failed:', e);
+                    }
+                }
             }
         } else {
             // Body has no armor — not encrypted, show plaintext as-is
@@ -6457,7 +6645,7 @@ ${attachmentsHtml}
             if (sentPreviewBody && sentPreviewBody.length > 100) previewText += '...';
             showSubject = true;
         }
-        
+
         // Check if email is decryptable (for filtering)
         const settings = appState.getSettings();
         const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
@@ -6917,7 +7105,7 @@ ${signatureIndicator}
 </div>`;
                 // This is the error path (no recipient pubkey) - show raw HTML if available
                 if (email.html_body) {
-                    Utils.renderHtmlBodyInIframe('sent-email-body-info', email.html_body);
+                    Utils.renderHtmlBodyInIframe('sent-email-body-info', email.html_body, {});
                 }
                 if (!email.html_body) {
                     Utils.decorateArmorBlocks('sent-email-body-info');
@@ -7020,7 +7208,7 @@ ${signatureIndicator}
         }
         
         // Define updateDetail function first (before it's called)
-        const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null) => {
+        const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {
             // Render attachments - decrypt metadata for display
             console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
             console.log(`[JS] Email object:`, email);
@@ -7371,27 +7559,10 @@ ${attachmentsHtml}
 </div>
 <button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
-            if (email.html_body && wasDecrypted) {
-                // Patch the HTML body: replace glossia-encoded div content with decrypted text
-                try {
-                    const parser = new DOMParser();
-                    const doc = parser.parseFromString(email.html_body, 'text/html');
-                    // Find the first content div (contains the glossia prose or ciphertext)
-                    const contentDiv = doc.querySelector('body > div > div') || doc.querySelector('body > div');
-                    if (contentDiv) {
-                        contentDiv.innerHTML = Utils.escapeHtml(body).replace(/\n/g, '<br>');
-                    }
-                    let patchedHtml = doc.documentElement.outerHTML;
-                    if (inlineSigResult) patchedHtml = this.injectHtmlSigBadge(patchedHtml, inlineSigResult);
-                    Utils.renderHtmlBodyInIframe('sent-email-body-info', patchedHtml);
-                } catch (e) {
-                    console.error('[JS] Failed to patch HTML body with decrypted text:', e);
-                    Utils.renderHtmlBodyInIframe('sent-email-body-info', email.html_body);
-                }
-            } else if (email.html_body) {
+            if (email.html_body) {
                 let htmlToRender = email.html_body;
                 if (inlineSigResult) htmlToRender = this.injectHtmlSigBadge(htmlToRender, inlineSigResult);
-                Utils.renderHtmlBodyInIframe('sent-email-body-info', htmlToRender);
+                Utils.renderHtmlBodyInIframe('sent-email-body-info', htmlToRender, { decryptedTexts: decryptResults, startDecrypted: true });
             }
             // Decorate and verify inline signature blocks in the sent body
             if (!email.html_body) {
@@ -7668,8 +7839,15 @@ ${attachmentsHtml}
                         } catch (e) {
                             console.warn('[JS] Signature verification error:', e);
                         }
+                        // Pre-decrypt all encrypted blocks from plaintext armor
+                        let decryptResults = null;
+                        try {
+                            decryptResults = await this.decryptAllEncryptedBlocks(email.body, email.recipient_pubkey);
+                        } catch (e) {
+                            console.warn('[JS] Pre-decrypt blocks error:', e);
+                        }
                         // Pass manifestResult to updateDetail to avoid re-decrypting
-                        await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, sigResults);
+                        await updateDetail(decryptedSubject, decryptedBody, manifestResult, true, sigResults, decryptResults);
                     } catch (err) {
                         console.error('[JS] Error decrypting sent email:', err);
                         await updateDetail('Could not decrypt', 'Could not decrypt: ' + err.message, null, true);

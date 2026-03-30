@@ -63,8 +63,9 @@ const CryptoService = {
         return data;
     },
 
-    /** Decode an npub1 bech32 string to hex public key string. */
+    /** Decode an npub1 bech32 string (or hex passthrough) to hex public key string. */
     _npubToHex(npub) {
+        if (/^[0-9a-fA-F]{64}$/.test(npub)) return npub;
         const { type, data } = this._nip19.decode(npub);
         if (type !== 'npub') throw new Error('Not an npub key');
         // nip19.decode returns data as hex string for npub

@@ -1398,10 +1398,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                 window.emailService._quotedOriginalArmor, quotedPlaintext
                             );
                             // bodyValue is already the body content from parseArmorComponents (no armor tags)
-                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(bodyValue, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey, quotedHtmlContent);
-                            // Build ASCII-armored plaintext body for text/plain MIME part
                             const encBtn = domManager.get('encryptBtn');
                             const isEncrypted = encBtn && encBtn.dataset.encrypted === 'true';
+                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(bodyValue, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey, quotedHtmlContent);
                             const encAlgo = isEncrypted ? (appState.getSettings()?.encryption_algorithm || 'nip44') : null;
                             // For plaintext signed emails, glossia-encode the full body (reply + quoted);
                             // for encrypted, use the body content from inside the armor

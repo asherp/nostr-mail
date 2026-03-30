@@ -182,6 +182,30 @@ body.dark-mode .inline-sig-block.invalid {
     border-left-color: #ef4444;
 }
 
+/* Proof copy button next to verified signature indicators */
+.proof-copy-btn {
+    display: inline-block;
+    background: none;
+    border: 1px solid #c3e6cb;
+    color: #155724;
+    cursor: pointer;
+    padding: 3px 7px;
+    margin-left: 6px;
+    border-radius: 4px;
+    font-size: 0.8125rem;
+    vertical-align: middle;
+}
+.proof-copy-btn:hover {
+    background-color: #c3e6cb;
+}
+body.dark-mode .proof-copy-btn {
+    border-color: #22c55e;
+    color: #4ade80;
+}
+body.dark-mode .proof-copy-btn:hover {
+    background-color: #1e3a2e;
+}
+
 .transport-auth-indicator {
     font-size: 0.8125rem;
     margin-left: 8px;

@@ -6,11 +6,13 @@
 class Utils {
     /**
      * Render an HTML email body inside a sandboxed iframe.
-     * Call after the container element is in the DOM.
-     * @param {string} containerId - ID of the container div
-     * @param {string} htmlContent - Raw HTML body of the email
+     * @param {string} containerId - DOM element ID to render into
+     * @param {string} htmlContent - HTML string to render
+     * @param {Object} [options] - Optional settings
+     * @param {Array} [options.decryptedTexts] - Pre-decrypted texts from plaintext armor
+     *   (each entry: {decryptedText: string} or {error: string})
      */
-    static renderHtmlBodyInIframe(containerId, htmlContent) {
+    static renderHtmlBodyInIframe(containerId, htmlContent, options) {
         const container = document.getElementById(containerId);
         if (!container) return;
         // Clear existing content
@@ -36,18 +38,35 @@ class Utils {
             div[style*="border-left"][style*="color: #888"] { color: #9ca3af !important; }
             hr { border-color: #374151 !important; }
         ` : '';
-        doc.write(`<!DOCTYPE html><html><head><style>
+        doc.write(`<!DOCTYPE html><html><head>
+            <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+            <style>
             body { margin: 0; padding: 8px; font-family: sans-serif; line-height: 1.6;
                    color: ${isDark ? '#e0e0e0' : '#111827'};
                    background: ${isDark ? '#232946' : '#fff'}; }
             img { max-width: 100%; height: auto; }
             a { color: ${isDark ? '#93c5fd' : '#2563eb'}; }
-            blockquote { cursor: pointer; }
+            blockquote { cursor: default; position: relative; }
+            blockquote::before {
+                content: '';
+                position: absolute;
+                left: 0; top: 0; bottom: 0;
+                width: 12px;
+                cursor: pointer;
+            }
             blockquote.collapsed > *:not(.collapse-hint) { display: none; }
             .collapse-hint {
                 font-size: 0.8em; color: ${isDark ? '#9ca3af' : '#6b7280'};
                 user-select: none; padding: 2px 0;
             }
+            h4[style*="color"] { cursor: pointer; user-select: none; }
+            h4[style*="color"]:hover { text-decoration: underline; }
+            .decrypt-toggle {
+                cursor: pointer; float: right; font-size: 1.1em; margin-left: 0.5em;
+                opacity: 0.7; transition: opacity 0.2s;
+            }
+            .decrypt-toggle:hover { opacity: 1; }
+            .decrypt-toggle.decrypting { opacity: 0.4; cursor: wait; }
             ${darkOverrides}
         </style></head><body>${htmlContent}</body></html>`);
         doc.close();
@@ -71,6 +90,9 @@ class Utils {
                 hint.style.display = 'none';
                 bq.insertBefore(hint, bq.firstChild);
                 bq.addEventListener('click', (e) => {
+                    // Only toggle when clicking on the left quote bar (within 12px of left edge)
+                    const rect = bq.getBoundingClientRect();
+                    if (e.clientX - rect.left > 12) return;
                     e.stopPropagation();
                     const collapsed = bq.classList.toggle('collapsed');
                     hint.style.display = collapsed ? '' : 'none';
@@ -79,6 +101,90 @@ class Utils {
             });
         };
         setTimeout(setupCollapsible, 50);
+        // Collapsible signature sections: click username to toggle sig content
+        // Match sig sections by canonical armor structure: h4 followed by italic border-left div
+        // (same approach as injectHtmlSigBadge — survives class stripping by Gmail)
+        const setupCollapsibleSigs = () => {
+            const h4s = doc.querySelectorAll('h4');
+            for (const h4 of h4s) {
+                const sigDiv = h4.nextElementSibling;
+                if (!sigDiv || sigDiv.tagName !== 'DIV' || !sigDiv.style.borderLeft || sigDiv.style.fontStyle !== 'italic') continue;
+                sigDiv.style.display = 'none';
+                h4.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const hidden = sigDiv.style.display === 'none';
+                    sigDiv.style.display = hidden ? '' : 'none';
+                    setTimeout(resize, 10);
+                });
+            }
+        };
+        // Inline decrypt toggles for encrypted body blocks
+        // Inline decrypt toggles — uses pre-computed decryptedTexts from plaintext armor.
+        // Finds body content divs by HTML structure (first child div of each font-family wrapper),
+        // matching them against the results array by position.
+        const setupEncryptedBlocks = () => {
+            const decryptedTexts = options && options.decryptedTexts;
+            if (!decryptedTexts || decryptedTexts.length === 0) return;
+            const startDecrypted = options && options.startDecrypted;
+            // Body divs appear outermost-first in DOM; results are innermost-first — reverse to align
+            const bodyDivs = doc.querySelectorAll('div[style*="font-family"] > div:first-child');
+            if (bodyDivs.length === 0) return;
+            const results = [...decryptedTexts].reverse();
+            bodyDivs.forEach((div, idx) => {
+                const result = results[idx];
+                if (!result) return; // No result for this block (non-encrypted)
+
+                const originalNodes = Array.from(div.childNodes).map(n => n.cloneNode(true));
+                let isDecrypted = false;
+                const decryptedText = result.decryptedText || null;
+
+                const lock = doc.createElement('i');
+                lock.className = 'fas fa-lock decrypt-toggle';
+                if (decryptedText) {
+                    lock.title = 'Click to decrypt';
+                } else {
+                    lock.style.opacity = '0.3';
+                    lock.title = result.error
+                        ? 'Decryption failed: ' + result.error
+                        : 'Encrypted';
+                }
+                div.insertBefore(lock, div.firstChild);
+
+                if (!decryptedText) return;
+
+                const replaceContent = (nodes) => {
+                    while (div.lastChild && div.lastChild !== lock) div.removeChild(div.lastChild);
+                    nodes.forEach(n => div.appendChild(n));
+                    setTimeout(resize, 10);
+                };
+
+                lock.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (isDecrypted) {
+                        replaceContent(originalNodes.map(n => n.cloneNode(true)));
+                        lock.className = 'fas fa-lock decrypt-toggle';
+                        lock.title = 'Click to decrypt';
+                        isDecrypted = false;
+                    } else {
+                        replaceContent([doc.createTextNode(decryptedText)]);
+                        lock.className = 'fas fa-lock-open decrypt-toggle';
+                        lock.title = 'Click to show encrypted';
+                        isDecrypted = true;
+                    }
+                });
+
+                // Start in decrypted mode if requested
+                if (startDecrypted) {
+                    replaceContent([doc.createTextNode(decryptedText)]);
+                    lock.className = 'fas fa-lock-open decrypt-toggle';
+                    lock.title = 'Click to show encrypted';
+                    isDecrypted = true;
+                }
+            });
+        };
+        setTimeout(setupEncryptedBlocks, 60);
+        // Collapsible sigs run after encrypted blocks to avoid DOM timing issues
+        setTimeout(setupCollapsibleSigs, 100);
     }
 
     /**

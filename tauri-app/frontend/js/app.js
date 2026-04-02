@@ -2259,7 +2259,7 @@ NostrMailApp.prototype.debugLiveEvents = function() {
 };
 
 // Experimental: Try to insert message directly into UI for instant updates
-NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
+NostrMailApp.prototype.tryDirectMessageInsertion = async function(dmData) {
     
     try {
         // Only try if we're viewing the messages tab
@@ -2325,10 +2325,19 @@ NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
                 minute: '2-digit' 
             });
         
+        // Decrypt the live message content using frontend decryption (glossia-aware)
+        let displayContent = dmData.content || '[Encrypted message]';
+        if (window.dmService && window.dmService._decryptDmContent) {
+            try {
+                const otherPubkey = isOutgoing ? dmData.recipient_pubkey : dmData.sender_pubkey;
+                displayContent = await window.dmService._decryptDmContent(dmData.content, otherPubkey);
+            } catch (_) { /* show raw content */ }
+        }
+
         // Use the same structure as dm-service.js
         messageDiv.innerHTML = `
             <div class="message-content">
-                <div class="message-text">${window.Utils?.escapeHtml(dmData.content) || dmData.content || '[Encrypted message]'}</div>
+                <div class="message-text">${window.Utils?.escapeHtml(displayContent) || displayContent}</div>
                 <div class="message-meta">
                     <div class="message-time">${dateTimeDisplay}</div>
                     <span class="message-status live-message" title="Live message">⚡</span>

@@ -46,6 +46,10 @@ pub struct Email {
     pub created_at: DateTime<Utc>,
     pub signature_valid: Option<bool>,
     pub transport_auth_verified: Option<bool>,
+    /// Pre-computed subject hash (from NIP ciphertext before glossia encoding).
+    /// When set, save_email uses this instead of hashing the (possibly glossia-encoded) subject.
+    #[serde(default)]
+    pub subject_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1036,12 +1040,15 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         
-        // Compute hash for encrypted emails
-        let subject_hash = if email.is_nostr_encrypted {
-            Some(Self::compute_content_hash(&email.subject))
-        } else {
-            None
-        };
+        // Use pre-computed subject_hash if provided (from NIP ciphertext before glossia),
+        // otherwise fall back to hashing the subject as stored.
+        let subject_hash = email.subject_hash.clone().or_else(|| {
+            if email.is_nostr_encrypted {
+                Some(Self::compute_content_hash(&email.subject))
+            } else {
+                None
+            }
+        });
 
         if let Some(id) = email.id {
             println!("[DB] save_email: Updating existing email with id={}", id);
@@ -1126,13 +1133,14 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         
-        // Compute hash for encrypted emails
-        let subject_hash = if email.is_nostr_encrypted {
-            Some(Self::compute_content_hash(&email.subject))
-        } else {
-            None
-        };
-        
+        let subject_hash = email.subject_hash.clone().or_else(|| {
+            if email.is_nostr_encrypted {
+                Some(Self::compute_content_hash(&email.subject))
+            } else {
+                None
+            }
+        });
+
         println!("[DB] insert_email_direct: About to execute INSERT statement");
         match conn.execute(
             "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, transport_auth_verified)
@@ -1210,6 +1218,7 @@ impl Database {
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
                 transport_auth_verified: row.get(18)?,
+                subject_hash: None,
             };
             println!("[DB] get_email: Found matching email, id={:?}", email.id);
             return Ok(Some(email));
@@ -1283,6 +1292,7 @@ impl Database {
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
                 transport_auth_verified: row.get(18)?,
+                subject_hash: None,
             })
         })?;
         rows.collect()
@@ -1399,6 +1409,7 @@ impl Database {
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
                 transport_auth_verified: row.get(18)?,
+                subject_hash: None,
             })
         })?;
         let emails: Vec<Email> = rows.collect::<Result<Vec<_>, _>>()?;
@@ -1680,6 +1691,7 @@ impl Database {
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
                 transport_auth_verified: row.get(18)?,
+                subject_hash: None,
             })
         })?;
         
@@ -1688,6 +1700,18 @@ impl Database {
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
+    }
+
+    /// Update the subject_hash for an email identified by message_id.
+    /// Called from the frontend after glossia-decoding recovers the NIP ciphertext.
+    pub fn update_email_subject_hash(&self, message_id: &str, subject_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let normalized = Self::normalize_message_id(message_id);
+        conn.execute(
+            "UPDATE emails SET subject_hash = ? WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?",
+            params![subject_hash, normalized],
+        )?;
+        Ok(())
     }
 
     // Attachment operations
@@ -2341,6 +2365,7 @@ impl Database {
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
                 transport_auth_verified: row.get(18)?,
+                subject_hash: None,
             })
         })?;
         
@@ -2484,6 +2509,7 @@ impl Database {
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
                 transport_auth_verified: row.get(18)?,
+                subject_hash: None,
             })
         })?;
         
@@ -2895,6 +2921,7 @@ mod tests {
             created_at: now,
             signature_valid: None,
             transport_auth_verified: None,
+            subject_hash: None,
         }
     }
 

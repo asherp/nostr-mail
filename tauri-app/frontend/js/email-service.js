@@ -27,6 +27,7 @@ class EmailService {
         this.selectedNostrContact = null;
         this.plaintextSubject = ''; // Store plaintext subject
         this.plaintextBody = ''; // Store plaintext body
+        this._subjectCiphertext = null; // Raw NIP ciphertext for DM sending
         this.currentDraftId = null; // Track the current draft being edited
         this.currentDraftDbId = null; // Track the database ID of the current draft
         this.currentMessageId = null; // Store the UUID for reuse
@@ -861,6 +862,7 @@ class EmailService {
         this.selectedNostrContact = null;
         this.plaintextSubject = '';
         this.plaintextBody = '';
+        this._subjectCiphertext = null;
         this.currentMessageId = null; // Reset message ID when clearing draft
         this._quotedOriginalArmor = null; // Clear quoted reply armor
         this.clearAttachments(); // Clear all attachments
@@ -1891,20 +1893,25 @@ class EmailService {
             // Only send DM if setting is enabled and email is actually encrypted
             if (shouldSendDm && isEmailEncrypted) {
                 console.log('[JS] Sending matching DM to contact:', contact.name);
-                // Use the encrypted subject for the DM to match the email subject blob
-                // Since we know the subject is already encrypted, we'll pass it as encrypted content
-                try {
-                    const dmResult = await TauriService.sendEncryptedDirectMessage(
-                        keypair.private_key,
-                        contact.pubkey,
-                        subject, // This is already encrypted content
-                        activeRelays
-                    );
-                    console.log('[JS] DM sent successfully, event ID:', dmResult);
-                    notificationService.showSuccess(`DM sent successfully (event ID: ${dmResult.substring(0, 16)}...)`);
-                } catch (dmError) {
-                    console.error('[JS] Failed to send DM:', dmError);
-                    notificationService.showError('Email sent but DM failed: ' + dmError);
+                // Send the NIP ciphertext (base64) directly as the DM content.
+                // This is already NIP-encrypted, so other Nostr clients can decrypt it.
+                const dmCiphertext = this._subjectCiphertext;
+                if (dmCiphertext) {
+                    try {
+                        const dmResult = await TauriService.sendEncryptedDirectMessage(
+                            keypair.private_key,
+                            contact.pubkey,
+                            dmCiphertext,
+                            activeRelays
+                        );
+                        console.log('[JS] DM sent successfully, event ID:', dmResult);
+                        notificationService.showSuccess(`DM sent successfully (event ID: ${dmResult.substring(0, 16)}...)`);
+                    } catch (dmError) {
+                        console.error('[JS] Failed to send DM:', dmError);
+                        notificationService.showError('Email sent but DM failed: ' + dmError);
+                    }
+                } else {
+                    console.warn('[JS] No subject ciphertext available for DM, skipping');
                 }
             } else if (shouldSendDm && !isEmailEncrypted) {
                 console.warn('[JS] Email is not encrypted, DM will NOT be sent for security reasons.');
@@ -1923,6 +1930,21 @@ class EmailService {
             }
             await TauriService.sendEmail(emailConfig, recipientEmail, subject, plainBody, null, messageId, attachmentData, this._htmlBody);
             console.log('[JS] Encrypted email sent successfully');
+
+            // Update the email's subject_hash in DB to match the NIP ciphertext
+            // (not the glossia-encoded subject). This enables DM↔email matching.
+            if (this._subjectCiphertext && messageId) {
+                try {
+                    const hash = await this.hashStringSHA256(this._subjectCiphertext);
+                    await window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                        messageId: messageId,
+                        subjectHash: hash,
+                    });
+                    console.log('[JS] Updated subject_hash for sent email:', messageId);
+                } catch (e) {
+                    console.warn('[JS] Failed to update subject_hash:', e);
+                }
+            }
         } catch (error) {
             console.error('[JS] Error sending encrypted email:', error);
             throw new Error(`Failed to send encrypted email: ${error}`);
@@ -2905,6 +2927,14 @@ class EmailService {
                             subjectCipher = email.subject;
                         } else {
                             subjectCipher = this.decodeGlossiaSubject(email.subject);
+                            if (subjectCipher && email.message_id) {
+                                this.hashStringSHA256(subjectCipher).then(hash => {
+                                    window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                                        messageId: email.message_id,
+                                        subjectHash: hash,
+                                    }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
+                                });
+                            }
                         }
                         if (subjectCipher) {
                             try {
@@ -3431,6 +3461,15 @@ class EmailService {
                         subjectCiphertext = this.decodeGlossiaSubject(email.subject);
                         if (subjectCiphertext) {
                             console.log('[JS] Inbox: glossia-decoded subject to ciphertext');
+                            // Update subject_hash so DM↔email matching uses the ciphertext hash
+                            if (email.message_id) {
+                                this.hashStringSHA256(subjectCiphertext).then(hash => {
+                                    window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                                        messageId: email.message_id,
+                                        subjectHash: hash,
+                                    }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
+                                });
+                            }
                         }
                     }
                 }
@@ -6109,6 +6148,9 @@ ${attachmentsHtml}
 
             // Capture raw encrypted body ciphertext for _plainBody generation
             let rawEncryptedBody = null;
+            // Capture raw NIP ciphertext for the subject (base64, before glossia encoding)
+            // so we can send it as the DM content directly
+            this._subjectCiphertext = null;
 
             if (shouldUseManifest) {
                 // Use manifest-based encryption when attachments are present or body is large
@@ -6193,6 +6235,7 @@ ${attachmentsHtml}
                     console.log('[JS] Encrypting subject with NIP...');
                     encryptedSubject = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, subject, encryptionAlgorithm);
                     console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
+                    this._subjectCiphertext = encryptedSubject.trim();
                     domManager.setValue('subject', encryptedSubject.trim());
                 }
 
@@ -6227,6 +6270,7 @@ ${attachmentsHtml}
                     console.log('[JS] Encrypting subject...');
                     encryptedSubject = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, subject, encryptionAlgorithm);
                     console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
+                    this._subjectCiphertext = encryptedSubject.trim();
                     domManager.setValue('subject', encryptedSubject.trim());
                 }
 
@@ -6554,6 +6598,14 @@ ${attachmentsHtml}
                             subjectCiphertext = email.subject;
                         } else {
                             subjectCiphertext = this.decodeGlossiaSubject(email.subject);
+                            if (subjectCiphertext && email.message_id) {
+                                this.hashStringSHA256(subjectCiphertext).then(hash => {
+                                    window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                                        messageId: email.message_id,
+                                        subjectHash: hash,
+                                    }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
+                                });
+                            }
                         }
                         if (subjectCiphertext) {
                             try {
@@ -7765,6 +7817,14 @@ ${attachmentsHtml}
                         subjectCiphertext = this.decodeGlossiaSubject(email.subject);
                         if (subjectCiphertext) {
                             console.log('[JS] Sent: glossia-decoded subject to ciphertext');
+                            if (email.message_id) {
+                                this.hashStringSHA256(subjectCiphertext).then(hash => {
+                                    window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                                        messageId: email.message_id,
+                                        subjectHash: hash,
+                                    }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
+                                });
+                            }
                         }
                     }
                 }
@@ -7961,6 +8021,14 @@ ${attachmentsHtml}
                 subjectCiphertext = email.subject;
             } else {
                 subjectCiphertext = this.decodeGlossiaSubject(email.subject);
+                if (subjectCiphertext && email.message_id) {
+                    this.hashStringSHA256(subjectCiphertext).then(hash => {
+                        window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                            messageId: email.message_id,
+                            subjectHash: hash,
+                        }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
+                    });
+                }
             }
             const isEncryptedSubject = !!subjectCiphertext;
 

@@ -150,6 +150,13 @@ pub struct EmailAttachment {
 pub struct MatchingEmailBodyResult {
     pub body: String,
     pub email_id: Option<i64>,
+    /// True when the body could not be decrypted server-side (e.g. glossia-encoded)
+    /// and the frontend should attempt glossia decode + NIP decrypt itself.
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Sender pubkey from the email (for frontend decryption key lookup)
+    #[serde(default)]
+    pub sender_pubkey: Option<String>,
 }
 
 /// Result structure for matching email ID lookup (includes both ID and message_id)

@@ -2971,11 +2971,13 @@ fn db_get_decrypted_dms_for_conversation(
             },
             Err(e) => {
                 eprintln!(
-                    "[DM DECRYPT] Failed to decrypt message: db_id={:?}, event_id={}, sender={}, recipient={}, error={}",
+                    "[DM DECRYPT] Failed to decrypt message: date={}, db_id={:?}, event_id={}, sender={}, recipient={}, content_len={}, error={}",
+                    msg.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
                     msg.id,
                     msg.event_id,
                     msg.sender_pubkey,
                     msg.recipient_pubkey,
+                    msg.content.len(),
                     e
                 );
                 msg.content = "[Failed to decrypt]".to_string();
@@ -4852,27 +4854,40 @@ fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String
     }
 }
 
-/// Extract encrypted content from ASCII armor
+#[tauri::command]
+fn db_update_email_subject_hash(message_id: String, subject_hash: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    db.update_email_subject_hash(&message_id, &subject_hash).map_err(|e| e.to_string())
+}
+
+/// Extract encrypted content from ASCII armor.
+/// Handles both `-----BEGIN` and `----- BEGIN` (with optional spaces after dashes).
 fn extract_encrypted_content_from_armor(body: &str) -> Option<String> {
-    // Look for the start and end markers
-    let start_marker = "-----BEGIN NOSTR NIP-";
-    let end_marker = "-----END NOSTR NIP-";
-    
-    if let Some(start_pos) = body.find(start_marker) {
-        if let Some(end_pos) = body.find(end_marker) {
-            // Find the actual start of encrypted content (after the header line)
-            if let Some(content_start) = body[start_pos..].find('\n') {
-                let content_start = start_pos + content_start + 1;
-                let encrypted_content = &body[content_start..end_pos];
-                
-                // Remove whitespace from the encrypted content
-                let cleaned_content = encrypted_content.replace(|c: char| c.is_whitespace(), "");
-                return Some(cleaned_content);
-            }
-        }
+    // Find start marker: 3+ dashes, optional spaces, "BEGIN NOSTR NIP-"
+    let start_pos = body.find("BEGIN NOSTR NIP-")
+        .and_then(|bp| {
+            // Walk backwards to find the leading dashes
+            let prefix = &body[..bp];
+            let dash_start = prefix.rfind("---")?;
+            Some(dash_start)
+        })?;
+
+    // Find end marker or next block marker (END NOSTR or BEGIN NOSTR SIGNATURE/SEAL)
+    let after_header = body[start_pos..].find('\n')? + start_pos + 1;
+    let end_pos = body[after_header..].find("END NOSTR")
+        .or_else(|| body[after_header..].find("BEGIN NOSTR SIGNATURE"))
+        .or_else(|| body[after_header..].find("BEGIN NOSTR SEAL"))
+        .map(|p| after_header + p)?;
+
+    // Walk back past the dashes on the end marker line
+    let end_line_start = body[..end_pos].rfind('\n').map(|p| p + 1).unwrap_or(end_pos);
+
+    let encrypted_content = &body[after_header..end_line_start];
+    let cleaned_content = encrypted_content.replace(|c: char| c.is_whitespace(), "");
+    if cleaned_content.is_empty() {
+        return None;
     }
-    
-    None
+    Some(cleaned_content)
 }
 
 #[tauri::command]
@@ -5005,14 +5020,16 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pu
     };
     
     // Try to decrypt the email body using each pubkey
-    for pubkey in pubkeys_to_try {
+    for pubkey in &pubkeys_to_try {
         println!("[RUST] Trying to decrypt with pubkey: {}", pubkey);
-        match nostr::decrypt_dm_content(&private_key, &pubkey, &encrypted_content) {
+        match nostr::decrypt_dm_content(&private_key, pubkey, &encrypted_content) {
             Ok(decrypted_body) => {
                 println!("[RUST] Successfully decrypted email body with pubkey: {}", pubkey);
                 return Ok(Some(types::MatchingEmailBodyResult {
                     body: decrypted_body,
                     email_id: email_id,
+                    encrypted: false,
+                    sender_pubkey: email.sender_pubkey.clone(),
                 }));
             },
             Err(e) => {
@@ -5021,9 +5038,16 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pu
             }
         }
     }
-    
-    println!("[RUST] Failed to decrypt email body with any pubkey");
-    Ok(None)
+
+    // Decryption failed (likely glossia-encoded) — return raw body so frontend can
+    // glossia-decode + NIP-decrypt itself.
+    println!("[RUST] Failed to decrypt email body server-side, returning raw body for frontend decryption");
+    Ok(Some(types::MatchingEmailBodyResult {
+        body: email.body.clone(),
+        email_id: email_id,
+        encrypted: true,
+        sender_pubkey: email.sender_pubkey.clone(),
+    }))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -5221,6 +5245,7 @@ pub fn run() {
         db_check_dm_matches_email_encrypted,
         db_get_matching_email_id,
         db_get_matching_email_body,
+        db_update_email_subject_hash,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     

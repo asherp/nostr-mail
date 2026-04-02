@@ -3706,6 +3706,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 created_at: existing_email.created_at, // Preserve original creation date
                 signature_valid: email.signature_valid,
                 transport_auth_verified: email.transport_auth_verified,
+                subject_hash: None,
             };
             db.save_email(&updated_email)?;
             println!("[RUST] Updated existing email in DB: message_id={}", email.message_id);
@@ -3732,6 +3733,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
                 transport_auth_verified: email.transport_auth_verified,
+                subject_hash: None,
             };
             println!("[RUST] Saving email to DB: message_id={}", email.message_id);
             let email_id = db.save_email(&db_email)?;
@@ -3851,6 +3853,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                     created_at: existing_email.created_at, // Preserve original creation time
                     signature_valid: email.signature_valid,
                     transport_auth_verified: email.transport_auth_verified,
+                    subject_hash: None,
                 };
                 match db.save_email(&updated_email) {
                     Ok(id) => println!("[RUST] Updated existing email with IMAP data, id: {}", id),
@@ -3885,6 +3888,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
                 transport_auth_verified: email.transport_auth_verified,
+                subject_hash: None,
             };
             println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}", 
                 db_email.message_id, db_email.from_address, db_email.to_address, 

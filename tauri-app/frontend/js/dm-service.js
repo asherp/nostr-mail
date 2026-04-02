@@ -18,6 +18,41 @@ class DMService {
         this.loadingMessages = new Map(); // Track ongoing loadDmMessages calls to prevent race conditions
     }
 
+    // Decrypt a single DM content string via NIP-44/NIP-04.
+    async _decryptDmContent(encryptedContent, contactPubkey) {
+        const keypair = window.appState.getKeypair();
+        if (!keypair) return '[No keypair]';
+
+        const cs = window.CryptoService;
+        if (!cs || !cs.isReady()) return '[Crypto not ready]';
+
+        try {
+            return await cs.decryptDmContent(keypair.private_key, contactPubkey, encryptedContent);
+        } catch (_) {
+            return '[Failed to decrypt]';
+        }
+    }
+
+    // Fetch raw DMs from DB and decrypt in the frontend (supports glossia).
+    async _fetchAndDecryptDms(contactPubkey) {
+        const myPubkey = window.appState.getKeypair().public_key;
+
+        const rawMessages = await window.__TAURI__.core.invoke('db_get_dms_for_conversation', {
+            userPubkey: myPubkey,
+            contactPubkey: contactPubkey
+        });
+
+        if (!rawMessages || rawMessages.length === 0) return [];
+
+        // Decrypt each message — use the other party's pubkey for the shared secret
+        for (const msg of rawMessages) {
+            const otherPubkey = (msg.sender_pubkey === myPubkey) ? msg.recipient_pubkey : msg.sender_pubkey;
+            msg.content = await this._decryptDmContent(msg.content, otherPubkey);
+        }
+
+        return rawMessages;
+    }
+
     // Load DM contacts from backend and network
     async loadDmContacts() {
         try {
@@ -41,13 +76,8 @@ class DMService {
 
             for (const contactPubkey of pubkeys) {
                 try {
-                    // LOG: Show which pubkeys are being used for the conversation fetch
-                    // 1. Fetch decrypted messages for this conversation
-                    const messages = await window.__TAURI__.core.invoke('db_get_decrypted_dms_for_conversation', {
-                        privateKey: privateKey,
-                        userPubkey: myPubkey,
-                        contactPubkey: contactPubkey
-                    });
+                    // 1. Fetch and decrypt messages for this conversation (frontend decryption with glossia support)
+                    const messages = await this._fetchAndDecryptDms(contactPubkey);
                     // LOG: Show how many messages were returned
                     if (!messages || messages.length === 0) {
                         continue;
@@ -630,12 +660,8 @@ class DMService {
         }
         
         try {
-            // Fetch conversation messages from the local database (decrypted)
-            const messages = await window.__TAURI__.core.invoke('db_get_decrypted_dms_for_conversation', {
-                privateKey: privateKey,
-                userPubkey: myPubkey,
-                contactPubkey: contactPubkey
-            });
+            // Fetch and decrypt messages in the frontend (supports glossia-encoded DMs)
+            const messages = await this._fetchAndDecryptDms(contactPubkey);
             
             if (!messages || !Array.isArray(messages)) {
                 console.error('[JS] Invalid messages response:', messages);
@@ -1625,17 +1651,28 @@ class DMService {
             expandableElement.removeChild(loadingDiv);
             
             if (emailResult && emailResult.body) {
-                // Check if the emailBody is a manifest JSON (starts with { and contains "body" and "ciphertext")
                 let finalBody = emailResult.body;
                 let manifest = null;
+
+                // If backend couldn't decrypt (e.g. glossia-encoded), try frontend decryption
+                if (emailResult.encrypted) {
+                    console.log('[JS] DM: Body still encrypted, attempting frontend glossia decode + NIP decrypt');
+                    // Use email's sender_pubkey as fallback when contactPubkey is our own key
+                    const decryptPubkey = contactPubkey !== window.appState.getKeypair()?.public_key
+                        ? contactPubkey
+                        : emailResult.sender_pubkey || contactPubkey;
+                    finalBody = await this._tryFrontendDecrypt(emailResult.body, decryptPubkey);
+                }
+
+                // Check if the emailBody is a manifest JSON (starts with { and contains "body" and "ciphertext")
                 try {
-                    const parsed = JSON.parse(emailResult.body);
+                    const parsed = JSON.parse(finalBody);
                     if (parsed.body && parsed.body.ciphertext && parsed.body.key_wrap) {
                         // This is a manifest - extract and decrypt the body
                         manifest = parsed;
                         const bodyKey = manifest.body.key_wrap;
                         const encryptedBodyData = manifest.body.ciphertext;
-                        
+
                         // Use emailService's decryptWithAES method
                         if (window.emailService && typeof window.emailService.decryptWithAES === 'function') {
                             try {
@@ -1761,6 +1798,89 @@ class DMService {
             errorDiv.textContent = 'Failed to load email body';
             expandableElement.appendChild(errorDiv);
         }
+    }
+
+    // Attempt glossia decode + NIP decrypt of a raw email body in the frontend.
+    // Reuses the same decryption pipeline as the email detail view.
+    async _tryFrontendDecrypt(rawBody, contactPubkey) {
+        const keypair = window.appState.getKeypair();
+        const es = window.emailService;
+        if (!keypair || !es) return '[Failed to decrypt email body]';
+
+        // If contactPubkey is our own key (e.g. after account switch), we can't
+        // compute a valid shared secret.  Fall back to the email's sender_pubkey
+        // or try all known pubkeys via the fallback path.
+        if (contactPubkey === keypair.public_key) {
+            console.warn('[JS] DM: contactPubkey equals myPubkey, clearing to trigger fallback');
+            contactPubkey = null;
+        }
+
+        // 1. Try armored glossia decode (body with BEGIN/END markers)
+        let ciphertext = null;
+        try {
+            const glossiaResult = es.decodeGlossiaArmoredBody(rawBody);
+            if (glossiaResult) {
+                ciphertext = glossiaResult.ciphertext;
+                console.log('[JS] DM: glossia-decoded armored body to ciphertext, dialect:', glossiaResult.dialect,
+                    'len:', ciphertext.length, 'preview:', ciphertext.substring(0, 40));
+            }
+        } catch (armorErr) {
+            console.warn('[JS] DM: decodeGlossiaArmoredBody crashed, trying manual extract:', armorErr.message);
+
+            // Manual fallback: extract glossia content from armor and try each detected dialect
+            const gs = window.GlossiaService;
+            if (gs && gs.isReady()) {
+                const armorMatch = rawBody.replace(/\r\n/g, '\n').match(
+                    /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR|BEGIN NOSTR)/
+                );
+                if (armorMatch) {
+                    const content = armorMatch[1].trim();
+                    const detections = gs.detectDialect(content);
+                    for (const det of (detections || [])) {
+                        try {
+                            const result = gs.transcode(content, `decode from ${det.language}`);
+                            let decoded = result.output;
+                            if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
+                            decoded = gs._autoUnpack(decoded);
+                            ciphertext = decoded;
+                            console.log('[JS] DM: manual glossia decode succeeded with dialect:', det.language);
+                            break;
+                        } catch (_) { /* try next dialect */ }
+                    }
+                }
+            }
+        }
+
+        // 2. If no armor, try raw glossia decode (bare glossia words, no markers)
+        if (!ciphertext) {
+            const rawDecoded = es.decodeGlossiaSubject(rawBody);
+            if (rawDecoded) {
+                ciphertext = rawDecoded;
+                console.log('[JS] DM: glossia-decoded raw body to ciphertext, length:', ciphertext.length);
+            }
+        }
+
+        // 3. Fallback: use raw body as-is (might be base64 ciphertext)
+        if (!ciphertext) {
+            ciphertext = rawBody.trim();
+        }
+
+        // Build a minimal email-like object for decryptNostrMessageWithFallback
+        console.log('[JS] DM: attempting decrypt with contactPubkey:', contactPubkey?.substring(0, 20),
+            'myPubkey:', window.appState.getKeypair()?.public_key?.substring(0, 20),
+            'ciphertext len:', ciphertext?.length);
+        const fakeEmail = { sender_pubkey: contactPubkey };
+        try {
+            const decrypted = await es.decryptNostrMessageWithFallback(fakeEmail, ciphertext, keypair);
+            if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
+                console.log('[JS] DM: Frontend decryption succeeded');
+                return decrypted;
+            }
+        } catch (err) {
+            console.warn('[JS] DM: Frontend decryption failed:', err.message);
+        }
+
+        return '[Failed to decrypt email body]';
     }
 
     // Download attachment from DM conversation email

@@ -100,7 +100,21 @@ Hello, this is a plaintext message.
 
 ### 3.5 Reply Format
 
-When replying, only the new reply content is encrypted/signed independently. The original message is nested inside the outer armor block, before the reply's SIGNATURE. This preserves the original message's signature for independent verification and avoids double-encryption. Nesting depth is determined by BEGIN/END tag pairing, not by quote prefixes.
+When replying, the new reply content is encrypted independently, but the reply's signature covers the entire conversation — the reply body bytes concatenated with all nested quoted body bytes (flattened). The original message is nested inside the outer armor block, before the reply's SIGNATURE. Inner signatures are preserved for independent verification of earlier messages. Nesting depth is determined by BEGIN/END tag pairing, not by quote prefixes.
+
+#### 3.5.0 Signature Coverage in Replies
+
+Each signature covers the **flat concatenation** of its own body's decoded bytes plus all nested quoted body bytes, recursively:
+
+```
+L1 original signature covers:  decode(L1)
+L2 reply signature covers:     decode(L2) || decode(L1)
+L3 reply signature covers:     decode(L3) || decode(L2) || decode(L1)
+```
+
+Where `decode()` means glossia-decoding (for encoded content) or base64-decoding (for raw ciphertext) the armor body content at that level, and `||` is byte concatenation.
+
+This ensures that each reply author authenticates not just their own message but the entire conversation history they are responding to. A tampered inner message will cause the outer signature to fail verification, providing chain-of-custody integrity.
 
 #### 3.5.1 Encrypted Reply
 
@@ -111,12 +125,12 @@ When replying, only the new reply content is encrypted/signed independently. The
 <original message ciphertext>
 ----- BEGIN NOSTR SIGNATURE -----
 @OriginalAuthor
-<original signature (64 bytes)>
+<original signature (64 bytes)>              ← signs: decode(original)
 <original author pubkey (32 bytes)>
 ----- END NOSTR MESSAGE -----
 ----- BEGIN NOSTR SIGNATURE -----
 @ReplyAuthor
-<reply signature (64 bytes)>
+<reply signature (64 bytes)>                 ← signs: decode(reply) || decode(original)
 <reply author pubkey (32 bytes)>
 ----- END NOSTR MESSAGE -----
 ```
@@ -136,19 +150,19 @@ In a signed plaintext reply, the new reply text appears above the armor block fo
 <original glossia-encoded plaintext>
 ----- BEGIN NOSTR SIGNATURE -----
 @OriginalAuthor
-<original signature (64 bytes)>
+<original signature (64 bytes)>              ← signs: decode(original)
 <original author pubkey (32 bytes)>
 ----- END NOSTR MESSAGE -----
 ----- BEGIN NOSTR SIGNATURE -----
 @ReplyAuthor
-<reply signature (64 bytes)>
+<reply signature (64 bytes)>                 ← signs: decode(reply) || decode(original)
 <reply author pubkey (32 bytes)>
 ----- END NOSTR MESSAGE -----
 ```
 
 #### 3.5.3 Reply Chains
 
-For reply chains, nesting increases with each level. Signatures close in innermost-first order:
+For reply chains, nesting increases with each level. Signatures close in innermost-first order. Each signature covers the flat concatenation of all body bytes from its level inward:
 
 ```
 ----- BEGIN NOSTR ... -----
@@ -158,15 +172,15 @@ For reply chains, nesting increases with each level. Signatures close in innermo
 ----- BEGIN NOSTR ... -----
 <L1 original body>
 ----- BEGIN NOSTR SIGNATURE -----
-@L1Author
+@L1Author                            ← signs: decode(L1)
 ...
 ----- END NOSTR MESSAGE -----
 ----- BEGIN NOSTR SIGNATURE -----
-@L2Author
+@L2Author                            ← signs: decode(L2) || decode(L1)
 ...
 ----- END NOSTR MESSAGE -----
 ----- BEGIN NOSTR SIGNATURE -----
-@L3Author
+@L3Author                            ← signs: decode(L3) || decode(L2) || decode(L1)
 ...
 ----- END NOSTR MESSAGE -----
 ```
@@ -181,12 +195,14 @@ Signing is user-controlled and can be applied at any stage to the current body b
 
 | Operation | What gets signed | Result |
 |-----------|-----------------|--------|
-| Sign plaintext | `SHA-256(decode(armor_body))` | Proves authorship of content |
+| Sign plaintext | `SHA-256(decode(armor_body) \|\| decode(quoted_bodies))` | Proves authorship of content + conversation history |
 | Sign then encrypt | Signature inside ciphertext | Only recipient can verify |
-| Encrypt then sign | `SHA-256(decode(armor_body))` | Proves sender without revealing content |
+| Encrypt then sign | `SHA-256(decode(armor_body) \|\| decode(quoted_bodies))` | Proves sender without revealing content |
 | Sign, encrypt, sign | Both layers | Full trust chain |
 
-The signing target is always the bytes obtained by decoding the armor block content. For glossia-encoded content, this means decoding the prose back to binary. For base64 content, this means base64-decoding. The signature is never on the raw plaintext or the encoded prose itself — it is on the canonical decoded bytes, which survive transport regardless of reformatting.
+The signing target is the **flat concatenation** of the decoded bytes from the current armor body and all nested quoted armor bodies (recursively). For glossia-encoded content, decoding means transcoding the prose back to binary. For base64 content, it means base64-decoding. The signature is never on the raw plaintext or the encoded prose itself — it is on the canonical decoded bytes, which survive transport regardless of reformatting.
+
+For messages with no quoted content, this reduces to `SHA-256(decode(armor_body))`. For replies, the concatenation provides chain-of-custody integrity — modifying any message in the conversation history invalidates all subsequent signatures.
 
 ## 5. Content Encoding (Glossia)
 

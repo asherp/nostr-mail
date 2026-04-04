@@ -493,14 +493,19 @@ class DMService {
                 dmConversationHeader.style.display = 'none';
             }
             
-            // Hide back button in tab-header
+            // Restore "Messages" title and hide back button in tab-header
             const tabHeader = document.querySelector('#dm .tab-header');
+            const messagesTitle = tabHeader?.querySelector('h2');
+            if (messagesTitle) {
+                messagesTitle.style.display = '';
+            }
+            const backToMessagesBtn = tabHeader?.querySelector('.dm-back-to-messages-btn');
+            if (backToMessagesBtn) {
+                backToMessagesBtn.style.display = 'none';
+            }
             const tabHeaderBackBtn = tabHeader?.querySelector('.back-to-nav-btn');
             if (tabHeaderBackBtn) {
                 tabHeaderBackBtn.style.display = 'none';
-                // Remove btn btn-secondary classes when hiding
-                tabHeaderBackBtn.classList.remove('btn', 'btn-secondary');
-                // Restore original handler (will be set up by setupBackButtons)
                 tabHeaderBackBtn.onclick = null;
             }
             
@@ -564,26 +569,39 @@ class DMService {
             dmContainer.classList.add('dm-conversation-view');
             this.dmNavState = 'conversation';
             
-            // Show back button in tab-header (left of "Messages")
+            // Replace "Messages" h2 with back button in tab header
             const tabHeader = document.querySelector('#dm .tab-header');
+            const messagesTitle = tabHeader?.querySelector('h2');
+            if (messagesTitle) {
+                messagesTitle.style.display = 'none';
+            }
+            // Hide the back-to-nav-btn (not needed here)
             const tabHeaderBackBtn = tabHeader?.querySelector('.back-to-nav-btn');
             if (tabHeaderBackBtn) {
-                // Add btn btn-secondary classes to match "back to inbox" button styling
-                tabHeaderBackBtn.classList.add('btn', 'btn-secondary');
-                tabHeaderBackBtn.style.display = 'flex';
-                // Update click handler to go back to DM list instead of navbar
-                tabHeaderBackBtn.onclick = (e) => {
+                tabHeaderBackBtn.style.display = 'none';
+            }
+            // Show or create the "Back to Messages" button in the tab header
+            let backToMessagesBtn = tabHeader?.querySelector('.dm-back-to-messages-btn');
+            if (!backToMessagesBtn && tabHeader) {
+                backToMessagesBtn = document.createElement('button');
+                backToMessagesBtn.className = 'btn btn-secondary dm-back-to-messages-btn';
+                backToMessagesBtn.innerHTML = '<i class="fas fa-arrow-left"></i> Back to Messages';
+                const headerLeft = tabHeader.querySelector('div');
+                if (headerLeft) {
+                    headerLeft.appendChild(backToMessagesBtn);
+                }
+            }
+            if (backToMessagesBtn) {
+                backToMessagesBtn.style.display = 'inline-flex';
+                backToMessagesBtn.onclick = (e) => {
                     e.preventDefault();
                     e.stopPropagation();
                     this.showDmList();
                 };
             }
-            
+
             // Load messages for this contact
             this.loadDmMessages(contactPubkey);
-            
-            // Show back button after messages are loaded (it will be created in loadDmMessages)
-            // The back button handler is already set up in loadDmMessages
         } catch (error) {
             console.error('Error showing DM conversation:', error);
         }
@@ -836,14 +854,13 @@ class DMService {
             }
             // --- End avatar fallback logic ---
             
-            // Back button is now handled in showDmConversation() - no need to create it here
             // Hide the dm-conversation-header if it exists
             const dmConversationHeader = document.getElementById('dm-conversation-header');
             if (dmConversationHeader) {
                 dmConversationHeader.style.display = 'none';
             }
-            
-            // Create conversation header with contact info (no back button here)
+
+            // Create conversation header with contact info
             const headerElement = document.createElement('div');
             headerElement.className = 'conversation-header';
             headerElement.innerHTML = `
@@ -856,7 +873,7 @@ class DMService {
                 </div>
             `;
             dmMessages.appendChild(headerElement);
-            
+
             // Add click handler to avatar to navigate to contacts page
             const avatarElement = headerElement.querySelector('.contact-avatar');
             if (avatarElement) {
@@ -983,11 +1000,10 @@ class DMService {
                                     await this.loadEmailBody(message, expandableElement, contactPubkey);
                                 } else {
                                     summaryElement.setAttribute('data-expanded', 'false');
-                                    // Remove email content when collapsing
-                                    const emailContent = expandableElement.querySelector('.email-body-content-text');
-                                    if (emailContent) {
-                                        expandableElement.removeChild(emailContent);
-                                    }
+                                    // Remove all loaded content (body, attachments, etc.) except the summary
+                                    Array.from(expandableElement.children).forEach(child => {
+                                        if (child !== summaryElement) child.remove();
+                                    });
                                 }
                             });
                         }
@@ -1826,8 +1842,11 @@ class DMService {
             }
         } catch (armorErr) {
             console.warn('[JS] DM: decodeGlossiaArmoredBody crashed, trying manual extract:', armorErr.message);
+        }
 
-            // Manual fallback: extract glossia content from armor and try each detected dialect
+        // If decodeGlossiaArmoredBody returned null or crashed,
+        // manually extract armor content and try each detected dialect
+        if (!ciphertext) {
             const gs = window.GlossiaService;
             if (gs && gs.isReady()) {
                 const armorMatch = rawBody.replace(/\r\n/g, '\n').match(

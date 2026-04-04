@@ -2957,6 +2957,23 @@ class EmailService {
                                 // Glossia-encoded body — decode to ciphertext
                                 const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
                                 encryptedContent = glossiaResult ? glossiaResult.ciphertext : null;
+                                if (!encryptedContent) {
+                                    // decodeGlossiaArmoredBody failed — try each dialect manually
+                                    const gs = window.GlossiaService;
+                                    if (gs && gs.isReady()) {
+                                        const detections = gs.detectDialect(armorContent);
+                                        for (const det of (detections || [])) {
+                                            try {
+                                                const result = gs.transcode(armorContent, `decode from ${det.language}`);
+                                                let decoded = result.output;
+                                                if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
+                                                decoded = gs._autoUnpack(decoded);
+                                                encryptedContent = decoded;
+                                                break;
+                                            } catch (_) { /* try next dialect */ }
+                                        }
+                                    }
+                                }
                             }
                             if (!encryptedContent) {
                                 // Glossia decode failed — can't decrypt
@@ -2990,11 +3007,19 @@ class EmailService {
                                 console.error('[JS] Manifest decryption failed for preview:', e);
                                 // If manifest fails, try legacy decryption
                                 try {
-                                    const decrypted = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                                    let decrypted = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
                                     // Check if decryption returned an error message
                                     if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
                                         previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
                                     } else {
+                                        // Fallback may have returned manifest JSON — try AES-decrypting
+                                        try {
+                                            const fm = JSON.parse(decrypted);
+                                            if (fm.body && fm.body.ciphertext && fm.body.key_wrap) {
+                                                const aesBody = await this.decryptWithAES(fm.body.ciphertext, fm.body.key_wrap);
+                                                decrypted = atob(aesBody);
+                                            }
+                                        } catch (_) { /* not JSON or AES failed */ }
                                         previewText = Utils.escapeHtml(decrypted.substring(0, 100));
                                         showSubject = true;
                                     }
@@ -3502,6 +3527,24 @@ class EmailService {
                                     decryptedSubject = 'Unable to decrypt';
                                 }
                             }
+                            // WASM glossia may have failed — fall back to backend native Rust
+                            if (!bodyCiphertext && encryptedBodyMatch) {
+                                const armorContent = encryptedBodyMatch[2].trim();
+                                const nip = encryptedBodyMatch[1]; // e.g. "NIP-44" or "NIP-04"
+                                const algo = nip === 'NIP-04' ? 'nip04' : 'nip44';
+                                const gs = window.GlossiaService;
+                                const detections = gs && gs.isReady() ? gs.detectDialect(armorContent) : [];
+                                const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : 'latin';
+                                try {
+                                    bodyCiphertext = await window.__TAURI__.core.invoke('decode_glossia', {
+                                        text: armorContent, language: dialect, algorithm: algo,
+                                    });
+                                    bodyIsGlossia = true;
+                                    console.log('[JS] Inbox: backend glossia decode succeeded, dialect:', dialect, 'len:', bodyCiphertext.length, 'preview:', bodyCiphertext.substring(0, 60));
+                                } catch (e) {
+                                    console.warn('[JS] Inbox: backend glossia decode failed:', e);
+                                }
+                            }
                             if (bodyCiphertext) {
                                 try {
                                     console.log('[JS] Attempting manifest decryption for detail view...');
@@ -3531,6 +3574,16 @@ class EmailService {
                                         if (decryptedBody && (decryptedBody.startsWith('Unable to decrypt') || decryptedBody.includes('Unable to decrypt'))) {
                                             decryptedSubject = 'Unable to decrypt';
                                             decryptedBody = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                                        } else {
+                                            // Fallback may have returned manifest JSON — try AES-decrypting
+                                            try {
+                                                const fallbackManifest = JSON.parse(decryptedBody);
+                                                if (fallbackManifest.body && fallbackManifest.body.ciphertext && fallbackManifest.body.key_wrap) {
+                                                    manifestResult = { type: 'manifest', manifest: fallbackManifest };
+                                                    const aesBody = await this.decryptWithAES(fallbackManifest.body.ciphertext, fallbackManifest.body.key_wrap);
+                                                    decryptedBody = atob(aesBody);
+                                                }
+                                            } catch (_) { /* not JSON or AES failed — keep decryptedBody as-is */ }
                                         }
                                     } catch (legacyErr) {
                                         console.error('[JS] Legacy decryption also failed:', legacyErr);
@@ -3617,6 +3670,19 @@ class EmailService {
                                         } else {
                                             const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
                                             encryptedContent = glossiaResult ? glossiaResult.ciphertext : null;
+                                            // WASM failed — use backend native Rust
+                                            if (!encryptedContent) {
+                                                const nip = encryptedBodyMatch[1];
+                                                const algo = nip === 'NIP-04' ? 'nip04' : 'nip44';
+                                                const gs = window.GlossiaService;
+                                                const dets = gs && gs.isReady() ? gs.detectDialect(armorContent) : [];
+                                                const dialect = (Array.isArray(dets) && dets.length > 0) ? dets[0].language : 'latin';
+                                                try {
+                                                    encryptedContent = await window.__TAURI__.core.invoke('decode_glossia', {
+                                                        text: armorContent, language: dialect, algorithm: algo,
+                                                    });
+                                                } catch (_) {}
+                                            }
                                         }
                                         if (encryptedContent) {
                                             const keypair = appState.getKeypair();
@@ -4761,8 +4827,16 @@ ${attachmentsHtml}
 
         // Decrypt
         const decryptNpub = window.CryptoService._nip19.npubEncode(decryptPubkeyHex);
-        const decrypted = await TauriService.decryptDmContent(keypair.private_key, decryptNpub, ciphertext);
+        let decrypted = await TauriService.decryptDmContent(keypair.private_key, decryptNpub, ciphertext);
         if (!decrypted || decrypted.startsWith('Unable to decrypt')) throw new Error(decrypted || 'Decryption failed');
+        // If decrypted content is manifest JSON, AES-decrypt the body
+        try {
+            const fm = JSON.parse(decrypted);
+            if (fm.body && fm.body.ciphertext && fm.body.key_wrap) {
+                const aesBody = await window.emailService.decryptWithAES(fm.body.ciphertext, fm.body.key_wrap);
+                decrypted = atob(aesBody);
+            }
+        } catch (_) { /* not JSON or AES failed — use as-is */ }
         return Utils.fixUtf8Encoding(decrypted);
     }
 
@@ -4817,36 +4891,31 @@ ${attachmentsHtml}
             return null;
         }
 
-        try {
-            const detections = gs.detectDialect(content);
-            console.log('[JS] decodeGlossiaArmoredBody: detected dialects:', detections);
-            if (!Array.isArray(detections) || detections.length === 0) {
-                console.warn('[JS] decodeGlossiaArmoredBody: no dialect detected');
-                return null;
+        // Loop through supported dialects until one succeeds.
+        // The WASM transcode can panic for a mismatched dialect, so we
+        // catch per-dialect and continue to the next one.
+        const supportedDialects = ['latin', 'english'];
+        for (const dialect of supportedDialects) {
+            try {
+                const result = gs.transcode(content, `decode from ${dialect}`);
+                let decoded = result.output;
+
+                // Convert hex to base64 if needed
+                if (gs._isHex(decoded)) {
+                    decoded = gs._hexToBase64(decoded);
+                }
+
+                // Unpack NIP-04 binary format if applicable
+                decoded = gs._autoUnpack(decoded);
+
+                console.log('[JS] decodeGlossiaArmoredBody: succeeded with dialect:', dialect, 'len:', decoded.length);
+                return { ciphertext: decoded, nip, isGlossia: true, dialect };
+            } catch (e) {
+                console.warn('[JS] decodeGlossiaArmoredBody: dialect', dialect, 'failed:', e.message);
             }
-            // Use the best match (first element) — language field maps to meta instruction
-            const dialect = detections[0].language;
-            if (!dialect) {
-                console.warn('[JS] decodeGlossiaArmoredBody: no language in detection result');
-                return null;
-            }
-
-            const result = gs.transcode(content, `decode from ${dialect}`);
-            let decoded = result.output;
-
-            // Convert hex to base64 if needed
-            if (gs._isHex(decoded)) {
-                decoded = gs._hexToBase64(decoded);
-            }
-
-            // Unpack NIP-04 binary format if applicable
-            decoded = gs._autoUnpack(decoded);
-
-            return { ciphertext: decoded, nip, isGlossia: true, dialect };
-        } catch (e) {
-            console.error('[JS] decodeGlossiaArmoredBody: glossia decode failed:', e);
-            return null;
         }
+        console.error('[JS] decodeGlossiaArmoredBody: all dialects failed');
+        return null;
     }
 
     /**
@@ -8471,11 +8540,34 @@ ${attachmentsHtml}
                     return;
                 }
                 
-                // Decrypt the manifest to get attachment keys (use decryptManifestMessage for inbox)
-                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                const manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
-                
-                if (manifestResult.type !== 'manifest') {
+                // Decrypt the manifest to get attachment keys
+                const armorContent = encryptedBodyMatch[1].trim();
+                let encryptedContent;
+                if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
+                    encryptedContent = armorContent.replace(/\s+/g, '');
+                } else {
+                    const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
+                    encryptedContent = glossiaResult ? glossiaResult.ciphertext : null;
+                }
+                if (!encryptedContent) {
+                    window.notificationService.showError('Cannot decrypt attachment: failed to decode body');
+                    return;
+                }
+                let manifestResult;
+                try {
+                    manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                } catch (e) {
+                    // Fallback: NIP-decrypt and parse manifest JSON directly
+                    try {
+                        const raw = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                        const fm = JSON.parse(raw);
+                        if (fm.attachments) {
+                            manifestResult = { type: 'manifest', manifest: fm };
+                        }
+                    } catch (_) {}
+                }
+
+                if (!manifestResult || manifestResult.type !== 'manifest') {
                     window.notificationService.showError('Cannot decrypt attachment: invalid manifest');
                     return;
                 }
@@ -8565,14 +8657,35 @@ ${attachmentsHtml}
                     return;
                 }
                 
-                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
-                
-                if (manifestResult.type !== 'manifest') {
+                const armorContent = encryptedBodyMatch[1].trim();
+                let encryptedContent;
+                if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
+                    encryptedContent = armorContent.replace(/\s+/g, '');
+                } else {
+                    const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
+                    encryptedContent = glossiaResult ? glossiaResult.ciphertext : null;
+                }
+                if (!encryptedContent) {
+                    window.notificationService.showError('Cannot decrypt attachments: failed to decode body');
+                    return;
+                }
+                try {
+                    manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                } catch (e) {
+                    try {
+                        const raw = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
+                        const fm = JSON.parse(raw);
+                        if (fm.attachments) {
+                            manifestResult = { type: 'manifest', manifest: fm };
+                        }
+                    } catch (_) {}
+                }
+
+                if (!manifestResult || manifestResult.type !== 'manifest') {
                     window.notificationService.showError('Cannot decrypt attachments: invalid manifest');
                     return;
                 }
-                
+
                 console.log(`[JS] Manifest decrypted successfully, has ${manifestResult.manifest.attachments.length} attachments`);
             }
             

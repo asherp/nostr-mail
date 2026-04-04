@@ -11,6 +11,8 @@ mod types;
 pub mod state;
 mod storage;
 mod database;
+#[allow(dead_code, unused_imports)]
+pub mod nostr_mail_capnp;
 
 use types::*;
 pub use state::{AppState, Relay};
@@ -3749,6 +3751,96 @@ fn decode_bip39(text: String, language: String, wordlist: String, algorithm: Str
     }
 }
 
+/// Decode glossia-encoded text back to the original data string using the full
+/// pipeline (grammar + codec lookup).  Unlike `decode_bip39` this uses the
+/// correct codec for each language/dialect instead of hardcoding "bip39".
+///
+/// The `language` hint from the frontend is tried first, but if it fails we
+/// fall back to server-side dialect detection (which doesn't depend on WASM).
+#[tauri::command]
+fn decode_glossia(text: String, language: String, algorithm: String) -> Result<String, String> {
+    use base64::Engine;
+
+    println!("[RUST] decode_glossia called with language: {}, algorithm: {}, text_len: {}", language, algorithm, text.len());
+
+    // Only try supported email dialects — other detected dialects (meta, cs,
+    // crypto/cashu) require filesystem language files not available in Tauri.
+    let mut languages_to_try = vec!["latin".to_string(), "english".to_string()];
+    if !languages_to_try.contains(&language) {
+        languages_to_try.push(language.clone());
+    }
+
+    println!("[RUST] decode_glossia: trying languages: {:?}", languages_to_try);
+
+    let mut last_err = String::new();
+    for lang in &languages_to_try {
+        // Catch panics from codec bugs (e.g. index out of bounds) so the app doesn't abort
+        let text_clone = text.clone();
+        let lang_clone = lang.clone();
+        let result = std::panic::catch_unwind(move || {
+            glossia::decode_from_language(&text_clone, &lang_clone, "default", false)
+        });
+        match result {
+            Ok(Ok(decoded)) => {
+                let preview = if decoded.len() > 80 { &decoded[..80] } else { &decoded };
+                println!("[RUST] decode_glossia succeeded with language: {}, output len: {}, preview: {:?}", lang, decoded.len(), preview);
+                return decode_glossia_postprocess(decoded, &algorithm);
+            },
+            Ok(Err(e)) => {
+                println!("[RUST] decode_glossia failed with language {}: {:?}", lang, e);
+                last_err = format!("{:?}", e);
+            },
+            Err(panic_info) => {
+                let msg = panic_info.downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                println!("[RUST] decode_glossia panicked with language {}: {}", lang, msg);
+                last_err = format!("panic: {}", msg);
+            }
+        }
+    }
+
+    Err(format!("Glossia decode failed for all languages {:?}: {}", languages_to_try, last_err))
+}
+
+/// Post-process glossia decode output: handle hex→base64 conversion and NIP-04 unpacking.
+fn decode_glossia_postprocess(decoded: String, algorithm: &str) -> Result<String, String> {
+    use base64::Engine;
+
+    let is_hex = !decoded.is_empty()
+        && decoded.len() % 2 == 0
+        && decoded.chars().all(|c| c.is_ascii_hexdigit());
+
+    if is_hex {
+        println!("[RUST] decode_glossia_postprocess: output is hex ({} chars), converting to base64", decoded.len());
+        let bytes: Vec<u8> = (0..decoded.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&decoded[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|e| format!("Hex decode failed: {}", e))?;
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        if algorithm == "nip04" && bytes.len() >= 2 {
+            let payload_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+            if 2 + payload_len <= bytes.len() {
+                let payload_b64 = b64.encode(&bytes[2..2 + payload_len]);
+                let iv_b64 = b64.encode(&bytes[2 + payload_len..]);
+                let result = format!("{}?iv={}", payload_b64, iv_b64);
+                println!("[RUST] decode_glossia_postprocess: NIP-04 result len: {}", result.len());
+                return Ok(result);
+            }
+        }
+        let result = b64.encode(&bytes);
+        println!("[RUST] decode_glossia_postprocess: base64 result len: {}", result.len());
+        Ok(result)
+    } else {
+        // Already a valid string (e.g. base64 for NIP-44) — return as-is
+        println!("[RUST] decode_glossia_postprocess: returning as-is (not hex), len: {}", decoded.len());
+        Ok(decoded)
+    }
+}
+
 #[tauri::command]
 async fn fetch_nostr_emails_last_24h(email_config: EmailConfig) -> Result<Vec<EmailMessage>, String> {
     email::fetch_nostr_emails_last_24h(&email_config)
@@ -4860,6 +4952,36 @@ fn db_update_email_subject_hash(message_id: String, subject_hash: String, state:
     db.update_email_subject_hash(&message_id, &subject_hash).map_err(|e| e.to_string())
 }
 
+/// Extract armor content preserving spaces (for glossia-encoded bodies).
+/// Returns the raw text between armor markers, only trimming leading/trailing whitespace.
+fn extract_glossia_content_from_armor(body: &str) -> Option<String> {
+    let start_pos = body.find("BEGIN NOSTR NIP-")
+        .and_then(|bp| {
+            let prefix = &body[..bp];
+            let dash_start = prefix.rfind("---")?;
+            Some(dash_start)
+        })?;
+
+    let after_header = body[start_pos..].find('\n')? + start_pos + 1;
+    let end_pos = body[after_header..].find("END NOSTR")
+        .or_else(|| body[after_header..].find("BEGIN NOSTR SIGNATURE"))
+        .or_else(|| body[after_header..].find("BEGIN NOSTR SEAL"))
+        .map(|p| after_header + p)?;
+
+    let end_line_start = body[..end_pos].rfind('\n').map(|p| p + 1).unwrap_or(end_pos);
+
+    let content = body[after_header..end_line_start].trim();
+    if content.is_empty() {
+        return None;
+    }
+    // Only return if content has spaces (glossia words); pure base64 is handled by the other extractor
+    if content.contains(' ') {
+        Some(content.to_string())
+    } else {
+        None
+    }
+}
+
 /// Extract encrypted content from ASCII armor.
 /// Handles both `-----BEGIN` and `----- BEGIN` (with optional spaces after dashes).
 fn extract_encrypted_content_from_armor(body: &str) -> Option<String> {
@@ -5039,8 +5161,54 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pu
         }
     }
 
-    // Decryption failed (likely glossia-encoded) — return raw body so frontend can
-    // glossia-decode + NIP-decrypt itself.
+    // Direct NIP decrypt failed — content is likely glossia-encoded.
+    // Try glossia decode (native Rust) then NIP decrypt.
+    println!("[RUST] Direct decrypt failed, trying glossia decode + NIP decrypt");
+    if let Some(glossia_ciphertext) = extract_glossia_content_from_armor(&email.body) {
+        // Only try supported email dialects (latin, english) — other detected
+        // dialects (meta, cs, crypto/cashu) require filesystem language files
+        // that aren't available in the Tauri app context.
+        let languages = vec!["latin".to_string(), "english".to_string()];
+        println!("[RUST] Glossia trying supported dialects: {:?}", languages);
+
+        for language in &languages {
+            let ciphertext_clone = glossia_ciphertext.clone();
+            let lang_clone = language.clone();
+            let result = std::panic::catch_unwind(move || {
+                glossia::decode_from_language(&ciphertext_clone, &lang_clone, "default", false)
+            });
+            match result {
+                Ok(Ok(decoded)) => {
+                    println!("[RUST] Glossia decode succeeded with {}, output len: {}", language, decoded.len());
+                    // Try NIP decrypt with each pubkey
+                    for pubkey in &pubkeys_to_try {
+                        match nostr::decrypt_dm_content(&private_key, pubkey, &decoded) {
+                            Ok(decrypted_body) => {
+                                println!("[RUST] Glossia + NIP decrypt succeeded with pubkey: {}", pubkey);
+                                return Ok(Some(types::MatchingEmailBodyResult {
+                                    body: decrypted_body,
+                                    email_id: email_id,
+                                    encrypted: false,
+                                    sender_pubkey: email.sender_pubkey.clone(),
+                                }));
+                            },
+                            Err(e) => {
+                                println!("[RUST] Glossia + NIP decrypt failed with pubkey {}: {}", pubkey, e);
+                            }
+                        }
+                    }
+                },
+                Ok(Err(e)) => {
+                    println!("[RUST] Glossia decode failed with {}: {:?}", language, e);
+                },
+                Err(_) => {
+                    println!("[RUST] Glossia decode panicked with {}, skipping", language);
+                }
+            }
+        }
+    }
+
+    // All attempts failed — return raw body so frontend can try
     println!("[RUST] Failed to decrypt email body server-side, returning raw body for frontend decryption");
     Ok(Some(types::MatchingEmailBodyResult {
         body: email.body.clone(),
@@ -5221,6 +5389,7 @@ pub fn run() {
         encrypt_message_with_algorithm,
         encode_bip39,
         decode_bip39,
+        decode_glossia,
         db_save_relay,
         db_get_all_relays,
         db_delete_relay,

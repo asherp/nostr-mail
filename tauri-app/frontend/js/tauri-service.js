@@ -583,6 +583,27 @@ const TauriService = {
 
     decodeBip39: async function(text, language, wordlist, algorithm) {
         return await this.invoke('decode_bip39', { text, language, wordlist, algorithm });
+    },
+
+    parseArmorMessage: async function(armorText) {
+        return await this.invoke('parse_armor_message', { armorText });
+    },
+
+    decryptEmailBody: async function(privateKey, armorText, subject, senderPubkey, recipientPubkey) {
+        return await this.invoke('decrypt_email_body', {
+            privateKey, armorText, subject,
+            senderPubkey: senderPubkey || null,
+            recipientPubkey: recipientPubkey || null,
+        });
+    },
+
+    decryptManifestAttachment: async function(attachmentDataB64, keyWrapB64, cipherSha256Hex, origFilename, origMime, attachmentId) {
+        return await this.invoke('decrypt_manifest_attachment', {
+            attachmentDataB64, keyWrapB64,
+            cipherSha256Hex: cipherSha256Hex || null,
+            origFilename, origMime,
+            attachmentId: attachmentId || null,
+        });
     }
 };
-window.TauriService = TauriService; 
+window.TauriService = TauriService;

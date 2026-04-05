@@ -3627,6 +3627,50 @@ fn encrypt_message_with_algorithm(private_key: String, public_key: String, messa
 }
 
 #[tauri::command]
+fn parse_armor_message(armor_text: String) -> Result<Option<types::ParsedArmorMessage>, String> {
+    Ok(email::parse_armor_components(&armor_text))
+}
+
+#[tauri::command]
+fn decrypt_email_body(
+    private_key: String,
+    armor_text: String,
+    subject: String,
+    sender_pubkey: Option<String>,
+    recipient_pubkey: Option<String>,
+) -> Result<types::DecryptEmailResult, String> {
+    email::decrypt_email_body_pipeline(
+        &private_key,
+        &armor_text,
+        &subject,
+        sender_pubkey.as_deref(),
+        recipient_pubkey.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn decrypt_manifest_attachment(
+    attachment_data_b64: String,
+    key_wrap_b64: String,
+    cipher_sha256_hex: Option<String>,
+    orig_filename: String,
+    orig_mime: String,
+    attachment_id: Option<String>,
+) -> Result<types::DecryptedAttachment, String> {
+    let mut result = email::decrypt_attachment_pipeline(
+        &attachment_data_b64,
+        &key_wrap_b64,
+        cipher_sha256_hex.as_deref(),
+        &orig_filename,
+        &orig_mime,
+    )?;
+    if let Some(id) = attachment_id {
+        result.id = id;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
 fn encode_bip39(ciphertext: String, language: String, wordlist: String, mode: String) -> Result<String, String> {
     use std::collections::HashSet;
     use glossia::generator::{PayloadTok, Lexicon, GenerationMode, SentenceLengthMode};
@@ -3805,40 +3849,12 @@ fn decode_glossia(text: String, language: String, algorithm: String) -> Result<S
 }
 
 /// Post-process glossia decode output: handle hex→base64 conversion and NIP-04 unpacking.
+/// Delegates to the shared implementation in email.rs.
 fn decode_glossia_postprocess(decoded: String, algorithm: &str) -> Result<String, String> {
-    use base64::Engine;
-
-    let is_hex = !decoded.is_empty()
-        && decoded.len() % 2 == 0
-        && decoded.chars().all(|c| c.is_ascii_hexdigit());
-
-    if is_hex {
-        println!("[RUST] decode_glossia_postprocess: output is hex ({} chars), converting to base64", decoded.len());
-        let bytes: Vec<u8> = (0..decoded.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&decoded[i..i + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-            .map_err(|e| format!("Hex decode failed: {}", e))?;
-
-        let b64 = base64::engine::general_purpose::STANDARD;
-        if algorithm == "nip04" && bytes.len() >= 2 {
-            let payload_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
-            if 2 + payload_len <= bytes.len() {
-                let payload_b64 = b64.encode(&bytes[2..2 + payload_len]);
-                let iv_b64 = b64.encode(&bytes[2 + payload_len..]);
-                let result = format!("{}?iv={}", payload_b64, iv_b64);
-                println!("[RUST] decode_glossia_postprocess: NIP-04 result len: {}", result.len());
-                return Ok(result);
-            }
-        }
-        let result = b64.encode(&bytes);
-        println!("[RUST] decode_glossia_postprocess: base64 result len: {}", result.len());
-        Ok(result)
-    } else {
-        // Already a valid string (e.g. base64 for NIP-44) — return as-is
-        println!("[RUST] decode_glossia_postprocess: returning as-is (not hex), len: {}", decoded.len());
-        Ok(decoded)
-    }
+    let result = email::glossia_postprocess(&decoded, algorithm)?;
+    let preview = if result.len() > 80 { &result[..80] } else { &result };
+    println!("[RUST] decode_glossia_postprocess: result len: {}, preview: {:?}", result.len(), preview);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -5387,6 +5403,9 @@ pub fn run() {
         encrypt_nip04_message,
         encrypt_nip04_message_legacy,
         encrypt_message_with_algorithm,
+        parse_armor_message,
+        decrypt_email_body,
+        decrypt_manifest_attachment,
         encode_bip39,
         decode_bip39,
         decode_glossia,

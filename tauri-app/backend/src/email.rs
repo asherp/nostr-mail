@@ -2492,6 +2492,1001 @@ fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
     Some((body_text, nested))
 }
 
+/// Decode a combined 96-byte signature+pubkey block.
+/// Tries glossia decode first (for encoded content), then raw hex fallback.
+/// Returns (sig_hex_128_chars, pubkey_hex_64_chars) or None.
+fn split_sig_pubkey(content: &str) -> Option<(String, String)> {
+    let content_len = content.len();
+    // Try glossia decode to 96 bytes (64-byte sig + 32-byte pubkey)
+    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
+        if bytes.len() == 96 {
+            println!("[RUST] split_sig_pubkey: glossia decoded {} chars → 96 bytes", content_len);
+            let sig_hex = hex::encode(&bytes[..64]);
+            let pubkey_hex = hex::encode(&bytes[64..]);
+            return Some((sig_hex, pubkey_hex));
+        }
+        println!("[RUST] split_sig_pubkey: glossia decoded {} chars → {} bytes (expected 96)", content_len, bytes.len());
+    }
+    // Fallback: raw hex (192 hex chars = 96 bytes)
+    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.len() == 192 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        println!("[RUST] split_sig_pubkey: raw hex 192 chars");
+        return Some((stripped[..128].to_string(), stripped[128..].to_string()));
+    }
+    println!("[RUST] split_sig_pubkey: failed (content_len={}, stripped_len={})", content_len, stripped.len());
+    None
+}
+
+/// Parse a complete ASCII-armored nostr-mail message into a structured result.
+/// Extracts body, signature, seal, profile names, prefix text, and nested quoted armor.
+///
+/// Internally builds a capnp ArmorMessage for schema validation and type identification:
+/// - Body union variant (encrypted/signed/plain) determined from BEGIN tag
+/// - NipVersion enum (nip04/nip44) set from the tag
+/// - SignatureBlock populated with decoded 64-byte sig + 32-byte pubkey
+/// - SealBlock populated with decoded 32-byte pubkey
+/// - Body.quoted recursively populated for nested reply chains
+///
+/// Returns a serde-friendly ParsedArmorMessage for Tauri JSON IPC.
+/// All serde fields are derived from reading the capnp message — nothing bypasses the schema.
+pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedArmorMessage> {
+    use crate::nostr_mail_capnp;
+
+    let preview: String = armor_text.chars().take(120).collect();
+    println!("[RUST] parse_armor_components: input length={} preview={:?}", armor_text.len(), preview);
+
+    // Build the capnp ArmorMessage — this is the parsing target
+    let mut capnp_msg = ::capnp::message::Builder::new_default();
+    let prefix_text = {
+        let armor_builder = capnp_msg.init_root::<nostr_mail_capnp::armor_message::Builder>();
+        populate_armor_from_text(armor_builder, armor_text)?
+    };
+
+    // Read the capnp message → serde struct (all fields derived from capnp)
+    let reader = capnp_msg.get_root_as_reader::<nostr_mail_capnp::armor_message::Reader>().ok()?;
+    let mut result = armor_message_to_serde(reader);
+    result.prefix_text = prefix_text;
+
+    println!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
+        result.body_type, result.encryption_nip, result.signature_hex.is_some(),
+        result.seal_pubkey_hex.is_some(), result.quoted.is_some());
+
+    Some(result)
+}
+
+/// Populate a capnp ArmorMessage builder from armor text.
+/// Writes directly into capnp builders — the capnp message IS the parsing result.
+/// Returns the prefix text (plaintext before the first armor delimiter), or None if no armor found.
+fn populate_armor_from_text(
+    mut armor_builder: crate::nostr_mail_capnp::armor_message::Builder<'_>,
+    armor_text: &str,
+) -> Option<Option<String>> {
+    use crate::nostr_mail_capnp;
+
+    let normalized = armor_text.replace("\r\n", "\n");
+
+    // Extract prefix text before first armor delimiter
+    let armor_start = normalized.find("----- BEGIN NOSTR ")
+        .or_else(|| normalized.find("--- BEGIN NOSTR "));
+    let prefix_text = match armor_start {
+        Some(idx) if idx > 0 => {
+            let p = normalized[..idx].trim();
+            if p.is_empty() { None } else { Some(p.to_string()) }
+        }
+        _ => None,
+    };
+    let armor_start = match armor_start {
+        Some(idx) => idx,
+        None => {
+            println!("[RUST] populate_armor_from_text: no armor delimiter found");
+            return None;
+        }
+    };
+
+    // ── Phase A: Line extraction (state machine) ──
+    let lines: Vec<&str> = normalized[armor_start..].lines().collect();
+
+    let is_begin_body = |l: &str| -> bool {
+        let t = l.trim().trim_matches('-').trim();
+        t.starts_with("BEGIN NOSTR NIP-") || t.starts_with("BEGIN NOSTR SIGNED")
+    };
+    let is_begin_sig = |l: &str| -> bool {
+        let t = l.trim().trim_matches('-').trim();
+        t == "BEGIN NOSTR SIGNATURE"
+    };
+    let is_begin_seal = |l: &str| -> bool {
+        let t = l.trim().trim_matches('-').trim();
+        t == "BEGIN NOSTR SEAL"
+    };
+    let is_end = |l: &str| -> bool {
+        let t = l.trim().trim_matches('-').trim();
+        t.starts_with("END NOSTR")
+    };
+
+    let mut depth: i32 = 0;
+    let mut state = "before";
+    let mut begin_tag = String::new();
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut quoted_armor_lines: Vec<&str> = Vec::new();
+    let mut sig_lines: Vec<&str> = Vec::new();
+    let mut seal_lines: Vec<&str> = Vec::new();
+
+    for line in &lines {
+        match state {
+            "before" => {
+                if is_begin_body(line) {
+                    depth = 1;
+                    state = "body";
+                    begin_tag = line.trim().to_string();
+                }
+            }
+            "body" => {
+                if is_begin_body(line) {
+                    depth += 1;
+                    state = "quoted";
+                    quoted_armor_lines.push(line);
+                } else if is_begin_sig(line) && depth == 1 {
+                    state = "sig";
+                } else if is_begin_seal(line) && depth == 1 {
+                    state = "seal";
+                } else if is_end(line) && depth == 1 {
+                    state = "done";
+                } else {
+                    body_lines.push(line);
+                }
+            }
+            "quoted" => {
+                quoted_armor_lines.push(line);
+                if is_begin_body(line) { depth += 1; }
+                else if is_end(line) {
+                    depth -= 1;
+                    if depth == 1 { state = "body"; }
+                }
+            }
+            "sig" => {
+                if is_end(line) { state = "done"; }
+                else if is_begin_seal(line) { state = "seal"; }
+                else { sig_lines.push(line); }
+            }
+            "seal" => {
+                if is_end(line) { state = "done"; }
+                else { seal_lines.push(line); }
+            }
+            _ => {}
+        }
+    }
+
+    if state == "before" {
+        println!("[RUST] populate_armor_from_text: state machine never left 'before'");
+        return None;
+    }
+
+    let body_text = body_lines.join("\n").trim().to_string();
+
+    // ── Phase B: Write directly into capnp builders ──
+
+    // Body: set union variant + decoded bytes + encoded content
+    let mut body_builder = armor_builder.reborrow().init_body();
+    body_builder.set_encoded_content(&body_text);
+
+    let is_encrypted = begin_tag.contains("ENCRYPTED");
+    let is_signed_body = begin_tag.contains("SIGNED");
+
+    if is_encrypted {
+        let mut enc = body_builder.reborrow().init_encrypted();
+        let nip_version = if begin_tag.contains("NIP-04") {
+            nostr_mail_capnp::NipVersion::Nip04
+        } else {
+            nostr_mail_capnp::NipVersion::Nip44
+        };
+        enc.set_nip(nip_version);
+        if let Some(bytes) = decode_armor_section(&body_text) {
+            enc.set_ciphertext(&bytes);
+        }
+    } else if is_signed_body {
+        let mut sgn = body_builder.reborrow().init_signed();
+        if let Some(bytes) = decode_armor_section(&body_text) {
+            sgn.set_plaintext(&bytes);
+        }
+    } else {
+        let mut pln = body_builder.reborrow().init_plain();
+        pln.set_text(&body_text);
+    }
+
+    // Quoted: recursively populate nested ArmorMessage
+    let stripped_quoted: Vec<&str> = quoted_armor_lines.iter().map(|l| {
+        if l.starts_with("> ") { &l[2..] }
+        else if *l == ">" { "" }
+        else { *l }
+    }).collect();
+    if !stripped_quoted.is_empty() {
+        let quoted_text = stripped_quoted.join("\n").trim().to_string();
+        if !quoted_text.is_empty() {
+            let quoted_builder = body_builder.init_quoted();
+            // Recursive: populate the nested ArmorMessage
+            populate_armor_from_text(quoted_builder, &quoted_text);
+        }
+    }
+
+    // Signature block: decode sig+pubkey, write to capnp
+    if !sig_lines.is_empty() {
+        let mut sig_builder = armor_builder.reborrow().init_signature();
+
+        if let Some(name_line) = sig_lines.iter().find(|l| l.trim().starts_with('@')) {
+            sig_builder.set_profile_name(name_line.trim().trim_start_matches('@'));
+        }
+
+        let content_lines: Vec<&str> = sig_lines.iter()
+            .filter(|l| !l.trim().starts_with('@'))
+            .copied()
+            .collect();
+        let all_content = content_lines.join("\n").trim().to_string();
+        if !all_content.is_empty() {
+            sig_builder.set_encoded_sig_pubkey(&all_content);
+            if let Some((sig_hex, pubkey_hex)) = split_sig_pubkey(&all_content) {
+                if let Ok(sig_bytes) = hex::decode(&sig_hex) {
+                    sig_builder.set_signature(&sig_bytes);
+                }
+                if let Ok(pk_bytes) = hex::decode(&pubkey_hex) {
+                    sig_builder.set_pubkey(&pk_bytes);
+                }
+            }
+        }
+    }
+
+    // Seal block: decode pubkey, write to capnp
+    if !seal_lines.is_empty() {
+        let mut seal_builder = armor_builder.reborrow().init_seal();
+
+        if let Some(name_line) = seal_lines.iter().find(|l| l.trim().starts_with('@')) {
+            seal_builder.set_display_name(name_line.trim().trim_start_matches('@'));
+        }
+
+        let content_lines: Vec<&str> = seal_lines.iter()
+            .filter(|l| !l.trim().starts_with('@'))
+            .copied()
+            .collect();
+        let seal_content = content_lines.join("\n").trim().to_string();
+        if !seal_content.is_empty() {
+            // Try glossia decode for 32-byte pubkey
+            let mut decoded = false;
+            if let Some(bytes) = try_glossia_decode_to_bytes(&seal_content) {
+                if bytes.len() == 32 {
+                    seal_builder.set_pubkey(&bytes);
+                    decoded = true;
+                }
+            }
+            if !decoded {
+                // Fallback: raw hex (64 hex chars = 32 bytes)
+                let stripped: String = seal_content.chars().filter(|c| !c.is_whitespace()).collect();
+                if stripped.len() == 64 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+                    if let Ok(bytes) = hex::decode(&stripped) {
+                        seal_builder.set_pubkey(&bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    Some(prefix_text)
+}
+
+/// Read a capnp ArmorMessage and produce a serde-friendly ParsedArmorMessage.
+/// All fields are derived from the capnp reader — nothing bypasses the schema.
+fn armor_message_to_serde(reader: crate::nostr_mail_capnp::armor_message::Reader) -> crate::types::ParsedArmorMessage {
+    use crate::nostr_mail_capnp;
+
+    // Read body
+    let (body_text, body_type, encryption_nip, body_bytes_b64) = if reader.has_body() {
+        if let Ok(body) = reader.get_body() {
+            let encoded = if body.has_encoded_content() {
+                body.reborrow().get_encoded_content().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            match body.which() {
+                Ok(nostr_mail_capnp::body::Encrypted(enc)) => {
+                    let nip = match enc.get_nip() {
+                        Ok(nostr_mail_capnp::NipVersion::Nip04) => "nip04",
+                        _ => "nip44",
+                    };
+                    let bytes_b64 = if enc.has_ciphertext() {
+                        enc.get_ciphertext().ok().map(|d| general_purpose::STANDARD.encode(d))
+                    } else {
+                        None
+                    };
+                    (encoded, "encrypted".to_string(), Some(nip.to_string()), bytes_b64)
+                }
+                Ok(nostr_mail_capnp::body::Signed(sgn)) => {
+                    let bytes_b64 = if sgn.has_plaintext() {
+                        sgn.get_plaintext().ok().map(|d| general_purpose::STANDARD.encode(d))
+                    } else {
+                        None
+                    };
+                    (encoded, "signed".to_string(), None, bytes_b64)
+                }
+                Ok(nostr_mail_capnp::body::Plain(pln)) => {
+                    let text = pln.get_text().map(|t| t.to_string().unwrap_or_default()).unwrap_or_default();
+                    (text, "plain".to_string(), None, None)
+                }
+                _ => (encoded, "unknown".to_string(), None, None),
+            }
+        } else {
+            (String::new(), "unknown".to_string(), None, None)
+        }
+    } else {
+        (String::new(), "unknown".to_string(), None, None)
+    };
+
+    // Read signature block
+    let (signature_hex, sig_pubkey_hex, profile_name, raw_sig_pubkey) = if reader.has_signature() {
+        if let Ok(sig) = reader.get_signature() {
+            let sig_hex = if sig.has_signature() {
+                sig.get_signature().ok().map(|d| hex::encode(d))
+            } else {
+                None
+            };
+            let pk_hex = if sig.has_pubkey() {
+                sig.get_pubkey().ok().map(|d| hex::encode(d))
+            } else {
+                None
+            };
+            let name = if sig.has_profile_name() {
+                sig.get_profile_name().ok().and_then(|s| s.to_str().ok()).map(|s| s.to_string())
+            } else {
+                None
+            };
+            let raw = if sig.has_encoded_sig_pubkey() {
+                sig.get_encoded_sig_pubkey().ok().and_then(|s| s.to_str().ok()).map(|s| s.to_string())
+            } else {
+                None
+            };
+            (sig_hex, pk_hex, name, raw)
+        } else {
+            (None, None, None, None)
+        }
+    } else {
+        (None, None, None, None)
+    };
+
+    // Read seal block
+    let (seal_pubkey_hex, seal_display_name) = if reader.has_seal() {
+        if let Ok(seal) = reader.get_seal() {
+            let pk_hex = if seal.has_pubkey() {
+                seal.get_pubkey().ok().map(|d| hex::encode(d))
+            } else {
+                None
+            };
+            let name = if seal.has_display_name() {
+                seal.get_display_name().ok().and_then(|s| s.to_str().ok()).map(|s| s.to_string())
+            } else {
+                None
+            };
+            (pk_hex, name)
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let display_name = seal_display_name.or_else(|| profile_name.clone());
+
+    // Read quoted (recursive)
+    let (quoted, quoted_armor_text) = if reader.has_body() {
+        if let Ok(body) = reader.get_body() {
+            if body.has_quoted() {
+                if let Ok(quoted_reader) = body.get_quoted() {
+                    let inner = armor_message_to_serde(quoted_reader);
+                    // Reconstruct quoted armor text from the inner encodedContent for JS compat
+                    let qt = if quoted_reader.has_body() {
+                        quoted_reader.get_body().ok().and_then(|b| {
+                            if b.has_encoded_content() {
+                                b.get_encoded_content().ok().and_then(|s| s.to_str().ok()).map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    (Some(Box::new(inner)), qt)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    crate::types::ParsedArmorMessage {
+        body_text,
+        body_type,
+        encryption_nip,
+        signature_hex,
+        sig_pubkey_hex,
+        seal_pubkey_hex,
+        profile_name,
+        display_name,
+        raw_sig_pubkey,
+        prefix_text: None, // Set by caller (prefix_text is outside the capnp message)
+        quoted,
+        quoted_armor_text,
+        body_bytes_b64,
+    }
+}
+
+// ── Shared glossia/NIP postprocess helpers ──────────────────────────
+
+/// Post-process glossia decode output: hex→base64 conversion and NIP-04 unpacking.
+/// Mirrors JS: _isHex → _hexToBase64 → _autoUnpack pipeline.
+/// Moved from lib.rs decode_glossia_postprocess so both Tauri commands and email decrypt can use it.
+pub fn glossia_postprocess(decoded: &str, algorithm: &str) -> Result<String, String> {
+    use base64::Engine;
+
+    let is_hex = !decoded.is_empty()
+        && decoded.len() % 2 == 0
+        && decoded.chars().all(|c| c.is_ascii_hexdigit());
+
+    if is_hex {
+        let bytes: Vec<u8> = (0..decoded.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&decoded[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|e| format!("Hex decode failed: {}", e))?;
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // NIP-04 binary unpack: [len_hi, len_lo, payload..., iv(16 bytes)] → base64?iv=base64
+        if algorithm == "nip04" && bytes.len() >= 2 {
+            let payload_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+            if 2 + payload_len <= bytes.len() {
+                let payload_b64 = b64.encode(&bytes[2..2 + payload_len]);
+                let iv_b64 = b64.encode(&bytes[2 + payload_len..]);
+                return Ok(format!("{}?iv={}", payload_b64, iv_b64));
+            }
+        }
+        Ok(b64.encode(&bytes))
+    } else {
+        // Already a valid string (e.g. base64 for NIP-44) — return as-is
+        Ok(decoded.to_string())
+    }
+}
+
+/// Check if content looks like base64 or base64?iv=base64 (already ciphertext, not glossia).
+/// Mirrors JS: /^[A-Za-z0-9+/=?]+$/.test(stripped)
+fn is_base64_content(content: &str) -> bool {
+    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '?')
+}
+
+// is_likely_encrypted_content is defined as pub fn later in this file (line ~3918)
+
+/// Glossia-decode body content to NIP-decrypt-ready ciphertext string.
+/// Mirrors JS: decodeGlossiaArmoredBody — tries latin then english, hex→base64, auto-unpack.
+/// The `nip_hint` is "nip04" or "nip44" from the armor BEGIN tag.
+fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result<String, String> {
+    // If already base64 or base64?iv=base64, return as-is
+    if is_base64_content(encoded_content) {
+        let stripped: String = encoded_content.chars().filter(|c| !c.is_whitespace()).collect();
+        return Ok(stripped);
+    }
+
+    // Try all dialects and pick the longest decoded output.
+    // decode_from_language with the wrong language silently returns a truncated result
+    // (matching only words that happen to overlap), so we can't trust the first success.
+    let languages = ["latin", "english"];
+    let mut best_decoded: Option<(String, String)> = None; // (decoded_hex, lang)
+    let mut last_err = String::new();
+    for lang in &languages {
+        let text = encoded_content.to_string();
+        let lang_str = lang.to_string();
+        let result = std::panic::catch_unwind(move || {
+            glossia::decode_from_language(&text, &lang_str, "default", false)
+        });
+        match result {
+            Ok(Ok(decoded)) => {
+                match &best_decoded {
+                    Some((prev, _)) if prev.len() >= decoded.len() => {
+                        // Previous was longer or equal, keep it
+                    }
+                    _ => {
+                        best_decoded = Some((decoded, lang.to_string()));
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                last_err = format!("{:?}", e);
+            }
+            Err(panic_info) => {
+                let msg = panic_info.downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                last_err = format!("panic: {}", msg);
+            }
+        }
+    }
+
+    // Use the longest decoded result
+    if let Some((decoded, _lang)) = best_decoded {
+        return glossia_postprocess(&decoded, nip_hint);
+    }
+
+    Err(format!("Glossia decode failed for all languages: {}", last_err))
+}
+
+/// Glossia-decode subject (payload_only mode, hit_rate >= 0.8).
+/// Mirrors JS: decodeGlossiaSubject — uses "decode from <dialect> raw" mode.
+fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
+    if subject.is_empty() || is_likely_encrypted_content(subject) {
+        return None;
+    }
+
+    // Detect dialect with hit_rate filtering
+    let words: Vec<String> = subject.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.is_empty() {
+        return None;
+    }
+    let detect_result = std::panic::catch_unwind(move || {
+        glossia::detect_dialect_best(&words)
+    });
+    let dialect = match detect_result {
+        Ok(Some(best)) if best.hit_rate >= 0.8 => best.language.clone(),
+        _ => return None
+    };
+
+    // Try decoding with both "default" and "raw" wordlists, pick longest
+    let wordlists = ["default", "raw"];
+    let mut best_decoded: Option<String> = None;
+    for wl in &wordlists {
+        let text = subject.to_string();
+        let lang = dialect.clone();
+        let wl_str = wl.to_string();
+        let decode_result = std::panic::catch_unwind(move || {
+            glossia::decode_from_language(&text, &lang, &wl_str, false)
+        });
+        match decode_result {
+            Ok(Ok(decoded)) => {
+                match &best_decoded {
+                    Some(prev) if prev.len() >= decoded.len() => {}
+                    _ => { best_decoded = Some(decoded); }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match best_decoded {
+        Some(decoded) => {
+            glossia_postprocess(&decoded, nip_hint).ok()
+        }
+        _ => None,
+    }
+}
+
+// ── Decrypt pipeline ─────────────────────────────────────────────────
+
+/// JSON manifest structs for legacy email format (serde deserialization).
+#[derive(Debug, serde::Deserialize)]
+struct JsonManifest {
+    body: Option<JsonEncryptedBlob>,
+    attachments: Option<Vec<JsonAttachment>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct JsonEncryptedBlob {
+    ciphertext: String,
+    cipher_sha256: Option<String>,
+    #[allow(dead_code)]
+    cipher_size: Option<u64>,
+    key_wrap: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct JsonAttachment {
+    id: String,
+    orig_filename: String,
+    orig_mime: String,
+    cipher_sha256: Option<String>,
+    cipher_size: Option<u64>,
+    key_wrap: String,
+}
+
+/// Determine which pubkey to use for NIP decryption at a given armor level.
+/// Mirrors JS: _decryptFromArmorParts pubkey selection logic.
+/// Returns hex pubkey string.
+fn determine_decrypt_pubkey(
+    sig_pubkey_hex: Option<&str>,
+    seal_pubkey_hex: Option<&str>,
+    user_pubkey_hex: &str,
+    fallback_pubkey: &str,
+) -> Result<String, String> {
+    // Get pubkey from seal or signature block
+    let other_pubkey = seal_pubkey_hex
+        .or(sig_pubkey_hex)
+        .ok_or_else(|| "No pubkey in seal/signature block".to_string())?;
+
+    // If it's the user's own pubkey, use fallback (the other party)
+    if other_pubkey == user_pubkey_hex {
+        if fallback_pubkey.is_empty() {
+            return Err("Cannot determine recipient pubkey (seal pubkey matches user)".to_string());
+        }
+        // Convert npub to hex if needed
+        if fallback_pubkey.starts_with("npub1") {
+            let pk = nostr_sdk::prelude::PublicKey::parse(fallback_pubkey)
+                .map_err(|e| format!("Invalid fallback npub: {:?}", e))?;
+            Ok(pk.to_hex())
+        } else {
+            Ok(fallback_pubkey.to_string())
+        }
+    } else {
+        Ok(other_pubkey.to_string())
+    }
+}
+
+/// Decrypt a single armor block level.
+/// Mirrors JS: _decryptFromArmorParts + manifest detection.
+fn decrypt_single_block(
+    body_text: &str,
+    body_type: &str,
+    encryption_nip: Option<&str>,
+    sig_pubkey_hex: Option<&str>,
+    seal_pubkey_hex: Option<&str>,
+    profile_name: Option<&str>,
+    private_key: &str,
+    user_pubkey_hex: &str,
+    fallback_pubkey: &str,
+) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
+    use base64::Engine;
+
+    let mut block = crate::types::DecryptedBlock {
+        decrypted_text: None,
+        error: None,
+        was_encrypted: body_type == "encrypted",
+        profile_name: profile_name.map(|s| s.to_string()),
+        body_type: body_type.to_string(),
+    };
+
+    if body_type != "encrypted" {
+        // Signed/plain blocks aren't encrypted — return body text as-is
+        block.decrypted_text = Some(body_text.to_string());
+        return (block, None);
+    }
+
+    let nip = encryption_nip.unwrap_or("nip44");
+
+    // Step 1: Glossia-decode body text → ciphertext string
+    let ciphertext = match glossia_decode_to_ciphertext(body_text, nip) {
+        Ok(ct) => ct,
+        Err(e) => {
+            block.error = Some(format!("Glossia decode failed: {}", e));
+            return (block, None);
+        }
+    };
+
+    // Step 2: Determine which pubkey to decrypt with
+    let decrypt_pubkey_hex = match determine_decrypt_pubkey(sig_pubkey_hex, seal_pubkey_hex, user_pubkey_hex, fallback_pubkey) {
+        Ok(pk) => pk,
+        Err(e) => {
+            block.error = Some(e);
+            return (block, None);
+        }
+    };
+
+    // Step 3: NIP decrypt
+    let decrypt_npub = match nostr_sdk::prelude::PublicKey::parse(&decrypt_pubkey_hex) {
+        Ok(pk) => {
+            use nostr_sdk::prelude::ToBech32;
+            pk.to_bech32().unwrap_or_default()
+        }
+        Err(e) => {
+            block.error = Some(format!("Invalid decrypt pubkey: {:?}", e));
+            return (block, None);
+        }
+    };
+
+    let decrypted = match crate::nostr::decrypt_dm_content(private_key, &decrypt_npub, &ciphertext) {
+        Ok(d) => d,
+        Err(e) => {
+            block.error = Some(format!("NIP decrypt failed: {}", e));
+            return (block, None);
+        }
+    };
+
+    // Step 4: Detect manifest vs legacy
+    let trimmed = decrypted.trim();
+    if trimmed.starts_with('{') {
+        // Try JSON manifest parse
+        if let Ok(manifest) = serde_json::from_str::<JsonManifest>(trimmed) {
+            if let Some(ref body_blob) = manifest.body {
+                // AES decrypt the manifest body
+                let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.key_wrap) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        block.error = Some(format!("Manifest key_wrap base64 decode failed: {}", e));
+                        return (block, Some(manifest));
+                    }
+                };
+                let ct_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.ciphertext) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        block.error = Some(format!("Manifest ciphertext base64 decode failed: {}", e));
+                        return (block, Some(manifest));
+                    }
+                };
+
+                match crate::crypto::aes_gcm_decrypt_raw(&key_bytes, &ct_bytes) {
+                    Ok(plaintext_bytes) => {
+                        // The plaintext is base64-encoded UTF-8 body (matching JS: atob(aesResult))
+                        match String::from_utf8(plaintext_bytes) {
+                            Ok(b64_body) => {
+                                // Decode the base64 to get the actual text
+                                match base64::engine::general_purpose::STANDARD.decode(b64_body.trim()) {
+                                    Ok(body_bytes) => {
+                                        match String::from_utf8(body_bytes) {
+                                            Ok(text) => block.decrypted_text = Some(text),
+                                            Err(_) => block.decrypted_text = Some(b64_body),
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Not base64 — use as-is (the plaintext IS the body)
+                                        block.decrypted_text = Some(b64_body);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                block.error = Some("Manifest body AES plaintext is not UTF-8".to_string());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        block.error = Some(format!("Manifest AES decrypt failed: {}", e));
+                    }
+                }
+                return (block, Some(manifest));
+            }
+        }
+    }
+
+    // Legacy format: decrypted content is the body text directly
+    block.decrypted_text = Some(decrypted);
+    (block, None)
+}
+
+/// Walk the capnp ArmorMessage tree recursively, decrypting each encrypted block.
+/// Returns results innermost-first (matching JS decryptAllEncryptedBlocks convention).
+fn decrypt_armor_tree(
+    parsed: &crate::types::ParsedArmorMessage,
+    private_key: &str,
+    user_pubkey_hex: &str,
+    fallback_pubkey: &str,
+) -> (Vec<crate::types::DecryptedBlock>, Option<JsonManifest>) {
+    let mut results = Vec::new();
+    let mut outer_manifest = None;
+
+    // Recurse into quoted first (innermost-first ordering)
+    if let Some(ref quoted) = parsed.quoted {
+        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, fallback_pubkey);
+        results.extend(inner_results);
+    }
+
+    // Decrypt this level
+    let (block, manifest) = decrypt_single_block(
+        &parsed.body_text,
+        &parsed.body_type,
+        parsed.encryption_nip.as_deref(),
+        parsed.sig_pubkey_hex.as_deref(),
+        parsed.seal_pubkey_hex.as_deref(),
+        parsed.profile_name.as_deref().or(parsed.display_name.as_deref()),
+        private_key,
+        user_pubkey_hex,
+        fallback_pubkey,
+    );
+    if manifest.is_some() {
+        outer_manifest = manifest;
+    }
+    results.push(block);
+
+    (results, outer_manifest)
+}
+
+/// Top-level decrypt pipeline: parse armor → decrypt tree → decrypt subject → assemble result.
+/// Mirrors the full JS decryptManifestMessage + decryptAllEncryptedBlocks pipeline.
+pub fn decrypt_email_body_pipeline(
+    private_key: &str,
+    armor_text: &str,
+    subject: &str,
+    sender_pubkey: Option<&str>,
+    recipient_pubkey: Option<&str>,
+) -> Result<crate::types::DecryptEmailResult, String> {
+    println!("[RUST] decrypt_email_body: armor_len={} subject_len={}", armor_text.len(), subject.len());
+
+    // Normalize line endings (spec section 8 step 2)
+    let normalized = armor_text.replace("\r\n", "\n");
+
+    // Parse armor into capnp ArmorMessage → serde struct
+    let parsed = match parse_armor_components(&normalized) {
+        Some(p) => p,
+        None => {
+            println!("[RUST] decrypt_email_body: no armor found");
+            return Ok(crate::types::DecryptEmailResult {
+                subject: subject.to_string(),
+                body: armor_text.to_string(),
+                is_manifest: false,
+                attachments: Vec::new(),
+                block_results: Vec::new(),
+                success: false,
+                error: Some("No armor block found in email body".to_string()),
+            });
+        }
+    };
+
+    // Derive user's pubkey hex from private key
+    let user_pubkey_hex = {
+        let sk = nostr_sdk::prelude::SecretKey::parse(private_key)
+            .map_err(|e| format!("Invalid private key: {:?}", e))?;
+        let keys = nostr_sdk::prelude::Keys::new(sk);
+        keys.public_key().to_hex()
+    };
+
+    // Determine fallback pubkey (the other party's pubkey for decryption)
+    let fallback = sender_pubkey
+        .or(recipient_pubkey)
+        .unwrap_or("");
+
+    // Walk the armor tree, decrypt each level
+    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback);
+
+    // Extract outermost decrypted body (last element in innermost-first array)
+    let outer_block = block_results.last();
+    let body = outer_block
+        .and_then(|b| b.decrypted_text.clone())
+        .unwrap_or_else(|| {
+            outer_block
+                .and_then(|b| b.error.clone())
+                .unwrap_or_else(|| armor_text.to_string())
+        });
+    let success = outer_block.map(|b| b.decrypted_text.is_some()).unwrap_or(false);
+    let error = if success { None } else { outer_block.and_then(|b| b.error.clone()) };
+
+    // Extract attachment metadata from manifest
+    let (is_manifest, attachments) = if let Some(ref m) = manifest {
+        let atts = m.attachments.as_ref().map(|att_list| {
+            att_list.iter().map(|a| crate::types::ManifestAttachmentInfo {
+                id: a.id.clone(),
+                orig_filename: a.orig_filename.clone(),
+                orig_mime: a.orig_mime.clone(),
+                key_wrap_b64: a.key_wrap.clone(),
+                cipher_sha256_hex: a.cipher_sha256.clone(),
+                cipher_size: a.cipher_size.unwrap_or(0),
+            }).collect()
+        }).unwrap_or_default();
+        (true, atts)
+    } else {
+        (false, Vec::new())
+    };
+
+    // Decrypt subject
+    let decrypted_subject = if parsed.body_type == "encrypted" {
+        // Determine NIP hint from the outer block for subject decoding
+        let nip_hint = parsed.encryption_nip.as_deref().unwrap_or("nip44");
+        decrypt_subject(subject, private_key, &user_pubkey_hex, fallback, nip_hint)
+    } else {
+        subject.to_string()
+    };
+
+    println!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={}",
+        success, is_manifest, block_results.len(), attachments.len());
+
+    Ok(crate::types::DecryptEmailResult {
+        subject: decrypted_subject,
+        body,
+        is_manifest,
+        attachments,
+        block_results,
+        success,
+        error,
+    })
+}
+
+/// Decrypt the email subject.
+/// Mirrors JS: decodeGlossiaSubject + NIP decrypt.
+fn decrypt_subject(
+    subject: &str,
+    private_key: &str,
+    user_pubkey_hex: &str,
+    fallback_pubkey: &str,
+    nip_hint: &str,
+) -> String {
+    if subject.is_empty() {
+        return subject.to_string();
+    }
+
+    // Try to get ciphertext from subject
+    let ciphertext = if is_likely_encrypted_content(subject) {
+        // Already base64 or base64?iv=base64
+        subject.to_string()
+    } else if let Some(decoded) = glossia_decode_subject(subject, nip_hint) {
+        decoded
+    } else {
+        // Not encrypted, return as-is
+        return subject.to_string();
+    };
+
+    // Determine which pubkey to use — use fallback (other party's pubkey)
+    let decrypt_pubkey = if fallback_pubkey.is_empty() {
+        return subject.to_string();
+    } else if fallback_pubkey.starts_with("npub1") {
+        fallback_pubkey.to_string()
+    } else {
+        use nostr_sdk::prelude::ToBech32;
+        match nostr_sdk::prelude::PublicKey::parse(fallback_pubkey) {
+            Ok(pk) => pk.to_bech32().unwrap_or_else(|_| fallback_pubkey.to_string()),
+            Err(_) => return subject.to_string(),
+        }
+    };
+
+    match crate::nostr::decrypt_dm_content(private_key, &decrypt_pubkey, &ciphertext) {
+        Ok(decrypted) => decrypted,
+        Err(_) => subject.to_string(),
+    }
+}
+
+/// Decrypt a manifest attachment (separate from body for large payloads).
+pub fn decrypt_attachment_pipeline(
+    attachment_data_b64: &str,
+    key_wrap_b64: &str,
+    cipher_sha256_hex: Option<&str>,
+    orig_filename: &str,
+    orig_mime: &str,
+) -> Result<crate::types::DecryptedAttachment, String> {
+    use base64::Engine;
+    use sha2::{Sha256, Digest};
+
+    println!("[RUST] decrypt_attachment: data_len={} filename={:?}", attachment_data_b64.len(), orig_filename);
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // Decode attachment data
+    let encrypted_data = b64.decode(attachment_data_b64)
+        .map_err(|e| format!("Attachment data base64 decode failed: {}", e))?;
+
+    // Decode AES key
+    let key_bytes = b64.decode(key_wrap_b64)
+        .map_err(|e| format!("key_wrap base64 decode failed: {}", e))?;
+
+    // Verify SHA-256 if provided (warn on mismatch but continue, matching JS behavior)
+    if let Some(expected_hash) = cipher_sha256_hex {
+        let mut hasher = Sha256::new();
+        hasher.update(&encrypted_data);
+        let actual_hash = hex::encode(hasher.finalize());
+        if actual_hash != expected_hash {
+            println!("[RUST] decrypt_attachment_pipeline: hash mismatch (expected {}, got {}) — continuing anyway", expected_hash, actual_hash);
+        }
+    }
+
+    // AES-256-GCM decrypt with padding removal
+    let decrypted = crate::crypto::aes_gcm_decrypt_padded(&key_bytes, &encrypted_data)
+        .map_err(|e| format!("Attachment AES decrypt failed: {}", e))?;
+
+    let size = decrypted.len();
+    let data_b64 = b64.encode(&decrypted);
+
+    Ok(crate::types::DecryptedAttachment {
+        id: String::new(), // Caller sets this
+        filename: orig_filename.to_string(),
+        content_type: orig_mime.to_string(),
+        data_b64,
+        size,
+    })
+}
+
 /// Extract binary ciphertext from the email body for signing/verification.
 /// For ASCII-armored bodies: extracts glossia-encoded or base64 payload and decodes to bytes.
 /// For nested reply chains, uses depth-counting to separate each level and concatenates
@@ -3382,6 +4377,327 @@ mod tests {
         let result = extract_ciphertext_binary(&body);
         assert_eq!(result, original_bytes,
             "glossia body should decode correctly with combined signature block");
+    }
+
+    // =============================================
+    // parse_armor_components tests
+    // =============================================
+
+    #[test]
+    fn test_parse_armor_components_encrypted_nip44() {
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert_eq!(result.body_type, "encrypted");
+        assert_eq!(result.encryption_nip.as_deref(), Some("nip44"));
+        assert_eq!(result.body_text, "SGVsbG8gV29ybGQ=");
+        assert!(result.signature_hex.is_none());
+        assert!(result.seal_pubkey_hex.is_none());
+        assert!(result.prefix_text.is_none());
+        assert!(result.quoted.is_none());
+    }
+
+    #[test]
+    fn test_parse_armor_components_encrypted_nip04() {
+        let body = "----- BEGIN NOSTR NIP-04 ENCRYPTED BODY -----\n\
+            SGVsbG8=?iv=dGVzdA==\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert_eq!(result.body_type, "encrypted");
+        assert_eq!(result.encryption_nip.as_deref(), Some("nip04"));
+    }
+
+    #[test]
+    fn test_parse_armor_components_signed_body() {
+        let body = "----- BEGIN NOSTR SIGNED BODY -----\n\
+            some glossia encoded text here\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert_eq!(result.body_type, "signed");
+        assert!(result.encryption_nip.is_none());
+        assert_eq!(result.body_text, "some glossia encoded text here");
+    }
+
+    #[test]
+    fn test_parse_armor_components_with_hex_signature() {
+        // 64-byte sig (128 hex) + 32-byte pubkey (64 hex) = 192 hex total
+        let sig_hex = "aa".repeat(64);   // 128 hex chars
+        let pub_hex = "bb".repeat(32);   // 64 hex chars
+        let combined = format!("{}{}", sig_hex, pub_hex);
+
+        let body = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n\
+            {}\n\
+            ----- END NOSTR MESSAGE -----",
+            combined
+        );
+
+        let result = parse_armor_components(&body).expect("should parse");
+        assert_eq!(result.body_type, "encrypted");
+        assert_eq!(result.signature_hex.as_deref(), Some(sig_hex.as_str()));
+        assert_eq!(result.sig_pubkey_hex.as_deref(), Some(pub_hex.as_str()));
+        assert_eq!(result.profile_name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn test_parse_armor_components_with_seal() {
+        let pub_hex = "cc".repeat(32); // 64 hex chars
+        let body = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8=\n\
+            ----- BEGIN NOSTR SEAL -----\n\
+            @Bob\n\
+            {}\n\
+            ----- END NOSTR MESSAGE -----",
+            pub_hex
+        );
+
+        let result = parse_armor_components(&body).expect("should parse");
+        assert_eq!(result.seal_pubkey_hex.as_deref(), Some(pub_hex.as_str()));
+        assert_eq!(result.display_name.as_deref(), Some("Bob"));
+        assert!(result.signature_hex.is_none());
+    }
+
+    #[test]
+    fn test_parse_armor_components_legacy_separate_seal() {
+        // Legacy format: SIGNATURE block followed by separate SEAL block
+        let sig_hex = "aa".repeat(64);
+        let sig_pub_hex = "bb".repeat(32);
+        let seal_pub_hex = "cc".repeat(32);
+        let combined_sig = format!("{}{}", sig_hex, sig_pub_hex);
+
+        let body = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8=\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n\
+            {}\n\
+            ----- BEGIN NOSTR SEAL -----\n\
+            @Bob\n\
+            {}\n\
+            ----- END NOSTR MESSAGE -----",
+            combined_sig, seal_pub_hex
+        );
+
+        let result = parse_armor_components(&body).expect("should parse");
+        assert_eq!(result.signature_hex.as_deref(), Some(sig_hex.as_str()));
+        assert_eq!(result.sig_pubkey_hex.as_deref(), Some(sig_pub_hex.as_str()));
+        assert_eq!(result.profile_name.as_deref(), Some("Alice"));
+        assert_eq!(result.seal_pubkey_hex.as_deref(), Some(seal_pub_hex.as_str()));
+        assert_eq!(result.display_name.as_deref(), Some("Bob"));
+    }
+
+    #[test]
+    fn test_parse_armor_components_prefix_text() {
+        let body = "Hello, this is plaintext.\n\n\
+            ----- BEGIN NOSTR SIGNED BODY -----\n\
+            glossia content\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert_eq!(result.prefix_text.as_deref(), Some("Hello, this is plaintext."));
+        assert_eq!(result.body_type, "signed");
+    }
+
+    #[test]
+    fn test_parse_armor_components_no_armor() {
+        let body = "Just a plain email with no armor blocks.";
+        assert!(parse_armor_components(body).is_none());
+    }
+
+    #[test]
+    fn test_parse_armor_components_nested_reply() {
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            reply_ciphertext_here\n\
+            ----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            original_ciphertext_here\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @OriginalAuthor\n\
+            aabbccdd\n\
+            ----- END NOSTR MESSAGE -----\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @ReplyAuthor\n\
+            eeff0011\n\
+            ----- END NOSTR MESSAGE -----";
+
+        let result = parse_armor_components(body).expect("should parse outer");
+        assert_eq!(result.body_text, "reply_ciphertext_here");
+        assert_eq!(result.profile_name.as_deref(), Some("ReplyAuthor"));
+
+        // Check nested quoted message
+        assert!(result.quoted.is_some());
+        assert!(result.quoted_armor_text.is_some());
+        let inner = result.quoted.as_ref().unwrap();
+        assert_eq!(inner.body_text, "original_ciphertext_here");
+        assert_eq!(inner.profile_name.as_deref(), Some("OriginalAuthor"));
+        assert_eq!(inner.body_type, "encrypted");
+    }
+
+    #[test]
+    fn test_parse_armor_components_body_bytes_base64() {
+        // Base64 body should decode to bytes and be returned as base64 in body_bytes_b64
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert!(result.body_bytes_b64.is_some());
+        // "SGVsbG8gV29ybGQ=" decodes to "Hello World"
+        let decoded = general_purpose::STANDARD.decode(result.body_bytes_b64.unwrap()).unwrap();
+        assert_eq!(std::str::from_utf8(&decoded).unwrap(), "Hello World");
+    }
+
+    #[test]
+    fn test_split_sig_pubkey_hex() {
+        let sig = "aa".repeat(64);
+        let pubkey = "bb".repeat(32);
+        let combined = format!("{}{}", sig, pubkey);
+        let (s, p) = split_sig_pubkey(&combined).expect("should split");
+        assert_eq!(s, sig);
+        assert_eq!(p, pubkey);
+    }
+
+    #[test]
+    fn test_split_sig_pubkey_too_short() {
+        assert!(split_sig_pubkey("aabb").is_none());
+    }
+
+    #[test]
+    fn test_parse_armor_components_body_bytes_match_extract_ciphertext() {
+        // Critical test: verify that body_bytes_b64 decoded matches extract_ciphertext_binary
+        // for the same input (ensuring signature verification compatibility)
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        let parsed = parse_armor_components(body).expect("should parse");
+        let parsed_bytes = general_purpose::STANDARD.decode(parsed.body_bytes_b64.unwrap()).unwrap();
+        let extract_bytes = extract_ciphertext_binary(body);
+        assert_eq!(parsed_bytes, extract_bytes,
+            "parse_armor_components body bytes must match extract_ciphertext_binary output");
+    }
+
+    // ── Decrypt pipeline tests ──────────────────────────────────
+
+    #[test]
+    fn test_is_base64_content() {
+        assert!(is_base64_content("SGVsbG8gV29ybGQ="));
+        assert!(is_base64_content("abc123+/=="));
+        assert!(is_base64_content("abc?iv=def")); // NIP-04 format
+        // Note: is_base64_content strips whitespace first (matching JS behavior),
+        // so it only rejects content with non-base64 chars like punctuation
+        assert!(!is_base64_content("Access are acoustic to crawl.")); // period
+        assert!(!is_base64_content("Hello, world!")); // comma and exclamation
+        assert!(!is_base64_content("")); // empty
+    }
+
+    #[test]
+    fn test_is_likely_encrypted_content() {
+        assert!(is_likely_encrypted_content("SGVsbG8gV29ybGQgdGhpcyBpcyBhIHRlc3Q="));
+        assert!(is_likely_encrypted_content("abc123def456ghi789jkl0mn+/=="));
+        assert!(!is_likely_encrypted_content("Re: Meeting tomorrow"));
+        assert!(!is_likely_encrypted_content("short"));
+        assert!(!is_likely_encrypted_content("user@example.com sent a message"));
+    }
+
+    #[test]
+    fn test_glossia_postprocess_hex_nip44() {
+        // Hex input for NIP-44 → base64 output
+        let hex = "48656c6c6f"; // "Hello" in hex
+        let result = glossia_postprocess(hex, "nip44").unwrap();
+        assert_eq!(result, "SGVsbG8="); // base64 of "Hello"
+    }
+
+    #[test]
+    fn test_glossia_postprocess_non_hex() {
+        // Non-hex input → returned as-is
+        let b64 = "SGVsbG8gV29ybGQ=";
+        let result = glossia_postprocess(b64, "nip44").unwrap();
+        assert_eq!(result, b64);
+    }
+
+    #[test]
+    fn test_glossia_postprocess_hex_nip04_unpack() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // Build NIP-04 packed format: [len_hi, len_lo, payload..., iv(16 bytes)]
+        let payload = b"encrypted_data!!"; // 16 bytes
+        let iv = b"0123456789abcdef"; // 16 bytes
+        let payload_len = payload.len() as u16;
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&payload_len.to_be_bytes());
+        packed.extend_from_slice(payload);
+        packed.extend_from_slice(iv);
+
+        let hex: String = packed.iter().map(|b| format!("{:02x}", b)).collect();
+        let result = glossia_postprocess(&hex, "nip04").unwrap();
+
+        // Should be base64(payload)?iv=base64(iv)
+        let expected = format!("{}?iv={}", b64.encode(payload), b64.encode(iv));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_glossia_decode_to_ciphertext_base64_passthrough() {
+        let b64 = "SGVsbG8gV29ybGQ=";
+        let result = glossia_decode_to_ciphertext(b64, "nip44").unwrap();
+        assert_eq!(result, b64);
+    }
+
+    #[test]
+    fn test_glossia_decode_to_ciphertext_nip04_passthrough() {
+        let nip04 = "SGVsbG8=?iv=V29ybGQ=";
+        let result = glossia_decode_to_ciphertext(nip04, "nip04").unwrap();
+        assert_eq!(result, nip04);
+    }
+
+    #[test]
+    fn test_determine_decrypt_pubkey_uses_seal() {
+        let seal = "aa".repeat(32); // 64 hex chars
+        let user = "bb".repeat(32);
+        let result = determine_decrypt_pubkey(None, Some(&seal), &user, "").unwrap();
+        assert_eq!(result, seal);
+    }
+
+    #[test]
+    fn test_determine_decrypt_pubkey_self_send_uses_fallback() {
+        let same = "aa".repeat(32);
+        let fallback = "cc".repeat(32);
+        let result = determine_decrypt_pubkey(None, Some(&same), &same, &fallback).unwrap();
+        assert_eq!(result, fallback);
+    }
+
+    #[test]
+    fn test_determine_decrypt_pubkey_prefers_seal_over_sig() {
+        let seal = "aa".repeat(32);
+        let sig = "bb".repeat(32);
+        let user = "cc".repeat(32);
+        let result = determine_decrypt_pubkey(Some(&sig), Some(&seal), &user, "").unwrap();
+        assert_eq!(result, seal);
+    }
+
+    #[test]
+    fn test_decrypt_single_block_non_encrypted() {
+        let (block, manifest) = decrypt_single_block(
+            "Hello world",
+            "plain",
+            None, None, None, None,
+            "nsec1fake", "aabb", "",
+        );
+        assert!(!block.was_encrypted);
+        assert_eq!(block.decrypted_text.as_deref(), Some("Hello world"));
+        assert!(manifest.is_none());
+    }
+
+    #[test]
+    fn test_json_manifest_parse() {
+        let json = r#"{"body":{"ciphertext":"dGVzdA==","cipher_sha256":"abc123","key_wrap":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},"attachments":[{"id":"a1","orig_filename":"test.pdf","orig_mime":"application/pdf","cipher_sha256":"def456","cipher_size":65536,"key_wrap":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}]}"#;
+        let manifest: JsonManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.body.is_some());
+        assert_eq!(manifest.attachments.as_ref().unwrap().len(), 1);
+        assert_eq!(manifest.attachments.as_ref().unwrap()[0].id, "a1");
+        assert_eq!(manifest.attachments.as_ref().unwrap()[0].orig_filename, "test.pdf");
     }
 }
 

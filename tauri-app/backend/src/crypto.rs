@@ -359,6 +359,38 @@ pub fn decrypt_setting_value(private_key: &str, encrypted_value: &str) -> Result
         .map_err(|e| anyhow::anyhow!("UTF-8 decode failed: {}", e))
 }
 
+/// AES-256-GCM decrypt with raw key bytes (not derived from private key).
+/// Input format: 12-byte nonce || ciphertext+tag (same layout as decrypt_setting_value).
+pub fn aes_gcm_decrypt_raw(key_bytes: &[u8], encrypted_data: &[u8]) -> Result<Vec<u8>> {
+    if key_bytes.len() != 32 {
+        return Err(anyhow::anyhow!("AES key must be 32 bytes, got {}", key_bytes.len()));
+    }
+    if encrypted_data.len() < 12 {
+        return Err(anyhow::anyhow!("Encrypted data too short (need at least 12-byte nonce)"));
+    }
+    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(&encrypted_data[..12]);
+    let ciphertext = &encrypted_data[12..];
+    cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| anyhow::anyhow!("AES-GCM decryption failed: {}", e))
+}
+
+/// AES-256-GCM decrypt + remove padding.
+/// After decryption, first 4 bytes are original size (little-endian u32),
+/// followed by the original data padded to 64 KiB boundaries.
+pub fn aes_gcm_decrypt_padded(key_bytes: &[u8], encrypted_data: &[u8]) -> Result<Vec<u8>> {
+    let plaintext = aes_gcm_decrypt_raw(key_bytes, encrypted_data)?;
+    if plaintext.len() < 4 {
+        return Err(anyhow::anyhow!("Decrypted data too short for padding header"));
+    }
+    let original_size = u32::from_le_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]) as usize;
+    if 4 + original_size > plaintext.len() {
+        return Err(anyhow::anyhow!("Original size {} exceeds plaintext length {}", original_size, plaintext.len() - 4));
+    }
+    Ok(plaintext[4..4 + original_size].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +433,74 @@ mod tests {
         let is_valid = validate_public_key(user_pubkey).unwrap();
         println!("User public key validation result: {}", is_valid);
         assert!(is_valid, "User public key should be valid");
+    }
+
+    #[test]
+    fn test_aes_gcm_decrypt_raw_roundtrip() {
+        // Encrypt then decrypt with raw key
+        let key_bytes = [0x42u8; 32];
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let plaintext = b"Hello, nostr-mail!";
+        let ciphertext = cipher.encrypt(&nonce, plaintext.as_ref()).unwrap();
+
+        // Combine nonce + ciphertext (same format as encrypt_setting_value)
+        let mut combined = nonce.to_vec();
+        combined.extend_from_slice(&ciphertext);
+
+        let decrypted = aes_gcm_decrypt_raw(&key_bytes, &combined).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_aes_gcm_decrypt_raw_wrong_key() {
+        let key_bytes = [0x42u8; 32];
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = cipher.encrypt(&nonce, b"secret".as_ref()).unwrap();
+
+        let mut combined = nonce.to_vec();
+        combined.extend_from_slice(&ciphertext);
+
+        // Decrypt with wrong key
+        let wrong_key = [0xFFu8; 32];
+        assert!(aes_gcm_decrypt_raw(&wrong_key, &combined).is_err());
+    }
+
+    #[test]
+    fn test_aes_gcm_decrypt_raw_bad_key_length() {
+        assert!(aes_gcm_decrypt_raw(&[0u8; 16], &[0u8; 28]).is_err());
+    }
+
+    #[test]
+    fn test_aes_gcm_decrypt_padded_roundtrip() {
+        // Simulate manifest attachment format: encrypt [size_le_u32 || data || padding]
+        let key_bytes = [0x42u8; 32];
+        let original_data = b"This is the original file content";
+        let original_size = original_data.len() as u32;
+
+        // Build padded plaintext: 4-byte LE size + data + zero padding to 64 KiB
+        let mut padded = Vec::new();
+        padded.extend_from_slice(&original_size.to_le_bytes());
+        padded.extend_from_slice(original_data);
+        // Pad to next 64 KiB boundary
+        let block = 65536;
+        let total = 4 + original_data.len();
+        let pad_len = if total % block == 0 { 0 } else { block - (total % block) };
+        padded.resize(padded.len() + pad_len, 0u8);
+
+        // Encrypt
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = cipher.encrypt(&nonce, padded.as_ref()).unwrap();
+        let mut combined = nonce.to_vec();
+        combined.extend_from_slice(&ciphertext);
+
+        // Decrypt with padding removal
+        let decrypted = aes_gcm_decrypt_padded(&key_bytes, &combined).unwrap();
+        assert_eq!(decrypted, original_data);
     }
 } 

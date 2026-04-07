@@ -219,7 +219,9 @@ pub fn verify_signature_bytes(public_key: &str, signature: &str, data: &[u8]) ->
     use ::secp256k1::{Message, Secp256k1, XOnlyPublicKey};
     use sha2::{Sha256, Digest};
 
-    let pubkey = PublicKey::from_bech32(public_key)?;
+    // Accept both npub (bech32) and hex pubkey formats
+    let pubkey = PublicKey::from_bech32(public_key)
+        .or_else(|_| PublicKey::from_hex(public_key))?;
     let secp = Secp256k1::verification_only();
 
     let sig_bytes = hex::decode(signature).map_err(|e| anyhow::anyhow!("Invalid hex signature: {}", e))?;
@@ -250,8 +252,10 @@ pub fn verify_signature_bytes(public_key: &str, signature: &str, data: &[u8]) ->
 pub fn verify_signature(public_key: &str, signature: &str, data: &str) -> Result<bool> {
     use ::secp256k1::{Message, Secp256k1, XOnlyPublicKey};
     use sha2::{Sha256, Digest};
-    
-    let pubkey = PublicKey::from_bech32(public_key)?;
+
+    // Accept both npub (bech32) and hex pubkey formats
+    let pubkey = PublicKey::from_bech32(public_key)
+        .or_else(|_| PublicKey::from_hex(public_key))?;
     let secp = Secp256k1::verification_only();
     
     // Parse signature from hex (schnorr signatures are 64 bytes = 128 hex chars)

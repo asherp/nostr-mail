@@ -386,6 +386,7 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         recipient_pubkey: email.recipient_pubkey.clone(),
         message_id: Some(email.message_id.clone()),
         signature_valid: email.signature_valid,
+        signature_source: email.signature_source.clone(),
     }
 }
 
@@ -610,29 +611,21 @@ fn verify_signature(public_key: String, signature: String, data: String) -> Resu
 fn recheck_email_signature(message_id: String, state: tauri::State<AppState>) -> Result<Option<bool>, String> {
     println!("[RUST] recheck_email_signature called for message_id: {}", message_id);
     let db = state.get_database().map_err(|e| e.to_string())?;
-    
+
     // Get the email from database
     let email = db.get_email(&message_id).map_err(|e| e.to_string())?
         .ok_or_else(|| "Email not found".to_string())?;
-    
-    // Extract signature and pubkey from raw headers
+
+    // Verify using both in-body (primary) and header (secondary) trust paths
     let raw_headers = email.raw_headers.as_deref().unwrap_or("");
-    let sender_pubkey = email::extract_nostr_pubkey_from_headers(raw_headers);
-    let signature = email::extract_nostr_sig_from_headers(raw_headers);
-    
-    if let (Some(pubkey), Some(sig)) = (sender_pubkey, signature) {
-        // Verify the signature
-        let is_valid = email::verify_email_signature(&pubkey, &sig, &email.body);
-        
-        // Update the database
-        db.update_signature_valid(&message_id, Some(is_valid)).map_err(|e| e.to_string())?;
-        
-        println!("[RUST] recheck_email_signature: Signature verification result: {}", is_valid);
-        Ok(Some(is_valid))
-    } else {
-        println!("[RUST] recheck_email_signature: Missing pubkey or signature");
-        Ok(None)
-    }
+    let (is_valid, source) = email::verify_email_signature_full(&email.body, raw_headers);
+
+    // Update the database
+    db.update_signature_valid(&message_id, is_valid).map_err(|e| e.to_string())?;
+    db.update_signature_source(&message_id, source.as_deref()).map_err(|e| e.to_string())?;
+
+    println!("[RUST] recheck_email_signature: result={:?}, source={:?}", is_valid, source);
+    Ok(is_valid)
 }
 
 #[tauri::command]
@@ -2201,6 +2194,12 @@ fn db_get_email(message_id: String, state: tauri::State<AppState>) -> Result<Opt
 }
 
 #[tauri::command]
+fn db_get_email_by_id(email_id: i64, state: tauri::State<AppState>) -> Result<Option<crate::database::Email>, String> {
+    let db = state.get_database()?;
+    db.get_email_by_id(email_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
     println!("[RUST] db_get_emails called");
     if let Some(ref email) = user_email {
@@ -2474,10 +2473,22 @@ fn db_get_all_sent_message_ids(user_email: Option<String>, state: tauri::State<A
 }
 
 #[tauri::command]
-fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
+fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
     let db = state.get_database()?;
     let emails = db.get_sent_emails(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
-    let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
+    // Filter by sender_pubkey if user_pubkey is provided — only show emails
+    // sent by the current keypair (avoids showing undecryptable emails from other profiles)
+    let filtered: Vec<_> = if let Some(ref upk) = user_pubkey {
+        emails.into_iter().filter(|e| {
+            match &e.sender_pubkey {
+                Some(spk) => spk == upk,
+                None => true, // Show emails without sender_pubkey (non-nostr or pre-header emails)
+            }
+        }).collect()
+    } else {
+        emails
+    };
+    let mapped: Vec<EmailMessage> = filtered.iter().map(map_db_email_to_email_message).collect();
     Ok(mapped)
 }
 
@@ -3803,8 +3814,6 @@ fn decode_bip39(text: String, language: String, wordlist: String, algorithm: Str
 /// fall back to server-side dialect detection (which doesn't depend on WASM).
 #[tauri::command]
 fn decode_glossia(text: String, language: String, algorithm: String) -> Result<String, String> {
-    use base64::Engine;
-
     println!("[RUST] decode_glossia called with language: {}, algorithm: {}, text_len: {}", language, algorithm, text.len());
 
     // Only try supported email dialects — other detected dialects (meta, cs,
@@ -4968,6 +4977,7 @@ fn db_update_email_subject_hash(message_id: String, subject_hash: String, state:
     db.update_email_subject_hash(&message_id, &subject_hash).map_err(|e| e.to_string())
 }
 
+#[allow(dead_code)]
 /// Extract armor content preserving spaces (for glossia-encoded bodies).
 /// Returns the raw text between armor markers, only trimming leading/trailing whitespace.
 fn extract_glossia_content_from_armor(body: &str) -> Option<String> {
@@ -5145,81 +5155,27 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pu
         return Ok(None);
     }
     
-    // Extract encrypted content from ASCII armor
-    let encrypted_content = match extract_encrypted_content_from_armor(&email.body) {
-        Some(content) => {
-            println!("[RUST] Extracted encrypted content from ASCII armor, length: {}", content.len());
-            content
-        },
-        None => {
-            println!("[RUST] No ASCII armor found in email body, trying raw body");
-            email.body.clone()
-        }
-    };
-    
-    // Try to decrypt the email body using each pubkey
+    // Use the unified decrypt pipeline (handles glossia, NIP-04/44, manifest, nested blocks)
+    // Try each candidate pubkey until one succeeds
     for pubkey in &pubkeys_to_try {
-        println!("[RUST] Trying to decrypt with pubkey: {}", pubkey);
-        match nostr::decrypt_dm_content(&private_key, pubkey, &encrypted_content) {
-            Ok(decrypted_body) => {
-                println!("[RUST] Successfully decrypted email body with pubkey: {}", pubkey);
+        let sender_pk = if user_received_email { Some(pubkey.as_str()) } else { None };
+        let recipient_pk = if user_sent_email { Some(pubkey.as_str()) } else { Some(pubkey.as_str()) };
+        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk) {
+            Ok(result) if result.success => {
+                println!("[RUST] decrypt_email_body_pipeline succeeded with pubkey: {}", pubkey);
                 return Ok(Some(types::MatchingEmailBodyResult {
-                    body: decrypted_body,
+                    body: result.body,
                     email_id: email_id,
                     encrypted: false,
                     sender_pubkey: email.sender_pubkey.clone(),
+                    attachments: result.attachments,
                 }));
-            },
-            Err(e) => {
-                println!("[RUST] Failed to decrypt with pubkey {}: {}", pubkey, e);
-                // Continue to try the next pubkey
             }
-        }
-    }
-
-    // Direct NIP decrypt failed — content is likely glossia-encoded.
-    // Try glossia decode (native Rust) then NIP decrypt.
-    println!("[RUST] Direct decrypt failed, trying glossia decode + NIP decrypt");
-    if let Some(glossia_ciphertext) = extract_glossia_content_from_armor(&email.body) {
-        // Only try supported email dialects (latin, english) — other detected
-        // dialects (meta, cs, crypto/cashu) require filesystem language files
-        // that aren't available in the Tauri app context.
-        let languages = vec!["latin".to_string(), "english".to_string()];
-        println!("[RUST] Glossia trying supported dialects: {:?}", languages);
-
-        for language in &languages {
-            let ciphertext_clone = glossia_ciphertext.clone();
-            let lang_clone = language.clone();
-            let result = std::panic::catch_unwind(move || {
-                glossia::decode_from_language(&ciphertext_clone, &lang_clone, "default", false)
-            });
-            match result {
-                Ok(Ok(decoded)) => {
-                    println!("[RUST] Glossia decode succeeded with {}, output len: {}", language, decoded.len());
-                    // Try NIP decrypt with each pubkey
-                    for pubkey in &pubkeys_to_try {
-                        match nostr::decrypt_dm_content(&private_key, pubkey, &decoded) {
-                            Ok(decrypted_body) => {
-                                println!("[RUST] Glossia + NIP decrypt succeeded with pubkey: {}", pubkey);
-                                return Ok(Some(types::MatchingEmailBodyResult {
-                                    body: decrypted_body,
-                                    email_id: email_id,
-                                    encrypted: false,
-                                    sender_pubkey: email.sender_pubkey.clone(),
-                                }));
-                            },
-                            Err(e) => {
-                                println!("[RUST] Glossia + NIP decrypt failed with pubkey {}: {}", pubkey, e);
-                            }
-                        }
-                    }
-                },
-                Ok(Err(e)) => {
-                    println!("[RUST] Glossia decode failed with {}: {:?}", language, e);
-                },
-                Err(_) => {
-                    println!("[RUST] Glossia decode panicked with {}, skipping", language);
-                }
+            Ok(result) => {
+                println!("[RUST] decrypt_email_body_pipeline failed with pubkey {}: {:?}", pubkey, result.error);
+            }
+            Err(e) => {
+                println!("[RUST] decrypt_email_body_pipeline error with pubkey {}: {}", pubkey, e);
             }
         }
     }
@@ -5231,6 +5187,7 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pu
         email_id: email_id,
         encrypted: true,
         sender_pubkey: email.sender_pubkey.clone(),
+        attachments: Vec::new(),
     }))
 }
 
@@ -5363,6 +5320,7 @@ pub fn run() {
         db_filter_new_contacts,
         db_save_email,
         db_get_email,
+        db_get_email_by_id,
         db_get_emails,
         db_search_emails,
         db_update_email_sender_pubkey,

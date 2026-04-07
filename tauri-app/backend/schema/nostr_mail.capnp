@@ -161,14 +161,15 @@ struct ArmorMessage {
 #   plain     — unarmored body text (no cryptographic wrapping)
 
 struct Body {
-  quoted       @4 :ArmorMessage;   # nested original message (replies), inside this body's armor region
+  quoted         @4 :ArmorMessage;   # nested original message (replies), inside this body's armor region
+  encodedContent @5 :Text;           # raw armor body text as it appears in the email (glossia words, base64, or plaintext)
   union {
     encrypted :group {
       nip        @0 :NipVersion;
-      ciphertext @1 :Data;         # raw NIP ciphertext bytes
+      ciphertext @1 :Data;         # raw NIP ciphertext bytes (decoded from glossia/base64)
     }
     signed :group {
-      plaintext  @2 :Data;         # glossia-encoded plaintext bytes
+      plaintext  @2 :Data;         # decoded plaintext bytes (from glossia encoding)
     }
     plain :group {
       text       @3 :Text;         # unarmored body
@@ -188,14 +189,18 @@ struct Body {
 #
 #   ----- BEGIN NOSTR SIGNATURE -----
 #   @Alice
-#   <64 bytes: Schnorr signature, optionally glossia-encoded>
-#   <32 bytes: x-only public key, optionally glossia-encoded>
+#   <signature: glossia-encoded or hex — decoded to 64 bytes>
+#   <pubkey: glossia-encoded, hex, or npub (bech32) — decoded to 32 bytes>
 #   ----- END NOSTR MESSAGE -----
+#
+# Decoders MUST also accept the legacy combined format where sig + pubkey
+# are encoded together as a single 96-byte glossia or hex payload.
 
 struct SignatureBlock {
-  profileName  @0 :Text;   # display name from the @ProfileName line
-  signature    @1 :Data;   # 64-byte Schnorr signature
-  pubkey       @2 :Data;   # 32-byte x-only secp256k1 public key
+  profileName      @0 :Text;   # display name from the @ProfileName line
+  signature        @1 :Data;   # 64-byte Schnorr signature
+  pubkey           @2 :Data;   # 32-byte x-only secp256k1 public key
+  encodedSigPubkey @3 :Text;   # raw encoded sig+pubkey content before decode (for display/fallback)
 }
 
 # Identity declaration without a signature. Appears inside a
@@ -208,7 +213,7 @@ struct SignatureBlock {
 #
 #   ----- BEGIN NOSTR SEAL -----
 #   @Bob
-#   <32 bytes: x-only public key>
+#   <pubkey: glossia-encoded, hex, or npub (bech32) — decoded to 32 bytes>
 #   ----- END NOSTR SEAL -----
 
 struct SealBlock {
@@ -245,6 +250,7 @@ struct Email {
   hasSignature    @13 :Bool;       # distinguishes "verified false" from "no signature"
   transportAuth   @14 :TransportAuth;
   attachments     @15 :List(EmailAttachment);
+  signatureSource @16 :Text;       # "body", "header", "both", or absent — which trust path verified
 }
 
 # Result of DMARC/DKIM verification on the email's sending domain.

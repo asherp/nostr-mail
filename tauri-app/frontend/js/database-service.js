@@ -264,6 +264,7 @@ class DatabaseService {
             recipient_pubkey: dbEmail.recipient_pubkey,
             message_id: dbEmail.message_id,
             signature_valid: dbEmail.signature_valid,
+            signature_source: dbEmail.signature_source || null,
             transport_auth_verified: dbEmail.transport_auth_verified,
             is_nostr_encrypted: dbEmail.is_nostr_encrypted,
             attachments: []

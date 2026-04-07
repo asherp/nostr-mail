@@ -1198,17 +1198,8 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
 
                 let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                 
-                // Verify signature if present - signature is created on the original body, so verify against body_text
-                let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                    if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                        Some(verify_email_signature(pubkey, &sig, &body_text))
-                    } else {
-                        None // No signature present
-                    }
-                } else {
-                    None // No pubkey, can't verify
-                };
-                
+                let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                 // Verify transport authentication
                 let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                     .unwrap_or_else(|e| TransportAuthVerdict {
@@ -1216,13 +1207,13 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                         method: TransportAuthMethod::None,
                         reason: format!("Error verifying transport auth: {}", e),
                     });
-                
+
                 // Skip emails that fail transport authentication
                 if !transport_auth.transport_verified {
                     println!("[RUST] fetch_emails_from_session: Email {} failed transport authentication: {}", email_id, transport_auth.reason);
                     continue;
                 }
-                
+
                 let email_message = EmailMessage {
                     id: email_id.to_string(),
                     from,
@@ -1238,6 +1229,7 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     message_id: extract_message_id_from_headers(&raw_headers),
                     signature_valid,
+                    signature_source,
                     transport_auth_verified: Some(transport_auth.transport_verified),
                 };
 
@@ -1343,17 +1335,8 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                 
                 let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                 
-                // Verify signature if present - signature is created on the encrypted body, so verify against body_text
-                let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                    if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                        Some(verify_email_signature(pubkey, &sig, &body_text))
-                    } else {
-                        None // No signature present
-                    }
-                } else {
-                    None // No pubkey, can't verify
-                };
-                
+                let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                 // Verify transport authentication
                 let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                     .unwrap_or_else(|e| TransportAuthVerdict {
@@ -1361,13 +1344,13 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                         method: TransportAuthMethod::None,
                         reason: format!("Error verifying transport auth: {}", e),
                     });
-                
+
                 // Skip emails that fail transport authentication
                 if !transport_auth.transport_verified {
                     println!("[RUST] fetch_emails_from_session_last_24h: Email {} failed transport authentication: {}", _email_id, transport_auth.reason);
                     continue;
                 }
-                
+
                 let email_message = EmailMessage {
                     id: _email_id.to_string(),
                     from,
@@ -1383,6 +1366,7 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     message_id: extract_message_id_from_headers(&raw_headers),
                     signature_valid,
+                    signature_source,
                     transport_auth_verified: Some(transport_auth.transport_verified),
                 };
                 emails.push(email_message);
@@ -1769,17 +1753,8 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                     
                     let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                     
-                    // Verify signature if present
-                    let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                        if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                            Some(verify_email_signature(pubkey, &sig, &body_text))
-                        } else {
-                            None // No signature present
-                        }
-                    } else {
-                        None // No pubkey, can't verify
-                    };
-                    
+                    let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                     // Verify transport authentication
                     let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                         .unwrap_or_else(|e| TransportAuthVerdict {
@@ -1787,13 +1762,13 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                             method: TransportAuthMethod::None,
                             reason: format!("Error verifying transport auth: {}", e),
                         });
-                    
+
                     // Skip emails that fail transport authentication
                     if !transport_auth.transport_verified {
                         println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} failed transport authentication: {}", email_id, transport_auth.reason);
                         continue;
                     }
-                    
+
                     let html_body = extract_html_body(&email);
                     let email_message = EmailMessage {
                         id: email_id.to_string(),
@@ -1810,6 +1785,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                         message_id: Some(message_id),
                         signature_valid,
+                        signature_source,
                         transport_auth_verified: Some(transport_auth.transport_verified),
                     };
                     emails.push(email_message);
@@ -2071,17 +2047,8 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                     
                     let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                     
-                    // Verify signature if present
-                    let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                        if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                            Some(verify_email_signature(pubkey, &sig, &body_text))
-                        } else {
-                            None // No signature present
-                        }
-                    } else {
-                        None // No pubkey, can't verify
-                    };
-                    
+                    let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                     let html_body = extract_html_body(&email);
                     let email_message = EmailMessage {
                         id: email_id.to_string(),
@@ -2098,6 +2065,7 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                         recipient_pubkey: None, // Will be populated during sync if contact exists
                         message_id: extract_message_id_from_headers(&raw_headers),
                         signature_valid,
+                        signature_source,
                         transport_auth_verified: None, // Sent emails don't have transport auth verification
                     };
                     
@@ -2271,6 +2239,7 @@ pub fn extract_nostr_sig_from_headers(raw_headers: &str) -> Option<String> {
 /// Find the offset of `marker` in `text` where it appears on a non-quoted line.
 /// A non-quoted line is one where the "-----" prefix starts at the beginning of the line,
 /// not after a ">" quote prefix. This skips markers inside nested quoted replies.
+#[allow(dead_code)]
 fn find_unquoted_marker(text: &str, marker: &str) -> Option<usize> {
     let mut search_from = 0;
     while let Some(pos) = text[search_from..].find(marker) {
@@ -2287,6 +2256,7 @@ fn find_unquoted_marker(text: &str, marker: &str) -> Option<usize> {
     None
 }
 
+#[allow(dead_code)]
 fn extract_armor_body_content(body: &str) -> Option<&str> {
     // Find the BEGIN line (encrypted or signed plaintext)
     let begin_idx = body.find("BEGIN NOSTR NIP-")
@@ -2387,32 +2357,6 @@ fn decode_armor_section(content: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// Split armor body content into non-quoted lines and quoted lines.
-/// Returns (body_only, quoted_content) where quoted_content has "> " prefixes stripped.
-fn split_body_and_quoted(content: &str) -> (String, Option<String>) {
-    let mut body_lines = Vec::new();
-    let mut quoted_lines = Vec::new();
-    let mut in_quoted = false;
-    for line in content.lines() {
-        if line.starts_with("> ") || line == ">" {
-            in_quoted = true;
-            quoted_lines.push(if line.starts_with("> ") { &line[2..] } else { "" });
-        } else if in_quoted && line.trim().is_empty() {
-            quoted_lines.push("");
-        } else {
-            in_quoted = false;
-            body_lines.push(line);
-        }
-    }
-    let body_only = body_lines.join("\n");
-    let quoted = if quoted_lines.is_empty() {
-        None
-    } else {
-        Some(quoted_lines.join("\n").trim().to_string())
-    };
-    (body_only, quoted)
-}
-
 /// Parse armor structure with depth counting, separating outermost body from nested armor.
 /// Returns (body_text, nested_armor) where nested_armor has one level of "> " prefix stripped.
 /// Handles both non-quoted nested armor (reply chains) and > quoted nested armor.
@@ -2495,25 +2439,90 @@ fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
 /// Decode a combined 96-byte signature+pubkey block.
 /// Tries glossia decode first (for encoded content), then raw hex fallback.
 /// Returns (sig_hex_128_chars, pubkey_hex_64_chars) or None.
-fn split_sig_pubkey(content: &str) -> Option<(String, String)> {
-    let content_len = content.len();
-    // Try glossia decode to 96 bytes (64-byte sig + 32-byte pubkey)
+/// Try to decode text as a 32-byte pubkey.
+/// Accepts: glossia (32 bytes), npub bech32, hex (64 chars).
+fn try_decode_as_pubkey(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() { return None; }
+
+    // Glossia decode → 32 bytes
+    if let Some(bytes) = try_glossia_decode_to_bytes(trimmed) {
+        if bytes.len() == 32 {
+            return Some(hex::encode(bytes));
+        }
+    }
+
+    let stripped: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // npub bech32
+    if stripped.starts_with("npub1") {
+        if let Ok(pk) = nostr_sdk::prelude::PublicKey::parse(&stripped) {
+            return Some(pk.to_hex());
+        }
+    }
+
+    // Raw hex (64 chars = 32 bytes)
+    if stripped.len() == 64 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(stripped);
+    }
+
+    None
+}
+
+/// Try to decode text as a 64-byte Schnorr signature.
+/// Accepts: glossia (64 bytes), hex (128 chars).
+fn try_decode_as_signature(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() { return None; }
+
+    // Glossia decode → 64 bytes
+    if let Some(bytes) = try_glossia_decode_to_bytes(trimmed) {
+        if bytes.len() == 64 {
+            return Some(hex::encode(bytes));
+        }
+    }
+
+    // Raw hex (128 chars = 64 bytes)
+    let stripped: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.len() == 128 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(stripped);
+    }
+
+    None
+}
+
+/// Decode signature block content into (sig_hex, pubkey_hex).
+/// Three-phase detection for backward compatibility:
+///   1. Combined 96-byte (old format): glossia→96 bytes or hex 192 chars
+///   2. Blank-line split (new format): sig and pubkey separated by empty line
+///   3. Last-line heuristic: last line is npub/hex pubkey, rest is sig
+fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
+    // Phase 1: Combined 96-byte (backward compat)
     if let Some(bytes) = try_glossia_decode_to_bytes(content) {
         if bytes.len() == 96 {
-            println!("[RUST] split_sig_pubkey: glossia decoded {} chars → 96 bytes", content_len);
             let sig_hex = hex::encode(&bytes[..64]);
             let pubkey_hex = hex::encode(&bytes[64..]);
             return Some((sig_hex, pubkey_hex));
         }
-        println!("[RUST] split_sig_pubkey: glossia decoded {} chars → {} bytes (expected 96)", content_len, bytes.len());
     }
-    // Fallback: raw hex (192 hex chars = 96 bytes)
     let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
     if stripped.len() == 192 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-        println!("[RUST] split_sig_pubkey: raw hex 192 chars");
         return Some((stripped[..128].to_string(), stripped[128..].to_string()));
     }
-    println!("[RUST] split_sig_pubkey: failed (content_len={}, stripped_len={})", content_len, stripped.len());
+
+    // Phase 2: Last-line heuristic (npub or hex pubkey on last line, rest is sig)
+    let lines: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if lines.len() >= 2 {
+        let last = lines[lines.len() - 1];
+        let last_stripped: String = last.chars().filter(|c| !c.is_whitespace()).collect();
+        if last_stripped.starts_with("npub1") || (last_stripped.len() == 64 && last_stripped.chars().all(|c| c.is_ascii_hexdigit())) {
+            let sig_text = lines[..lines.len() - 1].join("\n");
+            if let (Some(sig), Some(pk)) = (try_decode_as_signature(&sig_text), try_decode_as_pubkey(last)) {
+                return Some((sig, pk));
+            }
+        }
+    }
+
     None
 }
 
@@ -2565,8 +2574,9 @@ fn populate_armor_from_text(
 
     let normalized = armor_text.replace("\r\n", "\n");
 
-    // Extract prefix text before first armor delimiter
+    // Extract prefix text before first armor delimiter (accept both "----- BEGIN" and "-----BEGIN")
     let armor_start = normalized.find("----- BEGIN NOSTR ")
+        .or_else(|| normalized.find("-----BEGIN NOSTR "))
         .or_else(|| normalized.find("--- BEGIN NOSTR "));
     let prefix_text = match armor_start {
         Some(idx) if idx > 0 => {
@@ -2723,7 +2733,7 @@ fn populate_armor_from_text(
         let all_content = content_lines.join("\n").trim().to_string();
         if !all_content.is_empty() {
             sig_builder.set_encoded_sig_pubkey(&all_content);
-            if let Some((sig_hex, pubkey_hex)) = split_sig_pubkey(&all_content) {
+            if let Some((sig_hex, pubkey_hex)) = decode_sig_and_pubkey(&all_content) {
                 if let Ok(sig_bytes) = hex::decode(&sig_hex) {
                     sig_builder.set_signature(&sig_bytes);
                 }
@@ -2748,21 +2758,9 @@ fn populate_armor_from_text(
             .collect();
         let seal_content = content_lines.join("\n").trim().to_string();
         if !seal_content.is_empty() {
-            // Try glossia decode for 32-byte pubkey
-            let mut decoded = false;
-            if let Some(bytes) = try_glossia_decode_to_bytes(&seal_content) {
-                if bytes.len() == 32 {
+            if let Some(pk_hex) = try_decode_as_pubkey(&seal_content) {
+                if let Ok(bytes) = hex::decode(&pk_hex) {
                     seal_builder.set_pubkey(&bytes);
-                    decoded = true;
-                }
-            }
-            if !decoded {
-                // Fallback: raw hex (64 hex chars = 32 bytes)
-                let stripped: String = seal_content.chars().filter(|c| !c.is_whitespace()).collect();
-                if stripped.len() == 64 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-                    if let Ok(bytes) = hex::decode(&stripped) {
-                        seal_builder.set_pubkey(&bytes);
-                    }
                 }
             }
         }
@@ -3082,6 +3080,7 @@ struct JsonManifest {
 #[derive(Debug, serde::Deserialize)]
 struct JsonEncryptedBlob {
     ciphertext: String,
+    #[allow(dead_code)]
     cipher_sha256: Option<String>,
     #[allow(dead_code)]
     cipher_size: Option<u64>,
@@ -3107,12 +3106,24 @@ fn determine_decrypt_pubkey(
     user_pubkey_hex: &str,
     fallback_pubkey: &str,
 ) -> Result<String, String> {
-    // Get pubkey from seal or signature block
-    let other_pubkey = seal_pubkey_hex
-        .or(sig_pubkey_hex)
-        .ok_or_else(|| "No pubkey in seal/signature block".to_string())?;
+    // Get pubkey from seal or signature block, or fall back to provided pubkey
+    let other_pubkey = match seal_pubkey_hex.or(sig_pubkey_hex) {
+        Some(pk) => pk,
+        None => {
+            // No seal/sig in armor — use fallback pubkey directly
+            if fallback_pubkey.is_empty() {
+                return Err("No pubkey in seal/signature block and no fallback provided".to_string());
+            }
+            if fallback_pubkey.starts_with("npub1") {
+                let pk = nostr_sdk::prelude::PublicKey::parse(fallback_pubkey)
+                    .map_err(|e| format!("Invalid fallback npub: {:?}", e))?;
+                return Ok(pk.to_hex());
+            }
+            return Ok(fallback_pubkey.to_string());
+        }
+    };
 
-    // If it's the user's own pubkey, use fallback (the other party)
+    // If seal/sig pubkey is the user's own, use fallback (the other party)
     if other_pubkey == user_pubkey_hex {
         if fallback_pubkey.is_empty() {
             return Err("Cannot determine recipient pubkey (seal pubkey matches user)".to_string());
@@ -3323,6 +3334,7 @@ pub fn decrypt_email_body_pipeline(
                 block_results: Vec::new(),
                 success: false,
                 error: Some("No armor block found in email body".to_string()),
+                subject_ciphertext: None,
             });
         }
     };
@@ -3373,12 +3385,11 @@ pub fn decrypt_email_body_pipeline(
     };
 
     // Decrypt subject
-    let decrypted_subject = if parsed.body_type == "encrypted" {
-        // Determine NIP hint from the outer block for subject decoding
+    let (decrypted_subject, subject_ciphertext) = if parsed.body_type == "encrypted" {
         let nip_hint = parsed.encryption_nip.as_deref().unwrap_or("nip44");
         decrypt_subject(subject, private_key, &user_pubkey_hex, fallback, nip_hint)
     } else {
-        subject.to_string()
+        (subject.to_string(), None)
     };
 
     println!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={}",
@@ -3392,49 +3403,53 @@ pub fn decrypt_email_body_pipeline(
         block_results,
         success,
         error,
+        subject_ciphertext,
     })
 }
 
 /// Decrypt the email subject.
 /// Mirrors JS: decodeGlossiaSubject + NIP decrypt.
+/// Returns (decrypted_subject, subject_ciphertext).
+/// subject_ciphertext is the intermediate value after glossia decode / before NIP decrypt,
+/// needed by the frontend for DM↔email subject_hash matching.
 fn decrypt_subject(
     subject: &str,
     private_key: &str,
-    user_pubkey_hex: &str,
+    _user_pubkey_hex: &str,
     fallback_pubkey: &str,
     nip_hint: &str,
-) -> String {
+) -> (String, Option<String>) {
     if subject.is_empty() {
-        return subject.to_string();
+        return (subject.to_string(), None);
     }
 
     // Try to get ciphertext from subject
     let ciphertext = if is_likely_encrypted_content(subject) {
-        // Already base64 or base64?iv=base64
         subject.to_string()
     } else if let Some(decoded) = glossia_decode_subject(subject, nip_hint) {
         decoded
     } else {
-        // Not encrypted, return as-is
-        return subject.to_string();
+        return (subject.to_string(), None);
     };
+
+    let subject_ciphertext = Some(ciphertext.clone());
 
     // Determine which pubkey to use — use fallback (other party's pubkey)
     let decrypt_pubkey = if fallback_pubkey.is_empty() {
-        return subject.to_string();
+        return (subject.to_string(), subject_ciphertext);
     } else if fallback_pubkey.starts_with("npub1") {
         fallback_pubkey.to_string()
     } else {
         use nostr_sdk::prelude::ToBech32;
         match nostr_sdk::prelude::PublicKey::parse(fallback_pubkey) {
             Ok(pk) => pk.to_bech32().unwrap_or_else(|_| fallback_pubkey.to_string()),
-            Err(_) => return subject.to_string(),
+            Err(_) => return (subject.to_string(), subject_ciphertext),
         }
     };
 
     match crate::nostr::decrypt_dm_content(private_key, &decrypt_pubkey, &ciphertext) {
-        Ok(decrypted) => decrypted,
-        Err(_) => subject.to_string(),
+        Ok(decrypted) => (decrypted, subject_ciphertext),
+        Err(_) => (subject.to_string(), subject_ciphertext),
     }
 }
 
@@ -3525,6 +3540,51 @@ pub fn verify_email_signature(sender_pubkey: &str, signature: &str, body: &str) 
             println!("[RUST] verify_email_signature: error: {}", e);
             false
         }
+    }
+}
+
+/// Verify email signature using the in-body SIGNATURE block (primary trust path).
+/// Returns `Some(true/false)` if an inline signature was found, `None` if no inline sig exists.
+pub fn verify_email_signature_inline(body: &str) -> Option<bool> {
+    let parsed = parse_armor_components(body)?;
+    let sig_hex = parsed.signature_hex.as_ref()?;
+    let pubkey_hex = parsed.sig_pubkey_hex.as_ref()?;
+    let binary = extract_ciphertext_binary(body);
+    match crypto::verify_signature_bytes(pubkey_hex, sig_hex, &binary) {
+        Ok(valid) => {
+            println!("[RUST] verify_email_signature_inline: {} ({} bytes, pubkey={}...)",
+                if valid { "valid" } else { "INVALID" }, binary.len(), &pubkey_hex[..8.min(pubkey_hex.len())]);
+            Some(valid)
+        }
+        Err(e) => {
+            println!("[RUST] verify_email_signature_inline: error: {}", e);
+            Some(false)
+        }
+    }
+}
+
+/// Verify email signature trying both in-body (primary) and header (secondary) trust paths.
+/// Returns (signature_valid, signature_source) where source is "body", "header", "both", or None.
+pub fn verify_email_signature_full(body: &str, raw_headers: &str) -> (Option<bool>, Option<String>) {
+    let body_result = verify_email_signature_inline(body);
+
+    let header_result = {
+        let pubkey = extract_nostr_pubkey_from_headers(raw_headers);
+        let sig = extract_nostr_sig_from_headers(raw_headers);
+        match (pubkey, sig) {
+            (Some(pk), Some(s)) => Some(verify_email_signature(&pk, &s, body)),
+            _ => None,
+        }
+    };
+
+    println!("[RUST] verify_email_signature_full: body={:?}, header={:?}", body_result, header_result);
+
+    match (body_result, header_result) {
+        (Some(true), Some(true)) => (Some(true), Some("both".to_string())),
+        (Some(true), _)          => (Some(true), Some("body".to_string())),
+        (_, Some(true))          => (Some(true), Some("header".to_string())),
+        (Some(false), _) | (_, Some(false)) => (Some(false), None),
+        (None, None)             => (None, None),
     }
 }
 
@@ -4550,18 +4610,51 @@ mod tests {
     }
 
     #[test]
-    fn test_split_sig_pubkey_hex() {
+    fn test_decode_sig_and_pubkey_combined_hex() {
+        // Phase 1: combined 192-char hex (backward compat)
         let sig = "aa".repeat(64);
         let pubkey = "bb".repeat(32);
         let combined = format!("{}{}", sig, pubkey);
-        let (s, p) = split_sig_pubkey(&combined).expect("should split");
+        let (s, p) = decode_sig_and_pubkey(&combined).expect("should split");
         assert_eq!(s, sig);
         assert_eq!(p, pubkey);
     }
 
     #[test]
-    fn test_split_sig_pubkey_too_short() {
-        assert!(split_sig_pubkey("aabb").is_none());
+    fn test_decode_sig_and_pubkey_too_short() {
+        assert!(decode_sig_and_pubkey("aabb").is_none());
+    }
+
+    #[test]
+    fn test_decode_sig_and_pubkey_last_line_npub() {
+        // Phase 3: last-line heuristic with npub
+        let sig = "aa".repeat(64);
+        let npub = "npub17umm7nnvf6y2dse2gwyklhq0p9daeqzn6edp523fzfd5utj2upcsm6zk5r";
+        let content = format!("{}\n{}", sig, npub);
+        let (s, p) = decode_sig_and_pubkey(&content).expect("should split");
+        assert_eq!(s, sig);
+        assert_eq!(p.len(), 64);
+    }
+
+    #[test]
+    fn test_try_decode_as_pubkey_npub() {
+        let npub = "npub17umm7nnvf6y2dse2gwyklhq0p9daeqzn6edp523fzfd5utj2upcsm6zk5r";
+        let hex = try_decode_as_pubkey(npub).expect("should decode");
+        assert_eq!(hex.len(), 64);
+    }
+
+    #[test]
+    fn test_try_decode_as_pubkey_hex() {
+        let pk = "bb".repeat(32);
+        let hex = try_decode_as_pubkey(&pk).expect("should decode");
+        assert_eq!(hex, pk);
+    }
+
+    #[test]
+    fn test_try_decode_as_signature_hex() {
+        let sig = "aa".repeat(64);
+        let hex = try_decode_as_signature(&sig).expect("should decode");
+        assert_eq!(hex, sig);
     }
 
     #[test]
@@ -4765,17 +4858,8 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                             };
                             let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                             
-                            // Verify signature if present - signature is created on the encrypted body, so verify against body_text
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None // No signature present
-                                }
-                            } else {
-                                None // No pubkey, can't verify
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             let email_message = EmailMessage {
                                 id: _email_id.to_string(),
                                 from,
@@ -4791,6 +4875,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                                 message_id: extract_message_id_from_headers(&raw_headers),
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: None, // Not verified in this path
                             };
                             emails.push(email_message);
@@ -4845,17 +4930,8 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 };
                                 let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                                 
-                                // Verify signature if present
-                                let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                    if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                        Some(verify_email_signature(pubkey, &sig, &_final_body))
-                                    } else {
-                                        None // No signature present
-                                    }
-                                } else {
-                                    None // No pubkey, can't verify
-                                };
-                                
+                                let (signature_valid, signature_source) = verify_email_signature_full(&_final_body, &raw_headers);
+
                                 let email_message = EmailMessage {
                                     id: _email_id.to_string(),
                                     from,
@@ -4871,6 +4947,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                                     message_id: extract_message_id_from_headers(&raw_headers),
                                     signature_valid,
+                                    signature_source,
                                     transport_auth_verified: None, // Not verified in this path
                                 };
                                 emails.push(email_message);
@@ -5021,6 +5098,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 updated_at: Some(chrono::Utc::now()),
                 created_at: existing_email.created_at, // Preserve original creation date
                 signature_valid: email.signature_valid,
+                signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
                 subject_hash: None,
             };
@@ -5048,6 +5126,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 updated_at: None,
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
+                signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
                 subject_hash: None,
             };
@@ -5168,6 +5247,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                     updated_at: Some(chrono::Utc::now()),
                     created_at: existing_email.created_at, // Preserve original creation time
                     signature_valid: email.signature_valid,
+                    signature_source: email.signature_source.clone(),
                     transport_auth_verified: email.transport_auth_verified,
                     subject_hash: None,
                 };
@@ -5203,10 +5283,11 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                 updated_at: None,
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
+                signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
                 subject_hash: None,
             };
-            println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}", 
+            println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}",
                 db_email.message_id, db_email.from_address, db_email.to_address, 
                 db_email.subject.len(), db_email.body.len());
             let email_id = match db.insert_email_direct(&db_email) {
@@ -5287,6 +5368,7 @@ pub struct RawNostrEmail {
     pub raw_headers: String,
     pub attachments: Vec<crate::database::Attachment>, // Attachments extracted from email (in encrypted form)
     pub signature_valid: Option<bool>,
+    pub signature_source: Option<String>,
     pub transport_auth_verified: Option<bool>,
 }
 
@@ -5378,18 +5460,10 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                         let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                         
-                        let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                            if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                Some(verify_email_signature(pubkey, &sig, &body_text))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        
+                        let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                         let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                        
+
                         // Verify transport authentication
                         let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                             .unwrap_or_else(|e| TransportAuthVerdict {
@@ -5397,13 +5471,13 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                                 method: TransportAuthMethod::None,
                                 reason: format!("Error verifying transport auth: {}", e),
                             });
-                        
+
                         // Skip emails that fail transport authentication
                         if !transport_auth.transport_verified {
                             println!("[RUST] fetch_nostr_emails_from_folder: Email {} failed transport authentication: {}", message_id, transport_auth.reason);
                             continue;
                         }
-                        
+
                         all_emails.push(RawNostrEmail {
                             message_id,
                             from,
@@ -5417,6 +5491,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             raw_headers,
                             attachments: extracted_attachments,
                             signature_valid,
+                            signature_source,
                             transport_auth_verified: Some(transport_auth.transport_verified),
                         });
                     }
@@ -5475,18 +5550,10 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                     let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                     let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                     
-                    let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                        if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                            Some(verify_email_signature(pubkey, &sig, &body_text))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    
+                    let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                     let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                    
+
                     // Verify transport authentication
                     let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                         .unwrap_or_else(|e| TransportAuthVerdict {
@@ -5494,13 +5561,13 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             method: TransportAuthMethod::None,
                             reason: format!("Error verifying transport auth: {}", e),
                         });
-                    
+
                     // Skip emails that fail transport authentication
                     if !transport_auth.transport_verified {
                         println!("[RUST] fetch_nostr_emails_from_folder (non-Gmail): Email {} failed transport authentication: {}", message_id, transport_auth.reason);
                         continue;
                     }
-                    
+
                     emails.push(RawNostrEmail {
                         message_id,
                         from,
@@ -5514,6 +5581,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         raw_headers,
                         attachments: extracted_attachments,
                         signature_valid,
+                        signature_source,
                         transport_auth_verified: Some(transport_auth.transport_verified),
                     });
                 }
@@ -5596,18 +5664,10 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                             let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                             
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                            
+
                             // Verify transport authentication
                             let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                                 .unwrap_or_else(|e| TransportAuthVerdict {
@@ -5615,13 +5675,13 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                                     method: TransportAuthMethod::None,
                                     reason: format!("Error verifying transport auth: {}", e),
                                 });
-                            
+
                             // Skip emails that fail transport authentication
                             if !transport_auth.transport_verified {
                                 println!("[RUST] fetch_nostr_emails_from_folder: Email {} failed transport authentication: {}", message_id, transport_auth.reason);
                                 continue;
                             }
-                            
+
                             all_emails.push(RawNostrEmail {
                                 message_id,
                                 from,
@@ -5635,6 +5695,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                                 raw_headers,
                                 attachments: extracted_attachments,
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: Some(transport_auth.transport_verified),
                             });
                         }
@@ -5693,18 +5754,10 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                         let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                         
-                        let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                            if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                Some(verify_email_signature(pubkey, &sig, &body_text))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        
+                        let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                         let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                        
+
                         // Verify transport authentication
                         let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                             .unwrap_or_else(|e| TransportAuthVerdict {
@@ -5712,13 +5765,13 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                                 method: TransportAuthMethod::None,
                                 reason: format!("Error verifying transport auth: {}", e),
                             });
-                        
+
                         // Skip emails that fail transport authentication
                         if !transport_auth.transport_verified {
                             println!("[RUST] fetch_nostr_emails_from_folder (non-Gmail): Email {} failed transport authentication: {}", message_id, transport_auth.reason);
                             continue;
                         }
-                        
+
                         emails.push(RawNostrEmail {
                             message_id,
                             from,
@@ -5732,6 +5785,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             raw_headers,
                             attachments: extracted_attachments,
                             signature_valid,
+                            signature_source,
                             transport_auth_verified: Some(transport_auth.transport_verified),
                         });
                     }
@@ -5782,6 +5836,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                     raw_headers: em.raw_headers,
                     attachments,
                     signature_valid: em.signature_valid,
+                    signature_source: em.signature_source,
                     transport_auth_verified: em.transport_auth_verified,
                 }
             }).collect()
@@ -5828,17 +5883,8 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                         
                         let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                         
-                        // Verify signature if present (verify on raw body)
-                        let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                            if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                Some(verify_email_signature(pubkey, &sig, &body_text))
-                            } else {
-                                None // No signature present
-                            }
-                        } else {
-                            None // No pubkey, can't verify
-                        };
-                        
+                        let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                         let email_message = RawNostrEmail {
                             message_id: extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string()),
                             from,
@@ -5852,6 +5898,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                             raw_headers,
                             attachments: extracted_attachments,
                             signature_valid,
+                            signature_source,
                             transport_auth_verified: None, // Not verified in this path
                         };
                         emails.push(email_message);
@@ -5889,6 +5936,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                     raw_headers: em.raw_headers,
                     attachments,
                     signature_valid: em.signature_valid,
+                    signature_source: em.signature_source,
                     transport_auth_verified: em.transport_auth_verified,
                 }
             }).collect()
@@ -5939,18 +5987,10 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                             let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                             
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                            
+
                             // Verify transport authentication
                             let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                                 .unwrap_or_else(|e| TransportAuthVerdict {
@@ -5958,7 +5998,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                                     method: TransportAuthMethod::None,
                                     reason: format!("Error verifying transport auth: {}", e),
                                 });
-                            
+
                             let email_message = RawNostrEmail {
                                 message_id,
                                 from,
@@ -5972,6 +6012,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                                 raw_headers,
                                 attachments: extracted_attachments,
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: Some(transport_auth.transport_verified),
                             };
                             emails.push(email_message);
@@ -6132,6 +6173,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                         raw_headers: em.raw_headers,
                         attachments,
                         signature_valid: em.signature_valid,
+                        signature_source: em.signature_source,
                         transport_auth_verified: em.transport_auth_verified, // For sent emails, this will be None
                     });
                 }
@@ -6177,17 +6219,8 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 .join("\n");
                             let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                             
-                            // Verify signature if present (verify on raw body)
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None // No signature present
-                                }
-                            } else {
-                                None // No pubkey, can't verify
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             let extracted_msg_id = extract_message_id_from_headers(&raw_headers);
                             if extracted_msg_id.is_none() {
                                 println!("[RUST] fetch_sent_emails_smart_raw (non-TLS): WARNING - Could not extract Message-ID from headers for message {}. Headers preview: {}", idx + 1, raw_headers.chars().take(500).collect::<String>());
@@ -6222,6 +6255,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 raw_headers,
                                 attachments: vec![], // Will be extracted during sync
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: None, // Not verified in this path
                             };
                             emails.push(email_message);
@@ -6348,6 +6382,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                         raw_headers: em.raw_headers,
                         attachments,
                         signature_valid: em.signature_valid,
+                        signature_source: em.signature_source,
                         transport_auth_verified: em.transport_auth_verified,
                     });
                 }
@@ -6405,16 +6440,8 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                             let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                             let recipient_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                             
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             emails.push(RawNostrEmail {
                                 message_id: extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string()),
                                 from,
@@ -6428,6 +6455,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 raw_headers,
                                 attachments: extracted_attachments,
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: None,
                             });
                             println!("[RUST] fetch_sent_emails_smart_raw (non-TLS): Successfully parsed email {} from message {}", emails.len(), idx + 1);

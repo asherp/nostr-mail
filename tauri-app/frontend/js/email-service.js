@@ -556,13 +556,7 @@ class EmailService {
     // Decrypt the body content in compose view
     async decryptBodyContent() {
         const body = domManager.getValue('messageBody');
-        
-        if (!body) return;
-        
-        // Check if body contains encrypted content
-        const encParts = await this.parseArmorComponentsRust(body);
-        const isEncryptedBody = encParts ? encParts.isEncryptedBody : false;
-        if (!encParts || !isEncryptedBody) {
+        if (!body || !body.includes('BEGIN NOSTR')) {
             console.log('[JS] Body is not encrypted');
             return;
         }
@@ -581,60 +575,22 @@ class EmailService {
         }
 
         try {
-            console.log('[JS] Decrypting body content...');
-            const decryptQuotedArmor = encParts.quotedArmor;
-            let encryptedContent = encParts.bodyText;
-
-            // Check if content is glossia-encoded (not raw base64) and decode first
-            const stripped = encryptedContent.replace(/\s+/g, '');
-            if (!/^[A-Za-z0-9+/=?]+$/.test(stripped)) {
-                // Content contains non-base64 chars — likely glossia-encoded
-                const gs = window.GlossiaService;
-                if (gs && gs.isReady()) {
-                    console.log('[JS] Glossia-decoding armored body content before decrypt...');
-                    const meta = this.getGlossiaEncoding() || null;
-                    const instruction = meta ? `decode from ${meta}` : 'decode';
-                    const result = gs.transcode(encryptedContent, instruction);
-                    let decoded = result.output;
-                    // Base-N codec returns hex; convert to base64 for NIP decrypt
-                    if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
-                    encryptedContent = gs._autoUnpack ? gs._autoUnpack(decoded) : decoded;
-                } else {
-                    console.warn('[JS] Glossia not ready, cannot decode body content');
-                }
-            } else {
-                encryptedContent = stripped;
-            }
-            
-            // Create a mock email object for the decryption function
-            const mockEmail = {
-                sender_pubkey: pubkey,
-                nostr_pubkey: pubkey // Fallback for backward compatibility
-            };
-            
-            // Preserve quoted armor (reply chain) from inside the armor block
+            // Extract quoted armor (reply chain) to preserve after decrypt
+            const encParts = await this.parseArmorComponentsRust(body);
             let trailingQuoted = '';
-            if (decryptQuotedArmor) {
-                trailingQuoted = '\n\n' + decryptQuotedArmor;
+            if (encParts && encParts.quotedArmor) {
+                trailingQuoted = '\n\n' + encParts.quotedArmor;
             }
 
-            // Try manifest decryption first
-            const manifestResult = await this.decryptManifestMessage(mockEmail, encryptedContent, { private_key: privkey });
+            const result = await TauriService.decryptEmailBody(privkey, body, '', pubkey, null);
 
-            if (manifestResult.type === 'manifest') {
-                console.log('[JS] Successfully decrypted manifest body');
-                domManager.setValue('messageBody', manifestResult.body + trailingQuoted);
+            if (result.success) {
+                domManager.setValue('messageBody', result.body + trailingQuoted);
                 window.notificationService.showSuccess('Body decrypted successfully');
-                // Clear signature when decrypting (body state changed)
                 this.clearSignature();
-            } else if (manifestResult.type === 'legacy') {
-                console.log('[JS] Successfully decrypted legacy body');
-                domManager.setValue('messageBody', manifestResult.body + trailingQuoted);
-                window.notificationService.showSuccess('Body decrypted successfully');
-                // Clear signature when decrypting (body state changed)
-                this.clearSignature();
+            } else {
+                window.notificationService.showError('Failed to decrypt body content');
             }
-            
         } catch (error) {
             console.error('[JS] Failed to decrypt body:', error);
             window.notificationService.showError('Failed to decrypt body content');
@@ -1231,9 +1187,29 @@ class EmailService {
     // Returns { sigHex, pubkeyHex } with pre-decoded hex strings, or null if decode fails.
     _splitSigPubkey(content) {
         if (!content) return null;
-        const gs = window.GlossiaService;
 
-        // Try glossia decode: 96 bytes total → 192 hex chars
+        // Phase 1: Combined 96-byte decode (backward compat)
+        const combined = this._tryCombined96(content);
+        if (combined) return combined;
+
+        // Phase 2: Last-line heuristic (npub or hex pubkey on last line)
+        const lines = content.split('\n').map(l => l.trim()).filter(l => l);
+        if (lines.length >= 2) {
+            const last = lines[lines.length - 1];
+            const lastStripped = last.replace(/\s+/g, '');
+            if (lastStripped.startsWith('npub1') || /^[0-9a-fA-F]{64}$/.test(lastStripped)) {
+                const sig = this._tryDecodeSig(lines.slice(0, -1).join('\n'));
+                const pk = this._tryDecodePubkey(last);
+                if (sig && pk) return { sigHex: sig, pubkeyHex: pk };
+            }
+        }
+
+        return null;
+    }
+
+    // Phase 1 helper: try to decode as combined 96-byte sig+pubkey (glossia or hex)
+    _tryCombined96(content) {
+        const gs = window.GlossiaService;
         if (gs && gs.isReady()) {
             try {
                 const detections = gs.detectDialect(content);
@@ -1246,13 +1222,56 @@ class EmailService {
                 }
             } catch (_) {}
         }
-
-        // Fallback: raw hex (no glossia encoding)
         const stripped = content.replace(/\s+/g, '');
         if (/^[0-9a-fA-F]{192}$/.test(stripped)) {
             return { sigHex: stripped.substring(0, 128), pubkeyHex: stripped.substring(128) };
         }
+        return null;
+    }
 
+    // Try to decode text as a 64-byte Schnorr signature (glossia or hex)
+    _tryDecodeSig(text) {
+        if (!text) return null;
+        const gs = window.GlossiaService;
+        if (gs && gs.isReady()) {
+            try {
+                const detections = gs.detectDialect(text);
+                const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : null;
+                if (dialect) {
+                    const hex = gs.decodeRawBaseN(text, dialect, 64);
+                    if (hex && hex.length === 128) return hex;
+                }
+            } catch (_) {}
+        }
+        const stripped = text.replace(/\s+/g, '');
+        if (/^[0-9a-fA-F]{128}$/.test(stripped)) return stripped;
+        return null;
+    }
+
+    // Try to decode text as a 32-byte pubkey (glossia, npub, or hex)
+    _tryDecodePubkey(text) {
+        if (!text) return null;
+        const stripped = text.replace(/\s+/g, '');
+        // npub bech32
+        if (stripped.startsWith('npub1')) {
+            try {
+                return window.CryptoService._npubToHex(stripped);
+            } catch (_) {}
+        }
+        // hex (64 chars = 32 bytes)
+        if (/^[0-9a-fA-F]{64}$/.test(stripped)) return stripped;
+        // glossia
+        const gs = window.GlossiaService;
+        if (gs && gs.isReady()) {
+            try {
+                const detections = gs.detectDialect(text);
+                const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : null;
+                if (dialect) {
+                    const hex = gs.decodeRawBaseN(text, dialect, 32);
+                    if (hex && hex.length === 64) return hex;
+                }
+            } catch (_) {}
+        }
         return null;
     }
 
@@ -1300,10 +1319,10 @@ class EmailService {
             lines.push('----- BEGIN NOSTR SIGNATURE -----');
             if (profileName) lines.push(`@${profileName}`);
             if (encodedSigPubkey) {
-                // Combined 96-byte payload (glossia mode)
+                // Legacy combined 96-byte payload (for backward compat only)
                 lines.push(wordWrap(encodedSigPubkey));
             } else {
-                // Hex mode: separate sig + pubkey encodings
+                // New format: separate sig + pubkey
                 lines.push(wordWrap(encodedSig));
                 if (encodedPubkey) {
                     lines.push(wordWrap(encodedPubkey));
@@ -1846,7 +1865,19 @@ class EmailService {
                 // Pre-decrypt from plaintext armor for lock toggle
                 let decryptResults = null;
                 try {
-                    decryptResults = await this.decryptAllEncryptedBlocks(plainBody, this.selectedNostrContact?.pubkey);
+                    const pubkey = this.selectedNostrContact?.pubkey;
+                    const privkey = appState.getKeypair()?.private_key;
+                    if (pubkey && privkey) {
+                        const result = await TauriService.decryptEmailBody(privkey, plainBody, '', pubkey, null);
+                        if (result.blockResults && result.blockResults.length > 0) {
+                            decryptResults = result.blockResults.map(b => {
+                                if (!b.wasEncrypted) return null;
+                                if (b.decryptedText != null) return { decryptedText: b.decryptedText };
+                                if (b.error) return { error: b.error };
+                                return null;
+                            });
+                        }
+                    }
                 } catch (e) {
                     console.warn('[JS] Preview pre-decrypt failed:', e);
                 }
@@ -2157,7 +2188,8 @@ class EmailService {
             const pageSize = settings.emails_per_page || 50;
             console.log('[JS] Loading sent emails with offset:', this.sentOffset, 'pageSize:', pageSize);
             // Fetch sent emails (where user is sender)
-            let emails = await TauriService.getDbSentEmails(pageSize, this.sentOffset, userEmail);
+            const userPubkey = keypair ? keypair.public_key : null;
+            let emails = await TauriService.getDbSentEmails(pageSize, this.sentOffset, userEmail, userPubkey);
             
             // Load attachments for each email in parallel with timeout
             console.log(`[JS] Loading attachments for ${emails.length} sent emails`);
@@ -2486,417 +2518,11 @@ class EmailService {
         }
     }
 
-    // Decrypt manifest-based encrypted message
-    async decryptManifestMessage(email, encryptedContent, keypair) {
-        console.log('[JS] Attempting manifest decryption for email:', email.from || email.from_address);
-        
-        try {
-            // First decrypt the manifest using NIP encryption
-            let decryptedManifestJson;
-            
-            // Try with sender pubkey first (for inbox emails)
-            const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
-            if (senderPubkey) {
-                try {
-                    console.log('[JS] Decrypting with sender pubkey...');
-                    console.log('[JS] privateKey:', keypair.private_key ? 'present' : 'missing');
-                    console.log('[JS] senderPubkey:', senderPubkey);
-                    console.log('[JS] encryptedContent:', encryptedContent ? encryptedContent.substring(0, 50) + '...' : 'missing');
-                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, senderPubkey, encryptedContent);
-                } catch (e) {
-                    console.log('[JS] Failed with header pubkey:', e.message);
-                }
-            }
-            
-            // If that failed, try fallback methods
-            if (!decryptedManifestJson) {
-                decryptedManifestJson = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-            }
-            
-            // Try to parse as manifest JSON, if it fails it's probably legacy format
-            let manifest;
-            try {
-                manifest = JSON.parse(decryptedManifestJson);
-                console.log('[JS] Manifest parsed successfully:', manifest);
-            } catch (parseError) {
-                console.log('[JS] Not a manifest format, treating as legacy encrypted body');
-                // Return the decrypted content as legacy format (with UTF-8 fixes)
-                return {
-                    type: 'legacy',
-                    body: Utils.fixUtf8Encoding(decryptedManifestJson)
-                };
-            }
-            
-            // Decrypt body if present
-            let decryptedBody = '';
-            if (manifest.body && manifest.body.ciphertext) {
-                console.log('[JS] Decrypting body from manifest...');
-                console.log('[JS] Body ciphertext:', manifest.body.ciphertext);
-                console.log('[JS] Body key_wrap:', manifest.body.key_wrap);
-                
-                const bodyKey = manifest.body.key_wrap;
-                const encryptedBodyData = manifest.body.ciphertext;
-                
-                // Verify hash if present
-                if (manifest.body.cipher_sha256) {
-                    const actualHash = await this.calculateSHA256(encryptedBodyData);
-                    console.log('[JS] Expected hash:', manifest.body.cipher_sha256);
-                    console.log('[JS] Actual hash:', actualHash);
-                    if (actualHash !== manifest.body.cipher_sha256) {
-                        console.warn('[JS] Body hash mismatch!');
-                    }
-                }
-                
-                try {
-                    // Decrypt body with AES
-                    console.log('[JS] Attempting AES decryption...');
-                    console.log('[JS] Input data length:', encryptedBodyData.length);
-                    console.log('[JS] Key length:', bodyKey.length);
-                    
-                    const decryptedBodyBase64 = await this.decryptWithAES(encryptedBodyData, bodyKey);
-                    console.log('[JS] Decrypted base64:', decryptedBodyBase64);
-                    console.log('[JS] Decrypted base64 length:', decryptedBodyBase64.length);
-                    
-                    decryptedBody = atob(decryptedBodyBase64);
-                    console.log('[JS] Final decrypted body:', decryptedBody);
-                    console.log('[JS] Body decrypted successfully, length:', decryptedBody.length);
-                } catch (aesError) {
-                    console.error('[JS] AES decryption failed:', aesError);
-                    console.error('[JS] Error details:', aesError.stack);
-                    // Don't throw - let's see if we can continue with empty body
-                    console.log('[JS] Continuing with empty body due to AES error');
-                    decryptedBody = `[AES Decryption Failed: ${aesError.message}]`;
-                }
-            } else {
-                console.log('[JS] No body ciphertext found in manifest');
-            }
-            
-            return {
-                type: 'manifest',
-                body: Utils.fixUtf8Encoding(decryptedBody),
-                manifest: manifest
-            };
-            
-        } catch (error) {
-            console.error('[JS] Manifest decryption failed:', error);
-            throw error;
-        }
-    }
-
-    // Decrypt manifest-based attachment
-    async decryptManifestAttachment(email, attachmentId, manifest, keypair) {
-        console.log('[JS] Decrypting manifest attachment:', attachmentId);
-        
-        // Find attachment metadata in manifest
-        const attachmentMeta = manifest.attachments.find(a => a.id === attachmentId);
-        if (!attachmentMeta) {
-            throw new Error(`Attachment ${attachmentId} not found in manifest`);
-        }
-        
-        // Find the actual attachment file in the email
-        const attachments = await TauriService.getAttachmentsForEmail(email.id);
-        const attachmentFile = attachments.find(a => a.filename === `${attachmentId}.dat`);
-        if (!attachmentFile) {
-            throw new Error(`Attachment file ${attachmentId}.dat not found`);
-        }
-        
-        try {
-            // Verify hash if present
-            if (attachmentMeta.cipher_sha256) {
-                const actualHash = await this.calculateSHA256(attachmentFile.data);
-                if (actualHash !== attachmentMeta.cipher_sha256) {
-                    console.warn(`[JS] Attachment ${attachmentId} hash mismatch!`);
-                }
-            }
-            
-            // Decrypt attachment with AES key from manifest (with padding removal)
-            const decryptedData = await this.decryptWithAES(attachmentFile.data, attachmentMeta.key_wrap, true);
-            
-            console.log(`[JS] Attachment ${attachmentId} decrypted successfully`);
-            
-            return {
-                id: attachmentId,
-                filename: attachmentMeta.orig_filename,
-                contentType: attachmentMeta.orig_mime,
-                data: decryptedData,
-                size: attachmentMeta.orig_size || decryptedData.length
-            };
-            
-        } catch (error) {
-            console.error(`[JS] Failed to decrypt attachment ${attachmentId}:`, error);
-            throw error;
-        }
-    }
-
-    // Fallback decryption method for Nostr messages
-    async decryptNostrMessageWithFallback(email, encryptedContent, keypair) {
-        console.log('[JS] Fallback decryption called for email:', email.from || email.from_address);
-        // 1. Try the sender pubkey from the header/field first (for inbox emails)
-        // For inbox emails, sender_pubkey should always be available from headers
-        const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
-        if (senderPubkey) {
-            try {
-                const decrypted = await TauriService.decryptDmContent(keypair.private_key, senderPubkey, encryptedContent);
-                if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
-                    // Fix UTF-8 encoding issues in decrypted text
-                    return Utils.fixUtf8Encoding(decrypted);
-                }
-                // If decryption failed, it means our private key couldn't decrypt with this sender's pubkey
-                // This is expected if the email wasn't encrypted for us
-                return "Unable to decrypt: Your private key could not decrypt this message. The email may not have been encrypted for your keypair.";
-            } catch (e) {
-                // Decryption error - our private key couldn't decrypt
-                console.error('[JS] Decryption failed with sender pubkey:', e);
-                return "Unable to decrypt: Your private key could not decrypt this message. The email may not have been encrypted for your keypair.";
-            }
-        }
-
-        // 2. Fallback: search DB for pubkeys matching sender email
-        // This is only reached if sender_pubkey wasn't in headers (shouldn't happen for inbox emails)
-        const senderEmail = email.from || email.from_address;
-        if (!senderEmail) return "Unable to decrypt: sender address not found";
-
-        let pubkeys = [];
-        try {
-            console.log('[JS] Calling db_find_pubkeys_by_email with:', senderEmail);
-            pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: senderEmail });
-        } catch (e) {
-            return "Unable to decrypt: error searching contacts";
-        }
-
-        if (!pubkeys || pubkeys.length === 0) {
-            // For inbox emails, sender_pubkey should be in headers, so this is unexpected
-            return "Unable to decrypt: sender pubkey not found in headers or contacts. Your private key may not be able to decrypt this message.";
-        }
-
-        // 3. Try each pubkey from contacts
-        for (const pubkey of pubkeys) {
-            try {
-                const decrypted = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
-                if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
-                    // Update the email's sender_pubkey in the DB for future use
-                    try {
-                        await window.__TAURI__.core.invoke('db_update_email_sender_pubkey_by_id', {
-                            id: Number(email.id),
-                            senderPubkey: pubkey
-                        });
-                        email.sender_pubkey = pubkey; // Update local copy
-                        email.nostr_pubkey = pubkey; // Keep for backward compatibility
-                    } catch (err) {
-                        console.warn('Failed to update sender_pubkey in DB:', err);
-                    }
-                    // Fix UTF-8 encoding issues in decrypted text
-                    return Utils.fixUtf8Encoding(decrypted);
-                }
-            } catch (e) {
-                // try next
-            }
-        }
-        // All pubkeys tried, decryption failed with our private key
-        return "Unable to decrypt: Your private key could not decrypt this message with any of the sender's pubkeys. The email may not have been encrypted for your keypair.";
-    }
-
-    // Decrypt manifest-based message for sent emails (using recipient pubkey)
-    async decryptSentManifestMessage(email, encryptedContent, keypair) {
-        console.log('[JS] Attempting sent manifest decryption for email:', email.to || email.to_address);
-        
-        try {
-            let decryptedManifestJson;
-            let foundPubkey = false;
-            
-            // Try recipient_pubkey from email first (if available)
-            const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
-            if (recipientPubkey) {
-                try {
-                    console.log('[JS] Trying recipient_pubkey from email:', recipientPubkey);
-                    decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, recipientPubkey, encryptedContent);
-                    if (decryptedManifestJson && !decryptedManifestJson.startsWith('Unable to decrypt')) {
-                        foundPubkey = true;
-                    }
-                } catch (e) {
-                    console.log('[JS] Failed with recipient_pubkey from email, falling back to contact lookup:', e);
-                }
-            }
-            
-            // Fallback: For sent emails, we need the recipient's pubkey from contacts
-            if (!foundPubkey) {
-                const recipientEmail = email.to || email.to_address;
-                if (!recipientEmail) {
-                    throw new Error('Recipient address not found');
-                }
-                
-                // Normalize Gmail addresses (remove + aliases)
-                const normalizeGmail = (email) => {
-                    const lower = email.trim().toLowerCase();
-                    if (lower.includes('@gmail.com')) {
-                        const [local, domain] = lower.split('@');
-                        const normalizedLocal = local.split('+')[0];
-                        return `${normalizedLocal}@${domain}`;
-                    }
-                    return lower;
-                };
-                
-                const normalizedEmail = normalizeGmail(recipientEmail);
-                console.log('[JS] Normalized recipient email:', normalizedEmail, 'from:', recipientEmail);
-                
-                let pubkeys = [];
-                try {
-                    // Try both original and normalized email
-                    const emailVariants = [recipientEmail, normalizedEmail].filter((e, i, arr) => arr.indexOf(e) === i);
-                    for (const emailVariant of emailVariants) {
-                        try {
-                            const found = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: emailVariant });
-                            if (found && found.length > 0) {
-                                pubkeys.push(...found);
-                                console.log('[JS] Found pubkeys for', emailVariant, ':', found);
-                            }
-                        } catch (e) {
-                            console.log('[JS] No pubkeys found for', emailVariant);
-                        }
-                    }
-                    // Remove duplicates
-                    pubkeys = [...new Set(pubkeys)];
-                } catch (e) {
-                    console.error('[JS] Error searching contacts:', e);
-                    throw new Error('Error searching contacts: ' + e.message);
-                }
-                
-                if (!pubkeys || pubkeys.length === 0) {
-                    throw new Error('Recipient not found in contacts. Email: ' + recipientEmail + ' (normalized: ' + normalizedEmail + ')');
-                }
-                
-                console.log('[JS] Found', pubkeys.length, 'pubkey(s) for recipient');
-                
-                // Try each recipient pubkey
-                for (const pubkey of pubkeys) {
-                    try {
-                        console.log('[JS] Trying recipient pubkey:', pubkey);
-                        decryptedManifestJson = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
-                        if (decryptedManifestJson && !decryptedManifestJson.startsWith('Unable to decrypt')) {
-                            foundPubkey = true;
-                            break;
-                        }
-                    } catch (e) {
-                        console.log('[JS] Failed with pubkey:', pubkey, e.message);
-                        continue;
-                    }
-                }
-            }
-            
-            if (!decryptedManifestJson) {
-                throw new Error('Failed to decrypt with any recipient pubkey');
-            }
-            
-            // Try to parse as manifest JSON, if it fails it's probably legacy format
-            let manifest;
-            try {
-                manifest = JSON.parse(decryptedManifestJson);
-                console.log('[JS] Sent manifest parsed successfully:', manifest);
-                console.log('[JS] Manifest has attachments:', manifest.attachments ? manifest.attachments.length : 0);
-                if (manifest.attachments && manifest.attachments.length > 0) {
-                    console.log('[JS] Manifest attachment IDs:', manifest.attachments.map(a => a.id));
-                    manifest.attachments.forEach((att, idx) => {
-                        console.log(`[JS] Manifest attachment ${idx}: id=${att.id}, orig_filename=${att.orig_filename}, orig_mime=${att.orig_mime}`);
-                    });
-                }
-            } catch (parseError) {
-                console.log('[JS] Not a sent manifest format, treating as legacy encrypted body');
-                return {
-                    type: 'legacy',
-                    body: Utils.fixUtf8Encoding(decryptedManifestJson)
-                };
-            }
-            
-            // Decrypt body if present
-            let decryptedBody = '';
-            if (manifest.body && manifest.body.ciphertext) {
-                console.log('[JS] Decrypting body from sent manifest...');
-                const bodyKey = manifest.body.key_wrap;
-                const encryptedBodyData = manifest.body.ciphertext;
-                
-                try {
-                    const decryptedBodyBase64 = await this.decryptWithAES(encryptedBodyData, bodyKey);
-                    decryptedBody = atob(decryptedBodyBase64);
-                    console.log('[JS] Sent body decrypted successfully, length:', decryptedBody.length);
-                } catch (aesError) {
-                    console.error('[JS] Sent AES decryption failed:', aesError);
-                    decryptedBody = `[AES Decryption Failed: ${aesError.message}]`;
-                }
-            }
-            
-            const result = {
-                type: 'manifest',
-                body: Utils.fixUtf8Encoding(decryptedBody),
-                manifest: manifest
-            };
-            console.log('[JS] Returning manifest result, type:', result.type, 'has manifest:', !!result.manifest, 'has attachments:', result.manifest && result.manifest.attachments ? result.manifest.attachments.length : 0);
-            return result;
-            
-        } catch (error) {
-            console.error('[JS] Sent manifest decryption failed:', error);
-            throw error;
-        }
-    }
-
-    // Decrypt Nostr message for sent emails (using recipient pubkey from contacts DB)
-    async decryptNostrSentMessageWithFallback(email, encryptedContent, keypair) {
-        // Try recipient_pubkey from email first (if available)
-        const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
-        if (recipientPubkey) {
-            try {
-                const decrypted = await TauriService.decryptDmContent(keypair.private_key, recipientPubkey, encryptedContent);
-                if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
-                    return Utils.fixUtf8Encoding(decrypted);
-                }
-            } catch (e) {
-                // Fall through to lookup from contacts
-            }
-        }
-        
-        // Fallback: look up the recipient's pubkey using the to address (checking both contacts and DMs)
-        const recipientEmail = email.to || email.to_address;
-        if (!recipientEmail) return "Unable to decrypt: recipient address not found";
-        let pubkeys = [];
-        try {
-            // First try the new function that includes DMs
-            pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email_including_dms', { email: recipientEmail });
-            // If that fails or returns empty, fall back to contacts only
-            if (!pubkeys || pubkeys.length === 0) {
-                pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
-            }
-        } catch (e) {
-            console.error('[JS] Error searching for recipient pubkeys:', e);
-            // Try fallback to contacts only
-            try {
-                pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
-            } catch (fallbackError) {
-                return "Unable to decrypt: error searching contacts and DMs";
-            }
-        }
-        if (!pubkeys || pubkeys.length === 0) {
-            return "Unable to decrypt: recipient pubkey not found in contacts or DMs";
-        }
-        for (const pubkey of pubkeys) {
-            try {
-                const decrypted = await TauriService.decryptDmContent(keypair.private_key, pubkey, encryptedContent);
-                if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
-                    // Successfully decrypted - save the recipient pubkey to database for future use
-                    try {
-                        await this._saveRecipientPubkeyToDb(email, pubkey);
-                        console.log(`[JS] Saved recipient pubkey ${pubkey.substring(0, 16)}... to database for email ${email.id || email.message_id}`);
-                    } catch (saveError) {
-                        console.warn('[JS] Failed to save recipient pubkey to database:', saveError);
-                        // Continue anyway - decryption was successful
-                    }
-                    // Fix UTF-8 encoding issues in decrypted text
-                    return Utils.fixUtf8Encoding(decrypted);
-                }
-            } catch (e) {
-                // try next
-            }
-        }
-        return "Unable to decrypt: tried all candidate pubkeys";
-    }
+    // ── Legacy JS decrypt functions removed — all decrypt now goes through backend ──
+    // Removed: decryptManifestMessage, decryptManifestAttachment,
+    //          decryptNostrMessageWithFallback, decryptSentManifestMessage,
+    //          decryptNostrSentMessageWithFallback, decryptAllEncryptedBlocks,
+    //          _decryptFromArmorParts, decodeGlossiaArmoredBody
 
     async renderEmails(showLoadMore = false) {
         const emailList = domManager.get('emailList');
@@ -2955,128 +2581,32 @@ class EmailService {
                     if (!keypair) {
                         previewText = 'Unable to decrypt: no keypair';
                     } else {
-                        // Decrypt subject if it looks encrypted (base64 or glossia-encoded)
-                        let subjectCipher = null;
-                        if (Utils.isLikelyEncryptedContent(email.subject)) {
-                            subjectCipher = email.subject;
-                        } else {
-                            subjectCipher = this.decodeGlossiaSubject(email.subject);
-                            if (subjectCipher && email.message_id) {
-                                this.hashStringSHA256(subjectCipher).then(hash => {
+                        try {
+                            const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                            const result = await TauriService.decryptEmailBody(
+                                keypair.private_key, email.body, email.subject,
+                                senderPubkey, null
+                            );
+                            if (result.success) {
+                                previewSubject = result.subject;
+                                previewText = Utils.escapeHtml(result.body.substring(0, 100));
+                                if (result.body.length > 100) previewText += '...';
+                                showSubject = true;
+                            } else {
+                                previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                            }
+                            // Update subject_hash for DM↔email matching
+                            if (result.subjectCiphertext && email.message_id) {
+                                this.hashStringSHA256(result.subjectCiphertext).then(hash => {
                                     window.__TAURI__.core.invoke('db_update_email_subject_hash', {
                                         messageId: email.message_id,
                                         subjectHash: hash,
                                     }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
                                 });
                             }
-                        }
-                        if (subjectCipher) {
-                            try {
-                                previewSubject = await this.decryptNostrMessageWithFallback(email, subjectCipher, keypair);
-                                if (previewSubject && (previewSubject.startsWith('Unable to decrypt') || previewSubject.includes('Unable to decrypt'))) {
-                                    previewSubject = 'Unable to decrypt';
-                                }
-                            } catch (e) {
-                                previewSubject = 'Unable to decrypt';
-                            }
-                        }
-                        // Decrypt body - try manifest format first, then fallback to legacy
-                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
-                        if (encryptedBodyMatch) {
-                            const armorContent = encryptedBodyMatch[1].trim();
-                            let encryptedContent;
-                            if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
-                                encryptedContent = armorContent.replace(/\s+/g, '');
-                            } else {
-                                // Glossia-encoded body — decode to ciphertext
-                                const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
-                                encryptedContent = glossiaResult ? glossiaResult.ciphertext : null;
-                                if (!encryptedContent) {
-                                    // decodeGlossiaArmoredBody failed — try each dialect manually
-                                    const gs = window.GlossiaService;
-                                    if (gs && gs.isReady()) {
-                                        const detections = gs.detectDialect(armorContent);
-                                        for (const det of (detections || [])) {
-                                            try {
-                                                const result = gs.transcode(armorContent, `decode from ${det.language}`);
-                                                let decoded = result.output;
-                                                if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
-                                                decoded = gs._autoUnpack(decoded);
-                                                encryptedContent = decoded;
-                                                break;
-                                            } catch (_) { /* try next dialect */ }
-                                        }
-                                    }
-                                }
-                            }
-                            if (!encryptedContent) {
-                                // Glossia decode failed — can't decrypt
-                            } else try {
-                                // Try manifest decryption first
-                                console.log('[JS] Attempting manifest decryption for preview...');
-                                const manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
-                                console.log('[JS] Manifest result:', manifestResult);
-                                
-                                if (manifestResult.type === 'manifest') {
-                                    console.log('[JS] Using manifest body for preview:', manifestResult.body.substring(0, 50));
-                                    previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
-                                    showSubject = true;
-                                } else if (manifestResult.type === 'legacy') {
-                                    console.log('[JS] Using legacy body for preview:', manifestResult.body.substring(0, 50));
-                                    previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
-                                    showSubject = true;
-                                } else {
-                                    // Fallback to legacy decryption
-                                    console.log('[JS] Falling back to legacy decryption for preview...');
-                                    const decrypted = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                    // Check if decryption returned an error message
-                                    if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
-                                        previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
-                                    } else {
-                                        previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                        showSubject = true;
-                                    }
-                                }
-                            } catch (e) {
-                                console.error('[JS] Manifest decryption failed for preview:', e);
-                                // If manifest fails, try legacy decryption
-                                try {
-                                    let decrypted = await this.decryptNostrMessageWithFallback(email, encryptedContent, keypair);
-                                    // Check if decryption returned an error message
-                                    if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
-                                        previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
-                                    } else {
-                                        // Fallback may have returned manifest JSON — try AES-decrypting
-                                        try {
-                                            const fm = JSON.parse(decrypted);
-                                            if (fm.body && fm.body.ciphertext && fm.body.key_wrap) {
-                                                const aesBody = await this.decryptWithAES(fm.body.ciphertext, fm.body.key_wrap);
-                                                decrypted = atob(aesBody);
-                                            }
-                                        } catch (_) { /* not JSON or AES failed */ }
-                                        previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                        showSubject = true;
-                                    }
-                                } catch (legacyError) {
-                                    previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
-                                }
-                            }
-                        }
-                        // Fallback: if regex-based extraction failed (e.g. nested reply chains),
-                        // try the depth-counting parser which handles nesting correctly
-                        if (previewText.includes('could not decrypt') || previewText.includes('Unable to decrypt')) {
-                            try {
-                                const parts = await this.parseArmorComponentsRust(email.body);
-                                if (parts && parts.isEncryptedBody) {
-                                    const fallbackPub = email.sender_pubkey || email.nostr_pubkey;
-                                    const text = await this._decryptFromArmorParts(parts, fallbackPub);
-                                    previewText = Utils.escapeHtml(text.substring(0, 100));
-                                    if (text.length > 100) previewText += '...';
-                                    showSubject = true;
-                                }
-                            } catch (e) {
-                                console.warn('[JS] Armor parse fallback for preview failed:', e);
-                            }
+                        } catch (e) {
+                            console.error('[JS] Backend decrypt failed for inbox preview:', e);
+                            previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
                         }
                     }
                 } else {
@@ -3117,8 +2647,9 @@ class EmailService {
 
                 // Add signature verification indicator
                 let signatureIndicator = '';
+                const sigSource = email.signature_source ? ` (${email.signature_source})` : '';
                 if (email.signature_valid === true) {
-                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
                 } else if (email.signature_valid === false) {
                     signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
                 }
@@ -3617,33 +3148,28 @@ class EmailService {
                                 let manifestResult = cachedManifestResult;
                                 
                                 if (!manifestResult || manifestResult.type !== 'manifest') {
-                                    // Permissive regex: matches both base64 and glossia word content
-                                    const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
-                                    if (encryptedBodyMatch) {
-                                        const armorContent = encryptedBodyMatch[2].trim();
-                                        let encryptedContent;
-                                        if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
-                                            encryptedContent = armorContent.replace(/\s+/g, '');
-                                        } else {
-                                            const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
-                                            encryptedContent = glossiaResult ? glossiaResult.ciphertext : null;
-                                            // WASM failed — use backend native Rust
-                                            if (!encryptedContent) {
-                                                const nip = encryptedBodyMatch[1];
-                                                const algo = nip === 'NIP-04' ? 'nip04' : 'nip44';
-                                                const gs = window.GlossiaService;
-                                                const dets = gs && gs.isReady() ? gs.detectDialect(armorContent) : [];
-                                                const dialect = (Array.isArray(dets) && dets.length > 0) ? dets[0].language : 'latin';
-                                                try {
-                                                    encryptedContent = await window.__TAURI__.core.invoke('decode_glossia', {
-                                                        text: armorContent, language: dialect, algorithm: algo,
-                                                    });
-                                                } catch (_) {}
-                                            }
-                                        }
-                                        if (encryptedContent) {
-                                            const keypair = appState.getKeypair();
-                                            manifestResult = await this.decryptManifestMessage(email, encryptedContent, keypair);
+                                    // Re-decrypt via backend to extract manifest
+                                    const keypair = appState.getKeypair();
+                                    if (keypair && email.body && email.body.includes('BEGIN NOSTR')) {
+                                        const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                                        const decryptResult = await TauriService.decryptEmailBody(
+                                            keypair.private_key, email.body, email.subject || '',
+                                            senderPubkey, null
+                                        );
+                                        if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
+                                            manifestResult = {
+                                                type: 'manifest',
+                                                manifest: {
+                                                    attachments: decryptResult.attachments.map(a => ({
+                                                        id: a.id,
+                                                        orig_filename: a.origFilename,
+                                                        orig_mime: a.origMime,
+                                                        key_wrap: a.keyWrapB64,
+                                                        cipher_sha256: a.cipherSha256Hex,
+                                                        cipher_size: a.cipherSize,
+                                                    }))
+                                                }
+                                            };
                                         }
                                     }
                                 }
@@ -3754,16 +3280,17 @@ class EmailService {
                     // Extract the outer sig result (last element if array, since DOM order is [quoted, outer])
                     const outerSigResult = Array.isArray(inlineSigResult) ? inlineSigResult[inlineSigResult.length - 1] : inlineSigResult;
                     let signatureIndicator = '';
+                    const detailSigSource = email.signature_source ? ` (${email.signature_source})` : '';
                     if (outerSigResult && outerSigResult.isValid === true) {
                         signatureIndicator = `<span class="signature-indicator verified" title="Inline signature verified"><i class="fas fa-check-circle"></i> Signature Verified</span>`;
                     } else if (outerSigResult && outerSigResult.isValid === false) {
                         signatureIndicator = `<span class="signature-indicator invalid" title="Inline signature invalid"><i class="fas fa-times-circle"></i> Signature Invalid</span>`;
                     } else if (email.signature_valid === true) {
-                        signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                        signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${detailSigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
                     } else if (email.signature_valid === false) {
                         signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
                     }
-                    
+
                     // Get sender info for header
                     const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                     const contacts = appState.getContacts();
@@ -4701,178 +4228,6 @@ ${attachmentsHtml}
     getGlossiaEncodingPubkey() {
         const settings = window.appState?.getSettings();
         return settings?.glossia_encoding_pubkey ?? 'latin';
-    }
-
-    /**
-     * Pre-decrypt all encrypted blocks from plaintext armor, recursively.
-     * Mirrors verifyAllSignatures: works from canonical text/plain, returns
-     * results in innermost-first order (one entry per armor level, null for non-encrypted).
-     * @param {string} plainBody - Raw text/plain body with armor blocks
-     * @param {string} fallbackPubkey - npub/hex pubkey for when seal pubkey matches user's own
-     * @returns {Promise<Array<{decryptedText: string}|{error: string}|null>>}
-     */
-    async decryptAllEncryptedBlocks(plainBody, fallbackPubkey) {
-        if (!plainBody) return [];
-
-        const parts = await this.parseArmorComponentsRust(plainBody);
-        if (!parts) return [];
-
-        // Decrypt outer block (null for non-encrypted blocks to preserve position)
-        let outerResult = null;
-        if (parts.isEncryptedBody) {
-            try {
-                const text = await this._decryptFromArmorParts(parts, fallbackPubkey);
-                outerResult = { decryptedText: text };
-            } catch (e) {
-                outerResult = { error: e.message };
-            }
-        }
-
-        // Recurse into nested quoted armor
-        let innerResults = [];
-        if (parts.quotedArmor) {
-            innerResults = await this.decryptAllEncryptedBlocks(parts.quotedArmor, fallbackPubkey);
-        }
-
-        // Innermost-first; null entries preserved for positional alignment with DOM
-        return [...innerResults, outerResult];
-    }
-
-    /**
-     * Decrypt a single encrypted block using parsed armor components.
-     * Extracts pubkey from sealContent, decodes glossia body, decrypts.
-     */
-    async _decryptFromArmorParts(parts, fallbackPubkey) {
-        const keypair = appState.getKeypair();
-        if (!keypair) throw new Error('No active keypair');
-
-        // Get pubkey from parsed seal/signature (already hex from _splitSigPubkey, or raw text from seal block)
-        let otherPubkeyHex = parts.sealContent;
-        if (otherPubkeyHex && !/^[0-9a-fA-F]{64}$/.test(otherPubkeyHex)) {
-            otherPubkeyHex = this._decodePubkeyText(otherPubkeyHex);
-        }
-        if (!otherPubkeyHex) throw new Error('No pubkey in seal/signature');
-
-        // Determine which pubkey to use for decryption
-        const userPubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
-        let decryptPubkeyHex;
-        if (otherPubkeyHex === userPubkeyHex) {
-            if (!fallbackPubkey) throw new Error('Cannot determine recipient pubkey');
-            decryptPubkeyHex = fallbackPubkey.startsWith('npub1')
-                ? window.CryptoService._npubToHex(fallbackPubkey) : fallbackPubkey;
-        } else {
-            decryptPubkeyHex = otherPubkeyHex;
-        }
-
-        // Decode glossia body → ciphertext
-        const gs = window.GlossiaService;
-        let ciphertext;
-        const stripped = parts.bodyText.replace(/\s+/g, '');
-        if (/^[A-Za-z0-9+/=?]+$/.test(stripped)) {
-            ciphertext = stripped;
-        } else if (gs && gs.isReady()) {
-            const detections = gs.detectDialect(parts.bodyText);
-            if (!Array.isArray(detections) || detections.length === 0) throw new Error('Cannot detect dialect');
-            const dialect = detections[0].language;
-            const result = gs.transcode(parts.bodyText, `decode from ${dialect}`);
-            let decoded = result.output;
-            if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
-            ciphertext = gs._autoUnpack(decoded);
-        } else {
-            throw new Error('GlossiaService not ready');
-        }
-
-        // Decrypt
-        const decryptNpub = window.CryptoService._nip19.npubEncode(decryptPubkeyHex);
-        let decrypted = await TauriService.decryptDmContent(keypair.private_key, decryptNpub, ciphertext);
-        if (!decrypted || decrypted.startsWith('Unable to decrypt')) throw new Error(decrypted || 'Decryption failed');
-        // If decrypted content is manifest JSON, AES-decrypt the body
-        try {
-            const fm = JSON.parse(decrypted);
-            if (fm.body && fm.body.ciphertext && fm.body.key_wrap) {
-                const aesBody = await window.emailService.decryptWithAES(fm.body.ciphertext, fm.body.key_wrap);
-                decrypted = atob(aesBody);
-            }
-        } catch (_) { /* not JSON or AES failed — use as-is */ }
-        return Utils.fixUtf8Encoding(decrypted);
-    }
-
-    /**
-     * Decode an encoded pubkey text (npub, glossia, or raw hex) to hex.
-     * @returns {string|null} 64-char hex pubkey or null
-     */
-    _decodePubkeyText(text) {
-        if (!text) return null;
-        // Try npub
-        const npubMatch = text.match(/(npub1[a-z0-9]+)/);
-        if (npubMatch) {
-            try { return window.CryptoService._npubToHex(npubMatch[1]); } catch (_) {}
-        }
-        // Try raw hex
-        const stripped = text.replace(/\s+/g, '');
-        if (/^[0-9a-fA-F]{64}$/.test(stripped)) return stripped;
-        // Try glossia decode
-        const gs = window.GlossiaService;
-        if (gs && gs.isReady()) {
-            try {
-                const detections = gs.detectDialect(text);
-                const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : null;
-                if (dialect) {
-                    const hex = gs.decodeRawBaseN(text, dialect, 32);
-                    if (hex && hex.length === 64) return hex;
-                }
-            } catch (_) {}
-        }
-        return null;
-    }
-
-    decodeGlossiaArmoredBody(plainBody) {
-        // Permissive armor regex: handles both "-----BEGIN" and "----- BEGIN" (with optional spaces)
-        // Content stops at END NOSTR ... ENCRYPTED MESSAGE, END NOSTR MESSAGE, or BEGIN NOSTR SIGNATURE
-        const armorRegex = /-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/;
-        const match = plainBody.replace(/\r\n/g, '\n').match(armorRegex);
-        if (!match) return null;
-
-        const nip = match[1]; // e.g. "NIP-04" or "NIP-44"
-        const content = match[2].trim();
-
-        // If content is already base64 (no spaces), return as-is
-        if (/^[A-Za-z0-9+/=\n?]+$/.test(content.replace(/\s+/g, ''))) {
-            return { ciphertext: content.replace(/\s+/g, ''), nip, isGlossia: false };
-        }
-
-        // Content has spaces/words → glossia-encoded
-        const gs = window.GlossiaService;
-        if (!gs || !gs.isReady()) {
-            console.warn('[JS] decodeGlossiaArmoredBody: GlossiaService not ready');
-            return null;
-        }
-
-        // Loop through supported dialects until one succeeds.
-        // The WASM transcode can panic for a mismatched dialect, so we
-        // catch per-dialect and continue to the next one.
-        const supportedDialects = ['latin', 'english'];
-        for (const dialect of supportedDialects) {
-            try {
-                const result = gs.transcode(content, `decode from ${dialect}`);
-                let decoded = result.output;
-
-                // Convert hex to base64 if needed
-                if (gs._isHex(decoded)) {
-                    decoded = gs._hexToBase64(decoded);
-                }
-
-                // Unpack NIP-04 binary format if applicable
-                decoded = gs._autoUnpack(decoded);
-
-                console.log('[JS] decodeGlossiaArmoredBody: succeeded with dialect:', dialect, 'len:', decoded.length);
-                return { ciphertext: decoded, nip, isGlossia: true, dialect };
-            } catch (e) {
-                console.warn('[JS] decodeGlossiaArmoredBody: dialect', dialect, 'failed:', e.message);
-            }
-        }
-        console.error('[JS] decodeGlossiaArmoredBody: all dialects failed');
-        return null;
     }
 
     /**
@@ -6618,102 +5973,32 @@ ${attachmentsHtml}
             if (!keypair) {
                 previewText = 'Unable to decrypt: no keypair';
             } else {
-                        // Decrypt subject — try base64 first, then glossia decode
-                        let subjectCiphertext = null;
-                        if (Utils.isLikelyEncryptedContent(email.subject)) {
-                            subjectCiphertext = email.subject;
-                        } else {
-                            subjectCiphertext = this.decodeGlossiaSubject(email.subject);
-                            if (subjectCiphertext && email.message_id) {
-                                this.hashStringSHA256(subjectCiphertext).then(hash => {
-                                    window.__TAURI__.core.invoke('db_update_email_subject_hash', {
-                                        messageId: email.message_id,
-                                        subjectHash: hash,
-                                    }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
-                                });
-                            }
-                        }
-                        if (subjectCiphertext) {
-                            try {
-                                const decryptedSubject = await this.decryptNostrSentMessageWithFallback(email, subjectCiphertext, keypair);
-                                if (decryptedSubject && (decryptedSubject.startsWith('Unable to decrypt') || decryptedSubject.includes('Unable to decrypt'))) {
-                                    previewSubject = 'Could not decrypt';
-                                } else if (decryptedSubject) {
-                                    previewSubject = decryptedSubject;
-                                } else {
-                                    previewSubject = 'Could not decrypt';
-                                }
-                            } catch (e) {
-                                previewSubject = 'Could not decrypt';
-                            }
-                        }
-                        // Decrypt body - try manifest format first, then fallback to legacy
-                        const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
-                if (encryptedBodyMatch) {
-                    // Extract ciphertext: base64 as-is, glossia needs decoding
-                    const armorContent = encryptedBodyMatch[1].trim();
-                    let encryptedContent;
-                    if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
-                        encryptedContent = armorContent.replace(/\s+/g, '');
+                try {
+                    const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
+                    const result = await TauriService.decryptEmailBody(
+                        keypair.private_key, email.body, email.subject,
+                        null, recipientPubkey
+                    );
+                    if (result.success) {
+                        previewSubject = result.subject;
+                        previewText = Utils.escapeHtml(result.body.substring(0, 100));
+                        if (result.body.length > 100) previewText += '...';
+                        showSubject = true;
                     } else {
-                        const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
-                        encryptedContent = glossiaResult ? glossiaResult.ciphertext : armorContent.replace(/\s+/g, '');
+                        previewText = 'Could not decrypt';
                     }
-                    try {
-                        // Try sent manifest decryption first
-                        const manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
-                        if (manifestResult.type === 'manifest') {
-                            previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
-                            showSubject = true;
-                        } else if (manifestResult.type === 'legacy') {
-                            previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
-                            showSubject = true;
-                        } else {
-                            // Fallback to legacy decryption
-                            const decrypted = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
-                            // Check if decryption returned an error message
-                            if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
-                                previewText = 'Could not decrypt';
-                            } else if (decrypted) {
-                                previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                showSubject = true;
-                            } else {
-                                previewText = 'Could not decrypt';
-                            }
-                        }
-                    } catch (e) {
-                        // If manifest fails, try legacy decryption
-                        try {
-                            const decrypted = await this.decryptNostrSentMessageWithFallback(email, encryptedContent, keypair);
-                            // Check if decryption returned an error message
-                            if (decrypted && (decrypted.startsWith('Unable to decrypt') || decrypted.includes('Unable to decrypt'))) {
-                                previewText = 'Could not decrypt';
-                            } else if (decrypted) {
-                                previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                showSubject = true;
-                            } else {
-                                previewText = 'Could not decrypt';
-                            }
-                        } catch (legacyError) {
-                            previewText = 'Could not decrypt';
-                        }
+                    // Update subject_hash for DM↔email matching
+                    if (result.subjectCiphertext && email.message_id) {
+                        this.hashStringSHA256(result.subjectCiphertext).then(hash => {
+                            window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                                messageId: email.message_id,
+                                subjectHash: hash,
+                            }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
+                        });
                     }
-                }
-                // Fallback: if regex-based extraction failed (e.g. nested reply chains),
-                // try the depth-counting parser which handles nesting correctly
-                if (previewText === 'Could not decrypt' || previewText.includes('could not decrypt') || previewText.includes('Could not decrypt')) {
-                    try {
-                        const parts = await this.parseArmorComponentsRust(email.body);
-                        if (parts && parts.isEncryptedBody) {
-                            const fallbackPub = email.recipient_pubkey || email.nostr_pubkey;
-                            const text = await this._decryptFromArmorParts(parts, fallbackPub);
-                            previewText = Utils.escapeHtml(text.substring(0, 100));
-                            if (text.length > 100) previewText += '...';
-                            showSubject = true;
-                        }
-                    } catch (e) {
-                        console.warn('[JS] Armor parse fallback for sent preview failed:', e);
-                    }
+                } catch (e) {
+                    console.error('[JS] Backend decrypt failed for sent preview:', e);
+                    previewText = 'Could not decrypt';
                 }
             }
         } else {
@@ -6746,9 +6031,10 @@ ${attachmentsHtml}
 
         // Add signature verification indicator
         let signatureIndicator = '';
+        const sentSigSource = email.signature_source ? ` (${email.signature_source})` : '';
         // Check signature_valid - handle both boolean and null/undefined cases
         if (email.signature_valid === true || email.signature_valid === 1) {
-            signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+            signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sentSigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
         } else if (email.signature_valid === false || email.signature_valid === 0) {
             signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
         }
@@ -7060,9 +6346,10 @@ ${attachmentsHtml}
                 
                 // Add signature verification indicator
                 let signatureIndicator = '';
+                const sentDetailSigSource = email.signature_source ? ` (${email.signature_source})` : '';
                 // Check signature_valid - handle both boolean and null/undefined cases
                 if (email.signature_valid === true || email.signature_valid === 1) {
-                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sentDetailSigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
                 } else if (email.signature_valid === false || email.signature_valid === 0) {
                     signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
                 }
@@ -7345,36 +6632,28 @@ ${signatureIndicator}
                         
                         // Only decrypt if we don't have a cached result
                         if (!manifestResult || manifestResult.type !== 'manifest') {
-                            console.log('[JS] No valid cached manifest, need to decrypt');
-                            console.log('[JS] No cached manifest, attempting to decrypt...');
-                            console.log('[JS] Email body length:', email.body ? email.body.length : 0);
-                            console.log('[JS] Email body preview:', email.body ? email.body.substring(0, 200) : 'null');
-                            
-                            // Extract encrypted content from the body (permissive regex)
-                            const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
-                            if (!encryptedBodyMatch) {
-                                console.warn('[JS] No encrypted content found in email body using regex, trying raw body');
-                                const keypair = appState.getKeypair();
-                                try {
-                                    manifestResult = await this.decryptSentManifestMessage(email, email.body.replace(/\s+/g, ''), keypair);
-                                } catch (e) {
-                                    console.error('[JS] Failed to decrypt with raw body:', e);
-                                    throw new Error('No encrypted content found in email body');
+                            const keypair = appState.getKeypair();
+                            if (keypair && email.body && email.body.includes('BEGIN NOSTR')) {
+                                const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
+                                const decryptResult = await TauriService.decryptEmailBody(
+                                    keypair.private_key, email.body, email.subject || '',
+                                    null, recipientPubkey
+                                );
+                                if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
+                                    manifestResult = {
+                                        type: 'manifest',
+                                        manifest: {
+                                            attachments: decryptResult.attachments.map(a => ({
+                                                id: a.id,
+                                                orig_filename: a.origFilename,
+                                                orig_mime: a.origMime,
+                                                key_wrap: a.keyWrapB64,
+                                                cipher_sha256: a.cipherSha256Hex,
+                                                cipher_size: a.cipherSize,
+                                            }))
+                                        }
+                                    };
                                 }
-                            } else {
-                                const armorContent = encryptedBodyMatch[2].trim();
-                                let encryptedContent;
-                                if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
-                                    encryptedContent = armorContent.replace(/\s+/g, '');
-                                } else {
-                                    const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
-                                    encryptedContent = glossiaResult ? glossiaResult.ciphertext : armorContent.replace(/\s+/g, '');
-                                }
-                                console.log('[JS] Extracted encrypted content, length:', encryptedContent.length);
-                                const keypair = appState.getKeypair();
-
-                                // Decrypt the manifest to get original attachment metadata
-                                manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
                             }
                         }
                         
@@ -7509,7 +6788,8 @@ ${signatureIndicator}
             } else if (outerSigResult && outerSigResult.isValid === false) {
                 signatureIndicator = `<span class="signature-indicator invalid" title="Inline signature invalid"><i class="fas fa-times-circle"></i> Signature Invalid</span>`;
             } else if (email.signature_valid === true || email.signature_valid === 1) {
-                signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                const sentUpSigSource = email.signature_source ? ` (${email.signature_source})` : '';
+                signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sentUpSigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
             } else if (email.signature_valid === false || email.signature_valid === 0) {
                 signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
             }
@@ -7974,107 +7254,29 @@ ${attachmentsHtml}
     async _tryDecryptWithRecipientPubkey(email, recipientPubkey) {
         try {
             const keypair = appState.getKeypair();
-            if (!keypair) {
-                return false;
-            }
-            
-            // Create a test email object with the recipient pubkey
-            const testEmail = {
-                ...email,
-                recipient_pubkey: recipientPubkey
-            };
-            
-            // Detect subject encryption (base64 or glossia-encoded)
-            let subjectCiphertext = null;
-            if (Utils.isLikelyEncryptedContent(email.subject)) {
-                subjectCiphertext = email.subject;
-            } else {
-                subjectCiphertext = this.decodeGlossiaSubject(email.subject);
-                if (subjectCiphertext && email.message_id) {
-                    this.hashStringSHA256(subjectCiphertext).then(hash => {
+            if (!keypair) return false;
+
+            const result = await TauriService.decryptEmailBody(
+                keypair.private_key, email.body, email.subject || '',
+                null, recipientPubkey
+            );
+
+            if (result.success) {
+                await this._saveRecipientPubkeyToDb(email, recipientPubkey);
+                window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
+
+                // Update subject_hash for DM↔email matching
+                if (result.subjectCiphertext && email.message_id) {
+                    this.hashStringSHA256(result.subjectCiphertext).then(hash => {
                         window.__TAURI__.core.invoke('db_update_email_subject_hash', {
                             messageId: email.message_id,
                             subjectHash: hash,
                         }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
                     });
                 }
+                return true;
             }
-            const isEncryptedSubject = !!subjectCiphertext;
 
-            // Helper to extract body ciphertext (handles both base64 and glossia)
-            const extractBodyCiphertext = (bodyMatch) => {
-                if (!bodyMatch) return null;
-                const armorContent = bodyMatch[1].trim();
-                if (/^[A-Za-z0-9+/=\n?]+$/.test(armorContent.replace(/\s+/g, ''))) {
-                    return armorContent.replace(/\s+/g, '');
-                }
-                const glossiaResult = this.decodeGlossiaArmoredBody(email.body);
-                return glossiaResult ? glossiaResult.ciphertext : armorContent.replace(/\s+/g, '');
-            };
-
-            if (isEncryptedSubject) {
-                try {
-                    const decryptedSubject = await this.decryptNostrSentMessageWithFallback(testEmail, subjectCiphertext, keypair);
-                    if (decryptedSubject && !decryptedSubject.startsWith('Unable to decrypt')) {
-                        // Subject decryption successful, try body too
-                        const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('BEGIN NOSTR')).join('\n').trim();
-                        const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
-
-                        if (encryptedBodyMatch) {
-                            const encryptedContent = extractBodyCiphertext(encryptedBodyMatch);
-                            try {
-                                const manifestResult = await this.decryptSentManifestMessage(testEmail, encryptedContent, keypair);
-                                if (manifestResult && manifestResult.type !== 'error') {
-                                    // Both subject and body decrypted successfully
-                                    // Save to database
-                                    await this._saveRecipientPubkeyToDb(email, recipientPubkey);
-                                    window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
-                                    return true;
-                                }
-                            } catch (e) {
-                                // Try legacy decryption
-                                const decryptedBody = await this.decryptNostrSentMessageWithFallback(testEmail, encryptedContent, keypair);
-                                if (decryptedBody && !decryptedBody.startsWith('Unable to decrypt')) {
-                                    await this._saveRecipientPubkeyToDb(email, recipientPubkey);
-                                    window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
-                                    return true;
-                                }
-                            }
-                        } else {
-                            // No encrypted body, subject decryption is enough
-                            await this._saveRecipientPubkeyToDb(email, recipientPubkey);
-                            window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
-                            return true;
-                        }
-                    }
-                } catch (e) {
-                    console.error('[JS] Subject decryption test failed:', e);
-                }
-            } else {
-                // Subject not encrypted, try body
-                const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('BEGIN NOSTR')).join('\n').trim();
-                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
-
-                if (encryptedBodyMatch) {
-                    const encryptedContent = extractBodyCiphertext(encryptedBodyMatch);
-                    try {
-                        const manifestResult = await this.decryptSentManifestMessage(testEmail, encryptedContent, keypair);
-                        if (manifestResult && manifestResult.type !== 'error') {
-                            await this._saveRecipientPubkeyToDb(email, recipientPubkey);
-                            window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
-                            return true;
-                        }
-                    } catch (e) {
-                        const decryptedBody = await this.decryptNostrSentMessageWithFallback(testEmail, encryptedContent, keypair);
-                        if (decryptedBody && !decryptedBody.startsWith('Unable to decrypt')) {
-                            await this._saveRecipientPubkeyToDb(email, recipientPubkey);
-                            window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
-                            return true;
-                        }
-                    }
-                }
-            }
-            
             return false;
         } catch (error) {
             console.error('[JS] Error trying decryption with recipient pubkey:', error);
@@ -8284,62 +7486,58 @@ ${attachmentsHtml}
             if (hasManifestAttachments || (hasEncryptedContent && email.attachments.some(att => att.filename.endsWith('.dat')))) {
                 console.log(`[JS] Attempting to decrypt manifest for ZIP (hasManifestAttachments: ${hasManifestAttachments}, hasEncryptedContent: ${hasEncryptedContent})`);
                 
-                // Extract and decrypt manifest
-                const encryptedBodyMatch = email.body.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
-                if (!encryptedBodyMatch) {
-                    window.notificationService.showError('Cannot decrypt attachments: no encrypted manifest found');
-                    return;
-                }
-                
                 const keypair = appState.getKeypair();
-                if (!keypair) {
+                if (!keypair) return;
+
+                const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
+                const decryptResult = await TauriService.decryptEmailBody(
+                    keypair.private_key, email.body, email.subject || '',
+                    null, recipientPubkey
+                );
+
+                if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
+                    window.notificationService.showError('Cannot decrypt attachments: no manifest found');
                     return;
                 }
-                
-                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                manifestResult = await this.decryptSentManifestMessage(email, encryptedContent, keypair);
-                
-                if (manifestResult.type !== 'manifest') {
-                    window.notificationService.showError('Cannot decrypt attachments: invalid manifest');
-                    return;
-                }
-                
-                console.log(`[JS] Manifest decrypted successfully, has ${manifestResult.manifest.attachments.length} attachments`);
+
+                manifestResult = {
+                    type: 'manifest',
+                    manifest: {
+                        attachments: decryptResult.attachments.map(a => ({
+                            id: a.id,
+                            orig_filename: a.origFilename,
+                            orig_mime: a.origMime,
+                            key_wrap: a.keyWrapB64,
+                            cipher_sha256: a.cipherSha256Hex,
+                            cipher_size: a.cipherSize,
+                        }))
+                    }
+                };
             }
-            
+
             // Process each attachment - decrypt if we have a manifest
             for (const attachment of email.attachments) {
-                const shouldDecrypt = attachment.encryption_method === 'manifest_aes' || 
+                const shouldDecrypt = attachment.encryption_method === 'manifest_aes' ||
                                     (manifestResult && attachment.filename.endsWith('.dat'));
-                
+
                 if (shouldDecrypt && manifestResult) {
-                    // Find attachment metadata in manifest
-                    const opaqueId = attachment.filename.replace(/\.dat$/, ''); // a1.dat -> a1
-                    console.log(`[JS] Looking for manifest attachment with id: ${opaqueId} from filename: ${attachment.filename}`);
+                    const opaqueId = attachment.filename.replace(/\.dat$/, '');
                     const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
-                    
+
                     if (!attachmentMeta) {
-                        console.warn(`[JS] Skipping attachment ${attachment.filename}: metadata not found in manifest (looking for id: ${opaqueId}, available ids: ${manifestResult.manifest.attachments.map(a => a.id).join(', ')})`);
-                        // Fallback: add as-is if we can't find metadata
-                        attachmentsForZip.push({
-                            filename: attachment.filename,
-                            data: attachment.data
-                        });
+                        attachmentsForZip.push({ filename: attachment.filename, data: attachment.data });
                         continue;
                     }
-                    
-                    console.log(`[JS] Found attachment metadata:`, attachmentMeta);
-                    
-                    // Decrypt attachment data (attachment.data is base64)
-                    const decryptedData = await this.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
-                    
+
+                    const decryptedAttachment = await TauriService.decryptManifestAttachment(
+                        attachment.data, attachmentMeta.key_wrap, attachmentMeta.cipher_sha256,
+                        attachmentMeta.orig_filename, attachmentMeta.orig_mime, opaqueId
+                    );
+
                     attachmentsForZip.push({
-                        filename: attachmentMeta.orig_filename,
-                        data: decryptedData
+                        filename: decryptedAttachment.filename,
+                        data: decryptedAttachment.dataB64
                     });
-                    
-                    console.log(`[JS] Added decrypted attachment to ZIP: ${attachmentMeta.orig_filename} (${decryptedData.length} bytes)`);
-                    
                 } else {
                     // Plain attachment - decode base64 if needed
                     let attachmentData = attachment.data;
@@ -8778,31 +7976,18 @@ ${attachmentsHtml}
                     if (!keypair) {
                         previewText = 'Unable to decrypt: no keypair';
                     } else {
-                        // Try to decrypt subject and body
                         try {
-                            if (Utils.isLikelyEncryptedContent(draft.subject)) {
-                                previewSubject = await this.decryptNostrMessageWithFallback(draft, draft.subject, keypair);
-                            }
-                            const encryptedBodyMatch = draft.body.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
-                            if (encryptedBodyMatch) {
-                                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                                try {
-                                    // Try manifest decryption first
-                                    const manifestResult = await this.decryptManifestMessage(draft, encryptedContent, keypair);
-                                    if (manifestResult.type === 'manifest') {
-                                        previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
-                                    } else if (manifestResult.type === 'legacy') {
-                                        previewText = Utils.escapeHtml(manifestResult.body.substring(0, 100));
-                                    } else {
-                                        // Fallback to legacy decryption
-                                        const decrypted = await this.decryptNostrMessageWithFallback(draft, encryptedContent, keypair);
-                                        previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                    }
-                                } catch (e) {
-                                    // If manifest fails, try legacy decryption
-                                    const decrypted = await this.decryptNostrMessageWithFallback(draft, encryptedContent, keypair);
-                                    previewText = Utils.escapeHtml(decrypted.substring(0, 100));
-                                }
+                            const recipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey || draft.sender_pubkey;
+                            const result = await TauriService.decryptEmailBody(
+                                keypair.private_key, draft.body, draft.subject || '',
+                                recipientPubkey, null
+                            );
+                            if (result.success) {
+                                previewSubject = result.subject || draft.subject;
+                                previewText = Utils.escapeHtml(result.body.substring(0, 100));
+                                if (result.body.length > 100) previewText += '...';
+                            } else {
+                                previewText = 'Could not decrypt';
                             }
                         } catch (e) {
                             previewText = 'Could not decrypt';
@@ -8982,26 +8167,17 @@ ${attachmentsHtml}
                 if ((isEncryptedSubject || encryptedBodyMatch) && keypair) {
                     (async () => {
                         try {
-                            if (isEncryptedSubject) {
-                                decryptedSubject = await this.decryptNostrMessageWithFallback(draft, draft.subject, keypair);
-                            }
-                            if (encryptedBodyMatch) {
-                                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                                try {
-                                    // Try manifest decryption first
-                                    const manifestResult = await this.decryptManifestMessage(draft, encryptedContent, keypair);
-                                    if (manifestResult.type === 'manifest') {
-                                        decryptedBody = manifestResult.body;
-                                    } else if (manifestResult.type === 'legacy') {
-                                        decryptedBody = manifestResult.body;
-                                    } else {
-                                        // Fallback to legacy decryption
-                                        decryptedBody = await this.decryptNostrMessageWithFallback(draft, encryptedContent, keypair);
-                                    }
-                                } catch (e) {
-                                    // If manifest fails, try legacy decryption
-                                    decryptedBody = await this.decryptNostrMessageWithFallback(draft, encryptedContent, keypair);
-                                }
+                            const recipientPubkey = draftRecipientPubkey;
+                            const result = await TauriService.decryptEmailBody(
+                                keypair.private_key, draft.body, draft.subject || '',
+                                recipientPubkey, null
+                            );
+                            if (result.success) {
+                                decryptedSubject = result.subject || draft.subject;
+                                decryptedBody = result.body;
+                            } else {
+                                decryptedSubject = 'Could not decrypt';
+                                decryptedBody = result.error || 'Could not decrypt';
                             }
                             updateDetail(decryptedSubject, decryptedBody);
                         } catch (err) {

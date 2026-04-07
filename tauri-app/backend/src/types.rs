@@ -36,6 +36,7 @@ pub struct EmailMessage {
     pub recipient_pubkey: Option<String>,
     pub message_id: Option<String>,
     pub signature_valid: Option<bool>,
+    pub signature_source: Option<String>,
     pub transport_auth_verified: Option<bool>,
 }
 
@@ -157,6 +158,9 @@ pub struct MatchingEmailBodyResult {
     /// Sender pubkey from the email (for frontend decryption key lookup)
     #[serde(default)]
     pub sender_pubkey: Option<String>,
+    /// Manifest attachment metadata (if the email was manifest-encrypted)
+    #[serde(default)]
+    pub attachments: Vec<ManifestAttachmentInfo>,
 }
 
 /// Result structure for matching email ID lookup (includes both ID and message_id)
@@ -280,6 +284,8 @@ pub struct DecryptEmailResult {
     pub success: bool,
     /// Error message if overall decryption failed
     pub error: Option<String>,
+    /// Subject ciphertext (after glossia decode, before NIP decrypt) for DM↔email hash matching
+    pub subject_ciphertext: Option<String>,
 }
 
 /// Result from the decrypt_manifest_attachment Tauri command.

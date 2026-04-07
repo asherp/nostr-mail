@@ -192,22 +192,17 @@ const GlossiaService = {
         return result.output;
     },
 
-    /** Encode sig (64 bytes) + pubkey (32 bytes) as a single 96-byte base_n payload.
-     *  This ensures correct round-trip: decode as 96 bytes, split at byte 64.
-     *  With glossia encoding (meta): single base_n word sequence.
-     *  Without (Hex mode): returns separate encodings (sig_nostr armor + npub). */
-    encodeSigPubkey(sigHex, pubkeyHex, meta) {
-        if (meta) {
-            const combinedHex = sigHex + pubkeyHex; // 192 hex chars = 96 bytes
-            const { language, wordlist } = this._resolveMetaLanguage(meta);
-            const json = JSON.parse(this._wasm.encode_raw_base_n(combinedHex, language, wordlist, '', 0n));
-            if (json.error) throw new Error(json.error);
-            return { encodedSigPubkey: json.encoded_text, combined: true };
-        }
-        // Hex mode: encode separately (structurally different formats)
+    /** Encode sig (64 bytes) and pubkey (32 bytes) separately.
+     *  Each field is encoded independently with its own glossia setting.
+     *  @param {string} sigHex - 128-char hex signature
+     *  @param {string} pubkeyHex - 64-char hex pubkey
+     *  @param {string|null} metaSig - glossia encoding for signature (e.g. 'latin')
+     *  @param {string|null} metaPubkey - glossia encoding for pubkey (defaults to metaSig) */
+    encodeSigPubkey(sigHex, pubkeyHex, metaSig, metaPubkey) {
+        if (metaPubkey === undefined) metaPubkey = metaSig;
         return {
-            encodedSig: this.encodeSignature(sigHex, null),
-            encodedPubkey: this.encodePubkey(pubkeyHex, null),
+            encodedSig: this.encodeSignature(sigHex, metaSig),
+            encodedPubkey: this.encodePubkey(pubkeyHex, metaPubkey),
             combined: false
         };
     },

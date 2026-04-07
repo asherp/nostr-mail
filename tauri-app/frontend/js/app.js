@@ -1298,16 +1298,10 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         let encodedSig, encodedPubkey, encodedSigPubkey = null;
 
                         if (gs && gs.isReady()) {
-                            // Glossia available: encode sig+pubkey as single 96-byte payload
-                            const result = gs.encodeSigPubkey(signature, pubkeyHex, metaSig);
-                            if (result.combined) {
-                                encodedSigPubkey = result.encodedSigPubkey;
-                                encodedSig = null;
-                                encodedPubkey = null;
-                            } else {
-                                encodedSig = result.encodedSig;
-                                encodedPubkey = result.encodedPubkey;
-                            }
+                            // Glossia available: encode sig and pubkey separately
+                            const result = gs.encodeSigPubkey(signature, pubkeyHex, metaSig, metaPubkey);
+                            encodedSig = result.encodedSig;
+                            encodedPubkey = result.encodedPubkey;
                         } else {
                             // Glossia not loaded: append raw hex
                             encodedSig = signature;

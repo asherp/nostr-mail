@@ -23,11 +23,8 @@ class DMService {
         const keypair = window.appState.getKeypair();
         if (!keypair) return '[No keypair]';
 
-        const cs = window.CryptoService;
-        if (!cs || !cs.isReady()) return '[Crypto not ready]';
-
         try {
-            return await cs.decryptDmContent(keypair.private_key, contactPubkey, encryptedContent);
+            return await TauriService.decryptDmContent(keypair.private_key, contactPubkey, encryptedContent);
         } catch (_) {
             return '[Failed to decrypt]';
         }
@@ -1668,43 +1665,29 @@ class DMService {
             
             if (emailResult && emailResult.body) {
                 let finalBody = emailResult.body;
-                let manifest = null;
 
                 // If backend couldn't decrypt (e.g. glossia-encoded), try frontend decryption
                 if (emailResult.encrypted) {
                     console.log('[JS] DM: Body still encrypted, attempting frontend glossia decode + NIP decrypt');
-                    // Use email's sender_pubkey as fallback when contactPubkey is our own key
                     const decryptPubkey = contactPubkey !== window.appState.getKeypair()?.public_key
                         ? contactPubkey
                         : emailResult.sender_pubkey || contactPubkey;
                     finalBody = await this._tryFrontendDecrypt(emailResult.body, decryptPubkey);
                 }
 
-                // Check if the emailBody is a manifest JSON (starts with { and contains "body" and "ciphertext")
-                try {
-                    const parsed = JSON.parse(finalBody);
-                    if (parsed.body && parsed.body.ciphertext && parsed.body.key_wrap) {
-                        // This is a manifest - extract and decrypt the body
-                        manifest = parsed;
-                        const bodyKey = manifest.body.key_wrap;
-                        const encryptedBodyData = manifest.body.ciphertext;
-
-                        // Use emailService's decryptWithAES method
-                        if (window.emailService && typeof window.emailService.decryptWithAES === 'function') {
-                            try {
-                                const decryptedBodyBase64 = await window.emailService.decryptWithAES(encryptedBodyData, bodyKey);
-                                finalBody = atob(decryptedBodyBase64);
-                            } catch (aesError) {
-                                console.error('[JS] DM: AES decryption failed:', aesError);
-                                finalBody = `[AES Decryption Failed: ${aesError.message}]`;
-                            }
-                        } else {
-                            console.error('[JS] DM: emailService.decryptWithAES not available');
-                            finalBody = '[Manifest detected but AES decryption not available]';
-                        }
-                    }
-                } catch (parseError) {
-                    // Not JSON, use as-is (legacy format)
+                // Build manifest from backend attachment metadata (if available)
+                let manifest = null;
+                if (emailResult.attachments && emailResult.attachments.length > 0) {
+                    manifest = {
+                        attachments: emailResult.attachments.map(a => ({
+                            id: a.id,
+                            orig_filename: a.origFilename,
+                            orig_mime: a.origMime,
+                            key_wrap: a.keyWrapB64,
+                            cipher_sha256: a.cipherSha256Hex,
+                            orig_size: a.cipherSize,
+                        }))
+                    };
                 }
                 
                 // Display email body
@@ -1755,36 +1738,12 @@ class DMService {
                                 }));
                             }
                             
-                            // Create attachments HTML
+                            // Create attachments HTML — simple list of filename links
                             const attachmentsHtml = `
-                                <div class="email-attachments" style="margin: 15px 0;">
-                                    <h4 style="margin-bottom: 10px;">Attachments (${attachmentDisplayData.length})</h4>
-                                    <div class="attachment-list">
-                                        ${attachmentDisplayData.map(attachment => {
-                                            const sizeFormatted = (attachment.displaySize / 1024).toFixed(2) + ' KB';
-                                            const isEncrypted = attachment.encryption_method === 'manifest_aes';
-                                            const statusIcon = isEncrypted ? '🔒' : '📄';
-                                            const statusText = isEncrypted ? 'Encrypted' : 'Plain';
-                                            
-                                            return `
-                                            <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;">
-                                                <div class="attachment-info" style="display: flex; align-items: center;">
-                                                    <i class="fas fa-file" style="margin-right: 10px;"></i>
-                                                    <div class="attachment-details">
-                                                        <div class="attachment-name" style="font-weight: bold;">${window.Utils.escapeHtml(attachment.displayName)}</div>
-                                                        <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
-                                                            ${sizeFormatted} • ${statusIcon} ${statusText}
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                                <div class="attachment-actions">
-                                                    <button class="btn btn-sm btn-outline-primary" onclick="dmService.downloadDmAttachment(${attachment.id}, ${emailResult.email_id})">
-                                                        <i class="fas fa-download"></i> Download
-                                                    </button>
-                                                </div>
-                                            </div>`;
-                                        }).join('')}
-                                    </div>
+                                <div class="email-attachments" style="margin: 8px 0; font-size: 0.85em; opacity: 0.7;">
+                                    ${attachmentDisplayData.map(attachment =>
+                                        `<a href="#" onclick="event.preventDefault(); dmService.downloadDmAttachment(${attachment.id}, ${emailResult.email_id})" style="color: inherit; text-decoration: none; display: inline-block; margin-right: 12px;"><i class="fas fa-paperclip" style="margin-right: 4px;"></i>${window.Utils.escapeHtml(attachment.displayName)}</a>`
+                                    ).join('')}
                                 </div>
                             `;
                             
@@ -1820,83 +1779,16 @@ class DMService {
     // Reuses the same decryption pipeline as the email detail view.
     async _tryFrontendDecrypt(rawBody, contactPubkey) {
         const keypair = window.appState.getKeypair();
-        const es = window.emailService;
-        if (!keypair || !es) return '[Failed to decrypt email body]';
+        if (!keypair) return '[Failed to decrypt email body]';
 
-        // If contactPubkey is our own key (e.g. after account switch), we can't
-        // compute a valid shared secret.  Fall back to the email's sender_pubkey
-        // or try all known pubkeys via the fallback path.
-        if (contactPubkey === keypair.public_key) {
-            console.warn('[JS] DM: contactPubkey equals myPubkey, clearing to trigger fallback');
-            contactPubkey = null;
-        }
-
-        // 1. Try armored glossia decode (body with BEGIN/END markers)
-        let ciphertext = null;
         try {
-            const glossiaResult = es.decodeGlossiaArmoredBody(rawBody);
-            if (glossiaResult) {
-                ciphertext = glossiaResult.ciphertext;
-                console.log('[JS] DM: glossia-decoded armored body to ciphertext, dialect:', glossiaResult.dialect,
-                    'len:', ciphertext.length, 'preview:', ciphertext.substring(0, 40));
-            }
-        } catch (armorErr) {
-            console.warn('[JS] DM: decodeGlossiaArmoredBody crashed, trying manual extract:', armorErr.message);
-        }
-
-        // If decodeGlossiaArmoredBody returned null or crashed,
-        // manually extract armor content and try each detected dialect
-        if (!ciphertext) {
-            const gs = window.GlossiaService;
-            if (gs && gs.isReady()) {
-                const armorMatch = rawBody.replace(/\r\n/g, '\n').match(
-                    /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR|BEGIN NOSTR)/
-                );
-                if (armorMatch) {
-                    const content = armorMatch[1].trim();
-                    const detections = gs.detectDialect(content);
-                    for (const det of (detections || [])) {
-                        try {
-                            const result = gs.transcode(content, `decode from ${det.language}`);
-                            let decoded = result.output;
-                            if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
-                            decoded = gs._autoUnpack(decoded);
-                            ciphertext = decoded;
-                            console.log('[JS] DM: manual glossia decode succeeded with dialect:', det.language);
-                            break;
-                        } catch (_) { /* try next dialect */ }
-                    }
-                }
-            }
-        }
-
-        // 2. If no armor, try raw glossia decode (bare glossia words, no markers)
-        if (!ciphertext) {
-            const rawDecoded = es.decodeGlossiaSubject(rawBody);
-            if (rawDecoded) {
-                ciphertext = rawDecoded;
-                console.log('[JS] DM: glossia-decoded raw body to ciphertext, length:', ciphertext.length);
-            }
-        }
-
-        // 3. Fallback: use raw body as-is (might be base64 ciphertext)
-        if (!ciphertext) {
-            ciphertext = rawBody.trim();
-        }
-
-        // Build a minimal email-like object for decryptNostrMessageWithFallback
-        console.log('[JS] DM: attempting decrypt with contactPubkey:', contactPubkey?.substring(0, 20),
-            'myPubkey:', window.appState.getKeypair()?.public_key?.substring(0, 20),
-            'ciphertext len:', ciphertext?.length);
-        const fakeEmail = { sender_pubkey: contactPubkey };
-        try {
-            const decrypted = await es.decryptNostrMessageWithFallback(fakeEmail, ciphertext, keypair);
-            if (decrypted && !decrypted.startsWith('Unable to decrypt')) {
-                console.log('[JS] DM: Frontend decryption succeeded');
-                return decrypted;
-            }
+            const result = await TauriService.decryptEmailBody(
+                keypair.private_key, rawBody, '',
+                contactPubkey, null
+            );
+            if (result.success) return result.body;
         } catch (err) {
-            console.warn('[JS] DM: Frontend decryption failed:', err.message);
+            console.warn('[JS] DM: Backend decrypt fallback failed:', err);
         }
 
         return '[Failed to decrypt email body]';
@@ -1912,77 +1804,47 @@ class DMService {
             
             // Check if attachment is encrypted and needs decryption
             if (attachment.encryption_method === 'manifest_aes') {
-                // For manifest-encrypted attachments, we need to get the email and decrypt the manifest
-                // Try to find email in inbox or sent emails
-                let email = null;
-                const inboxEmails = appState.getEmails() || [];
-                const sentEmails = appState.getSentEmails() || [];
-                email = inboxEmails.find(e => e.id == emailId) || sentEmails.find(e => e.id == emailId);
-                
-                if (!email) {
-                    // Email not in cache - we need the email body to decrypt the manifest
-                    // For now, show an error. In the future, we could fetch the email from backend
-                    window.notificationService.showError('Email not found in cache. Please refresh the email list to download attachments.');
-                    return;
-                }
-                
-                // Extract encrypted content from email body
-                const encryptedBodyMatch = email.body.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED (?:MESSAGE|BODY)-----\s*([A-Za-z0-9+/=\n?]+)\s*-----(?:END NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))?|BEGIN NOSTR SIGNATURE)-----/);
-                if (!encryptedBodyMatch) {
-                    window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
-                    return;
-                }
-                
                 const keypair = appState.getKeypair();
-                if (!keypair) {
+                if (!keypair) return;
+
+                // Fetch email from DB (don't rely on in-memory cache)
+                const email = await window.__TAURI__.core.invoke('db_get_email_by_id', { emailId: parseInt(emailId) });
+                if (!email || !email.body) {
+                    window.notificationService.showError('Email not found');
                     return;
                 }
-                
-                // Decrypt the manifest to get attachment keys
-                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                
-                // Try to decrypt manifest (for received emails, use sender's pubkey; for sent emails, use recipient's pubkey)
-                let manifestResult;
-                try {
-                    // Check if this is a sent or received email
-                    const settings = appState.getSettings();
-                    const userEmail = settings?.email_address;
-                    const isSentEmail = (email.from_address && email.from_address === userEmail) || (email.from && email.from === userEmail);
-                    
-                    if (isSentEmail) {
-                        manifestResult = await window.emailService.decryptSentManifestMessage(email, encryptedContent, keypair);
-                    } else {
-                        manifestResult = await window.emailService.decryptManifestMessage(email, encryptedContent, keypair);
-                    }
-                } catch (e) {
-                    console.error('[JS] DM: Failed to decrypt manifest:', e);
-                    window.notificationService.showError('Failed to decrypt manifest: ' + e.message);
+
+                // Use backend to decrypt manifest and get attachment keys
+                const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                const recipientPubkey = email.recipient_pubkey;
+                const decryptResult = await TauriService.decryptEmailBody(
+                    keypair.private_key, email.body, email.subject || '',
+                    senderPubkey, recipientPubkey
+                );
+
+                if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
+                    window.notificationService.showError('Cannot decrypt attachment: no manifest found');
                     return;
                 }
-                
-                if (manifestResult.type !== 'manifest') {
-                    window.notificationService.showError('Cannot decrypt attachment: invalid manifest');
-                    return;
-                }
-                
-                // Find attachment metadata in manifest
-                const opaqueId = attachment.filename.replace('.dat', '');
-                const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
-                
+
+                const opaqueId = attachment.filename.replace(/\.dat$/, '');
+                const attachmentMeta = decryptResult.attachments.find(a => a.id === opaqueId);
                 if (!attachmentMeta) {
                     window.notificationService.showError('Attachment metadata not found in manifest');
                     return;
                 }
-                
-                // Decrypt attachment data
-                const decryptedData = await window.emailService.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
-                
-                // Save decrypted attachment to disk using Tauri
+
+                // Decrypt attachment via backend
+                const decryptedAttachment = await TauriService.decryptManifestAttachment(
+                    attachment.data, attachmentMeta.keyWrapB64, attachmentMeta.cipherSha256Hex,
+                    attachmentMeta.origFilename, attachmentMeta.origMime, opaqueId
+                );
+
                 const filePath = await TauriService.saveAttachmentToDisk(
-                    attachmentMeta.orig_filename || attachmentMeta.orig_mime?.split('/')[1] || 'attachment',
-                    decryptedData,
-                    attachmentMeta.orig_mime || attachment.mime_type || 'application/octet-stream'
-                );                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
+                    decryptedAttachment.filename, decryptedAttachment.dataB64,
+                    decryptedAttachment.contentType || 'application/octet-stream'
+                );
+                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
                 
             } else {
                 // Plain attachment - save directly to disk using Tauri

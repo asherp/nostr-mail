@@ -457,16 +457,13 @@ const TauriService = {
     searchSentEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
         return await this.invoke('db_search_sent_emails', { searchQuery, userEmail, privateKey, limit, offset });
     },
-    getDbSentEmails: async function(limit = 50, offset = 0, userEmail = null) {
-        return await this.invoke('db_get_sent_emails', { limit, offset, userEmail: userEmail });
+    getDbSentEmails: async function(limit = 50, offset = 0, userEmail = null, userPubkey = null) {
+        return await this.invoke('db_get_sent_emails', { limit, offset, userEmail, userPubkey });
     },
     getDbEmail: async function(messageId) {
         return await this.invoke('db_get_email', { messageId: messageId });
     },
     decryptDmContent: async function(privateKey, senderPubkey, encryptedContent) {
-        if (window.CryptoService && window.CryptoService.isReady()) {
-            return await window.CryptoService.decryptDmContent(privateKey, senderPubkey, encryptedContent);
-        }
         return await this.invoke('decrypt_dm_content', { privateKey, senderPubkey, encryptedContent });
     },
     filterNewContacts: async function(userPubkey, pubkeys) {

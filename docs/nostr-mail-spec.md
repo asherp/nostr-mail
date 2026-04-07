@@ -49,8 +49,8 @@ Additionally, decoders MUST accept the legacy format where SIGNATURE and SEAL ar
 <ciphertext, optionally glossia-encoded>
 ----- BEGIN NOSTR SIGNATURE -----
 @ProfileName
-<signature bytes, optionally glossia-encoded (64 bytes)>
-<pubkey bytes, optionally glossia-encoded (32 bytes)>
+<signature: glossia-encoded or hex (64 bytes)>
+<pubkey: glossia-encoded, hex, or npub>
 ----- END NOSTR MESSAGE -----
 ```
 
@@ -67,10 +67,12 @@ The original plaintext also appears above the armor block for readability in non
 <glossia-encoded plaintext>
 ----- BEGIN NOSTR SIGNATURE -----
 @ProfileName
-<signature bytes (64 bytes)>
-<pubkey bytes (32 bytes)>
+<signature: glossia-encoded or hex (64 bytes)>
+<pubkey: glossia-encoded, hex, or npub>
 ----- END NOSTR MESSAGE -----
 ```
+
+Signature and pubkey are encoded independently with separate glossia settings. Decoders MUST accept both the new separate format and the legacy combined format (sig + pubkey encoded together as a single 96-byte payload).
 
 ### 3.3 Unsigned + Encrypted (with Seal)
 
@@ -79,11 +81,11 @@ The original plaintext also appears above the armor block for readability in non
 <ciphertext, optionally glossia-encoded>
 ----- BEGIN NOSTR SEAL -----
 @DisplayName
-<pubkey bytes>
+<pubkey: glossia-encoded, hex, or npub>
 ----- END NOSTR MESSAGE -----
 ```
 
-The SEAL block provides the sender's pubkey, which is required for NIP-04/NIP-44 decryption and survives forwarding (unlike MIME headers).
+The SEAL block provides the sender's pubkey, which is required for NIP-04/NIP-44 decryption and survives forwarding (unlike MIME headers). Decoders MUST accept glossia-encoded, hex-encoded, and npub (bech32-encoded, `npub1...`) formats for pubkeys in SEAL blocks.
 
 ### 3.4 Unsigned Plaintext (with optional Seal)
 
@@ -94,7 +96,7 @@ Hello, this is a plaintext message.
 
 ----- BEGIN NOSTR SEAL -----
 @DisplayName
-<pubkey bytes>
+<pubkey: glossia-encoded, hex, or npub>
 ----- END NOSTR SEAL -----
 ```
 

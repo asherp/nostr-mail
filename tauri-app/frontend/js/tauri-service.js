@@ -107,11 +107,8 @@ const TauriService = {
     getDefaultPrivateKeyFromConfig: async function() {
         return await this.invoke('get_default_private_key_from_config');
     },
-    signData: async function(privateKey, data) {
-        if (window.CryptoService && window.CryptoService.isReady()) {
-            return await window.CryptoService.signData(privateKey, data);
-        }
-        return await this.invoke('sign_data', { privateKey, data });
+    signData: async function(data) {
+        return await this.invoke('sign_data', { data });
     },
     verifySignature: async function(publicKey, signature, data) {
         if (window.CryptoService && window.CryptoService.isReady()) {
@@ -122,83 +119,54 @@ const TauriService = {
     recheckEmailSignature: async function(messageId) {
         return await this.invoke('recheck_email_signature', { messageId });
     },
-    encryptNip44Message: async function(privateKey, publicKey, message) {
-        if (window.CryptoService && window.CryptoService.isReady()) {
-            return await window.CryptoService.encryptMessageWithAlgorithm(privateKey, publicKey, message, 'nip44');
-        }
-        return await this.invoke('encrypt_nip04_message', { privateKey, publicKey, message });
+    encryptNip44Message: async function(publicKey, message) {
+        return await this.invoke('encrypt_nip04_message', { publicKey, message });
     },
-    encryptNip04MessageLegacy: async function(privateKey, publicKey, message) {
-        if (window.CryptoService && window.CryptoService.isReady()) {
-            return await window.CryptoService.encryptMessageWithAlgorithm(privateKey, publicKey, message, 'nip04');
-        }
-        return await this.invoke('encrypt_nip04_message_legacy', { privateKey, publicKey, message });
+    encryptNip04MessageLegacy: async function(publicKey, message) {
+        return await this.invoke('encrypt_nip04_message_legacy', { publicKey, message });
     },
-
-    encryptMessageWithAlgorithm: async function(privateKey, publicKey, message, algorithm) {
-        if (window.CryptoService && window.CryptoService.isReady()) {
-            return await window.CryptoService.encryptMessageWithAlgorithm(privateKey, publicKey, message, algorithm);
-        }
-        return await this.invoke('encrypt_message_with_algorithm', { privateKey, publicKey, message, algorithm });
+    encryptMessageWithAlgorithm: async function(publicKey, message, algorithm) {
+        return await this.invoke('encrypt_message_with_algorithm', { publicKey, message, algorithm });
     },
-    sendDirectMessage: async function(privateKey, recipientPubkey, message, relays) {
-        // Determine if the message is already encrypted
+    sendDirectMessage: async function(recipientPubkey, message, relays) {
         const isEncrypted = Utils.isLikelyEncryptedContent(message);
-        
-        // Get encryption algorithm from settings
         const settings = window.appState?.getSettings();
         const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
-        
-        // Create the request with explicit content type
         const request = {
-            sender_private_key: privateKey,
             recipient_pubkey: recipientPubkey,
-            content: isEncrypted ? 
-                { Encrypted: message } : 
+            content: isEncrypted ?
+                { Encrypted: message } :
                 { Plaintext: message },
             relays: relays,
             encryption_algorithm: encryptionAlgorithm
         };
-        
         return await this.invoke('send_direct_message', { request });
     },
-    
-    sendEncryptedDirectMessage: async function(privateKey, recipientPubkey, encryptedMessage, relays) {
-        // Detect the actual encryption format of the already-encrypted content
-        // Don't rely on current settings, as the content may have been encrypted with a different algorithm
+    sendEncryptedDirectMessage: async function(recipientPubkey, encryptedMessage, relays) {
         const detectedFormat = window.Utils?.detectEncryptionFormat(encryptedMessage) || 'unknown';
-        
-        // Use detected format, fallback to current setting if detection fails
         let encryptionAlgorithm;
         if (detectedFormat === 'nip04' || detectedFormat === 'nip44') {
             encryptionAlgorithm = detectedFormat;
-            console.log('[JS] Detected encryption format:', detectedFormat, 'for already-encrypted content');
         } else {
-            // Fallback to current setting if format detection fails
             const settings = window.appState?.getSettings();
             encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
-            console.log('[JS] Could not detect encryption format, using current setting:', encryptionAlgorithm);
         }
-        
-        // Explicitly send already-encrypted content
         const request = {
-            sender_private_key: privateKey,
             recipient_pubkey: recipientPubkey,
             content: { Encrypted: encryptedMessage },
             relays: relays,
             encryption_algorithm: encryptionAlgorithm
         };
-        
         return await this.invoke('send_direct_message', { request });
     },
-    fetchDirectMessages: async function(privateKey, relays) {
-        return await this.invoke('fetch_direct_messages', { privateKey, relays });
+    fetchDirectMessages: async function(relays) {
+        return await this.invoke('fetch_direct_messages', { relays });
     },
-    fetchConversations: async function(privateKey, relays) {
-        return await this.invoke('fetch_conversations', { privateKey, relays });
+    fetchConversations: async function(relays) {
+        return await this.invoke('fetch_conversations', { relays });
     },
-    fetchConversationMessages: async function(privateKey, contactPubkey, relays) {
-        return await this.invoke('fetch_conversation_messages', { privateKey, contactPubkey, relays });
+    fetchConversationMessages: async function(contactPubkey, relays) {
+        return await this.invoke('fetch_conversation_messages', { contactPubkey, relays });
     },
     fetchProfile: async function(pubkey, relays) {
         return await this.invoke('fetch_profile', { pubkey, relays });
@@ -209,27 +177,26 @@ const TauriService = {
     decodeNostrIdentifier: async function(identifier) {
         return await this.invoke('decode_nostr_identifier', { identifier });
     },
-    fetchFollowingProfiles: async function(privateKey, relays) {
-        return await this.invoke('fetch_following_profiles', { privateKey, relays });
+    fetchFollowingProfiles: async function(relays) {
+        return await this.invoke('fetch_following_profiles', { relays });
     },
     fetchProfiles: async function(pubkeys, relays) {
         return await this.invoke('fetch_profiles', { pubkeys, relays });
     },
-    publishNostrEvent: async function(privateKey, content, kind, tags, relays) {
-        return await this.invoke('publish_nostr_event', { privateKey, content, kind, tags, relays });
+    publishNostrEvent: async function(content, kind, tags, relays) {
+        return await this.invoke('publish_nostr_event', { content, kind, tags, relays });
     },
-    followUser: async function(privateKey, pubkeyToFollow) {
-        return await this.invoke('follow_user', { privateKey, pubkeyToFollow });
+    followUser: async function(pubkeyToFollow) {
+        return await this.invoke('follow_user', { pubkeyToFollow });
     },
-    publishFollowList: async function(privateKey, userPubkey, relays) {
-        return await this.invoke('publish_follow_list', { privateKey, userPubkey, relays });
+    publishFollowList: async function(userPubkey, relays) {
+        return await this.invoke('publish_follow_list', { userPubkey, relays });
     },
-    updateProfile: async function(privateKey, fields, relays) {
-        return await this.invoke('update_profile', { privateKey, fields, relays });
+    updateProfile: async function(fields, relays) {
+        return await this.invoke('update_profile', { fields, relays });
     },
-    // Update profile using persistent client (more efficient)
-    updateProfilePersistent: async function(privateKey, fields) {
-        return await this.invoke('update_profile_persistent', { privateKey, fields });
+    updateProfilePersistent: async function(fields) {
+        return await this.invoke('update_profile_persistent', { fields });
     },
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
@@ -305,10 +272,9 @@ const TauriService = {
     updateContactPictureDataUrl: async function(pubkey, pictureDataUrl) {
         return await this.invoke('update_contact_picture_data_url', { pubkey, pictureDataUrl });
     },
-    getConversations: async function(userPubkey, privateKey) {
-        return await this.invoke('db_get_conversations_with_decrypted_last_message', { 
-            userPubkey, 
-            privateKey 
+    getConversations: async function(userPubkey) {
+        return await this.invoke('db_get_conversations_with_decrypted_last_message', {
+            userPubkey
         });
     },
     getConversationsWithoutDecryption: async function(userPubkey) {
@@ -350,8 +316,8 @@ const TauriService = {
     getRelayStatus: async function() {
         return await this.invoke('get_relay_status');
     },
-    initPersistentNostrClient: async function(privateKey) {
-        return await this.invoke('init_persistent_nostr_client', { privateKey });
+    initPersistentNostrClient: async function() {
+        return await this.invoke('init_persistent_nostr_client', {});
     },
     disconnectNostrClient: async function() {
         return await this.invoke('disconnect_nostr_client');
@@ -393,7 +359,7 @@ const TauriService = {
             imap_host: settings.imap_host,
             imap_port: settings.imap_port,
             use_tls: useTls,
-            private_key: keypair.private_key
+            private_key: null
         };
         
         return await this.invoke('sync_nostr_emails', { config: emailConfig, folder });
@@ -415,7 +381,7 @@ const TauriService = {
             imap_host: settings.imap_host,
             imap_port: settings.imap_port,
             use_tls: settings.use_tls,
-            private_key: keypair.private_key
+            private_key: null
         };
         
         return await this.invoke('sync_sent_emails', { config: emailConfig });
@@ -437,7 +403,7 @@ const TauriService = {
             imap_host: settings.imap_host,
             imap_port: settings.imap_port,
             use_tls: settings.use_tls,
-            private_key: keypair.private_key
+            private_key: null
         };
         
         return await this.invoke('sync_all_emails', { config: emailConfig });
@@ -451,11 +417,11 @@ const TauriService = {
     getDbEmails: async function(limit = 50, offset = 0, nostrOnly = null, userEmail = null, userPubkey = null) {
         return await this.invoke('db_get_emails', { limit, offset, nostrOnly, userEmail, userPubkey });
     },
-    searchEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
-        return await this.invoke('db_search_emails', { searchQuery, userEmail, privateKey, limit, offset });
+    searchEmails: async function(searchQuery, userEmail = null, limit = null, offset = null) {
+        return await this.invoke('db_search_emails', { searchQuery, userEmail, limit, offset });
     },
-    searchSentEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
-        return await this.invoke('db_search_sent_emails', { searchQuery, userEmail, privateKey, limit, offset });
+    searchSentEmails: async function(searchQuery, userEmail = null, limit = null, offset = null) {
+        return await this.invoke('db_search_sent_emails', { searchQuery, userEmail, limit, offset });
     },
     getDbSentEmails: async function(limit = 50, offset = 0, userEmail = null, userPubkey = null) {
         return await this.invoke('db_get_sent_emails', { limit, offset, userEmail, userPubkey });
@@ -463,8 +429,8 @@ const TauriService = {
     getDbEmail: async function(messageId) {
         return await this.invoke('db_get_email', { messageId: messageId });
     },
-    decryptDmContent: async function(privateKey, senderPubkey, encryptedContent) {
-        return await this.invoke('decrypt_dm_content', { privateKey, senderPubkey, encryptedContent });
+    decryptDmContent: async function(senderPubkey, encryptedContent) {
+        return await this.invoke('decrypt_dm_content', { senderPubkey, encryptedContent });
     },
     filterNewContacts: async function(userPubkey, pubkeys) {
         return await this.invoke('db_filter_new_contacts', { userPubkey, pubkeys });
@@ -536,8 +502,8 @@ const TauriService = {
     },
 
     // Live Event Subscription System
-    startLiveEventSubscription: async function(privateKey) {
-        return await this.invoke('start_live_event_subscription', { privateKey });
+    startLiveEventSubscription: async function() {
+        return await this.invoke('start_live_event_subscription', {});
     },
 
     stopLiveEventSubscription: async function() {
@@ -557,12 +523,12 @@ const TauriService = {
         return await this.invoke('db_get_setting', { pubkey, key });
     },
     
-    dbGetAllSettings: async function(pubkey, privateKey) {
-        return await this.invoke('db_get_all_settings', { pubkey, privateKey });
+    dbGetAllSettings: async function(pubkey) {
+        return await this.invoke('db_get_all_settings', { pubkey });
     },
-    
-    dbSaveSettingsBatch: async function(pubkey, settings, privateKey) {
-        return await this.invoke('db_save_settings_batch', { pubkey, settings, privateKey });
+
+    dbSaveSettingsBatch: async function(pubkey, settings) {
+        return await this.invoke('db_save_settings_batch', { pubkey, settings });
     },
     
     // Update email recipient pubkey
@@ -586,9 +552,9 @@ const TauriService = {
         return await this.invoke('parse_armor_message', { armorText });
     },
 
-    decryptEmailBody: async function(privateKey, armorText, subject, senderPubkey, recipientPubkey) {
+    decryptEmailBody: async function(armorText, subject, senderPubkey, recipientPubkey) {
         return await this.invoke('decrypt_email_body', {
-            privateKey, armorText, subject,
+            armorText, subject,
             senderPubkey: senderPubkey || null,
             recipientPubkey: recipientPubkey || null,
         });

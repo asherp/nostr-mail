@@ -265,20 +265,19 @@ class EmailService {
             return;
         }
         
-        const privkey = appState.getKeypair()?.private_key;
         const pubkey = this.selectedNostrContact.pubkey;
-        
-        if (!privkey || !pubkey) {
+
+        if (!appState.hasKeypair() || !pubkey) {
             window.notificationService.showError('Missing encryption keys');
             return;
         }
-        
+
         try {
             attachment.isEncrypting = true;
             this.renderAttachmentList();
-            
+
             console.log(`[JS] Encrypting attachment using hybrid encryption: ${attachment.name}`);
-            
+
             // Get encryption algorithm from settings (for NIP-44/04 key encryption)
             const settings = appState.getSettings();
             const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
@@ -303,9 +302,8 @@ class EmailService {
             
             // Step 4: Encrypt the key package with NIP-44/04
             const encryptedKeyPackage = await window.TauriService.encryptMessageWithAlgorithm(
-                privkey, 
-                pubkey, 
-                keyPackage, 
+                pubkey,
+                keyPackage,
                 encryptionAlgorithm
             );
             
@@ -566,10 +564,9 @@ class EmailService {
             return;
         }
 
-        const privkey = appState.getKeypair()?.private_key;
         const pubkey = this.selectedNostrContact.pubkey;
 
-        if (!privkey || !pubkey) {
+        if (!appState.hasKeypair() || !pubkey) {
             window.notificationService.showError('Missing decryption keys');
             return;
         }
@@ -582,7 +579,7 @@ class EmailService {
                 trailingQuoted = '\n\n' + encParts.quotedArmor;
             }
 
-            const result = await TauriService.decryptEmailBody(privkey, body, '', pubkey, null);
+            const result = await TauriService.decryptEmailBody(body, '', pubkey, null);
 
             if (result.success) {
                 domManager.setValue('messageBody', result.body + trailingQuoted);
@@ -1527,11 +1524,9 @@ class EmailService {
                 smtp_port: settings.smtp_port,
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
-                use_tls: useTls,
-                // Only include private key if we should sign
-                private_key: shouldSign && appState.getKeypair() ? appState.getKeypair().private_key : null
+                use_tls: useTls
             };
-            
+
             // If a Nostr contact is selected or a pubkey is manually entered, send encrypted email
             const sendPubkey = this.getRecipientPubkey();
             if (this.selectedNostrContact || sendPubkey) {
@@ -1696,12 +1691,10 @@ class EmailService {
                 smtp_port: settings.smtp_port,
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
-                use_tls: useTls,
-                // Only include private key if we should sign
-                private_key: shouldSign && appState.getKeypair() ? appState.getKeypair().private_key : null
+                use_tls: useTls
             };
-            
-            // Construct headers (sender's pubkey will be extracted from private_key in backend)
+
+            // Construct headers (sender's pubkey will be derived from keychain in backend)
             const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId, null, this._htmlBody);
             
             // Debug: Log what headers we actually received
@@ -1866,9 +1859,8 @@ class EmailService {
                 let decryptResults = null;
                 try {
                     const pubkey = this.selectedNostrContact?.pubkey;
-                    const privkey = appState.getKeypair()?.private_key;
-                    if (pubkey && privkey) {
-                        const result = await TauriService.decryptEmailBody(privkey, plainBody, '', pubkey, null);
+                    if (pubkey && appState.hasKeypair()) {
+                        const result = await TauriService.decryptEmailBody(plainBody, '', pubkey, null);
                         if (result.blockResults && result.blockResults.length > 0) {
                             decryptResults = result.blockResults.map(b => {
                                 if (!b.wasEncrypted) return null;
@@ -1964,7 +1956,6 @@ class EmailService {
                 if (dmCiphertext) {
                     try {
                         const dmResult = await TauriService.sendEncryptedDirectMessage(
-                            keypair.private_key,
                             contact.pubkey,
                             dmCiphertext,
                             activeRelays
@@ -2018,8 +2009,8 @@ class EmailService {
 
     // Load emails
     async loadEmails(searchQuery = '', append = false) {
-        if (!appState.hasSettings()) {
-            notificationService.showError('Please configure your email settings first');
+        if (!appState.hasEmailSettingsConfigured()) {
+            console.log('[JS] No email settings configured, skipping inbox load');
             return;
         }
         try {
@@ -2045,8 +2036,7 @@ class EmailService {
                 smtp_port: settings.smtp_port,
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
-                use_tls: settings.use_tls,
-                private_key: keypair ? keypair.private_key : null
+                use_tls: settings.use_tls
             };
             // Read filter preference from settings
             const emailFilter = settings.email_filter || 'nostr';
@@ -2351,17 +2341,15 @@ class EmailService {
         this.sentSearchTimeout = setTimeout(async () => {
             try {
                 const settings = appState.getSettings();
-                const keypair = appState.getKeypair();
                 const userEmail = settings.email_address ? settings.email_address : null;
-                const privateKey = keypair ? keypair.private_key : null;
-                
+
                 // Initialize search results accumulator (or keep existing if appending)
                 if (!append) {
                     this.sentSearchResults = [];
                     this.sentSearchOffset = 0;
                 }
                 this.sentSearchInProgress = true;
-                
+
                 // Show searching state
                 const sentList = domManager.get('sentList');
                 if (sentList) {
@@ -2471,7 +2459,7 @@ class EmailService {
                 
                 console.log('[JS] Starting sent search with query:', searchQuery, 'limit:', pageSize, 'offset:', this.sentSearchOffset);
                 // Start the search (this will emit events as results are found)
-                const result = await TauriService.searchSentEmails(searchQuery, userEmail, privateKey, pageSize, this.sentSearchOffset);
+                const result = await TauriService.searchSentEmails(searchQuery, userEmail, pageSize, this.sentSearchOffset);
                 console.log('[JS] Sent search result:', result);
                 
                 // Update offset for next page
@@ -2584,7 +2572,7 @@ class EmailService {
                         try {
                             const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                             const result = await TauriService.decryptEmailBody(
-                                keypair.private_key, email.body, email.subject,
+                                email.body, email.subject,
                                 senderPubkey, null
                             );
                             if (result.success) {
@@ -2838,17 +2826,15 @@ class EmailService {
         this.searchTimeout = setTimeout(async () => {
             try {
                 const settings = appState.getSettings();
-                const keypair = appState.getKeypair();
                 const userEmail = settings.email_address ? settings.email_address : null;
-                const privateKey = keypair ? keypair.private_key : null;
-                
+
                 // Initialize search results accumulator (or keep existing if appending)
                 if (!append) {
                     this.searchResults = [];
                     this.searchOffset = 0;
                 }
                 this.searchInProgress = true;
-                
+
                 // Show searching state
                 const emailList = domManager.get('emailList');
                 if (emailList) {
@@ -2958,7 +2944,7 @@ class EmailService {
                 
                 console.log('[JS] Starting search with query:', searchQuery, 'limit:', pageSize, 'offset:', this.searchOffset);
                 // Start the search (this will emit events as results are found)
-                const result = await TauriService.searchEmails(searchQuery, userEmail, privateKey, pageSize, this.searchOffset);
+                const result = await TauriService.searchEmails(searchQuery, userEmail, pageSize, this.searchOffset);
                 console.log('[JS] Search result:', result);
                 
                 // Update offset for next page
@@ -3045,7 +3031,7 @@ class EmailService {
                         try {
                             console.log('[JS] Calling backend decrypt_email_body...');
                             const result = await TauriService.decryptEmailBody(
-                                keypair.private_key, emailBody, email.subject,
+                                emailBody, email.subject,
                                 senderPubkey, null
                             );
                             console.log('[JS] Backend decrypt result: success=', result.success, 'isManifest=', result.isManifest, 'blocks=', result.blockResults?.length);
@@ -3153,7 +3139,7 @@ class EmailService {
                                     if (keypair && email.body && email.body.includes('BEGIN NOSTR')) {
                                         const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                                         const decryptResult = await TauriService.decryptEmailBody(
-                                            keypair.private_key, email.body, email.subject || '',
+                                            email.body, email.subject || '',
                                             senderPubkey, null
                                         );
                                         if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
@@ -3968,16 +3954,7 @@ ${attachmentsHtml}
                 smtp_port: settings.smtp_port,
                 imap_host: settings.imap_host,
                 imap_port: settings.imap_port,
-                use_tls: settings.use_tls,
-                // Only include private key if we should sign (check auto-sign setting or manual sign)
-                private_key: (() => {
-                    const settings = appState.getSettings();
-                    const autoSign = settings && settings.automatically_sign !== false;
-                    const signBtn = domManager.get('signBtn');
-                    const isManuallySigned = signBtn && signBtn.dataset.signed === 'true';
-                    const shouldSign = autoSign || isManuallySigned;
-                    return shouldSign && appState.getKeypair() ? appState.getKeypair().private_key : null;
-                })()
+                use_tls: settings.use_tls
             };
             
             console.log('[JS] Testing email connections with config:', {
@@ -5147,7 +5124,6 @@ ${attachmentsHtml}
         this.plaintextSubject = subject;
         this.plaintextBody = body;
 
-        const privkey = appState.getKeypair().private_key;
         const pubkey = this.selectedNostrContact.pubkey;
         const settings = appState.getSettings();
         const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
@@ -5168,7 +5144,7 @@ ${attachmentsHtml}
             // 3. Encrypt the compressed data
             const compressedBase64 = btoa(String.fromCharCode(...compressed));
             const ciphertext = await TauriService.encryptMessageWithAlgorithm(
-                privkey, pubkey, compressedBase64, encryptionAlgorithm
+                pubkey, compressedBase64, encryptionAlgorithm
             );
 
             // 4. Pack NIP-04 if needed, then build outer payload with pubkey
@@ -5237,19 +5213,18 @@ ${attachmentsHtml}
 
             // 5. Decrypt: try extracted sender pubkey first (recipient flow),
             //    then selected contact pubkey (sender self-test / sent-folder flow)
-            const privkey = appState.getKeypair().private_key;
             const senderNpub = window.CryptoService._nip19.npubEncode(outer.pubkeyHex);
             let compressedBase64;
             try {
                 compressedBase64 = await TauriService.decryptDmContent(
-                    privkey, senderNpub, ciphertext
+                    senderNpub, ciphertext
                 );
             } catch (_) {
                 // Sender pubkey didn't work — try the selected contact (other party)
                 const contactPubkey = this.selectedNostrContact?.pubkey;
                 if (!contactPubkey) throw new Error('Decryption failed and no contact selected to try');
                 compressedBase64 = await TauriService.decryptDmContent(
-                    privkey, contactPubkey, ciphertext
+                    contactPubkey, ciphertext
                 );
             }
 
@@ -5499,9 +5474,7 @@ ${attachmentsHtml}
             notificationService.showError('Nothing to encrypt');
             return false;
         }
-        const privkey = appState.getKeypair().private_key;
         const pubkey = this.selectedNostrContact.pubkey;
-        console.log('[JS] Using privkey:', privkey.substring(0, 20) + '...');
         console.log('[JS] Using pubkey:', pubkey);
         
         // Get the selected encryption algorithm
@@ -5614,7 +5587,7 @@ ${attachmentsHtml}
                 let encryptedSubject = subject;
                 if (subject) {
                     console.log('[JS] Encrypting subject with NIP...');
-                    encryptedSubject = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, subject, encryptionAlgorithm);
+                    encryptedSubject = await TauriService.encryptMessageWithAlgorithm(pubkey, subject, encryptionAlgorithm);
                     console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
                     this._subjectCiphertext = encryptedSubject.trim();
                     domManager.setValue('subject', encryptedSubject.trim());
@@ -5624,8 +5597,8 @@ ${attachmentsHtml}
                 console.log('[JS] Creating encrypted manifest...');
                 const manifestJson = JSON.stringify(manifest);
                 console.log('[JS] Manifest JSON size:', manifestJson.length);
-                
-                const encryptedManifest = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, manifestJson, encryptionAlgorithm);
+
+                const encryptedManifest = await TauriService.encryptMessageWithAlgorithm(pubkey, manifestJson, encryptionAlgorithm);
                 console.log('[JS] Manifest encrypted, size:', encryptedManifest.length);
                 rawEncryptedBody = encryptedManifest;
 
@@ -5649,7 +5622,7 @@ ${attachmentsHtml}
                 let encryptedSubject = subject;
                 if (subject) {
                     console.log('[JS] Encrypting subject...');
-                    encryptedSubject = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, subject, encryptionAlgorithm);
+                    encryptedSubject = await TauriService.encryptMessageWithAlgorithm(pubkey, subject, encryptionAlgorithm);
                     console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
                     this._subjectCiphertext = encryptedSubject.trim();
                     domManager.setValue('subject', encryptedSubject.trim());
@@ -5659,7 +5632,7 @@ ${attachmentsHtml}
                 let encryptedBody = body;
                 if (body) {
                     console.log('[JS] Encrypting body...');
-                    encryptedBody = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, body, encryptionAlgorithm);
+                    encryptedBody = await TauriService.encryptMessageWithAlgorithm(pubkey, body, encryptionAlgorithm);
                     console.log('[JS] Body encrypted:', encryptedBody.substring(0, 50) + '...');
                     rawEncryptedBody = encryptedBody;
 
@@ -5773,9 +5746,7 @@ ${attachmentsHtml}
             return { encryptedSubject: subject, encryptedBody: body };
         }
         
-        const privkey = appState.getKeypair().private_key;
         const pubkey = contact.pubkey;
-        console.log('[JS] Using privkey:', privkey.substring(0, 20) + '...');
         console.log('[JS] Using pubkey:', pubkey);
         
         // Get the selected encryption algorithm
@@ -5788,7 +5759,7 @@ ${attachmentsHtml}
             let encryptedSubject = subject;
             if (subject) {
                 console.log('[JS] Encrypting subject in memory...');
-                encryptedSubject = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, subject, encryptionAlgorithm);
+                encryptedSubject = await TauriService.encryptMessageWithAlgorithm(pubkey, subject, encryptionAlgorithm);
                 console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
             }
 
@@ -5796,7 +5767,7 @@ ${attachmentsHtml}
             let encryptedBody = body;
             if (body) {
                 console.log('[JS] Encrypting body in memory...');
-                encryptedBody = await TauriService.encryptMessageWithAlgorithm(privkey, pubkey, body, encryptionAlgorithm);
+                encryptedBody = await TauriService.encryptMessageWithAlgorithm(pubkey, body, encryptionAlgorithm);
                 console.log('[JS] Body encrypted:', encryptedBody.substring(0, 50) + '...');
                 encryptedBody = this.armorCiphertext(encryptedBody, encryptionAlgorithm).trim();
             }
@@ -5976,7 +5947,7 @@ ${attachmentsHtml}
                 try {
                     const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                     const result = await TauriService.decryptEmailBody(
-                        keypair.private_key, email.body, email.subject,
+                        email.body, email.subject,
                         null, recipientPubkey
                     );
                     if (result.success) {
@@ -6636,7 +6607,7 @@ ${signatureIndicator}
                             if (keypair && email.body && email.body.includes('BEGIN NOSTR')) {
                                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                                 const decryptResult = await TauriService.decryptEmailBody(
-                                    keypair.private_key, email.body, email.subject || '',
+                                    email.body, email.subject || '',
                                     null, recipientPubkey
                                 );
                                 if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
@@ -7106,7 +7077,7 @@ ${attachmentsHtml}
                     try {
                         console.log('[JS] Calling backend decrypt_email_body for sent email...');
                         const result = await TauriService.decryptEmailBody(
-                            keypair.private_key, email.body, email.subject,
+                            email.body, email.subject,
                             null, recipientPubkey
                         );
                         console.log('[JS] Backend sent decrypt result: success=', result.success, 'isManifest=', result.isManifest);
@@ -7257,7 +7228,7 @@ ${attachmentsHtml}
             if (!keypair) return false;
 
             const result = await TauriService.decryptEmailBody(
-                keypair.private_key, email.body, email.subject || '',
+                email.body, email.subject || '',
                 null, recipientPubkey
             );
 
@@ -7395,7 +7366,7 @@ ${attachmentsHtml}
                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for sent attachment...');
                 const decryptResult = await TauriService.decryptEmailBody(
-                    keypair.private_key, email.body, email.subject || '',
+                    email.body, email.subject || '',
                     null, recipientPubkey
                 );
 
@@ -7491,7 +7462,7 @@ ${attachmentsHtml}
 
                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                 const decryptResult = await TauriService.decryptEmailBody(
-                    keypair.private_key, email.body, email.subject || '',
+                    email.body, email.subject || '',
                     null, recipientPubkey
                 );
 
@@ -7637,7 +7608,7 @@ ${attachmentsHtml}
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for attachment...');
                 const decryptResult = await TauriService.decryptEmailBody(
-                    keypair.private_key, email.body, email.subject || '',
+                    email.body, email.subject || '',
                     senderPubkey, null
                 );
 
@@ -7736,7 +7707,7 @@ ${attachmentsHtml}
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for ZIP...');
                 const decryptResult = await TauriService.decryptEmailBody(
-                    keypair.private_key, email.body, email.subject || '',
+                    email.body, email.subject || '',
                     senderPubkey, null
                 );
 
@@ -8087,7 +8058,7 @@ ${attachmentsHtml}
                 try {
                     const recipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey || draft.sender_pubkey;
                     const result = await TauriService.decryptEmailBody(
-                        keypair.private_key, draft.body, draft.subject || '',
+                        draft.body, draft.subject || '',
                         recipientPubkey, null
                     );
                     if (result.success) {
@@ -8506,7 +8477,7 @@ ${attachmentsHtml}
                         try {
                             const recipientPubkey = draftRecipientPubkey;
                             const result = await TauriService.decryptEmailBody(
-                                keypair.private_key, draft.body, draft.subject || '',
+                                draft.body, draft.subject || '',
                                 recipientPubkey, null
                             );
                             if (result.success) {

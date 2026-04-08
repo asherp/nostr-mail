@@ -9,6 +9,20 @@ pub struct KeyPair {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub public_key: String,
+    pub label: String,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationAccount {
+    pub public_key: String,
+    pub private_key: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailConfig {
     pub email_address: String,
     pub password: String,
@@ -107,7 +121,7 @@ pub enum MessageContent {
 /// Request structure for sending direct messages with explicit content type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectMessageRequest {
-    pub sender_private_key: String,
+    pub sender_private_key: Option<String>,
     pub recipient_pubkey: String,
     pub content: MessageContent,
     pub relays: Vec<String>,

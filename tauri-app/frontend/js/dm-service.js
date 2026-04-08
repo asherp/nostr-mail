@@ -24,7 +24,7 @@ class DMService {
         if (!keypair) return '[No keypair]';
 
         try {
-            return await TauriService.decryptDmContent(keypair.private_key, contactPubkey, encryptedContent);
+            return await TauriService.decryptDmContent(contactPubkey, encryptedContent);
         } catch (_) {
             return '[Failed to decrypt]';
         }
@@ -68,7 +68,6 @@ class DMService {
             }
             
             const myPubkey = window.appState.getKeypair().public_key;
-            const privateKey = window.appState.getKeypair().private_key;
             const dmContacts = [];
 
             for (const contactPubkey of pubkeys) {
@@ -637,8 +636,7 @@ class DMService {
         }
         
         const myPubkey = window.appState.getKeypair().public_key;
-        const privateKey = window.appState.getKeypair().private_key;
-        
+
         // Check if messages are already cached (skip cache if forceRefresh is true)
         const cachedMessages = window.appState.getDmMessages(contactPubkey);
         if (cachedMessages && cachedMessages.length > 0 && !forceRefresh) {
@@ -1213,7 +1211,6 @@ class DMService {
             const sendStart = Date.now();
             
             const eventId = await window.TauriService.sendDirectMessage(
-                window.appState.getKeypair().private_key,
                 contactPubkey,
                 replyText,
                 activeRelays
@@ -1431,15 +1428,13 @@ class DMService {
         window.notificationService.showInfo(`Syncing conversation with ${contactPubkey.substring(0, 16)}...`);
         
         try {
-            const privateKey = window.appState.getKeypair()?.private_key;
             const relays = window.appState.getActiveRelays();
-            
-            if (!privateKey || !relays || relays.length === 0) {
+
+            if (!window.appState.hasKeypair() || !relays || relays.length === 0) {
                 return;
             }
-            
+
             const count = await window.__TAURI__.core.invoke('sync_conversation_with_network', {
-                privateKey,
                 contactPubkey: contactPubkey,
                 relays
             });
@@ -1473,10 +1468,9 @@ class DMService {
         window.notificationService.showInfo('Syncing DMs from network...');
         try {
             // Sync DMs from network to database
-            const privateKey = window.appState.getKeypair()?.private_key;
             const relays = window.appState.getActiveRelays();
-            if (!privateKey) {
-                window.notificationService.showError('No private key available for DM sync');
+            if (!window.appState.hasKeypair()) {
+                window.notificationService.showError('No keypair available for DM sync');
                 // Reset refresh button
                 if (refreshBtn && originalRefreshBtnHTML) {
                     refreshBtn.disabled = false;
@@ -1494,7 +1488,6 @@ class DMService {
                 return;
             }
             await window.__TAURI__.core.invoke('sync_direct_messages_with_network', {
-                privateKey,
                 relays
             });
             window.notificationService.showSuccess('DMs synced from network');
@@ -1650,12 +1643,10 @@ class DMService {
         
         try {
             // Fetch and display email body
-            const privateKey = window.appState.getKeypair().private_key;
             const userPubkey = window.appState.getKeypair().public_key;
-            
+
             const emailResult = await window.__TAURI__.core.invoke('db_get_matching_email_body', {
                 dmEventId: message.event_id,
-                privateKey: privateKey,
                 userPubkey: userPubkey,
                 contactPubkey: contactPubkey
             });
@@ -1783,7 +1774,7 @@ class DMService {
 
         try {
             const result = await TauriService.decryptEmailBody(
-                keypair.private_key, rawBody, '',
+                rawBody, '',
                 contactPubkey, null
             );
             if (result.success) return result.body;
@@ -1818,7 +1809,7 @@ class DMService {
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                 const recipientPubkey = email.recipient_pubkey;
                 const decryptResult = await TauriService.decryptEmailBody(
-                    keypair.private_key, email.body, email.subject || '',
+                    email.body, email.subject || '',
                     senderPubkey, recipientPubkey
                 );
 

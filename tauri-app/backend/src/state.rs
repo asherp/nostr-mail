@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use crate::database::Database;
+use crate::keychain::KeychainManager;
 use nostr_sdk::prelude::*;
 use anyhow::Result;
 use tokio::sync::RwLock;
@@ -39,6 +40,7 @@ pub struct AppState {
     pub relay_auth_status: Arc<Mutex<std::collections::HashMap<String, bool>>>, // Track authentication status per relay: URL -> authenticated boolean
     pub pending_auth_challenges: Arc<Mutex<std::collections::HashMap<String, String>>>, // Track pending AUTH challenges: URL -> challenge string
     pub current_private_key: Arc<Mutex<Option<String>>>, // Store current private key in bech32 format for AUTH
+    pub keychain: KeychainManager,
 }
 
 impl AppState {
@@ -55,6 +57,7 @@ impl AppState {
             relay_auth_status: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_auth_challenges: Arc::new(Mutex::new(std::collections::HashMap::new())),
             current_private_key: Arc::new(Mutex::new(None)),
+            keychain: KeychainManager::new(),
         }
     }
 
@@ -267,6 +270,13 @@ impl AppState {
                 Err("Nostr client not initialized and no private key provided".to_string())
             }
         }
+    }
+
+    /// Get the active private key from in-memory state
+    pub fn get_active_private_key(&self) -> Result<String, String> {
+        self.current_private_key.lock().unwrap()
+            .clone()
+            .ok_or_else(|| "No active account. Please log in first.".to_string())
     }
 
     /// Get current keys

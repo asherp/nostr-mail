@@ -1,146 +1,94 @@
 // Profile Manager
-// Manages multiple nostr accounts/profiles, allowing switching without re-entering keys
+// Manages multiple nostr accounts/profiles via backend keychain storage
 
 class ProfileManager {
     constructor() {
-        this.ACCOUNTS_KEY = 'nostr_mail_accounts';
-        this.ACTIVE_KEY = 'nostr_keypair';
         this.PROFILES_CACHE_KEY = 'nostr_mail_profiles';
     }
 
-    // One-time migration from single-keypair storage to multi-account array
-    migrateFromSingleKeypair() {
-        if (localStorage.getItem(this.ACCOUNTS_KEY)) {
-            return; // already migrated
-        }
-        const existing = localStorage.getItem(this.ACTIVE_KEY);
-        if (existing) {
-            try {
-                const kp = JSON.parse(existing);
-                if (kp && kp.private_key && kp.public_key) {
-                    const accounts = [{
-                        public_key: kp.public_key,
-                        private_key: kp.private_key,
-                        label: '',
-                        added_at: new Date().toISOString()
-                    }];
-                    this.saveAccounts(accounts);
-                    console.log('[ProfileManager] Migrated single keypair to accounts list');
-                }
-            } catch (e) {
-                console.error('[ProfileManager] Migration failed:', e);
-            }
-        }
-    }
-
-    getAccounts() {
+    async getAccounts() {
         try {
-            const raw = localStorage.getItem(this.ACCOUNTS_KEY);
-            return raw ? JSON.parse(raw) : [];
+            return await TauriService.invoke('keychain_list_accounts');
         } catch (e) {
-            console.error('[ProfileManager] Failed to read accounts:', e);
+            console.error('[ProfileManager] Failed to list accounts:', e);
             return [];
         }
     }
 
-    saveAccounts(accounts) {
-        localStorage.setItem(this.ACCOUNTS_KEY, JSON.stringify(accounts));
-    }
-
-    getActiveAccount() {
+    async getActiveAccount() {
         try {
-            const raw = localStorage.getItem(this.ACTIVE_KEY);
-            return raw ? JSON.parse(raw) : null;
+            const pubkey = await TauriService.invoke('keychain_get_active_account');
+            if (!pubkey) return null;
+            const accounts = await this.getAccounts();
+            return accounts.find(a => a.public_key === pubkey) || { public_key: pubkey, label: '', is_active: true };
         } catch (e) {
+            console.error('[ProfileManager] Failed to get active account:', e);
             return null;
         }
     }
 
-    // Add a new account. Returns the account object, or null if invalid/duplicate.
+    // Add a new account. Returns the public key, or null if invalid.
     async addAccount(privateKey, label) {
-        if (!Utils.isValidNostrPrivkey(privateKey)) {
-            console.warn('[ProfileManager] Invalid private key format');
-            return null;
-        }
-
-        let publicKey;
         try {
-            const valid = await TauriService.validatePrivateKey(privateKey);
-            if (!valid) return null;
-            publicKey = await TauriService.getPublicKeyFromPrivate(privateKey);
+            const publicKey = await TauriService.invoke('keychain_add_account', {
+                privateKey: privateKey,
+                label: label || ''
+            });
+            console.log('[ProfileManager] Added account:', publicKey.substring(0, 20) + '...');
+            return { public_key: publicKey, label: label || '' };
         } catch (e) {
-            console.error('[ProfileManager] Key validation failed:', e);
+            console.error('[ProfileManager] Failed to add account:', e);
             return null;
         }
+    }
 
-        const accounts = this.getAccounts();
-        const existing = accounts.find(a => a.public_key === publicKey);
-        if (existing) {
-            // Update private key and label if provided (in case format changed)
-            existing.private_key = privateKey;
-            if (label) existing.label = label;
-            this.saveAccounts(accounts);
-            return existing;
+    async removeAccount(publicKey) {
+        try {
+            await TauriService.invoke('keychain_remove_account', { publicKey });
+            console.log('[ProfileManager] Removed account:', publicKey.substring(0, 20) + '...');
+        } catch (e) {
+            console.error('[ProfileManager] Failed to remove account:', e);
         }
-
-        const account = {
-            public_key: publicKey,
-            private_key: privateKey,
-            label: label || '',
-            added_at: new Date().toISOString()
-        };
-        accounts.push(account);
-        this.saveAccounts(accounts);
-        console.log('[ProfileManager] Added account:', publicKey.substring(0, 20) + '...');
-        return account;
     }
 
-    removeAccount(publicKey) {
-        let accounts = this.getAccounts();
-        accounts = accounts.filter(a => a.public_key !== publicKey);
-        this.saveAccounts(accounts);
-        console.log('[ProfileManager] Removed account:', publicKey.substring(0, 20) + '...');
-        return accounts;
-    }
-
-    // Set the active account. Updates the nostr_keypair localStorage entry.
-    setActiveAccount(publicKey) {
-        const accounts = this.getAccounts();
-        const account = accounts.find(a => a.public_key === publicKey);
-        if (!account) {
-            console.error('[ProfileManager] Account not found:', publicKey.substring(0, 20) + '...');
+    // Set the active account in the backend.
+    async setActiveAccount(publicKey) {
+        try {
+            await TauriService.invoke('keychain_set_active_account', { publicKey });
+            return true;
+        } catch (e) {
+            console.error('[ProfileManager] Failed to set active account:', e);
             return false;
         }
-        localStorage.setItem(this.ACTIVE_KEY, JSON.stringify({
-            private_key: account.private_key,
-            public_key: account.public_key
-        }));
-        return true;
     }
 
-    updateAccountLabel(publicKey, label) {
-        const accounts = this.getAccounts();
-        const account = accounts.find(a => a.public_key === publicKey);
-        if (account) {
-            account.label = label;
-            this.saveAccounts(accounts);
+    async updateAccountLabel(publicKey, label) {
+        try {
+            await TauriService.invoke('keychain_update_label', { publicKey, label });
+        } catch (e) {
+            console.error('[ProfileManager] Failed to update label:', e);
+        }
+    }
+
+    // Get private key from keychain for display in settings
+    async getPrivateKey(publicKey) {
+        try {
+            return await TauriService.invoke('keychain_get_private_key', { publicKey });
+        } catch (e) {
+            console.error('[ProfileManager] Failed to get private key:', e);
+            return null;
         }
     }
 
     // Returns the best display name for an account:
     // label > cached profile display_name > cached profile name > truncated npub
     getAccountDisplayName(publicKey) {
-        const accounts = this.getAccounts();
-        const account = accounts.find(a => a.public_key === publicKey);
-        if (account && account.label) {
-            return account.label;
-        }
-
         // Check cached nostr profile
         try {
             const cached = localStorage.getItem(this.PROFILES_CACHE_KEY);
             if (cached) {
-                const profile = JSON.parse(cached)[publicKey];
+                const profiles = JSON.parse(cached);
+                const profile = profiles[publicKey];
                 if (profile?.fields?.display_name) return profile.fields.display_name;
                 if (profile?.fields?.name) return profile.fields.name;
             }
@@ -175,8 +123,9 @@ class ProfileManager {
         return null;
     }
 
-    getAccountCount() {
-        return this.getAccounts().length;
+    async getAccountCount() {
+        const accounts = await this.getAccounts();
+        return accounts.length;
     }
 }
 

@@ -11,6 +11,7 @@ mod types;
 pub mod state;
 mod storage;
 mod database;
+mod keychain;
 #[allow(dead_code, unused_imports)]
 pub mod nostr_mail_capnp;
 
@@ -34,6 +35,14 @@ use state::EventSubscription;
 use serde_json;
 use tauri::Emitter;
 use chrono::{DateTime, Utc};
+
+/// Resolve a private key: prefer an explicit key if provided, fall back to AppState.
+fn resolve_private_key(explicit: Option<String>, state: &AppState) -> Result<String, String> {
+    if let Some(key) = explicit.filter(|k| !k.is_empty()) {
+        return Ok(key);
+    }
+    state.get_active_private_key()
+}
 
 /// Helper function to sync relay states - auto-disables relays that failed or aren't connected
 async fn sync_relay_states_internal(state: &AppState) -> Vec<String> {
@@ -596,15 +605,133 @@ fn get_public_key_from_private(private_key: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn sign_data(private_key: String, data: String) -> Result<String, String> {
+fn sign_data(private_key: Option<String>, data: String, state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] sign_data called");
-    crypto::sign_data(&private_key, &data).map_err(|e| e.to_string())
+    let pk = resolve_private_key(private_key, &state)?;
+    crypto::sign_data(&pk, &data).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn verify_signature(public_key: String, signature: String, data: String) -> Result<bool, String> {
     println!("[RUST] verify_signature called");
     crypto::verify_signature(&public_key, &signature, &data).map_err(|e| e.to_string())
+}
+
+// =====================
+// Keychain commands
+// =====================
+
+#[tauri::command]
+fn keychain_add_account(private_key: String, label: String, state: tauri::State<AppState>) -> Result<String, String> {
+    println!("[RUST] keychain_add_account called");
+    crypto::validate_private_key(&private_key).map_err(|e| e.to_string())?;
+    let public_key = crypto::get_public_key_from_private(&private_key).map_err(|e| e.to_string())?;
+    state.keychain.store_key(&public_key, &private_key)?;
+    if !label.is_empty() {
+        state.keychain.set_label(&public_key, &label)?;
+    }
+    Ok(public_key)
+}
+
+#[tauri::command]
+fn keychain_generate_account(label: String, state: tauri::State<AppState>) -> Result<String, String> {
+    println!("[RUST] keychain_generate_account called");
+    let keypair = crypto::generate_keypair().map_err(|e| e.to_string())?;
+    state.keychain.store_key(&keypair.public_key, &keypair.private_key)?;
+    if !label.is_empty() {
+        state.keychain.set_label(&keypair.public_key, &label)?;
+    }
+    Ok(keypair.public_key)
+}
+
+#[tauri::command]
+fn keychain_remove_account(public_key: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] keychain_remove_account called");
+    state.keychain.delete_key(&public_key)?;
+    // Clear AppState if this was the active account
+    let is_active = state.current_private_key.lock().unwrap()
+        .as_ref()
+        .and_then(|pk| crypto::get_public_key_from_private(pk).ok())
+        .map_or(false, |active_pub| active_pub == public_key);
+    if is_active {
+        *state.current_private_key.lock().unwrap() = None;
+        *state.current_keys.lock().unwrap() = None;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn keychain_list_accounts(state: tauri::State<AppState>) -> Result<Vec<AccountInfo>, String> {
+    let accounts = state.keychain.list_accounts()?;
+    let labels = state.keychain.get_labels().unwrap_or_default();
+    let active_pubkey = state.current_private_key.lock().unwrap()
+        .as_ref()
+        .and_then(|pk| crypto::get_public_key_from_private(pk).ok());
+
+    Ok(accounts.into_iter().map(|pubkey| {
+        let is_active = active_pubkey.as_ref().map_or(false, |ap| ap == &pubkey);
+        AccountInfo {
+            label: labels.get(&pubkey).cloned().unwrap_or_default(),
+            public_key: pubkey,
+            is_active,
+        }
+    }).collect())
+}
+
+#[tauri::command]
+fn keychain_set_active_account(public_key: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] keychain_set_active_account called for: {}...", &public_key[..20.min(public_key.len())]);
+    let private_key = state.keychain.get_key(&public_key)?
+        .ok_or_else(|| format!("No key found in keychain for {}", &public_key[..20.min(public_key.len())]))?;
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let keys = nostr_sdk::prelude::Keys::new(secret_key);
+    *state.current_keys.lock().unwrap() = Some(keys);
+    *state.current_private_key.lock().unwrap() = Some(private_key);
+    Ok(())
+}
+
+#[tauri::command]
+fn keychain_get_active_account(state: tauri::State<AppState>) -> Result<Option<String>, String> {
+    let pubkey = state.current_private_key.lock().unwrap()
+        .as_ref()
+        .and_then(|pk| crypto::get_public_key_from_private(pk).ok());
+    Ok(pubkey)
+}
+
+#[tauri::command]
+fn keychain_get_private_key(public_key: String, state: tauri::State<AppState>) -> Result<String, String> {
+    state.keychain.get_key(&public_key)?
+        .ok_or_else(|| format!("No key found in keychain for {}", &public_key[..20.min(public_key.len())]))
+}
+
+#[tauri::command]
+fn keychain_update_label(public_key: String, label: String, state: tauri::State<AppState>) -> Result<(), String> {
+    state.keychain.set_label(&public_key, &label)
+}
+
+#[tauri::command]
+fn keychain_clear_all(state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] keychain_clear_all called");
+    state.keychain.clear_all()?;
+    *state.current_private_key.lock().unwrap() = None;
+    *state.current_keys.lock().unwrap() = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn keychain_migrate_from_frontend(accounts: Vec<MigrationAccount>, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] keychain_migrate_from_frontend called with {} accounts", accounts.len());
+    for account in &accounts {
+        if let Ok(true) = crypto::validate_private_key(&account.private_key).map_err(|e| e.to_string()) {
+            state.keychain.store_key(&account.public_key, &account.private_key)?;
+            if !account.label.is_empty() {
+                state.keychain.set_label(&account.public_key, &account.label)?;
+            }
+        } else {
+            println!("[RUST] Skipping invalid key during migration for: {}...", &account.public_key[..20.min(account.public_key.len())]);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -639,8 +766,9 @@ async fn send_direct_message(
     println!("[RUST] Content type: {:?}", request.content);
     println!("[RUST] Encryption algorithm: {:?}", request.encryption_algorithm);
     
+    let sender_pk = resolve_private_key(request.sender_private_key, &state)?;
     let result = send_direct_message_persistent(
-        &request.sender_private_key,
+        &sender_pk,
         &request.recipient_pubkey,
         &request.content,
         request.encryption_algorithm.as_deref(),
@@ -662,18 +790,21 @@ async fn send_direct_message(
 }
 
 #[tauri::command]
-async fn fetch_direct_messages(private_key: String, relays: Vec<String>, since: Option<i64>) -> Result<Vec<NostrEvent>, String> {
-    nostr::fetch_direct_messages(&private_key, &relays, since).await.map_err(|e| e.to_string())
+async fn fetch_direct_messages(private_key: Option<String>, relays: Vec<String>, since: Option<i64>, state: tauri::State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::fetch_direct_messages(&pk, &relays, since).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn fetch_conversations(private_key: String, relays: Vec<String>) -> Result<Vec<nostr::Conversation>, String> {
-    nostr::fetch_conversations(&private_key, &relays).await.map_err(|e| e.to_string())
+async fn fetch_conversations(private_key: Option<String>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<nostr::Conversation>, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::fetch_conversations(&pk, &relays).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn fetch_conversation_messages(private_key: String, contact_pubkey: String, relays: Vec<String>) -> Result<Vec<nostr::ConversationMessage>, String> {
-    nostr::fetch_conversation_messages(&private_key, &contact_pubkey, &relays).await.map_err(|e| e.to_string())
+async fn fetch_conversation_messages(private_key: Option<String>, contact_pubkey: String, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<nostr::ConversationMessage>, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::fetch_conversation_messages(&pk, &contact_pubkey, &relays).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1056,9 +1187,10 @@ async fn fetch_following_pubkeys_persistent(pubkey: String, state: tauri::State<
 
 
 #[tauri::command]
-async fn fetch_following_profiles(private_key: String, relays: Vec<String>) -> Result<Vec<Profile>, String> {
+async fn fetch_following_profiles(private_key: Option<String>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<Profile>, String> {
     println!("[RUST] fetch_following_profiles called");
-    nostr::fetch_following_profiles(&private_key, &relays).await.map_err(|e| e.to_string())
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::fetch_following_profiles(&pk, &relays).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1083,9 +1215,10 @@ async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
 }
 
 #[tauri::command]
-async fn init_persistent_nostr_client(private_key: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn init_persistent_nostr_client(private_key: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] init_persistent_nostr_client called");
-    state.init_nostr_client(&private_key).await
+    let pk = resolve_private_key(private_key, &state)?;
+    state.init_nostr_client(&pk).await
 }
 
 #[tauri::command]
@@ -1292,15 +1425,17 @@ async fn test_relay_connection(relay_url: String) -> Result<bool, String> {
 
 
 #[tauri::command]
-fn decrypt_dm_content(private_key: String, sender_pubkey: String, encrypted_content: String) -> Result<String, String> {
-    nostr::decrypt_dm_content(&private_key, &sender_pubkey, &encrypted_content)
+fn decrypt_dm_content(private_key: Option<String>, sender_pubkey: String, encrypted_content: String, state: tauri::State<AppState>) -> Result<String, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::decrypt_dm_content(&pk, &sender_pubkey, &encrypted_content)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn publish_nostr_event(private_key: String, content: String, kind: u16, tags: Vec<Vec<String>>, relays: Vec<String>) -> Result<(), String> {
+async fn publish_nostr_event(private_key: Option<String>, content: String, kind: u16, tags: Vec<Vec<String>>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] publish_nostr_event called");
-    nostr::publish_event(&private_key, &content, kind, tags, &relays)
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::publish_event(&pk, &content, kind, tags, &relays)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -2216,9 +2351,9 @@ fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<boo
 
 #[tauri::command]
 async fn db_search_emails(
-    search_query: String, 
-    user_email: Option<String>, 
-    private_key: Option<String>, 
+    search_query: String,
+    user_email: Option<String>,
+    private_key: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
     app_handle: tauri::AppHandle,
@@ -2227,6 +2362,7 @@ async fn db_search_emails(
     let page_size = limit.unwrap_or(50) as usize;
     let skip_count = offset.unwrap_or(0) as usize;
     println!("[RUST] db_search_emails called with query: '{}', limit: {}, offset: {}", search_query, page_size, skip_count);
+    let private_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
     
     // Emit search started event
@@ -2494,9 +2630,9 @@ fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Optio
 
 #[tauri::command]
 async fn db_search_sent_emails(
-    search_query: String, 
-    user_email: Option<String>, 
-    private_key: Option<String>, 
+    search_query: String,
+    user_email: Option<String>,
+    private_key: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
     app_handle: tauri::AppHandle,
@@ -2505,6 +2641,7 @@ async fn db_search_sent_emails(
     let page_size = limit.unwrap_or(50) as usize;
     let skip_count = offset.unwrap_or(0) as usize;
     println!("[RUST] db_search_sent_emails called with query: '{}', limit: {}, offset: {}", search_query, page_size, skip_count);
+    let private_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
     
     // Emit search started event
@@ -2964,11 +3101,12 @@ fn db_get_dms_for_conversation(user_pubkey: String, contact_pubkey: String, stat
 
 #[tauri::command]
 fn db_get_decrypted_dms_for_conversation(
-    private_key: String,
+    private_key: Option<String>,
     user_pubkey: String,
     contact_pubkey: String,
     state: tauri::State<AppState>
 ) -> Result<Vec<crate::database::DirectMessage>, String> {
+    let pk = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
     let mut messages = db.get_dms_for_conversation(&user_pubkey, &contact_pubkey)
         .map_err(|e| e.to_string())?;
@@ -2978,7 +3116,7 @@ fn db_get_decrypted_dms_for_conversation(
         } else {
             &msg.sender_pubkey
         };
-        match crate::nostr::decrypt_dm_content(&private_key, decrypt_sender_pubkey, &msg.content) {
+        match crate::nostr::decrypt_dm_content(&pk, decrypt_sender_pubkey, &msg.content) {
             Ok(decrypted) => {
                 msg.content = decrypted;
             },
@@ -3031,13 +3169,14 @@ fn db_get_conversations(user_pubkey: String, state: tauri::State<AppState>) -> R
 #[tauri::command]
 fn db_get_conversations_with_decrypted_last_message(
     user_pubkey: String,
-    private_key: String,
+    private_key: Option<String>,
     state: tauri::State<AppState>
 ) -> Result<Vec<ConversationWithDecryptedLastMessage>, String> {
     println!("[RUST] db_get_conversations_with_decrypted_last_message called for user: {}", user_pubkey);
+    let pk = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
     let conversations = db.get_conversations(&user_pubkey).map_err(|e| e.to_string())?;
-    
+
     let mut result = Vec::new();
     for conv in conversations {
         // Fetch the last message by event_id and decrypt it
@@ -3049,8 +3188,8 @@ fn db_get_conversations_with_decrypted_last_message(
                 } else {
                     &conv.user_pubkey
                 };
-                
-                match crate::nostr::decrypt_dm_content(&private_key, decrypt_sender_pubkey, &encrypted_content) {
+
+                match crate::nostr::decrypt_dm_content(&pk, decrypt_sender_pubkey, &encrypted_content) {
                     Ok(decrypted) => decrypted,
                     Err(e) => {
                         println!("[RUST] Failed to decrypt last message for conversation {}: event_id={}, error={}", conv.contact_pubkey, conv.last_message_event_id, e);
@@ -3284,14 +3423,15 @@ fn db_get_setting(pubkey: String, key: String, state: tauri::State<AppState>) ->
 #[tauri::command]
 fn db_get_all_settings(pubkey: String, private_key: Option<String>, state: tauri::State<AppState>) -> Result<std::collections::HashMap<String, String>, String> {
     println!("[RUST] db_get_all_settings called for pubkey: {}", pubkey);
+    let resolved_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
     let mut settings = db.get_all_settings(&pubkey).map_err(|e| e.to_string())?;
-    
+
     // List of sensitive settings that should be decrypted
     let sensitive_keys = vec!["password"];
-    
-    // Decrypt sensitive settings if private key is provided
-    if let Some(ref priv_key) = private_key {
+
+    // Decrypt sensitive settings if private key is available
+    if let Some(ref priv_key) = resolved_key {
         for key in sensitive_keys {
             if let Some(encrypted_value) = settings.get(key) {
                 if !encrypted_value.is_empty() {
@@ -3318,15 +3458,16 @@ fn db_get_all_settings(pubkey: String, private_key: Option<String>, state: tauri
 #[tauri::command]
 fn db_save_settings_batch(pubkey: String, settings: std::collections::HashMap<String, String>, private_key: Option<String>, state: tauri::State<AppState>) -> Result<(), String> {
     println!("[RUST] db_save_settings_batch called for pubkey: {}, {} settings", pubkey, settings.len());
+    let resolved_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
-    
+
     // List of sensitive settings that should be encrypted
     let sensitive_keys = vec!["password"];
-    
+
     for (key, value) in settings.iter() {
         let value_to_save = if sensitive_keys.contains(&key.as_str()) {
-            // Encrypt sensitive settings if private key is provided
-            if let Some(ref priv_key) = private_key {
+            // Encrypt sensitive settings if private key is available
+            if let Some(ref priv_key) = resolved_key {
                 match crypto::encrypt_setting_value(priv_key, value) {
                     Ok(encrypted) => {
                         println!("[RUST] Encrypted sensitive setting: {}", key);
@@ -3400,18 +3541,19 @@ fn db_delete_account_data(pubkey: String, state: tauri::State<AppState>) -> Resu
 }
 
 #[tauri::command]
-async fn follow_user(private_key: String, pubkey_to_follow: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn follow_user(private_key: Option<String>, pubkey_to_follow: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     use nostr_sdk::prelude::*;
-    
+
     println!("[RUST] follow_user called for pubkey: {}", pubkey_to_follow);
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Get or initialize the persistent client (will reinitialize if keys don't match)
-    let client = state.get_nostr_client(Some(&private_key)).await.map_err(|e| {
+    let client = state.get_nostr_client(Some(&pk)).await.map_err(|e| {
         format!("Failed to get or initialize persistent client: {}", e)
     })?;
-    
+
     // Parse private key and create keys
-    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let keys = Keys::new(secret_key);
     
     // Get the user's public key
@@ -3523,26 +3665,27 @@ async fn follow_user(private_key: String, pubkey_to_follow: String, state: tauri
 }
 
 #[tauri::command]
-async fn publish_follow_list(private_key: String, user_pubkey: String, _relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn publish_follow_list(private_key: Option<String>, user_pubkey: String, _relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<String, String> {
     use nostr_sdk::prelude::*;
-    
+
     println!("[RUST] publish_follow_list called for user: {}", user_pubkey);
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Get all public contacts from database
     let db = state.get_database()?;
     let public_pubkeys = db.get_public_contact_pubkeys(&user_pubkey)
         .map_err(|e| format!("Failed to get public contacts: {}", e))?;
-    
+
     println!("[RUST] Found {} public contacts to publish", public_pubkeys.len());
-    
+
     // Get or initialize the persistent client (same one used for fetching)
     // This ensures we use the same relay connections
-    let client = state.get_nostr_client(Some(&private_key)).await.map_err(|e| {
+    let client = state.get_nostr_client(Some(&pk)).await.map_err(|e| {
         format!("Failed to get or initialize persistent client: {}", e)
     })?;
-    
+
     // Parse private key and create keys (same keypair, just need it for signing)
-    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let keys = Keys::new(secret_key);
     
     // Create tags for the follow event (kind 3)
@@ -3611,30 +3754,33 @@ async fn publish_follow_list(private_key: String, user_pubkey: String, _relays: 
 }
 
 #[tauri::command]
-fn encrypt_nip04_message(private_key: String, public_key: String, message: String) -> Result<String, String> {
+fn encrypt_nip04_message(private_key: Option<String>, public_key: String, message: String, state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] encrypt_nip04_message called");
-    crypto::encrypt_message(&private_key, &public_key, &message, Some("nip04")).map_err(|e| e.to_string())
+    let pk = resolve_private_key(private_key, &state)?;
+    crypto::encrypt_message(&pk, &public_key, &message, Some("nip04")).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn encrypt_nip04_message_legacy(private_key: String, public_key: String, message: String) -> Result<String, String> {
+fn encrypt_nip04_message_legacy(private_key: Option<String>, public_key: String, message: String, state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] encrypt_nip04_message_legacy called");
     use nostr_sdk::prelude::*;
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Parse the keys from bech32 format
-    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let public_key = PublicKey::from_bech32(&public_key).map_err(|e| e.to_string())?;
-    
+
     // Use NIP-04 encryption (legacy)
     let encrypted = nip04::encrypt(&secret_key, &public_key, message).map_err(|e| e.to_string())?;
-    
+
     Ok(encrypted)
 }
 
 #[tauri::command]
-fn encrypt_message_with_algorithm(private_key: String, public_key: String, message: String, algorithm: String) -> Result<String, String> {
+fn encrypt_message_with_algorithm(private_key: Option<String>, public_key: String, message: String, algorithm: String, state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] encrypt_message_with_algorithm called with algorithm: {}", algorithm);
-    crypto::encrypt_message(&private_key, &public_key, &message, Some(&algorithm)).map_err(|e| e.to_string())
+    let pk = resolve_private_key(private_key, &state)?;
+    crypto::encrypt_message(&pk, &public_key, &message, Some(&algorithm)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3644,14 +3790,16 @@ fn parse_armor_message(armor_text: String) -> Result<Option<types::ParsedArmorMe
 
 #[tauri::command]
 fn decrypt_email_body(
-    private_key: String,
+    private_key: Option<String>,
     armor_text: String,
     subject: String,
     sender_pubkey: Option<String>,
     recipient_pubkey: Option<String>,
+    state: tauri::State<AppState>,
 ) -> Result<types::DecryptEmailResult, String> {
+    let pk = resolve_private_key(private_key, &state)?;
     email::decrypt_email_body_pipeline(
-        &private_key,
+        &pk,
         &armor_text,
         &subject,
         sender_pubkey.as_deref(),
@@ -3912,16 +4060,17 @@ async fn sync_all_emails(config: EmailConfig, state: tauri::State<'_, AppState>)
 }
 
 #[tauri::command]
-async fn sync_direct_messages_with_network(private_key: String, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+async fn sync_direct_messages_with_network(private_key: Option<String>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     println!("[RUST] sync_direct_messages_with_network called");
+    let pk = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
-    
+
     // Get the persistent client (clone it before await to avoid Send issues)
     let client_option = {
         let client_guard = state.nostr_client.lock().unwrap();
         client_guard.as_ref().cloned()
     };
-    
+
     let client = match client_option {
         Some(client) => client,
         None => {
@@ -3929,15 +4078,15 @@ async fn sync_direct_messages_with_network(private_key: String, relays: Vec<Stri
             // Fallback to old method if persistent client not available
             let latest = db.get_latest_dm_created_at().map_err(|e| e.to_string())?;
             let since = latest.map(|dt| dt.timestamp());
-            let events = crate::nostr::fetch_direct_messages(&private_key, &relays, since)
+            let events = crate::nostr::fetch_direct_messages(&pk, &relays, since)
                 .await
                 .map_err(|e| e.to_string())?;
             return sync_dms_from_events(events, db);
         }
     };
-    
+
     // Parse private key to get keys
-    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key)
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&pk)
         .map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
     
@@ -3962,7 +4111,7 @@ async fn sync_direct_messages_with_network(private_key: String, relays: Vec<Stri
         // Fallback to old method
         let latest = db.get_latest_dm_created_at().map_err(|e| e.to_string())?;
         let since = latest.map(|dt| dt.timestamp());
-        let events = crate::nostr::fetch_direct_messages(&private_key, &relays, since)
+        let events = crate::nostr::fetch_direct_messages(&pk, &relays, since)
             .await
             .map_err(|e| e.to_string())?;
         return sync_dms_from_events(events, db);
@@ -4037,16 +4186,17 @@ fn sync_dms_from_events(events: Vec<NostrEvent>, db: crate::database::Database) 
 
 #[tauri::command]
 async fn sync_conversation_with_network(
-    private_key: String,
+    private_key: Option<String>,
     contact_pubkey: String,
     relays: Vec<String>,
     state: tauri::State<'_, AppState>
 ) -> Result<usize, String> {
     println!("[RUST] sync_conversation_with_network called for contact: {}", contact_pubkey);
+    let pk = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
-    
+
     // Get user's pubkey
-    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key)
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&pk)
         .map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
     let user_pubkey = keys.public_key().to_bech32().map_err(|e| e.to_string())?;
@@ -4236,13 +4386,14 @@ fn db_get_all_dm_pubkeys_sorted(state: tauri::State<AppState>) -> Result<Vec<Str
 }
 
 #[tauri::command]
-async fn update_profile(private_key: String, fields: std::collections::HashMap<String, serde_json::Value>, relays: Vec<String>) -> Result<(), String> {
+async fn update_profile(private_key: Option<String>, fields: std::collections::HashMap<String, serde_json::Value>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let pk = resolve_private_key(private_key, &state)?;
 
     // Convert fields to JSON string
     let content = serde_json::to_string(&fields).map_err(|e| e.to_string())?;
 
     // Parse private key
-    let secret_key = nostr_sdk::prelude::SecretKey::from_str(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = nostr_sdk::prelude::SecretKey::from_str(&pk).map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
 
     // Build the profile event (kind 0)
@@ -4262,20 +4413,21 @@ async fn update_profile(private_key: String, fields: std::collections::HashMap<S
 }
 
 #[tauri::command]
-async fn update_profile_persistent(private_key: String, fields: std::collections::HashMap<String, serde_json::Value>, app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn update_profile_persistent(private_key: Option<String>, fields: std::collections::HashMap<String, serde_json::Value>, app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] update_profile_persistent called");
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Convert fields to JSON string
     let content = serde_json::to_string(&fields).map_err(|e| e.to_string())?;
     println!("[RUST] Profile content: {}", content);
 
     // Get or initialize the persistent client (will reinitialize if keys don't match)
-    let client = state.get_nostr_client(Some(&private_key)).await.map_err(|e| {
+    let client = state.get_nostr_client(Some(&pk)).await.map_err(|e| {
         format!("Failed to get or initialize persistent client: {}", e)
     })?;
 
     // Parse private key and create keys
-    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
 
     // Build the profile event (kind 0)
@@ -4329,17 +4481,18 @@ async fn update_profile_persistent(private_key: String, fields: std::collections
 // Live Event Subscription System
 #[tauri::command]
 async fn start_live_event_subscription(
-    private_key: String,
+    private_key: Option<String>,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>
 ) -> Result<(), String> {
     println!("[RUST] start_live_event_subscription called");
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Get the persistent client
-    let client = state.get_nostr_client(Some(&private_key)).await?;
-    
+    let client = state.get_nostr_client(Some(&pk)).await?;
+
     // Parse user's public key from private key
-    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let keys = Keys::new(secret_key);
     let user_pubkey = keys.public_key();
     
@@ -5075,8 +5228,9 @@ fn db_get_matching_email_id(dm_event_id: String, state: tauri::State<AppState>) 
 }
 
 #[tauri::command]
-fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<types::MatchingEmailBodyResult>, String> {
+fn db_get_matching_email_body(dm_event_id: String, private_key: Option<String>, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<types::MatchingEmailBodyResult>, String> {
     println!("[RUST] db_get_matching_email_body called for DM event_id: {}", dm_event_id);
+    let private_key = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
     
     // Get the DM content hash for fast lookup
@@ -5238,6 +5392,16 @@ pub fn run() {
         greet,
         should_clear_localstorage_cache,
         generate_keypair,
+        keychain_add_account,
+        keychain_generate_account,
+        keychain_remove_account,
+        keychain_list_accounts,
+        keychain_set_active_account,
+        keychain_get_active_account,
+        keychain_get_private_key,
+        keychain_update_label,
+        keychain_clear_all,
+        keychain_migrate_from_frontend,
         validate_private_key,
         validate_public_key,
         get_public_key_from_private,

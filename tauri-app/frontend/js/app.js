@@ -34,20 +34,26 @@ NostrMailApp.prototype.init = async function() {
     try {
         const shouldClear = await TauriService.invoke('should_clear_localstorage_cache');
         if (shouldClear) {
-            console.log('🧹 Clearing localStorage cache due to NOSTR_MAIL_CLEAR_CACHE environment variable...');
-            // Clear all nostr-mail related localStorage items
+            console.log('Clearing localStorage cache due to NOSTR_MAIL_CLEAR_CACHE environment variable...');
             localStorage.removeItem('nostr_mail_settings');
             localStorage.removeItem('nostr_mail_profiles');
             localStorage.removeItem('nostr_mail_profile_picture');
             localStorage.removeItem('nostr_keypair');
             localStorage.removeItem('nostr_mail_accounts');
-            // Also clear legacy items if they exist
+            localStorage.removeItem('nostr_mail_keychain_migrated');
             localStorage.removeItem('contacts');
             localStorage.removeItem('settings');
-            console.log('✅ localStorage cache cleared (including keypair)');
+            // Also clear keychain entries
+            try {
+                await TauriService.invoke('keychain_clear_all');
+                console.log('Keychain entries cleared');
+            } catch (ke) {
+                console.warn('Failed to clear keychain:', ke);
+            }
+            console.log('localStorage cache cleared');
         }
     } catch (e) {
-        console.warn('⚠️ Failed to check clear cache environment variable:', e);
+        console.warn('Failed to check clear cache environment variable:', e);
     }
     
     // Initialize the database
@@ -63,15 +69,57 @@ NostrMailApp.prototype.init = async function() {
             return;
         }
     }
+    // One-time migration: move keys from localStorage to system keychain
+    if (!localStorage.getItem('nostr_mail_keychain_migrated')) {
+        try {
+            const accounts = [];
+            const rawAccounts = localStorage.getItem('nostr_mail_accounts');
+            if (rawAccounts) {
+                const parsed = JSON.parse(rawAccounts);
+                for (const acct of parsed) {
+                    if (acct.private_key && acct.public_key) {
+                        accounts.push({
+                            public_key: acct.public_key,
+                            private_key: acct.private_key,
+                            label: acct.label || ''
+                        });
+                    }
+                }
+            }
+            // Fallback to single keypair if no accounts array
+            if (accounts.length === 0) {
+                try {
+                    const kp = JSON.parse(localStorage.getItem('nostr_keypair'));
+                    if (kp?.private_key && kp?.public_key) {
+                        accounts.push({ public_key: kp.public_key, private_key: kp.private_key, label: '' });
+                    }
+                } catch (e) { /* ignore parse errors */ }
+            }
+            if (accounts.length > 0) {
+                console.log('[APP] Migrating', accounts.length, 'accounts from localStorage to keychain...');
+                await TauriService.invoke('keychain_migrate_from_frontend', { accounts });
+                // Set the first account as active
+                await TauriService.invoke('keychain_set_active_account', { publicKey: accounts[0].public_key });
+                console.log('[APP] Migration complete');
+            }
+            // Clean up localStorage keys
+            localStorage.removeItem('nostr_keypair');
+            localStorage.removeItem('nostr_mail_accounts');
+        } catch (e) {
+            console.error('[APP] Keychain migration failed:', e);
+        }
+        localStorage.setItem('nostr_mail_keychain_migrated', 'true');
+    }
+
     try {
-        console.log('📋 Loading application settings...');
+        console.log('Loading application settings...');
         // Settings will be loaded after keypair is loaded (in loadKeypair)
         // This ensures we load settings for the correct pubkey
 
-        console.log('🌐 Loading relay configuration from database...');
+        console.log('Loading relay configuration from database...');
         await this.loadRelaysFromDatabase();
 
-        console.log('🔑 Loading/generating keypair...');
+        console.log('Loading keypair from keychain...');
         await this.loadKeypair();
         
         // Check if no keypair is available - navigate to settings and show message
@@ -158,12 +206,11 @@ NostrMailApp.prototype.loadSettings = async function() {
         const keypair = appState.getKeypair();
         if (keypair && keypair.public_key) {
             try {
-                const dbSettings = await TauriService.dbGetAllSettings(keypair.public_key, keypair.private_key);
+                const dbSettings = await TauriService.dbGetAllSettings(keypair.public_key);
                 if (dbSettings && Object.keys(dbSettings).length > 0) {
                     console.log('[APP] Loaded settings from database for pubkey:', keypair.public_key);
                     // Convert database settings back to settings object format
                     const settings = {
-                        npriv_key: keypair.private_key,
                         encryption_algorithm: dbSettings.encryption_algorithm || 'nip44',
                         email_address: dbSettings.email_address || '',
                         password: dbSettings.password || '',
@@ -266,7 +313,6 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
     
     // Define default settings
     const defaultSettings = {
-        npriv_key: keypair ? keypair.private_key : '',
         encryption_algorithm: 'nip44',
         email_address: '',
         password: '',
@@ -319,18 +365,12 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
         }
         
         console.log('[APP] Loading settings for pubkey:', pubkey);
-        // Get private key for decryption
-        const keypair = appState.getKeypair();
-        const privateKey = keypair ? keypair.private_key : null;
-        console.log('[APP] Using private key for decryption:', privateKey ? privateKey.substring(0, 20) + '...' : 'null');
-        const dbSettings = await TauriService.dbGetAllSettings(pubkey, privateKey);
+        // Backend decrypts sensitive settings using active key from AppState
+        const dbSettings = await TauriService.dbGetAllSettings(pubkey);
         console.log('[APP] Loaded settings from database:', Object.keys(dbSettings || {}).length, 'keys');
-        
+
         if (dbSettings && Object.keys(dbSettings).length > 0) {
-            // Get current keypair to include private key in settings
-            const keypair = appState.getKeypair();
             const settings = {
-                npriv_key: keypair ? keypair.private_key : '',
                 encryption_algorithm: dbSettings.encryption_algorithm || 'nip44',
                 email_address: dbSettings.email_address || '',
                 password: dbSettings.password || '',
@@ -372,10 +412,9 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
             if (stored) {
                 try {
                     const settings = JSON.parse(stored);
-                    // Only use localStorage settings if they match the current pubkey's keypair
-                    // (localStorage might have settings from a different keypair)
+                    // Only use localStorage settings if they match the current pubkey
                     const currentKeypair = appState.getKeypair();
-                    if (currentKeypair && settings.npriv_key === currentKeypair.private_key) {
+                    if (currentKeypair && settings._pubkey === currentKeypair.public_key) {
                         appState.setSettings(settings);
                         this.populateSettingsForm();
                         console.log('[APP] Loaded settings from localStorage for pubkey:', pubkey);
@@ -403,7 +442,7 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
             try {
                 const settings = JSON.parse(stored);
                 const currentKeypair = appState.getKeypair();
-                if (currentKeypair && settings.npriv_key === currentKeypair.private_key) {
+                if (currentKeypair && settings._pubkey === currentKeypair.public_key) {
                     appState.setSettings(settings);
                     this.populateSettingsForm();
                 } else {
@@ -445,89 +484,88 @@ NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
 // Load keypair
 NostrMailApp.prototype.loadKeypair = async function() {
     try {
-        // Migrate single-keypair users to multi-account storage
-        profileManager.migrateFromSingleKeypair();
+        let pubkey = null;
 
-        let keypair = null;
-
-        // Always check config file first - it overrides localStorage
+        // Check if there's an active account loaded in backend memory
         try {
-            const defaultPrivateKey = await TauriService.getDefaultPrivateKeyFromConfig();
-            if (defaultPrivateKey && defaultPrivateKey.trim() !== '') {
-                console.log('[APP] Found default private key from config file - overriding localStorage');
-                // Validate the private key
-                const isValid = await TauriService.validatePrivateKey(defaultPrivateKey);
-                if (isValid) {
-                    // Get public key from private key
-                    const publicKey = await TauriService.getPublicKeyFromPrivate(defaultPrivateKey);
-                    keypair = { private_key: defaultPrivateKey, public_key: publicKey };
-                    // Save to localStorage and appState (overriding any existing keypair)
-                    localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
-                    appState.setKeypair(keypair);
-                    // Ensure config key is in the accounts list
-                    await profileManager.addAccount(defaultPrivateKey, '');
-                    console.log('[APP] Loaded default keypair from config file');
-                } else {
-                    console.log('[APP] Default private key from config is invalid');
-                    // Fall through to localStorage fallback
+            pubkey = await TauriService.invoke('keychain_get_active_account');
+        } catch (e) {
+            console.log('[APP] No active account in memory:', e);
+        }
+
+        // If no active account in memory, check if keychain has accounts (cold start)
+        if (!pubkey) {
+            try {
+                const accounts = await profileManager.getAccounts();
+                if (accounts.length > 0) {
+                    console.log('[APP] Found', accounts.length, 'accounts in keychain, activating first one');
+                    await profileManager.setActiveAccount(accounts[0].public_key);
+                    pubkey = accounts[0].public_key;
                 }
-            }
-        } catch (error) {
-            console.error('[APP] Failed to get default private key from config:', error);
-            // Fall through to localStorage fallback
-        }
-        
-        // If no keypair from config, try localStorage
-        if (!keypair) {
-            const stored = localStorage.getItem('nostr_keypair');
-            if (stored) {
-                keypair = JSON.parse(stored);
-                appState.setKeypair(keypair);
-            } else {
-                // No keypair in localStorage and no default from config - don't auto-generate
-                // User must explicitly generate one via the "Generate New Keypair" button
-                appState.setKeypair(null);
-                console.log('[APP] No keypair found in localStorage or config. User must generate one in settings.');
+            } catch (e) {
+                console.log('[APP] Could not check keychain accounts:', e);
             }
         }
-        
-        // Only proceed with keypair-dependent operations if keypair exists
-        if (keypair) {
-            console.log('Keypair loaded:', appState.getKeypair().public_key.substring(0, 20) + '...');
+
+        // If still no account, check config file for a default key
+        if (!pubkey) {
+            try {
+                const defaultPrivateKey = await TauriService.getDefaultPrivateKeyFromConfig();
+                if (defaultPrivateKey && defaultPrivateKey.trim() !== '') {
+                    console.log('[APP] Found default private key from config file - importing to keychain');
+                    const result = await profileManager.addAccount(defaultPrivateKey, '');
+                    if (result) {
+                        pubkey = result.public_key;
+                        await profileManager.setActiveAccount(pubkey);
+                    }
+                }
+            } catch (error) {
+                console.error('[APP] Failed to get default private key from config:', error);
+            }
+        }
+
+        // Set appState
+        if (pubkey) {
+            appState.setKeypair({ public_key: pubkey });
+            console.log('Keypair loaded:', pubkey.substring(0, 20) + '...');
             this.renderProfilePubkey();
         } else {
-            console.log('[APP] No keypair available - skipping keypair-dependent initialization');
+            appState.setKeypair(null);
+            console.log('[APP] No keypair found. User must generate one in settings.');
         }
-        
-        // Populate private key field in settings form if it's empty
-        // This ensures the user sees they're already logged in when the app starts
+
+        // Populate private key field in settings from keychain
         const nprivKeyInput = domManager.get('nprivKey');
-        if (nprivKeyInput && (!nprivKeyInput.value || nprivKeyInput.value.trim() === '')) {
-            if (keypair && keypair.private_key) {
-                domManager.setValue('nprivKey', keypair.private_key);
-                console.log('[APP] Populated private key field from cached keypair on startup');
-                // Update public key display to show the user is logged in
-                await this.updatePublicKeyDisplay();
+        if (nprivKeyInput && (!nprivKeyInput.value || nprivKeyInput.value.trim() === '') && pubkey) {
+            try {
+                const privKey = await profileManager.getPrivateKey(pubkey);
+                if (privKey) {
+                    domManager.setValue('nprivKey', privKey);
+                    console.log('[APP] Populated private key field from keychain on startup');
+                    await this.updatePublicKeyDisplay();
+                }
+            } catch (e) {
+                console.log('[APP] Could not populate private key field:', e);
             }
         }
-        
+
         // Load settings for this pubkey
-        if (keypair && keypair.public_key) {
-            await this.loadSettingsForPubkey(keypair.public_key);
+        if (pubkey) {
+            await this.loadSettingsForPubkey(pubkey);
         }
-        
-        // Initialize persistent Nostr client with the loaded keypair (only if keypair exists)
-        if (keypair && keypair.private_key) {
+
+        // Initialize persistent Nostr client (backend reads key from its own state)
+        if (pubkey) {
             await this.initializeNostrClient();
         } else {
             console.log('[APP] Skipping Nostr client initialization - no keypair available');
         }
-        
+
         // Update pre-release warning visibility based on keypair existence
         this.updatePreReleaseWarning();
 
         // Update the sidebar profile switcher display
-        this.updateProfileSwitcher();
+        await this.updateProfileSwitcher();
     } catch (error) {
         console.error('Failed to load keypair:', error);
         notificationService.showError('Failed to load encryption keys');
@@ -539,9 +577,8 @@ NostrMailApp.prototype.updatePreReleaseWarning = function() {
     const warningDiv = document.getElementById('pre-release-warning');
     if (!warningDiv) return;
     
-    const keypair = appState.getKeypair();
-    const hasKeypair = keypair && keypair.private_key;
-    
+    const hasKeypair = appState.hasKeypair();
+
     if (hasKeypair) {
         warningDiv.style.display = 'none';
     } else {
@@ -552,14 +589,13 @@ NostrMailApp.prototype.updatePreReleaseWarning = function() {
 // Initialize the persistent Nostr client
 NostrMailApp.prototype.initializeNostrClient = async function() {
     try {
-        const keypair = appState.getKeypair();
-        if (!keypair || !keypair.private_key) {
+        if (!appState.hasKeypair()) {
             console.warn('[APP] No keypair available for Nostr client initialization');
             return;
         }
-        
+
         console.log('[APP] Initializing persistent Nostr client...');
-        await TauriService.initPersistentNostrClient(keypair.private_key);
+        await TauriService.initPersistentNostrClient();
         console.log('[APP] ✅ Nostr client initialized successfully');
         
         // Update relay status display after client initialization
@@ -693,25 +729,26 @@ NostrMailApp.prototype.ensureDefaultContact = async function() {
 }
 
 // Switch to a different profile/account. Consolidates all profile-switch logic.
-NostrMailApp.prototype.switchToProfile = async function(keypair) {
-    if (!keypair || !keypair.private_key || !keypair.public_key) {
-        console.error('[APP] switchToProfile called with invalid keypair');
+NostrMailApp.prototype.switchToProfile = async function(publicKeyOrKeypair) {
+    const publicKey = typeof publicKeyOrKeypair === 'string' ? publicKeyOrKeypair : publicKeyOrKeypair?.public_key;
+    if (!publicKey) {
+        console.error('[APP] switchToProfile called with invalid argument');
         return;
     }
 
     const lastLoadedPubkey = appState.getLastLoadedPubkey();
-    const isSameProfile = lastLoadedPubkey === keypair.public_key;
+    const isSameProfile = lastLoadedPubkey === publicKey;
 
-    console.log('[APP] Switching to profile:', keypair.public_key.substring(0, 20) + '...');
+    console.log('[APP] Switching to profile:', publicKey.substring(0, 20) + '...');
 
     // Prevent auto-save from firing during the switch
     if (this._setPopulatingForm) {
         this._setPopulatingForm(true);
     }
 
-    // Update appState and localStorage
-    appState.setKeypair(keypair);
-    profileManager.setActiveAccount(keypair.public_key);
+    // Set active account in backend keychain (loads private key into AppState)
+    await profileManager.setActiveAccount(publicKey);
+    appState.setKeypair({ public_key: publicKey });
     this.updatePreReleaseWarning();
 
     // Clear old user's data from memory
@@ -721,10 +758,15 @@ NostrMailApp.prototype.switchToProfile = async function(keypair) {
     }
 
     // Load settings for this pubkey (handles form population)
-    await this.loadSettingsForPubkey(keypair.public_key);
+    await this.loadSettingsForPubkey(publicKey);
 
-    // Update the private key field in settings
-    domManager.setValue('nprivKey', keypair.private_key);
+    // Update the private key field in settings from keychain
+    try {
+        const privKey = await profileManager.getPrivateKey(publicKey);
+        if (privKey) domManager.setValue('nprivKey', privKey);
+    } catch (e) {
+        console.log('[APP] Could not populate private key field:', e);
+    }
     await this.updatePublicKeyDisplay();
 
     // Restart Nostr connections
@@ -738,19 +780,22 @@ NostrMailApp.prototype.switchToProfile = async function(keypair) {
     await this.ensureDefaultContact();
 
     // Update the sidebar switcher display
-    this.updateProfileSwitcher();
+    await this.updateProfileSwitcher();
 
-    console.log('[APP] Profile switch complete:', keypair.public_key.substring(0, 20) + '...');
+    console.log('[APP] Profile switch complete:', publicKey.substring(0, 20) + '...');
 }
 
 // Update the sidebar profile switcher display to reflect current state
-NostrMailApp.prototype.updateProfileSwitcher = function() {
-    const activeAccount = profileManager.getActiveAccount();
+NostrMailApp.prototype.updateProfileSwitcher = async function() {
     const nameEl = domManager.get('profileSwitcherName');
     const npubEl = domManager.get('profileSwitcherNpub');
     const avatarEl = domManager.get('profileSwitcherAvatar');
 
     if (!nameEl) return; // DOM not ready
+
+    // Use appState pubkey (already loaded) to avoid extra async call
+    const keypair = appState.getKeypair();
+    const activeAccount = keypair ? { public_key: keypair.public_key } : null;
 
     if (!activeAccount || !activeAccount.public_key) {
         nameEl.textContent = 'No Account';
@@ -779,13 +824,13 @@ NostrMailApp.prototype.updateProfileSwitcher = function() {
 }
 
 // Render the profile switcher dropdown list
-NostrMailApp.prototype.renderProfileSwitcherList = function() {
+NostrMailApp.prototype.renderProfileSwitcherList = async function() {
     const listEl = domManager.get('profileSwitcherList');
     if (!listEl) return;
 
-    const accounts = profileManager.getAccounts();
-    const activeAccount = profileManager.getActiveAccount();
-    const activePubkey = activeAccount ? activeAccount.public_key : null;
+    const accounts = await profileManager.getAccounts();
+    const keypair = appState.getKeypair();
+    const activePubkey = keypair ? keypair.public_key : null;
 
     if (accounts.length === 0) {
         listEl.innerHTML = '<div style="padding: 8px 10px; font-size: 0.8125rem; opacity: 0.6;">No accounts</div>';
@@ -831,13 +876,13 @@ NostrMailApp.prototype.setupProfileSwitcherListeners = function() {
     if (!activeEl || !dropdownEl) return;
 
     // Toggle dropdown
-    activeEl.addEventListener('click', () => {
+    activeEl.addEventListener('click', async () => {
         const isOpen = dropdownEl.style.display !== 'none';
         if (isOpen) {
             dropdownEl.style.display = 'none';
             if (switcherEl) switcherEl.classList.remove('open');
         } else {
-            this.renderProfileSwitcherList();
+            await this.renderProfileSwitcherList();
             dropdownEl.style.display = 'block';
             if (switcherEl) switcherEl.classList.add('open');
         }
@@ -867,8 +912,8 @@ NostrMailApp.prototype.setupProfileSwitcherListeners = function() {
             const item = e.target.closest('.profile-switcher-item');
             if (item) {
                 const pubkey = item.dataset.pubkey;
-                const activeAccount = profileManager.getActiveAccount();
-                if (activeAccount && activeAccount.public_key === pubkey) {
+                const currentKeypair = appState.getKeypair();
+                if (currentKeypair && currentKeypair.public_key === pubkey) {
                     // Already active, just close dropdown
                     dropdownEl.style.display = 'none';
                     if (switcherEl) switcherEl.classList.remove('open');
@@ -876,14 +921,10 @@ NostrMailApp.prototype.setupProfileSwitcherListeners = function() {
                 }
 
                 // Switch to this account
-                const accounts = profileManager.getAccounts();
-                const account = accounts.find(a => a.public_key === pubkey);
-                if (account) {
-                    dropdownEl.style.display = 'none';
-                    if (switcherEl) switcherEl.classList.remove('open');
-                    await this.switchToProfile({ private_key: account.private_key, public_key: account.public_key });
-                    notificationService.showSuccess('Switched to ' + profileManager.getAccountDisplayName(pubkey));
-                }
+                dropdownEl.style.display = 'none';
+                if (switcherEl) switcherEl.classList.remove('open');
+                await this.switchToProfile(pubkey);
+                notificationService.showSuccess('Switched to ' + profileManager.getAccountDisplayName(pubkey));
             }
         });
     }
@@ -915,8 +956,8 @@ NostrMailApp.prototype.setupProfileSwitcherListeners = function() {
 // Handle removing an account with confirmation dialog
 NostrMailApp.prototype.handleRemoveAccount = async function(pubkey) {
     const displayName = profileManager.getAccountDisplayName(pubkey);
-    const activeAccount = profileManager.getActiveAccount();
-    const isActive = activeAccount && activeAccount.public_key === pubkey;
+    const currentKeypair = appState.getKeypair();
+    const isActive = currentKeypair && currentKeypair.public_key === pubkey;
 
     // First confirmation: remove the account?
     let msg = `Remove account "${displayName}"?`;
@@ -938,30 +979,29 @@ NostrMailApp.prototype.handleRemoveAccount = async function(pubkey) {
     }
 
     // Remove from accounts list
-    const remainingAccounts = profileManager.removeAccount(pubkey);
+    await profileManager.removeAccount(pubkey);
 
     if (isActive) {
-        if (remainingAccounts.length > 0) {
+        const accounts = await profileManager.getAccounts();
+        if (accounts.length > 0) {
             // Switch to the first remaining account
-            const next = remainingAccounts[0];
-            await this.switchToProfile({ private_key: next.private_key, public_key: next.public_key });
+            await this.switchToProfile(accounts[0].public_key);
         } else {
             // No accounts left — clear state
             appState.setKeypair(null);
             appState.setLastLoadedPubkey(null);
-            localStorage.removeItem('nostr_keypair');
             domManager.setValue('nprivKey', '');
             domManager.setValue('publicKeyDisplay', '');
             this.updatePreReleaseWarning();
-            this.updateProfileSwitcher();
+            await this.updateProfileSwitcher();
             await this.resetSettingsToDefaults();
             this.switchTab('settings');
         }
     }
 
     // Re-render the dropdown list and sidebar display
-    this.renderProfileSwitcherList();
-    this.updateProfileSwitcher();
+    await this.renderProfileSwitcherList();
+    await this.updateProfileSwitcher();
     notificationService.showSuccess(`Account "${displayName}" removed`);
 }
 
@@ -1050,7 +1090,6 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     if (!appState.hasKeypair()) {
                         return;
                     }
-                    const privkey = appState.getKeypair().private_key;
                     const pubkey = window.emailService?.selectedNostrContact?.pubkey;
                     let currentBody = domManager.getValue('messageBody') || '';
                     let currentSubject = domManager.getValue('subject') || '';
@@ -1105,7 +1144,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             if (subjectCiphertext && window.Utils && window.Utils.isLikelyEncryptedContent(subjectCiphertext)) {
                                 try {
                                     detectedScheme = Utils.detectEncryptionFormat(subjectCiphertext);
-                                    const decryptedSubject = await TauriService.decryptDmContent(privkey, pubkey, subjectCiphertext);
+                                    const decryptedSubject = await TauriService.decryptDmContent(pubkey, subjectCiphertext);
                                     domManager.setValue('subject', decryptedSubject);
                                     decryptedAny = true;
                                 } catch (err) {
@@ -1126,7 +1165,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                 // Fallback to legacy decryption
                                 const encryptedContent = match[2].replace(/\s+/g, '');
                                 try {
-                                    const decrypted = await TauriService.decryptDmContent(privkey, pubkey, encryptedContent);
+                                    const decrypted = await TauriService.decryptDmContent(pubkey, encryptedContent);
                                     domManager.setValue('messageBody', decrypted);
                                     decryptedAny = true;
                                     // Clear signature when decrypting (body state changed)
@@ -1183,7 +1222,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 const isSigned = signBtn.dataset.signed === 'true';
 
                 const keypair = appState.getKeypair();
-                if (!keypair || !keypair.private_key) {
+                if (!keypair) {
                     notificationService.showError('No keypair available for signing.');
                     return;
                 }
@@ -1293,7 +1332,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             }
                         }
                         console.log('[JS] Signing data (binary length:', dataBytes.length, ')');
-                        const signature = await TauriService.signData(keypair.private_key, dataBytes);
+                        const signature = await TauriService.signData(dataBytes);
                         const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
                         let encodedSig, encodedPubkey, encodedSigPubkey = null;
 
@@ -1815,9 +1854,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                             return;
                                         }
 
-                                        const keypair = { private_key: finalNprivKey, public_key: publicKey };
                                         await profileManager.addAccount(finalNprivKey, '');
-                                        await this.switchToProfile(keypair);
+                                        await this.switchToProfile(publicKey);
                                     }
                                 } catch (error) {
                                     console.error('[APP] Error checking/loading settings for pubkey:', error);
@@ -1881,9 +1919,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (generateKeyBtn) {
             generateKeyBtn.addEventListener('click', async () => {
                 try {
-                    const keypair = await TauriService.generateKeypair();
-                    await profileManager.addAccount(keypair.private_key, '');
-                    await app.switchToProfile(keypair);
+                    const pubkey = await TauriService.invoke('keychain_generate_account', { label: '' });
+                    await app.switchToProfile(pubkey);
                     notificationService.showSuccess('New keypair generated!');
                 } catch (error) {
                     notificationService.showError('Failed to generate keypair: ' + error);
@@ -1950,11 +1987,9 @@ NostrMailApp.prototype.initializeLiveEvents = async function() {
         return;
     }
     
-    const privateKey = appState.getKeypair().private_key;
-    
     try {
-        // Start unified subscription for DMs and profile updates
-        await TauriService.startLiveEventSubscription(privateKey);
+        // Start unified subscription for DMs and profile updates (backend reads key from state)
+        await TauriService.startLiveEventSubscription();
         
         // Set up event listeners for live events
         await this.setupLiveEventListeners();
@@ -3063,37 +3098,31 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 return false;
             }
             publicKey = await TauriService.getPublicKeyFromPrivate(nprivKey);
-            const keypair = { private_key: nprivKey, public_key: publicKey };
-            
+
             // Check if this is a different keypair by comparing public keys
-            // (public key uniquely identifies the keypair)
-            // Store the current public key BEFORE updating appState to ensure accurate comparison
             isNewKeypair = !currentPublicKey || currentPublicKey !== publicKey;
-            
+
             console.log('[APP] Keypair change check:', {
                 currentPublicKey: currentPublicKey ? currentPublicKey.substring(0, 20) + '...' : 'null',
                 newPublicKey: publicKey.substring(0, 20) + '...',
                 isNewKeypair: isNewKeypair
             });
-            
+
             // If keypair changed, use switchToProfile to handle the full switch
             if (isNewKeypair) {
-                await profileManager.addAccount(keypair.private_key, '');
-                await this.switchToProfile(keypair);
+                await profileManager.addAccount(nprivKey, '');
+                await this.switchToProfile(publicKey);
 
                 // After loading settings for new keypair, check if settings were actually loaded
                 const loadedSettings = appState.getSettings();
                 if (loadedSettings && Object.keys(loadedSettings).length > 0) {
                     console.log('[APP] Settings loaded for new keypair, keys:', Object.keys(loadedSettings));
-                    // Settings were loaded and form was populated, so we can continue to save them
-                    // (this allows user to see the loaded settings and optionally modify before saving)
                 } else {
                     console.log('[APP] No settings found for new keypair, will use defaults');
                 }
             } else {
                 // Same keypair, just update appState
-                appState.setKeypair(keypair);
-                localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
+                appState.setKeypair({ public_key: publicKey });
                 this.renderProfilePubkey();
                 // Hide pre-release warning once keypair is set
                 this.updatePreReleaseWarning();
@@ -3162,7 +3191,6 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             }
             
             settings = {
-                npriv_key: nprivKey || currentKeypair.private_key,
                 encryption_algorithm: domManager.getValue('encryptionAlgorithm') || 'nip44',
                 email_address: domManager.getValue('emailAddress') || '',
                 password: domManager.getValue('emailPassword') || '',
@@ -3226,10 +3254,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('glossia_encoding_pubkey', settings.glossia_encoding_pubkey ?? 'latin');
             
             const settingsObj = Object.fromEntries(settingsMap);
-            // Get private key for encryption
-            const currentKeypair = appState.getKeypair();
-            const privateKeyForEncryption = currentKeypair ? currentKeypair.private_key : null;
-            await TauriService.dbSaveSettingsBatch(publicKey, settingsObj, privateKeyForEncryption);
+            // Backend uses active key from AppState for encryption
+            await TauriService.dbSaveSettingsBatch(publicKey, settingsObj);
             console.log('[APP] Settings saved to database for pubkey:', publicKey);
             
             // Update last loaded pubkey tracker after successful save
@@ -3458,9 +3484,16 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         const currentNprivValue = nprivKeyInput?.value?.trim() || '';
         if (!currentNprivValue) {
             const keypair = appState.getKeypair();
-            if (keypair && keypair.private_key) {
-                domManager.setValue('nprivKey', keypair.private_key);
-                console.log('[APP] Populated private key field from cached keypair');
+            if (keypair && keypair.public_key) {
+                try {
+                    const privKey = await profileManager.getPrivateKey(keypair.public_key);
+                    if (privKey) {
+                        domManager.setValue('nprivKey', privKey);
+                        console.log('[APP] Populated private key field from keychain');
+                    }
+                } catch (e) {
+                    console.log('[APP] Could not populate private key field:', e);
+                }
             }
         }
         
@@ -3953,7 +3986,7 @@ NostrMailApp.prototype.getRelayStatusIcon = function(connectionStatus) {
 NostrMailApp.prototype.getRelayStatusText = function(connectionStatus) {
     // Check if private key is set - if not, show "Not Connected" instead of "Connection Failed"
     const keypair = appState.getKeypair();
-    const hasPrivateKey = keypair && keypair.private_key;
+    const hasPrivateKey = appState.hasKeypair();
     
     switch (connectionStatus) {
         case 'Connected': return 'Connected';
@@ -5234,11 +5267,8 @@ NostrMailApp.prototype.updateProfile = async function() {
             }
         }
 
-        // Update profile on Nostr using persistent client (more efficient)
-        await TauriService.updateProfilePersistent(
-            appState.getKeypair().private_key,
-            cleanedFields
-        );
+        // Update profile on Nostr using persistent client (backend reads key from state)
+        await TauriService.updateProfilePersistent(cleanedFields);
 
         // Cache the updated profile
         const updatedProfile = {

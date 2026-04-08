@@ -30,6 +30,8 @@ body.dark-mode .email-list {
     right: 20px;
     top: 50%;
     transform: translateY(-50%);
+    display: flex;
+    gap: 4px;
     opacity: 0;
     transition: opacity 0.2s ease;
 }

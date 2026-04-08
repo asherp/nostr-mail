@@ -7890,7 +7890,42 @@ ${attachmentsHtml}
             console.log('[JS] Loading drafts with offset:', this.draftsOffset, 'pageSize:', pageSize);
             
             const drafts = await TauriService.getDrafts(pageSize, this.draftsOffset, userEmail);
-            
+
+            // Load attachments for each draft in parallel with timeout
+            const attachmentPromises = drafts.map(async (draft) => {
+                try {
+                    const emailIdInt = parseInt(draft.id);
+                    if (isNaN(emailIdInt)) {
+                        if (draft.message_id) {
+                            try {
+                                const emailData = await TauriService.getDbEmail(draft.message_id);
+                                if (emailData && emailData.id) {
+                                    const realId = parseInt(emailData.id);
+                                    if (!isNaN(realId)) {
+                                        draft.attachments = await TauriService.getAttachmentsForEmail(realId);
+                                        return;
+                                    }
+                                }
+                            } catch (e) {
+                                console.error(`[JS] Failed to get draft by message_id ${draft.message_id}:`, e);
+                            }
+                        }
+                        draft.attachments = [];
+                        return;
+                    }
+                    const timeoutPromise = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
+                    );
+                    draft.attachments = await Promise.race([
+                        TauriService.getAttachmentsForEmail(emailIdInt),
+                        timeoutPromise
+                    ]);
+                } catch (error) {
+                    draft.attachments = [];
+                }
+            });
+            await Promise.allSettled(attachmentPromises);
+
             if (append) {
                 // Append new drafts to existing ones
                 const existingDrafts = appState.getDrafts();
@@ -7937,88 +7972,66 @@ ${attachmentsHtml}
             if (existingLoadMoreBtn) {
                 existingLoadMoreBtn.remove();
             }
-            
+
             // Get all drafts from state
             const drafts = appState.getDrafts();
-            
+
             if (!drafts || drafts.length === 0) {
                 draftsList.innerHTML = '<div class="text-center text-muted">No drafts found</div>';
                 return;
             }
-            
+
             // Always re-render all drafts (simpler approach)
             draftsList.innerHTML = '';
-            
-            for (const draft of drafts) {
-                const draftElement = document.createElement('div');
-                draftElement.className = 'email-item';
-                draftElement.dataset.draftId = draft.message_id;
-                
-                // Format the date
-                const draftDate = new Date(draft.created_at);
-                const now = new Date();
-                const diffInHours = (now - draftDate) / (1000 * 60 * 60);
-                let dateDisplay;
-                if (diffInHours < 24) {
-                    dateDisplay = draftDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                } else if (diffInHours < 168) {
-                    dateDisplay = draftDate.toLocaleDateString([], { weekday: 'short' });
-                } else {
-                    dateDisplay = draftDate.toLocaleDateString();
-                }
-                
-                let previewText = draft.body ? Utils.escapeHtml(draft.body.substring(0, 100)) : '';
-                let previewSubject = draft.subject;
-                
-                // Handle encrypted content
-                if (draft.body && draft.body.includes('BEGIN NOSTR')) {
-                    const keypair = appState.getKeypair();
-                    if (!keypair) {
-                        previewText = 'Unable to decrypt: no keypair';
-                    } else {
-                        try {
-                            const recipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey || draft.sender_pubkey;
-                            const result = await TauriService.decryptEmailBody(
-                                keypair.private_key, draft.body, draft.subject || '',
-                                recipientPubkey, null
-                            );
-                            if (result.success) {
-                                previewSubject = result.subject || draft.subject;
-                                previewText = Utils.escapeHtml(result.body.substring(0, 100));
-                                if (result.body.length > 100) previewText += '...';
-                            } else {
-                                previewText = 'Could not decrypt';
-                            }
-                        } catch (e) {
-                            previewText = 'Could not decrypt';
-                        }
+
+            // Check if we should hide unverified messages
+            const settings = appState.getSettings();
+            const hideUnverified = settings && settings.hide_unsigned_messages === true;
+
+            // Process drafts in parallel with timeout protection
+            const draftPromises = drafts
+                .filter(draft => {
+                    if (hideUnverified && draft.signature_valid !== true) {
+                        return false;
                     }
-                } else {
-                    if (draft.body && draft.body.length > 100) previewText += '...';
+                    return true;
+                })
+                .map(async (draft) => {
+                    try {
+                        const timeoutPromise = new Promise((_, reject) =>
+                            setTimeout(() => reject(new Error('Decryption timeout')), 5000)
+                        );
+                        const renderPromise = this.renderDraftItem(draft);
+                        return await Promise.race([renderPromise, timeoutPromise]);
+                    } catch (error) {
+                        console.error(`[JS] Error rendering draft ${draft.message_id}:`, error);
+                        return this.renderDraftItemBasic(draft);
+                    }
+                });
+
+            const renderedItems = await Promise.allSettled(draftPromises);
+
+            let renderedCount = 0;
+            for (const result of renderedItems) {
+                if (result.status === 'fulfilled' && result.value) {
+                    draftsList.appendChild(result.value);
+                    renderedCount++;
                 }
-                
-                draftElement.innerHTML = `
-                    <div class="email-header">
-                        <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(draft.to_address)}</div>
-                        <div class="email-date">${dateDisplay}</div>
-                    </div>
-                    <div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>
-                    <div class="email-preview">${previewText}</div>
-                    <div class="draft-actions" style="margin-top: 8px;">
-                        <button class="btn btn-primary btn-small" onclick="event.stopPropagation(); emailService.loadDraftToCompose(${JSON.stringify(draft).replace(/"/g, '&quot;')})">
-                            <i class="fas fa-edit"></i> Edit
-                        </button>
-                        <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteDraftFromList('${draft.message_id}')">
-                            <i class="fas fa-trash"></i> Delete
-                        </button>
-                    </div>
-                `;
-                
-                // Add click handler to load draft into compose form
-                draftElement.addEventListener('click', () => this.loadDraftToCompose(draft));
-                draftsList.appendChild(draftElement);
             }
-            
+
+            // Show message if no drafts were rendered (possibly all filtered out)
+            if (renderedCount === 0) {
+                const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+                if (hideUndecryptable && drafts.length > 0) {
+                    draftsList.innerHTML = '<div class="text-center text-muted">No decryptable drafts found. All drafts are encrypted for a different keypair.</div>';
+                } else if (hideUnverified && drafts.length > 0) {
+                    draftsList.innerHTML = '<div class="text-center text-muted">No verified drafts found. All drafts have missing or invalid signatures.</div>';
+                } else {
+                    draftsList.innerHTML = '<div class="text-center text-muted">No drafts found</div>';
+                }
+                return;
+            }
+
             // Add Load More button if there might be more drafts
             if (showLoadMore) {
                 const loadMoreBtn = document.createElement('button');
@@ -8031,7 +8044,331 @@ ${attachmentsHtml}
             }
         } catch (error) {
             console.error('Error rendering drafts:', error);
+            draftsList.innerHTML = '<div class="text-center text-muted">Error loading drafts</div>';
         }
+    }
+
+    // Render a single draft item (with decryption)
+    async renderDraftItem(draft) {
+        const draftElement = document.createElement('div');
+        draftElement.className = 'email-item';
+        draftElement.dataset.draftId = draft.message_id;
+
+        // Format the date
+        const draftDate = new Date(draft.created_at);
+        const now = new Date();
+        const diffInHours = (now - draftDate) / (1000 * 60 * 60);
+        let dateDisplay;
+        if (diffInHours < 24) {
+            dateDisplay = draftDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } else if (diffInHours < 168) {
+            dateDisplay = draftDate.toLocaleDateString([], { weekday: 'short' });
+        } else {
+            dateDisplay = draftDate.toLocaleDateString();
+        }
+
+        // Decode glossia signed message body for preview
+        let draftPreviewBody = draft.body || '';
+        const draftSignedMsg = this.decodeGlossiaSignedMessage(draftPreviewBody);
+        if (draftSignedMsg && draftSignedMsg.plaintextBody) {
+            draftPreviewBody = draftSignedMsg.plaintextBody;
+        }
+        let previewText = draftPreviewBody ? Utils.escapeHtml(draftPreviewBody.substring(0, 100)) : '';
+        let showSubject = true;
+        let previewSubject = draft.subject;
+
+        // Detect any NOSTR NIP-X ENCRYPTED MESSAGE
+        const armorRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/;
+        if (draft.body && armorRegex.test(draft.body)) {
+            const keypair = appState.getKeypair();
+            if (!keypair) {
+                previewText = 'Unable to decrypt: no keypair';
+            } else {
+                try {
+                    const recipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey || draft.sender_pubkey;
+                    const result = await TauriService.decryptEmailBody(
+                        keypair.private_key, draft.body, draft.subject || '',
+                        recipientPubkey, null
+                    );
+                    if (result.success) {
+                        previewSubject = result.subject || draft.subject;
+                        previewText = Utils.escapeHtml(result.body.substring(0, 100));
+                        if (result.body.length > 100) previewText += '...';
+                        showSubject = true;
+                    } else {
+                        previewText = 'Could not decrypt';
+                    }
+                } catch (e) {
+                    console.error('[JS] Backend decrypt failed for draft preview:', e);
+                    previewText = 'Could not decrypt';
+                }
+            }
+        } else {
+            previewText = Utils.escapeHtml(draftPreviewBody ? draftPreviewBody.substring(0, 100) : '');
+            if (draftPreviewBody && draftPreviewBody.length > 100) previewText += '...';
+            showSubject = true;
+        }
+
+        // Check if draft is decryptable (for filtering)
+        const settings = appState.getSettings();
+        const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+        const isDecryptable = !previewText.includes('Unable to decrypt') &&
+                            !previewText.includes('Your private key could not decrypt this message') &&
+                            !previewText.includes('could not decrypt') &&
+                            !previewText.includes('Could not decrypt') &&
+                            previewText !== 'Unable to decrypt: no keypair' &&
+                            previewSubject !== 'Could not decrypt';
+
+        if (hideUndecryptable && !isDecryptable) {
+            return null;
+        }
+
+        // Add attachment indicator
+        const attachmentCount = draft.attachments ? draft.attachments.length : 0;
+        const attachmentIndicator = attachmentCount > 0 ?
+            `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
+
+        // Add signature verification indicator
+        let signatureIndicator = '';
+        const draftSigSource = draft.signature_source ? ` (${draft.signature_source})` : '';
+        if (draft.signature_valid === true || draft.signature_valid === 1) {
+            signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${draftSigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
+        } else if (draft.signature_valid === false || draft.signature_valid === 0) {
+            signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(draft.message_id || draft.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+        }
+
+        // Add transport authentication indicator
+        let transportAuthIndicator = '';
+        if (draft.transport_auth_verified === true || draft.transport_auth_verified === 1) {
+            transportAuthIndicator = `<span class="transport-auth-indicator verified" title="Email transport authentication verified (DMARC/DKIM/SPF)"><i class="fas fa-envelope"></i> Email Verified</span>`;
+        } else if (draft.transport_auth_verified === false || draft.transport_auth_verified === 0) {
+            transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
+        }
+
+        // Get recipient contact for avatar
+        const recipientEmail = draft.to_address;
+        const contacts = appState.getContacts();
+        let recipientContact = null;
+
+        if (recipientEmail) {
+            const normalizeGmail = (email) => {
+                const lower = email.trim().toLowerCase();
+                if (lower.includes('@gmail.com')) {
+                    const [local, domain] = lower.split('@');
+                    const normalizedLocal = local.split('+')[0];
+                    return `${normalizedLocal}@${domain}`;
+                }
+                return lower;
+            };
+
+            const normalizedEmail = normalizeGmail(recipientEmail);
+            recipientContact = contacts.find(c => {
+                if (!c.email) return false;
+                const contactEmail = c.email.trim().toLowerCase();
+                return contactEmail === recipientEmail.toLowerCase() || contactEmail === normalizedEmail;
+            });
+        }
+
+        // Avatar fallback logic
+        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+        let avatarSrc = defaultAvatar;
+        let avatarClass = 'contact-avatar';
+        const isValidDataUrl = recipientContact && recipientContact.picture_data_url && recipientContact.picture_data_url.startsWith('data:image') && recipientContact.picture_data_url !== 'data:application/octet-stream;base64,';
+        if (recipientContact && recipientContact.picture_loading) {
+            avatarClass += ' loading';
+        } else if (isValidDataUrl) {
+            avatarSrc = recipientContact.picture_data_url;
+        } else if (recipientContact && recipientContact.picture_data_url && !isValidDataUrl && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        } else if (recipientContact && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        }
+
+        draftElement.innerHTML = `
+            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(draft.to_address)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <div class="email-content">
+                <div class="email-header">
+                    <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(draft.to_address)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
+                    <div class="email-date">${dateDisplay}</div>
+                </div>
+                ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
+                <div class="email-preview">${previewText}</div>
+            </div>
+            <div class="email-actions">
+                <button class="btn btn-primary btn-small draft-edit-btn">
+                    <i class="fas fa-edit"></i>
+                </button>
+                <button class="btn btn-danger btn-small draft-delete-btn">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+        `;
+
+        // Add event listeners for action buttons (avoids inline onclick with serialized JSON)
+        const editBtn = draftElement.querySelector('.draft-edit-btn');
+        if (editBtn) {
+            editBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.loadDraftToCompose(draft);
+            });
+        }
+        const deleteBtn = draftElement.querySelector('.draft-delete-btn');
+        if (deleteBtn) {
+            deleteBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.deleteDraftFromList(draft.message_id);
+            });
+        }
+
+        // Add hover and click handlers for invalid signature indicator
+        if (draft.signature_valid === false || draft.signature_valid === 0) {
+            const sigIndicator = draftElement.querySelector('.signature-indicator.invalid');
+            if (sigIndicator) {
+                const originalText = sigIndicator.textContent;
+                sigIndicator.addEventListener('mouseenter', () => {
+                    sigIndicator.textContent = 'recheck signature?';
+                });
+                sigIndicator.addEventListener('mouseleave', () => {
+                    sigIndicator.textContent = originalText;
+                });
+                sigIndicator.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    const messageId = sigIndicator.dataset.messageId;
+                    if (messageId) {
+                        sigIndicator.textContent = 'checking...';
+                        sigIndicator.style.opacity = '0.7';
+                        try {
+                            const result = await TauriService.recheckEmailSignature(messageId);
+                            if (result === true) {
+                                draft.signature_valid = true;
+                                sigIndicator.className = 'signature-indicator verified';
+                                sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
+                                sigIndicator.title = 'Verified Nostr signature';
+                                sigIndicator.removeAttribute('data-message-id');
+                                sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                notificationService.showSuccess('Signature verified successfully!');
+                            } else if (result === false) {
+                                sigIndicator.textContent = originalText;
+                                notificationService.showError('Signature is still invalid');
+                            } else {
+                                sigIndicator.textContent = originalText;
+                                notificationService.showWarning('Could not verify signature (missing pubkey or signature)');
+                            }
+                        } catch (error) {
+                            console.error('[JS] Failed to recheck signature:', error);
+                            sigIndicator.textContent = originalText;
+                            notificationService.showError('Failed to recheck signature: ' + error);
+                        } finally {
+                            sigIndicator.style.opacity = '1';
+                        }
+                    }
+                });
+            }
+        }
+
+        draftElement.addEventListener('click', () => this.loadDraftToCompose(draft));
+        return draftElement;
+    }
+
+    // Render a basic draft item (without decryption, used as fallback)
+    renderDraftItemBasic(draft) {
+        const draftElement = document.createElement('div');
+        draftElement.className = 'email-item';
+        draftElement.dataset.draftId = draft.message_id;
+
+        // Format the date
+        const draftDate = new Date(draft.created_at);
+        const now = new Date();
+        const diffInHours = (now - draftDate) / (1000 * 60 * 60);
+        let dateDisplay;
+        if (diffInHours < 24) {
+            dateDisplay = draftDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } else if (diffInHours < 168) {
+            dateDisplay = draftDate.toLocaleDateString([], { weekday: 'short' });
+        } else {
+            dateDisplay = draftDate.toLocaleDateString();
+        }
+
+        const attachmentCount = draft.attachments ? draft.attachments.length : 0;
+        const attachmentIndicator = attachmentCount > 0 ?
+            `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
+
+        // Get recipient contact for avatar
+        const recipientEmail = draft.to_address;
+        const contacts = appState.getContacts();
+        let recipientContact = null;
+
+        if (recipientEmail) {
+            const normalizeGmail = (email) => {
+                const lower = email.trim().toLowerCase();
+                if (lower.includes('@gmail.com')) {
+                    const [local, domain] = lower.split('@');
+                    const normalizedLocal = local.split('+')[0];
+                    return `${normalizedLocal}@${domain}`;
+                }
+                return lower;
+            };
+
+            const normalizedEmail = normalizeGmail(recipientEmail);
+            recipientContact = contacts.find(c => {
+                if (!c.email) return false;
+                const contactEmail = c.email.trim().toLowerCase();
+                return contactEmail === recipientEmail.toLowerCase() || contactEmail === normalizedEmail;
+            });
+        }
+
+        // Avatar fallback logic
+        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+        let avatarSrc = defaultAvatar;
+        let avatarClass = 'contact-avatar';
+        const isValidDataUrl = recipientContact && recipientContact.picture_data_url && recipientContact.picture_data_url.startsWith('data:image') && recipientContact.picture_data_url !== 'data:application/octet-stream;base64,';
+        if (recipientContact && recipientContact.picture_loading) {
+            avatarClass += ' loading';
+        } else if (isValidDataUrl) {
+            avatarSrc = recipientContact.picture_data_url;
+        } else if (recipientContact && recipientContact.picture_data_url && !isValidDataUrl && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        } else if (recipientContact && recipientContact.picture) {
+            avatarSrc = recipientContact.picture;
+        }
+
+        draftElement.innerHTML = `
+            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(draft.to_address)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <div class="email-content">
+                <div class="email-header">
+                    <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(draft.to_address)} ${attachmentIndicator}</div>
+                    <div class="email-date">${dateDisplay}</div>
+                </div>
+                <div class="email-subject email-list-strong">${Utils.escapeHtml(draft.subject)}</div>
+                <div class="email-preview">${Utils.escapeHtml(draft.body ? draft.body.substring(0, 100) : '')}</div>
+            </div>
+            <div class="email-actions">
+                <button class="btn btn-primary btn-small draft-edit-btn">
+                    <i class="fas fa-edit"></i>
+                </button>
+                <button class="btn btn-danger btn-small draft-delete-btn">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+        `;
+
+        const editBtn = draftElement.querySelector('.draft-edit-btn');
+        if (editBtn) {
+            editBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.loadDraftToCompose(draft);
+            });
+        }
+        const deleteBtn = draftElement.querySelector('.draft-delete-btn');
+        if (deleteBtn) {
+            deleteBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.deleteDraftFromList(draft.message_id);
+            });
+        }
+
+        draftElement.addEventListener('click', () => this.loadDraftToCompose(draft));
+        return draftElement;
     }
 
     // Load draft into compose form

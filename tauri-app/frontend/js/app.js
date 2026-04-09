@@ -753,9 +753,17 @@ NostrMailApp.prototype.switchToProfile = async function(publicKeyOrKeypair) {
 
     // Clear old user's data from memory
     appState.setContacts([]);
+    appState.setEmails([]);
+    appState.setSentEmails([]);
+    appState.setDmContacts([]);
+    appState.dmMessages = {};
     if (window.contactsService) {
         window.contactsService.renderContacts();
     }
+    const emailList = domManager.get('emailList');
+    if (emailList) emailList.innerHTML = '';
+    const sentList = domManager.get('sentList');
+    if (sentList) sentList.innerHTML = '';
 
     // Load settings for this pubkey (handles form population)
     await this.loadSettingsForPubkey(publicKey);

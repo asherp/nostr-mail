@@ -2011,6 +2011,9 @@ class EmailService {
     async loadEmails(searchQuery = '', append = false) {
         if (!appState.hasEmailSettingsConfigured()) {
             console.log('[JS] No email settings configured, skipping inbox load');
+            appState.setEmails([]);
+            const emailList = domManager.get('emailList');
+            if (emailList) emailList.innerHTML = '<div class="text-center text-muted">Configure email settings to view inbox</div>';
             return;
         }
         try {

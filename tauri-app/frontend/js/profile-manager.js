@@ -20,22 +20,21 @@ class ProfileManager {
             const pubkey = await TauriService.invoke('keychain_get_active_account');
             if (!pubkey) return null;
             const accounts = await this.getAccounts();
-            return accounts.find(a => a.public_key === pubkey) || { public_key: pubkey, label: '', is_active: true };
+            return accounts.find(a => a.public_key === pubkey) || { public_key: pubkey, is_active: true };
         } catch (e) {
             console.error('[ProfileManager] Failed to get active account:', e);
             return null;
         }
     }
 
-    // Add a new account. Returns the public key, or null if invalid.
-    async addAccount(privateKey, label) {
+    // Add a new account. Returns { public_key } or null if invalid.
+    async addAccount(privateKey) {
         try {
             const publicKey = await TauriService.invoke('keychain_add_account', {
-                privateKey: privateKey,
-                label: label || ''
+                privateKey: privateKey
             });
             console.log('[ProfileManager] Added account:', publicKey.substring(0, 20) + '...');
-            return { public_key: publicKey, label: label || '' };
+            return { public_key: publicKey };
         } catch (e) {
             console.error('[ProfileManager] Failed to add account:', e);
             return null;
@@ -62,14 +61,6 @@ class ProfileManager {
         }
     }
 
-    async updateAccountLabel(publicKey, label) {
-        try {
-            await TauriService.invoke('keychain_update_label', { publicKey, label });
-        } catch (e) {
-            console.error('[ProfileManager] Failed to update label:', e);
-        }
-    }
-
     // Get private key from keychain for display in settings
     async getPrivateKey(publicKey) {
         try {
@@ -81,7 +72,7 @@ class ProfileManager {
     }
 
     // Returns the best display name for an account:
-    // label > cached profile display_name > cached profile name > truncated npub
+    // cached profile display_name > cached profile name > truncated npub
     getAccountDisplayName(publicKey) {
         // Check cached nostr profile
         try {

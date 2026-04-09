@@ -80,8 +80,7 @@ NostrMailApp.prototype.init = async function() {
                     if (acct.private_key && acct.public_key) {
                         accounts.push({
                             public_key: acct.public_key,
-                            private_key: acct.private_key,
-                            label: acct.label || ''
+                            private_key: acct.private_key
                         });
                     }
                 }
@@ -91,7 +90,7 @@ NostrMailApp.prototype.init = async function() {
                 try {
                     const kp = JSON.parse(localStorage.getItem('nostr_keypair'));
                     if (kp?.private_key && kp?.public_key) {
-                        accounts.push({ public_key: kp.public_key, private_key: kp.private_key, label: '' });
+                        accounts.push({ public_key: kp.public_key, private_key: kp.private_key });
                     }
                 } catch (e) { /* ignore parse errors */ }
             }
@@ -513,7 +512,7 @@ NostrMailApp.prototype.loadKeypair = async function() {
                 const defaultPrivateKey = await TauriService.getDefaultPrivateKeyFromConfig();
                 if (defaultPrivateKey && defaultPrivateKey.trim() !== '') {
                     console.log('[APP] Found default private key from config file - importing to keychain');
-                    const result = await profileManager.addAccount(defaultPrivateKey, '');
+                    const result = await profileManager.addAccount(defaultPrivateKey);
                     if (result) {
                         pubkey = result.public_key;
                         await profileManager.setActiveAccount(pubkey);
@@ -1862,7 +1861,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                             return;
                                         }
 
-                                        await profileManager.addAccount(finalNprivKey, '');
+                                        await profileManager.addAccount(finalNprivKey);
                                         await this.switchToProfile(publicKey);
                                     }
                                 } catch (error) {
@@ -1927,7 +1926,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (generateKeyBtn) {
             generateKeyBtn.addEventListener('click', async () => {
                 try {
-                    const pubkey = await TauriService.invoke('keychain_generate_account', { label: '' });
+                    const pubkey = await TauriService.invoke('keychain_generate_account');
                     await app.switchToProfile(pubkey);
                     notificationService.showSuccess('New keypair generated!');
                 } catch (error) {
@@ -3118,7 +3117,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
 
             // If keypair changed, use switchToProfile to handle the full switch
             if (isNewKeypair) {
-                await profileManager.addAccount(nprivKey, '');
+                await profileManager.addAccount(nprivKey);
                 await this.switchToProfile(publicKey);
 
                 // After loading settings for new keypair, check if settings were actually loaded

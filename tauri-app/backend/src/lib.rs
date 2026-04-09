@@ -622,25 +622,19 @@ fn verify_signature(public_key: String, signature: String, data: String) -> Resu
 // =====================
 
 #[tauri::command]
-fn keychain_add_account(private_key: String, label: String, state: tauri::State<AppState>) -> Result<String, String> {
+fn keychain_add_account(private_key: String, state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] keychain_add_account called");
     crypto::validate_private_key(&private_key).map_err(|e| e.to_string())?;
     let public_key = crypto::get_public_key_from_private(&private_key).map_err(|e| e.to_string())?;
     state.keychain.store_key(&public_key, &private_key)?;
-    if !label.is_empty() {
-        state.keychain.set_label(&public_key, &label)?;
-    }
     Ok(public_key)
 }
 
 #[tauri::command]
-fn keychain_generate_account(label: String, state: tauri::State<AppState>) -> Result<String, String> {
+fn keychain_generate_account(state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] keychain_generate_account called");
     let keypair = crypto::generate_keypair().map_err(|e| e.to_string())?;
     state.keychain.store_key(&keypair.public_key, &keypair.private_key)?;
-    if !label.is_empty() {
-        state.keychain.set_label(&keypair.public_key, &label)?;
-    }
     Ok(keypair.public_key)
 }
 
@@ -662,16 +656,14 @@ fn keychain_remove_account(public_key: String, state: tauri::State<AppState>) ->
 
 #[tauri::command]
 fn keychain_list_accounts(state: tauri::State<AppState>) -> Result<Vec<AccountInfo>, String> {
-    let accounts = state.keychain.list_accounts()?;
-    let labels = state.keychain.get_labels().unwrap_or_default();
+    let pubkeys = state.keychain.list_pubkeys()?;
     let active_pubkey = state.current_private_key.lock().unwrap()
         .as_ref()
         .and_then(|pk| crypto::get_public_key_from_private(pk).ok());
 
-    Ok(accounts.into_iter().map(|pubkey| {
+    Ok(pubkeys.into_iter().map(|pubkey| {
         let is_active = active_pubkey.as_ref().map_or(false, |ap| ap == &pubkey);
         AccountInfo {
-            label: labels.get(&pubkey).cloned().unwrap_or_default(),
             public_key: pubkey,
             is_active,
         }
@@ -705,11 +697,6 @@ fn keychain_get_private_key(public_key: String, state: tauri::State<AppState>) -
 }
 
 #[tauri::command]
-fn keychain_update_label(public_key: String, label: String, state: tauri::State<AppState>) -> Result<(), String> {
-    state.keychain.set_label(&public_key, &label)
-}
-
-#[tauri::command]
 fn keychain_clear_all(state: tauri::State<AppState>) -> Result<(), String> {
     println!("[RUST] keychain_clear_all called");
     state.keychain.clear_all()?;
@@ -724,9 +711,6 @@ fn keychain_migrate_from_frontend(accounts: Vec<MigrationAccount>, state: tauri:
     for account in &accounts {
         if let Ok(true) = crypto::validate_private_key(&account.private_key).map_err(|e| e.to_string()) {
             state.keychain.store_key(&account.public_key, &account.private_key)?;
-            if !account.label.is_empty() {
-                state.keychain.set_label(&account.public_key, &account.label)?;
-            }
         } else {
             println!("[RUST] Skipping invalid key during migration for: {}...", &account.public_key[..20.min(account.public_key.len())]);
         }
@@ -5399,7 +5383,7 @@ pub fn run() {
         keychain_set_active_account,
         keychain_get_active_account,
         keychain_get_private_key,
-        keychain_update_label,
+
         keychain_clear_all,
         keychain_migrate_from_frontend,
         validate_private_key,

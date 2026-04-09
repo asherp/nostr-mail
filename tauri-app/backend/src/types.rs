@@ -11,7 +11,6 @@ pub struct KeyPair {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountInfo {
     pub public_key: String,
-    pub label: String,
     pub is_active: bool,
 }
 
@@ -19,7 +18,6 @@ pub struct AccountInfo {
 pub struct MigrationAccount {
     pub public_key: String,
     pub private_key: String,
-    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

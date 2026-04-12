@@ -246,6 +246,25 @@ pub struct ParsedArmorMessage {
     pub body_bytes_b64: Option<String>,
 }
 
+/// Per-signature verification result (one per nesting level in the armor chain).
+/// Array is ordered innermost-first, matching the JS verifyAllSignatures convention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureVerificationResult {
+    /// Schnorr signature hex (128 hex chars = 64 bytes)
+    pub signature_hex: Option<String>,
+    /// Signer pubkey hex (64 hex chars = 32 bytes)
+    pub pubkey_hex: Option<String>,
+    /// Whether the signature is valid
+    pub is_valid: bool,
+    /// Nesting depth (0 = outermost, increases inward)
+    pub depth: usize,
+    /// Body type at this level: "encrypted", "signed", or "plain"
+    pub body_type: String,
+    /// Profile name from the @ProfileName line in the signature block
+    pub profile_name: Option<String>,
+}
+
 /// Per-block decrypt result (one per nesting level in the armor chain).
 /// Array is ordered innermost-first, matching the JS decryptAllEncryptedBlocks convention.
 #[derive(Debug, Clone, Serialize, Deserialize)]

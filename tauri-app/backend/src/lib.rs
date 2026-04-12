@@ -612,9 +612,22 @@ fn sign_data(private_key: Option<String>, data: String, state: tauri::State<AppS
 }
 
 #[tauri::command]
+fn sign_data_bytes(private_key: Option<String>, data: Vec<u8>, state: tauri::State<AppState>) -> Result<String, String> {
+    println!("[RUST] sign_data_bytes called ({} bytes)", data.len());
+    let pk = resolve_private_key(private_key, &state)?;
+    crypto::sign_data_bytes(&pk, &data).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn verify_signature(public_key: String, signature: String, data: String) -> Result<bool, String> {
     println!("[RUST] verify_signature called");
     crypto::verify_signature(&public_key, &signature, &data).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn verify_signature_bytes(public_key: String, signature: String, data: Vec<u8>) -> Result<bool, String> {
+    println!("[RUST] verify_signature_bytes called ({} bytes)", data.len());
+    crypto::verify_signature_bytes(&public_key, &signature, &data).map_err(|e| e.to_string())
 }
 
 // =====================
@@ -740,8 +753,74 @@ fn recheck_email_signature(message_id: String, state: tauri::State<AppState>) ->
 }
 
 #[tauri::command]
+fn verify_all_signatures(armor_text: String) -> Vec<crate::types::SignatureVerificationResult> {
+    println!("[RUST] verify_all_signatures called, body length={}", armor_text.len());
+    email::verify_all_signatures_inline(&armor_text)
+}
+
+#[tauri::command]
+fn extract_signable_bytes(
+    body: String,
+    is_armored: bool,
+    quoted_armor: Option<String>,
+    glossia_encoding: Option<String>,
+) -> Result<Vec<u8>, String> {
+    println!("[RUST] extract_signable_bytes called, body_len={}, is_armored={}", body.len(), is_armored);
+    let mut bytes = if is_armored {
+        // Body content is already stripped of armor delimiters (bodyText from parseArmorComponents).
+        // Use decode_armor_section which handles glossia/base64 decode directly.
+        // If the body still has delimiters (full armor text), fall back to extract_ciphertext_binary.
+        if let Some(decoded) = email::decode_armor_section(&body) {
+            decoded
+        } else {
+            // Fallback: try as full armor text with delimiters
+            email::extract_ciphertext_binary(&body)
+        }
+    } else {
+        // Plaintext: glossia round-trip to canonical bytes
+        if let Some(ref encoding) = glossia_encoding {
+            if let Some(round_tripped) = email::glossia_roundtrip_to_bytes(&body, encoding) {
+                round_tripped
+            } else {
+                body.as_bytes().to_vec()
+            }
+        } else {
+            body.as_bytes().to_vec()
+        }
+    };
+
+    // Concatenate nested quoted body bytes if provided (quoted_armor has full delimiters)
+    if let Some(ref quoted) = quoted_armor {
+        let quoted_bytes = email::extract_ciphertext_binary(quoted);
+        println!("[RUST] extract_signable_bytes: concatenating {} body + {} quoted bytes",
+            bytes.len(), quoted_bytes.len());
+        bytes.extend_from_slice(&quoted_bytes);
+    }
+
+    Ok(bytes)
+}
+
+#[tauri::command]
+fn sign_and_verify_bytes(
+    private_key: Option<String>,
+    data: Vec<u8>,
+    state: tauri::State<AppState>,
+) -> Result<(String, bool), String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    let signature = crypto::sign_data_bytes(&pk, &data).map_err(|e| e.to_string())?;
+
+    // Derive public key for immediate verification
+    let pubkey = crypto::get_public_key_from_private(&pk).map_err(|e| e.to_string())?;
+    let is_valid = crypto::verify_signature_bytes(&pubkey, &signature, &data)
+        .map_err(|e| e.to_string())?;
+
+    println!("[RUST] sign_and_verify_bytes: sig_len={}, is_valid={}", signature.len(), is_valid);
+    Ok((signature, is_valid))
+}
+
+#[tauri::command]
 async fn send_direct_message(
-    request: DirectMessageRequest, 
+    request: DirectMessageRequest,
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle
 ) -> Result<String, String> {
@@ -5390,8 +5469,13 @@ pub fn run() {
         validate_public_key,
         get_public_key_from_private,
         sign_data,
+        sign_data_bytes,
         verify_signature,
+        verify_signature_bytes,
         recheck_email_signature,
+        verify_all_signatures,
+        extract_signable_bytes,
+        sign_and_verify_bytes,
         send_direct_message,
         fetch_direct_messages,
         fetch_conversations,

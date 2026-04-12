@@ -556,19 +556,19 @@ class EmailService {
         const body = domManager.getValue('messageBody');
         if (!body || !body.includes('BEGIN NOSTR')) {
             console.log('[JS] Body is not encrypted');
-            return;
+            return false;
         }
 
         if (!this.selectedNostrContact) {
             window.notificationService.showError('Please select a Nostr contact first');
-            return;
+            return false;
         }
 
         const pubkey = this.selectedNostrContact.pubkey;
 
         if (!appState.hasKeypair() || !pubkey) {
             window.notificationService.showError('Missing decryption keys');
-            return;
+            return false;
         }
 
         try {
@@ -583,14 +583,17 @@ class EmailService {
 
             if (result.success) {
                 domManager.setValue('messageBody', result.body + trailingQuoted);
-                window.notificationService.showSuccess('Body decrypted successfully');
                 this.clearSignature();
+                return true;
             } else {
-                window.notificationService.showError('Failed to decrypt body content');
+                const errorMsg = result.error || 'Failed to decrypt body content';
+                window.notificationService.showError(errorMsg);
+                return false;
             }
         } catch (error) {
             console.error('[JS] Failed to decrypt body:', error);
             window.notificationService.showError('Failed to decrypt body content');
+            return false;
         }
     }
     
@@ -854,6 +857,45 @@ class EmailService {
         // encrypt/sign cycles and is only cleared on form reset
     }
 
+    // Auto-sign the current DOM body for NIP-04 messages (spec section 4.1).
+    // NIP-04 lacks authenticated encryption, so the Schnorr signature serves as
+    // the MAC — preventing padding oracle and bit-flipping attacks.
+    async _autoSignNip04Body() {
+        const body = domManager.getValue('messageBody') || '';
+
+        // Extract body text and quoted armor for backend byte extraction
+        const parts = this.parseArmorComponents(body);
+        const bodyText = (parts && parts.bodyText) ? parts.bodyText : body;
+        const quotedArmor = (parts && parts.quotedArmor) ? parts.quotedArmor : null;
+
+        // Extract signable bytes via backend (handles glossia decode + nested concatenation)
+        const rawBytes = await TauriService.extractSignableBytes(bodyText, true, quotedArmor, null);
+        const dataBytes = new Uint8Array(rawBytes);
+        if (!dataBytes || dataBytes.length === 0) {
+            throw new Error('NIP-04 auto-sign failed: could not decode body bytes');
+        }
+
+        // Sign via Rust backend
+        const signature = await TauriService.signDataBytes(dataBytes);
+        if (!signature) {
+            throw new Error('NIP-04 auto-sign failed: signing returned no signature');
+        }
+
+        // Update sign button state so _plainBody rebuild includes SIGNATURE block
+        const signBtn = document.getElementById('sign-btn');
+        if (signBtn) {
+            signBtn.dataset.signed = 'true';
+            signBtn.dataset.signature = signature;
+            const iconSpan = signBtn.querySelector('.sign-btn-icon i');
+            const labelSpan = signBtn.querySelector('.sign-btn-label');
+            if (iconSpan) iconSpan.className = 'fas fa-check';
+            if (labelSpan) labelSpan.textContent = 'Signed';
+            signBtn.classList.add('signed');
+        }
+
+        console.log('[JS] NIP-04 auto-sign complete, signature:', signature.substring(0, 16) + '...');
+    }
+
     // Inject a signature verification badge into an HTML email body.
     // Finds the signature <h4> header and inserts a badge span after the header text.
     injectHtmlSigBadge(htmlString, inlineSigResult) {
@@ -902,17 +944,21 @@ class EmailService {
         const sigContent = encodedSigPubkey || encodedSig;
         if (sigContent) {
             const sigLabel = profileName ? escHtml(profileName) : 'Signature';
+            // Include npub below the sig when using separate encoding (default mode)
+            const pubkeyLine = (encodedPubkey && encodedSig && !encodedSigPubkey)
+                ? `\n    <br><code style="overflow-wrap:break-word;font-size:0.85em;">${escHtml(encodedPubkey)}</code>`
+                : '';
             sigHtml = `
   <hr style="border:none;border-top:1px solid #ccc;margin:1.5em 0;">
   <h4 style="margin:0 0 0.5em;color:#666;font-size:0.9em;">${sigLabel}</h4>
   <div class="sig-content" style="border-left:2px solid #ccc;padding-left:1em;color:#888;font-style:italic;overflow-wrap:break-word;">
-    ${escHtml(sigContent)}
+    ${escHtml(sigContent)}${pubkeyLine}
   </div>`;
         }
 
         let sealHtml = '';
-        // Only show separate seal block for unsigned messages (not when using combined sig+pubkey)
-        if (encodedPubkey && !encodedSigPubkey) {
+        // Only show separate seal block for unsigned messages (no sig at all)
+        if (encodedPubkey && !encodedSigPubkey && !encodedSig) {
             const nameHtml = displayName ? `<p style="margin:0 0 0.5em;"><strong>@${escHtml(displayName)}</strong></p>` : '';
             sealHtml = `
   <blockquote class="seal-block" style="border-left:4px solid #4a90d9;background:#f0f4f8;padding:1em;margin:1.5em 0 0;border-radius:4px;">
@@ -1545,7 +1591,20 @@ class EmailService {
                     return;
                 }
 
-                // Send encrypted email using NIP-04
+                // Safety check: NIP-04 messages must contain a SIGNATURE block (spec section 4.1)
+                const encAlgo = settings?.encryption_algorithm || 'nip44';
+                const currentBody = this._plainBody || domManager.getValue('messageBody') || '';
+                if (encAlgo === 'nip04' &&
+                    currentBody.includes('NIP-04 ENCRYPTED') &&
+                    !currentBody.includes('BEGIN NOSTR SIGNATURE')) {
+                    notificationService.showError(
+                        'NIP-04 messages require a signature for security. ' +
+                        'Signing failed — please try again or switch to NIP-44.'
+                    );
+                    return;
+                }
+
+                // Send encrypted email
                 await this.sendEncryptedEmail(emailConfig, contact, subject, body, messageId, toAddress);
             } else {
                 // Send regular email
@@ -1710,27 +1769,9 @@ class EmailService {
             const sigMatch = headers.match(/X-Nostr-Sig:\s*(\S+)/i);
             if (pubkeyMatch && sigMatch) {
                 try {
-                    // Use depth-counting parser (parseArmorComponents) to properly handle
-                    // nested reply armor, matching Rust extract_ciphertext_binary behavior.
-                    let dataBytes;
-                    const normalized = previewBody.replace(/\r\n/g, '\n');
-                    const parts = this.parseArmorComponents(normalized);
-                    const isEncrypted = !!normalized.match(/-{3,}\s*BEGIN NOSTR (?:NIP-(?:04|44) ENCRYPTED)/);
-                    if (parts && parts.bodyText) {
-                        dataBytes = this._decodeArmorBodyToBytes(parts.bodyText, isEncrypted);
-                        if (dataBytes && parts.quotedArmor) {
-                            const allQuotedBytes = this._extractAllBodyBytes(parts.quotedArmor);
-                            if (allQuotedBytes) {
-                                dataBytes = this._concatBytes(dataBytes, allQuotedBytes);
-                            }
-                        }
-                        console.log('[JS] Header sig verify: decoded body bytes=', dataBytes?.length);
-                    }
-                    // Final fallback: raw UTF-8 bytes of the entire body (matches Rust fallback)
-                    if (!dataBytes) {
-                        console.log('[JS] Header sig verify: fallback to raw UTF-8 bytes');
-                        dataBytes = new TextEncoder().encode(previewBody);
-                    }
+                    // Extract signable bytes via backend (handles armor decode + nested concatenation)
+                    const rawBytes = await TauriService.extractSignableBytes(previewBody, true, null, null);
+                    const dataBytes = new Uint8Array(rawBytes);
                     console.log('[JS] Header sig verify: dataBytes length=', dataBytes.length);
                     const isValid = await TauriService.verifySignature(
                         pubkeyMatch[1], sigMatch[1], dataBytes
@@ -1848,7 +1889,7 @@ class EmailService {
             const renderHtmlWithSigBadge = async () => {
                 let htmlToRender = this._htmlBody;
                 try {
-                    const sigResults = await this.verifyAllSignatures(plainBody);
+                    const sigResults = await TauriService.verifyAllSignatures(plainBody);
                     if (sigResults.length > 0) {
                         htmlToRender = this.injectHtmlSigBadge(htmlToRender, sigResults);
                     }
@@ -3076,10 +3117,10 @@ class EmailService {
                                 });
                             }
 
-                            // Verify all signatures recursively (still JS for now)
+                            // Verify all signatures recursively via backend
                             let sigResults = null;
                             try {
-                                const allSigs = await this.verifyAllSignatures(emailBody);
+                                const allSigs = await TauriService.verifyAllSignatures(emailBody);
                                 sigResults = allSigs.length > 0 ? allSigs : null;
                             } catch (e) {
                                 console.warn('[JS] Signature verification error:', e);
@@ -3096,7 +3137,7 @@ class EmailService {
                         // Verify all signatures recursively (handles nested quoted blocks)
                         let sigResults = null;
                         try {
-                            const allSigs = await this.verifyAllSignatures(emailBody);
+                            const allSigs = await TauriService.verifyAllSignatures(emailBody);
                             sigResults = allSigs.length > 0 ? allSigs : null;
                         } catch (e) {
                             console.warn('[JS] Signature verification error:', e);
@@ -4207,7 +4248,7 @@ ${attachmentsHtml}
     // Get glossia meta encoding keyword for pubkey from settings
     getGlossiaEncodingPubkey() {
         const settings = window.appState?.getSettings();
-        return settings?.glossia_encoding_pubkey ?? 'latin';
+        return settings?.glossia_encoding_pubkey ?? '';
     }
 
     /**
@@ -4339,203 +4380,6 @@ ${attachmentsHtml}
         return { body, pubkeyHex, signatureHex };
     }
 
-    // Shared signature verification: parse body for sig+pubkey blocks and verify.
-    // Returns { found, signed, isValid, pubkeyHex, signatureHex, body }
-    async verifyBodySignature(fullBody, dataToVerify) {
-        const gs = window.GlossiaService;
-        const metaPubkey = this.getGlossiaEncodingPubkey();
-        const metaSig = this.getGlossiaEncodingSignature();
-        let parsed;
-        if (gs && gs.isReady()) {
-            parsed = gs.parseSignedBody(fullBody, metaPubkey, metaSig);
-        } else {
-            parsed = this.parseRawSignedBody(fullBody);
-        }
-        if (!parsed?.pubkeyHex) return { found: false };
-        if (!parsed.signatureHex) return { found: true, signed: false, pubkeyHex: parsed.pubkeyHex, body: parsed.body };
-
-        const npub = window.CryptoService._nip19.npubEncode(parsed.pubkeyHex);
-        const dataBytes = window.CryptoService.ciphertextToBytes(dataToVerify);
-        const isValid = await TauriService.verifySignature(npub, parsed.signatureHex, dataBytes);
-        return { found: true, signed: true, isValid, pubkeyHex: parsed.pubkeyHex, signatureHex: parsed.signatureHex, body: parsed.body };
-    }
-
-    /**
-     * Extract inline signature and pubkey from ASCII-armored email body,
-     * and verify the signature against the raw encrypted message content.
-     * Returns { signatureHex, pubkeyHex, isValid, rawSignedContent } or null.
-     */
-    async verifyInlineSignature(plainBody) {
-        if (!plainBody) { console.log('[JS] verifyInlineSignature: no body, returning null'); return null; }
-
-        console.log('[JS] verifyInlineSignature: body length=', plainBody.length, 'preview=', plainBody.substring(0, 200));
-        const gs = window.GlossiaService;
-
-        // Use depth-counting parser to extract components
-        const parts = this.parseArmorComponents(plainBody);
-        const isEncrypted = !!plainBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-(?:04|44) ENCRYPTED)/);
-        const isSignedBody = !!plainBody.match(/-{3,}\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY))/);
-
-        // 1. Extract and decode the signed data
-        let dataBytes;
-
-        if (isEncrypted && parts && parts.bodyText) {
-            dataBytes = this._decodeArmorBodyToBytes(parts.bodyText, true);
-            console.log('[JS] verifyInlineSignature: encrypted mode, decoded bytes length=', dataBytes ? dataBytes.length : 0);
-            if (parts.quotedArmor) {
-                const allQuotedBytes = this._extractAllBodyBytes(parts.quotedArmor);
-                if (allQuotedBytes) {
-                    dataBytes = this._concatBytes(dataBytes, allQuotedBytes);
-                    console.log('[JS] verifyInlineSignature: concatenated all quoted bytes, total length=', dataBytes.length);
-                }
-            }
-        } else if (isSignedBody && parts && parts.bodyText) {
-            // Signed plaintext: decode glossia body back to original plaintext
-            if (gs && gs.isReady()) {
-                try {
-                    const detections = gs.detectDialect(parts.bodyText);
-                    if (Array.isArray(detections) && detections.length > 0) {
-                        const dialect = detections[0].language;
-                        const result = gs.transcode(parts.bodyText, `decode from ${dialect}`);
-                        dataBytes = new TextEncoder().encode(result.output);
-                        console.log('[JS] verifyInlineSignature: signed message, transcoded back to original, bytes length=', dataBytes.length);
-                    }
-                } catch (e) {
-                    console.warn('[JS] verifyInlineSignature: transcode decode failed:', e);
-                }
-            }
-            // Fallback: transcodeToBytes
-            if (!dataBytes && gs && gs.isReady()) {
-                try {
-                    const bytes = gs.transcodeToBytes(parts.bodyText);
-                    if (bytes) {
-                        dataBytes = new TextEncoder().encode(new TextDecoder().decode(bytes));
-                        console.log('[JS] verifyInlineSignature: signed message, using transcodeToBytes fallback, bytes length=', dataBytes.length);
-                    }
-                } catch (_) {}
-            }
-
-            // Recursively concatenate all nested quoted body bytes
-            if (parts.quotedArmor) {
-                const allQuotedBytes = this._extractAllBodyBytes(parts.quotedArmor);
-                if (allQuotedBytes) {
-                    dataBytes = this._concatBytes(dataBytes, allQuotedBytes);
-                    console.log('[JS] verifyInlineSignature: signed msg, concatenated all quoted bytes, total=', dataBytes.length);
-                }
-            }
-        } else if (!isEncrypted && !isSignedBody) {
-            // Plaintext without signed body armor — strip signature/seal blocks to get message body
-            const bodyOnly = plainBody
-                .replace(/\r\n/g, '\n')
-                .replace(/-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR (?:SIGNATURE|MESSAGE)\s*-{3,}/g, '')
-                .replace(/-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR (?:SEAL|MESSAGE)\s*-{3,}/g, '')
-                .trim();
-            console.log('[JS] verifyInlineSignature: plaintext mode, bodyOnly length=', bodyOnly.length);
-            if (!bodyOnly) { console.log('[JS] verifyInlineSignature: empty body after stripping blocks'); return null; }
-            dataBytes = new TextEncoder().encode(bodyOnly);
-        }
-
-        if (!parts || !parts.sigContent) {
-            console.log('[JS] verifyInlineSignature: no signature found via parseArmorComponents');
-            return null;
-        }
-
-        // 2. Decode sig and pubkey from parsed components
-        let signatureHex = null;
-        let pubkeyHex = null;
-
-        // Check if already hex (from _splitSigPubkey in parseArmorComponents)
-        if (parts.sigContent && /^[0-9a-fA-F]{128}$/.test(parts.sigContent)) {
-            signatureHex = parts.sigContent;
-        }
-        if (parts.sealContent && /^[0-9a-fA-F]{64}$/.test(parts.sealContent)) {
-            pubkeyHex = parts.sealContent;
-        }
-
-        // Attempt glossia decode if not already hex
-        if (!signatureHex || !pubkeyHex) {
-            try {
-                if (gs && gs.isReady()) {
-                    if (!signatureHex && parts.sigContent) {
-                        const sigDetections = gs.detectDialect(parts.sigContent);
-                        const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
-                        if (sigDialect) {
-                            const decoded = gs.decodeRawBaseN(parts.sigContent, sigDialect, 64);
-                            if (decoded.length === 128) signatureHex = decoded;
-                        }
-                    }
-                    if (!pubkeyHex && parts.sealContent) {
-                        const pkDetections = gs.detectDialect(parts.sealContent);
-                        const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
-                        if (pkDialect) {
-                            const decoded = gs.decodeRawBaseN(parts.sealContent, pkDialect, 32);
-                            if (decoded.length === 64) pubkeyHex = decoded;
-                        }
-                    }
-                }
-                // Fallback: try npub in seal content
-                if (!pubkeyHex && parts.sealContent) {
-                    const npubMatch = parts.sealContent.match(/(npub1[a-z0-9]+)/);
-                    if (npubMatch) pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
-                }
-                // Fallback: raw hex sig
-                if (!signatureHex && parts.sigContent && /^[0-9a-fA-F]{128}$/.test(parts.sigContent.replace(/\s+/g, ''))) {
-                    signatureHex = parts.sigContent.replace(/\s+/g, '');
-                }
-            } catch (e) {
-                console.warn('[JS] verifyInlineSignature: sig/pubkey decode error:', e);
-            }
-        }
-
-        if (!pubkeyHex) { console.log('[JS] verifyInlineSignature: could not decode pubkey'); return null; }
-        if (!signatureHex) { console.log('[JS] verifyInlineSignature: could not decode signature hex (expected len 128)'); return null; }
-
-        // 3. Verify signature against signed data
-        try {
-            const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
-            const isValid = await TauriService.verifySignature(npub, signatureHex, dataBytes);
-            console.log('[JS] verifyInlineSignature:', isValid ? 'VALID' : 'INVALID');
-            return { signatureHex, pubkeyHex, isValid, ciphertext: isEncrypted ? dataBytes : null };
-        } catch (e) {
-            console.error('[JS] verifyInlineSignature: verification failed:', e);
-            return { signatureHex, pubkeyHex, isValid: false, ciphertext: isEncrypted ? dataBytes : null };
-        }
-    }
-
-    /**
-     * Recursively verify ALL signatures in a body, including nested quoted blocks.
-     * Returns an array of verification results ordered innermost-first
-     * (matching DOM h4 order where blockquoted content appears before outer sig).
-     */
-    async verifyAllSignatures(plainBody) {
-        if (!plainBody) return [];
-
-        // Verify the outermost signature
-        let outerResult = null;
-        try {
-            outerResult = await this.verifyInlineSignature(plainBody);
-        } catch (e) {
-            console.warn('[JS] verifyAllSignatures: outer verification error:', e);
-        }
-
-        // Extract nested armor from depth-counting parser
-        let innerArmor = null;
-        const parts = this.parseArmorComponents(plainBody);
-        if (parts && parts.quotedArmor) {
-            innerArmor = parts.quotedArmor;
-        }
-
-        // Recurse into nested armor
-        let innerResults = [];
-        if (innerArmor) {
-            innerResults = await this.verifyAllSignatures(innerArmor);
-        }
-
-        // Return innermost-first (matches DOM h4 order: blockquoted content before outer)
-        const results = [...innerResults, outerResult].filter(r => r != null);
-        console.log(`[JS] verifyAllSignatures: found ${results.length} signature(s), ${innerResults.length} from nested quotes, outer=${outerResult ? (outerResult.isValid ? 'VALID' : 'INVALID') : 'none'}`);
-        return results;
-    }
 
     /**
      * Build a JSON proof blob for third-party signature verification
@@ -4582,338 +4426,56 @@ ${attachmentsHtml}
      */
     async verifyAndAnnotateSignatureBlocks(bodyText, containerId) {
         if (!bodyText) return;
-        const gs = window.GlossiaService;
 
-        // Quote prefix: lines in quoted replies start with "> "
-        // Allow zero or more levels of quoting before each delimiter line
-        const QP = '(?:>\\s*)*';
-        // First, handle nested armor blocks (plaintext signed or encrypted+signed) that end with END NOSTR MESSAGE
-        // Matches both new combined SIGNATURE block and legacy separate SEAL block
-        const signedMsgRegex = new RegExp(`${QP}-{3,}\\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}\\s*([\\s\\S]+?)\\s*${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}\\s*([\\s\\S]+?)\\s*(?:${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}\\s*([\\s\\S]+?)\\s*)?${QP}-{3,}\\s*END NOSTR MESSAGE\\s*-{3,}`, 'g');
-        let signedBlockIndex = 0;
-        let smMatch;
-        while ((smMatch = signedMsgRegex.exec(bodyText)) !== null) {
-            const armorBody = smMatch[1].trim();
-            const rawSigContent = smMatch[2].trim();
-            const rawSealContent = smMatch[3] ? smMatch[3].trim() : null;
-            // Detect whether this is encrypted or plaintext signed
-            const isEncryptedArmor = new RegExp(`${QP}-{3,}\\s*BEGIN NOSTR (?:NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}`).test(smMatch[0]);
-
-            const el = document.getElementById(`inline-sig-block-${signedBlockIndex}`);
-            signedBlockIndex++;
-            if (!el) continue;
-            const indicator = el.querySelector('.inline-sig-indicator');
-
-            // Decode body content for verification
-            let dataBytes = null;
-            if (isEncryptedArmor) {
-                // Encrypted: body is bitpacked then prose-encoded, so use transcodeToBytes
-                // (handles grammar/cover words) to get packed cipher bytes
-                try {
-                    const decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(armorBody) : null;
-                    if (decoded) {
-                        dataBytes = decoded;
-                    } else {
-                        // Fallback: raw base64 ciphertext
-                        dataBytes = window.CryptoService.ciphertextToBytes(armorBody.replace(/\s+/g, ''));
-                    }
-                } catch (_) {}
-            } else {
-                // Plaintext signed: glossia body → UTF-8 bytes
-                if (gs && gs.isReady()) {
-                    try {
-                        const bytes = gs.decodeToBytes(armorBody);
-                        if (bytes) dataBytes = bytes;
-                    } catch (_) {}
-                }
-            }
-            if (!dataBytes) {
-                if (indicator) {
-                    indicator.className = 'inline-sig-indicator invalid';
-                    indicator.innerHTML = '<i class="fas fa-question-circle"></i> Cannot decode body';
-                }
-                continue;
-            }
-
-            // Split sig content: legacy has separate SEAL, new format has combined block
-            let signatureHex = null;
-            let pubkeyHex = null;
-
-            if (rawSealContent) {
-                // Legacy: separate SEAL block — decode each independently
-                const sigContentLines = rawSigContent.split('\n').filter(l => !l.trim().startsWith('@'));
-                const sigText = sigContentLines.join(' ').trim();
-                const sealLines = rawSealContent.split('\n').filter(l => !l.trim().startsWith('@'));
-                const pubkeyText = sealLines.join(' ').trim();
-
-                try {
-                    if (gs && gs.isReady()) {
-                        const sigDetections = gs.detectDialect(sigText);
-                        const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
-                        if (sigDialect) {
-                            const decoded = gs.decodeRawBaseN(sigText, sigDialect, 64);
-                            if (decoded.length === 128) signatureHex = decoded;
-                        }
-                    }
-                    if (!signatureHex && /^[0-9a-fA-F]{128}$/.test(sigText)) signatureHex = sigText;
-                } catch (_) {}
-
-                try {
-                    const npubMatch = pubkeyText.match(/(npub1[a-z0-9]+)/);
-                    if (npubMatch) {
-                        pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
-                    } else if (gs && gs.isReady()) {
-                        const pkDetections = gs.detectDialect(pubkeyText);
-                        const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
-                        if (pkDialect) {
-                            const decoded = gs.decodeRawBaseN(pubkeyText, pkDialect, 32);
-                            if (decoded.length === 64) pubkeyHex = decoded;
-                        }
-                    }
-                } catch (_) {}
-            } else {
-                // New: combined block — decode as 96 bytes, split at byte boundary
-                const sigContentLines = rawSigContent.split('\n').filter(l => !l.trim().startsWith('@'));
-                const allContent = sigContentLines.join('\n').trim();
-                const split = window.emailService._splitSigPubkey(allContent);
-                if (split) {
-                    signatureHex = split.sigHex;
-                    pubkeyHex = split.pubkeyHex;
-                }
-            }
-
-            if (!signatureHex || !pubkeyHex) {
-                if (indicator) {
-                    indicator.className = 'inline-sig-indicator invalid';
-                    indicator.innerHTML = '<i class="fas fa-question-circle"></i> Cannot decode';
-                }
-                continue;
-            }
-
-            try {
-                const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
-                const shortNpub = npub.substring(0, 12) + '...' + npub.substring(npub.length - 6);
-                const isValid = await TauriService.verifySignature(npub, signatureHex, dataBytes);
-                if (indicator) {
-                    if (isValid) {
-                        indicator.className = 'inline-sig-indicator verified';
-                        indicator.innerHTML = `<i class="fas fa-check-circle"></i> Signed by: ${shortNpub}`;
-                        indicator.title = `Verified signature from ${npub}`;
-                        el.classList.add('verified');
-                        indicator.after(this._buildProofButton(pubkeyHex, signatureHex, dataBytes));
-                    } else {
-                        indicator.className = 'inline-sig-indicator invalid';
-                        indicator.innerHTML = '<i class="fas fa-times-circle"></i> Signature Invalid';
-                        el.classList.add('invalid');
-                    }
-                }
-            } catch (e) {
-                console.error('[JS] verifyAndAnnotateSignatureBlocks: signed message verification error:', e);
-                if (indicator) {
-                    indicator.className = 'inline-sig-indicator invalid';
-                    indicator.innerHTML = '<i class="fas fa-times-circle"></i> Verification Error';
-                    el.classList.add('invalid');
-                }
-            }
+        // Use backend to verify all signatures recursively
+        let results = [];
+        try {
+            results = await TauriService.verifyAllSignatures(bodyText);
+        } catch (e) {
+            console.error('[JS] verifyAndAnnotateSignatureBlocks: backend verification error:', e);
+            return;
         }
 
-        // Then handle traditional signature+seal pairs
-        const sigSealRegex = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}\\s*([\\s\\S]+?)\\s*${QP}-{3,}\\s*END NOSTR SIGNATURE\\s*-{3,})[\\s\\n]*(${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}\\s*([\\s\\S]+?)\\s*${QP}-{3,}\\s*END NOSTR SEAL\\s*-{3,})`, 'g');
+        if (!results || results.length === 0) return;
 
-        // Also find the encrypted message block (ciphertext) to verify against
-        const encMsgRegex = new RegExp(`${QP}-{3,}\\s*BEGIN NOSTR (?:NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}\\s*([\\s\\S]+?)\\s*${QP}-{3,}\\s*(?:END NOSTR (?:NIP-\\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\\s*-{3,}`, 'g');
-        const ciphertexts = [];
-        let encMatch;
-        while ((encMatch = encMsgRegex.exec(bodyText)) !== null) {
-            const armorContent = encMatch[1].trim();
-            let ct = null;
-            if (/^[A-Za-z0-9+/=\n?\s]+$/.test(armorContent.replace(/\s+/g, ''))) {
-                ct = armorContent.replace(/\s+/g, '');
-            } else if (gs && gs.isReady()) {
-                try {
-                    const result = gs.transcode(armorContent, 'decode');
-                    ct = result.output;
-                } catch (_) {}
-            }
-            if (ct) ciphertexts.push(ct);
-        }
-
-        let blockIndex = signedBlockIndex;
-        let match;
-        while ((match = sigSealRegex.exec(bodyText)) !== null) {
-            const sigContent = match[2].trim().split('\n')
-                .filter(l => !l.trim().startsWith('@'))
-                .join(' ').trim();
-            const sealContent = match[4].trim().split('\n')
-                .filter(l => !l.trim().startsWith('@'))
-                .join(' ').trim();
-
-            const el = document.getElementById(`inline-sig-block-${blockIndex}`);
-            blockIndex++;
+        // Annotate DOM elements with verification results (innermost-first order)
+        for (let i = 0; i < results.length; i++) {
+            const result = results[i];
+            const el = document.getElementById(`inline-sig-block-${i}`);
             if (!el) continue;
-
             const indicator = el.querySelector('.inline-sig-indicator');
+            if (!indicator) continue;
 
-            let pubkeyHex = null;
-            let signatureHex = null;
-
-            // Decode pubkey
-            try {
-                const npubMatch = sealContent.match(/(npub1[a-z0-9]+)/);
-                if (npubMatch) {
-                    pubkeyHex = window.CryptoService._npubToHex(npubMatch[1]);
-                } else if (gs && gs.isReady()) {
-                    const pkDetections = gs.detectDialect(sealContent);
-                    const pkDialect = (Array.isArray(pkDetections) && pkDetections.length > 0) ? pkDetections[0].language : null;
-                    if (pkDialect) {
-                        const decoded = gs.decodeRawBaseN(sealContent, pkDialect, 32);
-                        if (decoded.length === 64) pubkeyHex = decoded;
-                    }
-                }
-            } catch (_) {}
-
-            // Decode signature
-            try {
-                if (gs && gs.isReady()) {
-                    const sigDetections = gs.detectDialect(sigContent);
-                    const sigDialect = (Array.isArray(sigDetections) && sigDetections.length > 0) ? sigDetections[0].language : null;
-                    if (sigDialect) {
-                        const decoded = gs.decodeRawBaseN(sigContent, sigDialect, 64);
-                        if (decoded.length === 128) signatureHex = decoded;
-                    }
-                }
-            } catch (_) {}
+            const pubkeyHex = result.pubkeyHex;
+            const signatureHex = result.signatureHex;
 
             if (!pubkeyHex || !signatureHex) {
-                if (indicator) {
-                    indicator.className = 'inline-sig-indicator invalid';
-                    indicator.innerHTML = '<i class="fas fa-question-circle"></i> Cannot decode';
-                }
+                indicator.className = 'inline-sig-indicator invalid';
+                indicator.innerHTML = '<i class="fas fa-question-circle"></i> Cannot decode';
                 continue;
-            }
-
-            // Verify against the most recent ciphertext preceding this sig block
-            // Use the last ciphertext found before this match position, or the latest one
-            const ciphertext = ciphertexts.length > 0 ? ciphertexts[Math.min(blockIndex - 1, ciphertexts.length - 1)] : null;
-
-            let dataBytes;
-            if (ciphertext) {
-                dataBytes = window.CryptoService.ciphertextToBytes(ciphertext);
-            } else {
-                // Plaintext email: signed data is the body text with sig/seal blocks stripped
-                // Normalize \r\n to \n to match what the textarea produced at sign time
-                const bodyOnly = bodyText
-                    .replace(/\r\n/g, '\n')
-                    .replace(/-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR (?:SIGNATURE|MESSAGE)\s*-{3,}/g, '')
-                    .replace(/-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}[\s\S]*?-{3,}\s*END NOSTR (?:SEAL|MESSAGE)\s*-{3,}/g, '')
-                    .trim();
-                if (!bodyOnly) {
-                    if (indicator) {
-                        indicator.className = 'inline-sig-indicator invalid';
-                        indicator.innerHTML = '<i class="fas fa-question-circle"></i> No content to verify';
-                    }
-                    continue;
-                }
-                dataBytes = new TextEncoder().encode(bodyOnly);
             }
 
             try {
                 const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
                 const shortNpub = npub.substring(0, 12) + '...' + npub.substring(npub.length - 6);
-                const isValid = await TauriService.verifySignature(npub, signatureHex, dataBytes);
-                if (indicator) {
-                    if (isValid) {
-                        indicator.className = 'inline-sig-indicator verified';
-                        indicator.innerHTML = `<i class="fas fa-check-circle"></i> Signed by: ${shortNpub}`;
-                        indicator.title = `Verified signature from ${npub}`;
-                        el.classList.add('verified');
-                        indicator.after(this._buildProofButton(pubkeyHex, signatureHex, dataBytes));
-                    } else {
-                        indicator.className = 'inline-sig-indicator invalid';
-                        indicator.innerHTML = '<i class="fas fa-times-circle"></i> Signature Invalid';
-                        el.classList.add('invalid');
-                    }
-                }
-            } catch (e) {
-                console.error('[JS] verifyAndAnnotateSignatureBlocks: verification error:', e);
-                if (indicator) {
+                if (result.isValid) {
+                    indicator.className = 'inline-sig-indicator verified';
+                    indicator.innerHTML = `<i class="fas fa-check-circle"></i> Signed by: ${shortNpub}`;
+                    indicator.title = `Verified signature from ${npub}`;
+                    el.classList.add('verified');
+                    indicator.after(this._buildProofButton(pubkeyHex, signatureHex, null));
+                } else {
                     indicator.className = 'inline-sig-indicator invalid';
-                    indicator.innerHTML = '<i class="fas fa-times-circle"></i> Verification Error';
+                    indicator.innerHTML = '<i class="fas fa-times-circle"></i> Signature Invalid';
                     el.classList.add('invalid');
                 }
+            } catch (e) {
+                console.error('[JS] verifyAndAnnotateSignatureBlocks: annotation error:', e);
+                indicator.className = 'inline-sig-indicator invalid';
+                indicator.innerHTML = '<i class="fas fa-times-circle"></i> Verification Error';
+                el.classList.add('invalid');
             }
         }
-    }
-
-    // Split compose body into reply text and quoted original.
-    // Quoted lines start with "> " — the first contiguous block of quoted lines
-    // at the end of the body is treated as the quoted original message.
-    // Concatenate multiple Uint8Arrays into one
-    _concatBytes(...arrays) {
-        const filtered = arrays.filter(a => a && a.length);
-        const total = filtered.reduce((sum, a) => sum + a.length, 0);
-        const result = new Uint8Array(total);
-        let offset = 0;
-        for (const a of filtered) { result.set(a, offset); offset += a.length; }
-        return result;
-    }
-
-    // Decode an armor body section to canonical bytes.
-    // For encrypted: transcodeToBytes (packed cipher bytes) or base64 decode.
-    // For signed plaintext: glossia round-trip decode to UTF-8 bytes.
-    _decodeArmorBodyToBytes(bodyText, isEncrypted) {
-        const gs = window.GlossiaService;
-        if (isEncrypted) {
-            const decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(bodyText) : null;
-            if (decoded) return decoded;
-            return window.CryptoService.ciphertextToBytes(bodyText.replace(/\s+/g, ''));
-        }
-        // Signed plaintext: detect dialect, decode back to original text, UTF-8 encode
-        if (gs && gs.isReady()) {
-            try {
-                const detections = gs.detectDialect(bodyText);
-                if (Array.isArray(detections) && detections.length > 0 && detections[0].language) {
-                    const result = gs.transcode(bodyText, `decode from ${detections[0].language}`);
-                    if (result.output) return new TextEncoder().encode(result.output);
-                }
-            } catch (_) {}
-            // Try transcodeToBytes as fallback
-            try {
-                const bytes = gs.transcodeToBytes(bodyText);
-                if (bytes) return bytes;
-            } catch (_) {}
-        }
-        return new TextEncoder().encode(bodyText);
-    }
-
-    // Recursively extract and concatenate all body bytes from nested armor.
-    // For a 3-level chain, returns: decode(outer_body) + decode(middle_body) + decode(inner_body).
-    _extractAllBodyBytes(armorText) {
-        if (!armorText) return null;
-        // Try encrypted/general armor format
-        const parts = this.parseArmorComponents(armorText);
-        if (parts && parts.bodyText) {
-            const isEnc = !!armorText.match(/-{3,}\s*BEGIN NOSTR (?:NIP-(?:04|44) ENCRYPTED)/);
-            const bodyBytes = this._decodeArmorBodyToBytes(parts.bodyText, isEnc);
-            if (!bodyBytes) return null;
-            if (parts.quotedArmor) {
-                const deeperBytes = this._extractAllBodyBytes(parts.quotedArmor);
-                return deeperBytes ? this._concatBytes(bodyBytes, deeperBytes) : bodyBytes;
-            }
-            return bodyBytes;
-        }
-        // Try signed plaintext format
-        const signedMsg = this.decodeGlossiaSignedMessage(armorText);
-        if (signedMsg && signedMsg.glossiaBody) {
-            const bodyBytes = this._decodeArmorBodyToBytes(signedMsg.glossiaBody, false);
-            if (!bodyBytes) return null;
-            if (signedMsg.quotedArmor) {
-                const deeperBytes = this._extractAllBodyBytes(signedMsg.quotedArmor);
-                return deeperBytes ? this._concatBytes(bodyBytes, deeperBytes) : bodyBytes;
-            }
-            return bodyBytes;
-        }
-        return null;
     }
 
     // Strip one level of "> " quote prefixes from text (for verifying quoted armor)
@@ -5609,12 +5171,15 @@ ${attachmentsHtml}
                 const armoredManifest = this.armorCiphertext(encryptedManifest, encryptionAlgorithm);
                 domManager.setValue('messageBody', armoredManifest.trim());
                 
-                // Clear signature when encrypting (body state changed)
-                this.clearSignature();
-                
+                // NIP-44 clears any stale signature since body state changed.
+                // NIP-04 signing happens after glossia encoding (below).
+                if (encryptionAlgorithm !== 'nip04') {
+                    this.clearSignature();
+                }
+
                 // Update attachment list display
                 this.renderAttachmentList();
-                
+
                 notificationService.showSuccess(`Email encrypted using manifest format (${reason}) with ${encryptionAlgorithm.toUpperCase()}`);
                 
             } else {
@@ -5644,6 +5209,8 @@ ${attachmentsHtml}
                     domManager.setValue('messageBody', armoredBody.trim());
                 }
                 
+                // NIP-04 signing happens after glossia encoding (below).
+
                 notificationService.showSuccess(`Subject and body encrypted using ${encryptionAlgorithm.toUpperCase()}`);
             }
 
@@ -5657,6 +5224,14 @@ ${attachmentsHtml}
                 } else {
                     console.warn('[JS] Auto-encode failed, sending as ASCII armor');
                 }
+            }
+
+            // NIP-04 requires mandatory signing (spec section 4.1).
+            // Sign AFTER glossia encoding so the signed bytes match what the
+            // verifier recovers (glossia decode produces packed bytes; signing
+            // those ensures consistency with verifyInlineSignature).
+            if (encryptionAlgorithm === 'nip04') {
+                await this._autoSignNip04Body();
             }
 
             // Rebuild _plainBody with ASCII-armored encrypted content
@@ -5677,8 +5252,8 @@ ${attachmentsHtml}
                     const metaSig = this.getGlossiaEncodingSignature();
                     const metaPubkey = this.getGlossiaEncodingPubkey();
                     if (sigHex && pkHex) {
-                        // Encode sig+pubkey as single 96-byte payload for combined SIGNATURE block
-                        const result = gs.encodeSigPubkey(sigHex, pkHex, metaSig);
+                        // Encode sig+pubkey for SIGNATURE block (default: glossia sig + npub; masked: combined 96-byte)
+                        const result = gs.encodeSigPubkey(sigHex, pkHex, metaSig, metaPubkey);
                         if (result.combined) {
                             encodedSigPubkey = result.encodedSigPubkey;
                         } else {
@@ -7121,10 +6696,10 @@ ${attachmentsHtml}
                             });
                         }
 
-                        // Verify all signatures recursively (still JS)
+                        // Verify all signatures recursively via backend
                         let sigResults = null;
                         try {
-                            const allSigs = await this.verifyAllSignatures(email.body);
+                            const allSigs = await TauriService.verifyAllSignatures(email.body);
                             sigResults = allSigs.length > 0 ? allSigs : null;
                         } catch (e) {
                             console.warn('[JS] Signature verification error:', e);
@@ -7139,7 +6714,7 @@ ${attachmentsHtml}
                     // Non-encrypted sent email: verify all signatures recursively
                     let sigResults = null;
                     try {
-                        const allSigs = await this.verifyAllSignatures(email.body);
+                        const allSigs = await TauriService.verifyAllSignatures(email.body);
                         sigResults = allSigs.length > 0 ? allSigs : null;
                     } catch (e) {
                         console.warn('[JS] Signature verification error:', e);

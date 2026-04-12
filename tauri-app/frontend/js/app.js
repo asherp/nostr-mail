@@ -783,6 +783,13 @@ NostrMailApp.prototype.switchToProfile = async function(publicKeyOrKeypair) {
 
     // Refresh the UI
     this.renderProfilePubkey();
+    // Reload contacts for the new profile and repopulate compose dropdown
+    if (window.contactsService) {
+        await window.contactsService.loadContacts();
+    }
+    if (window.emailService) {
+        window.emailService.populateNostrContactDropdown();
+    }
     await this.reloadActivePage();
     await this.ensureDefaultContact();
 
@@ -1051,6 +1058,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (encryptBtn) {
             console.log('[JS] Setting up encrypt button event listener');
             encryptBtn.dataset.encrypted = 'false';
+            // Set initial label based on encryption algorithm
+            const initLabelSpan = encryptBtn.querySelector('.encrypt-btn-label');
+            if (initLabelSpan) {
+                const algo = appState.getSettings()?.encryption_algorithm || 'nip44';
+                initLabelSpan.textContent = algo === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
+            }
             // Update DM checkbox visibility on initialization
             if (window.emailService) window.emailService.updateDmCheckboxVisibility();
             encryptBtn.addEventListener('click', async function handleEncryptClick() {
@@ -1091,109 +1104,40 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         window.emailService._htmlBody = savedHtmlBody;
                     }
                 } else {
-                    // Decrypt mode
+                    // Decrypt mode — use the same backend pipeline as sent mail viewing
                     console.log('[JS] Decrypt button clicked');
-                    // Get keys and contact
                     if (!appState.hasKeypair()) {
                         return;
                     }
                     const pubkey = window.emailService?.selectedNostrContact?.pubkey;
-                    let currentBody = domManager.getValue('messageBody') || '';
-                    let currentSubject = domManager.getValue('subject') || '';
-
-                    // Auto-decode glossia if body doesn't have ASCII armor markers
-                    let decryptedAny = false;
-                    const hasArmor = /-{3,}\s*BEGIN NOSTR (?:NIP-(04|44) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(currentBody);
-                    if (!hasArmor && currentBody) {
-                        const glossiaMeta = window.emailService?.getGlossiaEncoding();
-                        if (glossiaMeta) {
-                            console.log('[JS] No ASCII armor found, attempting glossia decode first...');
-                            try {
-                                const decoded = await window.emailService.decodeEmailFields();
-                                if (decoded) {
-                                    currentBody = domManager.getValue('messageBody') || '';
-                                    currentSubject = domManager.getValue('subject') || '';
-                                }
-                            } catch (err) {
-                                console.warn('[JS] Glossia decode failed, proceeding with raw content:', err);
-                            }
-                        }
+                    if (!pubkey) {
+                        notificationService.showError('Please select a Nostr contact first');
+                        return;
                     }
+                    const currentBody = domManager.getValue('messageBody') || '';
+                    const currentSubject = domManager.getValue('subject') || '';
 
-                    if (privkey && pubkey) {
-                        // Standard armor-based decryption
-                        // Regex for both NIP-04 and NIP-44 armored messages
-                        const match = currentBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-(04|44) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-(?:04|44) ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
-                        // Decrypt subject if it looks encrypted (base64 or glossia-encoded)
-                        let detectedScheme = null;
-                        if (currentSubject && currentSubject.length >= 20) {
-                            let subjectCiphertext = currentSubject;
-                            const isBase64Subject = window.Utils && window.Utils.isLikelyEncryptedContent(currentSubject);
-                            if (!isBase64Subject) {
-                                // Try glossia-decoding subject to recover ciphertext
-                                const gs = window.GlossiaService;
-                                if (gs && gs.isReady()) {
-                                    try {
-                                        const meta = window.emailService?.getGlossiaEncoding() || null;
-                                        const instruction = meta ? `decode from ${meta} raw` : 'decode raw';
-                                        const result = gs.transcode(currentSubject, instruction);
-                                        let decoded = result.output;
-                                        if (gs._isHex(decoded)) decoded = gs._hexToBase64(decoded);
-                                        subjectCiphertext = gs._autoUnpack ? gs._autoUnpack(decoded) : decoded;
-                                    } catch (e) {
-                                        console.warn('[JS] Glossia subject decode failed:', e);
-                                        subjectCiphertext = null;
-                                    }
-                                } else {
-                                    subjectCiphertext = null;
-                                }
-                            }
-                            if (subjectCiphertext && window.Utils && window.Utils.isLikelyEncryptedContent(subjectCiphertext)) {
-                                try {
-                                    detectedScheme = Utils.detectEncryptionFormat(subjectCiphertext);
-                                    const decryptedSubject = await TauriService.decryptDmContent(pubkey, subjectCiphertext);
-                                    domManager.setValue('subject', decryptedSubject);
-                                    decryptedAny = true;
-                                } catch (err) {
-                                    notificationService.showError('Failed to decrypt subject: ' + err);
-                                }
-                            }
-                        }
-                        // Decrypt body if armored
-                        if (match) {
-                            if (!detectedScheme || detectedScheme === 'unknown') {
-                                detectedScheme = match[1] === '04' ? 'nip04' : 'nip44';
-                            }
-                            try {
-                                // Use the new manifest-aware decryption function
-                                await window.emailService.decryptBodyContent();
-                                decryptedAny = true;
-                            } catch (err) {
-                                // Fallback to legacy decryption
-                                const encryptedContent = match[2].replace(/\s+/g, '');
-                                try {
-                                    const decrypted = await TauriService.decryptDmContent(pubkey, encryptedContent);
-                                    domManager.setValue('messageBody', decrypted);
-                                    decryptedAny = true;
-                                    // Clear signature when decrypting (body state changed)
-                                    if (window.emailService) window.emailService.clearSignature();
-                                } catch (legacyErr) {
-                                    notificationService.showError('Failed to decrypt body: ' + legacyErr);
-                                }
-                            }
-                        }
-                        if (decryptedAny) {
-                            const scheme = detectedScheme && detectedScheme !== 'unknown'
-                                ? detectedScheme.toUpperCase().replace('NIP', 'NIP-')
+                    try {
+                        const result = await TauriService.decryptEmailBody(
+                            currentBody, currentSubject, pubkey, null
+                        );
+                        if (result.success) {
+                            domManager.setValue('messageBody', result.body);
+                            domManager.setValue('subject', result.subject);
+                            if (window.emailService) window.emailService.clearSignature();
+                            const nip = result.blockResults?.[0]?.bodyType === 'encrypted'
+                                ? (currentBody.includes('NIP-04') ? 'NIP-04' : 'NIP-44')
                                 : 'NIP';
-                            notificationService.showSuccess(`Decrypted with ${scheme}`);
+                            notificationService.showSuccess(`Decrypted with ${nip}`);
                         } else {
-                            notificationService.showError('No encrypted message found in subject or body');
+                            const errorMsg = result.error || 'Failed to decrypt';
+                            notificationService.showError(errorMsg);
                         }
-                    } else {
-                        notificationService.showError('No encrypted message found or missing keys');
+                    } catch (error) {
+                        console.error('[JS] Decrypt failed:', error);
+                        notificationService.showError('Failed to decrypt: ' + error);
                     }
-                    
+
                     // Also decrypt any encrypted attachments
                     try {
                         await window.emailService.decryptAllAttachments();
@@ -1201,17 +1145,16 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         console.error('Failed to decrypt attachments:', error);
                     }
                     if (iconSpan) iconSpan.className = 'fas fa-lock';
-                    if (labelSpan) labelSpan.textContent = 'Encrypt';
+                    if (labelSpan) {
+                        const algo = appState.getSettings()?.encryption_algorithm || 'nip44';
+                        labelSpan.textContent = algo === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
+                    }
                     encryptBtn.dataset.encrypted = 'false';
                     // Re-enable editing
                     if (subjectInput) subjectInput.disabled = false;
                     if (messageBodyInput) messageBodyInput.disabled = false;
                     // Update DM checkbox visibility
                     if (window.emailService) window.emailService.updateDmCheckboxVisibility();
-                    // Clear signature when decrypting (body state changed)
-                    if (decryptedAny) {
-                        window.emailService.clearSignature();
-                    }
                 }
             });
         } else {
@@ -1283,63 +1226,20 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     }
 
                     try {
-                        // Extract content from ASCII armor if present, otherwise use body as-is.
-                        // For encrypted armor, body is bitpacked before glossia encoding,
-                        // so decodeToBytes returns packed cipher bytes directly.
-                        let dataBytes;
-                        if (isArmored) {
-                            const gs = window.GlossiaService;
-                            // Body is bitpacked then prose-encoded, so use transcodeToBytes
-                            // (handles grammar/cover words) to get packed cipher bytes
-                            const decoded = (gs && gs.isReady()) ? gs.transcodeToBytes(bodyValue) : null;
-                            if (decoded) {
-                                dataBytes = decoded;
-                            } else {
-                                // Fallback: raw base64 content (strip whitespace)
-                                dataBytes = window.CryptoService.ciphertextToBytes(bodyValue.replace(/\s+/g, ''));
-                            }
-                        } else {
-                            // Plaintext: glossia-encode reply text only, then decode back to get
-                            // canonical bytes. The signature is on the decoded armor content,
-                            // not the raw plaintext — this survives transport.
-                            const gs2 = window.GlossiaService;
-                            const metaBody = window.emailService?.getGlossiaEncoding();
-                            if (gs2 && gs2.isReady() && metaBody) {
-                                const encoded = gs2.transcode(bodyValue, `encode into ${metaBody}`);
-                                // Round-trip: decode back to get canonical bytes
-                                const roundTripped = gs2.transcodeToBytes(encoded.output);
-                                if (roundTripped) {
-                                    dataBytes = roundTripped;
-                                } else {
-                                    // Plaintext: transcodeToBytes returns null (output is text, not hex)
-                                    // Use transcode to decode back to original text
-                                    try {
-                                        const det = gs2.detectDialect(encoded.output);
-                                        if (Array.isArray(det) && det.length > 0 && det[0].language) {
-                                            const decoded = gs2.transcode(encoded.output, `decode from ${det[0].language}`);
-                                            if (decoded.output) {
-                                                dataBytes = new TextEncoder().encode(decoded.output);
-                                            }
-                                        }
-                                    } catch (e) {
-                                        console.warn('[JS] Sign: glossia round-trip decode failed:', e);
-                                    }
-                                    if (!dataBytes) dataBytes = new TextEncoder().encode(bodyValue);
-                                }
-                            } else {
-                                dataBytes = new TextEncoder().encode(bodyValue);
-                            }
-                        }
-                        // Concatenate all nested quoted body bytes for signature coverage
+                        // Extract signable bytes via backend (handles glossia round-trip + nested concatenation)
                         const quotedArmorForSig = window.emailService?._quotedOriginalArmor || null;
-                        if (quotedArmorForSig && window.emailService) {
-                            const allQuotedBytes = window.emailService._extractAllBodyBytes(quotedArmorForSig);
-                            if (allQuotedBytes) {
-                                dataBytes = window.emailService._concatBytes(dataBytes, allQuotedBytes);
-                            }
-                        }
+                        const glossiaEncoding = !isArmored ? (window.emailService?.getGlossiaEncoding() || null) : null;
+                        const dataBytes = new Uint8Array(await TauriService.extractSignableBytes(
+                            bodyValue, isArmored, quotedArmorForSig, glossiaEncoding
+                        ));
                         console.log('[JS] Signing data (binary length:', dataBytes.length, ')');
-                        const signature = await TauriService.signData(dataBytes);
+
+                        // Sign + verify in one backend round-trip
+                        const [signature, isValid] = await TauriService.signAndVerifyBytes(dataBytes);
+                        if (!isValid) {
+                            notificationService.showError('Signature verification failed. Body restored.');
+                            return;
+                        }
                         const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
                         let encodedSig, encodedPubkey, encodedSigPubkey = null;
 
@@ -1409,21 +1309,6 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         }
                         domManager.setValue('messageBody', newBody);
 
-                        // Verify the signature we just created before showing checkmark
-                        const npub = window.CryptoService._nip19.npubEncode(pubkeyHex);
-                        const isValid = await TauriService.verifySignature(npub, signature, dataBytes);
-                        const verifyResult = { found: true, signed: true, isValid };
-                        if (!verifyResult.found || !verifyResult.signed) {
-                            domManager.setValue('messageBody', rawBodyValue);
-                            notificationService.showError('Could not verify signature. Body restored.');
-                            return;
-                        }
-                        if (!verifyResult.isValid) {
-                            domManager.setValue('messageBody', rawBodyValue);
-                            notificationService.showError('Signature verification failed. Body restored.');
-                            return;
-                        }
-
                         signBtn.dataset.signed = 'true';
                         signBtn.dataset.signature = signature;
                         signBtn.dataset.originalBody = rawBodyValue;
@@ -1477,6 +1362,16 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         notificationService.showError('Failed to sign: ' + error);
                     }
                 } else {
+                    // Block unsigning NIP-04 messages (spec section 4.1)
+                    const bodyContent = domManager.getValue('messageBody') || '';
+                    if (bodyContent.includes('NIP-04 ENCRYPTED')) {
+                        notificationService.showError(
+                            'Cannot remove signature from NIP-04 encrypted messages. ' +
+                            'NIP-04 requires signing for security.'
+                        );
+                        return;
+                    }
+
                     // Unsign: restore the original body saved at sign time
                     console.log('[JS] Unsign button clicked');
                     if (signBtn.dataset.originalBody !== undefined) {
@@ -2556,9 +2451,15 @@ NostrMailApp.prototype.updateComposeButtons = function() {
     const autoEncrypt = settings.automatically_encrypt !== false;
     const autoSign = settings.automatically_sign !== false;
     
-    // Hide/show encrypt button
+    // Hide/show encrypt button and update label for NIP-04
     if (encryptBtn) {
         encryptBtn.style.display = autoEncrypt ? 'none' : 'inline-block';
+        if (encryptBtn.dataset.encrypted !== 'true') {
+            const label = encryptBtn.querySelector('.encrypt-btn-label');
+            if (label) {
+                label.textContent = settings.encryption_algorithm === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
+            }
+        }
     }
     
     // Hide/show sign button

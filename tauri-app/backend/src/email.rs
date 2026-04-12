@@ -2324,9 +2324,39 @@ fn try_glossia_decode_to_bytes(text: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Glossia round-trip: encode plaintext bytes into the given language, then decode back
+/// to get canonical bytes. This ensures signature verification survives transport
+/// (word-wrap, quote prefixes, etc.) because the signature is on the decoded binary.
+/// Returns None if glossia encode/decode fails (caller should fall back to raw UTF-8 bytes).
+pub fn glossia_roundtrip_to_bytes(text: &str, encoding: &str) -> Option<Vec<u8>> {
+    let hex_input = glossia::hex_encode(text.as_bytes());
+    // Map frontend encoding names to glossia parameters
+    let encoding_lower = encoding.to_lowercase();
+    let (language, wordlist) = match encoding_lower.as_str() {
+        "latin" => ("latin", "default"),
+        "english" | "english - bip39" => ("english", "bip39"),
+        _ => (encoding_lower.as_str(), "default"),
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        glossia::encode_into_language(
+            &hex_input, language, wordlist, "body",
+            None, 42, false, None, None, None, None,
+        )
+    }));
+    let encoded = match result {
+        Ok(Ok((encoded_text, _, _, _))) => encoded_text,
+        _ => {
+            println!("[RUST] glossia_roundtrip_to_bytes: encode failed for encoding={}", encoding);
+            return None;
+        }
+    };
+    // Decode back to bytes
+    try_glossia_decode_to_bytes(&encoded)
+}
+
 /// Decode a single section of armor body content (non-quoted lines only) to bytes.
 /// Tries glossia decode, then base64 decode. Returns None if all fail.
-fn decode_armor_section(content: &str) -> Option<Vec<u8>> {
+pub fn decode_armor_section(content: &str) -> Option<Vec<u8>> {
     let content = content.trim();
     if content.is_empty() {
         return None;
@@ -2497,7 +2527,7 @@ fn try_decode_as_signature(text: &str) -> Option<String> {
 ///   2. Blank-line split (new format): sig and pubkey separated by empty line
 ///   3. Last-line heuristic: last line is npub/hex pubkey, rest is sig
 fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
-    // Phase 1: Combined 96-byte (backward compat)
+    // Phase 1: Combined 96-byte (masked mode — glossia encodes sig||pubkey as one payload)
     if let Some(bytes) = try_glossia_decode_to_bytes(content) {
         if bytes.len() == 96 {
             let sig_hex = hex::encode(&bytes[..64]);
@@ -2510,14 +2540,13 @@ fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
         return Some((stripped[..128].to_string(), stripped[128..].to_string()));
     }
 
-    // Phase 2: Last-line heuristic (npub or hex pubkey on last line, rest is sig)
+    // Phase 2: Default mode — glossia sig + npub/hex pubkey on last line
     let lines: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     if lines.len() >= 2 {
         let last = lines[lines.len() - 1];
-        let last_stripped: String = last.chars().filter(|c| !c.is_whitespace()).collect();
-        if last_stripped.starts_with("npub1") || (last_stripped.len() == 64 && last_stripped.chars().all(|c| c.is_ascii_hexdigit())) {
+        if let Some(pk) = try_decode_as_pubkey(last) {
             let sig_text = lines[..lines.len() - 1].join("\n");
-            if let (Some(sig), Some(pk)) = (try_decode_as_signature(&sig_text), try_decode_as_pubkey(last)) {
+            if let Some(sig) = try_decode_as_signature(&sig_text) {
                 return Some((sig, pk));
             }
         }
@@ -3287,6 +3316,83 @@ fn decrypt_armor_tree(
         results.extend(inner_results);
     }
 
+    // NIP-04 mandatory signature verification (spec section 4.1).
+    // NIP-04 (AES-256-CBC) lacks authenticated encryption; the Schnorr signature
+    // serves as the MAC. Verification MUST happen before decryption to prevent
+    // padding oracle attacks.
+    if parsed.encryption_nip.as_deref() == Some("nip04") {
+        match (&parsed.signature_hex, &parsed.sig_pubkey_hex) {
+            (Some(sig_hex), Some(pubkey_hex)) => {
+                // Collect body bytes for verification — use raw decoded bytes (no NIP-04
+                // unpacking) to match extract_ciphertext_binary, which the inline
+                // signature verification uses successfully.
+                let verify_bytes = if let Some(ref b64) = parsed.body_bytes_b64 {
+                    general_purpose::STANDARD.decode(b64).unwrap_or_else(|_| parsed.body_text.as_bytes().to_vec())
+                } else {
+                    extract_ciphertext_binary(&parsed.body_text)
+                };
+                let mut all_bytes = verify_bytes;
+
+                // Concatenate nested quoted body bytes
+                fn collect_quoted_bytes(
+                    quoted: &Option<Box<crate::types::ParsedArmorMessage>>,
+                    buf: &mut Vec<u8>,
+                ) {
+                    if let Some(ref q) = quoted {
+                        if let Some(ref b64) = q.body_bytes_b64 {
+                            if let Ok(bytes) = general_purpose::STANDARD.decode(b64) {
+                                buf.extend_from_slice(&bytes);
+                            }
+                        }
+                        collect_quoted_bytes(&q.quoted, buf);
+                    }
+                }
+                collect_quoted_bytes(&parsed.quoted, &mut all_bytes);
+
+                // Step 7: Verify signature against unpacked canonical bytes
+                let verified = matches!(
+                    crate::crypto::verify_signature_bytes(pubkey_hex, sig_hex, &all_bytes),
+                    Ok(true)
+                );
+
+                if verified {
+                    println!("[RUST] NIP-04 signature verified ({} bytes), proceeding to decrypt", all_bytes.len());
+                } else {
+                    println!("[RUST] NIP-04 signature INVALID — rejecting without decryption");
+                    results.push(crate::types::DecryptedBlock {
+                        decrypted_text: None,
+                        error: Some(
+                            "NIP-04 signature verification failed. The message was rejected \
+                             without decrypting to prevent potential ciphertext manipulation. \
+                             The message may have been tampered with in transit.".to_string()
+                        ),
+                        was_encrypted: true,
+                        profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
+                        body_type: "encrypted".to_string(),
+                    });
+                    return (results, outer_manifest);
+                }
+            }
+            _ => {
+                // No signature on NIP-04 message — reject
+                println!("[RUST] NIP-04 message has no signature — rejecting without decryption");
+                results.push(crate::types::DecryptedBlock {
+                    decrypted_text: None,
+                    error: Some(
+                        "This NIP-04 encrypted message has no signature. NIP-04 requires a \
+                         signature for authentication because it lacks built-in message \
+                         integrity (MAC). The message cannot be safely decrypted. The sender \
+                         may be using an older client that doesn't sign NIP-04 messages.".to_string()
+                    ),
+                    was_encrypted: true,
+                    profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
+                    body_type: "encrypted".to_string(),
+                });
+                return (results, outer_manifest);
+            }
+        }
+    }
+
     // Decrypt this level
     let (block, manifest) = decrypt_single_block(
         &parsed.body_text,
@@ -3507,7 +3613,7 @@ pub fn decrypt_attachment_pipeline(
 /// For nested reply chains, uses depth-counting to separate each level and concatenates
 /// decoded bytes from all levels (matching the JS signing behavior).
 /// For non-armored bodies: returns the UTF-8 bytes of the body text.
-fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
+pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
     // Use depth-counting parser to properly handle nested reply armor
     if let Some((body_text, nested_armor)) = parse_armor_depth(body) {
         if let Some(mut bytes) = decode_armor_section(&body_text) {
@@ -3586,6 +3692,89 @@ pub fn verify_email_signature_full(body: &str, raw_headers: &str) -> (Option<boo
         (Some(false), _) | (_, Some(false)) => (Some(false), None),
         (None, None)             => (None, None),
     }
+}
+
+/// Recursively verify ALL signatures in an armor body, including nested quoted blocks.
+/// Returns a Vec of verification results ordered innermost-first
+/// (matching the JS verifyAllSignatures convention for DOM h4 matching).
+pub fn verify_all_signatures_inline(body: &str) -> Vec<crate::types::SignatureVerificationResult> {
+    verify_all_signatures_recursive(body, 0)
+}
+
+fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types::SignatureVerificationResult> {
+    let mut results = Vec::new();
+
+    println!("[RUST] verify_all_sigs_recursive: depth={}, body_len={}, preview={:?}",
+        depth, body.len(), &body[..80.min(body.len())]);
+
+    // Parse armor at this level to get sig/pubkey and body type
+    let parsed = match parse_armor_components(body) {
+        Some(p) => p,
+        None => {
+            println!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_components returned None", depth);
+            return results;
+        }
+    };
+
+    println!("[RUST] verify_all_sigs_recursive: depth={}, parsed: body_type={}, has_sig={}, has_pubkey={}, has_quoted={}",
+        depth, parsed.body_type,
+        parsed.signature_hex.is_some(), parsed.sig_pubkey_hex.is_some(),
+        parsed.quoted.is_some());
+
+    // Use parse_armor_depth to get the nested armor text for recursion
+    let depth_result = parse_armor_depth(body);
+    match &depth_result {
+        Some((_body_text, Some(ref nested_armor))) => {
+            println!("[RUST] verify_all_sigs_recursive: depth={}, found nested armor ({} bytes), recursing",
+                depth, nested_armor.len());
+            let inner_results = verify_all_signatures_recursive(nested_armor, depth + 1);
+            println!("[RUST] verify_all_sigs_recursive: depth={}, inner recursion returned {} results",
+                depth, inner_results.len());
+            results.extend(inner_results);
+        }
+        Some((_body_text, None)) => {
+            println!("[RUST] verify_all_sigs_recursive: depth={}, no nested armor (leaf node)", depth);
+        }
+        None => {
+            println!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_depth returned None", depth);
+        }
+    }
+
+    // Verify this level's signature if present
+    let sig_hex = parsed.signature_hex.as_ref();
+    let pubkey_hex = parsed.sig_pubkey_hex.as_ref();
+
+    if let (Some(sig), Some(pk)) = (sig_hex, pubkey_hex) {
+        // extract_ciphertext_binary already concatenates this level's bytes + all nested bytes
+        let binary = extract_ciphertext_binary(body);
+        let is_valid = match crate::crypto::verify_signature_bytes(pk, sig, &binary) {
+            Ok(valid) => {
+                println!("[RUST] verify_all_signatures: depth={}, {} ({} bytes, pubkey={}...)",
+                    depth, if valid { "valid" } else { "INVALID" }, binary.len(),
+                    &pk[..8.min(pk.len())]);
+                valid
+            }
+            Err(e) => {
+                println!("[RUST] verify_all_signatures: depth={}, error: {}", depth, e);
+                false
+            }
+        };
+
+        results.push(crate::types::SignatureVerificationResult {
+            signature_hex: Some(sig.clone()),
+            pubkey_hex: Some(pk.clone()),
+            is_valid,
+            depth,
+            body_type: parsed.body_type.clone(),
+            profile_name: parsed.profile_name.clone(),
+        });
+    } else {
+        println!("[RUST] verify_all_sigs_recursive: depth={}, no sig/pubkey at this level (sig={}, pk={})",
+            depth, sig_hex.is_some(), pubkey_hex.is_some());
+    }
+
+    println!("[RUST] verify_all_sigs_recursive: depth={}, returning {} total results", depth, results.len());
+    results
 }
 
 /// Extract message ID from email headers
@@ -4670,6 +4859,8 @@ mod tests {
         assert_eq!(parsed_bytes, extract_bytes,
             "parse_armor_components body bytes must match extract_ciphertext_binary output");
     }
+
+
 
     // ── Decrypt pipeline tests ──────────────────────────────────
 

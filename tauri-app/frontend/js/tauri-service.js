@@ -110,14 +110,26 @@ const TauriService = {
     signData: async function(data) {
         return await this.invoke('sign_data', { data });
     },
+    signDataBytes: async function(data) {
+        return await this.invoke('sign_data_bytes', { data: Array.from(data) });
+    },
     verifySignature: async function(publicKey, signature, data) {
-        if (window.CryptoService && window.CryptoService.isReady()) {
-            return await window.CryptoService.verifySignature(publicKey, signature, data);
+        if (data instanceof Uint8Array) {
+            return await this.invoke('verify_signature_bytes', { publicKey, signature, data: Array.from(data) });
         }
         return await this.invoke('verify_signature', { publicKey, signature, data });
     },
     recheckEmailSignature: async function(messageId) {
         return await this.invoke('recheck_email_signature', { messageId });
+    },
+    verifyAllSignatures: async function(armorText) {
+        return await this.invoke('verify_all_signatures', { armorText });
+    },
+    extractSignableBytes: async function(body, isArmored, quotedArmor, glossiaEncoding) {
+        return await this.invoke('extract_signable_bytes', { body, isArmored, quotedArmor, glossiaEncoding });
+    },
+    signAndVerifyBytes: async function(data) {
+        return await this.invoke('sign_and_verify_bytes', { data: Array.from(data) });
     },
     encryptNip44Message: async function(publicKey, message) {
         return await this.invoke('encrypt_nip04_message', { publicKey, message });

@@ -74,7 +74,7 @@ The original plaintext also appears above the armor block for readability in non
 
 Signature and pubkey are encoded independently with separate glossia settings. Decoders MUST accept both the new separate format and the legacy combined format (sig + pubkey encoded together as a single 96-byte payload).
 
-### 3.3 Unsigned + Encrypted (with Seal)
+### 3.3 Unsigned + Encrypted (with Seal) — NIP-44 only
 
 ```
 ----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----
@@ -85,7 +85,9 @@ Signature and pubkey are encoded independently with separate glossia settings. D
 ----- END NOSTR MESSAGE -----
 ```
 
-The SEAL block provides the sender's pubkey, which is required for NIP-04/NIP-44 decryption and survives forwarding (unlike MIME headers). Decoders MUST accept glossia-encoded, hex-encoded, and npub (bech32-encoded, `npub1...`) formats for pubkeys in SEAL blocks.
+The SEAL block provides the sender's pubkey, which is required for NIP-44 decryption and survives forwarding (unlike MIME headers). Decoders MUST accept glossia-encoded, hex-encoded, and npub (bech32-encoded, `npub1...`) formats for pubkeys in SEAL blocks.
+
+**NIP-04 messages MUST NOT use this format.** Because NIP-04 (AES-256-CBC) lacks authenticated encryption, an unsigned NIP-04 message is vulnerable to ciphertext manipulation (bit-flipping, padding oracle attacks). NIP-04 encrypted messages MUST include a SIGNATURE block (see Section 3.1). See Section 4.1 for rationale.
 
 ### 3.4 Unsigned Plaintext (with optional Seal)
 
@@ -193,7 +195,7 @@ Decoders MUST also accept armor block delimiters preceded by `> ` quote prefixes
 
 ## 4. Composable Signing Model
 
-Signing is user-controlled and can be applied at any stage to the current body bytes:
+Signing is user-controlled for NIP-44 messages and can be applied at any stage to the current body bytes. **For NIP-04 messages, signing is mandatory** — encoders MUST produce a SIGNATURE block, and decoders MUST reject NIP-04 messages without one (see Section 4.1).
 
 | Operation | What gets signed | Result |
 |-----------|-----------------|--------|
@@ -205,6 +207,21 @@ Signing is user-controlled and can be applied at any stage to the current body b
 The signing target is the **flat concatenation** of the decoded bytes from the current armor body and all nested quoted armor bodies (recursively). For glossia-encoded content, decoding means transcoding the prose back to binary. For base64 content, it means base64-decoding. The signature is never on the raw plaintext or the encoded prose itself — it is on the canonical decoded bytes, which survive transport regardless of reformatting.
 
 For messages with no quoted content, this reduces to `SHA-256(decode(armor_body))`. For replies, the concatenation provides chain-of-custody integrity — modifying any message in the conversation history invalidates all subsequent signatures.
+
+### 4.1 Mandatory Signing for NIP-04
+
+NIP-04 uses AES-256-CBC without a MAC (unauthenticated encryption). Without an external integrity check, NIP-04 ciphertext is vulnerable to:
+
+- **Padding oracle attacks**: An attacker who can modify the ciphertext and observe whether decryption produces valid or invalid PKCS7 padding can recover the plaintext one byte at a time — without knowing the key.
+- **Bit-flipping**: In CBC mode, flipping bits in ciphertext block *N* produces predictable changes to plaintext block *N+1*, allowing targeted message tampering.
+
+The Schnorr signature over `SHA-256(ciphertext_bytes)` serves as the authentication mechanism that NIP-04 itself lacks. This converts NIP-04 into an Encrypt-then-Sign (EtS) scheme, binding the ciphertext to the sender's identity and preventing tampering.
+
+**Compose-time requirement**: Encoders MUST produce a SIGNATURE block for all NIP-04 encrypted messages. A compose UI MUST either auto-sign NIP-04 messages or prevent sending unsigned NIP-04 messages.
+
+**Decode-time requirement**: Decoders MUST verify the signature **before** attempting NIP-04 decryption. If the signature is missing or invalid, the decoder MUST reject the message without decrypting. This verify-then-decrypt ordering is critical — if decryption errors (including padding errors) are surfaced before signature verification, the padding oracle window remains open.
+
+NIP-44 messages are exempt from this requirement because NIP-44 uses ChaCha20 (no padding) with HMAC-SHA256 authentication built in.
 
 ## 5. Content Encoding (Glossia)
 
@@ -331,6 +348,8 @@ Since email clients strip `<style>` tags and external stylesheets, all styling M
 5. **Decode** content: base64 decode or Glossia transcode -> bytes
 6. **Unpack** NIP-04 if applicable (bitpacked binary -> `base64?iv=base64`)
 7. **Verify** signatures against `SHA-256(decoded_body_bytes)` using the pubkey from the SIGNATURE block
+   - For NIP-04: signature MUST be present and MUST verify. If the signature is missing or invalid, the decoder MUST reject the message **without proceeding to step 8** (see Section 4.1)
+   - For NIP-44: signature verification is recommended but not required (NIP-44 provides its own authentication via HMAC)
 8. **Decrypt** if encrypted, using recipient's private key and sender's pubkey
 
 ## 9. Versioning

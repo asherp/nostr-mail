@@ -1266,6 +1266,7 @@ impl Database {
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
+        where_clauses.push("is_draft = 0");
         if let Some(true) = nostr_only {
             // "Nostr Emails Only": show nostr-encrypted, signed, or from contacts
             if let Some(pubkey) = user_pubkey {

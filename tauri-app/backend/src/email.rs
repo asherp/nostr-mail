@@ -3068,12 +3068,15 @@ fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result
 /// Glossia-decode subject (payload_only mode, hit_rate >= 0.8).
 /// Mirrors JS: decodeGlossiaSubject — uses "decode from <dialect> raw" mode.
 fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
+    println!("[RUST] glossia_decode_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
     if subject.is_empty() || is_likely_encrypted_content(subject) {
+        println!("[RUST] glossia_decode_subject: empty or already encrypted, returning None");
         return None;
     }
 
     // Detect dialect with hit_rate filtering
     let words: Vec<String> = subject.split_whitespace().map(|w| w.to_lowercase()).collect();
+    println!("[RUST] glossia_decode_subject: word_count={} words={:?}", words.len(), &words[..words.len().min(6)]);
     if words.is_empty() {
         return None;
     }
@@ -3081,8 +3084,23 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
         glossia::detect_dialect_best(&words)
     });
     let dialect = match detect_result {
-        Ok(Some(best)) if best.hit_rate >= 0.8 => best.language.clone(),
-        _ => return None
+        Ok(Some(best)) => {
+            println!("[RUST] glossia_decode_subject: detected dialect={:?} hit_rate={}", best.language, best.hit_rate);
+            if best.hit_rate >= 0.8 {
+                best.language.clone()
+            } else {
+                println!("[RUST] glossia_decode_subject: hit_rate too low (<0.8), returning None");
+                return None;
+            }
+        }
+        Ok(None) => {
+            println!("[RUST] glossia_decode_subject: no dialect detected, returning None");
+            return None;
+        }
+        Err(e) => {
+            println!("[RUST] glossia_decode_subject: detect_dialect_best panicked: {:?}", e.downcast_ref::<String>());
+            return None;
+        }
     };
 
     // Try decoding with both "default" and "raw" wordlists, pick longest
@@ -3097,20 +3115,31 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
         });
         match decode_result {
             Ok(Ok(decoded)) => {
+                println!("[RUST] glossia_decode_subject: wl={} decoded len={} preview={:?}", wl, decoded.len(), &decoded[..decoded.len().min(40)]);
                 match &best_decoded {
                     Some(prev) if prev.len() >= decoded.len() => {}
                     _ => { best_decoded = Some(decoded); }
                 }
             }
-            _ => {}
+            Ok(Err(e)) => {
+                println!("[RUST] glossia_decode_subject: wl={} decode error: {:?}", wl, e);
+            }
+            Err(e) => {
+                println!("[RUST] glossia_decode_subject: wl={} decode panicked: {:?}", wl, e.downcast_ref::<String>());
+            }
         }
     }
 
     match best_decoded {
         Some(decoded) => {
-            glossia_postprocess(&decoded, nip_hint).ok()
+            let result = glossia_postprocess(&decoded, nip_hint);
+            println!("[RUST] glossia_decode_subject: postprocess result={:?}", result.as_ref().map(|s| &s[..s.len().min(40)]));
+            result.ok()
         }
-        _ => None,
+        _ => {
+            println!("[RUST] glossia_decode_subject: no successful decode from any wordlist");
+            None
+        }
     }
 }
 
@@ -3202,6 +3231,12 @@ fn decrypt_single_block(
 ) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
     use base64::Engine;
 
+    println!("[RUST] decrypt_single_block: type={} nip={:?} sig_pk={:?} seal_pk={:?} fallback={:?} body_preview={:?}",
+        body_type, encryption_nip, sig_pubkey_hex.map(|s| &s[..s.len().min(16)]),
+        seal_pubkey_hex.map(|s| &s[..s.len().min(16)]),
+        &fallback_pubkey[..fallback_pubkey.len().min(16)],
+        &body_text[..body_text.len().min(60)]);
+
     let mut block = crate::types::DecryptedBlock {
         decrypted_text: None,
         error: None,
@@ -3220,8 +3255,12 @@ fn decrypt_single_block(
 
     // Step 1: Glossia-decode body text → ciphertext string
     let ciphertext = match glossia_decode_to_ciphertext(body_text, nip) {
-        Ok(ct) => ct,
+        Ok(ct) => {
+            println!("[RUST] decrypt_single_block: glossia decoded, ciphertext len={}", ct.len());
+            ct
+        }
         Err(e) => {
+            println!("[RUST] decrypt_single_block: glossia decode FAILED: {}", e);
             block.error = Some(format!("Glossia decode failed: {}", e));
             return (block, None);
         }
@@ -3229,8 +3268,12 @@ fn decrypt_single_block(
 
     // Step 2: Determine which pubkey to decrypt with
     let decrypt_pubkey_hex = match determine_decrypt_pubkey(sig_pubkey_hex, seal_pubkey_hex, user_pubkey_hex, fallback_pubkey) {
-        Ok(pk) => pk,
+        Ok(pk) => {
+            println!("[RUST] decrypt_single_block: decrypt pubkey={}", &pk[..pk.len().min(16)]);
+            pk
+        }
         Err(e) => {
+            println!("[RUST] decrypt_single_block: determine_decrypt_pubkey FAILED: {}", e);
             block.error = Some(e);
             return (block, None);
         }
@@ -3249,8 +3292,12 @@ fn decrypt_single_block(
     };
 
     let decrypted = match crate::nostr::decrypt_dm_content(private_key, &decrypt_npub, &ciphertext) {
-        Ok(d) => d,
+        Ok(d) => {
+            println!("[RUST] decrypt_single_block: NIP decrypt SUCCESS, len={} preview={:?}", d.len(), &d[..d.len().min(40)]);
+            d
+        }
         Err(e) => {
+            println!("[RUST] decrypt_single_block: NIP decrypt FAILED: {}", e);
             block.error = Some(format!("NIP decrypt failed: {}", e));
             return (block, None);
         }
@@ -3328,8 +3375,17 @@ fn decrypt_armor_tree(
     let mut outer_manifest = None;
 
     // Recurse into quoted first (innermost-first ordering)
+    // Propagate current level's sig/seal pubkey as fallback for inner blocks,
+    // so nested blocks can identify the other party when their own sig matches the user.
     if let Some(ref quoted) = parsed.quoted {
-        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, fallback_pubkey);
+        let inner_fallback = if fallback_pubkey.is_empty() {
+            parsed.sig_pubkey_hex.as_deref()
+                .or(parsed.seal_pubkey_hex.as_deref())
+                .unwrap_or("")
+        } else {
+            fallback_pubkey
+        };
+        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback);
         results.extend(inner_results);
     }
 
@@ -3507,10 +3563,18 @@ pub fn decrypt_email_body_pipeline(
         (false, Vec::new())
     };
 
-    // Decrypt subject
+    // Decrypt subject — use armor's embedded pubkey as fallback when sender_pubkey wasn't provided
     let (decrypted_subject, subject_ciphertext) = if parsed.body_type == "encrypted" {
         let nip_hint = parsed.encryption_nip.as_deref().unwrap_or("nip44");
-        decrypt_subject(subject, private_key, &user_pubkey_hex, fallback, nip_hint)
+        let subject_fallback = if fallback.is_empty() {
+            // The armor signature/seal block contains the sender's pubkey
+            parsed.sig_pubkey_hex.as_deref()
+                .or(parsed.seal_pubkey_hex.as_deref())
+                .unwrap_or("")
+        } else {
+            fallback
+        };
+        decrypt_subject(subject, private_key, &user_pubkey_hex, subject_fallback, nip_hint)
     } else {
         (subject.to_string(), None)
     };
@@ -3542,16 +3606,23 @@ fn decrypt_subject(
     fallback_pubkey: &str,
     nip_hint: &str,
 ) -> (String, Option<String>) {
+    println!("[RUST] decrypt_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
     if subject.is_empty() {
+        println!("[RUST] decrypt_subject: empty subject, returning as-is");
         return (subject.to_string(), None);
     }
 
     // Try to get ciphertext from subject
-    let ciphertext = if is_likely_encrypted_content(subject) {
+    let is_encrypted = is_likely_encrypted_content(subject);
+    println!("[RUST] decrypt_subject: is_likely_encrypted={}", is_encrypted);
+    let ciphertext = if is_encrypted {
+        println!("[RUST] decrypt_subject: using subject directly as ciphertext");
         subject.to_string()
     } else if let Some(decoded) = glossia_decode_subject(subject, nip_hint) {
+        println!("[RUST] decrypt_subject: glossia decoded to ciphertext len={} preview={:?}", decoded.len(), &decoded[..decoded.len().min(60)]);
         decoded
     } else {
+        println!("[RUST] decrypt_subject: glossia decode failed, returning subject as-is");
         return (subject.to_string(), None);
     };
 
@@ -3559,6 +3630,7 @@ fn decrypt_subject(
 
     // Determine which pubkey to use — use fallback (other party's pubkey)
     let decrypt_pubkey = if fallback_pubkey.is_empty() {
+        println!("[RUST] decrypt_subject: no fallback pubkey, returning subject as-is");
         return (subject.to_string(), subject_ciphertext);
     } else if fallback_pubkey.starts_with("npub1") {
         fallback_pubkey.to_string()
@@ -3566,13 +3638,23 @@ fn decrypt_subject(
         use nostr_sdk::prelude::ToBech32;
         match nostr_sdk::prelude::PublicKey::parse(fallback_pubkey) {
             Ok(pk) => pk.to_bech32().unwrap_or_else(|_| fallback_pubkey.to_string()),
-            Err(_) => return (subject.to_string(), subject_ciphertext),
+            Err(_) => {
+                println!("[RUST] decrypt_subject: failed to parse fallback pubkey {:?}", fallback_pubkey);
+                return (subject.to_string(), subject_ciphertext);
+            }
         }
     };
 
+    println!("[RUST] decrypt_subject: attempting NIP decrypt with pubkey prefix={:?}", &decrypt_pubkey[..decrypt_pubkey.len().min(20)]);
     match crate::nostr::decrypt_dm_content(private_key, &decrypt_pubkey, &ciphertext) {
-        Ok(decrypted) => (decrypted, subject_ciphertext),
-        Err(_) => (subject.to_string(), subject_ciphertext),
+        Ok(decrypted) => {
+            println!("[RUST] decrypt_subject: success! decrypted={:?}", &decrypted[..decrypted.len().min(60)]);
+            (decrypted, subject_ciphertext)
+        }
+        Err(e) => {
+            println!("[RUST] decrypt_subject: NIP decrypt failed: {:?}", e);
+            (subject.to_string(), subject_ciphertext)
+        }
     }
 }
 

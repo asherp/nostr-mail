@@ -1514,6 +1514,37 @@ impl Database {
         }
     }
 
+    /// Get the last successful sync timestamp for a given email account and folder.
+    /// Stored in user_settings with the email address as the pubkey field
+    /// and `last_sync_at:<folder>` as the key.
+    pub fn get_last_sync_at(&self, email: &str, folder: &str) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.conn.lock().unwrap();
+        let key = format!("last_sync_at:{}", folder);
+        let mut stmt = conn.prepare(
+            "SELECT value FROM user_settings WHERE pubkey = ? AND key = ?"
+        )?;
+        let mut rows = stmt.query(params![email.trim().to_lowercase(), key])?;
+        if let Some(row) = rows.next()? {
+            let value: String = row.get(0)?;
+            match value.parse::<DateTime<Utc>>() {
+                Ok(dt) => Ok(Some(dt)),
+                Err(_) => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Save the sync timestamp for a given email account and folder.
+    pub fn set_last_sync_at(&self, email: &str, folder: &str, timestamp: DateTime<Utc>) -> Result<()> {
+        let key = format!("last_sync_at:{}", folder);
+        self.save_setting(
+            &email.trim().to_lowercase(),
+            &key,
+            &timestamp.to_rfc3339(),
+        )
+    }
+
     // Direct message operations
     pub fn save_dm(&self, dm: &DirectMessage) -> Result<i64> {
         let conn = self.conn.lock().unwrap();

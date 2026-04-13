@@ -213,7 +213,7 @@ const TauriService = {
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
     },
-    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null) {
+    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -226,10 +226,16 @@ const TauriService = {
         }
         if (htmlBody) {
             args.htmlBody = htmlBody;
+        }
+        if (inReplyTo) {
+            args.inReplyTo = inReplyTo;
+        }
+        if (references) {
+            args.references = references;
         }
         return await this.invoke('send_email', args);
     },
-    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null) {
+    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -242,6 +248,12 @@ const TauriService = {
         }
         if (htmlBody) {
             args.htmlBody = htmlBody;
+        }
+        if (inReplyTo) {
+            args.inReplyTo = inReplyTo;
+        }
+        if (references) {
+            args.references = references;
         }
         return await this.invoke('construct_email_headers', args);
     },

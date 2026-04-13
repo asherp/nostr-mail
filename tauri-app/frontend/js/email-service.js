@@ -43,6 +43,8 @@ class EmailService {
         this._htmlBody = null; // HTML alternative body for multipart emails
         this._plainBody = null; // BIP39-armored plaintext body for text/plain MIME part
         this._quotedOriginalArmor = null; // Original message armor to append as quote in replies
+        this._replyToMessageId = null; // Message-ID of email being replied to (In-Reply-To header)
+        this._replyReferences = null; // References chain for email threading
     }
 
     // Get appropriate background color for Nostr contact input based on dark mode
@@ -821,6 +823,8 @@ class EmailService {
         this._subjectCiphertext = null;
         this.currentMessageId = null; // Reset message ID when clearing draft
         this._quotedOriginalArmor = null; // Clear quoted reply armor
+        this._replyToMessageId = null;
+        this._replyReferences = null;
         this.clearAttachments(); // Clear all attachments
         // Clear saved contact selection when clearing draft
         this.clearSavedContactSelection();
@@ -1615,7 +1619,7 @@ class EmailService {
                 console.log('[JS] Sending email with attachments:', attachmentData);
                 
                 const plainBody = this._plainBody || body;
-                await TauriService.sendEmail(emailConfig, toAddress, subject, plainBody, null, messageId, attachmentData, this._htmlBody);
+                await TauriService.sendEmail(emailConfig, toAddress, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences);
             }
 
             console.log('[JS] Email sent successfully');
@@ -1754,7 +1758,7 @@ class EmailService {
             };
 
             // Construct headers (sender's pubkey will be derived from keychain in backend)
-            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId, null, this._htmlBody);
+            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId, null, this._htmlBody, this._replyToMessageId, this._replyReferences);
             
             // Debug: Log what headers we actually received
             console.log('[JS] Headers received from backend:');
@@ -2025,7 +2029,7 @@ class EmailService {
             if (!recipientEmail) {
                 throw new Error('No email address available for this contact. Please enter one in the To field.');
             }
-            await TauriService.sendEmail(emailConfig, recipientEmail, subject, plainBody, null, messageId, attachmentData, this._htmlBody);
+            await TauriService.sendEmail(emailConfig, recipientEmail, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences);
             console.log('[JS] Encrypted email sent successfully');
 
             // Update the email's subject_hash in DB to match the NIP ciphertext
@@ -3658,6 +3662,22 @@ ${attachmentsHtml}
                 this.resetEncryptButtonState();
                 this.clearSignature();
                 this._quotedOriginalArmor = null;
+
+                // Capture threading headers for In-Reply-To and References
+                this._replyToMessageId = null;
+                this._replyReferences = null;
+                if (email.message_id) {
+                    const msgId = email.message_id.includes('@')
+                        ? `<${email.message_id}>` : email.message_id;
+                    this._replyToMessageId = msgId;
+                    // Build References: original's References + original's Message-ID
+                    let refs = '';
+                    if (email.raw_headers) {
+                        const refMatch = email.raw_headers.match(/^References:\s*(.+(?:\n\s+.+)*)$/mi);
+                        if (refMatch) refs = refMatch[1].replace(/\n\s+/g, ' ').trim();
+                    }
+                    this._replyReferences = refs ? `${refs} ${msgId}` : msgId;
+                }
 
                 domManager.setValue('toAddress', replyTo);
                 domManager.setValue('subject', replySubject);

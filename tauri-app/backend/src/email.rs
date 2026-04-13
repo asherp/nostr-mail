@@ -147,6 +147,8 @@ pub fn construct_email_headers(
     message_id: Option<&str>,
     attachments: Option<&Vec<EmailAttachment>>,
     html_body: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
 ) -> Result<String> {
     println!("[RUST] construct_email_headers: Constructing email headers");
     println!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
@@ -169,7 +171,19 @@ pub fn construct_email_headers(
     } else {
         println!("[RUST] construct_email_headers: No message ID provided");
     }
-    
+
+    // Add In-Reply-To header if provided (for email threading)
+    if let Some(reply_id) = in_reply_to {
+        println!("[RUST] construct_email_headers: Setting In-Reply-To: {}", reply_id);
+        builder = builder.in_reply_to(reply_id.to_string());
+    }
+
+    // Add References header if provided (for email threading)
+    if let Some(refs) = references {
+        println!("[RUST] construct_email_headers: Setting References: {}", refs);
+        builder = builder.references(refs.to_string());
+    }
+
     // Add the sender's public key to the headers (not the receiver's)
     // This allows the receiver to derive the shared secret using their private key
     if let Some(private_key) = &config.private_key {
@@ -310,6 +324,8 @@ pub async fn send_email(
     message_id: Option<&str>,
     attachments: Option<&Vec<EmailAttachment>>,
     html_body: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
 ) -> Result<String> {
     println!("[RUST] send_email: Starting email send process");
     println!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
@@ -327,7 +343,19 @@ pub async fn send_email(
         // Pass the message ID as Option<String> to the builder
         builder = builder.message_id(Some(msg_id.to_string()));
     }
-    
+
+    // Add In-Reply-To header if provided (for email threading)
+    if let Some(reply_id) = in_reply_to {
+        println!("[RUST] send_email: Setting In-Reply-To: {}", reply_id);
+        builder = builder.in_reply_to(reply_id.to_string());
+    }
+
+    // Add References header if provided (for email threading)
+    if let Some(refs) = references {
+        println!("[RUST] send_email: Setting References: {}", refs);
+        builder = builder.references(refs.to_string());
+    }
+
     // Add the sender's public key to the headers (not the receiver's)
     // This allows the receiver to derive the shared secret using their private key
     if let Some(private_key) = &config.private_key {
@@ -1805,115 +1833,104 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
     Ok((emails, emails_with_attachments))
 }
 
-fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::io::Read + std::io::Write>, config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>) -> Result<(Vec<EmailMessage>, Vec<(String, Vec<crate::database::Attachment>)>)> {
+fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::io::Read + std::io::Write>, config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>, sent_folder: &str) -> Result<(Vec<EmailMessage>, Vec<(String, Vec<crate::database::Attachment>)>)> {
     use chrono::Utc;
-    
+
     // Try to select the sent folder
-    let sent_folder = "[Gmail]/Sent Mail";
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Selecting sent folder: {}", sent_folder);
-    session.select(sent_folder)?;
+    let mailbox = session.select(sent_folder)?;
+    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Mailbox has {} messages", mailbox.exists);
     
     // Calculate cutoff date for filtering
-    // If latest is provided, use it directly; otherwise search all emails
-    let cutoff = latest.unwrap_or_else(|| Utc::now() - chrono::Duration::days(365 * 5));
-    
-    // Build IMAP SINCE date filter
+    // If latest is provided, use it directly; otherwise look back 30 days
+    let cutoff = latest.unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
     let cutoff_with_buffer = cutoff - chrono::Duration::hours(1);
-    let since_filter = if latest.is_some() {
+
+    // Use SINCE date search to get candidates, then filter client-side for nostr content.
+    // Gmail's IMAP TEXT search is broken in [Gmail]/Sent Mail, so we skip it entirely.
+    let search_criteria = if latest.is_some() {
         let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
-        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for emails after: {} (SINCE {})", cutoff, since_date);
-        format!(" SINCE {}", since_date)
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Searching SINCE {}", since_date);
+        format!("ALL SINCE {}", since_date)
     } else {
-        String::new()
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: First sync, searching all (30-day lookback)");
+        "ALL".to_string()
     };
 
-    // Search strategies:
-    // 1. IMAP TEXT searches all MIME parts, finds ASCII armor in text/plain
-    // 2. IMAP HEADER search for the X-Nostr-Pubkey custom header
-    let search_terms = vec![
-        format!("TEXT \"BEGIN NOSTR\"{}", since_filter),
-        format!("HEADER X-Nostr-Pubkey \"\"{}", since_filter),
-    ];
-    
-    let mut all_message_numbers: HashSet<u32> = HashSet::new();
-    
-    // Search with each term and collect results
-    for search_term in search_terms {
-        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Searching with: {}", search_term);
-        match session.search(&search_term) {
-            Ok(messages) => {
-                let count = messages.len();
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Found {} messages with search '{}'", count, search_term);
-                all_message_numbers.extend(messages.iter().cloned());
+    let mut message_numbers: Vec<u32> = Vec::new();
+    match session.search(&search_criteria) {
+        Ok(candidates) => {
+            let mut candidate_numbers: Vec<u32> = candidates.iter().cloned().collect();
+            // Safety cap: take only the most recent 500 if too many
+            if candidate_numbers.len() > 500 {
+                candidate_numbers.sort();
+                candidate_numbers = candidate_numbers[candidate_numbers.len() - 500..].to_vec();
             }
-            Err(e) => {
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Search '{}' failed: {}", search_term, e);
-            }
-        }
-    }
-    
-    let mut message_numbers: Vec<u32> = all_message_numbers.into_iter().collect();
-    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Total unique sent messages to fetch: {}", message_numbers.len());
-    
-    // If no results and we have a latest date that's recent (within last 7 days), try searching without date filter
-    // This handles cases where Gmail's date filtering might be too strict
-    if message_numbers.is_empty() && latest.is_some() {
-        let days_since_latest = Utc::now().signed_duration_since(cutoff).num_days();
-        if days_since_latest <= 7 {
-            println!("[RUST] fetch_sent_emails_from_gmail_optimized: No results with date filter, trying without date filter (latest was {} days ago)", days_since_latest);
-            let fallback_search_terms = vec![
-                "TEXT \"BEGIN NOSTR\"".to_string(),
-                "HEADER X-Nostr-Pubkey \"\"".to_string(),
-            ];
-            
-            let mut fallback_message_numbers: HashSet<u32> = HashSet::new();
-            for search_term in fallback_search_terms {
-                match session.search(&search_term) {
-                    Ok(messages) => {
-                        let count = messages.len();
-                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fallback search '{}' found {} messages", search_term, count);
-                        fallback_message_numbers.extend(messages.iter().cloned());
+            println!("[RUST] fetch_sent_emails_from_gmail_optimized: SINCE search returned {} candidates", candidate_numbers.len());
+
+            // Two-phase fetch: check body text first, then fetch full RFC822 only for matches
+            if !candidate_numbers.is_empty() {
+                let range = candidate_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+                match session.fetch(&range, "(BODY.PEEK[TEXT] UID)") {
+                    Ok(fetched) => {
+                        for msg in fetched.iter() {
+                            if let Some(text_section) = msg.text() {
+                                let text_str = String::from_utf8_lossy(text_section);
+                                if text_str.contains("BEGIN NOSTR") {
+                                    let seq = msg.message;
+                                    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Found nostr email at seq {}", seq);
+                                    message_numbers.push(seq);
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
-                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fallback search '{}' failed: {}", search_term, e);
+                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Body text fetch failed: {}", e);
                     }
                 }
             }
-            message_numbers = fallback_message_numbers.into_iter().collect();
-            println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fallback search found {} total messages", message_numbers.len());
+            println!("[RUST] fetch_sent_emails_from_gmail_optimized: Client-side filter matched {} nostr emails", message_numbers.len());
+        }
+        Err(e) => {
+            println!("[RUST] fetch_sent_emails_from_gmail_optimized: SINCE search failed: {}", e);
         }
     }
-    
+
     // Also search the nostr-mail folder for previously-moved sent emails
     let mut nostr_folder_messages_raw: Vec<Vec<u8>> = Vec::new();
     if let Ok(_) = session.select("nostr-mail") {
-        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Also searching nostr-mail folder for sent emails");
-        // Filter by FROM to only get emails we sent (not received ones also moved to nostr-mail)
-        let from_filter = format!(" FROM \"{}\"", config.email_address);
-        let nostr_search_terms = vec![
-            format!("TEXT \"BEGIN NOSTR\"{}{}", since_filter, from_filter),
-            format!("HEADER X-Nostr-Pubkey \"\"{}{}", since_filter, from_filter),
-        ];
-        let mut nostr_msg_numbers: HashSet<u32> = HashSet::new();
-        for search_term in &nostr_search_terms {
-            if let Ok(msgs) = session.search(search_term) {
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: nostr-mail folder search '{}' found {} messages", search_term, msgs.len());
-                nostr_msg_numbers.extend(msgs.iter().cloned());
-            }
-        }
-        if !nostr_msg_numbers.is_empty() {
-            let nostr_nums: Vec<u32> = nostr_msg_numbers.into_iter().collect();
-            if let Ok(fetched) = session.fetch(nostr_nums.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822") {
-                for msg in fetched.iter() {
-                    if let Some(body) = msg.body() {
-                        nostr_folder_messages_raw.push(body.to_vec());
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Searching nostr-mail folder for sent emails");
+        let nostr_search = if latest.is_some() {
+            let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+            format!("SINCE {} FROM \"{}\"", since_date, config.email_address)
+        } else {
+            format!("FROM \"{}\"", config.email_address)
+        };
+        match session.search(&nostr_search) {
+            Ok(msgs) => {
+                let msg_numbers: Vec<u32> = msgs.iter().cloned().collect();
+                println!("[RUST] fetch_sent_emails_from_gmail_optimized: nostr-mail folder SINCE+FROM found {} candidates", msg_numbers.len());
+                if !msg_numbers.is_empty() {
+                    let range = msg_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+                    if let Ok(fetched) = session.fetch(&range, "RFC822") {
+                        for msg in fetched.iter() {
+                            if let Some(body) = msg.body() {
+                                let body_str = String::from_utf8_lossy(body);
+                                if body_str.contains("BEGIN NOSTR") {
+                                    nostr_folder_messages_raw.push(body.to_vec());
+                                }
+                            }
+                        }
+                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Matched {} nostr emails from nostr-mail folder", nostr_folder_messages_raw.len());
                     }
                 }
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fetched {} messages from nostr-mail folder", nostr_folder_messages_raw.len());
+            }
+            Err(e) => {
+                println!("[RUST] fetch_sent_emails_from_gmail_optimized: nostr-mail folder search failed: {}", e);
             }
         }
         // Re-select sent folder for any remaining operations
-        let _ = session.select("[Gmail]/Sent Mail");
+        let _ = session.select(sent_folder);
     }
 
     if message_numbers.is_empty() && nostr_folder_messages_raw.is_empty() {
@@ -5374,11 +5391,22 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
 } 
 
 pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyhow::Result<usize> {
-    
+
     println!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
-    // Fetch latest sent email date from DB using the user's email address
-    let latest = db.get_latest_sent_email_received_at(Some(&config.email_address))?;
-    println!("[RUST] sync_sent_emails_to_db: Latest sent email date: {:?}", latest);
+    // Use the last successful sync timestamp, falling back to the latest sent email date
+    let sync_timestamp = chrono::Utc::now();
+    let latest = match db.get_last_sync_at(&config.email_address, "sent")? {
+        Some(dt) => {
+            println!("[RUST] sync_sent_emails_to_db: Last sent sync at: {:?}", dt);
+            Some(dt)
+        }
+        None => {
+            // First sync with new timestamp tracking — fall back to latest email date
+            let fallback = db.get_latest_sent_email_received_at(Some(&config.email_address))?;
+            println!("[RUST] sync_sent_emails_to_db: No sync timestamp found, falling back to latest sent email date: {:?}", fallback);
+            fallback
+        }
+    };
     
     // Fetch new sent Nostr emails from IMAP (raw, not decrypted)
     // Sync from most recent email sent onward
@@ -5542,9 +5570,13 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
             }
         }
     }
-    println!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved", new_count);
+    // Save the sync timestamp so the next sync starts from this point in time
+    if let Err(e) = db.set_last_sync_at(&config.email_address, "sent", sync_timestamp) {
+        println!("[RUST] sync_sent_emails_to_db: Warning: failed to save sync timestamp: {}", e);
+    }
+    println!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved (sync timestamp: {})", new_count, sync_timestamp);
     Ok(new_count)
-} 
+}
 
 pub struct RawNostrEmail {
     pub message_id: String,
@@ -6224,17 +6256,25 @@ fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::i
     // Use LIST to get all mailboxes
     let mailboxes = session.list(Some(""), Some("*"))?;
     
-    // Common sent folder names (case-insensitive)
-    let sent_patterns = vec![
-        "sent",
-        "sent mail",
-        "sent items",
-        "[gmail]/sent mail",
-    ];
-    
+    // Check for Gmail-specific sent folder first (most specific match)
     for mailbox in mailboxes.iter() {
         let mailbox_name = mailbox.name().to_lowercase();
-        
+        if mailbox_name == "[gmail]/sent mail" {
+            println!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
+            return Ok(Some(mailbox.name().to_string()));
+        }
+    }
+
+    // Common sent folder names (case-insensitive), ordered by specificity
+    let sent_patterns = vec![
+        "sent mail",
+        "sent items",
+        "sent",
+    ];
+
+    for mailbox in mailboxes.iter() {
+        let mailbox_name = mailbox.name().to_lowercase();
+
         // Check if this mailbox matches any sent pattern
         for pattern in &sent_patterns {
             if mailbox_name.contains(pattern) {
@@ -6330,7 +6370,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
         let emails_result: anyhow::Result<Vec<RawNostrEmail>> = if is_gmail {
             // Pass latest directly to the optimized function
             // fetch_sent_emails_from_gmail_optimized now returns emails and attachments
-            let (email_msgs, attachments_map) = fetch_sent_emails_from_gmail_optimized(&mut session, config, latest)?;
+            let (email_msgs, attachments_map) = fetch_sent_emails_from_gmail_optimized(&mut session, config, latest, &sent_folder)?;
             
             // Create a HashMap for quick lookup of attachments by message_id
             let attachments_by_msg_id: std::collections::HashMap<String, Vec<crate::database::Attachment>> = attachments_map.into_iter().collect();
@@ -6539,7 +6579,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
         let emails_result: anyhow::Result<Vec<RawNostrEmail>> = if is_gmail {
             // Pass latest directly to the optimized function
             // fetch_sent_emails_from_gmail_optimized now returns emails and attachments
-            let (email_msgs, attachments_map) = fetch_sent_emails_from_gmail_optimized(&mut session, config, latest)?;
+            let (email_msgs, attachments_map) = fetch_sent_emails_from_gmail_optimized(&mut session, config, latest, &sent_folder)?;
             
             // Create a HashMap for quick lookup of attachments by message_id
             let attachments_by_msg_id: std::collections::HashMap<String, Vec<crate::database::Attachment>> = attachments_map.into_iter().collect();

@@ -1122,7 +1122,13 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             currentBody, currentSubject, pubkey, null
                         );
                         if (result.success) {
-                            domManager.setValue('messageBody', result.body);
+                            // Re-attach quoted original armor so the reply chain
+                            // survives decrypt→edit→re-encrypt cycles in compose.
+                            let decryptedBody = result.body;
+                            if (window.emailService?._quotedOriginalArmor) {
+                                decryptedBody += '\n\n' + window.emailService._quotedOriginalArmor;
+                            }
+                            domManager.setValue('messageBody', decryptedBody);
                             domManager.setValue('subject', result.subject);
                             if (window.emailService) window.emailService.clearSignature();
                             const nip = result.blockResults?.[0]?.bodyType === 'encrypted'

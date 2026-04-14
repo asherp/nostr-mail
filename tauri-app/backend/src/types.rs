@@ -317,6 +317,11 @@ pub struct DecryptEmailResult {
     pub error: Option<String>,
     /// Subject ciphertext (after glossia decode, before NIP decrypt) for DM↔email hash matching
     pub subject_ciphertext: Option<String>,
+    /// Sender pubkey extracted from outermost armor signature block (npub bech32),
+    /// populated when the X-Nostr-Pubkey header is absent but a valid inline signature exists.
+    /// The frontend can use this to backfill sender_pubkey in the DB for avatar lookup.
+    #[serde(default)]
+    pub sender_pubkey: Option<String>,
 }
 
 /// Result from the decrypt_manifest_attachment Tauri command.

@@ -1070,9 +1070,10 @@ pub async fn fetch_emails(config: &EmailConfig, limit: usize, search_query: Opti
     }
     
     // After collecting all emails, filter for Nostr if needed (only for non-Gmail or when not using optimization)
+    // Accept emails with X-Nostr-Pubkey header OR a verified inline armor signature
     if only_nostr && !use_gmail_optimization {
         sorted_emails.retain(|email| {
-            email.raw_headers.contains("X-Nostr-Pubkey:")
+            email.sender_pubkey.is_some()
         });
     }
     
@@ -1224,7 +1225,7 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     (subject.clone(), body_text.clone())
                 };
 
-                let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                 
                 let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -1361,7 +1362,7 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     (subject.clone(), body_text.clone())
                 };
                 
-                let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                 
                 let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -1779,7 +1780,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         }
                     };
                     
-                    let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                    let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                     
                     let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -2062,7 +2063,7 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                     // Just save the encrypted content as-is.
                     let (_final_subject, _final_body) = (subject.clone(), body_text.clone());
                     
-                    let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                    let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                     
                     let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -2236,6 +2237,33 @@ pub fn extract_nostr_pubkey_from_headers(raw_headers: &str) -> Option<String> {
     for line in raw_headers.lines() {
         if line.to_lowercase().starts_with("x-nostr-pubkey:") {
             return Some(line.split_once(':').unwrap_or(("", "")).1.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract sender pubkey from headers, falling back to the outermost armor
+/// signature block's pubkey when the `X-Nostr-Pubkey` header is absent.
+/// The armor pubkey is only used if its inline signature verifies successfully,
+/// and is converted from hex to npub (bech32) to match the header format.
+pub fn extract_sender_pubkey_with_armor_fallback(raw_headers: &str, body_text: &str) -> Option<String> {
+    if let Some(pk) = extract_nostr_pubkey_from_headers(raw_headers) {
+        return Some(pk);
+    }
+    // No header — try the outermost armor signature block
+    if let Some(parsed) = parse_armor_components(body_text) {
+        if let (Some(sig_hex), Some(pubkey_hex)) = (&parsed.signature_hex, &parsed.sig_pubkey_hex) {
+            // Verify the signature before trusting this pubkey
+            let binary = extract_ciphertext_binary(body_text);
+            if let Ok(true) = crate::crypto::verify_signature_bytes(pubkey_hex, sig_hex, &binary) {
+                // Convert hex pubkey to npub bech32
+                if let Ok(pk) = nostr_sdk::prelude::PublicKey::from_hex(pubkey_hex) {
+                    // to_bech32 is infallible for PublicKey
+                    let npub = nostr_sdk::prelude::ToBech32::to_bech32(&pk).expect("bech32 encode");
+                    println!("[RUST] extract_sender_pubkey_with_armor_fallback: using verified armor pubkey {} ({})", &npub[..std::cmp::min(npub.len(), 20)], &pubkey_hex[..std::cmp::min(pubkey_hex.len(), 16)]);
+                    return Some(npub);
+                }
+            }
         }
     }
     None
@@ -2592,7 +2620,7 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
 
     // Build the capnp ArmorMessage — this is the parsing target
     let mut capnp_msg = ::capnp::message::Builder::new_default();
-    let prefix_text = {
+    let (prefix_text, raw_quoted_text) = {
         let armor_builder = capnp_msg.init_root::<nostr_mail_capnp::armor_message::Builder>();
         populate_armor_from_text(armor_builder, armor_text)?
     };
@@ -2601,6 +2629,12 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
     let reader = capnp_msg.get_root_as_reader::<nostr_mail_capnp::armor_message::Reader>().ok()?;
     let mut result = armor_message_to_serde(reader);
     result.prefix_text = prefix_text;
+    // Override quoted_armor_text with the verbatim text from the input (the capnp
+    // encoded_content field only stores the inner body text, losing delimiters,
+    // signatures, and deeper nesting levels).
+    if raw_quoted_text.is_some() {
+        result.quoted_armor_text = raw_quoted_text;
+    }
 
     println!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
         result.body_type, result.encryption_nip, result.signature_hex.is_some(),
@@ -2611,11 +2645,13 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
 
 /// Populate a capnp ArmorMessage builder from armor text.
 /// Writes directly into capnp builders — the capnp message IS the parsing result.
-/// Returns the prefix text (plaintext before the first armor delimiter), or None if no armor found.
+/// Returns (prefix_text, quoted_armor_text) or None if no armor found.
+/// `quoted_armor_text` is the raw text of nested quoted levels (with delimiters and signatures),
+/// preserved verbatim from the input for round-tripping.
 fn populate_armor_from_text(
     mut armor_builder: crate::nostr_mail_capnp::armor_message::Builder<'_>,
     armor_text: &str,
-) -> Option<Option<String>> {
+) -> Option<(Option<String>, Option<String>)> {
     use crate::nostr_mail_capnp;
 
     let normalized = armor_text.replace("\r\n", "\n");
@@ -2755,14 +2791,19 @@ fn populate_armor_from_text(
         else if *l == ">" { "" }
         else { *l }
     }).collect();
-    if !stripped_quoted.is_empty() {
+    let raw_quoted_text = if !stripped_quoted.is_empty() {
         let quoted_text = stripped_quoted.join("\n").trim().to_string();
         if !quoted_text.is_empty() {
             let quoted_builder = body_builder.init_quoted();
             // Recursive: populate the nested ArmorMessage
             populate_armor_from_text(quoted_builder, &quoted_text);
+            Some(quoted_text)
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     // Signature block: decode sig+pubkey, write to capnp
     if !sig_lines.is_empty() {
@@ -2812,7 +2853,7 @@ fn populate_armor_from_text(
         }
     }
 
-    Some(prefix_text)
+    Some((prefix_text, raw_quoted_text))
 }
 
 /// Read a capnp ArmorMessage and produce a serde-friendly ParsedArmorMessage.
@@ -2918,24 +2959,15 @@ fn armor_message_to_serde(reader: crate::nostr_mail_capnp::armor_message::Reader
     let display_name = seal_display_name.or_else(|| profile_name.clone());
 
     // Read quoted (recursive)
+    // Note: quoted_armor_text is set to None here — parse_armor_components overrides
+    // it with the verbatim text from the input, since capnp only stores structured
+    // fields (encoded_content), not the full armor with delimiters and signatures.
     let (quoted, quoted_armor_text) = if reader.has_body() {
         if let Ok(body) = reader.get_body() {
             if body.has_quoted() {
                 if let Ok(quoted_reader) = body.get_quoted() {
                     let inner = armor_message_to_serde(quoted_reader);
-                    // Reconstruct quoted armor text from the inner encodedContent for JS compat
-                    let qt = if quoted_reader.has_body() {
-                        quoted_reader.get_body().ok().and_then(|b| {
-                            if b.has_encoded_content() {
-                                b.get_encoded_content().ok().and_then(|s| s.to_str().ok()).map(|s| s.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                    } else {
-                        None
-                    };
-                    (Some(Box::new(inner)), qt)
+                    (Some(Box::new(inner)), None)
                 } else {
                     (None, None)
                 }
@@ -3514,6 +3546,7 @@ pub fn decrypt_email_body_pipeline(
                 success: false,
                 error: Some("No armor block found in email body".to_string()),
                 subject_ciphertext: None,
+                sender_pubkey: None,
             });
         }
     };
@@ -3579,8 +3612,28 @@ pub fn decrypt_email_body_pipeline(
         (subject.to_string(), None)
     };
 
-    println!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={}",
-        success, is_manifest, block_results.len(), attachments.len());
+    // Extract sender pubkey from outermost armor signature (for avatar fallback)
+    let armor_sender_pubkey = if sender_pubkey.is_none() {
+        // No header-provided pubkey — try to derive from verified armor signature
+        parsed.sig_pubkey_hex.as_deref().and_then(|pk_hex| {
+            parsed.signature_hex.as_deref().and_then(|sig_hex| {
+                let binary = extract_ciphertext_binary(armor_text);
+                match crate::crypto::verify_signature_bytes(pk_hex, sig_hex, &binary) {
+                    Ok(true) => {
+                        nostr_sdk::prelude::PublicKey::from_hex(pk_hex).ok()
+                            .and_then(|pk| nostr_sdk::prelude::ToBech32::to_bech32(&pk).ok())
+                    }
+                    _ => None,
+                }
+            })
+        })
+    } else {
+        None
+    };
+
+    println!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={} armor_sender_pubkey={:?}",
+        success, is_manifest, block_results.len(), attachments.len(),
+        armor_sender_pubkey.as_deref().map(|s: &str| &s[..std::cmp::min(s.len(), 20)]));
 
     Ok(crate::types::DecryptEmailResult {
         subject: decrypted_subject,
@@ -3591,6 +3644,7 @@ pub fn decrypt_email_body_pipeline(
         success,
         error,
         subject_ciphertext,
+        sender_pubkey: armor_sender_pubkey,
     })
 }
 
@@ -5086,7 +5140,7 @@ mod tests {
 
 pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database::Database) -> Result<Vec<EmailMessage>> {
     use chrono::Utc;
-    use crate::email::extract_nostr_pubkey_from_headers;
+    use crate::email::extract_sender_pubkey_with_armor_fallback;
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -5146,7 +5200,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
                                 Err(_) => (subject.clone(), body_text.clone()),
                             };
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             
                             let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -5218,7 +5272,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                     Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
                                     Err(_) => (subject.clone(), body_text.clone()),
                                 };
-                                let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                                let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                                 
                                 let (signature_valid, signature_source) = verify_email_signature_full(&_final_body, &raw_headers);
 
@@ -5681,7 +5735,7 @@ pub struct RawNostrEmail {
 async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>, sync_cutoff_days: Option<i64>, folder_name: &str) -> anyhow::Result<Vec<RawNostrEmail>> {
     use chrono::Utc;
     use mailparse::parse_mail;
-    use crate::email::extract_nostr_pubkey_from_headers;
+    use crate::email::extract_sender_pubkey_with_armor_fallback;
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -5763,7 +5817,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                        let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                        let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                         
                         let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -5853,7 +5907,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                     
                     let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                    let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                    let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                     
                     let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -5967,7 +6021,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                                 .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             
                             let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -6057,7 +6111,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                        let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                        let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                         
                         let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -6104,7 +6158,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
 async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>, sync_cutoff_days: Option<i64>) -> anyhow::Result<Vec<RawNostrEmail>> {
     use chrono::Utc;
     use mailparse::parse_mail;
-    use crate::email::extract_nostr_pubkey_from_headers;
+    use crate::email::extract_sender_pubkey_with_armor_fallback;
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -6186,7 +6240,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                         println!("[RUST] fetch_sent_emails_smart_raw: Extracted {} attachments from email", extracted_attachments.len());
                         
-                        let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                        let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                         
                         let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -6290,7 +6344,7 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                                 .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             
                             let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -6373,7 +6427,7 @@ fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::i
 async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<Vec<RawNostrEmail>> {
     use chrono::Utc;
     use mailparse::parse_mail;
-    use crate::email::extract_nostr_pubkey_from_headers;
+    use crate::email::{extract_nostr_pubkey_from_headers, extract_sender_pubkey_with_armor_fallback};
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -6471,7 +6525,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                     }
                     // For sent emails, extract sender_pubkey from headers (it's included when we send)
                     // and try to find recipient_pubkey from contacts
-                    let sender_pubkey = extract_nostr_pubkey_from_headers(&em.raw_headers);
+                    let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&em.raw_headers, &em.body);
                     let recipient_pubkey = None; // Will be populated during sync if contact exists
                     raw_emails.push(RawNostrEmail {
                         message_id: msg_id.clone(),
@@ -6530,7 +6584,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             
                             let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
 
@@ -6750,7 +6804,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             let recipient_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                             
                             let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);

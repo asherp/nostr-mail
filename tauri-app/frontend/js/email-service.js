@@ -870,7 +870,11 @@ class EmailService {
         // Extract body text and quoted armor for backend byte extraction
         const parts = this.parseArmorComponents(body);
         const bodyText = (parts && parts.bodyText) ? parts.bodyText : body;
-        const quotedArmor = (parts && parts.quotedArmor) ? parts.quotedArmor : null;
+        // Use quoted armor from DOM body (if already nested) or from stored reply context.
+        // During reply compose, the DOM only has the outermost body; the nested quoted
+        // levels are in _quotedOriginalArmor and must be included so the signature covers
+        // the full conversation chain per spec section 3.5.0.
+        const quotedArmor = (parts && parts.quotedArmor) ? parts.quotedArmor : this._quotedOriginalArmor;
 
         // Extract signable bytes via backend (handles glossia decode + nested concatenation)
         const rawBytes = await TauriService.extractSignableBytes(bodyText, true, quotedArmor, null);
@@ -1422,7 +1426,8 @@ class EmailService {
             const labelSpan = encryptBtn.querySelector('.encrypt-btn-label');
             
             if (iconSpan) iconSpan.className = 'fas fa-lock';
-            if (labelSpan) labelSpan.textContent = 'Encrypt';
+            const algo = appState.getSettings()?.encryption_algorithm || 'nip44';
+            if (labelSpan) labelSpan.textContent = algo === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
             encryptBtn.dataset.encrypted = 'false';
             
             // Re-enable editing
@@ -2640,6 +2645,15 @@ class EmailService {
                                     }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
                                 });
                             }
+                            // Backfill sender_pubkey from armor signature if header was missing
+                            if (result.senderPubkey && !email.sender_pubkey && email.id) {
+                                console.log('[JS] Backfilling sender_pubkey from armor:', result.senderPubkey.substring(0, 20) + '...');
+                                email.sender_pubkey = result.senderPubkey;
+                                window.__TAURI__.core.invoke('db_update_email_sender_pubkey_by_id', {
+                                    id: typeof email.id === 'number' ? email.id : parseInt(email.id, 10),
+                                    senderPubkey: result.senderPubkey,
+                                }).catch(e => console.warn('[JS] Failed to backfill sender_pubkey:', e));
+                            }
                         } catch (e) {
                             console.error('[JS] Backend decrypt failed for inbox preview:', e);
                             previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
@@ -3128,6 +3142,16 @@ class EmailService {
                                 sigResults = allSigs.length > 0 ? allSigs : null;
                             } catch (e) {
                                 console.warn('[JS] Signature verification error:', e);
+                            }
+
+                            // Backfill sender_pubkey from armor signature if header was missing
+                            if (result.senderPubkey && !email.sender_pubkey && email.id) {
+                                console.log('[JS] Backfilling sender_pubkey from armor (detail):', result.senderPubkey.substring(0, 20) + '...');
+                                email.sender_pubkey = result.senderPubkey;
+                                window.__TAURI__.core.invoke('db_update_email_sender_pubkey_by_id', {
+                                    id: typeof email.id === 'number' ? email.id : parseInt(email.id, 10),
+                                    senderPubkey: result.senderPubkey,
+                                }).catch(e => console.warn('[JS] Failed to backfill sender_pubkey:', e));
                             }
 
                             await updateDetail(decryptedSubject, decryptedBody, manifestResult, result.success, sigResults, decryptResults);
@@ -5543,7 +5567,24 @@ ${attachmentsHtml}
                 previewText = 'Unable to decrypt: no keypair';
             } else {
                 try {
-                    const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
+                    let recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
+                    // If no recipient pubkey, try DB lookup by email address (same as detail view)
+                    if (!recipientPubkey) {
+                        const recipientEmail = email.to || email.to_address;
+                        if (recipientEmail) {
+                            try {
+                                let pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email_including_dms', { email: recipientEmail });
+                                if (!pubkeys || pubkeys.length === 0) {
+                                    pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
+                                }
+                                if (pubkeys && pubkeys.length > 0) {
+                                    recipientPubkey = pubkeys[0];
+                                }
+                            } catch (e) {
+                                console.warn('[JS] Sent preview: pubkey lookup failed for', recipientEmail, e);
+                            }
+                        }
+                    }
                     const result = await TauriService.decryptEmailBody(
                         email.body, email.subject,
                         null, recipientPubkey
@@ -5555,6 +5596,12 @@ ${attachmentsHtml}
                         showSubject = true;
                     } else {
                         previewText = 'Could not decrypt';
+                    }
+                    // Backfill recipient_pubkey to DB if discovered via lookup
+                    if (result.success && recipientPubkey && !email.recipient_pubkey && email.id) {
+                        email.recipient_pubkey = recipientPubkey;
+                        this._saveRecipientPubkeyToDb(email, recipientPubkey)
+                            .catch(e => console.warn('[JS] Failed to backfill recipient_pubkey:', e));
                     }
                     // Update subject_hash for DM↔email matching
                     if (result.subjectCiphertext && email.message_id) {

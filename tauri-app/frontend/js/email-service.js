@@ -2615,9 +2615,13 @@ class EmailService {
                 let showSubject = false;
                 let previewSubject = email.subject;
 
-                // Detect any NOSTR NIP-X ENCRYPTED MESSAGE
-                const armorRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/;
-                if (email.body && armorRegex.test(email.body)) {
+                // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
+                // Nested blocks (quoted replies) may be a different type — only the
+                // outermost block determines whether this is an encrypted or signed message.
+                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+                const outerIsEncrypted = firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+
+                if (outerIsEncrypted) {
                     const keypair = appState.getKeypair();
                     if (!keypair) {
                         previewText = 'Unable to decrypt: no keypair';
@@ -4302,14 +4306,15 @@ ${attachmentsHtml}
      * Returns { plaintextBody, glossiaBody, sigContent, sealContent, profileName, displayName } or null.
      */
     async decodeGlossiaSignedMessage(plainBody) {
-        if (!plainBody) return null;
+        if (!plainBody) { console.log('[JS] decodeGlossiaSignedMessage: no body'); return null; }
 
         // Delegate parsing to the depth-counting parseArmorComponents
         const parts = await this.parseArmorComponents(plainBody);
-        if (!parts) return null;
+        if (!parts) { console.log('[JS] decodeGlossiaSignedMessage: parseArmorComponents returned null, body preview:', plainBody.substring(0, 120)); return null; }
 
         const glossiaBody = parts.bodyText;
         const { sigContent, sealContent, profileName, displayName, quotedArmor } = parts;
+        console.log('[JS] decodeGlossiaSignedMessage: parsed armor, bodyText len=', glossiaBody.length, 'isEncrypted=', parts.isEncryptedBody, 'preview:', glossiaBody.substring(0, 80));
 
         // Decode glossia body → original UTF-8 plaintext
         // Use transcodeToBytes (full pipeline with header word), not decodeToBytes (raw base_n)
@@ -4318,15 +4323,19 @@ ${attachmentsHtml}
         if (gs) {
             try {
                 const bytes = await gs.transcodeToBytes(glossiaBody);
+                console.log('[JS] decodeGlossiaSignedMessage: transcodeToBytes returned', bytes ? `${bytes.length} bytes` : 'null');
                 if (bytes) {
                     plaintextBody = new TextDecoder().decode(bytes);
+                    console.log('[JS] decodeGlossiaSignedMessage: decoded plaintext:', plaintextBody.substring(0, 80));
                 }
             } catch (e) {
                 console.warn('[JS] decodeGlossiaSignedMessage: transcodeToBytes failed:', e);
             }
+        } else {
+            console.warn('[JS] decodeGlossiaSignedMessage: GlossiaService not available');
         }
 
-        return { plaintextBody, glossiaBody, sigContent, sealContent, profileName, displayName, quotedArmor };
+        return { plaintextBody, glossiaBody, sigContent, sealContent, profileName, displayName, quotedArmor, isEncryptedBody: parts.isEncryptedBody };
     }
 
     /**
@@ -5545,19 +5554,15 @@ ${attachmentsHtml}
             dateDisplay = emailDate.toLocaleDateString();
         }
         
-        // Decode glossia signed message body for preview
-        let sentPreviewBody = email.body || '';
-        const sentSignedMsg = await this.decodeGlossiaSignedMessage(sentPreviewBody);
-        if (sentSignedMsg && sentSignedMsg.plaintextBody) {
-            sentPreviewBody = sentSignedMsg.plaintextBody;
-        }
-        let previewText = sentPreviewBody ? Utils.escapeHtml(sentPreviewBody.substring(0, 100)) : '';
+        let previewText = '';
         let showSubject = true;
         let previewSubject = email.subject;
 
-        // Detect any NOSTR NIP-X ENCRYPTED MESSAGE (same as inbox)
-        const armorRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/;
-        if (email.body && armorRegex.test(email.body)) {
+        // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
+        const sentFirstBegin = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+        const sentOuterIsEncrypted = sentFirstBegin && /NIP-\d+ ENCRYPTED/.test(sentFirstBegin[1]);
+
+        if (sentOuterIsEncrypted) {
             const keypair = appState.getKeypair();
             if (!keypair) {
                 previewText = 'Unable to decrypt: no keypair';
@@ -5614,8 +5619,12 @@ ${attachmentsHtml}
                 }
             }
         } else {
-            // Body has no armor — not encrypted, show plaintext as-is
-            // (sentSignedMsg already decoded above if signed message armor present)
+            // Decode glossia signed message body for preview
+            let sentPreviewBody = email.body || '';
+            const sentSignedMsg = await this.decodeGlossiaSignedMessage(sentPreviewBody);
+            if (sentSignedMsg && sentSignedMsg.plaintextBody) {
+                sentPreviewBody = sentSignedMsg.plaintextBody;
+            }
             previewText = Utils.escapeHtml(sentPreviewBody ? sentPreviewBody.substring(0, 100) : '');
             if (sentPreviewBody && sentPreviewBody.length > 100) previewText += '...';
             showSubject = true;
@@ -7679,19 +7688,15 @@ ${attachmentsHtml}
             dateDisplay = draftDate.toLocaleDateString();
         }
 
-        // Decode glossia signed message body for preview
-        let draftPreviewBody = draft.body || '';
-        const draftSignedMsg = await this.decodeGlossiaSignedMessage(draftPreviewBody);
-        if (draftSignedMsg && draftSignedMsg.plaintextBody) {
-            draftPreviewBody = draftSignedMsg.plaintextBody;
-        }
-        let previewText = draftPreviewBody ? Utils.escapeHtml(draftPreviewBody.substring(0, 100)) : '';
+        let previewText = '';
         let showSubject = true;
         let previewSubject = draft.subject;
 
-        // Detect any NOSTR NIP-X ENCRYPTED MESSAGE
-        const armorRegex = /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/;
-        if (draft.body && armorRegex.test(draft.body)) {
+        // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
+        const draftFirstBegin = draft.body && draft.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+        const draftOuterIsEncrypted = draftFirstBegin && /NIP-\d+ ENCRYPTED/.test(draftFirstBegin[1]);
+
+        if (draftOuterIsEncrypted) {
             const keypair = appState.getKeypair();
             if (!keypair) {
                 previewText = 'Unable to decrypt: no keypair';
@@ -7716,6 +7721,12 @@ ${attachmentsHtml}
                 }
             }
         } else {
+            // Decode glossia signed message body for preview
+            let draftPreviewBody = draft.body || '';
+            const draftSignedMsg = await this.decodeGlossiaSignedMessage(draftPreviewBody);
+            if (draftSignedMsg && draftSignedMsg.plaintextBody) {
+                draftPreviewBody = draftSignedMsg.plaintextBody;
+            }
             previewText = Utils.escapeHtml(draftPreviewBody ? draftPreviewBody.substring(0, 100) : '');
             if (draftPreviewBody && draftPreviewBody.length > 100) previewText += '...';
             showSubject = true;

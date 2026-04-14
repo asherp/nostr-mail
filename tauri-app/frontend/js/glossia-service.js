@@ -125,13 +125,19 @@ const GlossiaService = {
             const dialect = detections[0].language;
             if (!dialect) return null;
             const result = await this.transcode(text, `decode from ${dialect}`);
-            let hex = result.output;
-            if (!hex || !this._isHex(hex)) return null;
-            const bytes = new Uint8Array(hex.length / 2);
-            for (let i = 0; i < bytes.length; i++) {
-                bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+            let output = result.output;
+            if (!output) return null;
+            if (this._isHex(output)) {
+                const bytes = new Uint8Array(output.length / 2);
+                for (let i = 0; i < bytes.length; i++) {
+                    bytes[i] = parseInt(output.substr(i * 2, 2), 16);
+                }
+                return bytes;
             }
-            return bytes;
+            // Decoded output is UTF-8 plaintext (Rust decoder returns the
+            // original string when the bytes are valid UTF-8, e.g. signed
+            // plaintext bodies encoded as Ascii7).
+            return new TextEncoder().encode(output);
         } catch (e) {
             console.warn('[GlossiaService] transcodeToBytes failed:', e);
             return null;

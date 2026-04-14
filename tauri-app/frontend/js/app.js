@@ -1368,9 +1368,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         notificationService.showError('Failed to sign: ' + error);
                     }
                 } else {
-                    // Block unsigning NIP-04 messages (spec section 4.1)
+                    // Block unsigning NIP-04 messages that arrived pre-signed
+                    // (no original body to restore). Allow unsigning if the user
+                    // signed it themselves this session (originalBody is saved).
                     const bodyContent = domManager.getValue('messageBody') || '';
-                    if (bodyContent.includes('NIP-04 ENCRYPTED')) {
+                    if (bodyContent.includes('NIP-04 ENCRYPTED') &&
+                        signBtn.dataset.originalBody === undefined) {
                         notificationService.showError(
                             'Cannot remove signature from NIP-04 encrypted messages. ' +
                             'NIP-04 requires signing for security.'

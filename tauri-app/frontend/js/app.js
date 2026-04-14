@@ -1249,9 +1249,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
                         let encodedSig, encodedPubkey, encodedSigPubkey = null;
 
-                        if (gs && gs.isReady()) {
+                        if (gs) {
                             // Glossia available: encode sig and pubkey separately
-                            const result = gs.encodeSigPubkey(signature, pubkeyHex, metaSig, metaPubkey);
+                            const result = await gs.encodeSigPubkey(signature, pubkeyHex, metaSig, metaPubkey);
                             encodedSig = result.encodedSig;
                             encodedPubkey = result.encodedPubkey;
                         } else {
@@ -1296,11 +1296,11 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                 ? bodyValue + '\n\n' + quotedPlaintext
                                 : bodyValue;
                             let plainBodyText = bodyValue;
-                            if (gs && gs.isReady()) {
+                            if (gs) {
                                 const metaBody = window.emailService?.getGlossiaEncoding();
                                 if (metaBody) {
                                     try {
-                                        const encoded = gs.transcode(bodyValue, `encode into ${metaBody}`);
+                                        const encoded = await gs.transcode(bodyValue, `encode into ${metaBody}`);
                                         plainBodyText = encoded.output;
                                     } catch (e) {
                                         console.warn('[JS] Sign: glossia-encode plaintext body failed:', e);
@@ -1325,7 +1325,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         // Build HTML alternative body for multipart email
                         if (window.emailService) {
                             // Build quoted HTML recursively for all nesting levels
-                            const quotedHtmlContent = window.emailService.buildRecursiveQuotedHtml(
+                            const quotedHtmlContent = await window.emailService.buildRecursiveQuotedHtml(
                                 window.emailService._quotedOriginalArmor, quotedPlaintext
                             );
                             // bodyValue is already the body content from parseArmorComponents (no armor tags)
@@ -1339,11 +1339,11 @@ NostrMailApp.prototype.setupEventListeners = function() {
                                 ? bodyValue + '\n\n' + quotedPlaintext
                                 : (isEncrypted ? null : bodyValue);
                             let plainBodyText = bodyValue;
-                            if (!isEncrypted && gs && gs.isReady()) {
+                            if (!isEncrypted && gs) {
                                 const metaBody = window.emailService?.getGlossiaEncoding();
                                 if (metaBody) {
                                     try {
-                                        const encoded = gs.transcode(bodyValue, `encode into ${metaBody}`);
+                                        const encoded = await gs.transcode(bodyValue, `encode into ${metaBody}`);
                                         plainBodyText = encoded.output;
                                     } catch (e) {
                                         console.warn('[JS] Failed to glossia-encode plaintext body:', e);

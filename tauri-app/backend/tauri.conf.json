@@ -4,8 +4,8 @@
   "version": "1.0.4-beta",
   "identifier": "com.nostr.mail",
   "build": {
-    "beforeDevCommand": "cd ../glossia && ./build_web.sh && cp web/glossia.js web/glossia_bg.wasm ../tauri-app/frontend/js/pkg/",
-    "beforeBuildCommand": "cd ../glossia && ./build_web.sh && cp web/glossia.js web/glossia_bg.wasm ../tauri-app/frontend/js/pkg/",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
     "frontendDist": "../frontend"
   },
   "app": {

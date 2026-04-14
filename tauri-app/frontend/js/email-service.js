@@ -868,7 +868,7 @@ class EmailService {
         const body = domManager.getValue('messageBody') || '';
 
         // Extract body text and quoted armor for backend byte extraction
-        const parts = this.parseArmorComponents(body);
+        const parts = await this.parseArmorComponents(body);
         const bodyText = (parts && parts.bodyText) ? parts.bodyText : body;
         // Use quoted armor from DOM body (if already nested) or from stored reply context.
         // During reply compose, the DOM only has the outermost body; the nested quoted
@@ -986,9 +986,9 @@ class EmailService {
 
     // Recursively build HTML for nested quoted armor at all nesting levels.
     // plaintextFallback: plaintext extracted from parent's prefixText for when glossia decode fails.
-    buildRecursiveQuotedHtml(armorText, plaintextFallback) {
+    async buildRecursiveQuotedHtml(armorText, plaintextFallback) {
         if (!armorText) return null;
-        const qParts = this.parseArmorComponents(armorText);
+        const qParts = await this.parseArmorComponents(armorText);
         if (!qParts) return null;
 
         // Determine plaintext fallback for this level and deeper levels.
@@ -1025,7 +1025,7 @@ class EmailService {
         // Recurse into deeper quoted content first
         let deeperHtml = null;
         if (qParts.quotedArmor) {
-            deeperHtml = this.buildRecursiveQuotedHtml(qParts.quotedArmor, deeperFallback);
+            deeperHtml = await this.buildRecursiveQuotedHtml(qParts.quotedArmor, deeperFallback);
         }
         // Per spec 6.2.2:
         // - Signed plaintext: decode glossia to show readable plaintext
@@ -1038,9 +1038,9 @@ class EmailService {
             } else {
                 // Signed plaintext: decode glossia to plaintext for display
                 const gs = window.GlossiaService;
-                if (gs && gs.isReady()) {
+                if (gs) {
                     try {
-                        const bytes = gs.transcodeToBytes(qParts.bodyText);
+                        const bytes = await gs.transcodeToBytes(qParts.bodyText);
                         if (bytes) decodedBody = new TextDecoder().decode(bytes);
                     } catch (_) {}
                 }
@@ -1098,7 +1098,7 @@ class EmailService {
         return { bodyOnly, quotedArmor };
     }
 
-    parseArmorComponents(armorText) {
+    async parseArmorComponents(armorText) {
         if (!armorText) return null;
         const normalized = armorText.replace(/\r\n/g, '\n');
 
@@ -1181,7 +1181,7 @@ class EmailService {
             const contentLines = sigLines.filter(l => !l.trim().startsWith('@'));
             const allContent = contentLines.join('\n').trim();
             rawSigPubkey = allContent;
-            const split = this._splitSigPubkey(allContent);
+            const split = await this._splitSigPubkey(allContent);
             if (split) {
                 sigContent = split.sigHex;
                 sealContent = split.pubkeyHex;
@@ -1236,11 +1236,11 @@ class EmailService {
     // Split combined signature block content into sig (64 bytes) and pubkey (32 bytes).
     // Decodes the full block as 96 bytes, splits at byte boundary.
     // Returns { sigHex, pubkeyHex } with pre-decoded hex strings, or null if decode fails.
-    _splitSigPubkey(content) {
+    async _splitSigPubkey(content) {
         if (!content) return null;
 
         // Phase 1: Combined 96-byte decode (backward compat)
-        const combined = this._tryCombined96(content);
+        const combined = await this._tryCombined96(content);
         if (combined) return combined;
 
         // Phase 2: Last-line heuristic (npub or hex pubkey on last line)
@@ -1249,8 +1249,8 @@ class EmailService {
             const last = lines[lines.length - 1];
             const lastStripped = last.replace(/\s+/g, '');
             if (lastStripped.startsWith('npub1') || /^[0-9a-fA-F]{64}$/.test(lastStripped)) {
-                const sig = this._tryDecodeSig(lines.slice(0, -1).join('\n'));
-                const pk = this._tryDecodePubkey(last);
+                const sig = await this._tryDecodeSig(lines.slice(0, -1).join('\n'));
+                const pk = await this._tryDecodePubkey(last);
                 if (sig && pk) return { sigHex: sig, pubkeyHex: pk };
             }
         }
@@ -1259,14 +1259,14 @@ class EmailService {
     }
 
     // Phase 1 helper: try to decode as combined 96-byte sig+pubkey (glossia or hex)
-    _tryCombined96(content) {
+    async _tryCombined96(content) {
         const gs = window.GlossiaService;
-        if (gs && gs.isReady()) {
+        if (gs) {
             try {
-                const detections = gs.detectDialect(content);
+                const detections = await gs.detectDialect(content);
                 const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : null;
                 if (dialect) {
-                    const hex = gs.decodeRawBaseN(content, dialect, 96);
+                    const hex = await gs.decodeRawBaseN(content, dialect, 96);
                     if (hex && hex.length === 192) {
                         return { sigHex: hex.substring(0, 128), pubkeyHex: hex.substring(128) };
                     }
@@ -1281,15 +1281,15 @@ class EmailService {
     }
 
     // Try to decode text as a 64-byte Schnorr signature (glossia or hex)
-    _tryDecodeSig(text) {
+    async _tryDecodeSig(text) {
         if (!text) return null;
         const gs = window.GlossiaService;
-        if (gs && gs.isReady()) {
+        if (gs) {
             try {
-                const detections = gs.detectDialect(text);
+                const detections = await gs.detectDialect(text);
                 const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : null;
                 if (dialect) {
-                    const hex = gs.decodeRawBaseN(text, dialect, 64);
+                    const hex = await gs.decodeRawBaseN(text, dialect, 64);
                     if (hex && hex.length === 128) return hex;
                 }
             } catch (_) {}
@@ -1300,7 +1300,7 @@ class EmailService {
     }
 
     // Try to decode text as a 32-byte pubkey (glossia, npub, or hex)
-    _tryDecodePubkey(text) {
+    async _tryDecodePubkey(text) {
         if (!text) return null;
         const stripped = text.replace(/\s+/g, '');
         // npub bech32
@@ -1313,12 +1313,12 @@ class EmailService {
         if (/^[0-9a-fA-F]{64}$/.test(stripped)) return stripped;
         // glossia
         const gs = window.GlossiaService;
-        if (gs && gs.isReady()) {
+        if (gs) {
             try {
-                const detections = gs.detectDialect(text);
+                const detections = await gs.detectDialect(text);
                 const dialect = (Array.isArray(detections) && detections.length > 0) ? detections[0].language : null;
                 if (dialect) {
-                    const hex = gs.decodeRawBaseN(text, dialect, 32);
+                    const hex = await gs.decodeRawBaseN(text, dialect, 32);
                     if (hex && hex.length === 64) return hex;
                 }
             } catch (_) {}
@@ -2662,7 +2662,7 @@ class EmailService {
                 } else {
                     // Decode glossia signed message body for preview
                     let previewBody = email.body || '';
-                    const signedMsg = this.decodeGlossiaSignedMessage(previewBody);
+                    const signedMsg = await this.decodeGlossiaSignedMessage(previewBody);
                     if (signedMsg && signedMsg.plaintextBody) {
                         previewBody = signedMsg.plaintextBody;
                     }
@@ -3172,7 +3172,7 @@ class EmailService {
                         }
                         // Decode glossia signed message body for display
                         let displayBody = decryptedBody;
-                        const signedMsg = this.decodeGlossiaSignedMessage(emailBody);
+                        const signedMsg = await this.decodeGlossiaSignedMessage(emailBody);
                         if (signedMsg && signedMsg.plaintextBody) {
                             displayBody = signedMsg.plaintextBody;
                         }
@@ -4301,11 +4301,11 @@ ${attachmentsHtml}
      * Decodes the glossia body back to the original UTF-8 plaintext.
      * Returns { plaintextBody, glossiaBody, sigContent, sealContent, profileName, displayName } or null.
      */
-    decodeGlossiaSignedMessage(plainBody) {
+    async decodeGlossiaSignedMessage(plainBody) {
         if (!plainBody) return null;
 
         // Delegate parsing to the depth-counting parseArmorComponents
-        const parts = this.parseArmorComponents(plainBody);
+        const parts = await this.parseArmorComponents(plainBody);
         if (!parts) return null;
 
         const glossiaBody = parts.bodyText;
@@ -4315,9 +4315,9 @@ ${attachmentsHtml}
         // Use transcodeToBytes (full pipeline with header word), not decodeToBytes (raw base_n)
         let plaintextBody = null;
         const gs = window.GlossiaService;
-        if (gs && gs.isReady()) {
+        if (gs) {
             try {
-                const bytes = gs.transcodeToBytes(glossiaBody);
+                const bytes = await gs.transcodeToBytes(glossiaBody);
                 if (bytes) {
                     plaintextBody = new TextDecoder().decode(bytes);
                 }
@@ -4334,28 +4334,24 @@ ${attachmentsHtml}
      * Subjects use payload_only encoding (bare words, no grammar) via "raw" mode.
      * Returns the decrypted ciphertext string, or null if not glossia-encoded.
      */
-    decodeGlossiaSubject(subject) {
+    async decodeGlossiaSubject(subject) {
         if (!subject || typeof subject !== 'string') return null;
 
         // If already base64-like, not glossia
         if (Utils.isLikelyEncryptedContent(subject)) return null;
 
         const gs = window.GlossiaService;
-        if (!gs || !gs.isReady()) return null;
+        if (!gs) return null;
 
         try {
-            const detections = gs.detectDialect(subject);
+            const detections = await gs.detectDialect(subject);
             console.log('[JS] decodeGlossiaSubject: detected dialects:', detections);
             if (!Array.isArray(detections) || detections.length === 0) return null;
-            // Require high hit rate — glossia subjects use payload_only (all words are payload),
-            // so real glossia subjects should have hit_rate ≈ 1.0.
-            // Normal English text may partially match BIP39/Latin wordlists.
             if (detections[0].hit_rate < 0.8) return null;
-            // Use the best match — language field maps to meta instruction
             const dialect = detections[0].language;
             if (!dialect) return null;
 
-            const result = gs.transcode(subject, `decode from ${dialect} raw`);
+            const result = await gs.transcode(subject, `decode from ${dialect} raw`);
             let decoded = result.output;
 
             if (gs._isHex(decoded)) {
@@ -4372,7 +4368,7 @@ ${attachmentsHtml}
 
     // Parse raw sig+pubkey blocks from body (Hex/no-glossia mode).
     // Strips Seal block (with npub) from end, then Signature block if present.
-    parseRawSignedBody(fullBody) {
+    async parseRawSignedBody(fullBody) {
         let body = fullBody;
         let pubkeyHex = null;
         let signatureHex = null;
@@ -4393,7 +4389,7 @@ ${attachmentsHtml}
         // Strip sig_bip39 armored block from end (multi-line > quoted)
         if (pubkeyHex) {
             const gs = window.GlossiaService;
-            if (gs && gs.isReady()) {
+            if (gs) {
                 // Match multi-line > quoted block or bare armor block
                 const sigArmorRegex = /\n\n((?:>\s*[^\n]*\n?)*-{3,}[^\n]*\n[\s\S]*?-{3,}[^\n]*)\s*$/;
                 const sigMatch = body.match(sigArmorRegex);
@@ -4401,7 +4397,7 @@ ${attachmentsHtml}
                     try {
                         // Strip > prefixes from each line
                         const sigText = sigMatch[1].split('\n').map(l => l.replace(/^>\s*/, '')).join('\n').trim();
-                        const sigResult = gs.transcode(sigText, `decode from sig nostr`);
+                        const sigResult = await gs.transcode(sigText, `decode from sig nostr`);
                         let sigDecoded = sigResult.output;
                         if (!gs._isHex(sigDecoded)) {
                             sigDecoded = gs._base64ToHex(sigDecoded);
@@ -4739,8 +4735,8 @@ ${attachmentsHtml}
 
         try {
             const gs = window.GlossiaService;
-            if (!gs || !gs.isReady()) {
-                notificationService.showError('Glossia WASM not loaded');
+            if (!gs) {
+                notificationService.showError('Glossia service not available');
                 return false;
             }
 
@@ -4802,8 +4798,8 @@ ${attachmentsHtml}
 
         try {
             const gs = window.GlossiaService;
-            if (!gs || !gs.isReady()) {
-                notificationService.showError('Glossia WASM not loaded');
+            if (!gs) {
+                notificationService.showError('Glossia service not available');
                 return false;
             }
 
@@ -4883,8 +4879,8 @@ ${attachmentsHtml}
 
         try {
             const gs = window.GlossiaService;
-            if (!gs || !gs.isReady()) {
-                notificationService.showError('Glossia WASM not loaded');
+            if (!gs) {
+                notificationService.showError('Glossia service not available');
                 return false;
             }
 
@@ -4892,7 +4888,7 @@ ${attachmentsHtml}
             if (currentSubject) {
                 console.log('[JS] Encoding subject with transcode("encode into ' + meta + ' raw")...');
                 const packed = gs._packNip04(currentSubject.trim());
-                const result = gs.transcode(packed, `encode into ${meta} raw`);
+                const result = await gs.transcode(packed, `encode into ${meta} raw`);
                 domManager.setValue('subject', result.output);
             }
 
@@ -4904,7 +4900,7 @@ ${attachmentsHtml}
                 );
                 const rawCipher = armorMatch ? armorMatch[1].replace(/\s+/g, '') : currentBody.trim();
                 const packed = gs._packNip04(rawCipher);
-                const result = gs.transcode(packed, `encode into ${meta}`);
+                const result = await gs.transcode(packed, `encode into ${meta}`);
                 domManager.setValue('messageBody', result.output);
             }
 
@@ -4935,15 +4931,15 @@ ${attachmentsHtml}
 
         try {
             const gs = window.GlossiaService;
-            if (!gs || !gs.isReady()) {
-                notificationService.showError('Glossia WASM not loaded');
+            if (!gs) {
+                notificationService.showError('Glossia service not available');
                 return false;
             }
 
             if (currentSubject) {
                 const subjectInstruction = decodeMeta ? `decode from ${decodeMeta} raw` : 'decode raw';
                 console.log('[JS] Decoding subject with transcode("' + subjectInstruction + '")...');
-                const result = gs.transcode(currentSubject, subjectInstruction);
+                const result = await gs.transcode(currentSubject, subjectInstruction);
                 // Base-N codec returns hex; convert to base64 for NIP decrypt
                 const subjectOut = gs._isHex(result.output) ? gs._hexToBase64(result.output) : result.output;
                 // Unpack NIP-04 binary format if the subject was bitpacked on encode
@@ -4961,7 +4957,7 @@ ${attachmentsHtml}
                 try {
                     const metaPubkey = this.getGlossiaEncodingPubkey();
                     const metaSig = this.getGlossiaEncodingSignature();
-                    const parsed = gs.parseSignedBody(currentBody, metaPubkey, metaSig);
+                    const parsed = await gs.parseSignedBody(currentBody, metaPubkey, metaSig);
                     if (parsed.pubkeyHex) {
                         bodyToDecode = parsed.body;
                         extractedPubkey = parsed.pubkeyHex;
@@ -4975,7 +4971,7 @@ ${attachmentsHtml}
                     console.warn('[JS] Failed to parse signed body, decoding as-is:', parseErr);
                 }
 
-                const result = gs.transcode(bodyToDecode, bodyInstruction);
+                const result = await gs.transcode(bodyToDecode, bodyInstruction);
                 // Base-N codec returns hex; convert to base64 for NIP decrypt
                 const decoded = gs._isHex(result.output) ? gs._hexToBase64(result.output) : result.output;
 
@@ -5292,12 +5288,12 @@ ${attachmentsHtml}
                 const kp = appState.getKeypair();
                 const pkHex = kp ? window.CryptoService._npubToHex(kp.public_key) : null;
                 let encodedSig = null, encodedPubkey = null, encodedSigPubkey = null;
-                if (gs && gs.isReady()) {
+                if (gs) {
                     const metaSig = this.getGlossiaEncodingSignature();
                     const metaPubkey = this.getGlossiaEncodingPubkey();
                     if (sigHex && pkHex) {
                         // Encode sig+pubkey for SIGNATURE block (default: glossia sig + npub; masked: combined 96-byte)
-                        const result = gs.encodeSigPubkey(sigHex, pkHex, metaSig, metaPubkey);
+                        const result = await gs.encodeSigPubkey(sigHex, pkHex, metaSig, metaPubkey);
                         if (result.combined) {
                             encodedSigPubkey = result.encodedSigPubkey;
                         } else {
@@ -5307,7 +5303,7 @@ ${attachmentsHtml}
                     }
                     // For unsigned messages, encode pubkey separately for SEAL block
                     if (!encodedPubkey && !encodedSigPubkey && pkHex) {
-                        encodedPubkey = gs.encodePubkey(pkHex, metaPubkey);
+                        encodedPubkey = await gs.encodePubkey(pkHex, metaPubkey);
                     }
                 }
                 let profileName = null, senderDisplayName = null;
@@ -5320,7 +5316,7 @@ ${attachmentsHtml}
                     }
                 } catch (_) {}
                 // Build quoted HTML recursively for all nesting levels
-                const quotedHtmlContent = this.buildRecursiveQuotedHtml(this._quotedOriginalArmor);
+                const quotedHtmlContent = await this.buildRecursiveQuotedHtml(this._quotedOriginalArmor);
                 this._plainBody = this.buildPlainBody(
                     encodedBody, encodedSig, encodedPubkey, profileName, senderDisplayName,
                     true, encryptionAlgorithm, null, encodedSigPubkey,
@@ -5551,7 +5547,7 @@ ${attachmentsHtml}
         
         // Decode glossia signed message body for preview
         let sentPreviewBody = email.body || '';
-        const sentSignedMsg = this.decodeGlossiaSignedMessage(sentPreviewBody);
+        const sentSignedMsg = await this.decodeGlossiaSignedMessage(sentPreviewBody);
         if (sentSignedMsg && sentSignedMsg.plaintextBody) {
             sentPreviewBody = sentSignedMsg.plaintextBody;
         }
@@ -5904,7 +5900,7 @@ ${attachmentsHtml}
         // Permissive regex: matches both base64 and glossia word content between armor markers
         const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:(NIP-\d+) ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
         // Only check subject encryption if body has armor (encrypted body implies subject may also be encrypted)
-        const isEncryptedSubject = encryptedBodyMatch && (Utils.isLikelyEncryptedContent(email.subject) || !!this.decodeGlossiaSubject(email.subject));
+        const isEncryptedSubject = encryptedBodyMatch && (Utils.isLikelyEncryptedContent(email.subject) || !!(await this.decodeGlossiaSubject(email.subject)));
         const isEncrypted = isEncryptedSubject || encryptedBodyMatch;
 
         console.log(`[JS] _loadSentEmailDetail: Email ${email.id}, encrypted: ${isEncrypted}, hasRecipientPubkey: ${hasRecipientPubkey}, recipient_pubkey: ${email.recipient_pubkey || 'none'}`);
@@ -6788,7 +6784,7 @@ ${attachmentsHtml}
                     }
                     // Decode glossia signed message body for display
                     let displayBody = decryptedBody;
-                    const signedMsg = this.decodeGlossiaSignedMessage(email.body);
+                    const signedMsg = await this.decodeGlossiaSignedMessage(email.body);
                     if (signedMsg && signedMsg.plaintextBody) {
                         displayBody = signedMsg.plaintextBody;
                     }
@@ -7685,7 +7681,7 @@ ${attachmentsHtml}
 
         // Decode glossia signed message body for preview
         let draftPreviewBody = draft.body || '';
-        const draftSignedMsg = this.decodeGlossiaSignedMessage(draftPreviewBody);
+        const draftSignedMsg = await this.decodeGlossiaSignedMessage(draftPreviewBody);
         if (draftSignedMsg && draftSignedMsg.plaintextBody) {
             draftPreviewBody = draftSignedMsg.plaintextBody;
         }

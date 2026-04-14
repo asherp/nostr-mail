@@ -4077,6 +4077,307 @@ fn decode_glossia_postprocess(decoded: String, algorithm: &str) -> Result<String
     Ok(result)
 }
 
+/// Transcode text using a meta-instruction (e.g. "encode into latin", "decode from latin raw").
+/// Mirrors `transcode_inner` from glossia/src/wasm.rs.
+#[tauri::command]
+fn glossia_transcode(input: String, meta_instruction: String, seed: Option<u64>) -> Result<String, String> {
+    use rand::Rng;
+
+    let actual_seed = seed.unwrap_or_else(|| rand::thread_rng().gen::<u32>() as u64);
+
+    let input_clone = input.clone();
+    let meta_clone = meta_instruction.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let pipeline = glossia::Pipeline::from_meta(&meta_clone)
+            .map_err(|e| format!("Pipeline parse error: {}", e))?;
+        let pipeline = pipeline.with_seed(actual_seed);
+        let result = pipeline.execute_rich(&input_clone)
+            .map_err(|e| format!("Pipeline error: {}", e))?;
+
+        let mut response = serde_json::json!({
+            "output": result.output,
+            "source": format!("{}", pipeline.source),
+            "target": format!("{}", pipeline.target),
+            "payload_words": result.payload_words,
+        });
+
+        if let Some(mode) = &result.data_mode {
+            response["data_mode"] = serde_json::json!(mode.to_string());
+        }
+        if let Some(stats) = &result.stats {
+            response["stats"] = serde_json::json!({
+                "payload_count": stats.payload_count,
+                "cover_count": stats.cover_count,
+                "total_words": stats.total_words,
+                "ratio": stats.ratio,
+            });
+        }
+        if let Some(ref resolved) = result.resolved_source {
+            response["resolved_source"] = serde_json::json!(format!("{}", resolved));
+        }
+
+        Ok::<String, String>(response.to_string())
+    }));
+
+    match result {
+        Ok(inner) => inner,
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("glossia_transcode panicked: {}", msg))
+        }
+    }
+}
+
+/// Detect the glossia dialect (language/wordlist) from text.
+/// Mirrors `detect_dialect_from_text` from glossia/src/wasm.rs.
+#[tauri::command]
+fn glossia_detect_dialect(text: String) -> Result<String, String> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let words: Vec<String> = text
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        let matches = glossia::generator::detect_dialect(&words);
+
+        let json_matches: Vec<serde_json::Value> = matches
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "language": m.language,
+                    "wordlist": m.wordlist,
+                    "dialects": m.dialects,
+                    "hits": m.hits,
+                    "total": m.total,
+                    "hit_rate": m.hit_rate,
+                    "wordlist_size": m.wordlist_size
+                })
+            })
+            .collect();
+
+        serde_json::to_string(&json_matches).unwrap_or_else(|_| "[]".to_string())
+    }));
+
+    match result {
+        Ok(json) => Ok(json),
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("glossia_detect_dialect panicked: {}", msg))
+        }
+    }
+}
+
+/// Encode hex/base64 input to base-N payload words, optionally wrapped in prose.
+/// Mirrors `encode_raw_base_n_inner` from glossia/src/wasm.rs.
+#[tauri::command]
+fn glossia_encode_raw_base_n(input: String, language: String, wordlist: String, dialect: String, seed: Option<u64>) -> Result<String, String> {
+    use std::collections::HashSet;
+    use rand::Rng;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use glossia::generator::{PayloadTok, Lexicon, GenerationMode, SentenceLengthMode};
+    use glossia::generator::core::generate_text_with_original_payload;
+
+    let actual_seed = seed.unwrap_or_else(|| rand::thread_rng().gen::<u32>() as u64);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        // 1. Auto-detect hex/base64 and decode to raw bytes
+        let (_mode, bytes) = glossia::detect_mode(&input);
+
+        // 2. Load payload wordlist and build WordlistTree
+        let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
+            .map_err(|e| format!("Failed to load wordlist: {}", e))?;
+        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
+
+        // 3. Encode bytes to payload words via bitpack_fixed codec
+        let byte_count = bytes.len();
+        let encoded_words = glossia::codec::encode_base_n(&bytes, &payload_tree, "bitpack_fixed")
+            .map_err(|e| format!("Encoding error: {}", e))?;
+
+        // 4. If no dialect, return bare words
+        if dialect.is_empty() {
+            let response = serde_json::json!({
+                "encoded_text": encoded_words.join(" "),
+                "payload_words": encoded_words,
+                "data_mode": "bitpack_fixed",
+                "byte_count": byte_count,
+                "stats": {
+                    "payload_count": encoded_words.len(),
+                    "cover_count": 0,
+                    "total_words": encoded_words.len(),
+                    "ratio": 1.0
+                }
+            });
+            return Ok(response.to_string());
+        }
+
+        // 5. Wrap in prose using the specified dialect
+        let pos_mapping = glossia::generator::data::build_pos_mapping_for_wordlist(&language, &wordlist)
+            .map_err(|e| format!("Failed to build POS mapping: {}", e))?;
+
+        let payload_toks: Vec<PayloadTok> = encoded_words
+            .iter()
+            .map(|word| {
+                let allowed = pos_mapping
+                    .get(&word.to_lowercase())
+                    .cloned()
+                    .unwrap_or_default();
+                PayloadTok::new(word.clone(), &allowed)
+            })
+            .collect();
+
+        let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
+        let (cover_by_pos, refined_cover) =
+            glossia::generator::data::load_cover_words_by_pos_for_wordlist(&wordlist_set, &language, &wordlist);
+
+        let mut lex = Lexicon::new(wordlist_set.clone(), wordlist_set);
+        for (pos, words) in cover_by_pos {
+            lex = lex.with_words(pos, &words.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        }
+        lex = lex.with_refined_cover(refined_cover);
+
+        let grammar = glossia::Grammar::from_language_dialect(&language, &dialect)
+            .map_err(|e| format!("Grammar error: {}", e))?;
+
+        let min_k = grammar.min_sentence_length().unwrap_or(5);
+        let concat_payload = grammar.payload_separator().is_empty();
+        let (k_min, k_max) = if concat_payload {
+            let k = min_k + payload_toks.len().saturating_sub(1);
+            (k, k)
+        } else {
+            (5, 12)
+        };
+
+        let mut rng = StdRng::seed_from_u64(actual_seed);
+        let mode = if dialect.starts_with("subject") {
+            GenerationMode::Subject
+        } else {
+            GenerationMode::Body
+        };
+        let (text, used_payload) = generate_text_with_original_payload(
+            &mut rng,
+            &lex,
+            &payload_toks,
+            None,
+            false,
+            mode,
+            &language,
+            Some(&dialect),
+            k_min,
+            k_max,
+            SentenceLengthMode::Natural,
+            " ",
+        );
+
+        let payload_count = encoded_words.len();
+        let total_words = text.split_whitespace().count();
+        let cover_count = total_words.saturating_sub(used_payload.len());
+
+        let response = serde_json::json!({
+            "encoded_text": text,
+            "payload_words": encoded_words,
+            "data_mode": "bitpack_fixed",
+            "byte_count": byte_count,
+            "stats": {
+                "payload_count": payload_count,
+                "cover_count": cover_count,
+                "total_words": total_words,
+                "ratio": if total_words > 0 {
+                    (payload_count as f64) / (total_words as f64)
+                } else {
+                    0.0
+                }
+            }
+        });
+
+        Ok::<String, String>(response.to_string())
+    }));
+
+    match result {
+        Ok(inner) => inner,
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("glossia_encode_raw_base_n panicked: {}", msg))
+        }
+    }
+}
+
+/// Decode base-N payload words back to hex bytes.
+/// Mirrors `decode_raw_base_n_inner` from glossia/src/wasm.rs.
+#[tauri::command]
+fn glossia_decode_raw_base_n(text: String, language: String, wordlist: String, expected_byte_count: usize) -> Result<String, String> {
+    use std::collections::HashSet;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        // 1. Load payload wordlist
+        let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
+            .map_err(|e| format!("Failed to load wordlist: {}", e))?;
+        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
+
+        // 2. Build payload set for filtering
+        let payload_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
+
+        // 3. Extract payload words (filter out cover/prose words)
+        let extracted: Vec<String> = text
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|w| payload_set.contains(w))
+            .collect();
+
+        if extracted.is_empty() {
+            return Ok(serde_json::json!({
+                "decoded_hex": "",
+                "payload_words": [],
+                "error": "No payload words found in input"
+            }).to_string());
+        }
+
+        // 4. Decode via bitpack_fixed codec with known byte count
+        let bytes = if expected_byte_count > 0 {
+            glossia::codec::decode_base_n_fixed(&extracted, &payload_tree, "bitpack_fixed", expected_byte_count)
+        } else {
+            glossia::codec::decode_base_n(&extracted, &payload_tree, "bitpack_fixed")
+        }.map_err(|e| format!("Decoding error: {}", e))?;
+
+        // 5. Return hex-encoded bytes
+        let hex = glossia::hex_encode(&bytes);
+
+        let response = serde_json::json!({
+            "decoded_hex": hex,
+            "payload_words": extracted,
+        });
+
+        Ok::<String, String>(response.to_string())
+    }));
+
+    match result {
+        Ok(inner) => inner,
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("glossia_decode_raw_base_n panicked: {}", msg))
+        }
+    }
+}
+
+/// Get the default wordlist for a given language.
+#[tauri::command]
+fn glossia_get_default_wordlist(language: String) -> String {
+    glossia::generator::default_wordlist(&language).to_string()
+}
+
 #[tauri::command]
 async fn fetch_nostr_emails_last_24h(email_config: EmailConfig) -> Result<Vec<EmailMessage>, String> {
     email::fetch_nostr_emails_last_24h(&email_config)
@@ -5599,6 +5900,11 @@ pub fn run() {
         encode_bip39,
         decode_bip39,
         decode_glossia,
+        glossia_transcode,
+        glossia_detect_dialect,
+        glossia_encode_raw_base_n,
+        glossia_decode_raw_base_n,
+        glossia_get_default_wordlist,
         db_save_relay,
         db_get_all_relays,
         db_delete_relay,

@@ -166,13 +166,13 @@ const CryptoService = {
     // Tries glossia decode first (returns raw bytes directly), then
     // falls back to base64/NIP-04 decoding for non-glossia content.
     // Returns Uint8Array.
-    ciphertextToBytes(ciphertext) {
+    async ciphertextToBytes(ciphertext) {
         if (ciphertext instanceof Uint8Array) return ciphertext;
 
         // Try glossia decode → binary (skips base64 round-trip)
         const gs = window.GlossiaService;
-        if (gs && gs.isReady()) {
-            const bytes = gs.decodeToBytes(ciphertext);
+        if (gs) {
+            const bytes = await gs.decodeToBytes(ciphertext);
             if (bytes && bytes.length > 0) return bytes;
         }
 

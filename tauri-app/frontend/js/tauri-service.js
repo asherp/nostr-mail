@@ -572,6 +572,26 @@ const TauriService = {
         return await this.invoke('decode_bip39', { text, language, wordlist, algorithm });
     },
 
+    glossiaTranscode: async function(input, metaInstruction, seed) {
+        return await this.invoke('glossia_transcode', { input, metaInstruction, seed: seed ?? null });
+    },
+
+    glossiaDetectDialect: async function(text) {
+        return await this.invoke('glossia_detect_dialect', { text });
+    },
+
+    glossiaEncodeRawBaseN: async function(input, language, wordlist, dialect, seed) {
+        return await this.invoke('glossia_encode_raw_base_n', { input, language, wordlist, dialect, seed: seed ?? null });
+    },
+
+    glossiaDecodeRawBaseN: async function(text, language, wordlist, expectedByteCount) {
+        return await this.invoke('glossia_decode_raw_base_n', { text, language, wordlist, expectedByteCount });
+    },
+
+    glossiaGetDefaultWordlist: async function(language) {
+        return await this.invoke('glossia_get_default_wordlist', { language });
+    },
+
     parseArmorMessage: async function(armorText) {
         return await this.invoke('parse_armor_message', { armorText });
     },

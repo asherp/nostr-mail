@@ -604,6 +604,13 @@ const TauriService = {
         });
     },
 
+    // Batch decrypt multiple email bodies in a single IPC call.
+    // `emails` is an array of { id, armorText, subject, senderPubkey, recipientPubkey }.
+    // Returns an array of { id, result, error } in the same order.
+    decryptEmailBodiesBatch: async function(emails) {
+        return await this.invoke('decrypt_email_bodies_batch', { emails });
+    },
+
     decryptManifestAttachment: async function(attachmentDataB64, keyWrapB64, cipherSha256Hex, origFilename, origMime, attachmentId) {
         return await this.invoke('decrypt_manifest_attachment', {
             attachmentDataB64, keyWrapB64,

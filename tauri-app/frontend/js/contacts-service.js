@@ -2421,14 +2421,12 @@ class ContactsService {
         }
 
         try {
-            // Get your private key
-            const privateKey = window.appState.getKeypair().private_key;
             const userPubkey = window.appState.getKeypair().public_key;
 
             // Only call backend to follow the user on Nostr if it's a public follow
             // Uses persistent client (no relays parameter needed)
             if (isPublic) {
-                await window.TauriService.followUser(privateKey, pubkey);
+                await window.TauriService.followUser(pubkey);
             }
 
             // Save the contact locally with the appropriate is_public flag
@@ -2707,7 +2705,6 @@ class ContactsService {
             }
 
             const userPubkey = window.appState.getKeypair().public_key;
-            const privateKey = window.appState.getKeypair().private_key;
             const activeRelays = window.appState.getActiveRelays();
             
             if (activeRelays.length === 0) {
@@ -2759,7 +2756,7 @@ class ContactsService {
             // This ensures that privacy changes are immediately reflected on relays
             try {
                 // getActiveRelays() already returns an array of URLs (strings)
-                const eventId = await window.TauriService.publishFollowList(privateKey, userPubkey, activeRelays);
+                const eventId = await window.TauriService.publishFollowList(userPubkey, activeRelays);
                 console.log(`[JS] Successfully published follow list after ${isPublic ? 'making' : 'removing'} contact public, event ID: ${eventId}`);
             } catch (publishError) {
                 console.error('[JS] Error publishing follow list:', publishError);

@@ -4,6 +4,235 @@
 // Remove all import/export statements. Attach Utils to window. Replace any usage of imported symbols with window equivalents if needed.
 
 class Utils {
+    /**
+     * Render an HTML email body inside a sandboxed iframe.
+     * @param {string} containerId - DOM element ID to render into
+     * @param {string} htmlContent - HTML string to render
+     * @param {Object} [options] - Optional settings
+     * @param {Array} [options.decryptedTexts] - Pre-decrypted texts from plaintext armor
+     *   (each entry: {decryptedText: string} or {error: string})
+     */
+    static renderHtmlBodyInIframe(containerId, htmlContent, options) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        // Clear existing content
+        container.innerHTML = '';
+        container.style.whiteSpace = 'normal';
+        const iframe = document.createElement('iframe');
+        iframe.sandbox = 'allow-same-origin allow-scripts';
+        iframe.style.width = '100%';
+        iframe.style.border = 'none';
+        iframe.style.overflow = 'hidden';
+        iframe.style.minHeight = '100px';
+        container.appendChild(iframe);
+        const doc = iframe.contentDocument || iframe.contentWindow.document;
+        // Inject dark mode aware base styles + the email HTML
+        const isDark = document.body.classList.contains('dark-mode');
+        doc.open();
+        const darkOverrides = isDark ? `
+            h4 { color: #9ca3af !important; }
+            blockquote, .seal-block { background: #1f2937 !important; border-color: #60a5fa !important; }
+            blockquote p, blockquote strong, .seal-block p, .seal-block strong { color: #e0e0e0 !important; }
+            blockquote code, .seal-block code { color: #93c5fd !important; }
+            div[style*="border-left"][style*="color:#888"],
+            div[style*="border-left"][style*="color: #888"] { color: #9ca3af !important; }
+            hr { border-color: #374151 !important; }
+        ` : '';
+        doc.write(`<!DOCTYPE html><html><head>
+            <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+            <style>
+            body { margin: 0; padding: 8px; font-family: sans-serif; line-height: 1.6;
+                   color: ${isDark ? '#e0e0e0' : '#111827'};
+                   background: ${isDark ? '#232946' : '#fff'}; }
+            img { max-width: 100%; height: auto; }
+            a { color: ${isDark ? '#93c5fd' : '#2563eb'}; }
+            blockquote { cursor: default; position: relative; }
+            blockquote::before {
+                content: '';
+                position: absolute;
+                left: 0; top: 0; bottom: 0;
+                width: 12px;
+                cursor: pointer;
+            }
+            blockquote.collapsed > *:not(.collapse-hint) { display: none; }
+            .collapse-hint {
+                font-size: 0.8em; color: ${isDark ? '#9ca3af' : '#6b7280'};
+                user-select: none; padding: 2px 0;
+            }
+            h4[style*="color"] { cursor: pointer; user-select: none; }
+            h4[style*="color"]:hover { text-decoration: underline; }
+            .decrypt-toggle {
+                cursor: pointer; float: right; font-size: 1.1em; margin-left: 0.5em;
+                opacity: 0.7; transition: opacity 0.2s;
+            }
+            .decrypt-toggle:hover { opacity: 1; }
+            .decrypt-toggle.decrypting { opacity: 0.4; cursor: wait; }
+            ${darkOverrides}
+        </style></head><body>${htmlContent}</body></html>`);
+        doc.close();
+        // Auto-resize iframe to fit content
+        const resize = () => {
+            if (doc.body) {
+                iframe.style.height = doc.body.scrollHeight + 'px';
+            }
+        };
+        iframe.addEventListener('load', resize);
+        // Also resize after a short delay for late-loading content
+        setTimeout(resize, 100);
+        setTimeout(resize, 500);
+        // Collapsible blockquotes: click to toggle nested reply chains
+        const setupCollapsible = () => {
+            const bqs = doc.querySelectorAll('blockquote');
+            bqs.forEach(bq => {
+                const hint = doc.createElement('div');
+                hint.className = 'collapse-hint';
+                hint.textContent = '\u2026';
+                hint.style.display = 'none';
+                bq.insertBefore(hint, bq.firstChild);
+                bq.addEventListener('click', (e) => {
+                    // Only toggle when clicking on the left quote bar (within 12px of left edge)
+                    const rect = bq.getBoundingClientRect();
+                    if (e.clientX - rect.left > 12) return;
+                    e.stopPropagation();
+                    const collapsed = bq.classList.toggle('collapsed');
+                    hint.style.display = collapsed ? '' : 'none';
+                    setTimeout(resize, 10);
+                });
+            });
+        };
+        setTimeout(setupCollapsible, 50);
+        // Collapsible signature sections: click username to toggle sig content
+        // Match sig sections by canonical armor structure: h4 followed by italic border-left div
+        // (same approach as injectHtmlSigBadge — survives class stripping by Gmail)
+        const setupCollapsibleSigs = () => {
+            const h4s = doc.querySelectorAll('h4');
+            for (const h4 of h4s) {
+                const sigDiv = h4.nextElementSibling;
+                if (!sigDiv || sigDiv.tagName !== 'DIV' || !sigDiv.style.borderLeft || sigDiv.style.fontStyle !== 'italic') continue;
+                sigDiv.style.display = 'none';
+                h4.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const hidden = sigDiv.style.display === 'none';
+                    sigDiv.style.display = hidden ? '' : 'none';
+                    setTimeout(resize, 10);
+                });
+            }
+        };
+        // Inline decrypt toggles for encrypted body blocks
+        // Inline decrypt toggles — uses pre-computed decryptedTexts from plaintext armor.
+        // Finds body content divs by HTML structure (first child div of each font-family wrapper),
+        // matching them against the results array by position.
+        const setupEncryptedBlocks = () => {
+            const decryptedTexts = options && options.decryptedTexts;
+            if (!decryptedTexts || decryptedTexts.length === 0) return;
+            const startDecrypted = options && options.startDecrypted;
+            // Body divs appear outermost-first in DOM; results are innermost-first — reverse to align
+            const bodyDivs = doc.querySelectorAll('div[style*="font-family"] > div:first-child');
+            if (bodyDivs.length === 0) return;
+            const results = [...decryptedTexts].reverse();
+            bodyDivs.forEach((div, idx) => {
+                const result = results[idx];
+                if (!result) return; // No result for this block (non-encrypted)
+
+                const originalNodes = Array.from(div.childNodes).map(n => n.cloneNode(true));
+                let isDecrypted = false;
+                const decryptedText = result.decryptedText || null;
+
+                const lock = doc.createElement('i');
+                lock.className = 'fas fa-lock decrypt-toggle';
+                if (decryptedText) {
+                    lock.title = 'Click to decrypt';
+                } else {
+                    lock.style.opacity = '0.3';
+                    lock.title = result.error
+                        ? 'Decryption failed: ' + result.error
+                        : 'Encrypted';
+                }
+                div.insertBefore(lock, div.firstChild);
+
+                if (!decryptedText) return;
+
+                const replaceContent = (nodes) => {
+                    while (div.lastChild && div.lastChild !== lock) div.removeChild(div.lastChild);
+                    nodes.forEach(n => div.appendChild(n));
+                    setTimeout(resize, 10);
+                };
+
+                lock.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (isDecrypted) {
+                        replaceContent(originalNodes.map(n => n.cloneNode(true)));
+                        lock.className = 'fas fa-lock decrypt-toggle';
+                        lock.title = 'Click to decrypt';
+                        isDecrypted = false;
+                    } else {
+                        replaceContent([doc.createTextNode(decryptedText)]);
+                        lock.className = 'fas fa-lock-open decrypt-toggle';
+                        lock.title = 'Click to show encrypted';
+                        isDecrypted = true;
+                    }
+                });
+
+                // Start in decrypted mode if requested
+                if (startDecrypted) {
+                    replaceContent([doc.createTextNode(decryptedText)]);
+                    lock.className = 'fas fa-lock-open decrypt-toggle';
+                    lock.title = 'Click to show encrypted';
+                    isDecrypted = true;
+                }
+            });
+        };
+        setTimeout(setupEncryptedBlocks, 60);
+        // Collapsible sigs run after encrypted blocks to avoid DOM timing issues
+        setTimeout(setupCollapsibleSigs, 100);
+    }
+
+    /**
+     * Post-process a body container to wrap SIGNATURE and SEAL armor blocks
+     * in styled divs with a verification indicator placeholder.
+     * Works on plain-text bodies rendered as escaped HTML with <br> tags.
+     */
+    static decorateArmorBlocks(containerId) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        // Work on innerHTML — armor delimiters are escaped text with <br> newlines
+        let html = container.innerHTML;
+        // Quote prefix: lines in quoted replies start with "> "
+        // (innerHTML preserves literal > — browsers don't escape it via textContent/innerHTML)
+        // Allow zero or more levels of quoting before each delimiter line
+        const QP = '(?:>\\s*)*';
+        // Match signed nested armor blocks (contain SIGNATURE section) that end with END NOSTR MESSAGE
+        // Must match before other patterns to prevent partial matches on nested SIGNATURE/SEAL
+        const signedMsgPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR MESSAGE\\s*-{3,})`, 'g');
+        let blockIndex = 0;
+        html = html.replace(signedMsgPattern, (match) => {
+            const id = `inline-sig-block-${blockIndex++}`;
+            return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
+        });
+        // Match unsigned encrypted armor blocks (with seal but no signature) that end with END NOSTR MESSAGE
+        const unsignedEncMsgPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY)\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR MESSAGE\\s*-{3,})`, 'g');
+        html = html.replace(unsignedEncMsgPattern, (match) => {
+            const id = `inline-sig-block-${blockIndex++}`;
+            return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
+        });
+        // Match standalone signature block (new format: ends with END NOSTR SIGNATURE or END NOSTR MESSAGE)
+        // Also match legacy format: SIGNATURE block followed by SEAL block
+        const sigSealPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SIGNATURE|MESSAGE)\\s*-{3,}(?:(?:<br>)*(?:\\s*<br>)*(?:\\s*${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SEAL|MESSAGE)\\s*-{3,}))?)`, 'g');
+        html = html.replace(sigSealPattern, (match) => {
+            const id = `inline-sig-block-${blockIndex++}`;
+            return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
+        });
+        // Legacy: wrap standalone seal blocks (pubkey without signature)
+        const sealOnlyPattern = new RegExp(`(?<!<\\/div>)(${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SEAL|MESSAGE)\\s*-{3,})`, 'g');
+        html = html.replace(sealOnlyPattern, (match) => {
+            const id = `inline-sig-block-${blockIndex++}`;
+            return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
+        });
+        if (blockIndex > 0) {
+            container.innerHTML = html;
+        }
+    }
+
     // Helper function to escape HTML
     static escapeHtml(text) {
         const div = document.createElement('div');
@@ -305,6 +534,54 @@ class Utils {
                                 content.includes('To:');
         
         return isBase64 && !hasEmailPatterns;
+    }
+
+    /**
+     * Detect encryption format from encrypted content
+     * Returns 'nip04', 'nip44', or 'unknown'
+     * @param {string} content - The encrypted content to analyze
+     * @returns {string} - The detected encryption format
+     */
+    static detectEncryptionFormat(content) {
+        if (!content || typeof content !== 'string') {
+            return 'unknown';
+        }
+
+        // Remove ASCII armor if present (for body content) — handles both new and legacy formats
+        let cleanContent = content
+            .replace(/-----BEGIN NOSTR NIP-04 ENCRYPTED (?:MESSAGE|BODY)-----/g, '')
+            .replace(/-----END NOSTR NIP-04 ENCRYPTED (?:MESSAGE|BODY)-----/g, '')
+            .replace(/-----BEGIN NOSTR NIP-44 ENCRYPTED (?:MESSAGE|BODY)-----/g, '')
+            .replace(/-----END NOSTR NIP-44 ENCRYPTED (?:MESSAGE|BODY)-----/g, '')
+            .replace(/-----END NOSTR MESSAGE-----/g, '')
+            .trim();
+
+        // Check for NIP-04 format: base64?iv=base64
+        const nip04Pattern = /^[A-Za-z0-9+/=]+\?iv=[A-Za-z0-9+/=]+$/;
+        if (nip04Pattern.test(cleanContent)) {
+            return 'nip04';
+        }
+
+        // Check for NIP-44 format: versioned format (starts with version byte 1 or 2)
+        // NIP-44 is base64 encoded, and when decoded, the first byte indicates version
+        const base64Pattern = /^[A-Za-z0-9+/=]+$/;
+        if (base64Pattern.test(cleanContent)) {
+            try {
+                // Decode base64 to check version byte
+                const decoded = atob(cleanContent);
+                if (decoded.length > 0) {
+                    const versionByte = decoded.charCodeAt(0);
+                    // NIP-44 v1 uses version byte 1 (0x01), v2 uses version byte 2 (0x02)
+                    if (versionByte === 1 || versionByte === 2) {
+                        return 'nip44';
+                    }
+                }
+            } catch (e) {
+                // Not valid base64 or can't decode, fall through to unknown
+            }
+        }
+
+        return 'unknown';
     }
 } 
 window.Utils = Utils; 

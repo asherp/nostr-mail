@@ -34,19 +34,26 @@ NostrMailApp.prototype.init = async function() {
     try {
         const shouldClear = await TauriService.invoke('should_clear_localstorage_cache');
         if (shouldClear) {
-            console.log('🧹 Clearing localStorage cache due to NOSTR_MAIL_CLEAR_CACHE environment variable...');
-            // Clear all nostr-mail related localStorage items
+            console.log('Clearing localStorage cache due to NOSTR_MAIL_CLEAR_CACHE environment variable...');
             localStorage.removeItem('nostr_mail_settings');
             localStorage.removeItem('nostr_mail_profiles');
             localStorage.removeItem('nostr_mail_profile_picture');
             localStorage.removeItem('nostr_keypair');
-            // Also clear legacy items if they exist
+            localStorage.removeItem('nostr_mail_accounts');
+            localStorage.removeItem('nostr_mail_keychain_migrated');
             localStorage.removeItem('contacts');
             localStorage.removeItem('settings');
-            console.log('✅ localStorage cache cleared (including keypair)');
+            // Also clear keychain entries
+            try {
+                await TauriService.invoke('keychain_clear_all');
+                console.log('Keychain entries cleared');
+            } catch (ke) {
+                console.warn('Failed to clear keychain:', ke);
+            }
+            console.log('localStorage cache cleared');
         }
     } catch (e) {
-        console.warn('⚠️ Failed to check clear cache environment variable:', e);
+        console.warn('Failed to check clear cache environment variable:', e);
     }
     
     // Initialize the database
@@ -62,15 +69,56 @@ NostrMailApp.prototype.init = async function() {
             return;
         }
     }
+    // One-time migration: move keys from localStorage to system keychain
+    if (!localStorage.getItem('nostr_mail_keychain_migrated')) {
+        try {
+            const accounts = [];
+            const rawAccounts = localStorage.getItem('nostr_mail_accounts');
+            if (rawAccounts) {
+                const parsed = JSON.parse(rawAccounts);
+                for (const acct of parsed) {
+                    if (acct.private_key && acct.public_key) {
+                        accounts.push({
+                            public_key: acct.public_key,
+                            private_key: acct.private_key
+                        });
+                    }
+                }
+            }
+            // Fallback to single keypair if no accounts array
+            if (accounts.length === 0) {
+                try {
+                    const kp = JSON.parse(localStorage.getItem('nostr_keypair'));
+                    if (kp?.private_key && kp?.public_key) {
+                        accounts.push({ public_key: kp.public_key, private_key: kp.private_key });
+                    }
+                } catch (e) { /* ignore parse errors */ }
+            }
+            if (accounts.length > 0) {
+                console.log('[APP] Migrating', accounts.length, 'accounts from localStorage to keychain...');
+                await TauriService.invoke('keychain_migrate_from_frontend', { accounts });
+                // Set the first account as active
+                await TauriService.invoke('keychain_set_active_account', { publicKey: accounts[0].public_key });
+                console.log('[APP] Migration complete');
+            }
+            // Clean up localStorage keys
+            localStorage.removeItem('nostr_keypair');
+            localStorage.removeItem('nostr_mail_accounts');
+        } catch (e) {
+            console.error('[APP] Keychain migration failed:', e);
+        }
+        localStorage.setItem('nostr_mail_keychain_migrated', 'true');
+    }
+
     try {
-        console.log('📋 Loading application settings...');
+        console.log('Loading application settings...');
         // Settings will be loaded after keypair is loaded (in loadKeypair)
         // This ensures we load settings for the correct pubkey
 
-        console.log('🌐 Loading relay configuration from database...');
+        console.log('Loading relay configuration from database...');
         await this.loadRelaysFromDatabase();
 
-        console.log('🔑 Loading/generating keypair...');
+        console.log('Loading keypair from keychain...');
         await this.loadKeypair();
         
         // Check if no keypair is available - navigate to settings and show message
@@ -157,12 +205,11 @@ NostrMailApp.prototype.loadSettings = async function() {
         const keypair = appState.getKeypair();
         if (keypair && keypair.public_key) {
             try {
-                const dbSettings = await TauriService.dbGetAllSettings(keypair.public_key, keypair.private_key);
+                const dbSettings = await TauriService.dbGetAllSettings(keypair.public_key);
                 if (dbSettings && Object.keys(dbSettings).length > 0) {
                     console.log('[APP] Loaded settings from database for pubkey:', keypair.public_key);
                     // Convert database settings back to settings object format
                     const settings = {
-                        npriv_key: keypair.private_key,
                         encryption_algorithm: dbSettings.encryption_algorithm || 'nip44',
                         email_address: dbSettings.email_address || '',
                         password: dbSettings.password || '',
@@ -229,18 +276,21 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
         send_matching_dm: true,
         sync_cutoff_days: 365,
         emails_per_page: 50,
-        require_signature: true
+        require_signature: true,
+        glossia_encoding_body: 'latin',
+        glossia_encoding_signature: 'latin',
+        glossia_encoding_pubkey: 'latin'
     };
-    
+
     // Set default settings in appState
     appState.setSettings(defaultSettings);
-    
+
     // Clear localStorage settings
     localStorage.removeItem('nostr_mail_settings');
-    
+
     // Populate form with default values
     this.populateSettingsForm();
-    
+
     // Clear public key display
     this.renderProfilePubkey();
     
@@ -262,7 +312,6 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
     
     // Define default settings
     const defaultSettings = {
-        npriv_key: keypair ? keypair.private_key : '',
         encryption_algorithm: 'nip44',
         email_address: '',
         password: '',
@@ -279,12 +328,15 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         hide_undecryptable_emails: true,
         automatically_encrypt: true,
         automatically_sign: true,
-        hide_unsigned_messages: true
+        hide_unsigned_messages: true,
+        glossia_encoding_body: 'latin',
+        glossia_encoding_signature: 'latin',
+        glossia_encoding_pubkey: 'latin'
     };
-    
+
     // Set default settings in appState
     appState.setSettings(defaultSettings);
-    
+
     // Update last loaded pubkey tracker BEFORE populating form
     // This ensures autosave knows which pubkey to save to
     appState.setLastLoadedPubkey(pubkey);
@@ -312,18 +364,12 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
         }
         
         console.log('[APP] Loading settings for pubkey:', pubkey);
-        // Get private key for decryption
-        const keypair = appState.getKeypair();
-        const privateKey = keypair ? keypair.private_key : null;
-        console.log('[APP] Using private key for decryption:', privateKey ? privateKey.substring(0, 20) + '...' : 'null');
-        const dbSettings = await TauriService.dbGetAllSettings(pubkey, privateKey);
+        // Backend decrypts sensitive settings using active key from AppState
+        const dbSettings = await TauriService.dbGetAllSettings(pubkey);
         console.log('[APP] Loaded settings from database:', Object.keys(dbSettings || {}).length, 'keys');
-        
+
         if (dbSettings && Object.keys(dbSettings).length > 0) {
-            // Get current keypair to include private key in settings
-            const keypair = appState.getKeypair();
             const settings = {
-                npriv_key: keypair ? keypair.private_key : '',
                 encryption_algorithm: dbSettings.encryption_algorithm || 'nip44',
                 email_address: dbSettings.email_address || '',
                 password: dbSettings.password || '',
@@ -340,7 +386,10 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                 automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                 automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
-                hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false' // Default to true if not set
+                hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false', // Default to true if not set
+                glossia_encoding_body: dbSettings.glossia_encoding_body ?? dbSettings.glossia_encoding ?? 'latin',
+                glossia_encoding_signature: dbSettings.glossia_encoding_signature ?? dbSettings.glossia_encoding ?? 'latin',
+                glossia_encoding_pubkey: dbSettings.glossia_encoding_pubkey ?? dbSettings.glossia_encoding ?? 'latin'
             };
             
             appState.setSettings(settings);
@@ -362,10 +411,9 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
             if (stored) {
                 try {
                     const settings = JSON.parse(stored);
-                    // Only use localStorage settings if they match the current pubkey's keypair
-                    // (localStorage might have settings from a different keypair)
+                    // Only use localStorage settings if they match the current pubkey
                     const currentKeypair = appState.getKeypair();
-                    if (currentKeypair && settings.npriv_key === currentKeypair.private_key) {
+                    if (currentKeypair && settings._pubkey === currentKeypair.public_key) {
                         appState.setSettings(settings);
                         this.populateSettingsForm();
                         console.log('[APP] Loaded settings from localStorage for pubkey:', pubkey);
@@ -393,7 +441,7 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
             try {
                 const settings = JSON.parse(stored);
                 const currentKeypair = appState.getKeypair();
-                if (currentKeypair && settings.npriv_key === currentKeypair.private_key) {
+                if (currentKeypair && settings._pubkey === currentKeypair.public_key) {
                     appState.setSettings(settings);
                     this.populateSettingsForm();
                 } else {
@@ -435,81 +483,88 @@ NostrMailApp.prototype.loadRelaysFromDatabase = async function() {
 // Load keypair
 NostrMailApp.prototype.loadKeypair = async function() {
     try {
-        let keypair = null;
-        
-        // Always check config file first - it overrides localStorage
+        let pubkey = null;
+
+        // Check if there's an active account loaded in backend memory
         try {
-            const defaultPrivateKey = await TauriService.getDefaultPrivateKeyFromConfig();
-            if (defaultPrivateKey && defaultPrivateKey.trim() !== '') {
-                console.log('[APP] Found default private key from config file - overriding localStorage');
-                // Validate the private key
-                const isValid = await TauriService.validatePrivateKey(defaultPrivateKey);
-                if (isValid) {
-                    // Get public key from private key
-                    const publicKey = await TauriService.getPublicKeyFromPrivate(defaultPrivateKey);
-                    keypair = { private_key: defaultPrivateKey, public_key: publicKey };
-                    // Save to localStorage and appState (overriding any existing keypair)
-                    localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
-                    appState.setKeypair(keypair);
-                    console.log('[APP] Loaded default keypair from config file');
-                } else {
-                    console.log('[APP] Default private key from config is invalid');
-                    // Fall through to localStorage fallback
+            pubkey = await TauriService.invoke('keychain_get_active_account');
+        } catch (e) {
+            console.log('[APP] No active account in memory:', e);
+        }
+
+        // If no active account in memory, check if keychain has accounts (cold start)
+        if (!pubkey) {
+            try {
+                const accounts = await profileManager.getAccounts();
+                if (accounts.length > 0) {
+                    console.log('[APP] Found', accounts.length, 'accounts in keychain, activating first one');
+                    await profileManager.setActiveAccount(accounts[0].public_key);
+                    pubkey = accounts[0].public_key;
                 }
-            }
-        } catch (error) {
-            console.error('[APP] Failed to get default private key from config:', error);
-            // Fall through to localStorage fallback
-        }
-        
-        // If no keypair from config, try localStorage
-        if (!keypair) {
-            const stored = localStorage.getItem('nostr_keypair');
-            if (stored) {
-                keypair = JSON.parse(stored);
-                appState.setKeypair(keypair);
-            } else {
-                // No keypair in localStorage and no default from config - don't auto-generate
-                // User must explicitly generate one via the "Generate New Keypair" button
-                appState.setKeypair(null);
-                console.log('[APP] No keypair found in localStorage or config. User must generate one in settings.');
+            } catch (e) {
+                console.log('[APP] Could not check keychain accounts:', e);
             }
         }
-        
-        // Only proceed with keypair-dependent operations if keypair exists
-        if (keypair) {
-            console.log('Keypair loaded:', appState.getKeypair().public_key.substring(0, 20) + '...');
+
+        // If still no account, check config file for a default key
+        if (!pubkey) {
+            try {
+                const defaultPrivateKey = await TauriService.getDefaultPrivateKeyFromConfig();
+                if (defaultPrivateKey && defaultPrivateKey.trim() !== '') {
+                    console.log('[APP] Found default private key from config file - importing to keychain');
+                    const result = await profileManager.addAccount(defaultPrivateKey);
+                    if (result) {
+                        pubkey = result.public_key;
+                        await profileManager.setActiveAccount(pubkey);
+                    }
+                }
+            } catch (error) {
+                console.error('[APP] Failed to get default private key from config:', error);
+            }
+        }
+
+        // Set appState
+        if (pubkey) {
+            appState.setKeypair({ public_key: pubkey });
+            console.log('Keypair loaded:', pubkey.substring(0, 20) + '...');
             this.renderProfilePubkey();
         } else {
-            console.log('[APP] No keypair available - skipping keypair-dependent initialization');
+            appState.setKeypair(null);
+            console.log('[APP] No keypair found. User must generate one in settings.');
         }
-        
-        // Populate private key field in settings form if it's empty
-        // This ensures the user sees they're already logged in when the app starts
+
+        // Populate private key field in settings from keychain
         const nprivKeyInput = domManager.get('nprivKey');
-        if (nprivKeyInput && (!nprivKeyInput.value || nprivKeyInput.value.trim() === '')) {
-            if (keypair && keypair.private_key) {
-                domManager.setValue('nprivKey', keypair.private_key);
-                console.log('[APP] Populated private key field from cached keypair on startup');
-                // Update public key display to show the user is logged in
-                await this.updatePublicKeyDisplay();
+        if (nprivKeyInput && (!nprivKeyInput.value || nprivKeyInput.value.trim() === '') && pubkey) {
+            try {
+                const privKey = await profileManager.getPrivateKey(pubkey);
+                if (privKey) {
+                    domManager.setValue('nprivKey', privKey);
+                    console.log('[APP] Populated private key field from keychain on startup');
+                    await this.updatePublicKeyDisplay();
+                }
+            } catch (e) {
+                console.log('[APP] Could not populate private key field:', e);
             }
         }
-        
+
         // Load settings for this pubkey
-        if (keypair && keypair.public_key) {
-            await this.loadSettingsForPubkey(keypair.public_key);
+        if (pubkey) {
+            await this.loadSettingsForPubkey(pubkey);
         }
-        
-        // Initialize persistent Nostr client with the loaded keypair (only if keypair exists)
-        if (keypair && keypair.private_key) {
+
+        // Initialize persistent Nostr client (backend reads key from its own state)
+        if (pubkey) {
             await this.initializeNostrClient();
         } else {
             console.log('[APP] Skipping Nostr client initialization - no keypair available');
         }
-        
+
         // Update pre-release warning visibility based on keypair existence
         this.updatePreReleaseWarning();
+
+        // Update the sidebar profile switcher display
+        await this.updateProfileSwitcher();
     } catch (error) {
         console.error('Failed to load keypair:', error);
         notificationService.showError('Failed to load encryption keys');
@@ -521,9 +576,8 @@ NostrMailApp.prototype.updatePreReleaseWarning = function() {
     const warningDiv = document.getElementById('pre-release-warning');
     if (!warningDiv) return;
     
-    const keypair = appState.getKeypair();
-    const hasKeypair = keypair && keypair.private_key;
-    
+    const hasKeypair = appState.hasKeypair();
+
     if (hasKeypair) {
         warningDiv.style.display = 'none';
     } else {
@@ -534,14 +588,13 @@ NostrMailApp.prototype.updatePreReleaseWarning = function() {
 // Initialize the persistent Nostr client
 NostrMailApp.prototype.initializeNostrClient = async function() {
     try {
-        const keypair = appState.getKeypair();
-        if (!keypair || !keypair.private_key) {
+        if (!appState.hasKeypair()) {
             console.warn('[APP] No keypair available for Nostr client initialization');
             return;
         }
-        
+
         console.log('[APP] Initializing persistent Nostr client...');
-        await TauriService.initPersistentNostrClient(keypair.private_key);
+        await TauriService.initPersistentNostrClient();
         console.log('[APP] ✅ Nostr client initialized successfully');
         
         // Update relay status display after client initialization
@@ -674,6 +727,298 @@ NostrMailApp.prototype.ensureDefaultContact = async function() {
     }
 }
 
+// Switch to a different profile/account. Consolidates all profile-switch logic.
+NostrMailApp.prototype.switchToProfile = async function(publicKeyOrKeypair) {
+    const publicKey = typeof publicKeyOrKeypair === 'string' ? publicKeyOrKeypair : publicKeyOrKeypair?.public_key;
+    if (!publicKey) {
+        console.error('[APP] switchToProfile called with invalid argument');
+        return;
+    }
+
+    const lastLoadedPubkey = appState.getLastLoadedPubkey();
+    const isSameProfile = lastLoadedPubkey === publicKey;
+
+    console.log('[APP] Switching to profile:', publicKey.substring(0, 20) + '...');
+
+    // Prevent auto-save from firing during the switch
+    if (this._setPopulatingForm) {
+        this._setPopulatingForm(true);
+    }
+
+    // Set active account in backend keychain (loads private key into AppState)
+    await profileManager.setActiveAccount(publicKey);
+    appState.setKeypair({ public_key: publicKey });
+    this.updatePreReleaseWarning();
+
+    // Clear old user's data from memory
+    appState.setContacts([]);
+    appState.setEmails([]);
+    appState.setSentEmails([]);
+    appState.setDmContacts([]);
+    appState.dmMessages = {};
+    if (window.contactsService) {
+        window.contactsService.renderContacts();
+    }
+    const emailList = domManager.get('emailList');
+    if (emailList) emailList.innerHTML = '';
+    const sentList = domManager.get('sentList');
+    if (sentList) sentList.innerHTML = '';
+
+    // Load settings for this pubkey (handles form population)
+    await this.loadSettingsForPubkey(publicKey);
+
+    // Update the private key field in settings from keychain
+    try {
+        const privKey = await profileManager.getPrivateKey(publicKey);
+        if (privKey) domManager.setValue('nprivKey', privKey);
+    } catch (e) {
+        console.log('[APP] Could not populate private key field:', e);
+    }
+    await this.updatePublicKeyDisplay();
+
+    // Restart Nostr connections
+    await this.cleanupLiveEvents();
+    await this.initializeLiveEvents();
+    await this.initializeNostrClient();
+
+    // Refresh the UI
+    this.renderProfilePubkey();
+    // Reload contacts for the new profile and repopulate compose dropdown
+    if (window.contactsService) {
+        await window.contactsService.loadContacts();
+    }
+    if (window.emailService) {
+        window.emailService.populateNostrContactDropdown();
+    }
+    await this.reloadActivePage();
+    await this.ensureDefaultContact();
+
+    // Update the sidebar switcher display
+    await this.updateProfileSwitcher();
+
+    console.log('[APP] Profile switch complete:', publicKey.substring(0, 20) + '...');
+}
+
+// Update the sidebar profile switcher display to reflect current state
+NostrMailApp.prototype.updateProfileSwitcher = async function() {
+    const nameEl = domManager.get('profileSwitcherName');
+    const npubEl = domManager.get('profileSwitcherNpub');
+    const avatarEl = domManager.get('profileSwitcherAvatar');
+
+    if (!nameEl) return; // DOM not ready
+
+    // Use appState pubkey (already loaded) to avoid extra async call
+    const keypair = appState.getKeypair();
+    const activeAccount = keypair ? { public_key: keypair.public_key } : null;
+
+    if (!activeAccount || !activeAccount.public_key) {
+        nameEl.textContent = 'No Account';
+        if (npubEl) npubEl.textContent = '';
+        if (avatarEl) avatarEl.innerHTML = '<i class="fas fa-user"></i>';
+        return;
+    }
+
+    const pubkey = activeAccount.public_key;
+    const displayName = profileManager.getAccountDisplayName(pubkey);
+    const truncatedNpub = pubkey.length > 20
+        ? pubkey.substring(0, 10) + '...' + pubkey.substring(pubkey.length - 4)
+        : pubkey;
+
+    nameEl.textContent = displayName;
+    if (npubEl) npubEl.textContent = truncatedNpub;
+
+    if (avatarEl) {
+        const picture = profileManager.getAccountPicture(pubkey);
+        if (picture) {
+            avatarEl.innerHTML = `<img src="${picture}" alt="${displayName}">`;
+        } else {
+            avatarEl.textContent = profileManager.getAccountInitial(pubkey);
+        }
+    }
+}
+
+// Render the profile switcher dropdown list
+NostrMailApp.prototype.renderProfileSwitcherList = async function() {
+    const listEl = domManager.get('profileSwitcherList');
+    if (!listEl) return;
+
+    const accounts = await profileManager.getAccounts();
+    const keypair = appState.getKeypair();
+    const activePubkey = keypair ? keypair.public_key : null;
+
+    if (accounts.length === 0) {
+        listEl.innerHTML = '<div style="padding: 8px 10px; font-size: 0.8125rem; opacity: 0.6;">No accounts</div>';
+        return;
+    }
+
+    listEl.innerHTML = accounts.map(account => {
+        const isActive = account.public_key === activePubkey;
+        const displayName = profileManager.getAccountDisplayName(account.public_key);
+        const truncatedNpub = account.public_key.length > 20
+            ? account.public_key.substring(0, 10) + '...' + account.public_key.substring(account.public_key.length - 4)
+            : account.public_key;
+        const picture = profileManager.getAccountPicture(account.public_key);
+        const initial = profileManager.getAccountInitial(account.public_key);
+        const avatarContent = picture
+            ? `<img src="${picture}" alt="${displayName}">`
+            : initial;
+
+        return `
+            <div class="profile-switcher-item ${isActive ? 'active' : ''}" data-pubkey="${account.public_key}">
+                <span class="profile-switcher-item-check">${isActive ? '<i class="fas fa-check"></i>' : ''}</span>
+                <div class="profile-switcher-item-avatar">${avatarContent}</div>
+                <div class="profile-switcher-item-info">
+                    <span class="profile-switcher-item-name">${displayName}</span>
+                    <span class="profile-switcher-item-npub">${truncatedNpub}</span>
+                </div>
+                <button class="profile-switcher-item-remove" data-pubkey="${account.public_key}" title="Remove account">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+        `;
+    }).join('');
+}
+
+// Setup profile switcher event listeners
+NostrMailApp.prototype.setupProfileSwitcherListeners = function() {
+    const activeEl = domManager.get('profileSwitcherActive');
+    const dropdownEl = domManager.get('profileSwitcherDropdown');
+    const listEl = domManager.get('profileSwitcherList');
+    const addBtn = domManager.get('profileSwitcherAdd');
+    const switcherEl = domManager.get('profileSwitcher');
+
+    if (!activeEl || !dropdownEl) return;
+
+    // Toggle dropdown
+    activeEl.addEventListener('click', async () => {
+        const isOpen = dropdownEl.style.display !== 'none';
+        if (isOpen) {
+            dropdownEl.style.display = 'none';
+            if (switcherEl) switcherEl.classList.remove('open');
+        } else {
+            await this.renderProfileSwitcherList();
+            dropdownEl.style.display = 'block';
+            if (switcherEl) switcherEl.classList.add('open');
+        }
+    });
+
+    // Close dropdown on click outside
+    document.addEventListener('click', (e) => {
+        if (switcherEl && !switcherEl.contains(e.target)) {
+            dropdownEl.style.display = 'none';
+            switcherEl.classList.remove('open');
+        }
+    });
+
+    // Account item click (switch) and remove button click (delegated)
+    if (listEl) {
+        listEl.addEventListener('click', async (e) => {
+            // Check if remove button was clicked
+            const removeBtn = e.target.closest('.profile-switcher-item-remove');
+            if (removeBtn) {
+                e.stopPropagation();
+                const pubkey = removeBtn.dataset.pubkey;
+                await this.handleRemoveAccount(pubkey);
+                return;
+            }
+
+            // Check if an account item was clicked
+            const item = e.target.closest('.profile-switcher-item');
+            if (item) {
+                const pubkey = item.dataset.pubkey;
+                const currentKeypair = appState.getKeypair();
+                if (currentKeypair && currentKeypair.public_key === pubkey) {
+                    // Already active, just close dropdown
+                    dropdownEl.style.display = 'none';
+                    if (switcherEl) switcherEl.classList.remove('open');
+                    return;
+                }
+
+                // Switch to this account
+                dropdownEl.style.display = 'none';
+                if (switcherEl) switcherEl.classList.remove('open');
+                await this.switchToProfile(pubkey);
+                notificationService.showSuccess('Switched to ' + profileManager.getAccountDisplayName(pubkey));
+            }
+        });
+    }
+
+    // Add account button
+    if (addBtn) {
+        addBtn.addEventListener('click', () => {
+            dropdownEl.style.display = 'none';
+            if (switcherEl) switcherEl.classList.remove('open');
+            // Navigate to Settings > Nostr section
+            this.switchTab('settings');
+            // Expand Nostr settings section
+            setTimeout(() => {
+                const nostrSection = document.querySelector('.settings-section[data-section="nostr"]');
+                if (nostrSection) {
+                    const content = nostrSection.querySelector('.settings-section-content');
+                    if (content) content.style.display = 'block';
+                    const toggle = nostrSection.querySelector('.settings-section-toggle');
+                    if (toggle) toggle.classList.add('expanded');
+                    // Focus the private key input
+                    const nprivInput = domManager.get('nprivKey');
+                    if (nprivInput) nprivInput.focus();
+                }
+            }, 100);
+        });
+    }
+}
+
+// Handle removing an account with confirmation dialog
+NostrMailApp.prototype.handleRemoveAccount = async function(pubkey) {
+    const displayName = profileManager.getAccountDisplayName(pubkey);
+    const currentKeypair = appState.getKeypair();
+    const isActive = currentKeypair && currentKeypair.public_key === pubkey;
+
+    // First confirmation: remove the account?
+    let msg = `Remove account "${displayName}"?`;
+    if (isActive) {
+        msg += '\n\nThis is the currently active account.';
+    }
+    if (!confirm(msg)) return;
+
+    // Second confirmation: also delete stored data?
+    const shouldPurge = confirm('Also delete stored data (settings, contacts, emails) for this account?\n\nClick OK to delete data, or Cancel to keep it.');
+
+    if (shouldPurge) {
+        try {
+            await TauriService.invoke('db_delete_account_data', { pubkey });
+            console.log('[APP] Purged database data for:', pubkey.substring(0, 20) + '...');
+        } catch (e) {
+            console.warn('[APP] Failed to purge account data:', e);
+        }
+    }
+
+    // Remove from accounts list
+    await profileManager.removeAccount(pubkey);
+
+    if (isActive) {
+        const accounts = await profileManager.getAccounts();
+        if (accounts.length > 0) {
+            // Switch to the first remaining account
+            await this.switchToProfile(accounts[0].public_key);
+        } else {
+            // No accounts left — clear state
+            appState.setKeypair(null);
+            appState.setLastLoadedPubkey(null);
+            domManager.setValue('nprivKey', '');
+            domManager.setValue('publicKeyDisplay', '');
+            this.updatePreReleaseWarning();
+            await this.updateProfileSwitcher();
+            await this.resetSettingsToDefaults();
+            this.switchTab('settings');
+        }
+    }
+
+    // Re-render the dropdown list and sidebar display
+    await this.renderProfileSwitcherList();
+    await this.updateProfileSwitcher();
+    notificationService.showSuccess(`Account "${displayName}" removed`);
+}
+
 // Setup event listeners
 NostrMailApp.prototype.setupEventListeners = function() {
     console.log('Setting up event listeners...');
@@ -713,6 +1058,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (encryptBtn) {
             console.log('[JS] Setting up encrypt button event listener');
             encryptBtn.dataset.encrypted = 'false';
+            // Set initial label based on encryption algorithm
+            const initLabelSpan = encryptBtn.querySelector('.encrypt-btn-label');
+            if (initLabelSpan) {
+                const algo = appState.getSettings()?.encryption_algorithm || 'nip44';
+                initLabelSpan.textContent = algo === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
+            }
             // Update DM checkbox visibility on initialization
             if (window.emailService) window.emailService.updateDmCheckboxVisibility();
             encryptBtn.addEventListener('click', async function handleEncryptClick() {
@@ -727,8 +1078,10 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     const subjectValue = domManager.getValue('subject') || '';
                     const messageBodyValue = domManager.getValue('messageBody') || '';
                     
-                    // Always require both subject and body
-                    if (!subjectValue || !messageBodyValue) {
+                    // Check if there's actual content to encrypt (not just quoted original)
+                    const splitCheck = window.emailService ? window.emailService.splitReplyAndQuoted(messageBodyValue) : { replyText: messageBodyValue, quotedOriginal: '' };
+                    const effectiveBody = splitCheck.quotedOriginal ? splitCheck.replyText : messageBodyValue;
+                    if (!subjectValue || !effectiveBody) {
                         notificationService.showError('Both subject and message body must be filled to encrypt.');
                         return;
                     }
@@ -737,68 +1090,60 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         if (iconSpan) iconSpan.className = 'fas fa-unlock';
                         if (labelSpan) labelSpan.textContent = 'Decrypt';
                         encryptBtn.dataset.encrypted = 'true';
-                        // Disable editing
+                        // Disable editing while encrypted
                         if (subjectInput) subjectInput.disabled = true;
                         if (messageBodyInput) messageBodyInput.disabled = true;
                         // Update DM checkbox visibility
                         if (window.emailService) window.emailService.updateDmCheckboxVisibility();
                         // Clear signature when encrypting (body state changed)
+                        // Preserve _plainBody and _htmlBody since encryptEmailFields() just rebuilt them
+                        const savedPlainBody = window.emailService._plainBody;
+                        const savedHtmlBody = window.emailService._htmlBody;
                         window.emailService.clearSignature();
+                        window.emailService._plainBody = savedPlainBody;
+                        window.emailService._htmlBody = savedHtmlBody;
                     }
                 } else {
-                    // Decrypt mode
+                    // Decrypt mode — use the same backend pipeline as sent mail viewing
                     console.log('[JS] Decrypt button clicked');
-                    // Get keys and contact
                     if (!appState.hasKeypair()) {
                         return;
                     }
-                    const privkey = appState.getKeypair().private_key;
                     const pubkey = window.emailService?.selectedNostrContact?.pubkey;
-                    const armoredBody = domManager.getValue('messageBody') || '';
-                    const encryptedSubject = domManager.getValue('subject') || '';
-                    // Regex for both NIP-04 and NIP-44 armored messages
-                    const match = armoredBody.match(/-----BEGIN NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-(04|44) ENCRYPTED MESSAGE-----/);
-                    let decryptedAny = false;
-                    if (privkey && pubkey) {
-                        // Decrypt subject if it looks encrypted
-                        if (window.Utils && window.Utils.isLikelyEncryptedContent(encryptedSubject)) {
-                            try {
-                                const decryptedSubject = await TauriService.decryptDmContent(privkey, pubkey, encryptedSubject);
-                                domManager.setValue('subject', decryptedSubject);
-                                notificationService.showSuccess('Subject decrypted');
-                                decryptedAny = true;
-                            } catch (err) {
-                                notificationService.showError('Failed to decrypt subject: ' + err);
-                            }
-                        }
-                        // Decrypt body if armored
-                        if (match) {
-                            try {
-                                // Use the new manifest-aware decryption function
-                                await window.emailService.decryptBodyContent();
-                                decryptedAny = true;
-                            } catch (err) {
-                                // Fallback to legacy decryption
-                                const encryptedContent = match[2].replace(/\s+/g, '');
-                                try {
-                                    const decrypted = await TauriService.decryptDmContent(privkey, pubkey, encryptedContent);
-                                    domManager.setValue('messageBody', decrypted);
-                                    notificationService.showSuccess('Body decrypted');
-                                    decryptedAny = true;
-                                    // Clear signature when decrypting (body state changed)
-                                    if (window.emailService) window.emailService.clearSignature();
-                                } catch (legacyErr) {
-                                    notificationService.showError('Failed to decrypt body: ' + legacyErr);
-                                }
-                            }
-                        }
-                        if (!decryptedAny) {
-                            notificationService.showError('No encrypted message found in subject or body');
-                        }
-                    } else {
-                        notificationService.showError('No encrypted message found or missing keys');
+                    if (!pubkey) {
+                        notificationService.showError('Please select a Nostr contact first');
+                        return;
                     }
-                    
+                    const currentBody = domManager.getValue('messageBody') || '';
+                    const currentSubject = domManager.getValue('subject') || '';
+
+                    try {
+                        const result = await TauriService.decryptEmailBody(
+                            currentBody, currentSubject, pubkey, null
+                        );
+                        if (result.success) {
+                            // Re-attach quoted original armor so the reply chain
+                            // survives decrypt→edit→re-encrypt cycles in compose.
+                            let decryptedBody = result.body;
+                            if (window.emailService?._quotedOriginalArmor) {
+                                decryptedBody += '\n\n' + window.emailService._quotedOriginalArmor;
+                            }
+                            domManager.setValue('messageBody', decryptedBody);
+                            domManager.setValue('subject', result.subject);
+                            if (window.emailService) window.emailService.clearSignature();
+                            const nip = result.blockResults?.[0]?.bodyType === 'encrypted'
+                                ? (currentBody.includes('NIP-04') ? 'NIP-04' : 'NIP-44')
+                                : 'NIP';
+                            notificationService.showSuccess(`Decrypted with ${nip}`);
+                        } else {
+                            const errorMsg = result.error || 'Failed to decrypt';
+                            notificationService.showError(errorMsg);
+                        }
+                    } catch (error) {
+                        console.error('[JS] Decrypt failed:', error);
+                        notificationService.showError('Failed to decrypt: ' + error);
+                    }
+
                     // Also decrypt any encrypted attachments
                     try {
                         await window.emailService.decryptAllAttachments();
@@ -806,23 +1151,22 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         console.error('Failed to decrypt attachments:', error);
                     }
                     if (iconSpan) iconSpan.className = 'fas fa-lock';
-                    if (labelSpan) labelSpan.textContent = 'Encrypt';
+                    if (labelSpan) {
+                        const algo = appState.getSettings()?.encryption_algorithm || 'nip44';
+                        labelSpan.textContent = algo === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
+                    }
                     encryptBtn.dataset.encrypted = 'false';
                     // Re-enable editing
                     if (subjectInput) subjectInput.disabled = false;
                     if (messageBodyInput) messageBodyInput.disabled = false;
                     // Update DM checkbox visibility
                     if (window.emailService) window.emailService.updateDmCheckboxVisibility();
-                    // Clear signature when decrypting (body state changed)
-                    if (decryptedAny) {
-                        window.emailService.clearSignature();
-                    }
                 }
             });
         } else {
             console.error('[JS] Encrypt button not found in DOM');
         }
-        
+
         // Sign button
         const signBtn = domManager.get('signBtn');
         if (signBtn) {
@@ -832,55 +1176,232 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 const iconSpan = signBtn.querySelector('.sign-btn-icon i');
                 const labelSpan = signBtn.querySelector('.sign-btn-label');
                 const isSigned = signBtn.dataset.signed === 'true';
-                
+
+                const keypair = appState.getKeypair();
+                if (!keypair) {
+                    notificationService.showError('No keypair available for signing.');
+                    return;
+                }
+
+                const gs = window.GlossiaService;
+                const metaSig = window.emailService?.getGlossiaEncodingSignature();
+                const metaPubkey = window.emailService?.getGlossiaEncodingPubkey();
+
                 if (!isSigned) {
-                    // Sign mode
+                    // Sign: sign the canonical ciphertext (decoded binary) if encrypted,
+                    // otherwise sign the plaintext body as-is
                     console.log('[JS] Sign button clicked');
-                    const subjectValue = domManager.getValue('subject') || '';
-                    const messageBodyValue = domManager.getValue('messageBody') || '';
-                    
-                    // Require both subject and body to sign
-                    if (!subjectValue || !messageBodyValue) {
-                        notificationService.showError('Both subject and message body must be filled to sign.');
+                    const rawBodyValue = domManager.getValue('messageBody') || '';
+                    if (!rawBodyValue) {
+                        notificationService.showError('Message body must be filled to sign.');
                         return;
                     }
-                    
-                    const keypair = appState.getKeypair();
-                    if (!keypair || !keypair.private_key) {
-                        return;
+
+                    // Parse armor structure from the full body.
+                    // parseArmorComponents handles depth-counting to properly extract
+                    // the outermost body, nested quoted armor, sig, and seal.
+                    const armorParts = window.emailService ? window.emailService.parseArmorComponents(rawBodyValue) : null;
+                    // isArmored = the body starts with armor (user's own encrypted/signed body).
+                    // If prefixText exists, armor is a quoted original (plaintext reply case).
+                    const isArmored = !!(armorParts && armorParts.bodyText && !armorParts.prefixText);
+                    let bodyValue;
+                    let quotedPlaintext = null;
+
+                    if (isArmored) {
+                        // Armored content: extract body and quoted armor from parsed structure
+                        bodyValue = armorParts.bodyText;
+                        if (window.emailService) {
+                            window.emailService._quotedOriginalArmor = armorParts.quotedArmor || null;
+                        }
+                    } else {
+                        // Not armored: use splitReplyAndQuoted for plaintext reply detection
+                        const splitResult = window.emailService ? window.emailService.splitReplyAndQuoted(rawBodyValue) : { replyText: rawBodyValue, quotedOriginal: '' };
+                        bodyValue = splitResult.quotedOriginal ? splitResult.replyText : rawBodyValue;
+                        if (splitResult.quotedOriginal && window.emailService) {
+                            const qParts = window.emailService.parseArmorComponents(splitResult.quotedOriginal);
+                            if (qParts && qParts.prefixText) {
+                                quotedPlaintext = qParts.prefixText;
+                                const armorStart = splitResult.quotedOriginal.indexOf('-----');
+                                window.emailService._quotedOriginalArmor = armorStart >= 0
+                                    ? splitResult.quotedOriginal.substring(armorStart).trim()
+                                    : splitResult.quotedOriginal;
+                            } else {
+                                window.emailService._quotedOriginalArmor = splitResult.quotedOriginal;
+                            }
+                        }
                     }
-                    
+
                     try {
-                        // Sign the email body in whatever state it's in (encrypted or decrypted)
-                        const contentToSign = messageBodyValue; // Sign the current body state
-                        const signature = await TauriService.signData(keypair.private_key, contentToSign);
-                        
-                        console.log('[JS] Email signed successfully, signature:', signature.substring(0, 32) + '...');
-                        
-                        // Store signature for later use
-                        signBtn.dataset.signature = signature;
+                        // Extract signable bytes via backend (handles glossia round-trip + nested concatenation)
+                        const quotedArmorForSig = window.emailService?._quotedOriginalArmor || null;
+                        const glossiaEncoding = !isArmored ? (window.emailService?.getGlossiaEncoding() || null) : null;
+                        const dataBytes = new Uint8Array(await TauriService.extractSignableBytes(
+                            bodyValue, isArmored, quotedArmorForSig, glossiaEncoding
+                        ));
+                        console.log('[JS] Signing data (binary length:', dataBytes.length, ')');
+
+                        // Sign + verify in one backend round-trip
+                        const [signature, isValid] = await TauriService.signAndVerifyBytes(dataBytes);
+                        if (!isValid) {
+                            notificationService.showError('Signature verification failed. Body restored.');
+                            return;
+                        }
+                        const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
+                        let encodedSig, encodedPubkey, encodedSigPubkey = null;
+
+                        if (gs) {
+                            // Glossia available: encode sig and pubkey separately
+                            const result = await gs.encodeSigPubkey(signature, pubkeyHex, metaSig, metaPubkey);
+                            encodedSig = result.encodedSig;
+                            encodedPubkey = result.encodedPubkey;
+                        } else {
+                            // Glossia not loaded: append raw hex
+                            encodedSig = signature;
+                            encodedPubkey = pubkeyHex;
+                        }
+
+                        // Look up sender name and display name from profile cache or contacts
+                        let profileName = null;
+                        let displayName = null;
+                        try {
+                            const cached = localStorage.getItem('nostr_mail_profiles');
+                            if (cached) {
+                                const profile = JSON.parse(cached)[keypair.public_key];
+                                profileName = profile?.fields?.name || null;
+                                displayName = profile?.fields?.display_name || null;
+                            }
+                        } catch (_) {}
+                        if (!profileName && !displayName) {
+                            const contacts = appState.getContacts() || [];
+                            const selfContact = contacts.find(c => c.pubkey === pubkeyHex);
+                            profileName = selfContact?.name || null;
+                        }
+
+                        // Build armored body via buildPlainBody (handles both encrypted and plaintext per spec)
+                        let newBody;
+                        if (isArmored && window.emailService) {
+                            const encBtn = domManager.get('encryptBtn');
+                            const encAlgo = (encBtn && encBtn.dataset.encrypted === 'true')
+                                ? (appState.getSettings()?.encryption_algorithm || 'nip44')
+                                : null;
+                            newBody = window.emailService.buildPlainBody(
+                                bodyValue, encodedSig, encodedPubkey,
+                                profileName, displayName, true, encAlgo, null, encodedSigPubkey,
+                                window.emailService._quotedOriginalArmor
+                            );
+                        } else if (window.emailService) {
+                            // Plaintext: glossia-encode body and build SIGNED BODY armor per spec 3.2
+                            // originalPlaintext includes quoted text with > prefixes for display above armor
+                            const origPlain = quotedPlaintext
+                                ? bodyValue + '\n\n' + quotedPlaintext
+                                : bodyValue;
+                            let plainBodyText = bodyValue;
+                            if (gs) {
+                                const metaBody = window.emailService?.getGlossiaEncoding();
+                                if (metaBody) {
+                                    try {
+                                        const encoded = await gs.transcode(bodyValue, `encode into ${metaBody}`);
+                                        plainBodyText = encoded.output;
+                                    } catch (e) {
+                                        console.warn('[JS] Sign: glossia-encode plaintext body failed:', e);
+                                    }
+                                }
+                            }
+                            newBody = window.emailService.buildPlainBody(
+                                plainBodyText, encodedSig, encodedPubkey,
+                                profileName, displayName, false, null, origPlain, encodedSigPubkey,
+                                window.emailService._quotedOriginalArmor
+                            );
+                        }
+                        domManager.setValue('messageBody', newBody);
+
                         signBtn.dataset.signed = 'true';
-                        
+                        signBtn.dataset.signature = signature;
+                        signBtn.dataset.originalBody = rawBodyValue;
                         if (iconSpan) iconSpan.className = 'fas fa-check-circle';
                         if (labelSpan) labelSpan.textContent = 'Signed';
                         signBtn.classList.add('signed');
-                        
-                        notificationService.showSuccess('Email signed successfully. Signature will be added when sending.');
+
+                        // Build HTML alternative body for multipart email
+                        if (window.emailService) {
+                            // Build quoted HTML recursively for all nesting levels
+                            const quotedHtmlContent = await window.emailService.buildRecursiveQuotedHtml(
+                                window.emailService._quotedOriginalArmor, quotedPlaintext
+                            );
+                            // bodyValue is already the body content from parseArmorComponents (no armor tags)
+                            const encBtn = domManager.get('encryptBtn');
+                            const isEncrypted = encBtn && encBtn.dataset.encrypted === 'true';
+                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(bodyValue, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey, quotedHtmlContent);
+                            const encAlgo = isEncrypted ? (appState.getSettings()?.encryption_algorithm || 'nip44') : null;
+                            // For plaintext signed emails, glossia-encode the full body (reply + quoted);
+                            // for encrypted, use the body content from inside the armor
+                            const origPlainForMime = (!isEncrypted && quotedPlaintext)
+                                ? bodyValue + '\n\n' + quotedPlaintext
+                                : (isEncrypted ? null : bodyValue);
+                            let plainBodyText = bodyValue;
+                            if (!isEncrypted && gs) {
+                                const metaBody = window.emailService?.getGlossiaEncoding();
+                                if (metaBody) {
+                                    try {
+                                        const encoded = await gs.transcode(bodyValue, `encode into ${metaBody}`);
+                                        plainBodyText = encoded.output;
+                                    } catch (e) {
+                                        console.warn('[JS] Failed to glossia-encode plaintext body:', e);
+                                    }
+                                }
+                            }
+                            window.emailService._plainBody = window.emailService.buildPlainBody(
+                                plainBodyText, encodedSig, encodedPubkey, profileName, displayName,
+                                isEncrypted, encAlgo, origPlainForMime, encodedSigPubkey,
+                                window.emailService._quotedOriginalArmor
+                            );
+                            // Show armored format in textarea
+                            if (window.emailService._plainBody) {
+                                domManager.setValue('messageBody', window.emailService._plainBody);
+                            }
+                        }
+
+                        console.log('[JS] Signature verified successfully');
+                        notificationService.showSuccess('Signed and verified.');
                     } catch (error) {
-                        console.error('[JS] Failed to sign email:', error);
-                        notificationService.showError('Failed to sign email: ' + error);
+                        console.error('[JS] Failed to sign:', error);
+                        notificationService.showError('Failed to sign: ' + error);
                     }
                 } else {
-                    // Unsigned mode
+                    // Block unsigning NIP-04 messages that arrived pre-signed
+                    // (no original body to restore). Allow unsigning if the user
+                    // signed it themselves this session (originalBody is saved).
+                    const bodyContent = domManager.getValue('messageBody') || '';
+                    if (bodyContent.includes('NIP-04 ENCRYPTED') &&
+                        signBtn.dataset.originalBody === undefined) {
+                        notificationService.showError(
+                            'Cannot remove signature from NIP-04 encrypted messages. ' +
+                            'NIP-04 requires signing for security.'
+                        );
+                        return;
+                    }
+
+                    // Unsign: restore the original body saved at sign time
                     console.log('[JS] Unsign button clicked');
+                    if (signBtn.dataset.originalBody !== undefined) {
+                        domManager.setValue('messageBody', signBtn.dataset.originalBody);
+                        delete signBtn.dataset.originalBody;
+                        console.log('[JS] Restored original body from sign-time snapshot');
+                    }
+
                     signBtn.dataset.signed = 'false';
                     delete signBtn.dataset.signature;
-                    
                     if (iconSpan) iconSpan.className = 'fas fa-pen';
                     if (labelSpan) labelSpan.textContent = 'Sign';
                     signBtn.classList.remove('signed');
-                    
-                    notificationService.showInfo('Email signature removed.');
+
+                    // Clear HTML and plain alternative bodies
+                    if (window.emailService) {
+                        window.emailService._htmlBody = null;
+                        window.emailService._plainBody = null;
+                    }
+
+                    notificationService.showInfo('Signature removed.');
                 }
             });
         } else {
@@ -1233,45 +1754,19 @@ NostrMailApp.prototype.setupEventListeners = function() {
                             } else {
                                 // Valid key - check if pubkey changed and load settings if needed
                                 try {
-                                    // Re-read public key from display element (in case it changed)
                                     const publicKey = domManager.getValue('publicKeyDisplay')?.trim();
                                     const lastLoadedPubkey = appState.getLastLoadedPubkey();
-                                    
-                                    // Check if this is a different pubkey than what was last loaded
-                                    // Also verify it's a valid npub (starts with npub1) and not an error message
+
                                     if (publicKey && publicKey.startsWith('npub1') && publicKey !== lastLoadedPubkey) {
-                                        console.log('[APP] Pubkey changed, loading settings for:', publicKey.substring(0, 20) + '...');
-                                        
                                         // Double-check the private key hasn't changed again
                                         const finalNprivKey = nprivKeyInput.value.trim();
                                         if (finalNprivKey !== currentNprivKey) {
                                             console.log('[APP] Private key changed during settings load, aborting');
                                             return;
                                         }
-                                        
-                                        // Immediately set flag to prevent auto-save from triggering
-                                        if (this._setPopulatingForm) {
-                                            this._setPopulatingForm(true);
-                                        }
-                                        
-                                        // Update keypair in appState BEFORE loading settings (so it has correct private key for decryption)
-                                        const keypair = { private_key: finalNprivKey, public_key: publicKey };
-                                        appState.setKeypair(keypair);
-                                        localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
-                                        // Hide pre-release warning once keypair is set
-                                        this.updatePreReleaseWarning();
-                                        
-                                        // Clear contacts from appState since they belong to the old user
-                                        appState.setContacts([]);
-                                        // Immediately clear the contacts UI if visible
-                                        if (window.contactsService) {
-                                            window.contactsService.renderContacts();
-                                        }
-                                        
-                                        // Load settings for the new pubkey
-                                        await this.loadSettingsForPubkey(publicKey);
-                                        
-                                        // Note: loadSettingsForPubkey already sets lastLoadedPubkey, so we don't need to set it here
+
+                                        await profileManager.addAccount(finalNprivKey);
+                                        await this.switchToProfile(publicKey);
                                     }
                                 } catch (error) {
                                     console.error('[APP] Error checking/loading settings for pubkey:', error);
@@ -1285,6 +1780,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
             });
         }
         
+        // Profile switcher
+        this.setupProfileSwitcherListeners();
+
         // Dark mode toggle
         const darkToggle = document.getElementById('dark-mode-toggle');
         if (darkToggle) {
@@ -1332,40 +1830,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (generateKeyBtn) {
             generateKeyBtn.addEventListener('click', async () => {
                 try {
-                    const keypair = await TauriService.generateKeypair();
-                    appState.setKeypair(keypair);
-                    localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
-                    domManager.setValue('nprivKey', keypair.private_key);
-                    await app.updatePublicKeyDisplay();
-                    
-                    // Hide pre-release warning once keypair is generated
-                    app.updatePreReleaseWarning();
-                    
-                    // Load settings for the new pubkey
-                    console.log('[APP] New keypair generated, loading settings for pubkey:', keypair.public_key);
-                    await app.loadSettingsForPubkey(keypair.public_key);
-                    
-                    // Restart live events with new keypair
-                    await app.cleanupLiveEvents();
-                    await app.initializeLiveEvents();
-                    
-                    // Reinitialize the persistent Nostr client with the new keypair
-                    console.log('[APP] New keypair generated, reinitializing persistent Nostr client');
-                    await app.initializeNostrClient();
-                    
-                    // Clear contacts from appState since they belong to the old user
-                    appState.setContacts([]);
-                    // Immediately clear the contacts UI if visible
-                    if (window.contactsService) {
-                        window.contactsService.renderContacts();
-                    }
-                    
-                    // Reload the currently active page to reflect the new keypair
-                    await app.reloadActivePage();
-                    
-                    // Ensure default nostr-mail contact is added for the new user
-                    await app.ensureDefaultContact();
-                    
+                    const pubkey = await TauriService.invoke('keychain_generate_account');
+                    await app.switchToProfile(pubkey);
                     notificationService.showSuccess('New keypair generated!');
                 } catch (error) {
                     notificationService.showError('Failed to generate keypair: ' + error);
@@ -1432,11 +1898,9 @@ NostrMailApp.prototype.initializeLiveEvents = async function() {
         return;
     }
     
-    const privateKey = appState.getKeypair().private_key;
-    
     try {
-        // Start unified subscription for DMs and profile updates
-        await TauriService.startLiveEventSubscription(privateKey);
+        // Start unified subscription for DMs and profile updates (backend reads key from state)
+        await TauriService.startLiveEventSubscription();
         
         // Set up event listeners for live events
         await this.setupLiveEventListeners();
@@ -1735,7 +2199,7 @@ NostrMailApp.prototype.debugLiveEvents = function() {
 };
 
 // Experimental: Try to insert message directly into UI for instant updates
-NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
+NostrMailApp.prototype.tryDirectMessageInsertion = async function(dmData) {
     
     try {
         // Only try if we're viewing the messages tab
@@ -1801,10 +2265,19 @@ NostrMailApp.prototype.tryDirectMessageInsertion = function(dmData) {
                 minute: '2-digit' 
             });
         
+        // Decrypt the live message content using frontend decryption (glossia-aware)
+        let displayContent = dmData.content || '[Encrypted message]';
+        if (window.dmService && window.dmService._decryptDmContent) {
+            try {
+                const otherPubkey = isOutgoing ? dmData.recipient_pubkey : dmData.sender_pubkey;
+                displayContent = await window.dmService._decryptDmContent(dmData.content, otherPubkey);
+            } catch (_) { /* show raw content */ }
+        }
+
         // Use the same structure as dm-service.js
         messageDiv.innerHTML = `
             <div class="message-content">
-                <div class="message-text">${window.Utils?.escapeHtml(dmData.content) || dmData.content || '[Encrypted message]'}</div>
+                <div class="message-text">${window.Utils?.escapeHtml(displayContent) || displayContent}</div>
                 <div class="message-meta">
                     <div class="message-time">${dateTimeDisplay}</div>
                     <span class="message-status live-message" title="Live message">⚡</span>
@@ -1987,9 +2460,15 @@ NostrMailApp.prototype.updateComposeButtons = function() {
     const autoEncrypt = settings.automatically_encrypt !== false;
     const autoSign = settings.automatically_sign !== false;
     
-    // Hide/show encrypt button
+    // Hide/show encrypt button and update label for NIP-04
     if (encryptBtn) {
         encryptBtn.style.display = autoEncrypt ? 'none' : 'inline-block';
+        if (encryptBtn.dataset.encrypted !== 'true') {
+            const label = encryptBtn.querySelector('.encrypt-btn-label');
+            if (label) {
+                label.textContent = settings.encryption_algorithm === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
+            }
+        }
     }
     
     // Hide/show sign button
@@ -2536,65 +3015,31 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 return false;
             }
             publicKey = await TauriService.getPublicKeyFromPrivate(nprivKey);
-            const keypair = { private_key: nprivKey, public_key: publicKey };
-            
+
             // Check if this is a different keypair by comparing public keys
-            // (public key uniquely identifies the keypair)
-            // Store the current public key BEFORE updating appState to ensure accurate comparison
             isNewKeypair = !currentPublicKey || currentPublicKey !== publicKey;
-            
+
             console.log('[APP] Keypair change check:', {
                 currentPublicKey: currentPublicKey ? currentPublicKey.substring(0, 20) + '...' : 'null',
                 newPublicKey: publicKey.substring(0, 20) + '...',
                 isNewKeypair: isNewKeypair
             });
-            
-            // If keypair changed, update appState FIRST so loadSettingsForPubkey can use the correct private key for decryption
+
+            // If keypair changed, use switchToProfile to handle the full switch
             if (isNewKeypair) {
-                console.log('[APP] Keypair changed, updating appState before loading settings');
-                appState.setKeypair(keypair);
-                localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
-                this.renderProfilePubkey();
-                // Hide pre-release warning once keypair is set
-                this.updatePreReleaseWarning();
-                
-                console.log('[APP] Keypair changed, loading settings for new pubkey:', publicKey);
-                await this.loadSettingsForPubkey(publicKey);
-                // Note: loadSettingsForPubkey already sets lastLoadedPubkey, so we don't need to set it here
-                
-                await this.cleanupLiveEvents();
-                await this.initializeLiveEvents();
-                
-                // Reinitialize the persistent Nostr client with the new keypair
-                console.log('[APP] Keypair changed, reinitializing persistent Nostr client');
-                await this.initializeNostrClient();
-                
-                // Clear contacts from appState since they belong to the old user
-                appState.setContacts([]);
-                // Immediately clear the contacts UI if visible
-                if (window.contactsService) {
-                    window.contactsService.renderContacts();
-                }
-                
-                // Reload the currently active page to reflect the new keypair
-                await this.reloadActivePage();
-                
-                // Ensure default nostr-mail contact is added for the new user
-                await this.ensureDefaultContact();
-                
+                await profileManager.addAccount(nprivKey);
+                await this.switchToProfile(publicKey);
+
                 // After loading settings for new keypair, check if settings were actually loaded
                 const loadedSettings = appState.getSettings();
                 if (loadedSettings && Object.keys(loadedSettings).length > 0) {
                     console.log('[APP] Settings loaded for new keypair, keys:', Object.keys(loadedSettings));
-                    // Settings were loaded and form was populated, so we can continue to save them
-                    // (this allows user to see the loaded settings and optionally modify before saving)
                 } else {
                     console.log('[APP] No settings found for new keypair, will use defaults');
                 }
             } else {
                 // Same keypair, just update appState
-                appState.setKeypair(keypair);
-                localStorage.setItem('nostr_keypair', JSON.stringify(keypair));
+                appState.setKeypair({ public_key: publicKey });
                 this.renderProfilePubkey();
                 // Hide pre-release warning once keypair is set
                 this.updatePreReleaseWarning();
@@ -2644,7 +3089,10 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 hide_undecryptable_emails: (loadedSettings && loadedSettings.hide_undecryptable_emails !== undefined) ? loadedSettings.hide_undecryptable_emails : (domManager.get('hide-undecryptable-emails-preference')?.checked !== false),
                 automatically_encrypt: (loadedSettings && loadedSettings.automatically_encrypt !== undefined) ? loadedSettings.automatically_encrypt : (domManager.get('automatically-encrypt-preference')?.checked !== false),
                 automatically_sign: (loadedSettings && loadedSettings.automatically_sign !== undefined) ? loadedSettings.automatically_sign : (domManager.get('automatically-sign-preference')?.checked !== false),
-                hide_unsigned_messages: (loadedSettings && loadedSettings.hide_unsigned_messages !== undefined) ? loadedSettings.hide_unsigned_messages : (domManager.get('hide-unsigned-messages-preference')?.checked !== false)
+                hide_unsigned_messages: (loadedSettings && loadedSettings.hide_unsigned_messages !== undefined) ? loadedSettings.hide_unsigned_messages : (domManager.get('hide-unsigned-messages-preference')?.checked !== false),
+                glossia_encoding_body: (loadedSettings && loadedSettings.glossia_encoding_body != null) ? loadedSettings.glossia_encoding_body : (domManager.getValue('glossiaEncodingBody') ?? 'latin'),
+                glossia_encoding_signature: (loadedSettings && loadedSettings.glossia_encoding_signature != null) ? loadedSettings.glossia_encoding_signature : (domManager.getValue('glossiaEncodingSignature') ?? 'latin'),
+                glossia_encoding_pubkey: (loadedSettings && loadedSettings.glossia_encoding_pubkey != null) ? loadedSettings.glossia_encoding_pubkey : (domManager.getValue('glossiaEncodingPubkey') ?? 'latin')
             };
         } else {
             // Use form values (normal case)
@@ -2660,7 +3108,6 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             }
             
             settings = {
-                npriv_key: nprivKey || currentKeypair.private_key,
                 encryption_algorithm: domManager.getValue('encryptionAlgorithm') || 'nip44',
                 email_address: domManager.getValue('emailAddress') || '',
                 password: domManager.getValue('emailPassword') || '',
@@ -2677,7 +3124,10 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 hide_undecryptable_emails: domManager.get('hide-undecryptable-emails-preference')?.checked !== false, // Default to true
                 automatically_encrypt: autoEncryptEnabled,
                 automatically_sign: autoSignPref?.checked !== false, // Default to true (will be true if auto-encrypt is enabled)
-                hide_unsigned_messages: domManager.get('hide-unsigned-messages-preference')?.checked !== false // Default to true
+                hide_unsigned_messages: domManager.get('hide-unsigned-messages-preference')?.checked !== false, // Default to true
+                glossia_encoding_body: domManager.getValue('glossiaEncodingBody') ?? 'latin',
+                glossia_encoding_signature: domManager.getValue('glossiaEncodingSignature') ?? 'latin',
+                glossia_encoding_pubkey: domManager.getValue('glossiaEncodingPubkey') ?? 'latin'
             };
         }
         
@@ -2716,12 +3166,13 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('automatically_encrypt', (settings.automatically_encrypt !== undefined ? settings.automatically_encrypt : true).toString());
             settingsMap.set('automatically_sign', (settings.automatically_sign !== undefined ? settings.automatically_sign : true).toString());
             settingsMap.set('hide_unsigned_messages', (settings.hide_unsigned_messages !== undefined ? settings.hide_unsigned_messages : true).toString());
+            settingsMap.set('glossia_encoding_body', settings.glossia_encoding_body ?? 'latin');
+            settingsMap.set('glossia_encoding_signature', settings.glossia_encoding_signature ?? 'latin');
+            settingsMap.set('glossia_encoding_pubkey', settings.glossia_encoding_pubkey ?? 'latin');
             
             const settingsObj = Object.fromEntries(settingsMap);
-            // Get private key for encryption
-            const currentKeypair = appState.getKeypair();
-            const privateKeyForEncryption = currentKeypair ? currentKeypair.private_key : null;
-            await TauriService.dbSaveSettingsBatch(publicKey, settingsObj, privateKeyForEncryption);
+            // Backend uses active key from AppState for encryption
+            await TauriService.dbSaveSettingsBatch(publicKey, settingsObj);
             console.log('[APP] Settings saved to database for pubkey:', publicKey);
             
             // Update last loaded pubkey tracker after successful save
@@ -2810,7 +3261,10 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'automatically-sign-preference',
         'hide-unsigned-messages-preference',
         'syncCutoffDays',
-        'emailsPerPage'
+        'emailsPerPage',
+        'glossiaEncodingBody',
+        'glossiaEncodingSignature',
+        'glossiaEncodingPubkey'
     ];
     
     settingsFields.forEach(fieldId => {
@@ -2947,13 +3401,23 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         const currentNprivValue = nprivKeyInput?.value?.trim() || '';
         if (!currentNprivValue) {
             const keypair = appState.getKeypair();
-            if (keypair && keypair.private_key) {
-                domManager.setValue('nprivKey', keypair.private_key);
-                console.log('[APP] Populated private key field from cached keypair');
+            if (keypair && keypair.public_key) {
+                try {
+                    const privKey = await profileManager.getPrivateKey(keypair.public_key);
+                    if (privKey) {
+                        domManager.setValue('nprivKey', privKey);
+                        console.log('[APP] Populated private key field from keychain');
+                    }
+                } catch (e) {
+                    console.log('[APP] Could not populate private key field:', e);
+                }
             }
         }
         
         domManager.setValue('encryptionAlgorithm', settings.encryption_algorithm || 'nip44');
+        domManager.setValue('glossiaEncodingBody', settings.glossia_encoding_body ?? 'latin');
+        domManager.setValue('glossiaEncodingSignature', settings.glossia_encoding_signature ?? 'latin');
+        domManager.setValue('glossiaEncodingPubkey', settings.glossia_encoding_pubkey ?? 'latin');
         domManager.setValue('emailAddress', settings.email_address || '');
         domManager.setValue('emailPassword', settings.password || '');
         domManager.setValue('smtpHost', settings.smtp_host || '');
@@ -3439,7 +3903,7 @@ NostrMailApp.prototype.getRelayStatusIcon = function(connectionStatus) {
 NostrMailApp.prototype.getRelayStatusText = function(connectionStatus) {
     // Check if private key is set - if not, show "Not Connected" instead of "Connection Failed"
     const keypair = appState.getKeypair();
-    const hasPrivateKey = keypair && keypair.private_key;
+    const hasPrivateKey = appState.hasKeypair();
     
     switch (connectionStatus) {
         case 'Connected': return 'Connected';
@@ -4720,11 +5184,8 @@ NostrMailApp.prototype.updateProfile = async function() {
             }
         }
 
-        // Update profile on Nostr using persistent client (more efficient)
-        await TauriService.updateProfilePersistent(
-            appState.getKeypair().private_key,
-            cleanedFields
-        );
+        // Update profile on Nostr using persistent client (backend reads key from state)
+        await TauriService.updateProfilePersistent(cleanedFields);
 
         // Cache the updated profile
         const updatedProfile = {

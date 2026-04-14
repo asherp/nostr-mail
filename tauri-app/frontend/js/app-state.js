@@ -112,10 +112,9 @@ class AppState {
         return this.settings;
     }
 
-    // Keypair management
+    // Keypair management (public key only — private keys stay in backend keychain)
     setKeypair(keypair) {
-        this.keypair = keypair;
-        this.nprivKey = keypair?.private_key || null;
+        this.keypair = keypair ? { public_key: keypair.public_key } : null;
     }
 
     getKeypair() {

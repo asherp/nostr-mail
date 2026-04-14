@@ -18,6 +18,38 @@ class DMService {
         this.loadingMessages = new Map(); // Track ongoing loadDmMessages calls to prevent race conditions
     }
 
+    // Decrypt a single DM content string via NIP-44/NIP-04.
+    async _decryptDmContent(encryptedContent, contactPubkey) {
+        const keypair = window.appState.getKeypair();
+        if (!keypair) return '[No keypair]';
+
+        try {
+            return await TauriService.decryptDmContent(contactPubkey, encryptedContent);
+        } catch (_) {
+            return '[Failed to decrypt]';
+        }
+    }
+
+    // Fetch raw DMs from DB and decrypt in the frontend (supports glossia).
+    async _fetchAndDecryptDms(contactPubkey) {
+        const myPubkey = window.appState.getKeypair().public_key;
+
+        const rawMessages = await window.__TAURI__.core.invoke('db_get_dms_for_conversation', {
+            userPubkey: myPubkey,
+            contactPubkey: contactPubkey
+        });
+
+        if (!rawMessages || rawMessages.length === 0) return [];
+
+        // Decrypt each message — use the other party's pubkey for the shared secret
+        for (const msg of rawMessages) {
+            const otherPubkey = (msg.sender_pubkey === myPubkey) ? msg.recipient_pubkey : msg.sender_pubkey;
+            msg.content = await this._decryptDmContent(msg.content, otherPubkey);
+        }
+
+        return rawMessages;
+    }
+
     // Load DM contacts from backend and network
     async loadDmContacts() {
         try {
@@ -36,18 +68,12 @@ class DMService {
             }
             
             const myPubkey = window.appState.getKeypair().public_key;
-            const privateKey = window.appState.getKeypair().private_key;
             const dmContacts = [];
 
             for (const contactPubkey of pubkeys) {
                 try {
-                    // LOG: Show which pubkeys are being used for the conversation fetch
-                    // 1. Fetch decrypted messages for this conversation
-                    const messages = await window.__TAURI__.core.invoke('db_get_decrypted_dms_for_conversation', {
-                        privateKey: privateKey,
-                        userPubkey: myPubkey,
-                        contactPubkey: contactPubkey
-                    });
+                    // 1. Fetch and decrypt messages for this conversation (frontend decryption with glossia support)
+                    const messages = await this._fetchAndDecryptDms(contactPubkey);
                     // LOG: Show how many messages were returned
                     if (!messages || messages.length === 0) {
                         continue;
@@ -463,14 +489,19 @@ class DMService {
                 dmConversationHeader.style.display = 'none';
             }
             
-            // Hide back button in tab-header
+            // Restore "Messages" title and hide back button in tab-header
             const tabHeader = document.querySelector('#dm .tab-header');
+            const messagesTitle = tabHeader?.querySelector('h2');
+            if (messagesTitle) {
+                messagesTitle.style.display = '';
+            }
+            const backToMessagesBtn = tabHeader?.querySelector('.dm-back-to-messages-btn');
+            if (backToMessagesBtn) {
+                backToMessagesBtn.style.display = 'none';
+            }
             const tabHeaderBackBtn = tabHeader?.querySelector('.back-to-nav-btn');
             if (tabHeaderBackBtn) {
                 tabHeaderBackBtn.style.display = 'none';
-                // Remove btn btn-secondary classes when hiding
-                tabHeaderBackBtn.classList.remove('btn', 'btn-secondary');
-                // Restore original handler (will be set up by setupBackButtons)
                 tabHeaderBackBtn.onclick = null;
             }
             
@@ -534,26 +565,39 @@ class DMService {
             dmContainer.classList.add('dm-conversation-view');
             this.dmNavState = 'conversation';
             
-            // Show back button in tab-header (left of "Messages")
+            // Replace "Messages" h2 with back button in tab header
             const tabHeader = document.querySelector('#dm .tab-header');
+            const messagesTitle = tabHeader?.querySelector('h2');
+            if (messagesTitle) {
+                messagesTitle.style.display = 'none';
+            }
+            // Hide the back-to-nav-btn (not needed here)
             const tabHeaderBackBtn = tabHeader?.querySelector('.back-to-nav-btn');
             if (tabHeaderBackBtn) {
-                // Add btn btn-secondary classes to match "back to inbox" button styling
-                tabHeaderBackBtn.classList.add('btn', 'btn-secondary');
-                tabHeaderBackBtn.style.display = 'flex';
-                // Update click handler to go back to DM list instead of navbar
-                tabHeaderBackBtn.onclick = (e) => {
+                tabHeaderBackBtn.style.display = 'none';
+            }
+            // Show or create the "Back to Messages" button in the tab header
+            let backToMessagesBtn = tabHeader?.querySelector('.dm-back-to-messages-btn');
+            if (!backToMessagesBtn && tabHeader) {
+                backToMessagesBtn = document.createElement('button');
+                backToMessagesBtn.className = 'btn btn-secondary dm-back-to-messages-btn';
+                backToMessagesBtn.innerHTML = '<i class="fas fa-arrow-left"></i> Back to Messages';
+                const headerLeft = tabHeader.querySelector('div');
+                if (headerLeft) {
+                    headerLeft.appendChild(backToMessagesBtn);
+                }
+            }
+            if (backToMessagesBtn) {
+                backToMessagesBtn.style.display = 'inline-flex';
+                backToMessagesBtn.onclick = (e) => {
                     e.preventDefault();
                     e.stopPropagation();
                     this.showDmList();
                 };
             }
-            
+
             // Load messages for this contact
             this.loadDmMessages(contactPubkey);
-            
-            // Show back button after messages are loaded (it will be created in loadDmMessages)
-            // The back button handler is already set up in loadDmMessages
         } catch (error) {
             console.error('Error showing DM conversation:', error);
         }
@@ -592,8 +636,7 @@ class DMService {
         }
         
         const myPubkey = window.appState.getKeypair().public_key;
-        const privateKey = window.appState.getKeypair().private_key;
-        
+
         // Check if messages are already cached (skip cache if forceRefresh is true)
         const cachedMessages = window.appState.getDmMessages(contactPubkey);
         if (cachedMessages && cachedMessages.length > 0 && !forceRefresh) {
@@ -630,12 +673,8 @@ class DMService {
         }
         
         try {
-            // Fetch conversation messages from the local database (decrypted)
-            const messages = await window.__TAURI__.core.invoke('db_get_decrypted_dms_for_conversation', {
-                privateKey: privateKey,
-                userPubkey: myPubkey,
-                contactPubkey: contactPubkey
-            });
+            // Fetch and decrypt messages in the frontend (supports glossia-encoded DMs)
+            const messages = await this._fetchAndDecryptDms(contactPubkey);
             
             if (!messages || !Array.isArray(messages)) {
                 console.error('[JS] Invalid messages response:', messages);
@@ -810,14 +849,13 @@ class DMService {
             }
             // --- End avatar fallback logic ---
             
-            // Back button is now handled in showDmConversation() - no need to create it here
             // Hide the dm-conversation-header if it exists
             const dmConversationHeader = document.getElementById('dm-conversation-header');
             if (dmConversationHeader) {
                 dmConversationHeader.style.display = 'none';
             }
-            
-            // Create conversation header with contact info (no back button here)
+
+            // Create conversation header with contact info
             const headerElement = document.createElement('div');
             headerElement.className = 'conversation-header';
             headerElement.innerHTML = `
@@ -830,7 +868,7 @@ class DMService {
                 </div>
             `;
             dmMessages.appendChild(headerElement);
-            
+
             // Add click handler to avatar to navigate to contacts page
             const avatarElement = headerElement.querySelector('.contact-avatar');
             if (avatarElement) {
@@ -957,11 +995,10 @@ class DMService {
                                     await this.loadEmailBody(message, expandableElement, contactPubkey);
                                 } else {
                                     summaryElement.setAttribute('data-expanded', 'false');
-                                    // Remove email content when collapsing
-                                    const emailContent = expandableElement.querySelector('.email-body-content-text');
-                                    if (emailContent) {
-                                        expandableElement.removeChild(emailContent);
-                                    }
+                                    // Remove all loaded content (body, attachments, etc.) except the summary
+                                    Array.from(expandableElement.children).forEach(child => {
+                                        if (child !== summaryElement) child.remove();
+                                    });
                                 }
                             });
                         }
@@ -1174,7 +1211,6 @@ class DMService {
             const sendStart = Date.now();
             
             const eventId = await window.TauriService.sendDirectMessage(
-                window.appState.getKeypair().private_key,
                 contactPubkey,
                 replyText,
                 activeRelays
@@ -1392,15 +1428,13 @@ class DMService {
         window.notificationService.showInfo(`Syncing conversation with ${contactPubkey.substring(0, 16)}...`);
         
         try {
-            const privateKey = window.appState.getKeypair()?.private_key;
             const relays = window.appState.getActiveRelays();
-            
-            if (!privateKey || !relays || relays.length === 0) {
+
+            if (!window.appState.hasKeypair() || !relays || relays.length === 0) {
                 return;
             }
-            
+
             const count = await window.__TAURI__.core.invoke('sync_conversation_with_network', {
-                privateKey,
                 contactPubkey: contactPubkey,
                 relays
             });
@@ -1434,10 +1468,9 @@ class DMService {
         window.notificationService.showInfo('Syncing DMs from network...');
         try {
             // Sync DMs from network to database
-            const privateKey = window.appState.getKeypair()?.private_key;
             const relays = window.appState.getActiveRelays();
-            if (!privateKey) {
-                window.notificationService.showError('No private key available for DM sync');
+            if (!window.appState.hasKeypair()) {
+                window.notificationService.showError('No keypair available for DM sync');
                 // Reset refresh button
                 if (refreshBtn && originalRefreshBtnHTML) {
                     refreshBtn.disabled = false;
@@ -1455,7 +1488,6 @@ class DMService {
                 return;
             }
             await window.__TAURI__.core.invoke('sync_direct_messages_with_network', {
-                privateKey,
                 relays
             });
             window.notificationService.showSuccess('DMs synced from network');
@@ -1611,12 +1643,10 @@ class DMService {
         
         try {
             // Fetch and display email body
-            const privateKey = window.appState.getKeypair().private_key;
             const userPubkey = window.appState.getKeypair().public_key;
-            
+
             const emailResult = await window.__TAURI__.core.invoke('db_get_matching_email_body', {
                 dmEventId: message.event_id,
-                privateKey: privateKey,
                 userPubkey: userPubkey,
                 contactPubkey: contactPubkey
             });
@@ -1625,33 +1655,30 @@ class DMService {
             expandableElement.removeChild(loadingDiv);
             
             if (emailResult && emailResult.body) {
-                // Check if the emailBody is a manifest JSON (starts with { and contains "body" and "ciphertext")
                 let finalBody = emailResult.body;
+
+                // If backend couldn't decrypt (e.g. glossia-encoded), try frontend decryption
+                if (emailResult.encrypted) {
+                    console.log('[JS] DM: Body still encrypted, attempting frontend glossia decode + NIP decrypt');
+                    const decryptPubkey = contactPubkey !== window.appState.getKeypair()?.public_key
+                        ? contactPubkey
+                        : emailResult.sender_pubkey || contactPubkey;
+                    finalBody = await this._tryFrontendDecrypt(emailResult.body, decryptPubkey);
+                }
+
+                // Build manifest from backend attachment metadata (if available)
                 let manifest = null;
-                try {
-                    const parsed = JSON.parse(emailResult.body);
-                    if (parsed.body && parsed.body.ciphertext && parsed.body.key_wrap) {
-                        // This is a manifest - extract and decrypt the body
-                        manifest = parsed;
-                        const bodyKey = manifest.body.key_wrap;
-                        const encryptedBodyData = manifest.body.ciphertext;
-                        
-                        // Use emailService's decryptWithAES method
-                        if (window.emailService && typeof window.emailService.decryptWithAES === 'function') {
-                            try {
-                                const decryptedBodyBase64 = await window.emailService.decryptWithAES(encryptedBodyData, bodyKey);
-                                finalBody = atob(decryptedBodyBase64);
-                            } catch (aesError) {
-                                console.error('[JS] DM: AES decryption failed:', aesError);
-                                finalBody = `[AES Decryption Failed: ${aesError.message}]`;
-                            }
-                        } else {
-                            console.error('[JS] DM: emailService.decryptWithAES not available');
-                            finalBody = '[Manifest detected but AES decryption not available]';
-                        }
-                    }
-                } catch (parseError) {
-                    // Not JSON, use as-is (legacy format)
+                if (emailResult.attachments && emailResult.attachments.length > 0) {
+                    manifest = {
+                        attachments: emailResult.attachments.map(a => ({
+                            id: a.id,
+                            orig_filename: a.origFilename,
+                            orig_mime: a.origMime,
+                            key_wrap: a.keyWrapB64,
+                            cipher_sha256: a.cipherSha256Hex,
+                            orig_size: a.cipherSize,
+                        }))
+                    };
                 }
                 
                 // Display email body
@@ -1702,36 +1729,12 @@ class DMService {
                                 }));
                             }
                             
-                            // Create attachments HTML
+                            // Create attachments HTML — simple list of filename links
                             const attachmentsHtml = `
-                                <div class="email-attachments" style="margin: 15px 0;">
-                                    <h4 style="margin-bottom: 10px;">Attachments (${attachmentDisplayData.length})</h4>
-                                    <div class="attachment-list">
-                                        ${attachmentDisplayData.map(attachment => {
-                                            const sizeFormatted = (attachment.displaySize / 1024).toFixed(2) + ' KB';
-                                            const isEncrypted = attachment.encryption_method === 'manifest_aes';
-                                            const statusIcon = isEncrypted ? '🔒' : '📄';
-                                            const statusText = isEncrypted ? 'Encrypted' : 'Plain';
-                                            
-                                            return `
-                                            <div class="attachment-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin: 5px 0;">
-                                                <div class="attachment-info" style="display: flex; align-items: center;">
-                                                    <i class="fas fa-file" style="margin-right: 10px;"></i>
-                                                    <div class="attachment-details">
-                                                        <div class="attachment-name" style="font-weight: bold;">${window.Utils.escapeHtml(attachment.displayName)}</div>
-                                                        <div class="attachment-meta" style="font-size: 0.9em; color: #666;">
-                                                            ${sizeFormatted} • ${statusIcon} ${statusText}
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                                <div class="attachment-actions">
-                                                    <button class="btn btn-sm btn-outline-primary" onclick="dmService.downloadDmAttachment(${attachment.id}, ${emailResult.email_id})">
-                                                        <i class="fas fa-download"></i> Download
-                                                    </button>
-                                                </div>
-                                            </div>`;
-                                        }).join('')}
-                                    </div>
+                                <div class="email-attachments" style="margin: 8px 0; font-size: 0.85em; opacity: 0.7;">
+                                    ${attachmentDisplayData.map(attachment =>
+                                        `<a href="#" onclick="event.preventDefault(); dmService.downloadDmAttachment(${attachment.id}, ${emailResult.email_id})" style="color: inherit; text-decoration: none; display: inline-block; margin-right: 12px;"><i class="fas fa-paperclip" style="margin-right: 4px;"></i>${window.Utils.escapeHtml(attachment.displayName)}</a>`
+                                    ).join('')}
                                 </div>
                             `;
                             
@@ -1763,6 +1766,25 @@ class DMService {
         }
     }
 
+    // Attempt glossia decode + NIP decrypt of a raw email body in the frontend.
+    // Reuses the same decryption pipeline as the email detail view.
+    async _tryFrontendDecrypt(rawBody, contactPubkey) {
+        const keypair = window.appState.getKeypair();
+        if (!keypair) return '[Failed to decrypt email body]';
+
+        try {
+            const result = await TauriService.decryptEmailBody(
+                rawBody, '',
+                contactPubkey, null
+            );
+            if (result.success) return result.body;
+        } catch (err) {
+            console.warn('[JS] DM: Backend decrypt fallback failed:', err);
+        }
+
+        return '[Failed to decrypt email body]';
+    }
+
     // Download attachment from DM conversation email
     async downloadDmAttachment(attachmentId, emailId) {
         try {            const attachment = await TauriService.getAttachment(attachmentId);
@@ -1773,77 +1795,47 @@ class DMService {
             
             // Check if attachment is encrypted and needs decryption
             if (attachment.encryption_method === 'manifest_aes') {
-                // For manifest-encrypted attachments, we need to get the email and decrypt the manifest
-                // Try to find email in inbox or sent emails
-                let email = null;
-                const inboxEmails = appState.getEmails() || [];
-                const sentEmails = appState.getSentEmails() || [];
-                email = inboxEmails.find(e => e.id == emailId) || sentEmails.find(e => e.id == emailId);
-                
-                if (!email) {
-                    // Email not in cache - we need the email body to decrypt the manifest
-                    // For now, show an error. In the future, we could fetch the email from backend
-                    window.notificationService.showError('Email not found in cache. Please refresh the email list to download attachments.');
-                    return;
-                }
-                
-                // Extract encrypted content from email body
-                const encryptedBodyMatch = email.body.match(/-----BEGIN NOSTR NIP-\d+ ENCRYPTED MESSAGE-----\s*([A-Za-z0-9+/=\n?]+)\s*-----END NOSTR NIP-\d+ ENCRYPTED MESSAGE-----/);
-                if (!encryptedBodyMatch) {
-                    window.notificationService.showError('Cannot decrypt attachment: no encrypted manifest found');
-                    return;
-                }
-                
                 const keypair = appState.getKeypair();
-                if (!keypair) {
+                if (!keypair) return;
+
+                // Fetch email from DB (don't rely on in-memory cache)
+                const email = await window.__TAURI__.core.invoke('db_get_email_by_id', { emailId: parseInt(emailId) });
+                if (!email || !email.body) {
+                    window.notificationService.showError('Email not found');
                     return;
                 }
-                
-                // Decrypt the manifest to get attachment keys
-                const encryptedContent = encryptedBodyMatch[1].replace(/\s+/g, '');
-                
-                // Try to decrypt manifest (for received emails, use sender's pubkey; for sent emails, use recipient's pubkey)
-                let manifestResult;
-                try {
-                    // Check if this is a sent or received email
-                    const settings = appState.getSettings();
-                    const userEmail = settings?.email_address;
-                    const isSentEmail = (email.from_address && email.from_address === userEmail) || (email.from && email.from === userEmail);
-                    
-                    if (isSentEmail) {
-                        manifestResult = await window.emailService.decryptSentManifestMessage(email, encryptedContent, keypair);
-                    } else {
-                        manifestResult = await window.emailService.decryptManifestMessage(email, encryptedContent, keypair);
-                    }
-                } catch (e) {
-                    console.error('[JS] DM: Failed to decrypt manifest:', e);
-                    window.notificationService.showError('Failed to decrypt manifest: ' + e.message);
+
+                // Use backend to decrypt manifest and get attachment keys
+                const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                const recipientPubkey = email.recipient_pubkey;
+                const decryptResult = await TauriService.decryptEmailBody(
+                    email.body, email.subject || '',
+                    senderPubkey, recipientPubkey
+                );
+
+                if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
+                    window.notificationService.showError('Cannot decrypt attachment: no manifest found');
                     return;
                 }
-                
-                if (manifestResult.type !== 'manifest') {
-                    window.notificationService.showError('Cannot decrypt attachment: invalid manifest');
-                    return;
-                }
-                
-                // Find attachment metadata in manifest
-                const opaqueId = attachment.filename.replace('.dat', '');
-                const attachmentMeta = manifestResult.manifest.attachments.find(a => a.id === opaqueId);
-                
+
+                const opaqueId = attachment.filename.replace(/\.dat$/, '');
+                const attachmentMeta = decryptResult.attachments.find(a => a.id === opaqueId);
                 if (!attachmentMeta) {
                     window.notificationService.showError('Attachment metadata not found in manifest');
                     return;
                 }
-                
-                // Decrypt attachment data
-                const decryptedData = await window.emailService.decryptWithAES(attachment.data, attachmentMeta.key_wrap, true);
-                
-                // Save decrypted attachment to disk using Tauri
+
+                // Decrypt attachment via backend
+                const decryptedAttachment = await TauriService.decryptManifestAttachment(
+                    attachment.data, attachmentMeta.keyWrapB64, attachmentMeta.cipherSha256Hex,
+                    attachmentMeta.origFilename, attachmentMeta.origMime, opaqueId
+                );
+
                 const filePath = await TauriService.saveAttachmentToDisk(
-                    attachmentMeta.orig_filename || attachmentMeta.orig_mime?.split('/')[1] || 'attachment',
-                    decryptedData,
-                    attachmentMeta.orig_mime || attachment.mime_type || 'application/octet-stream'
-                );                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
+                    decryptedAttachment.filename, decryptedAttachment.dataB64,
+                    decryptedAttachment.contentType || 'application/octet-stream'
+                );
+                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
                 
             } else {
                 // Plain attachment - save directly to disk using Tauri

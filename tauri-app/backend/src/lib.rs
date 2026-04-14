@@ -11,10 +11,13 @@ mod types;
 pub mod state;
 mod storage;
 mod database;
+mod keychain;
+#[allow(dead_code, unused_imports)]
+pub mod nostr_mail_capnp;
 
 use types::*;
 pub use state::{AppState, Relay};
-pub use types::KeyPair;
+pub use types::{KeyPair, EmailConfig};
 use storage::{Storage, Contact, UserProfile, AppSettings, EmailDraft};
 use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation};
 use crate::types::{EmailMessage, RelayStatus, RelayConnectionStatus};
@@ -32,6 +35,14 @@ use state::EventSubscription;
 use serde_json;
 use tauri::Emitter;
 use chrono::{DateTime, Utc};
+
+/// Resolve a private key: prefer an explicit key if provided, fall back to AppState.
+fn resolve_private_key(explicit: Option<String>, state: &AppState) -> Result<String, String> {
+    if let Some(key) = explicit.filter(|k| !k.is_empty()) {
+        return Ok(key);
+    }
+    state.get_active_private_key()
+}
 
 /// Helper function to sync relay states - auto-disables relays that failed or aren't connected
 async fn sync_relay_states_internal(state: &AppState) -> Vec<String> {
@@ -375,6 +386,7 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         subject: email.subject.clone(),
         body: email.body.clone(),
         raw_body: email.body.clone(),
+        html_body: email.body_html.clone(),
         date: email.received_at,
         transport_auth_verified: email.transport_auth_verified,
         is_read: email.is_read,
@@ -383,6 +395,7 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         recipient_pubkey: email.recipient_pubkey.clone(),
         message_id: Some(email.message_id.clone()),
         signature_valid: email.signature_valid,
+        signature_source: email.signature_source.clone(),
     }
 }
 
@@ -433,6 +446,18 @@ async fn send_direct_message_persistent(
         },
         MessageContent::Encrypted(encrypted) => {
             println!("[RUST] Using pre-encrypted content");
+            // Detect the actual encryption format of the already-encrypted content
+            let detected_format = crypto::detect_encryption_format(&encrypted);
+            println!("[RUST] Detected encryption format: {} (algorithm parameter: {:?})", detected_format, encryption_algorithm);
+            
+            // Warn if detected format doesn't match the algorithm parameter
+            if let Some(alg_param) = encryption_algorithm {
+                let alg_normalized = alg_param.to_lowercase();
+                if detected_format != "unknown" && detected_format != alg_normalized {
+                    println!("[RUST] WARNING: Format mismatch! Detected format: {}, but algorithm parameter says: {}", detected_format, alg_normalized);
+                }
+            }
+            
             encrypted.clone()
         }
     };
@@ -580,9 +605,17 @@ fn get_public_key_from_private(private_key: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn sign_data(private_key: String, data: String) -> Result<String, String> {
+fn sign_data(private_key: Option<String>, data: String, state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] sign_data called");
-    crypto::sign_data(&private_key, &data).map_err(|e| e.to_string())
+    let pk = resolve_private_key(private_key, &state)?;
+    crypto::sign_data(&pk, &data).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn sign_data_bytes(private_key: Option<String>, data: Vec<u8>, state: tauri::State<AppState>) -> Result<String, String> {
+    println!("[RUST] sign_data_bytes called ({} bytes)", data.len());
+    let pk = resolve_private_key(private_key, &state)?;
+    crypto::sign_data_bytes(&pk, &data).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -592,37 +625,202 @@ fn verify_signature(public_key: String, signature: String, data: String) -> Resu
 }
 
 #[tauri::command]
+fn verify_signature_bytes(public_key: String, signature: String, data: Vec<u8>) -> Result<bool, String> {
+    println!("[RUST] verify_signature_bytes called ({} bytes)", data.len());
+    crypto::verify_signature_bytes(&public_key, &signature, &data).map_err(|e| e.to_string())
+}
+
+// =====================
+// Keychain commands
+// =====================
+
+#[tauri::command]
+fn keychain_add_account(private_key: String, state: tauri::State<AppState>) -> Result<String, String> {
+    println!("[RUST] keychain_add_account called");
+    crypto::validate_private_key(&private_key).map_err(|e| e.to_string())?;
+    let public_key = crypto::get_public_key_from_private(&private_key).map_err(|e| e.to_string())?;
+    state.keychain.store_key(&public_key, &private_key)?;
+    Ok(public_key)
+}
+
+#[tauri::command]
+fn keychain_generate_account(state: tauri::State<AppState>) -> Result<String, String> {
+    println!("[RUST] keychain_generate_account called");
+    let keypair = crypto::generate_keypair().map_err(|e| e.to_string())?;
+    state.keychain.store_key(&keypair.public_key, &keypair.private_key)?;
+    Ok(keypair.public_key)
+}
+
+#[tauri::command]
+fn keychain_remove_account(public_key: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] keychain_remove_account called");
+    state.keychain.delete_key(&public_key)?;
+    // Clear AppState if this was the active account
+    let is_active = state.current_private_key.lock().unwrap()
+        .as_ref()
+        .and_then(|pk| crypto::get_public_key_from_private(pk).ok())
+        .map_or(false, |active_pub| active_pub == public_key);
+    if is_active {
+        *state.current_private_key.lock().unwrap() = None;
+        *state.current_keys.lock().unwrap() = None;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn keychain_list_accounts(state: tauri::State<AppState>) -> Result<Vec<AccountInfo>, String> {
+    let pubkeys = state.keychain.list_pubkeys()?;
+    let active_pubkey = state.current_private_key.lock().unwrap()
+        .as_ref()
+        .and_then(|pk| crypto::get_public_key_from_private(pk).ok());
+
+    Ok(pubkeys.into_iter().map(|pubkey| {
+        let is_active = active_pubkey.as_ref().map_or(false, |ap| ap == &pubkey);
+        AccountInfo {
+            public_key: pubkey,
+            is_active,
+        }
+    }).collect())
+}
+
+#[tauri::command]
+fn keychain_set_active_account(public_key: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] keychain_set_active_account called for: {}...", &public_key[..20.min(public_key.len())]);
+    let private_key = state.keychain.get_key(&public_key)?
+        .ok_or_else(|| format!("No key found in keychain for {}", &public_key[..20.min(public_key.len())]))?;
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let keys = nostr_sdk::prelude::Keys::new(secret_key);
+    *state.current_keys.lock().unwrap() = Some(keys);
+    *state.current_private_key.lock().unwrap() = Some(private_key);
+    Ok(())
+}
+
+#[tauri::command]
+fn keychain_get_active_account(state: tauri::State<AppState>) -> Result<Option<String>, String> {
+    let pubkey = state.current_private_key.lock().unwrap()
+        .as_ref()
+        .and_then(|pk| crypto::get_public_key_from_private(pk).ok());
+    Ok(pubkey)
+}
+
+#[tauri::command]
+fn keychain_get_private_key(public_key: String, state: tauri::State<AppState>) -> Result<String, String> {
+    state.keychain.get_key(&public_key)?
+        .ok_or_else(|| format!("No key found in keychain for {}", &public_key[..20.min(public_key.len())]))
+}
+
+#[tauri::command]
+fn keychain_clear_all(state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] keychain_clear_all called");
+    state.keychain.clear_all()?;
+    *state.current_private_key.lock().unwrap() = None;
+    *state.current_keys.lock().unwrap() = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn keychain_migrate_from_frontend(accounts: Vec<MigrationAccount>, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] keychain_migrate_from_frontend called with {} accounts", accounts.len());
+    for account in &accounts {
+        if let Ok(true) = crypto::validate_private_key(&account.private_key).map_err(|e| e.to_string()) {
+            state.keychain.store_key(&account.public_key, &account.private_key)?;
+        } else {
+            println!("[RUST] Skipping invalid key during migration for: {}...", &account.public_key[..20.min(account.public_key.len())]);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn recheck_email_signature(message_id: String, state: tauri::State<AppState>) -> Result<Option<bool>, String> {
     println!("[RUST] recheck_email_signature called for message_id: {}", message_id);
     let db = state.get_database().map_err(|e| e.to_string())?;
-    
+
     // Get the email from database
     let email = db.get_email(&message_id).map_err(|e| e.to_string())?
         .ok_or_else(|| "Email not found".to_string())?;
-    
-    // Extract signature and pubkey from raw headers
+
+    // Verify using both in-body (primary) and header (secondary) trust paths
     let raw_headers = email.raw_headers.as_deref().unwrap_or("");
-    let sender_pubkey = email::extract_nostr_pubkey_from_headers(raw_headers);
-    let signature = email::extract_nostr_sig_from_headers(raw_headers);
-    
-    if let (Some(pubkey), Some(sig)) = (sender_pubkey, signature) {
-        // Verify the signature
-        let is_valid = email::verify_email_signature(&pubkey, &sig, &email.body);
-        
-        // Update the database
-        db.update_signature_valid(&message_id, Some(is_valid)).map_err(|e| e.to_string())?;
-        
-        println!("[RUST] recheck_email_signature: Signature verification result: {}", is_valid);
-        Ok(Some(is_valid))
+    let (is_valid, source) = email::verify_email_signature_full(&email.body, raw_headers);
+
+    // Update the database
+    db.update_signature_valid(&message_id, is_valid).map_err(|e| e.to_string())?;
+    db.update_signature_source(&message_id, source.as_deref()).map_err(|e| e.to_string())?;
+
+    println!("[RUST] recheck_email_signature: result={:?}, source={:?}", is_valid, source);
+    Ok(is_valid)
+}
+
+#[tauri::command]
+fn verify_all_signatures(armor_text: String) -> Vec<crate::types::SignatureVerificationResult> {
+    println!("[RUST] verify_all_signatures called, body length={}", armor_text.len());
+    email::verify_all_signatures_inline(&armor_text)
+}
+
+#[tauri::command]
+fn extract_signable_bytes(
+    body: String,
+    is_armored: bool,
+    quoted_armor: Option<String>,
+    glossia_encoding: Option<String>,
+) -> Result<Vec<u8>, String> {
+    println!("[RUST] extract_signable_bytes called, body_len={}, is_armored={}", body.len(), is_armored);
+    let mut bytes = if is_armored {
+        // Body content is already stripped of armor delimiters (bodyText from parseArmorComponents).
+        // Use decode_armor_section which handles glossia/base64 decode directly.
+        // If the body still has delimiters (full armor text), fall back to extract_ciphertext_binary.
+        if let Some(decoded) = email::decode_armor_section(&body) {
+            decoded
+        } else {
+            // Fallback: try as full armor text with delimiters
+            email::extract_ciphertext_binary(&body)
+        }
     } else {
-        println!("[RUST] recheck_email_signature: Missing pubkey or signature");
-        Ok(None)
+        // Plaintext: glossia round-trip to canonical bytes
+        if let Some(ref encoding) = glossia_encoding {
+            if let Some(round_tripped) = email::glossia_roundtrip_to_bytes(&body, encoding) {
+                round_tripped
+            } else {
+                body.as_bytes().to_vec()
+            }
+        } else {
+            body.as_bytes().to_vec()
+        }
+    };
+
+    // Concatenate nested quoted body bytes if provided (quoted_armor has full delimiters)
+    if let Some(ref quoted) = quoted_armor {
+        let quoted_bytes = email::extract_ciphertext_binary(quoted);
+        println!("[RUST] extract_signable_bytes: concatenating {} body + {} quoted bytes",
+            bytes.len(), quoted_bytes.len());
+        bytes.extend_from_slice(&quoted_bytes);
     }
+
+    Ok(bytes)
+}
+
+#[tauri::command]
+fn sign_and_verify_bytes(
+    private_key: Option<String>,
+    data: Vec<u8>,
+    state: tauri::State<AppState>,
+) -> Result<(String, bool), String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    let signature = crypto::sign_data_bytes(&pk, &data).map_err(|e| e.to_string())?;
+
+    // Derive public key for immediate verification
+    let pubkey = crypto::get_public_key_from_private(&pk).map_err(|e| e.to_string())?;
+    let is_valid = crypto::verify_signature_bytes(&pubkey, &signature, &data)
+        .map_err(|e| e.to_string())?;
+
+    println!("[RUST] sign_and_verify_bytes: sig_len={}, is_valid={}", signature.len(), is_valid);
+    Ok((signature, is_valid))
 }
 
 #[tauri::command]
 async fn send_direct_message(
-    request: DirectMessageRequest, 
+    request: DirectMessageRequest,
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle
 ) -> Result<String, String> {
@@ -631,8 +829,9 @@ async fn send_direct_message(
     println!("[RUST] Content type: {:?}", request.content);
     println!("[RUST] Encryption algorithm: {:?}", request.encryption_algorithm);
     
+    let sender_pk = resolve_private_key(request.sender_private_key, &state)?;
     let result = send_direct_message_persistent(
-        &request.sender_private_key,
+        &sender_pk,
         &request.recipient_pubkey,
         &request.content,
         request.encryption_algorithm.as_deref(),
@@ -654,18 +853,21 @@ async fn send_direct_message(
 }
 
 #[tauri::command]
-async fn fetch_direct_messages(private_key: String, relays: Vec<String>, since: Option<i64>) -> Result<Vec<NostrEvent>, String> {
-    nostr::fetch_direct_messages(&private_key, &relays, since).await.map_err(|e| e.to_string())
+async fn fetch_direct_messages(private_key: Option<String>, relays: Vec<String>, since: Option<i64>, state: tauri::State<'_, AppState>) -> Result<Vec<NostrEvent>, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::fetch_direct_messages(&pk, &relays, since).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn fetch_conversations(private_key: String, relays: Vec<String>) -> Result<Vec<nostr::Conversation>, String> {
-    nostr::fetch_conversations(&private_key, &relays).await.map_err(|e| e.to_string())
+async fn fetch_conversations(private_key: Option<String>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<nostr::Conversation>, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::fetch_conversations(&pk, &relays).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn fetch_conversation_messages(private_key: String, contact_pubkey: String, relays: Vec<String>) -> Result<Vec<nostr::ConversationMessage>, String> {
-    nostr::fetch_conversation_messages(&private_key, &contact_pubkey, &relays).await.map_err(|e| e.to_string())
+async fn fetch_conversation_messages(private_key: Option<String>, contact_pubkey: String, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<nostr::ConversationMessage>, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::fetch_conversation_messages(&pk, &contact_pubkey, &relays).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1048,9 +1250,10 @@ async fn fetch_following_pubkeys_persistent(pubkey: String, state: tauri::State<
 
 
 #[tauri::command]
-async fn fetch_following_profiles(private_key: String, relays: Vec<String>) -> Result<Vec<Profile>, String> {
+async fn fetch_following_profiles(private_key: Option<String>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<Profile>, String> {
     println!("[RUST] fetch_following_profiles called");
-    nostr::fetch_following_profiles(&private_key, &relays).await.map_err(|e| e.to_string())
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::fetch_following_profiles(&pk, &relays).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1075,9 +1278,10 @@ async fn sync_relay_states(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
 }
 
 #[tauri::command]
-async fn init_persistent_nostr_client(private_key: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn init_persistent_nostr_client(private_key: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] init_persistent_nostr_client called");
-    state.init_nostr_client(&private_key).await
+    let pk = resolve_private_key(private_key, &state)?;
+    state.init_nostr_client(&pk).await
 }
 
 #[tauri::command]
@@ -1284,40 +1488,42 @@ async fn test_relay_connection(relay_url: String) -> Result<bool, String> {
 
 
 #[tauri::command]
-fn decrypt_dm_content(private_key: String, sender_pubkey: String, encrypted_content: String) -> Result<String, String> {
-    nostr::decrypt_dm_content(&private_key, &sender_pubkey, &encrypted_content)
+fn decrypt_dm_content(private_key: Option<String>, sender_pubkey: String, encrypted_content: String, state: tauri::State<AppState>) -> Result<String, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::decrypt_dm_content(&pk, &sender_pubkey, &encrypted_content)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn publish_nostr_event(private_key: String, content: String, kind: u16, tags: Vec<Vec<String>>, relays: Vec<String>) -> Result<(), String> {
+async fn publish_nostr_event(private_key: Option<String>, content: String, kind: u16, tags: Vec<Vec<String>>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] publish_nostr_event called");
-    nostr::publish_event(&private_key, &content, kind, tags, &relays)
+    let pk = resolve_private_key(private_key, &state)?;
+    nostr::publish_event(&pk, &content, kind, tags, &relays)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, _state: tauri::State<'_, AppState>) -> Result<(), String> {
-    println!("[RUST] send_email called with {} attachments", attachments.as_ref().map(|a| a.len()).unwrap_or(0));
-    
+async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>, _state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] send_email called with {} attachments, html_body: {}", attachments.as_ref().map(|a| a.len()).unwrap_or(0), html_body.is_some());
+
     // Send the email via SMTP
     // Note: We don't save to database here - sent emails will be fetched from the server's sent folder via IMAP sync
     // This avoids duplicate entries and ensures we have the server's version with proper headers
-    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref())
+    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref())
         .await
         .map_err(|e| e.to_string())?;
-    
+
     println!("[RUST] send_email: Email sent successfully. It will appear in sent folder after IMAP sync.");
-    
+
     Ok(())
 }
 
 #[tauri::command]
-async fn construct_email_headers(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>) -> Result<String, String> {
-    println!("[RUST] construct_email_headers called with {} attachments", attachments.as_ref().map(|a| a.len()).unwrap_or(0));
-    email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref())
+async fn construct_email_headers(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>) -> Result<String, String> {
+    println!("[RUST] construct_email_headers called with {} attachments, html_body: {}", attachments.as_ref().map(|a| a.len()).unwrap_or(0), html_body.is_some());
+    email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref())
         .map_err(|e| e.to_string())
 }
 
@@ -2186,7 +2392,13 @@ fn db_get_email(message_id: String, state: tauri::State<AppState>) -> Result<Opt
 }
 
 #[tauri::command]
-fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
+fn db_get_email_by_id(email_id: i64, state: tauri::State<AppState>) -> Result<Option<crate::database::Email>, String> {
+    let db = state.get_database()?;
+    db.get_email_by_id(email_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
     println!("[RUST] db_get_emails called");
     if let Some(ref email) = user_email {
         println!("[RUST] db_get_emails: Filtering for user_email: {}", email);
@@ -2194,20 +2406,17 @@ fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<boo
         println!("[RUST] db_get_emails: No user_email filter provided");
     }
     let db = state.get_database()?;
-    let emails = db.get_emails(limit, offset, nostr_only, user_email.as_deref()).map_err(|e| e.to_string())?;
+    let emails = db.get_emails(limit, offset, nostr_only, user_email.as_deref(), user_pubkey.as_deref()).map_err(|e| e.to_string())?;
     let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
-    println!("[RUST] Sending {} emails to frontend:", mapped.len());
-    for (i, email) in mapped.iter().enumerate() {
-        println!("[RUST] Email {}: {:#?}", i + 1, email);
-    }
+    println!("[RUST] Sending {} emails to frontend", mapped.len());
     Ok(mapped)
 }
 
 #[tauri::command]
 async fn db_search_emails(
-    search_query: String, 
-    user_email: Option<String>, 
-    private_key: Option<String>, 
+    search_query: String,
+    user_email: Option<String>,
+    private_key: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
     app_handle: tauri::AppHandle,
@@ -2216,6 +2425,7 @@ async fn db_search_emails(
     let page_size = limit.unwrap_or(50) as usize;
     let skip_count = offset.unwrap_or(0) as usize;
     println!("[RUST] db_search_emails called with query: '{}', limit: {}, offset: {}", search_query, page_size, skip_count);
+    let private_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
     
     // Emit search started event
@@ -2245,7 +2455,7 @@ async fn db_search_emails(
     
     // Process emails in batches until we have enough results
     loop {
-        let batch_emails = db.get_emails(Some(batch_size as i64), Some(db_offset), Some(true), user_email.as_deref())
+        let batch_emails = db.get_emails(Some(batch_size as i64), Some(db_offset), Some(true), user_email.as_deref(), None)
             .map_err(|e| e.to_string())?;
         
         if batch_emails.is_empty() {
@@ -2301,8 +2511,7 @@ async fn db_search_emails(
                     // Try to extract original filenames from manifest if email has manifest-encrypted attachments
                     let has_manifest_attachments = attachments.iter().any(|att| att.encryption_method.as_deref() == Some("manifest_aes"));
                     if has_manifest_attachments && email_config.private_key.is_some() {
-                        println!("[RUST] Inbox email {} has manifest-encrypted attachments, attempting to extract original filenames", email.id.unwrap_or(0));
-                        println!("[RUST] Decrypted body length: {}, preview: {}", decrypted_body.len(), &decrypted_body.chars().take(200).collect::<String>());
+                        println!("[RUST] Inbox email {} has manifest-encrypted attachments, decrypted body: {} chars", email.id.unwrap_or(0), decrypted_body.len());
                         
                         // Try to parse decrypted body as manifest JSON
                         match serde_json::from_str::<serde_json::Value>(&decrypted_body) {
@@ -2463,18 +2672,30 @@ fn db_get_all_sent_message_ids(user_email: Option<String>, state: tauri::State<A
 }
 
 #[tauri::command]
-fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
+fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
     let db = state.get_database()?;
     let emails = db.get_sent_emails(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
-    let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
+    // Filter by sender_pubkey if user_pubkey is provided — only show emails
+    // sent by the current keypair (avoids showing undecryptable emails from other profiles)
+    let filtered: Vec<_> = if let Some(ref upk) = user_pubkey {
+        emails.into_iter().filter(|e| {
+            match &e.sender_pubkey {
+                Some(spk) => spk == upk,
+                None => true, // Show emails without sender_pubkey (non-nostr or pre-header emails)
+            }
+        }).collect()
+    } else {
+        emails
+    };
+    let mapped: Vec<EmailMessage> = filtered.iter().map(map_db_email_to_email_message).collect();
     Ok(mapped)
 }
 
 #[tauri::command]
 async fn db_search_sent_emails(
-    search_query: String, 
-    user_email: Option<String>, 
-    private_key: Option<String>, 
+    search_query: String,
+    user_email: Option<String>,
+    private_key: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
     app_handle: tauri::AppHandle,
@@ -2483,6 +2704,7 @@ async fn db_search_sent_emails(
     let page_size = limit.unwrap_or(50) as usize;
     let skip_count = offset.unwrap_or(0) as usize;
     println!("[RUST] db_search_sent_emails called with query: '{}', limit: {}, offset: {}", search_query, page_size, skip_count);
+    let private_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
     
     // Emit search started event
@@ -2789,8 +3011,7 @@ async fn db_search_sent_emails(
                     // Try to extract original filenames from manifest if email has manifest-encrypted attachments
                     let has_manifest_attachments = attachments.iter().any(|att| att.encryption_method.as_deref() == Some("manifest_aes"));
                     if has_manifest_attachments && email_config.private_key.is_some() {
-                        println!("[RUST] Sent email {} has manifest-encrypted attachments, attempting to extract original filenames", email.id.unwrap_or(0));
-                        println!("[RUST] Decrypted body length: {}, preview: {}", decrypted_body.len(), &decrypted_body.chars().take(200).collect::<String>());
+                        println!("[RUST] Sent email {} has manifest-encrypted attachments, decrypted body: {} chars", email.id.unwrap_or(0), decrypted_body.len());
                         
                         // Try to parse decrypted body as manifest JSON
                         match serde_json::from_str::<serde_json::Value>(&decrypted_body) {
@@ -2943,11 +3164,12 @@ fn db_get_dms_for_conversation(user_pubkey: String, contact_pubkey: String, stat
 
 #[tauri::command]
 fn db_get_decrypted_dms_for_conversation(
-    private_key: String,
+    private_key: Option<String>,
     user_pubkey: String,
     contact_pubkey: String,
     state: tauri::State<AppState>
 ) -> Result<Vec<crate::database::DirectMessage>, String> {
+    let pk = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
     let mut messages = db.get_dms_for_conversation(&user_pubkey, &contact_pubkey)
         .map_err(|e| e.to_string())?;
@@ -2957,15 +3179,19 @@ fn db_get_decrypted_dms_for_conversation(
         } else {
             &msg.sender_pubkey
         };
-        match crate::nostr::decrypt_dm_content(&private_key, decrypt_sender_pubkey, &msg.content) {
+        match crate::nostr::decrypt_dm_content(&pk, decrypt_sender_pubkey, &msg.content) {
             Ok(decrypted) => {
                 msg.content = decrypted;
             },
             Err(e) => {
                 eprintln!(
-                    "[DM DECRYPT] Failed to decrypt message: sender={}, recipient={}, error={}",
+                    "[DM DECRYPT] Failed to decrypt message: date={}, db_id={:?}, event_id={}, sender={}, recipient={}, content_len={}, error={}",
+                    msg.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                    msg.id,
+                    msg.event_id,
                     msg.sender_pubkey,
                     msg.recipient_pubkey,
+                    msg.content.len(),
                     e
                 );
                 msg.content = "[Failed to decrypt]".to_string();
@@ -3006,13 +3232,14 @@ fn db_get_conversations(user_pubkey: String, state: tauri::State<AppState>) -> R
 #[tauri::command]
 fn db_get_conversations_with_decrypted_last_message(
     user_pubkey: String,
-    private_key: String,
+    private_key: Option<String>,
     state: tauri::State<AppState>
 ) -> Result<Vec<ConversationWithDecryptedLastMessage>, String> {
     println!("[RUST] db_get_conversations_with_decrypted_last_message called for user: {}", user_pubkey);
+    let pk = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
     let conversations = db.get_conversations(&user_pubkey).map_err(|e| e.to_string())?;
-    
+
     let mut result = Vec::new();
     for conv in conversations {
         // Fetch the last message by event_id and decrypt it
@@ -3024,11 +3251,11 @@ fn db_get_conversations_with_decrypted_last_message(
                 } else {
                     &conv.user_pubkey
                 };
-                
-                match crate::nostr::decrypt_dm_content(&private_key, decrypt_sender_pubkey, &encrypted_content) {
+
+                match crate::nostr::decrypt_dm_content(&pk, decrypt_sender_pubkey, &encrypted_content) {
                     Ok(decrypted) => decrypted,
                     Err(e) => {
-                        println!("[RUST] Failed to decrypt last message for conversation {}: {}", conv.contact_pubkey, e);
+                        println!("[RUST] Failed to decrypt last message for conversation {}: event_id={}, error={}", conv.contact_pubkey, conv.last_message_event_id, e);
                         "[Failed to decrypt]".to_string()
                     }
                 }
@@ -3100,7 +3327,6 @@ fn db_save_attachment(attachment: crate::database::Attachment, state: tauri::Sta
 
 #[tauri::command]
 fn db_get_attachments_for_email(email_id: i64, state: tauri::State<AppState>) -> Result<Vec<crate::database::Attachment>, String> {
-    println!("[RUST] db_get_attachments_for_email called for email_id: {}", email_id);
     let db = state.get_database()?;
     db.get_attachments_for_email(email_id).map_err(|e| e.to_string())
 }
@@ -3260,14 +3486,15 @@ fn db_get_setting(pubkey: String, key: String, state: tauri::State<AppState>) ->
 #[tauri::command]
 fn db_get_all_settings(pubkey: String, private_key: Option<String>, state: tauri::State<AppState>) -> Result<std::collections::HashMap<String, String>, String> {
     println!("[RUST] db_get_all_settings called for pubkey: {}", pubkey);
+    let resolved_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
     let mut settings = db.get_all_settings(&pubkey).map_err(|e| e.to_string())?;
-    
+
     // List of sensitive settings that should be decrypted
     let sensitive_keys = vec!["password"];
-    
-    // Decrypt sensitive settings if private key is provided
-    if let Some(ref priv_key) = private_key {
+
+    // Decrypt sensitive settings if private key is available
+    if let Some(ref priv_key) = resolved_key {
         for key in sensitive_keys {
             if let Some(encrypted_value) = settings.get(key) {
                 if !encrypted_value.is_empty() {
@@ -3294,15 +3521,16 @@ fn db_get_all_settings(pubkey: String, private_key: Option<String>, state: tauri
 #[tauri::command]
 fn db_save_settings_batch(pubkey: String, settings: std::collections::HashMap<String, String>, private_key: Option<String>, state: tauri::State<AppState>) -> Result<(), String> {
     println!("[RUST] db_save_settings_batch called for pubkey: {}, {} settings", pubkey, settings.len());
+    let resolved_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
-    
+
     // List of sensitive settings that should be encrypted
     let sensitive_keys = vec!["password"];
-    
+
     for (key, value) in settings.iter() {
         let value_to_save = if sensitive_keys.contains(&key.as_str()) {
-            // Encrypt sensitive settings if private key is provided
-            if let Some(ref priv_key) = private_key {
+            // Encrypt sensitive settings if private key is available
+            if let Some(ref priv_key) = resolved_key {
                 match crypto::encrypt_setting_value(priv_key, value) {
                     Ok(encrypted) => {
                         println!("[RUST] Encrypted sensitive setting: {}", key);
@@ -3369,18 +3597,26 @@ fn db_clear_all_data(state: tauri::State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn follow_user(private_key: String, pubkey_to_follow: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn db_delete_account_data(pubkey: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] db_delete_account_data called for pubkey: {}", pubkey);
+    let db = state.get_database()?;
+    db.delete_account_data(&pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn follow_user(private_key: Option<String>, pubkey_to_follow: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     use nostr_sdk::prelude::*;
-    
+
     println!("[RUST] follow_user called for pubkey: {}", pubkey_to_follow);
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Get or initialize the persistent client (will reinitialize if keys don't match)
-    let client = state.get_nostr_client(Some(&private_key)).await.map_err(|e| {
+    let client = state.get_nostr_client(Some(&pk)).await.map_err(|e| {
         format!("Failed to get or initialize persistent client: {}", e)
     })?;
-    
+
     // Parse private key and create keys
-    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let keys = Keys::new(secret_key);
     
     // Get the user's public key
@@ -3492,26 +3728,27 @@ async fn follow_user(private_key: String, pubkey_to_follow: String, state: tauri
 }
 
 #[tauri::command]
-async fn publish_follow_list(private_key: String, user_pubkey: String, _relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn publish_follow_list(private_key: Option<String>, user_pubkey: String, _relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<String, String> {
     use nostr_sdk::prelude::*;
-    
+
     println!("[RUST] publish_follow_list called for user: {}", user_pubkey);
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Get all public contacts from database
     let db = state.get_database()?;
     let public_pubkeys = db.get_public_contact_pubkeys(&user_pubkey)
         .map_err(|e| format!("Failed to get public contacts: {}", e))?;
-    
+
     println!("[RUST] Found {} public contacts to publish", public_pubkeys.len());
-    
+
     // Get or initialize the persistent client (same one used for fetching)
     // This ensures we use the same relay connections
-    let client = state.get_nostr_client(Some(&private_key)).await.map_err(|e| {
+    let client = state.get_nostr_client(Some(&pk)).await.map_err(|e| {
         format!("Failed to get or initialize persistent client: {}", e)
     })?;
-    
+
     // Parse private key and create keys (same keypair, just need it for signing)
-    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let keys = Keys::new(secret_key);
     
     // Create tags for the follow event (kind 3)
@@ -3580,30 +3817,565 @@ async fn publish_follow_list(private_key: String, user_pubkey: String, _relays: 
 }
 
 #[tauri::command]
-fn encrypt_nip04_message(private_key: String, public_key: String, message: String) -> Result<String, String> {
+fn encrypt_nip04_message(private_key: Option<String>, public_key: String, message: String, state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] encrypt_nip04_message called");
-    crypto::encrypt_message(&private_key, &public_key, &message, Some("nip04")).map_err(|e| e.to_string())
+    let pk = resolve_private_key(private_key, &state)?;
+    crypto::encrypt_message(&pk, &public_key, &message, Some("nip04")).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn encrypt_nip04_message_legacy(private_key: String, public_key: String, message: String) -> Result<String, String> {
+fn encrypt_nip04_message_legacy(private_key: Option<String>, public_key: String, message: String, state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] encrypt_nip04_message_legacy called");
     use nostr_sdk::prelude::*;
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Parse the keys from bech32 format
-    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let public_key = PublicKey::from_bech32(&public_key).map_err(|e| e.to_string())?;
-    
+
     // Use NIP-04 encryption (legacy)
     let encrypted = nip04::encrypt(&secret_key, &public_key, message).map_err(|e| e.to_string())?;
-    
+
     Ok(encrypted)
 }
 
 #[tauri::command]
-fn encrypt_message_with_algorithm(private_key: String, public_key: String, message: String, algorithm: String) -> Result<String, String> {
+fn encrypt_message_with_algorithm(private_key: Option<String>, public_key: String, message: String, algorithm: String, state: tauri::State<AppState>) -> Result<String, String> {
     println!("[RUST] encrypt_message_with_algorithm called with algorithm: {}", algorithm);
-    crypto::encrypt_message(&private_key, &public_key, &message, Some(&algorithm)).map_err(|e| e.to_string())
+    let pk = resolve_private_key(private_key, &state)?;
+    crypto::encrypt_message(&pk, &public_key, &message, Some(&algorithm)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn parse_armor_message(armor_text: String) -> Result<Option<types::ParsedArmorMessage>, String> {
+    Ok(email::parse_armor_components(&armor_text))
+}
+
+#[tauri::command]
+fn decrypt_email_body(
+    private_key: Option<String>,
+    armor_text: String,
+    subject: String,
+    sender_pubkey: Option<String>,
+    recipient_pubkey: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<types::DecryptEmailResult, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    email::decrypt_email_body_pipeline(
+        &pk,
+        &armor_text,
+        &subject,
+        sender_pubkey.as_deref(),
+        recipient_pubkey.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn decrypt_manifest_attachment(
+    attachment_data_b64: String,
+    key_wrap_b64: String,
+    cipher_sha256_hex: Option<String>,
+    orig_filename: String,
+    orig_mime: String,
+    attachment_id: Option<String>,
+) -> Result<types::DecryptedAttachment, String> {
+    let mut result = email::decrypt_attachment_pipeline(
+        &attachment_data_b64,
+        &key_wrap_b64,
+        cipher_sha256_hex.as_deref(),
+        &orig_filename,
+        &orig_mime,
+    )?;
+    if let Some(id) = attachment_id {
+        result.id = id;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn encode_bip39(ciphertext: String, language: String, wordlist: String, mode: String) -> Result<String, String> {
+    use std::collections::HashSet;
+    use glossia::generator::{PayloadTok, Lexicon, GenerationMode, SentenceLengthMode};
+    use base64::Engine;
+
+    println!("[RUST] encode_bip39 called with language: {}, wordlist: {}, mode: {}", language, wordlist, mode);
+
+    // 1. Base64-decode the ciphertext to get raw binary bytes
+    //    NIP-04 format: base64?iv=base64 — decode both parts, prefix payload length as 2 bytes
+    //    NIP-44 format: plain base64
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let raw_bytes = if let Some((payload_b64, iv_b64)) = ciphertext.trim().split_once("?iv=") {
+        let payload_bytes = b64.decode(payload_b64)
+            .map_err(|e| format!("Failed to base64-decode NIP-04 payload: {}", e))?;
+        let iv_bytes = b64.decode(iv_b64)
+            .map_err(|e| format!("Failed to base64-decode NIP-04 IV: {}", e))?;
+        // Pack as: [payload_len_hi, payload_len_lo, payload_bytes..., iv_bytes...]
+        let payload_len = payload_bytes.len() as u16;
+        let mut combined = Vec::with_capacity(2 + payload_bytes.len() + iv_bytes.len());
+        combined.extend_from_slice(&payload_len.to_be_bytes());
+        combined.extend_from_slice(&payload_bytes);
+        combined.extend_from_slice(&iv_bytes);
+        println!("[RUST] NIP-04 format: {} payload + {} IV = {} combined bytes",
+            payload_bytes.len(), iv_bytes.len(), combined.len());
+        combined
+    } else {
+        b64.decode(ciphertext.trim())
+            .map_err(|e| format!("Failed to base64-decode ciphertext: {}", e))?
+    };
+    println!("[RUST] Total raw bytes to encode: {}", raw_bytes.len());
+
+    // 2. Encode raw bytes to BIP39 payload words
+    let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
+        .map_err(|e| format!("Failed to load wordlist: {}", e))?;
+    let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
+    let tree = glossia::WordlistTree::new(payload_words);
+    let encoded_words = glossia::codec::encode_base_n(&raw_bytes, &tree, "bip39")
+        .map_err(|e| format!("BIP39 encoding failed: {:?}", e))?;
+
+    // 3. Build POS mapping and tag each encoded word
+    //    Fall back to Pos::N for words with unrecognized POS tags (e.g. Pron)
+    let pos_mapping = glossia::generator::data::build_pos_mapping_for_wordlist(&language, &wordlist)
+        .map_err(|e| format!("Failed to build POS mapping: {}", e))?;
+    let payload: Vec<PayloadTok> = encoded_words.iter().map(|word| {
+        let tags = pos_mapping.get(&word.to_lowercase()).cloned().unwrap_or_default();
+        if tags.is_empty() {
+            PayloadTok::new(word.clone(), &[glossia::types::Pos::N])
+        } else {
+            PayloadTok::new(word.clone(), &tags)
+        }
+    }).collect();
+    let payload_set: HashSet<String> = payload.iter().map(|t| t.word.to_lowercase()).collect();
+
+    // 4. Load cover words and build Lexicon
+    let (cover_by_pos, refined_cover) = glossia::generator::data::load_cover_words_by_pos_for_wordlist(&wordlist_set, &language, &wordlist);
+    let mut lex = Lexicon::new(payload_set, wordlist_set);
+    for (pos, words) in &cover_by_pos {
+        let word_refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        lex = lex.with_words(*pos, &word_refs);
+    }
+    lex = lex.with_refined_cover(refined_cover);
+
+    // 5. Generate grammatically correct text
+    let generation_mode = match mode.as_str() {
+        "subject" => GenerationMode::Subject,
+        _ => GenerationMode::Body,
+    };
+    println!("[RUST] Encoding {} payload words with {:?} mode", payload.len(), generation_mode);
+    let mut rng = rand::thread_rng();
+    let (text, _) = glossia::generator::core::generate_text(
+        &mut rng, &lex, &payload, false, generation_mode, &language,
+        3, 20, SentenceLengthMode::Compact, " ",
+    );
+
+    Ok(text)
+}
+
+#[tauri::command]
+fn decode_bip39(text: String, language: String, wordlist: String, algorithm: String) -> Result<String, String> {
+    use std::collections::HashSet;
+    use base64::Engine;
+
+    println!("[RUST] decode_bip39 called with language: {}, wordlist: {}, algorithm: {}", language, wordlist, algorithm);
+
+    // 1. Load wordlist and build tree
+    let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
+        .map_err(|e| format!("Failed to load wordlist: {}", e))?;
+    let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
+    let tree = glossia::WordlistTree::new(payload_words);
+
+    // 2. Filter text to extract only payload words (preserving order)
+    let extracted: Vec<String> = text.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()).to_lowercase())
+        .filter(|w| !w.is_empty() && wordlist_set.contains(w))
+        .collect();
+
+    if extracted.is_empty() {
+        return Err("No BIP39 words found in text".to_string());
+    }
+
+    // 3. Decode back to raw bytes
+    let bytes = glossia::codec::decode_base_n(&extracted, &tree, "bip39")
+        .map_err(|e| format!("BIP39 decoding failed: {:?}", e))?;
+
+    // 4. Reconstruct the original ciphertext string
+    let b64 = base64::engine::general_purpose::STANDARD;
+    if algorithm == "nip04" {
+        // NIP-04: unpack [payload_len(2 bytes), payload_bytes..., iv_bytes...]
+        if bytes.len() < 2 {
+            return Err("Decoded data too short for NIP-04 format".to_string());
+        }
+        let payload_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+        if 2 + payload_len > bytes.len() {
+            return Err(format!("Invalid NIP-04 payload length: {} (total bytes: {})", payload_len, bytes.len()));
+        }
+        let payload_b64 = b64.encode(&bytes[2..2 + payload_len]);
+        let iv_b64 = b64.encode(&bytes[2 + payload_len..]);
+        Ok(format!("{}?iv={}", payload_b64, iv_b64))
+    } else {
+        // NIP-44: plain base64
+        Ok(b64.encode(&bytes))
+    }
+}
+
+/// Decode glossia-encoded text back to the original data string using the full
+/// pipeline (grammar + codec lookup).  Unlike `decode_bip39` this uses the
+/// correct codec for each language/dialect instead of hardcoding "bip39".
+///
+/// The `language` hint from the frontend is tried first, but if it fails we
+/// fall back to server-side dialect detection (which doesn't depend on WASM).
+#[tauri::command]
+fn decode_glossia(text: String, language: String, algorithm: String) -> Result<String, String> {
+    println!("[RUST] decode_glossia called with language: {}, algorithm: {}, text_len: {}", language, algorithm, text.len());
+
+    // Only try supported email dialects — other detected dialects (meta, cs,
+    // crypto/cashu) require filesystem language files not available in Tauri.
+    let mut languages_to_try = vec!["latin".to_string(), "english".to_string()];
+    if !languages_to_try.contains(&language) {
+        languages_to_try.push(language.clone());
+    }
+
+    println!("[RUST] decode_glossia: trying languages: {:?}", languages_to_try);
+
+    let mut last_err = String::new();
+    for lang in &languages_to_try {
+        // Catch panics from codec bugs (e.g. index out of bounds) so the app doesn't abort
+        let text_clone = text.clone();
+        let lang_clone = lang.clone();
+        let result = std::panic::catch_unwind(move || {
+            glossia::decode_from_language(&text_clone, &lang_clone, "default", false)
+        });
+        match result {
+            Ok(Ok(decoded)) => {
+                let preview = if decoded.len() > 80 { &decoded[..80] } else { &decoded };
+                println!("[RUST] decode_glossia succeeded with language: {}, output len: {}, preview: {:?}", lang, decoded.len(), preview);
+                return decode_glossia_postprocess(decoded, &algorithm);
+            },
+            Ok(Err(e)) => {
+                println!("[RUST] decode_glossia failed with language {}: {:?}", lang, e);
+                last_err = format!("{:?}", e);
+            },
+            Err(panic_info) => {
+                let msg = panic_info.downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                println!("[RUST] decode_glossia panicked with language {}: {}", lang, msg);
+                last_err = format!("panic: {}", msg);
+            }
+        }
+    }
+
+    Err(format!("Glossia decode failed for all languages {:?}: {}", languages_to_try, last_err))
+}
+
+/// Post-process glossia decode output: handle hex→base64 conversion and NIP-04 unpacking.
+/// Delegates to the shared implementation in email.rs.
+fn decode_glossia_postprocess(decoded: String, algorithm: &str) -> Result<String, String> {
+    let result = email::glossia_postprocess(&decoded, algorithm)?;
+    let preview = if result.len() > 80 { &result[..80] } else { &result };
+    println!("[RUST] decode_glossia_postprocess: result len: {}, preview: {:?}", result.len(), preview);
+    Ok(result)
+}
+
+/// Transcode text using a meta-instruction (e.g. "encode into latin", "decode from latin raw").
+/// Mirrors `transcode_inner` from glossia/src/wasm.rs.
+#[tauri::command]
+fn glossia_transcode(input: String, meta_instruction: String, seed: Option<u64>) -> Result<String, String> {
+    use rand::Rng;
+
+    let actual_seed = seed.unwrap_or_else(|| rand::thread_rng().gen::<u32>() as u64);
+
+    let input_clone = input.clone();
+    let meta_clone = meta_instruction.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let pipeline = glossia::Pipeline::from_meta(&meta_clone)
+            .map_err(|e| format!("Pipeline parse error: {}", e))?;
+        let pipeline = pipeline.with_seed(actual_seed);
+        let result = pipeline.execute_rich(&input_clone)
+            .map_err(|e| format!("Pipeline error: {}", e))?;
+
+        let mut response = serde_json::json!({
+            "output": result.output,
+            "source": format!("{}", pipeline.source),
+            "target": format!("{}", pipeline.target),
+            "payload_words": result.payload_words,
+        });
+
+        if let Some(mode) = &result.data_mode {
+            response["data_mode"] = serde_json::json!(mode.to_string());
+        }
+        if let Some(stats) = &result.stats {
+            response["stats"] = serde_json::json!({
+                "payload_count": stats.payload_count,
+                "cover_count": stats.cover_count,
+                "total_words": stats.total_words,
+                "ratio": stats.ratio,
+            });
+        }
+        if let Some(ref resolved) = result.resolved_source {
+            response["resolved_source"] = serde_json::json!(format!("{}", resolved));
+        }
+
+        Ok::<String, String>(response.to_string())
+    }));
+
+    match result {
+        Ok(inner) => inner,
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("glossia_transcode panicked: {}", msg))
+        }
+    }
+}
+
+/// Detect the glossia dialect (language/wordlist) from text.
+/// Mirrors `detect_dialect_from_text` from glossia/src/wasm.rs.
+#[tauri::command]
+fn glossia_detect_dialect(text: String) -> Result<String, String> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let words: Vec<String> = text
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        let matches = glossia::generator::detect_dialect(&words);
+
+        let json_matches: Vec<serde_json::Value> = matches
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "language": m.language,
+                    "wordlist": m.wordlist,
+                    "dialects": m.dialects,
+                    "hits": m.hits,
+                    "total": m.total,
+                    "hit_rate": m.hit_rate,
+                    "wordlist_size": m.wordlist_size
+                })
+            })
+            .collect();
+
+        serde_json::to_string(&json_matches).unwrap_or_else(|_| "[]".to_string())
+    }));
+
+    match result {
+        Ok(json) => Ok(json),
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("glossia_detect_dialect panicked: {}", msg))
+        }
+    }
+}
+
+/// Encode hex/base64 input to base-N payload words, optionally wrapped in prose.
+/// Mirrors `encode_raw_base_n_inner` from glossia/src/wasm.rs.
+#[tauri::command]
+fn glossia_encode_raw_base_n(input: String, language: String, wordlist: String, dialect: String, seed: Option<u64>) -> Result<String, String> {
+    use std::collections::HashSet;
+    use rand::Rng;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use glossia::generator::{PayloadTok, Lexicon, GenerationMode, SentenceLengthMode};
+    use glossia::generator::core::generate_text_with_original_payload;
+
+    let actual_seed = seed.unwrap_or_else(|| rand::thread_rng().gen::<u32>() as u64);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        // 1. Auto-detect hex/base64 and decode to raw bytes
+        let (_mode, bytes) = glossia::detect_mode(&input);
+
+        // 2. Load payload wordlist and build WordlistTree
+        let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
+            .map_err(|e| format!("Failed to load wordlist: {}", e))?;
+        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
+
+        // 3. Encode bytes to payload words via bitpack_fixed codec
+        let byte_count = bytes.len();
+        let encoded_words = glossia::codec::encode_base_n(&bytes, &payload_tree, "bitpack_fixed")
+            .map_err(|e| format!("Encoding error: {}", e))?;
+
+        // 4. If no dialect, return bare words
+        if dialect.is_empty() {
+            let response = serde_json::json!({
+                "encoded_text": encoded_words.join(" "),
+                "payload_words": encoded_words,
+                "data_mode": "bitpack_fixed",
+                "byte_count": byte_count,
+                "stats": {
+                    "payload_count": encoded_words.len(),
+                    "cover_count": 0,
+                    "total_words": encoded_words.len(),
+                    "ratio": 1.0
+                }
+            });
+            return Ok(response.to_string());
+        }
+
+        // 5. Wrap in prose using the specified dialect
+        let pos_mapping = glossia::generator::data::build_pos_mapping_for_wordlist(&language, &wordlist)
+            .map_err(|e| format!("Failed to build POS mapping: {}", e))?;
+
+        let payload_toks: Vec<PayloadTok> = encoded_words
+            .iter()
+            .map(|word| {
+                let allowed = pos_mapping
+                    .get(&word.to_lowercase())
+                    .cloned()
+                    .unwrap_or_default();
+                PayloadTok::new(word.clone(), &allowed)
+            })
+            .collect();
+
+        let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
+        let (cover_by_pos, refined_cover) =
+            glossia::generator::data::load_cover_words_by_pos_for_wordlist(&wordlist_set, &language, &wordlist);
+
+        let mut lex = Lexicon::new(wordlist_set.clone(), wordlist_set);
+        for (pos, words) in cover_by_pos {
+            lex = lex.with_words(pos, &words.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        }
+        lex = lex.with_refined_cover(refined_cover);
+
+        let grammar = glossia::Grammar::from_language_dialect(&language, &dialect)
+            .map_err(|e| format!("Grammar error: {}", e))?;
+
+        let min_k = grammar.min_sentence_length().unwrap_or(5);
+        let concat_payload = grammar.payload_separator().is_empty();
+        let (k_min, k_max) = if concat_payload {
+            let k = min_k + payload_toks.len().saturating_sub(1);
+            (k, k)
+        } else {
+            (5, 12)
+        };
+
+        let mut rng = StdRng::seed_from_u64(actual_seed);
+        let mode = if dialect.starts_with("subject") {
+            GenerationMode::Subject
+        } else {
+            GenerationMode::Body
+        };
+        let (text, used_payload) = generate_text_with_original_payload(
+            &mut rng,
+            &lex,
+            &payload_toks,
+            None,
+            false,
+            mode,
+            &language,
+            Some(&dialect),
+            k_min,
+            k_max,
+            SentenceLengthMode::Natural,
+            " ",
+        );
+
+        let payload_count = encoded_words.len();
+        let total_words = text.split_whitespace().count();
+        let cover_count = total_words.saturating_sub(used_payload.len());
+
+        let response = serde_json::json!({
+            "encoded_text": text,
+            "payload_words": encoded_words,
+            "data_mode": "bitpack_fixed",
+            "byte_count": byte_count,
+            "stats": {
+                "payload_count": payload_count,
+                "cover_count": cover_count,
+                "total_words": total_words,
+                "ratio": if total_words > 0 {
+                    (payload_count as f64) / (total_words as f64)
+                } else {
+                    0.0
+                }
+            }
+        });
+
+        Ok::<String, String>(response.to_string())
+    }));
+
+    match result {
+        Ok(inner) => inner,
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("glossia_encode_raw_base_n panicked: {}", msg))
+        }
+    }
+}
+
+/// Decode base-N payload words back to hex bytes.
+/// Mirrors `decode_raw_base_n_inner` from glossia/src/wasm.rs.
+#[tauri::command]
+fn glossia_decode_raw_base_n(text: String, language: String, wordlist: String, expected_byte_count: usize) -> Result<String, String> {
+    use std::collections::HashSet;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        // 1. Load payload wordlist
+        let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
+            .map_err(|e| format!("Failed to load wordlist: {}", e))?;
+        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
+
+        // 2. Build payload set for filtering
+        let payload_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
+
+        // 3. Extract payload words (filter out cover/prose words)
+        let extracted: Vec<String> = text
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|w| payload_set.contains(w))
+            .collect();
+
+        if extracted.is_empty() {
+            return Ok(serde_json::json!({
+                "decoded_hex": "",
+                "payload_words": [],
+                "error": "No payload words found in input"
+            }).to_string());
+        }
+
+        // 4. Decode via bitpack_fixed codec with known byte count
+        let bytes = if expected_byte_count > 0 {
+            glossia::codec::decode_base_n_fixed(&extracted, &payload_tree, "bitpack_fixed", expected_byte_count)
+        } else {
+            glossia::codec::decode_base_n(&extracted, &payload_tree, "bitpack_fixed")
+        }.map_err(|e| format!("Decoding error: {}", e))?;
+
+        // 5. Return hex-encoded bytes
+        let hex = glossia::hex_encode(&bytes);
+
+        let response = serde_json::json!({
+            "decoded_hex": hex,
+            "payload_words": extracted,
+        });
+
+        Ok::<String, String>(response.to_string())
+    }));
+
+    match result {
+        Ok(inner) => inner,
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("glossia_decode_raw_base_n panicked: {}", msg))
+        }
+    }
+}
+
+/// Get the default wordlist for a given language.
+#[tauri::command]
+fn glossia_get_default_wordlist(language: String) -> String {
+    glossia::generator::default_wordlist(&language).to_string()
 }
 
 #[tauri::command]
@@ -3652,16 +4424,17 @@ async fn sync_all_emails(config: EmailConfig, state: tauri::State<'_, AppState>)
 }
 
 #[tauri::command]
-async fn sync_direct_messages_with_network(private_key: String, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+async fn sync_direct_messages_with_network(private_key: Option<String>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     println!("[RUST] sync_direct_messages_with_network called");
+    let pk = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
-    
+
     // Get the persistent client (clone it before await to avoid Send issues)
     let client_option = {
         let client_guard = state.nostr_client.lock().unwrap();
         client_guard.as_ref().cloned()
     };
-    
+
     let client = match client_option {
         Some(client) => client,
         None => {
@@ -3669,15 +4442,15 @@ async fn sync_direct_messages_with_network(private_key: String, relays: Vec<Stri
             // Fallback to old method if persistent client not available
             let latest = db.get_latest_dm_created_at().map_err(|e| e.to_string())?;
             let since = latest.map(|dt| dt.timestamp());
-            let events = crate::nostr::fetch_direct_messages(&private_key, &relays, since)
+            let events = crate::nostr::fetch_direct_messages(&pk, &relays, since)
                 .await
                 .map_err(|e| e.to_string())?;
             return sync_dms_from_events(events, db);
         }
     };
-    
+
     // Parse private key to get keys
-    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key)
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&pk)
         .map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
     
@@ -3702,7 +4475,7 @@ async fn sync_direct_messages_with_network(private_key: String, relays: Vec<Stri
         // Fallback to old method
         let latest = db.get_latest_dm_created_at().map_err(|e| e.to_string())?;
         let since = latest.map(|dt| dt.timestamp());
-        let events = crate::nostr::fetch_direct_messages(&private_key, &relays, since)
+        let events = crate::nostr::fetch_direct_messages(&pk, &relays, since)
             .await
             .map_err(|e| e.to_string())?;
         return sync_dms_from_events(events, db);
@@ -3777,16 +4550,17 @@ fn sync_dms_from_events(events: Vec<NostrEvent>, db: crate::database::Database) 
 
 #[tauri::command]
 async fn sync_conversation_with_network(
-    private_key: String,
+    private_key: Option<String>,
     contact_pubkey: String,
     relays: Vec<String>,
     state: tauri::State<'_, AppState>
 ) -> Result<usize, String> {
     println!("[RUST] sync_conversation_with_network called for contact: {}", contact_pubkey);
+    let pk = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
-    
+
     // Get user's pubkey
-    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key)
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&pk)
         .map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
     let user_pubkey = keys.public_key().to_bech32().map_err(|e| e.to_string())?;
@@ -3976,13 +4750,14 @@ fn db_get_all_dm_pubkeys_sorted(state: tauri::State<AppState>) -> Result<Vec<Str
 }
 
 #[tauri::command]
-async fn update_profile(private_key: String, fields: std::collections::HashMap<String, serde_json::Value>, relays: Vec<String>) -> Result<(), String> {
+async fn update_profile(private_key: Option<String>, fields: std::collections::HashMap<String, serde_json::Value>, relays: Vec<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let pk = resolve_private_key(private_key, &state)?;
 
     // Convert fields to JSON string
     let content = serde_json::to_string(&fields).map_err(|e| e.to_string())?;
 
     // Parse private key
-    let secret_key = nostr_sdk::prelude::SecretKey::from_str(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = nostr_sdk::prelude::SecretKey::from_str(&pk).map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
 
     // Build the profile event (kind 0)
@@ -4002,20 +4777,21 @@ async fn update_profile(private_key: String, fields: std::collections::HashMap<S
 }
 
 #[tauri::command]
-async fn update_profile_persistent(private_key: String, fields: std::collections::HashMap<String, serde_json::Value>, app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn update_profile_persistent(private_key: Option<String>, fields: std::collections::HashMap<String, serde_json::Value>, app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] update_profile_persistent called");
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Convert fields to JSON string
     let content = serde_json::to_string(&fields).map_err(|e| e.to_string())?;
     println!("[RUST] Profile content: {}", content);
 
     // Get or initialize the persistent client (will reinitialize if keys don't match)
-    let client = state.get_nostr_client(Some(&private_key)).await.map_err(|e| {
+    let client = state.get_nostr_client(Some(&pk)).await.map_err(|e| {
         format!("Failed to get or initialize persistent client: {}", e)
     })?;
 
     // Parse private key and create keys
-    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
 
     // Build the profile event (kind 0)
@@ -4069,17 +4845,18 @@ async fn update_profile_persistent(private_key: String, fields: std::collections
 // Live Event Subscription System
 #[tauri::command]
 async fn start_live_event_subscription(
-    private_key: String,
+    private_key: Option<String>,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>
 ) -> Result<(), String> {
     println!("[RUST] start_live_event_subscription called");
-    
+    let pk = resolve_private_key(private_key, &state)?;
+
     // Get the persistent client
-    let client = state.get_nostr_client(Some(&private_key)).await?;
-    
+    let client = state.get_nostr_client(Some(&pk)).await?;
+
     // Parse user's public key from private key
-    let secret_key = SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
+    let secret_key = SecretKey::from_bech32(&pk).map_err(|e| e.to_string())?;
     let keys = Keys::new(secret_key);
     let user_pubkey = keys.public_key();
     
@@ -4571,87 +5348,113 @@ fn db_delete_draft(message_id: String, state: tauri::State<AppState>) -> Result<
 }
 
 #[tauri::command]
-async fn db_delete_sent_email(message_id: String, user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    println!("[RUST] db_delete_sent_email called for message_id: {}", message_id);
-    
+async fn db_delete_sent_email(message_id: String, delete_from_server: Option<bool>, user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] db_delete_sent_email called for message_id: {}, delete_from_server: {:?}", message_id, delete_from_server);
+
     let db = state.get_database()?;
-    
-    // First, try to delete from the email server
-    // Get the email from database to find the from_address
-    if let Ok(Some(email)) = db.get_email(&message_id) {
-        let from_email = email.from_address.trim().to_lowercase();
-        
-        // Try to find settings that match this email address
-        // We'll need to check settings for all pubkeys, but that's complex
-        // For now, let's try a simpler approach: get all unique pubkeys and check their settings
-        // Actually, let's just try to get settings - if user_email is provided, we can use it to match
-        // But settings are keyed by pubkey, not email...
-        
-        // Simplified approach: Try to construct EmailConfig if we have user_email
-        // The frontend should pass the correct user_email that matches the email's from_address
+
+    // Try to delete from email server using current user's IMAP settings
+    if delete_from_server.unwrap_or(true) {
+    if let Some(ref user_email_param) = user_email {
+        let pubkeys_vec = db.find_pubkeys_by_email_setting(user_email_param).unwrap_or_default();
+        for pubkey in pubkeys_vec {
+            if let Ok(all_settings) = db.get_all_settings(&pubkey) {
+                let email_address = all_settings.get("email_address").cloned();
+                let password = all_settings.get("password").cloned();
+                let imap_host = all_settings.get("imap_host").cloned();
+                let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+                let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+                if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+                    let email_config = crate::types::EmailConfig {
+                        email_address: email_addr,
+                        password: pwd,
+                        smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+                        smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+                        imap_host: host,
+                        imap_port: port,
+                        use_tls,
+                        private_key: all_settings.get("nostr_private_key").cloned(),
+                    };
+
+                    println!("[RUST] db_delete_sent_email: Attempting to delete from email server");
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        crate::email::delete_sent_email_from_server(&email_config, &message_id)
+                    ).await {
+                        Ok(Ok(_)) => {
+                            println!("[RUST] db_delete_sent_email: Successfully deleted from email server");
+                        }
+                        Ok(Err(e)) => {
+                            println!("[RUST] db_delete_sent_email: Failed to delete from email server: {}, continuing with local deletion", e);
+                        }
+                        Err(_) => {
+                            println!("[RUST] db_delete_sent_email: Server deletion timed out after 30 seconds, continuing with local deletion");
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    }
+
+    // Always delete locally, even if server deletion failed
+    db.delete_sent_email(&message_id, user_email.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn db_delete_inbox_email(message_id: String, delete_from_server: Option<bool>, user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] db_delete_inbox_email called for message_id: {}, delete_from_server: {:?}", message_id, delete_from_server);
+
+    if delete_from_server.unwrap_or(false) {
         if let Some(ref user_email_param) = user_email {
-            if user_email_param.trim().to_lowercase() == from_email {
-                // Try to get settings from database by querying for email_address setting
-                // Use a helper function to find pubkeys with matching email
-                let pubkeys_vec = match db.find_pubkeys_by_email_setting(user_email_param) {
-                    Ok(p) => p,
-                    Err(_) => vec![],
-                };
-                
-                if !pubkeys_vec.is_empty() {
-                    // Try each pubkey's settings
-                    for pubkey in pubkeys_vec {
-                        if let Ok(all_settings) = db.get_all_settings(&pubkey) {
-                            let email_address = all_settings.get("email_address").cloned();
-                            let password = all_settings.get("password").cloned();
-                            let imap_host = all_settings.get("imap_host").cloned();
-                            let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
-                            let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
-                            
-                            // Only attempt server deletion if we have the necessary config
-                            if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
-                                if email_addr.to_lowercase() == from_email {
-                                    let email_config = crate::types::EmailConfig {
-                                        email_address: email_addr,
-                                        password: pwd,
-                                        smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
-                                        smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
-                                        imap_host: host,
-                                        imap_port: port,
-                                        use_tls,
-                                        private_key: all_settings.get("nostr_private_key").cloned(),
-                                    };
-                                    
-                                    println!("[RUST] db_delete_sent_email: Attempting to delete from email server");
-                                    // Use tokio::time::timeout to prevent hanging
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(30),
-                                        crate::email::delete_sent_email_from_server(&email_config, &message_id)
-                                    ).await {
-                                        Ok(Ok(_)) => {
-                                            println!("[RUST] db_delete_sent_email: Successfully deleted from email server");
-                                        }
-                                        Ok(Err(e)) => {
-                                            // Log error but continue with local deletion
-                                            println!("[RUST] db_delete_sent_email: Failed to delete from email server: {}, continuing with local deletion", e);
-                                        }
-                                        Err(_) => {
-                                            // Timeout occurred
-                                            println!("[RUST] db_delete_sent_email: Server deletion timed out after 30 seconds, continuing with local deletion");
-                                        }
-                                    }
-                                    break; // Found matching settings, stop searching
-                                }
+            let db = state.get_database()?;
+            let pubkeys_vec = db.find_pubkeys_by_email_setting(user_email_param).unwrap_or_default();
+            for pubkey in pubkeys_vec {
+                if let Ok(all_settings) = db.get_all_settings(&pubkey) {
+                    let email_address = all_settings.get("email_address").cloned();
+                    let password = all_settings.get("password").cloned();
+                    let imap_host = all_settings.get("imap_host").cloned();
+                    let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+                    let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+                    if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+                        let email_config = crate::types::EmailConfig {
+                            email_address: email_addr,
+                            password: pwd,
+                            smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+                            smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+                            imap_host: host,
+                            imap_port: port,
+                            use_tls,
+                            private_key: all_settings.get("nostr_private_key").cloned(),
+                        };
+
+                        println!("[RUST] db_delete_inbox_email: Attempting to delete from email server");
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            crate::email::delete_inbox_email_from_server(&email_config, &message_id)
+                        ).await {
+                            Ok(Ok(_)) => {
+                                println!("[RUST] db_delete_inbox_email: Successfully deleted from email server");
+                            }
+                            Ok(Err(e)) => {
+                                println!("[RUST] db_delete_inbox_email: Failed to delete from email server: {}, continuing with local deletion", e);
+                            }
+                            Err(_) => {
+                                println!("[RUST] db_delete_inbox_email: Server deletion timed out after 30 seconds, continuing with local deletion");
                             }
                         }
+                        break;
                     }
                 }
             }
         }
     }
-    
-    // Always delete locally, even if server deletion failed
-    db.delete_sent_email(&message_id, user_email.as_deref()).map_err(|e| e.to_string())
+
+    let db = state.get_database()?;
+    db.delete_inbox_email(&message_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -4685,27 +5488,71 @@ fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String
     }
 }
 
-/// Extract encrypted content from ASCII armor
-fn extract_encrypted_content_from_armor(body: &str) -> Option<String> {
-    // Look for the start and end markers
-    let start_marker = "-----BEGIN NOSTR NIP-";
-    let end_marker = "-----END NOSTR NIP-";
-    
-    if let Some(start_pos) = body.find(start_marker) {
-        if let Some(end_pos) = body.find(end_marker) {
-            // Find the actual start of encrypted content (after the header line)
-            if let Some(content_start) = body[start_pos..].find('\n') {
-                let content_start = start_pos + content_start + 1;
-                let encrypted_content = &body[content_start..end_pos];
-                
-                // Remove whitespace from the encrypted content
-                let cleaned_content = encrypted_content.replace(|c: char| c.is_whitespace(), "");
-                return Some(cleaned_content);
-            }
-        }
+#[tauri::command]
+fn db_update_email_subject_hash(message_id: String, subject_hash: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    db.update_email_subject_hash(&message_id, &subject_hash).map_err(|e| e.to_string())
+}
+
+#[allow(dead_code)]
+/// Extract armor content preserving spaces (for glossia-encoded bodies).
+/// Returns the raw text between armor markers, only trimming leading/trailing whitespace.
+fn extract_glossia_content_from_armor(body: &str) -> Option<String> {
+    let start_pos = body.find("BEGIN NOSTR NIP-")
+        .and_then(|bp| {
+            let prefix = &body[..bp];
+            let dash_start = prefix.rfind("---")?;
+            Some(dash_start)
+        })?;
+
+    let after_header = body[start_pos..].find('\n')? + start_pos + 1;
+    let end_pos = body[after_header..].find("END NOSTR")
+        .or_else(|| body[after_header..].find("BEGIN NOSTR SIGNATURE"))
+        .or_else(|| body[after_header..].find("BEGIN NOSTR SEAL"))
+        .map(|p| after_header + p)?;
+
+    let end_line_start = body[..end_pos].rfind('\n').map(|p| p + 1).unwrap_or(end_pos);
+
+    let content = body[after_header..end_line_start].trim();
+    if content.is_empty() {
+        return None;
     }
-    
-    None
+    // Only return if content has spaces (glossia words); pure base64 is handled by the other extractor
+    if content.contains(' ') {
+        Some(content.to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract encrypted content from ASCII armor.
+/// Handles both `-----BEGIN` and `----- BEGIN` (with optional spaces after dashes).
+fn extract_encrypted_content_from_armor(body: &str) -> Option<String> {
+    // Find start marker: 3+ dashes, optional spaces, "BEGIN NOSTR NIP-"
+    let start_pos = body.find("BEGIN NOSTR NIP-")
+        .and_then(|bp| {
+            // Walk backwards to find the leading dashes
+            let prefix = &body[..bp];
+            let dash_start = prefix.rfind("---")?;
+            Some(dash_start)
+        })?;
+
+    // Find end marker or next block marker (END NOSTR or BEGIN NOSTR SIGNATURE/SEAL)
+    let after_header = body[start_pos..].find('\n')? + start_pos + 1;
+    let end_pos = body[after_header..].find("END NOSTR")
+        .or_else(|| body[after_header..].find("BEGIN NOSTR SIGNATURE"))
+        .or_else(|| body[after_header..].find("BEGIN NOSTR SEAL"))
+        .map(|p| after_header + p)?;
+
+    // Walk back past the dashes on the end marker line
+    let end_line_start = body[..end_pos].rfind('\n').map(|p| p + 1).unwrap_or(end_pos);
+
+    let encrypted_content = &body[after_header..end_line_start];
+    let cleaned_content = encrypted_content.replace(|c: char| c.is_whitespace(), "");
+    if cleaned_content.is_empty() {
+        return None;
+    }
+    Some(cleaned_content)
 }
 
 #[tauri::command]
@@ -4745,8 +5592,9 @@ fn db_get_matching_email_id(dm_event_id: String, state: tauri::State<AppState>) 
 }
 
 #[tauri::command]
-fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<types::MatchingEmailBodyResult>, String> {
+fn db_get_matching_email_body(dm_event_id: String, private_key: Option<String>, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<Option<types::MatchingEmailBodyResult>, String> {
     println!("[RUST] db_get_matching_email_body called for DM event_id: {}", dm_event_id);
+    let private_key = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
     
     // Get the DM content hash for fast lookup
@@ -4825,38 +5673,40 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: String, _user_pu
         return Ok(None);
     }
     
-    // Extract encrypted content from ASCII armor
-    let encrypted_content = match extract_encrypted_content_from_armor(&email.body) {
-        Some(content) => {
-            println!("[RUST] Extracted encrypted content from ASCII armor, length: {}", content.len());
-            content
-        },
-        None => {
-            println!("[RUST] No ASCII armor found in email body, trying raw body");
-            email.body.clone()
-        }
-    };
-    
-    // Try to decrypt the email body using each pubkey
-    for pubkey in pubkeys_to_try {
-        println!("[RUST] Trying to decrypt with pubkey: {}", pubkey);
-        match nostr::decrypt_dm_content(&private_key, &pubkey, &encrypted_content) {
-            Ok(decrypted_body) => {
-                println!("[RUST] Successfully decrypted email body with pubkey: {}", pubkey);
+    // Use the unified decrypt pipeline (handles glossia, NIP-04/44, manifest, nested blocks)
+    // Try each candidate pubkey until one succeeds
+    for pubkey in &pubkeys_to_try {
+        let sender_pk = if user_received_email { Some(pubkey.as_str()) } else { None };
+        let recipient_pk = if user_sent_email { Some(pubkey.as_str()) } else { Some(pubkey.as_str()) };
+        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk) {
+            Ok(result) if result.success => {
+                println!("[RUST] decrypt_email_body_pipeline succeeded with pubkey: {}", pubkey);
                 return Ok(Some(types::MatchingEmailBodyResult {
-                    body: decrypted_body,
+                    body: result.body,
                     email_id: email_id,
+                    encrypted: false,
+                    sender_pubkey: email.sender_pubkey.clone(),
+                    attachments: result.attachments,
                 }));
-            },
+            }
+            Ok(result) => {
+                println!("[RUST] decrypt_email_body_pipeline failed with pubkey {}: {:?}", pubkey, result.error);
+            }
             Err(e) => {
-                println!("[RUST] Failed to decrypt with pubkey {}: {}", pubkey, e);
-                // Continue to try the next pubkey
+                println!("[RUST] decrypt_email_body_pipeline error with pubkey {}: {}", pubkey, e);
             }
         }
     }
-    
-    println!("[RUST] Failed to decrypt email body with any pubkey");
-    Ok(None)
+
+    // All attempts failed — return raw body so frontend can try
+    println!("[RUST] Failed to decrypt email body server-side, returning raw body for frontend decryption");
+    Ok(Some(types::MatchingEmailBodyResult {
+        body: email.body.clone(),
+        email_id: email_id,
+        encrypted: true,
+        sender_pubkey: email.sender_pubkey.clone(),
+        attachments: Vec::new(),
+    }))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -4906,12 +5756,27 @@ pub fn run() {
         greet,
         should_clear_localstorage_cache,
         generate_keypair,
+        keychain_add_account,
+        keychain_generate_account,
+        keychain_remove_account,
+        keychain_list_accounts,
+        keychain_set_active_account,
+        keychain_get_active_account,
+        keychain_get_private_key,
+
+        keychain_clear_all,
+        keychain_migrate_from_frontend,
         validate_private_key,
         validate_public_key,
         get_public_key_from_private,
         sign_data,
+        sign_data_bytes,
         verify_signature,
+        verify_signature_bytes,
         recheck_email_signature,
+        verify_all_signatures,
+        extract_signable_bytes,
+        sign_and_verify_bytes,
         send_direct_message,
         fetch_direct_messages,
         fetch_conversations,
@@ -4988,6 +5853,7 @@ pub fn run() {
         db_filter_new_contacts,
         db_save_email,
         db_get_email,
+        db_get_email_by_id,
         db_get_emails,
         db_search_emails,
         db_update_email_sender_pubkey,
@@ -5022,11 +5888,23 @@ pub fn run() {
         db_save_settings_batch,
         db_get_database_size,
         db_clear_all_data,
+        db_delete_account_data,
         follow_user,
         publish_follow_list,
         encrypt_nip04_message,
         encrypt_nip04_message_legacy,
         encrypt_message_with_algorithm,
+        parse_armor_message,
+        decrypt_email_body,
+        decrypt_manifest_attachment,
+        encode_bip39,
+        decode_bip39,
+        decode_glossia,
+        glossia_transcode,
+        glossia_detect_dialect,
+        glossia_encode_raw_base_n,
+        glossia_decode_raw_base_n,
+        glossia_get_default_wordlist,
         db_save_relay,
         db_get_all_relays,
         db_delete_relay,
@@ -5046,10 +5924,12 @@ pub fn run() {
         db_get_drafts,
         db_delete_draft,
         db_delete_sent_email,
+        db_delete_inbox_email,
         db_mark_as_read,
         db_check_dm_matches_email_encrypted,
         db_get_matching_email_id,
         db_get_matching_email_body,
+        db_update_email_subject_hash,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     
@@ -5140,15 +6020,17 @@ pub async fn http_db_get_emails(
     app_state: std::sync::Arc<AppState>,
     limit: usize,
     offset: usize,
-    nostr_only: bool,
+    nostr_only: Option<bool>,
     user_email: Option<String>,
+    user_pubkey: Option<String>,
 ) -> Result<Vec<DbEmail>, String> {
     let db = app_state.get_database()?;
     db.get_emails(
         Some(limit as i64),
         Some(offset as i64),
-        Some(nostr_only),
+        nostr_only,
         user_email.as_deref(),
+        user_pubkey.as_deref(),
     )
     .map_err(|e| e.to_string())
 }
@@ -5308,4 +6190,71 @@ pub async fn http_sync_sent_emails(app_state: std::sync::Arc<AppState>, email_co
     println!("[HTTP] sync_sent_emails called");
     let db = app_state.get_database().map_err(|e| e.to_string())?;
     email::sync_sent_emails_to_db(&email_config, &db).await.map_err(|e| e.to_string())
-} 
+}
+
+pub async fn http_db_get_all_settings(
+    app_state: std::sync::Arc<AppState>,
+    pubkey: String,
+    private_key: Option<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    println!("[HTTP] db_get_all_settings called for pubkey: {}", pubkey);
+    let db = app_state.get_database()?;
+    let mut settings = db.get_all_settings(&pubkey).map_err(|e| e.to_string())?;
+
+    let sensitive_keys = vec!["password"];
+    if let Some(ref priv_key) = private_key {
+        for key in sensitive_keys {
+            if let Some(encrypted_value) = settings.get(key) {
+                if !encrypted_value.is_empty() {
+                    match crypto::decrypt_setting_value(priv_key, encrypted_value) {
+                        Ok(decrypted) => {
+                            println!("[HTTP] Decrypted sensitive setting: {}", key);
+                            settings.insert(key.to_string(), decrypted);
+                        }
+                        Err(e) => {
+                            println!("[HTTP] Failed to decrypt setting {} (may be plaintext): {}", key, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(settings)
+}
+
+pub async fn http_db_save_settings_batch(
+    app_state: std::sync::Arc<AppState>,
+    pubkey: String,
+    settings: std::collections::HashMap<String, String>,
+    private_key: Option<String>,
+) -> Result<(), String> {
+    println!("[HTTP] db_save_settings_batch called for pubkey: {}, {} settings", pubkey, settings.len());
+    let db = app_state.get_database()?;
+
+    let sensitive_keys = vec!["password"];
+    for (key, value) in settings.iter() {
+        let value_to_save = if sensitive_keys.contains(&key.as_str()) {
+            if let Some(ref priv_key) = private_key {
+                match crypto::encrypt_setting_value(priv_key, value) {
+                    Ok(encrypted) => {
+                        println!("[HTTP] Encrypted sensitive setting: {}", key);
+                        encrypted
+                    }
+                    Err(e) => {
+                        eprintln!("[HTTP] Failed to encrypt setting {}: {}", key, e);
+                        return Err(format!("Failed to encrypt setting {}: {}", key, e));
+                    }
+                }
+            } else {
+                eprintln!("[HTTP] WARNING: Saving sensitive setting '{}' without encryption (no private key provided)", key);
+                value.clone()
+            }
+        } else {
+            value.clone()
+        };
+
+        db.save_setting(&pubkey, key, &value_to_save).map_err(|e| format!("Failed to save setting {}: {}", key, e))?;
+    }
+    Ok(())
+}

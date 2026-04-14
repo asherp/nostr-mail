@@ -24,15 +24,29 @@
     <link rel="stylesheet" href="styles.css">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "nostr-tools/nip04": "https://esm.sh/nostr-tools@2.10.4/nip04",
+            "nostr-tools/nip44": "https://esm.sh/nostr-tools@2.10.4/nip44",
+            "nostr-tools/nip19": "https://esm.sh/nostr-tools@2.10.4/nip19",
+            "nostr-tools/pure":  "https://esm.sh/nostr-tools@2.10.4/pure",
+            "@noble/curves/secp256k1": "https://esm.sh/@noble/curves@1.8.1/secp256k1"
+        }
+    }
+    </script>
     <script src="storage-service.js"></script>
     <script src="js/database-service.js"></script>
     <script src="js/contacts-service.js"></script>
     <script src="js/dm-service.js"></script>
     <script src="js/dom-manager.js"></script>
     <script src="js/tauri-service.js"></script>
+    <script type="module" src="js/crypto-service.js"></script>
+    <script src="js/glossia-service.js"></script>
     <script src="js/email-service.js"></script>
     <script src="js/utils.js"></script>
     <script src="js/app-state.js"></script>
+    <script src="js/profile-manager.js"></script>
     <script src="js/notification-service.js"></script>
     <script src="js/app.js"></script>
 </head>
@@ -76,6 +90,24 @@
             </nav>
             
             <div class="sidebar-footer">
+                <div class="profile-switcher" id="profile-switcher">
+                    <div class="profile-switcher-active" id="profile-switcher-active" title="Switch account">
+                        <div class="profile-switcher-avatar" id="profile-switcher-avatar"></div>
+                        <div class="profile-switcher-info">
+                            <span class="profile-switcher-name" id="profile-switcher-name">No Account</span>
+                            <span class="profile-switcher-npub" id="profile-switcher-npub"></span>
+                        </div>
+                        <i class="fas fa-chevron-up profile-switcher-toggle"></i>
+                    </div>
+                    <div class="profile-switcher-dropdown" id="profile-switcher-dropdown" style="display:none;">
+                        <div class="profile-switcher-list" id="profile-switcher-list"></div>
+                        <div class="profile-switcher-actions">
+                            <button class="profile-switcher-add" id="profile-switcher-add">
+                                <i class="fas fa-plus"></i> Add Account
+                            </button>
+                        </div>
+                    </div>
+                </div>
                 <span class="version-text">v1.0.4-beta</span>
             </div>
         </aside>
@@ -99,9 +131,10 @@
                         <select id="nostr-contact-select" class="form-control" style="margin-bottom: 8px;">
                             <option value="">Select a Nostr contact with email...</option>
                         </select>
-                        <input type="email" id="to-address" placeholder="recipient@example.com">
-                        <div id="selected-recipient-pubkey" class="selected-pubkey-display" style="display: none;">
-                            <strong>Recipient pubkey:</strong> <span id="recipient-pubkey-value"></span>
+                        <input type="email" id="to-address" placeholder="recipient@example.com" autocorrect="off" autocapitalize="off" spellcheck="false">
+                        <div id="selected-recipient-pubkey" class="selected-pubkey-display">
+                            <label for="recipient-pubkey-value" style="font-size:0.85em; font-weight:bold; margin-bottom:2px;">Recipient pubkey:</label>
+                            <input type="text" id="recipient-pubkey-value" placeholder="npub1... or hex pubkey (optional)" style="font-family: monospace; font-size: 0.85em;" autocorrect="off" autocapitalize="off" spellcheck="false">
                         </div>
                     </div>
                     
@@ -115,23 +148,15 @@
                         <textarea id="message-body" rows="10" placeholder="Type your message here..."></textarea>
                     </div>
                     
-                    <div class="form-group">
-                        <label for="attachments">Attachments:</label>
-                        <div class="attachment-section">
-                            <div class="attachment-input-wrapper">
-                                <input type="file" id="attachment-input" multiple accept="*/*" style="display: none;">
-                                <button type="button" id="add-attachment-btn" class="btn btn-secondary">
-                                    <i class="fas fa-paperclip"></i> Add Attachments
-                                </button>
-                                <small class="form-text text-muted">Attachments will be encrypted individually using hybrid encryption (NIP-44 for keys + AES-256 for large files)</small>
-                            </div>
-                            <div id="attachment-list" class="attachment-list">
-                                <!-- Attachments will be displayed here -->
-                            </div>
-                        </div>
+                    <input type="file" id="attachment-input" multiple accept="*/*" style="display: none;">
+                    <div id="attachment-list" class="attachment-list">
+                        <!-- Attachments will be displayed here -->
                     </div>
-                    
+
                     <div class="form-actions">
+                        <button type="button" id="add-attachment-btn" class="btn btn-secondary">
+                            <i class="fas fa-paperclip"></i> Attach
+                        </button>
                         <button id="encrypt-btn" class="btn btn-secondary" type="button">
                             <span class="encrypt-btn-icon"><i class="fas fa-lock"></i></span>
                             <span class="encrypt-btn-label">Encrypt</span>
@@ -141,7 +166,7 @@
                             <span class="sign-btn-label">Sign</span>
                         </button>
                         <button id="preview-headers-btn" class="btn btn-secondary" type="button">
-                            <i class="fas fa-eye"></i> Preview Headers
+                            <i class="fas fa-eye"></i> Preview
                         </button>
                         <button id="send-btn" class="btn btn-primary">
                             <i class="fas fa-paper-plane"></i> Send
@@ -543,6 +568,37 @@
                                 NIP-44 is the modern, secure encryption standard. NIP-04 is legacy and less secure.
                             </div>
                         </div>
+
+                        <div class="form-group">
+                            <label>Glossia Encoding:</label>
+                            <small class="form-text text-muted" style="margin-bottom:0.5em;">Language for encoding of each email component.</small>
+                            <div style="display:flex; gap:1em; flex-wrap:wrap;">
+                                <div style="flex:1; min-width:120px;">
+                                    <label for="glossia-encoding-body" style="font-size:0.85em; font-weight:normal;">Ciphertext</label>
+                                    <select id="glossia-encoding-body">
+                                        <option value="latin">Latin</option>
+                                        <option value="english bip39">English - BIP39</option>
+                                        <option value="">Base64 (no encoding, ⚠ breaks on fwd/reply)</option>
+                                    </select>
+                                </div>
+                                <div style="flex:1; min-width:120px;">
+                                    <label for="glossia-encoding-signature" style="font-size:0.85em; font-weight:normal;">Signature</label>
+                                    <select id="glossia-encoding-signature">
+                                        <option value="latin">Latin</option>
+                                        <option value="english bip39">English - BIP39</option>
+                                        <option value="">Base64 (no encoding, ⚠ breaks on fwd/reply)</option>
+                                    </select>
+                                </div>
+                                <div style="flex:1; min-width:120px;">
+                                    <label for="glossia-encoding-pubkey" style="font-size:0.85em; font-weight:normal;">Pubkey</label>
+                                    <select id="glossia-encoding-pubkey">
+                                        <option value="latin">Latin</option>
+                                        <option value="english bip39">English - BIP39</option>
+                                        <option value="">Bech32</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="email-filter-preference">Inbox Filter:</label>
@@ -550,7 +606,7 @@
                                 <option value="nostr">Nostr Emails Only</option>
                                 <option value="all">All Emails</option>
                             </select>
-                            <small class="form-text text-muted">Choose whether to show only Nostr-encrypted emails or all emails in your inbox</small>
+                            <small class="form-text text-muted">Nostr Emails Only shows encrypted emails, signed emails, and emails from your Nostr contacts. All Emails shows everything.</small>
                         </div>
                         
                         <div class="form-group">

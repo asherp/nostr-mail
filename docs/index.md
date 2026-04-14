@@ -77,13 +77,14 @@ Nostr-mail aims to improve privacy for the average person by bridging the gap be
 
 ## Getting Started
 
-Ready to get started? Check out the [Installation Guide](installation.md) and [Quick Start Guide](quick-start.md).
+Ready to get started? Check out the [Installation Guide](installation.md) and [Quick Start Guide](quick-start.md). If you're already using other Nostr clients, see [Using nostr-mail with Nostr Clients](nostr-clients.md) for important compatibility information.
 
 ## Documentation
 
 ### User Guides
 - [Installation](installation.md) - Set up nostr-mail on your system
 - [Quick Start](quick-start.md) - Get up and running quickly
+- [Nostr Clients](nostr-clients.md) - Use nostr-mail with Amethyst, Damus, and other Nostr clients
 - [Compose Page](pages/compose.md) - Create and send encrypted emails
 - [Inbox Page](pages/inbox.md) - View and manage received emails
 - [Sent Page](pages/sent.md) - View sent email history
@@ -97,6 +98,7 @@ Ready to get started? Check out the [Installation Guide](installation.md) and [Q
 - [Architecture](architecture.md) - Project structure and data flow
 - [Development](development.md) - Building and development workflow
 - [NIP-44 Encryption](nip44.md) - Encryption standard details
+- [Glossia Design Philosophy](glossia-design.md) - Why glossia uses text/plain, not multipart/alternative
 
 ### Legacy Documentation
 - [Legacy Docker Setup](legacy.md) - Old Docker/Python setup documentation

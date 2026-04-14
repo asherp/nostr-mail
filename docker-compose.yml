@@ -77,8 +77,13 @@ services:
       - cargo-cache:/root/.cargo/git
       - target-cache:/app/target
     container_name: glossia
+    profiles: ["glossia"]
     # Default: run with cargo watch for hot reloading
     # Override with: docker compose run --rm glossia cargo run --bin glossia -- "your text here"
+    # Note: glossia is an optional git submodule. To use it:
+    #   1. Ensure you have access to the private glossia repository
+    #   2. Run: git submodule update --init --recursive glossia
+    #   3. Start with: docker compose --profile glossia up glossia
     command: ["cargo", "watch", "-q", "-c", "-w", "src", "-x", "run --bin glossia --"]
 
   glossia-prod:
@@ -86,7 +91,9 @@ services:
       context: ./glossia
       dockerfile: Dockerfile
     container_name: glossia-prod
+    profiles: ["glossia"]
     # Usage: docker compose run --rm glossia-prod cargo run --bin glossia -- "your text here"
     # Or: docker compose run --rm glossia-prod (runs default example)
+    # Note: Requires glossia submodule to be initialized (see glossia service above)
 
 

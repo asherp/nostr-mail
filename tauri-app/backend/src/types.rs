@@ -9,6 +9,18 @@ pub struct KeyPair {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub public_key: String,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationAccount {
+    pub public_key: String,
+    pub private_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailConfig {
     pub email_address: String,
     pub password: String,
@@ -28,6 +40,7 @@ pub struct EmailMessage {
     pub subject: String,
     pub body: String,
     pub raw_body: String,
+    pub html_body: Option<String>,
     pub date: DateTime<Utc>,
     pub is_read: bool,
     pub raw_headers: String,
@@ -35,6 +48,7 @@ pub struct EmailMessage {
     pub recipient_pubkey: Option<String>,
     pub message_id: Option<String>,
     pub signature_valid: Option<bool>,
+    pub signature_source: Option<String>,
     pub transport_auth_verified: Option<bool>,
 }
 
@@ -105,7 +119,7 @@ pub enum MessageContent {
 /// Request structure for sending direct messages with explicit content type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectMessageRequest {
-    pub sender_private_key: String,
+    pub sender_private_key: Option<String>,
     pub recipient_pubkey: String,
     pub content: MessageContent,
     pub relays: Vec<String>,
@@ -149,6 +163,16 @@ pub struct EmailAttachment {
 pub struct MatchingEmailBodyResult {
     pub body: String,
     pub email_id: Option<i64>,
+    /// True when the body could not be decrypted server-side (e.g. glossia-encoded)
+    /// and the frontend should attempt glossia decode + NIP decrypt itself.
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Sender pubkey from the email (for frontend decryption key lookup)
+    #[serde(default)]
+    pub sender_pubkey: Option<String>,
+    /// Manifest attachment metadata (if the email was manifest-encrypted)
+    #[serde(default)]
+    pub attachments: Vec<ManifestAttachmentInfo>,
 }
 
 /// Result structure for matching email ID lookup (includes both ID and message_id)
@@ -186,4 +210,129 @@ pub struct FollowListResult {
     pub event_found: bool,
     /// ID of the latest contact list event found (if any)
     pub event_id: Option<String>,
-} 
+}
+
+/// Parsed representation of an ASCII-armored nostr-mail message.
+/// Populated from a capnp ArmorMessage (schema validation) then serialized as JSON for Tauri IPC.
+/// The body_type and encryption_nip fields derive from the capnp Body union and NipVersion enum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedArmorMessage {
+    /// Raw encoded body content (glossia words, base64, or plaintext)
+    pub body_text: String,
+    /// Body variant from capnp Body union: "encrypted", "signed", or "plain"
+    pub body_type: String,
+    /// NIP version if encrypted, from capnp NipVersion enum: "nip04" or "nip44"
+    pub encryption_nip: Option<String>,
+    /// Schnorr signature hex (128 hex chars = 64 bytes), from capnp SignatureBlock.signature
+    pub signature_hex: Option<String>,
+    /// Pubkey hex from SIGNATURE block (64 hex chars = 32 bytes), from capnp SignatureBlock.pubkey
+    pub sig_pubkey_hex: Option<String>,
+    /// Pubkey hex from SEAL block (64 hex chars = 32 bytes), from capnp SealBlock.pubkey
+    pub seal_pubkey_hex: Option<String>,
+    /// Profile name from @ProfileName line, from capnp SignatureBlock.profileName
+    pub profile_name: Option<String>,
+    /// Display name from @DisplayName line, from capnp SealBlock.displayName (falls back to profile_name)
+    pub display_name: Option<String>,
+    /// Raw encoded sig+pubkey content before decode (for JS fallback paths)
+    pub raw_sig_pubkey: Option<String>,
+    /// Plaintext that appeared before the first armor delimiter
+    pub prefix_text: Option<String>,
+    /// Recursively parsed nested quoted armor, from capnp Body.quoted -> ArmorMessage
+    pub quoted: Option<Box<ParsedArmorMessage>>,
+    /// Raw nested armor text string (for JS compatibility during incremental migration)
+    pub quoted_armor_text: Option<String>,
+    /// Decoded body bytes as base64 (for signature verification without re-decoding)
+    pub body_bytes_b64: Option<String>,
+}
+
+/// Per-signature verification result (one per nesting level in the armor chain).
+/// Array is ordered innermost-first, matching the JS verifyAllSignatures convention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureVerificationResult {
+    /// Schnorr signature hex (128 hex chars = 64 bytes)
+    pub signature_hex: Option<String>,
+    /// Signer pubkey hex (64 hex chars = 32 bytes)
+    pub pubkey_hex: Option<String>,
+    /// Whether the signature is valid
+    pub is_valid: bool,
+    /// Nesting depth (0 = outermost, increases inward)
+    pub depth: usize,
+    /// Body type at this level: "encrypted", "signed", or "plain"
+    pub body_type: String,
+    /// Profile name from the @ProfileName line in the signature block
+    pub profile_name: Option<String>,
+}
+
+/// Per-block decrypt result (one per nesting level in the armor chain).
+/// Array is ordered innermost-first, matching the JS decryptAllEncryptedBlocks convention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecryptedBlock {
+    /// Decrypted plaintext body (after manifest AES decrypt if applicable)
+    pub decrypted_text: Option<String>,
+    /// Error message if decryption failed at this level
+    pub error: Option<String>,
+    /// Whether this block was encrypted (false for signed/plain blocks → null in JS array)
+    pub was_encrypted: bool,
+    /// Profile name from the signature/seal block at this level
+    pub profile_name: Option<String>,
+    /// Body type at this level: "encrypted", "signed", "plain"
+    pub body_type: String,
+}
+
+/// Manifest attachment metadata — carries the AES key needed for separate decryption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestAttachmentInfo {
+    pub id: String,
+    pub orig_filename: String,
+    pub orig_mime: String,
+    /// Base64-encoded AES-256 key for this attachment
+    pub key_wrap_b64: String,
+    /// Hex SHA-256 of the encrypted file (for integrity check)
+    pub cipher_sha256_hex: Option<String>,
+    pub cipher_size: u64,
+}
+
+/// Full result from the decrypt_email_body Tauri command.
+/// Replaces the JS decryptManifestMessage + decryptAllEncryptedBlocks pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecryptEmailResult {
+    /// Decrypted subject (or original if not encrypted / decryption failed)
+    pub subject: String,
+    /// Decrypted outermost body text
+    pub body: String,
+    /// Whether the body came from a manifest (vs legacy direct encryption)
+    pub is_manifest: bool,
+    /// Attachment metadata from manifest (empty if legacy or no attachments)
+    pub attachments: Vec<ManifestAttachmentInfo>,
+    /// Per-block decrypt results, innermost-first (for lock/unlock icons)
+    pub block_results: Vec<DecryptedBlock>,
+    /// Whether overall decryption succeeded
+    pub success: bool,
+    /// Error message if overall decryption failed
+    pub error: Option<String>,
+    /// Subject ciphertext (after glossia decode, before NIP decrypt) for DM↔email hash matching
+    pub subject_ciphertext: Option<String>,
+    /// Sender pubkey extracted from outermost armor signature block (npub bech32),
+    /// populated when the X-Nostr-Pubkey header is absent but a valid inline signature exists.
+    /// The frontend can use this to backfill sender_pubkey in the DB for avatar lookup.
+    #[serde(default)]
+    pub sender_pubkey: Option<String>,
+}
+
+/// Result from the decrypt_manifest_attachment Tauri command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecryptedAttachment {
+    pub id: String,
+    pub filename: String,
+    pub content_type: String,
+    /// Base64-encoded decrypted file bytes
+    pub data_b64: String,
+    /// Original (unpadded) file size
+    pub size: usize,
+}

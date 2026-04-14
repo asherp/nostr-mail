@@ -280,6 +280,111 @@ class NotificationService {
             okBtn.focus();
         });
     }
+    async showDeleteOptions(title = 'Delete Email', message = 'How would you like to delete this email?') {
+        return new Promise((resolve) => {
+            const modal = document.createElement('div');
+            modal.className = 'confirmation-modal';
+            modal.innerHTML = `
+                <div class="confirmation-overlay">
+                    <div class="confirmation-dialog">
+                        <h3>${title}</h3>
+                        <p>${message}</p>
+                        <div class="confirmation-actions delete-options">
+                            <button class="btn btn-secondary" id="delete-cancel">Cancel</button>
+                            <button class="btn btn-primary" id="delete-local">Delete Locally</button>
+                            <button class="btn btn-danger" id="delete-everywhere">Delete Everywhere</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            modal.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                z-index: 10000;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                pointer-events: auto;
+            `;
+
+            const overlay = modal.querySelector('.confirmation-overlay');
+            overlay.style.cssText = `
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.5);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            `;
+
+            const dialog = modal.querySelector('.confirmation-dialog');
+            dialog.style.cssText = `
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                max-width: 480px;
+                text-align: center;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+                word-wrap: break-word;
+            `;
+
+            const actions = modal.querySelector('.confirmation-actions');
+            actions.style.cssText = `
+                margin-top: 20px;
+                display: flex;
+                gap: 10px;
+                justify-content: center;
+                flex-wrap: wrap;
+            `;
+
+            document.body.appendChild(modal);
+
+            const cancelBtn = modal.querySelector('#delete-cancel');
+            const localBtn = modal.querySelector('#delete-local');
+            const everywhereBtn = modal.querySelector('#delete-everywhere');
+
+            const cleanup = () => {
+                if (modal.parentNode) {
+                    modal.parentNode.removeChild(modal);
+                }
+            };
+
+            cancelBtn.addEventListener('click', () => {
+                cleanup();
+                resolve(null);
+            });
+
+            localBtn.addEventListener('click', () => {
+                cleanup();
+                resolve('local');
+            });
+
+            everywhereBtn.addEventListener('click', () => {
+                cleanup();
+                resolve('everywhere');
+            });
+
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    cleanup();
+                    resolve(null);
+                }
+            });
+
+            dialog.addEventListener('click', (e) => {
+                e.stopPropagation();
+            });
+        });
+    }
 }
 
 // Create and export a singleton instance

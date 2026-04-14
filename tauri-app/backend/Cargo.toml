@@ -16,6 +16,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+capnp = "0.20"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 nostr-sdk = { version = "0.42.0", features = ["nip04", "nip44", "nip59"] }
@@ -40,6 +41,9 @@ dirs = "5"
 zip = "2.1"
 tower = "0.4"
 sha2 = "0.10"
+glossia = { path = "../../glossia", default-features = false }
+rand = "0.8"
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"] }
 
 # Android-specific dependencies (use rustls instead of native-tls)
 [target.'cfg(target_os = "android")'.dependencies]

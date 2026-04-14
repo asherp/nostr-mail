@@ -45,7 +45,12 @@ pub struct Email {
     pub updated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub signature_valid: Option<bool>,
+    pub signature_source: Option<String>,
     pub transport_auth_verified: Option<bool>,
+    /// Pre-computed subject hash (from NIP ciphertext before glossia encoding).
+    /// When set, save_email uses this instead of hashing the (possibly glossia-encoded) subject.
+    #[serde(default)]
+    pub subject_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -453,6 +458,9 @@ impl Database {
         // Migrate: Add transport_auth_verified column to emails table if it doesn't exist
         Self::migrate_add_transport_auth_column(&conn)?;
 
+        // Migrate: Add signature_source column to emails table if it doesn't exist
+        Self::migrate_add_signature_source_column(&conn)?;
+
         // Migrate: Remove duplicate settings entries
         Self::migrate_remove_duplicate_settings(&conn)?;
 
@@ -599,6 +607,28 @@ impl Database {
                 [],
             )?;
             println!("[DB] Migration complete: transport_auth_verified column added to emails");
+        }
+
+        Ok(())
+    }
+
+    /// Migration: Add signature_source column to emails table if it doesn't exist
+    fn migrate_add_signature_source_column(conn: &Connection) -> Result<()> {
+        let has_signature_source = {
+            let mut stmt = conn.prepare("PRAGMA table_info(emails)")?;
+            let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?) // column name
+            })?.collect();
+            columns.map(|cols| cols.contains(&"signature_source".to_string())).unwrap_or(false)
+        };
+
+        if !has_signature_source {
+            println!("[DB] Adding signature_source column to emails table");
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN signature_source TEXT",
+                [],
+            )?;
+            println!("[DB] Migration complete: signature_source column added to emails");
         }
 
         Ok(())
@@ -757,18 +787,19 @@ impl Database {
                     updated_at DATETIME,
                     created_at DATETIME NOT NULL,
                     subject_hash TEXT,
-                    signature_valid BOOLEAN
+                    signature_valid BOOLEAN,
+                    signature_source TEXT
                 )",
                 [],
             )?;
-            
+
             // Copy data from old table to new table
-            // Note: signature_valid will be NULL for existing emails, which is fine
+            // Note: signature_valid and signature_source will be NULL for existing emails, which is fine
             conn.execute(
-                "INSERT INTO emails_new SELECT 
+                "INSERT INTO emails_new SELECT
                     id, message_id, from_address, to_address, subject, body, body_plain, body_html,
                     received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
-                    is_draft, is_read, updated_at, created_at, subject_hash, NULL
+                    is_draft, is_read, updated_at, created_at, subject_hash, NULL, NULL
                 FROM emails",
                 [],
             )?;
@@ -1036,12 +1067,15 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         
-        // Compute hash for encrypted emails
-        let subject_hash = if email.is_nostr_encrypted {
-            Some(Self::compute_content_hash(&email.subject))
-        } else {
-            None
-        };
+        // Use pre-computed subject_hash if provided (from NIP ciphertext before glossia),
+        // otherwise fall back to hashing the subject as stored.
+        let subject_hash = email.subject_hash.clone().or_else(|| {
+            if email.is_nostr_encrypted {
+                Some(Self::compute_content_hash(&email.subject))
+            } else {
+                None
+            }
+        });
 
         if let Some(id) = email.id {
             println!("[DB] save_email: Updating existing email with id={}", id);
@@ -1050,13 +1084,13 @@ impl Database {
                     message_id = ?, from_address = ?, to_address = ?, subject = ?, 
                     body = ?, body_plain = ?, body_html = ?, received_at = ?, 
                     is_nostr_encrypted = ?, sender_pubkey = ?, recipient_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?,
-                    subject_hash = ?, signature_valid = ?, transport_auth_verified = ?
+                    subject_hash = ?, signature_valid = ?, signature_source = ?, transport_auth_verified = ?
                 WHERE id = ?",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
                     email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                    subject_hash, email.signature_valid, email.transport_auth_verified, id
+                    subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified, id
                 ],
             )?;
             println!("[DB] save_email: Successfully updated email id={}", id);
@@ -1098,13 +1132,13 @@ impl Database {
             println!("[DB] save_email: Email is new, inserting into database");
             println!("[DB] save_email: About to execute INSERT statement");
             match conn.execute(
-                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, transport_auth_verified)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, signature_source, transport_auth_verified)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
                     email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                    subject_hash, email.signature_valid, email.transport_auth_verified
+                    subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified
                 ],
             ) {
                 Ok(rows_affected) => {
@@ -1126,22 +1160,23 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         
-        // Compute hash for encrypted emails
-        let subject_hash = if email.is_nostr_encrypted {
-            Some(Self::compute_content_hash(&email.subject))
-        } else {
-            None
-        };
-        
+        let subject_hash = email.subject_hash.clone().or_else(|| {
+            if email.is_nostr_encrypted {
+                Some(Self::compute_content_hash(&email.subject))
+            } else {
+                None
+            }
+        });
+
         println!("[DB] insert_email_direct: About to execute INSERT statement");
         match conn.execute(
-            "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, transport_auth_verified)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, signature_source, transport_auth_verified)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 email.message_id, email.from_address, email.to_address, email.subject,
                 email.body, email.body_plain, email.body_html, email.received_at,
                 email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                subject_hash, email.signature_valid, email.transport_auth_verified
+                subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified
             ],
         ) {
             Ok(rows_affected) => {
@@ -1179,9 +1214,9 @@ impl Database {
         // SQLite's TRIM and REPLACE can handle the normalization
         // We'll try multiple formats: exact match, normalized match, and with/without angle brackets
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified
-             FROM emails 
-             WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? 
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified
+             FROM emails
+             WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?
              ORDER BY received_at DESC"
         )?;
         println!("[DB] get_email: Prepared optimized query with normalization");
@@ -1209,7 +1244,9 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
-                transport_auth_verified: row.get(18)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
             };
             println!("[DB] get_email: Found matching email, id={:?}", email.id);
             return Ok(Some(email));
@@ -1219,23 +1256,40 @@ impl Database {
         Ok(None)
     }
 
-    pub fn get_emails(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>) -> Result<Vec<Email>> {
+    pub fn get_emails(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>, user_pubkey: Option<&str>) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.unwrap_or(50);
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
-        if let Some(nostr_only) = nostr_only {
-            where_clauses.push("is_nostr_encrypted = ?");
-            params.push(Box::new(nostr_only));
+        where_clauses.push("is_draft = 0");
+        if let Some(true) = nostr_only {
+            // "Nostr Emails Only": show nostr-encrypted, signed, or from contacts
+            if let Some(pubkey) = user_pubkey {
+                where_clauses.push(
+                    "(is_nostr_encrypted = 1 OR signature_valid IS NOT NULL \
+                     OR sender_pubkey IN (SELECT contact_pubkey FROM user_contacts WHERE user_pubkey = ?) \
+                     OR LOWER(TRIM(from_address)) IN (\
+                         SELECT LOWER(TRIM(c.email)) FROM contacts c \
+                         INNER JOIN user_contacts uc ON c.pubkey = uc.contact_pubkey \
+                         WHERE uc.user_pubkey = ? AND c.email IS NOT NULL AND c.email != ''\
+                     ))"
+                );
+                params.push(Box::new(pubkey.to_string()));
+                params.push(Box::new(pubkey.to_string()));
+            } else {
+                // No user_pubkey: fall back to just nostr-encrypted or signed
+                where_clauses.push("(is_nostr_encrypted = 1 OR signature_valid IS NOT NULL)");
+            }
         }
+        // When nostr_only is None ("All Emails"), no filter is applied
         if let Some(email) = user_email {
             where_clauses.push("LOWER(TRIM(to_address)) = LOWER(TRIM(?))");
-            params.push(Box::new(email));
+            params.push(Box::new(email.to_string()));
         }
         if !where_clauses.is_empty() {
             query.push_str(" WHERE ");
@@ -1266,7 +1320,9 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
-                transport_auth_verified: row.get(18)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
             })
         })?;
         rows.collect()
@@ -1302,11 +1358,11 @@ impl Database {
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
-        
+
         // Always exclude drafts from sent emails
         where_clauses.push("is_draft = 0");
         
@@ -1382,7 +1438,9 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
-                transport_auth_verified: row.get(18)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
             })
         })?;
         let emails: Vec<Email> = rows.collect::<Result<Vec<_>, _>>()?;
@@ -1454,6 +1512,37 @@ impl Database {
                 Ok(None)
             }
         }
+    }
+
+    /// Get the last successful sync timestamp for a given email account and folder.
+    /// Stored in user_settings with the email address as the pubkey field
+    /// and `last_sync_at:<folder>` as the key.
+    pub fn get_last_sync_at(&self, email: &str, folder: &str) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.conn.lock().unwrap();
+        let key = format!("last_sync_at:{}", folder);
+        let mut stmt = conn.prepare(
+            "SELECT value FROM user_settings WHERE pubkey = ? AND key = ?"
+        )?;
+        let mut rows = stmt.query(params![email.trim().to_lowercase(), key])?;
+        if let Some(row) = rows.next()? {
+            let value: String = row.get(0)?;
+            match value.parse::<DateTime<Utc>>() {
+                Ok(dt) => Ok(Some(dt)),
+                Err(_) => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Save the sync timestamp for a given email account and folder.
+    pub fn set_last_sync_at(&self, email: &str, folder: &str, timestamp: DateTime<Utc>) -> Result<()> {
+        let key = format!("last_sync_at:{}", folder);
+        self.save_setting(
+            &email.trim().to_lowercase(),
+            &key,
+            &timestamp.to_rfc3339(),
+        )
     }
 
     // Direct message operations
@@ -1640,7 +1729,7 @@ impl Database {
     pub fn find_email_by_subject_hash(&self, subject_hash: &str) -> Result<Option<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified
              FROM emails WHERE subject_hash = ? AND is_nostr_encrypted = 1 LIMIT 1"
         )?;
         let mut rows = stmt.query_map(params![subject_hash], |row| {
@@ -1663,7 +1752,9 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
-                transport_auth_verified: row.get(18)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
             })
         })?;
         
@@ -1672,6 +1763,56 @@ impl Database {
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
+    }
+
+    pub fn get_email_by_id(&self, id: i64) -> Result<Option<Email>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified
+             FROM emails WHERE id = ? LIMIT 1"
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(Email {
+                id: Some(row.get(0)?),
+                message_id: row.get(1)?,
+                from_address: row.get(2)?,
+                to_address: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                body_plain: row.get(6)?,
+                body_html: row.get(7)?,
+                received_at: row.get(8)?,
+                is_nostr_encrypted: row.get(9)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
+                signature_valid: row.get(17)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(email)) => Ok(Some(email)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Update the subject_hash for an email identified by message_id.
+    /// Called from the frontend after glossia-decoding recovers the NIP ciphertext.
+    pub fn update_email_subject_hash(&self, message_id: &str, subject_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let normalized = Self::normalize_message_id(message_id);
+        conn.execute(
+            "UPDATE emails SET subject_hash = ? WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?",
+            params![subject_hash, normalized],
+        )?;
+        Ok(())
     }
 
     // Attachment operations
@@ -1928,7 +2069,17 @@ impl Database {
         Ok(())
     }
 
+    // Delete all data associated with a pubkey (settings, contacts, conversations)
+    pub fn delete_account_data(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM user_settings WHERE pubkey = ?", params![pubkey])?;
+        conn.execute("DELETE FROM user_contacts WHERE user_pubkey = ?", params![pubkey])?;
+        conn.execute("DELETE FROM conversations WHERE user_pubkey = ?", params![pubkey])?;
+        Ok(())
+    }
+
     /// Load config data from JSON string (events, profiles, relays)
+    #[allow(dead_code)]
     fn load_config_data_from_str(&self, content: &str) -> Result<()> {
         self.parse_and_load_config_data(content)
     }
@@ -2009,6 +2160,7 @@ impl Database {
         struct ConfigProfile {
             #[allow(dead_code)]
             pubkey: String,
+            #[allow(dead_code)]
             private_key: String,
             #[allow(dead_code)]
             name: Option<String>,
@@ -2291,7 +2443,7 @@ impl Database {
     pub fn find_emails_by_message_id(&self, message_id: &str) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified
              FROM emails WHERE message_id = ? ORDER BY received_at DESC"
         )?;
         
@@ -2315,7 +2467,9 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
-                transport_auth_verified: row.get(18)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
             })
         })?;
         
@@ -2364,7 +2518,7 @@ impl Database {
                 email_lower
             };
             query.push_str(" AND (LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(from_address)) = LOWER(TRIM(?)))");
-            params.push(Box::new(email.clone()));
+            params.push(Box::new(email));
             params.push(Box::new(email_normalized));
         }
         
@@ -2424,7 +2578,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
         
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, transport_auth_verified FROM emails WHERE is_draft = 1"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified FROM emails WHERE is_draft = 1"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         
@@ -2458,7 +2612,9 @@ impl Database {
                 updated_at: row.get(15)?,
                 created_at: row.get(16)?,
                 signature_valid: row.get(17)?,
-                transport_auth_verified: row.get(18)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
             })
         })?;
         
@@ -2471,39 +2627,65 @@ impl Database {
 
     pub fn delete_draft(&self, message_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        // Delete attachments first (CASCADE should handle this, but explicit is safer)
-        if let Ok(Some(email)) = self.get_email(message_id) {
-            if let Some(email_id) = email.id {
-                self.delete_attachments_for_email(email_id)?;
-            }
+        let normalized_id = Self::normalize_message_id(message_id);
+
+        // Delete attachments first (inline lookup to avoid deadlock)
+        let email_id: Option<i64> = conn.query_row(
+            "SELECT id FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 1",
+            params![normalized_id],
+            |row| row.get(0),
+        ).ok();
+        if let Some(eid) = email_id {
+            conn.execute("DELETE FROM attachments WHERE email_id = ?", params![eid])?;
         }
+
         conn.execute(
-            "DELETE FROM emails WHERE message_id = ? AND is_draft = 1",
-            params![message_id],
+            "DELETE FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 1",
+            params![normalized_id],
         )?;
         Ok(())
     }
     
-    pub fn delete_sent_email(&self, message_id: &str, user_email: Option<&str>) -> Result<()> {
+    pub fn delete_sent_email(&self, message_id: &str, _user_email: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        // Delete attachments first
-        if let Ok(Some(email)) = self.get_email(message_id) {
-            if let Some(email_id) = email.id {
-                self.delete_attachments_for_email(email_id)?;
-            }
+        let normalized_id = Self::normalize_message_id(message_id);
+
+        // Delete attachments first (inline lookup to avoid deadlock)
+        let email_id: Option<i64> = conn.query_row(
+            "SELECT id FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?",
+            params![normalized_id],
+            |row| row.get(0),
+        ).ok();
+        if let Some(eid) = email_id {
+            conn.execute("DELETE FROM attachments WHERE email_id = ?", params![eid])?;
         }
-        
+
         // Delete the email (only if it's a sent email, not a draft)
-        let mut query = String::from("DELETE FROM emails WHERE message_id = ? AND is_draft = 0");
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(message_id)];
-        
-        // Optionally filter by user_email to ensure user can only delete their own sent emails
-        if let Some(email) = user_email {
-            query.push_str(" AND LOWER(TRIM(from_address)) = LOWER(TRIM(?))");
-            params.push(Box::new(email));
+        conn.execute(
+            "DELETE FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 0",
+            params![normalized_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_inbox_email(&self, message_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let normalized_id = Self::normalize_message_id(message_id);
+
+        // Delete attachments first
+        let email_id: Option<i64> = conn.query_row(
+            "SELECT id FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 0",
+            params![normalized_id],
+            |row| row.get(0),
+        ).ok();
+        if let Some(eid) = email_id {
+            conn.execute("DELETE FROM attachments WHERE email_id = ?", params![eid])?;
         }
-        
-        conn.execute(&query, rusqlite::params_from_iter(params.iter()))?;
+
+        conn.execute(
+            "DELETE FROM emails WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ? AND is_draft = 0",
+            params![normalized_id],
+        )?;
         Ok(())
     }
 
@@ -2523,6 +2705,17 @@ impl Database {
         conn.execute(
             "UPDATE emails SET signature_valid = ? WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?",
             params![signature_valid, normalized_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update signature_source field for an email
+    pub fn update_signature_source(&self, message_id: &str, signature_source: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let normalized_id = Self::normalize_message_id(message_id);
+        conn.execute(
+            "UPDATE emails SET signature_source = ? WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?",
+            params![signature_source, normalized_id],
         )?;
         Ok(())
     }
@@ -2843,7 +3036,9 @@ mod tests {
             updated_at: None,
             created_at: now,
             signature_valid: None,
+            signature_source: None,
             transport_auth_verified: None,
+            subject_hash: None,
         }
     }
 
@@ -3076,14 +3271,49 @@ mod tests {
         e2.to_address = "inbox@example.com".to_string();
         db.save_email(&e2).unwrap();
 
-        // nostr_only = true
-        let nostr_only = db.get_emails(None, None, Some(true), None).unwrap();
+        // nostr_only = true (no user_pubkey: only encrypted emails)
+        let nostr_only = db.get_emails(None, None, Some(true), None, None).unwrap();
         assert_eq!(nostr_only.len(), 1);
         assert_eq!(nostr_only[0].message_id, "msg-e1@example.com");
 
-        // filter by user email
-        let by_email = db.get_emails(None, None, None, Some("inbox@example.com")).unwrap();
-        assert_eq!(by_email.len(), 2);
+        // nostr_only = None ("All Emails"): no filtering on nostr fields
+        let all = db.get_emails(None, None, None, Some("inbox@example.com"), None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Add a signed (non-encrypted) email
+        let mut e3 = make_email("msg-e3@example.com");
+        e3.is_nostr_encrypted = false;
+        e3.signature_valid = Some(true);
+        e3.to_address = "inbox@example.com".to_string();
+        db.save_email(&e3).unwrap();
+
+        // nostr_only = true should include signed emails
+        let nostr_filtered = db.get_emails(None, None, Some(true), Some("inbox@example.com"), None).unwrap();
+        assert_eq!(nostr_filtered.len(), 2); // e1 (encrypted) + e3 (signed)
+
+        // Add a contact and an email from that contact
+        let contact = make_contact("contact_pk_1");
+        db.save_contact(&contact).unwrap();
+        db.add_user_contact("my_pubkey", "contact_pk_1", true).unwrap();
+
+        let mut e4 = make_email("msg-e4@example.com");
+        e4.is_nostr_encrypted = false;
+        e4.signature_valid = None;
+        e4.sender_pubkey = Some("contact_pk_1".to_string());
+        e4.to_address = "inbox@example.com".to_string();
+        db.save_email(&e4).unwrap();
+
+        // nostr_only with user_pubkey should include contact's email
+        let with_contacts = db.get_emails(None, None, Some(true), Some("inbox@example.com"), Some("my_pubkey")).unwrap();
+        assert_eq!(with_contacts.len(), 3); // e1 (encrypted) + e3 (signed) + e4 (from contact)
+
+        // Without user_pubkey, contact email is not included
+        let without_contacts = db.get_emails(None, None, Some(true), Some("inbox@example.com"), None).unwrap();
+        assert_eq!(without_contacts.len(), 2); // e1 + e3 only
+
+        // "All Emails" shows everything
+        let all_emails = db.get_emails(None, None, None, Some("inbox@example.com"), None).unwrap();
+        assert_eq!(all_emails.len(), 4);
     }
 
     #[test]

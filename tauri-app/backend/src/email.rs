@@ -146,15 +146,19 @@ pub fn construct_email_headers(
     _nostr_npub: Option<&str>,
     message_id: Option<&str>,
     attachments: Option<&Vec<EmailAttachment>>,
+    html_body: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
 ) -> Result<String> {
     println!("[RUST] construct_email_headers: Constructing email headers");
     println!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
     
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
+        .reply_to(config.email_address.parse()?)
         .to(to_address.parse()?)
         .subject(subject);
-    
+
     // Add custom message ID if provided
     if let Some(msg_id) = message_id {
         println!("[RUST] construct_email_headers: Setting message ID: {}", msg_id);
@@ -167,7 +171,19 @@ pub fn construct_email_headers(
     } else {
         println!("[RUST] construct_email_headers: No message ID provided");
     }
-    
+
+    // Add In-Reply-To header if provided (for email threading)
+    if let Some(reply_id) = in_reply_to {
+        println!("[RUST] construct_email_headers: Setting In-Reply-To: {}", reply_id);
+        builder = builder.in_reply_to(reply_id.to_string());
+    }
+
+    // Add References header if provided (for email threading)
+    if let Some(refs) = references {
+        println!("[RUST] construct_email_headers: Setting References: {}", refs);
+        builder = builder.references(refs.to_string());
+    }
+
     // Add the sender's public key to the headers (not the receiver's)
     // This allows the receiver to derive the shared secret using their private key
     if let Some(private_key) = &config.private_key {
@@ -177,10 +193,11 @@ pub fn construct_email_headers(
                 println!("[RUST] construct_email_headers: Adding sender pubkey to headers: {}", sender_pubkey);
                 builder = builder.header(XNostrPubkey(sender_pubkey));
                 
-                // Sign the email body and add signature to headers
-                match crypto::sign_data(private_key, body) {
+                // Sign the binary ciphertext extracted from the body
+                let binary = extract_ciphertext_binary(body);
+                match crypto::sign_data_bytes(private_key, &binary) {
                     Ok(signature) => {
-                        println!("[RUST] construct_email_headers: Signing email body, signature length: {}", signature.len());
+                        println!("[RUST] construct_email_headers: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
                         builder = builder.header(XNostrSig(signature));
                     }
                     Err(e) => {
@@ -194,48 +211,73 @@ pub fn construct_email_headers(
         }
     }
     
+    // Build the text (and optional HTML) body part
+    let text_part = SinglePart::builder()
+        .header(ContentType::TEXT_PLAIN)
+        .body(body.to_string());
+
+    let body_part: Option<MultiPart> = if let Some(html) = html_body {
+        println!("[RUST] construct_email_headers: Building multipart/alternative with HTML body");
+        let html_part = SinglePart::builder()
+            .header(ContentType::TEXT_HTML)
+            .body(html.to_string());
+        Some(MultiPart::alternative()
+            .singlepart(text_part)
+            .singlepart(html_part))
+    } else {
+        None
+    };
+
     // Build email with or without attachments (for header construction)
     let email = if let Some(attachments) = attachments {
         if attachments.is_empty() {
-            // No attachments, simple text email
-            builder.body(body.to_string())?
+            if let Some(alt) = body_part {
+                builder.multipart(alt)?
+            } else {
+                builder.body(body.to_string())?
+            }
         } else {
             println!("[RUST] construct_email_headers: Building multipart email with {} attachments", attachments.len());
-            
-            // Create multipart email with text body and attachments
-            let mut multipart = MultiPart::mixed()
-                .singlepart(SinglePart::builder()
+
+            // Create multipart/mixed; nest alternative or plain text inside
+            let mut multipart = if let Some(alt) = body_part {
+                MultiPart::mixed().multipart(alt)
+            } else {
+                MultiPart::mixed().singlepart(SinglePart::builder()
                     .header(ContentType::TEXT_PLAIN)
-                    .body(body.to_string()));
-            
+                    .body(body.to_string()))
+            };
+
             // Add each attachment (for header construction, we don't need the actual data)
             for attachment in attachments {
                 println!("[RUST] construct_email_headers: Adding attachment header: {}", attachment.filename);
-                
+
                 // Parse content type
                 let content_type = attachment.content_type.parse::<ContentType>()
                     .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
-                
+
                 // Create attachment part with empty data for header construction
                 let attachment_part = Attachment::new(attachment.filename.clone())
                     .body(Vec::new(), content_type);
-                
+
                 multipart = multipart.singlepart(attachment_part);
             }
-            
+
             builder.multipart(multipart)?
         }
     } else {
-        // No attachments, simple text email
-        builder.body(body.to_string())?
+        if let Some(alt) = body_part {
+            builder.multipart(alt)?
+        } else {
+            builder.body(body.to_string())?
+        }
     };
     
     // Convert the email to a string to get the raw headers
     let email_bytes = email.formatted();
     let email_string = String::from_utf8(email_bytes)?;
     
-    println!("[RUST] construct_email_headers: Full email string:");
-    println!("{}", email_string);
+    println!("[RUST] construct_email_headers: Full email string length: {}", email_string.len());
     
     // Extract headers from the email string
     let lines: Vec<&str> = email_string.lines().collect();
@@ -281,6 +323,9 @@ pub async fn send_email(
     _nostr_npub: Option<&str>,
     message_id: Option<&str>,
     attachments: Option<&Vec<EmailAttachment>>,
+    html_body: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
 ) -> Result<String> {
     println!("[RUST] send_email: Starting email send process");
     println!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
@@ -289,15 +334,28 @@ pub async fn send_email(
     
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
+        .reply_to(config.email_address.parse()?)
         .to(to_address.parse()?)
         .subject(subject);
-    
+
     // Add custom message ID if provided
     if let Some(msg_id) = message_id {
         // Pass the message ID as Option<String> to the builder
         builder = builder.message_id(Some(msg_id.to_string()));
     }
-    
+
+    // Add In-Reply-To header if provided (for email threading)
+    if let Some(reply_id) = in_reply_to {
+        println!("[RUST] send_email: Setting In-Reply-To: {}", reply_id);
+        builder = builder.in_reply_to(reply_id.to_string());
+    }
+
+    // Add References header if provided (for email threading)
+    if let Some(refs) = references {
+        println!("[RUST] send_email: Setting References: {}", refs);
+        builder = builder.references(refs.to_string());
+    }
+
     // Add the sender's public key to the headers (not the receiver's)
     // This allows the receiver to derive the shared secret using their private key
     if let Some(private_key) = &config.private_key {
@@ -307,10 +365,19 @@ pub async fn send_email(
                 println!("[RUST] send_email: Adding sender pubkey to headers: {}", sender_pubkey);
                 builder = builder.header(XNostrPubkey(sender_pubkey));
                 
-                // Sign the email body and add signature to headers
-                match crypto::sign_data(private_key, body) {
+                // Sign the binary ciphertext extracted from the body
+                println!("[RUST] send_email: body passed to extract_ciphertext_binary ({} chars):\n{}", body.len(), &body[..body.len().min(500)]);
+                let binary = extract_ciphertext_binary(body);
+                let binary_hash = {
+                    use sha2::{Sha256, Digest};
+                    let mut h = Sha256::new();
+                    h.update(&binary);
+                    hex::encode(&h.finalize()[..8])
+                };
+                println!("[RUST] send_email: extracted binary {} bytes, sha256_prefix: {}", binary.len(), binary_hash);
+                match crypto::sign_data_bytes(private_key, &binary) {
                     Ok(signature) => {
-                        println!("[RUST] send_email: Signing email body, signature length: {}", signature.len());
+                        println!("[RUST] send_email: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
                         builder = builder.header(XNostrSig(signature));
                     }
                     Err(e) => {
@@ -324,24 +391,47 @@ pub async fn send_email(
         }
     }
     
+    // Build the text (and optional HTML) body part
+    let text_part = SinglePart::builder()
+        .header(ContentType::TEXT_PLAIN)
+        .body(body.to_string());
+
+    let body_part: Option<MultiPart> = if let Some(html) = html_body {
+        println!("[RUST] send_email: Building multipart/alternative with HTML body");
+        let html_part = SinglePart::builder()
+            .header(ContentType::TEXT_HTML)
+            .body(html.to_string());
+        Some(MultiPart::alternative()
+            .singlepart(text_part)
+            .singlepart(html_part))
+    } else {
+        None
+    };
+
     // Build email with or without attachments
     let email = if let Some(attachments) = attachments {
         if attachments.is_empty() {
-            // No attachments, simple text email
-            builder.body(body.to_string())?
+            if let Some(alt) = body_part {
+                builder.multipart(alt)?
+            } else {
+                builder.body(body.to_string())?
+            }
         } else {
             println!("[RUST] send_email: Building multipart email with {} attachments", attachments.len());
-            
-            // Create multipart email with text body and attachments
-            let mut multipart = MultiPart::mixed()
-                .singlepart(SinglePart::builder()
+
+            // Create multipart/mixed; nest alternative or plain text inside
+            let mut multipart = if let Some(alt) = body_part {
+                MultiPart::mixed().multipart(alt)
+            } else {
+                MultiPart::mixed().singlepart(SinglePart::builder()
                     .header(ContentType::TEXT_PLAIN)
-                    .body(body.to_string()));
-            
+                    .body(body.to_string()))
+            };
+
             // Add each attachment
             for attachment in attachments {
                 println!("[RUST] send_email: Adding attachment: {} ({})", attachment.filename, attachment.size);
-                
+
                 // Decode base64 data
                 let attachment_data = match general_purpose::STANDARD.decode(&attachment.data) {
                     Ok(data) => data,
@@ -350,23 +440,26 @@ pub async fn send_email(
                         continue;
                     }
                 };
-                
+
                 // Parse content type
                 let content_type = attachment.content_type.parse::<ContentType>()
                     .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
-                
+
                 // Create attachment part
                 let attachment_part = Attachment::new(attachment.filename.clone())
                     .body(attachment_data, content_type);
-                
+
                 multipart = multipart.singlepart(attachment_part);
             }
-            
+
             builder.multipart(multipart)?
         }
     } else {
-        // No attachments, simple text email
-        builder.body(body.to_string())?
+        if let Some(alt) = body_part {
+            builder.multipart(alt)?
+        } else {
+            builder.body(body.to_string())?
+        }
     };
 
     let creds = Credentials::new(config.email_address.clone(), config.password.clone());
@@ -438,42 +531,84 @@ pub async fn send_email(
 /// For Gmail, moves to [Gmail]/Trash
 /// For other providers, tries common trash folder names
 pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &str) -> Result<()> {
-    use std::net::TcpStream;
-    
-    let host = &config.imap_host;
+    let host = config.imap_host.clone();
     let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
     let use_tls = config.use_tls;
-    let addr = format!("{}:{}", host, port);
-    let is_gmail = host.contains("gmail.com");
-    
+    let message_id = message_id.to_string();
+
     println!("[RUST] delete_sent_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
-    
-    // Handle TLS and non-TLS connections separately due to type differences
-    // Use a block to ensure session is dropped/logged out properly
-    let result = if use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        
-        let result = delete_sent_email_from_session(&mut session, is_gmail, message_id).await;
-        // Close the session properly - ignore errors on logout
-        let _ = session.logout();
-        println!("[RUST] delete_sent_email_from_server: Session closed");
+
+    // Run all blocking IMAP I/O on a dedicated thread to avoid blocking the Tokio runtime
+    tokio::task::spawn_blocking(move || {
+        use std::net::TcpStream;
+        let addr = format!("{}:{}", host, port);
+        let is_gmail = host.contains("gmail.com");
+
+        let result = if use_tls {
+            let client = create_imap_tls_client!(&host, &addr)?;
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = delete_sent_email_from_session_sync(&mut session, is_gmail, &message_id);
+            let _ = session.logout();
+            println!("[RUST] delete_sent_email_from_server: Session closed");
+            result
+        } else {
+            let tcp_stream = TcpStream::connect(&addr)?;
+            let client = imap::Client::new(tcp_stream);
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = delete_sent_email_from_session_sync(&mut session, is_gmail, &message_id);
+            let _ = session.logout();
+            println!("[RUST] delete_sent_email_from_server: Session closed");
+            result
+        };
         result
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        
-        let result = delete_sent_email_from_session(&mut session, is_gmail, message_id).await;
-        // Close the session properly - ignore errors on logout
-        let _ = session.logout();
-        println!("[RUST] delete_sent_email_from_server: Session closed");
-        result
-    };
-    
-    result
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+/// Extract the text/plain body from a parsed email, recursing into multipart parts.
+/// Returns None if no text/plain part is found.
+fn extract_text_body(email: &mailparse::ParsedMail) -> Option<String> {
+    // If this part itself is text/plain, return it
+    if email.ctype.mimetype == "text/plain" && email.subparts.is_empty() {
+        return email.get_body().ok();
+    }
+    for subpart in email.subparts.iter() {
+        let ctype = &subpart.ctype;
+        if ctype.mimetype == "text/plain" {
+            return subpart.get_body().ok();
+        }
+        // Recurse into nested multipart
+        if ctype.mimetype.starts_with("multipart/") {
+            if let Some(text) = extract_text_body(subpart) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// Extract the text/html body from a parsed email (multipart/alternative).
+/// Returns None if no HTML part is found.
+fn extract_html_body(email: &mailparse::ParsedMail) -> Option<String> {
+    println!("[RUST] extract_html_body: top-level mimetype={}, subparts={}", email.ctype.mimetype, email.subparts.len());
+    for (i, subpart) in email.subparts.iter().enumerate() {
+        let ctype = &subpart.ctype;
+        println!("[RUST] extract_html_body: subpart[{}] mimetype={}", i, ctype.mimetype);
+        if ctype.mimetype == "text/html" {
+            let body = subpart.get_body().ok();
+            println!("[RUST] extract_html_body: found text/html, body length={}", body.as_ref().map(|b| b.len()).unwrap_or(0));
+            return body;
+        }
+        // Recurse into nested multipart
+        if ctype.mimetype.starts_with("multipart/") {
+            if let Some(html) = extract_html_body(subpart) {
+                return Some(html);
+            }
+        }
+    }
+    println!("[RUST] extract_html_body: no text/html found");
+    None
 }
 
 /// Helper function to ensure the nostr-mail folder exists on the IMAP server
@@ -572,7 +707,7 @@ fn move_email_to_nostr_folder(
 }
 
 /// Helper function to delete email from IMAP session (works with both TLS and non-TLS)
-async fn delete_sent_email_from_session(
+fn delete_sent_email_from_session_sync(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     is_gmail: bool,
     message_id: &str,
@@ -706,6 +841,128 @@ async fn delete_sent_email_from_session(
     }
 }
 
+/// Delete an inbox email from the IMAP server (move to trash).
+pub async fn delete_inbox_email_from_server(config: &EmailConfig, message_id: &str) -> Result<()> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+
+    println!("[RUST] delete_inbox_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
+
+    tokio::task::spawn_blocking(move || {
+        use std::net::TcpStream;
+        let addr = format!("{}:{}", host, port);
+        let is_gmail = host.contains("gmail.com");
+
+        let result = if use_tls {
+            let client = create_imap_tls_client!(&host, &addr)?;
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = delete_email_from_folder_sync(&mut session, is_gmail, &message_id, &["INBOX", "nostr-mail"]);
+            let _ = session.logout();
+            result
+        } else {
+            let tcp_stream = TcpStream::connect(&addr)?;
+            let client = imap::Client::new(tcp_stream);
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = delete_email_from_folder_sync(&mut session, is_gmail, &message_id, &["INBOX", "nostr-mail"]);
+            let _ = session.logout();
+            result
+        };
+        result
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+/// Delete an email from a specific IMAP folder by searching multiple folders in order.
+fn delete_email_from_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    is_gmail: bool,
+    message_id: &str,
+    source_folders: &[&str],
+) -> Result<()> {
+    // Try each source folder until we find and delete the email
+    let mut folder_selected = false;
+    for folder in source_folders {
+        println!("[RUST] delete_email_from_folder_sync: Trying folder: {}", folder);
+        if session.select(folder).is_ok() {
+            folder_selected = true;
+
+            // Search for the email by Message-ID
+            let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+            let full_msg_id = if normalized_msg_id.contains('@') {
+                format!("<{}>", normalized_msg_id)
+            } else {
+                format!("<{}@nostr-mail>", normalized_msg_id)
+            };
+
+            let search_queries = vec![
+                format!("HEADER Message-ID \"{}\"", full_msg_id),
+                format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+                format!("HEADER Message-ID \"{}\"", message_id.trim()),
+            ];
+
+            let mut matching_messages = std::collections::HashSet::new();
+            for search_query in &search_queries {
+                if let Ok(results) = session.search(search_query) {
+                    if !results.is_empty() {
+                        matching_messages.extend(results);
+                        println!("[RUST] delete_email_from_folder_sync: Found {} match(es) in {} with query: {}", matching_messages.len(), folder, search_query);
+                        break;
+                    }
+                }
+            }
+
+            if !matching_messages.is_empty() {
+                let message_seq = *matching_messages.iter().next().unwrap();
+                return move_to_trash(session, is_gmail, message_seq);
+            }
+        }
+    }
+
+    if !folder_selected {
+        return Err(anyhow::anyhow!("Could not select any source folder"));
+    }
+    Err(anyhow::anyhow!("Email not found on server"))
+}
+
+/// Move a message (by sequence number) to the trash folder.
+fn move_to_trash(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    is_gmail: bool,
+    message_seq: u32,
+) -> Result<()> {
+    let trash_folder = if is_gmail { "[Gmail]/Trash" } else { "Trash" };
+    let seq_str = format!("{}", message_seq);
+
+    println!("[RUST] move_to_trash: Moving message {} to {}", message_seq, trash_folder);
+
+    // Try MOVE first
+    if session.mv(&seq_str, trash_folder).is_ok() {
+        println!("[RUST] move_to_trash: Successfully moved via MOVE command");
+        return Ok(());
+    }
+
+    // Fallback: COPY + DELETE + EXPUNGE
+    let trash_folders = if is_gmail {
+        vec!["[Gmail]/Trash"]
+    } else {
+        vec!["Trash", "Deleted", "Deleted Items", "Junk"]
+    };
+
+    for folder in trash_folders {
+        if session.copy(&seq_str, folder).is_ok() {
+            session.store(&seq_str, "+FLAGS (\\Deleted)")?;
+            session.expunge()?;
+            println!("[RUST] move_to_trash: Successfully moved to {} via COPY", folder);
+            return Ok(());
+        }
+    }
+
+    Err(anyhow::anyhow!("Failed to move email to trash"))
+}
+
 /// List available IMAP folders/mailboxes
 pub async fn list_imap_folders(config: &EmailConfig) -> Result<Vec<String>> {
     let host = &config.imap_host;
@@ -813,9 +1070,10 @@ pub async fn fetch_emails(config: &EmailConfig, limit: usize, search_query: Opti
     }
     
     // After collecting all emails, filter for Nostr if needed (only for non-Gmail or when not using optimization)
+    // Accept emails with X-Nostr-Pubkey header OR a verified inline armor signature
     if only_nostr && !use_gmail_optimization {
         sorted_emails.retain(|email| {
-            email.raw_headers.contains("X-Nostr-Pubkey:")
+            email.sender_pubkey.is_some()
         });
     }
     
@@ -931,17 +1189,8 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     .unwrap_or_else(|_| Utc::now());
                 
                 // Extract body text - try multiple approaches
-                let body_text = if let Some(body_part) = email.subparts.first() {
-                    if let Ok(body_content) = body_part.get_body() {
-                        body_content
-                    } else {
-                        // Try to get the main body if subpart fails
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    }
-                } else {
-                    // No subparts, try to get the main body
-                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                };
+                let body_text = extract_text_body(&email)
+                    .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
 
                 println!("[RUST] Email {} - From: {}, Subject: {}, Body length: {}", 
                     email_id, from, subject, body_text.len());
@@ -976,19 +1225,10 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     (subject.clone(), body_text.clone())
                 };
 
-                let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                 
-                // Verify signature if present
-                let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                    if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                        Some(verify_email_signature(pubkey, &sig, &final_body))
-                    } else {
-                        None // No signature present
-                    }
-                } else {
-                    None // No pubkey, can't verify
-                };
-                
+                let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                 // Verify transport authentication
                 let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                     .unwrap_or_else(|e| TransportAuthVerdict {
@@ -996,13 +1236,13 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                         method: TransportAuthMethod::None,
                         reason: format!("Error verifying transport auth: {}", e),
                     });
-                
+
                 // Skip emails that fail transport authentication
                 if !transport_auth.transport_verified {
                     println!("[RUST] fetch_emails_from_session: Email {} failed transport authentication: {}", email_id, transport_auth.reason);
                     continue;
                 }
-                
+
                 let email_message = EmailMessage {
                     id: email_id.to_string(),
                     from,
@@ -1010,6 +1250,7 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     subject: final_subject,
                     body: final_body.clone(),
                     raw_body: final_body.clone(),
+                    html_body: None,
                     date,
                     is_read: true, // We'll assume all fetched emails are read for now
                     raw_headers: raw_headers.clone(),
@@ -1017,6 +1258,7 @@ fn fetch_emails_from_session(session: &mut imap::Session<impl std::io::Read + st
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     message_id: extract_message_id_from_headers(&raw_headers),
                     signature_valid,
+                    signature_source,
                     transport_auth_verified: Some(transport_auth.transport_verified),
                 };
 
@@ -1092,15 +1334,8 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                 if date < cutoff_with_buffer {
                     continue;
                 }
-                let body_text = if let Some(body_part) = email.subparts.first() {
-                    if let Ok(body_content) = body_part.get_body() {
-                        body_content
-                    } else {
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    }
-                } else {
-                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                };
+                let body_text = extract_text_body(&email)
+                    .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                 let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
                 // Check if this is a Nostr email and try to decrypt it
                 let (_final_subject, _final_body) = if raw_headers.contains("X-Nostr-Pubkey:") {
@@ -1127,19 +1362,10 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     (subject.clone(), body_text.clone())
                 };
                 
-                let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                 
-                // Verify signature if present - signature is created on the encrypted body, so verify against body_text
-                let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                    if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                        Some(verify_email_signature(pubkey, &sig, &body_text))
-                    } else {
-                        None // No signature present
-                    }
-                } else {
-                    None // No pubkey, can't verify
-                };
-                
+                let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                 // Verify transport authentication
                 let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                     .unwrap_or_else(|e| TransportAuthVerdict {
@@ -1147,13 +1373,13 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                         method: TransportAuthMethod::None,
                         reason: format!("Error verifying transport auth: {}", e),
                     });
-                
+
                 // Skip emails that fail transport authentication
                 if !transport_auth.transport_verified {
                     println!("[RUST] fetch_emails_from_session_last_24h: Email {} failed transport authentication: {}", _email_id, transport_auth.reason);
                     continue;
                 }
-                
+
                 let email_message = EmailMessage {
                     id: _email_id.to_string(),
                     from,
@@ -1161,6 +1387,7 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     subject: _final_subject,
                     body: _final_body.clone(),
                     raw_body: _final_body.clone(),
+                    html_body: None,
                     date,
                     is_read: true,
                     raw_headers: raw_headers.clone(),
@@ -1168,6 +1395,7 @@ fn fetch_emails_from_session_last_24h(session: &mut imap::Session<impl std::io::
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     message_id: extract_message_id_from_headers(&raw_headers),
                     signature_valid,
+                    signature_source,
                     transport_auth_verified: Some(transport_auth.transport_verified),
                 };
                 emails.push(email_message);
@@ -1362,40 +1590,25 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
         }
     };
     
-    // Use Gmail's date filtering in X-GM-RAW search to reduce server load
-    // IMPORTANT: Gmail interprets "after:YYYY/MM/DD" as midnight (00:00) Pacific Time, not UTC!
-    // To avoid timezone issues, we use Unix timestamps instead, which are timezone-independent
-    // Format: X-GM-RAW "content search AND after:unix_timestamp"
-    // Unix timestamps are in seconds since epoch (1970-01-01 00:00:00 UTC)
-    let date_filter = if latest.is_some() {
-        // Convert cutoff timestamp to Unix timestamp (seconds)
-        let unix_timestamp = cutoff.timestamp();
-        // Subtract a small buffer (1 hour) to account for any timing edge cases
-        let search_timestamp = unix_timestamp - 3600;
-        println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Filtering for emails after: {} (using Unix timestamp: {} to avoid timezone issues)", cutoff, search_timestamp);
-        format!(" AND after:{}", search_timestamp)
+    // Build IMAP SINCE date filter
+    let cutoff_with_buffer = cutoff - chrono::Duration::hours(1);
+    let since_filter = if latest.is_some() {
+        let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+        println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Filtering for emails after: {} (SINCE {})", cutoff, since_date);
+        format!(" SINCE {}", since_date)
     } else {
         String::new()
     };
-    
-    // Use more specific search terms with date filtering to avoid fetching old emails
-    // Try multiple search strategies to catch all Nostr emails:
-    let mut search_terms = vec![
-        format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
-        format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
+
+    // Search strategies:
+    // 1. IMAP TEXT searches all MIME parts (headers + body), so it finds ASCII armor in text/plain
+    // 2. IMAP HEADER search for the X-Nostr-Pubkey custom header
+    let search_terms = vec![
+        // Primary: standard IMAP TEXT search finds ASCII armor in text/plain part
+        format!("TEXT \"BEGIN NOSTR\"{}", since_filter),
+        // Standard IMAP HEADER search for custom header
+        format!("HEADER X-Nostr-Pubkey \"\"{}", since_filter),
     ];
-    
-    // Add header searches - try multiple approaches
-    if !date_filter.is_empty() {
-        // With date filter, try different header search syntaxes
-        search_terms.push(format!("X-GM-RAW \"has:X-Nostr-Pubkey{}\"", date_filter));
-        // Also search for "npub" which is in the header value - this might be more reliable
-        search_terms.push(format!("X-GM-RAW \"npub{}\"", date_filter));
-    } else {
-        // Without date filter
-        search_terms.push("X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string());
-        search_terms.push("X-GM-RAW \"npub\"".to_string());
-    }
     
     let mut all_message_numbers: HashSet<u32> = HashSet::new();
     
@@ -1424,12 +1637,10 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
         if days_since_latest <= 7 {
             println!("[RUST] fetch_nostr_emails_from_gmail_optimized: No results with date filter, trying without date filter (latest was {} days ago)", days_since_latest);
             let fallback_search_terms = vec![
-                "X-GM-RAW \"BEGIN NOSTR NIP-\"".to_string(),
-                "X-GM-RAW \"END NOSTR NIP-\"".to_string(),
-                "X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string(),
-                "X-GM-RAW \"npub\"".to_string(),
+                "TEXT \"BEGIN NOSTR\"".to_string(),
+                "HEADER X-Nostr-Pubkey \"\"".to_string(),
             ];
-            
+
             let mut fallback_message_numbers: HashSet<u32> = HashSet::new();
             for search_term in fallback_search_terms {
                 match session.search(&search_term) {
@@ -1463,8 +1674,6 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
     // Store parsed emails with attachments for later use (keyed by message_id)
     let mut emails_with_attachments: Vec<(String, Vec<crate::database::Attachment>)> = Vec::new();
     
-    println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Filtering for emails after: {}", cutoff);
-    
     for (idx, message) in messages.iter().enumerate() {
         email_id += 1;
         // Get the actual message sequence number from message_numbers
@@ -1480,25 +1689,8 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
                 
-                println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Processing email {} - From: {}, Subject: {}, Date: {}", 
-                    email_id, from, subject, date);
-                
-                // Only keep emails after the cutoff (use <= to include emails on the exact cutoff timestamp)
-                if date <= cutoff {
-                    println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} is too old ({} <= {}), skipping", 
-                        email_id, date, cutoff);
-                    continue;
-                }
-                
-                let body_text = if let Some(body_part) = email.subparts.first() {
-                    if let Ok(body_content) = body_part.get_body() {
-                        body_content
-                    } else {
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    }
-                } else {
-                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                };
+                let body_text = extract_text_body(&email)
+                    .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                 
                 let raw_headers = email.headers.iter()
                     .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
@@ -1507,17 +1699,20 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                 
                 // Check for Nostr indicators
                 let has_nostr_header = raw_headers.contains("X-Nostr-Pubkey:");
-                // Check for both NIP-04 and NIP-44 encrypted message markers
-                // Require BOTH begin and end markers to avoid false positives
+                // Check for both legacy and new format armor markers
+                // Legacy: BEGIN NOSTR NIP-XX ENCRYPTED MESSAGE / END NOSTR NIP-XX ENCRYPTED MESSAGE
+                // New: BEGIN NOSTR NIP-XX ENCRYPTED BODY / END NOSTR MESSAGE
                 let has_nip04_begin = body_text.contains("BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE");
                 let has_nip04_end = body_text.contains("END NOSTR NIP-04 ENCRYPTED MESSAGE");
                 let has_nip44_begin = body_text.contains("BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE");
                 let has_nip44_end = body_text.contains("END NOSTR NIP-44 ENCRYPTED MESSAGE");
-                let has_encrypted_content = (has_nip04_begin && has_nip04_end) || (has_nip44_begin && has_nip44_end);
-                
-                println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} - Has Nostr header: {}, Has encrypted content (with both markers): {}", 
+                let has_nip04_body = body_text.contains("BEGIN NOSTR NIP-04 ENCRYPTED BODY");
+                let has_nip44_body = body_text.contains("BEGIN NOSTR NIP-44 ENCRYPTED BODY");
+                let has_encrypted_content = (has_nip04_begin && has_nip04_end) || (has_nip44_begin && has_nip44_end) || has_nip04_body || has_nip44_body;
+
+                println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} - Has Nostr header: {}, Has encrypted content (with both markers): {}",
                     email_id, has_nostr_header, has_encrypted_content);
-                
+
                 // Accept if it has the header OR has both begin and end encrypted content markers
                 let is_nostr_email = has_nostr_header || has_encrypted_content;
                 
@@ -1585,19 +1780,10 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         }
                     };
                     
-                    let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                    let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                     
-                    // Verify signature if present
-                    let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                        if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                            Some(verify_email_signature(pubkey, &sig, &body_text))
-                        } else {
-                            None // No signature present
-                        }
-                    } else {
-                        None // No pubkey, can't verify
-                    };
-                    
+                    let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                     // Verify transport authentication
                     let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                         .unwrap_or_else(|e| TransportAuthVerdict {
@@ -1605,13 +1791,14 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                             method: TransportAuthMethod::None,
                             reason: format!("Error verifying transport auth: {}", e),
                         });
-                    
+
                     // Skip emails that fail transport authentication
                     if !transport_auth.transport_verified {
                         println!("[RUST] fetch_nostr_emails_from_gmail_optimized: Email {} failed transport authentication: {}", email_id, transport_auth.reason);
                         continue;
                     }
-                    
+
+                    let html_body = extract_html_body(&email);
                     let email_message = EmailMessage {
                         id: email_id.to_string(),
                         from,
@@ -1619,6 +1806,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         subject,
                         body: body_text.clone(),
                         raw_body: body_text.clone(),
+                        html_body,
                         date,
                         is_read: true,
                         raw_headers: raw_headers.clone(),
@@ -1626,6 +1814,7 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
                         recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                         message_id: Some(message_id),
                         signature_valid,
+                        signature_source,
                         transport_auth_verified: Some(transport_auth.transport_verified),
                     };
                     emails.push(email_message);
@@ -1645,133 +1834,143 @@ fn fetch_nostr_emails_from_gmail_optimized(session: &mut imap::Session<impl std:
     Ok((emails, emails_with_attachments))
 }
 
-fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::io::Read + std::io::Write>, config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>) -> Result<(Vec<EmailMessage>, Vec<(String, Vec<crate::database::Attachment>)>)> {
+fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::io::Read + std::io::Write>, config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>, sent_folder: &str) -> Result<(Vec<EmailMessage>, Vec<(String, Vec<crate::database::Attachment>)>)> {
     use chrono::Utc;
-    
+
     // Try to select the sent folder
-    let sent_folder = "[Gmail]/Sent Mail";
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Selecting sent folder: {}", sent_folder);
-    session.select(sent_folder)?;
+    let mailbox = session.select(sent_folder)?;
+    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Mailbox has {} messages", mailbox.exists);
     
     // Calculate cutoff date for filtering
-    // If latest is provided, use it directly; otherwise search all emails
-    let cutoff = latest.unwrap_or_else(|| Utc::now() - chrono::Duration::days(365 * 5));
-    
-    // Use Gmail's date filtering in X-GM-RAW search to reduce server load
-    // IMPORTANT: Gmail interprets "after:YYYY/MM/DD" as midnight (00:00) Pacific Time, not UTC!
-    // To avoid timezone issues, we use Unix timestamps instead, which are timezone-independent
-    // Format: X-GM-RAW "content search AND after:unix_timestamp"
-    // Unix timestamps are in seconds since epoch (1970-01-01 00:00:00 UTC)
-    let date_filter = if latest.is_some() {
-        // Convert cutoff timestamp to Unix timestamp (seconds)
-        let unix_timestamp = cutoff.timestamp();
-        // Subtract a small buffer (1 hour) to account for any timing edge cases
-        let search_timestamp = unix_timestamp - 3600;
-        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for emails after: {} (using Unix timestamp: {} to avoid timezone issues)", cutoff, search_timestamp);
-        format!(" AND after:{}", search_timestamp)
+    // If latest is provided, use it directly; otherwise look back 30 days
+    let cutoff = latest.unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
+    let cutoff_with_buffer = cutoff - chrono::Duration::hours(1);
+
+    // Use SINCE date search to get candidates, then filter client-side for nostr content.
+    // Gmail's IMAP TEXT search is broken in [Gmail]/Sent Mail, so we skip it entirely.
+    let search_criteria = if latest.is_some() {
+        let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Searching SINCE {}", since_date);
+        format!("ALL SINCE {}", since_date)
     } else {
-        String::new()
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: First sync, searching all (30-day lookback)");
+        "ALL".to_string()
     };
-    
-    // Use more specific search terms with date filtering to avoid fetching old emails
-    // Gmail X-GM-RAW syntax supports various search operators
-    // Try multiple search strategies to catch all Nostr emails:
-    // 1. Search body content for encrypted message markers (partial match should work)
-    // 2. Search for header using has: operator (Gmail-specific)
-    // 3. Search for "npub" which appears in X-Nostr-Pubkey header values
-    let mut search_terms = vec![
-        format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
-        format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
-    ];
-    
-    // Add header searches - try multiple approaches
-    if !date_filter.is_empty() {
-        // With date filter, try different header search syntaxes
-        // Note: Gmail's has: operator searches for header existence
-        search_terms.push(format!("X-GM-RAW \"has:X-Nostr-Pubkey{}\"", date_filter));
-        // Also search for "npub" which is in the header value - this might be more reliable
-        search_terms.push(format!("X-GM-RAW \"npub{}\"", date_filter));
-    } else {
-        // Without date filter
-        search_terms.push("X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string());
-        search_terms.push("X-GM-RAW \"npub\"".to_string());
-    }
-    
-    let mut all_message_numbers: HashSet<u32> = HashSet::new();
-    
-    // Search with each term and collect results
-    for search_term in search_terms {
-        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Searching with: {}", search_term);
-        match session.search(&search_term) {
-            Ok(messages) => {
-                let count = messages.len();
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Found {} messages with search '{}'", count, search_term);
-                all_message_numbers.extend(messages.iter().cloned());
+
+    let mut message_numbers: Vec<u32> = Vec::new();
+    match session.search(&search_criteria) {
+        Ok(candidates) => {
+            let mut candidate_numbers: Vec<u32> = candidates.iter().cloned().collect();
+            // Safety cap: take only the most recent 500 if too many
+            if candidate_numbers.len() > 500 {
+                candidate_numbers.sort();
+                candidate_numbers = candidate_numbers[candidate_numbers.len() - 500..].to_vec();
             }
-            Err(e) => {
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Search '{}' failed: {}", search_term, e);
-            }
-        }
-    }
-    
-    let mut message_numbers: Vec<u32> = all_message_numbers.into_iter().collect();
-    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Total unique sent messages to fetch: {}", message_numbers.len());
-    
-    // If no results and we have a latest date that's recent (within last 7 days), try searching without date filter
-    // This handles cases where Gmail's date filtering might be too strict
-    if message_numbers.is_empty() && latest.is_some() {
-        let days_since_latest = Utc::now().signed_duration_since(cutoff).num_days();
-        if days_since_latest <= 7 {
-            println!("[RUST] fetch_sent_emails_from_gmail_optimized: No results with date filter, trying without date filter (latest was {} days ago)", days_since_latest);
-            let fallback_search_terms = vec![
-                "X-GM-RAW \"BEGIN NOSTR NIP-\"".to_string(),
-                "X-GM-RAW \"END NOSTR NIP-\"".to_string(),
-                "X-GM-RAW \"has:X-Nostr-Pubkey\"".to_string(),
-                "X-GM-RAW \"npub\"".to_string(), // Search for npub in header values
-            ];
-            
-            let mut fallback_message_numbers: HashSet<u32> = HashSet::new();
-            for search_term in fallback_search_terms {
-                match session.search(&search_term) {
-                    Ok(messages) => {
-                        let count = messages.len();
-                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fallback search '{}' found {} messages", search_term, count);
-                        fallback_message_numbers.extend(messages.iter().cloned());
+            println!("[RUST] fetch_sent_emails_from_gmail_optimized: SINCE search returned {} candidates", candidate_numbers.len());
+
+            // Two-phase fetch: check body text first, then fetch full RFC822 only for matches
+            if !candidate_numbers.is_empty() {
+                let range = candidate_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+                match session.fetch(&range, "(BODY.PEEK[TEXT] UID)") {
+                    Ok(fetched) => {
+                        for msg in fetched.iter() {
+                            if let Some(text_section) = msg.text() {
+                                let text_str = String::from_utf8_lossy(text_section);
+                                if text_str.contains("BEGIN NOSTR") {
+                                    let seq = msg.message;
+                                    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Found nostr email at seq {}", seq);
+                                    message_numbers.push(seq);
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
-                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fallback search '{}' failed: {}", search_term, e);
+                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Body text fetch failed: {}", e);
                     }
                 }
             }
-            message_numbers = fallback_message_numbers.into_iter().collect();
-            println!("[RUST] fetch_sent_emails_from_gmail_optimized: Fallback search found {} total messages", message_numbers.len());
+            println!("[RUST] fetch_sent_emails_from_gmail_optimized: Client-side filter matched {} nostr emails", message_numbers.len());
+        }
+        Err(e) => {
+            println!("[RUST] fetch_sent_emails_from_gmail_optimized: SINCE search failed: {}", e);
         }
     }
-    
-    if message_numbers.is_empty() {
+
+    // Also search the nostr-mail folder for previously-moved sent emails
+    let mut nostr_folder_messages_raw: Vec<Vec<u8>> = Vec::new();
+    if let Ok(_) = session.select("nostr-mail") {
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Searching nostr-mail folder for sent emails");
+        let nostr_search = if latest.is_some() {
+            let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+            format!("SINCE {} FROM \"{}\"", since_date, config.email_address)
+        } else {
+            format!("FROM \"{}\"", config.email_address)
+        };
+        match session.search(&nostr_search) {
+            Ok(msgs) => {
+                let msg_numbers: Vec<u32> = msgs.iter().cloned().collect();
+                println!("[RUST] fetch_sent_emails_from_gmail_optimized: nostr-mail folder SINCE+FROM found {} candidates", msg_numbers.len());
+                if !msg_numbers.is_empty() {
+                    let range = msg_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+                    if let Ok(fetched) = session.fetch(&range, "RFC822") {
+                        for msg in fetched.iter() {
+                            if let Some(body) = msg.body() {
+                                let body_str = String::from_utf8_lossy(body);
+                                if body_str.contains("BEGIN NOSTR") {
+                                    nostr_folder_messages_raw.push(body.to_vec());
+                                }
+                            }
+                        }
+                        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Matched {} nostr emails from nostr-mail folder", nostr_folder_messages_raw.len());
+                    }
+                }
+            }
+            Err(e) => {
+                println!("[RUST] fetch_sent_emails_from_gmail_optimized: nostr-mail folder search failed: {}", e);
+            }
+        }
+        // Re-select sent folder for any remaining operations
+        let _ = session.select(sent_folder);
+    }
+
+    if message_numbers.is_empty() && nostr_folder_messages_raw.is_empty() {
         println!("[RUST] fetch_sent_emails_from_gmail_optimized: No sent messages found, returning empty result");
         return Ok((vec![], vec![]));
     }
-    
-    // Fetch all matching messages
-    let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
-    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Successfully fetched {} sent message objects", messages.len());
+
+    // Fetch all matching messages from sent folder
+    let mut all_message_bodies: Vec<(Vec<u8>, Option<u32>)> = Vec::new();
+    if !message_numbers.is_empty() {
+        let messages = session.fetch(message_numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","), "RFC822")?;
+        println!("[RUST] fetch_sent_emails_from_gmail_optimized: Successfully fetched {} sent message objects", messages.len());
+        for (idx, message) in messages.iter().enumerate() {
+            if let Some(body) = message.body() {
+                let seq = message_numbers.get(idx).copied();
+                all_message_bodies.push((body.to_vec(), seq));
+            }
+        }
+    }
+    // Add nostr-mail folder messages (no sequence number since we don't need to move them)
+    for raw in nostr_folder_messages_raw {
+        all_message_bodies.push((raw, None));
+    }
     
     let mut emails = Vec::new();
     let mut email_id = 0;
     
     // Filter for emails after the cutoff timestamp (client-side filtering since Gmail only supports dates)
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Filtering for sent emails after: {}", cutoff);
-    
+
     // Store parsed emails with attachments for later use (keyed by message_id)
     let mut emails_with_attachments: Vec<(String, Vec<crate::database::Attachment>)> = Vec::new();
-    
-    for (idx, message) in messages.iter().enumerate() {
+
+    for (body_bytes, seq_num) in &all_message_bodies {
         email_id += 1;
-        // Get the actual message sequence number from message_numbers
-        let message_seq = message_numbers.get(idx).copied().unwrap_or(0);
-        if let Some(body) = message.body() {
-            if let Ok(email) = parse_mail(body) {
+        // seq_num is Some for sent folder messages (can be moved), None for nostr-mail folder messages (already moved)
+        let message_seq = seq_num.unwrap_or(0);
+        {
+            if let Ok(email) = parse_mail(body_bytes) {
                 let from = email.headers.get_first_value("From").unwrap_or_else(|| "Unknown".to_string());
                 let to = email.headers.get_first_value("To").unwrap_or_else(|| config.email_address.clone());
                 let subject_raw = email.headers.get_first_value("Subject").unwrap_or_else(|| "No Subject".to_string());
@@ -1781,25 +1980,8 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
                 
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Processing sent email {} - From: {}, Subject (raw): {:?}, Subject (decoded): {}, Date: {}", 
-                    email_id, from, subject_raw, subject, date);
-                
-                // Only keep emails after the cutoff timestamp (strict comparison)
-                if date <= cutoff {
-                    println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} is not newer than cutoff ({} <= {}), skipping", 
-                        email_id, date, cutoff);
-                    continue;
-                }
-                
-                let body_text = if let Some(body_part) = email.subparts.first() {
-                    if let Ok(body_content) = body_part.get_body() {
-                        body_content
-                    } else {
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    }
-                } else {
-                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                };
+                let body_text = extract_text_body(&email)
+                    .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                 
                 let raw_headers = email.headers.iter()
                     .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
@@ -1808,17 +1990,18 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                 
                 // Check for Nostr indicators
                 let has_nostr_header = raw_headers.contains("X-Nostr-Pubkey:");
-                // Check for both NIP-04 and NIP-44 encrypted message markers
-                // Require BOTH begin and end markers to avoid false positives
+                // Check for both legacy and new format armor markers
                 let has_nip04_begin = body_text.contains("BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE");
                 let has_nip04_end = body_text.contains("END NOSTR NIP-04 ENCRYPTED MESSAGE");
                 let has_nip44_begin = body_text.contains("BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE");
                 let has_nip44_end = body_text.contains("END NOSTR NIP-44 ENCRYPTED MESSAGE");
-                let has_encrypted_content = (has_nip04_begin && has_nip04_end) || (has_nip44_begin && has_nip44_end);
-                
-                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} - Has Nostr header: {}, Has encrypted content (with both markers): {}", 
+                let has_nip04_body = body_text.contains("BEGIN NOSTR NIP-04 ENCRYPTED BODY");
+                let has_nip44_body = body_text.contains("BEGIN NOSTR NIP-44 ENCRYPTED BODY");
+                let has_encrypted_content = (has_nip04_begin && has_nip04_end) || (has_nip44_begin && has_nip44_end) || has_nip04_body || has_nip44_body;
+
+                println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} - Has Nostr header: {}, Has encrypted content (with both markers): {}",
                     email_id, has_nostr_header, has_encrypted_content);
-                
+
                 // Accept if it has the header OR has both begin and end encrypted content markers
                 let is_nostr_email = has_nostr_header || has_encrypted_content;
                 
@@ -1826,8 +2009,8 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent email {} is confirmed as Nostr email", email_id);
                     
                     // Move email to nostr-mail folder before processing
-                    // Note: We're in the sent folder context, so we need to ensure we're still there
-                    if message_seq > 0 {
+                    // Only move if from sent folder (seq_num is Some), skip if already in nostr-mail
+                    if seq_num.is_some() && message_seq > 0 {
                         let sent_folder = "[Gmail]/Sent Mail";
                         if let Err(e) = move_email_to_nostr_folder(session, message_seq, true, sent_folder) {
                             println!("[RUST] fetch_sent_emails_from_gmail_optimized: Failed to move email {} (seq {}) to nostr-mail folder: {}, continuing", email_id, message_seq, e);
@@ -1880,19 +2063,11 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                     // Just save the encrypted content as-is.
                     let (_final_subject, _final_body) = (subject.clone(), body_text.clone());
                     
-                    let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                    let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                     
-                    // Verify signature if present
-                    let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                        if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                            Some(verify_email_signature(pubkey, &sig, &body_text))
-                        } else {
-                            None // No signature present
-                        }
-                    } else {
-                        None // No pubkey, can't verify
-                    };
-                    
+                    let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
+                    let html_body = extract_html_body(&email);
                     let email_message = EmailMessage {
                         id: email_id.to_string(),
                         from,
@@ -1900,6 +2075,7 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                         subject,
                         body: body_text.clone(),
                         raw_body: body_text.clone(),
+                        html_body,
                         date,
                         is_read: true,
                         raw_headers: raw_headers.clone(),
@@ -1907,6 +2083,7 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
                         recipient_pubkey: None, // Will be populated during sync if contact exists
                         message_id: extract_message_id_from_headers(&raw_headers),
                         signature_valid,
+                        signature_source,
                         transport_auth_verified: None, // Sent emails don't have transport auth verification
                     };
                     
@@ -1921,11 +2098,9 @@ fn fetch_sent_emails_from_gmail_optimized(session: &mut imap::Session<impl std::
             } else {
                 println!("[RUST] fetch_sent_emails_from_gmail_optimized: Failed to parse sent email {}", email_id);
             }
-        } else {
-            println!("[RUST] fetch_sent_emails_from_gmail_optimized: Sent message {} has no body", email_id);
         }
     }
-    
+
     // Don't logout here - let the caller handle session cleanup
     // session.logout()?;
     println!("[RUST] fetch_sent_emails_from_gmail_optimized: Successfully processed {} sent Nostr emails with {} attachment sets", emails.len(), emails_with_attachments.len());
@@ -1952,12 +2127,8 @@ fn extract_attachments_from_parsed_email(email: &mailparse::ParsedMail, body_tex
         }
     }
     
-    println!("[RUST] extract_attachments_from_parsed_email: Checking email with {} subparts, manifest_encrypted: {}", email.subparts.len(), is_manifest_encrypted);
-    
     // Recursively extract attachments from all subparts
     extract_attachments_recursive(email, &mut attachments, is_manifest_encrypted, 0);
-    
-    println!("[RUST] extract_attachments_from_parsed_email: Extracted {} total attachments", attachments.len());
     
     attachments
 }
@@ -1972,40 +2143,31 @@ fn extract_attachments_recursive(
     use base64::{Engine as _, engine::general_purpose};
     use chrono::Utc;
     
-    let indent = "  ".repeat(depth);
-    println!("{}[RUST] Checking part at depth {}: {} subparts", indent, depth, part.subparts.len());
-    
     // Check Content-Type of this part
     let content_type = part.headers.get_first_value("Content-Type").unwrap_or_default();
     let content_disposition = part.headers.get_first_value("Content-Disposition").unwrap_or_default();
-    
-    println!("{}[RUST] Part Content-Type: {}, Content-Disposition: {}", indent, content_type, content_disposition);
-    
+
     // Check if this part itself is an attachment
-    let is_attachment = content_disposition.to_lowercase().contains("attachment") || 
+    let is_attachment = content_disposition.to_lowercase().contains("attachment") ||
                        content_disposition.to_lowercase().contains("filename");
-    
+
     let is_multipart = content_type.to_lowercase().starts_with("multipart/");
     let is_text = content_type.to_lowercase().starts_with("text/");
-    
+
     // If this is a multipart container, recurse into subparts
     if is_multipart {
-        println!("{}[RUST] Part is multipart, recursing into {} subparts", indent, part.subparts.len());
         for (_idx, subpart) in part.subparts.iter().enumerate() {
             extract_attachments_recursive(subpart, attachments, is_manifest_encrypted, depth + 1);
         }
     } else if is_attachment || (!is_text && !content_type.is_empty()) {
         // This part is an attachment (has Content-Disposition: attachment or is non-text)
-        println!("{}[RUST] Part looks like attachment: is_attachment={}, is_text={}, content_type={}", 
-            indent, is_attachment, is_text, content_type);
-        
+
         // Extract filename from Content-Disposition or Content-Type
         let filename = extract_filename_from_headers(&content_disposition, &content_type)
             .unwrap_or_else(|| format!("attachment_{}.dat", attachments.len()));
-        
+
         // Get attachment data
         if let Ok(attachment_data) = part.get_body_raw() {
-            println!("{}[RUST] Extracting attachment: {} ({} bytes)", indent, filename, attachment_data.len());
             
             // Encode as base64 for storage
             let data_base64 = general_purpose::STANDARD.encode(&attachment_data);
@@ -2027,13 +2189,8 @@ fn extract_attachments_recursive(
             };
             
             attachments.push(db_attachment);
-            println!("{}[RUST] Successfully extracted attachment: {} ({} bytes, encrypted: {})", 
-                indent, filename, attachment_data.len(), is_manifest_encrypted);
-        } else {
-            println!("{}[RUST] Failed to get attachment data for {}", indent, filename);
+            println!("[RUST] Extracted attachment: {} ({} bytes)", filename, attachment_data.len());
         }
-    } else {
-        println!("{}[RUST] Part is not an attachment (text or empty), skipping", indent);
     }
 }
 
@@ -2085,6 +2242,33 @@ pub fn extract_nostr_pubkey_from_headers(raw_headers: &str) -> Option<String> {
     None
 }
 
+/// Extract sender pubkey from headers, falling back to the outermost armor
+/// signature block's pubkey when the `X-Nostr-Pubkey` header is absent.
+/// The armor pubkey is only used if its inline signature verifies successfully,
+/// and is converted from hex to npub (bech32) to match the header format.
+pub fn extract_sender_pubkey_with_armor_fallback(raw_headers: &str, body_text: &str) -> Option<String> {
+    if let Some(pk) = extract_nostr_pubkey_from_headers(raw_headers) {
+        return Some(pk);
+    }
+    // No header — try the outermost armor signature block
+    if let Some(parsed) = parse_armor_components(body_text) {
+        if let (Some(sig_hex), Some(pubkey_hex)) = (&parsed.signature_hex, &parsed.sig_pubkey_hex) {
+            // Verify the signature before trusting this pubkey
+            let binary = extract_ciphertext_binary(body_text);
+            if let Ok(true) = crate::crypto::verify_signature_bytes(pubkey_hex, sig_hex, &binary) {
+                // Convert hex pubkey to npub bech32
+                if let Ok(pk) = nostr_sdk::prelude::PublicKey::from_hex(pubkey_hex) {
+                    // to_bech32 is infallible for PublicKey
+                    let npub = nostr_sdk::prelude::ToBech32::to_bech32(&pk).expect("bech32 encode");
+                    println!("[RUST] extract_sender_pubkey_with_armor_fallback: using verified armor pubkey {} ({})", &npub[..std::cmp::min(npub.len(), 20)], &pubkey_hex[..std::cmp::min(pubkey_hex.len(), 16)]);
+                    return Some(npub);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn extract_nostr_sig_from_headers(raw_headers: &str) -> Option<String> {
     for line in raw_headers.lines() {
         if line.to_lowercase().starts_with("x-nostr-sig:") {
@@ -2094,38 +2278,1656 @@ pub fn extract_nostr_sig_from_headers(raw_headers: &str) -> Option<String> {
     None
 }
 
-/// Normalize email body for signature verification
-/// This ensures the body matches what was signed, handling:
-/// - Line ending differences (\r\n vs \n)
-/// - Trailing whitespace
-fn normalize_body_for_verification(body: &str) -> String {
-    // Replace \r\n with \n to normalize line endings
-    let normalized = body.replace("\r\n", "\n");
-    // Remove trailing whitespace from each line (but preserve structure)
-    normalized.lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Extract the body content from an ASCII-armored email.
+/// Finds the content between the BEGIN ENCRYPTED line and the next armor boundary
+/// (END, SIGNATURE, or SEAL marker). Returns None if no armor is found.
+/// Find the offset of `marker` in `text` where it appears on a non-quoted line.
+/// A non-quoted line is one where the "-----" prefix starts at the beginning of the line,
+/// not after a ">" quote prefix. This skips markers inside nested quoted replies.
+#[allow(dead_code)]
+fn find_unquoted_marker(text: &str, marker: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(pos) = text[search_from..].find(marker) {
+        let abs_pos = search_from + pos;
+        // Walk back from the marker to find the start of this line
+        let line_start = text[..abs_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prefix = text[line_start..abs_pos].trim_start();
+        // Non-quoted: line prefix should be only dashes (e.g. "-----"), not "> -----"
+        if !prefix.starts_with('>') {
+            return Some(abs_pos);
+        }
+        search_from = abs_pos + marker.len();
+    }
+    None
 }
 
-/// Verify email signature
+#[allow(dead_code)]
+fn extract_armor_body_content(body: &str) -> Option<&str> {
+    // Find the BEGIN line (encrypted or signed plaintext)
+    let begin_idx = body.find("BEGIN NOSTR NIP-")
+        .or_else(|| body.find("BEGIN NOSTR SIGNED"))?;
+    // Find the end of that line (first newline after BEGIN)
+    let line_end = body[begin_idx..].find('\n').map(|i| begin_idx + i + 1)?;
+
+    // Content ends at the next non-quoted armor marker line.
+    // Skip quoted markers like "> ----- BEGIN NOSTR SIGNATURE -----" in nested replies;
+    // only match markers where "-----" starts at the beginning of a line (no ">" prefix).
+    let content_region = &body[line_end..];
+    let content_end = find_unquoted_marker(content_region, "BEGIN NOSTR SIGNATURE")
+        .or_else(|| find_unquoted_marker(content_region, "BEGIN NOSTR SEAL"))
+        .or_else(|| find_unquoted_marker(content_region, "END NOSTR"))
+        .unwrap_or(content_region.len());
+
+    // Walk back past the dash prefix on the marker line (e.g. "----- BEGIN...")
+    let end_abs = line_end + content_end;
+    let trimmed_end = body[line_end..end_abs].trim_end().len() + line_end;
+    // Strip trailing dashes from the content (the "-----" prefix of the next marker line)
+    let content = body[line_end..trimmed_end].trim_end_matches('-').trim();
+
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+/// Try to decode glossia-encoded text (BIP39/Latin words) back to binary bytes.
+/// Returns None if the text doesn't appear to be glossia-encoded or decode fails.
+/// Uses catch_unwind because glossia's codec can panic on malformed input
+/// (e.g. partial wordlist matches with bad padding).
+fn try_glossia_decode_to_bytes(text: &str) -> Option<Vec<u8>> {
+    let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.is_empty() {
+        return None;
+    }
+    let best = glossia::detect_dialect_best(&words)?;
+    if best.hit_rate < 0.3 {
+        return None;
+    }
+    let text_owned = text.to_string();
+    let language = best.language.clone();
+    let wordlist = best.wordlist.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        glossia::decode_from_language(&text_owned, &language, &wordlist, false)
+    }));
+    let decoded = match result {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => {
+            println!("[RUST] try_glossia_decode_to_bytes: decode error: {:?}", e);
+            return None;
+        }
+        Err(_) => {
+            println!("[RUST] try_glossia_decode_to_bytes: glossia panicked during decode, skipping");
+            return None;
+        }
+    };
+    // decode_from_language returns hex when bytes aren't valid UTF-8 (i.e. binary ciphertext)
+    if let Some(bytes) = glossia::hex_decode(&decoded) {
+        Some(bytes)
+    } else {
+        Some(decoded.into_bytes())
+    }
+}
+
+/// Glossia round-trip: encode plaintext bytes into the given language, then decode back
+/// to get canonical bytes. This ensures signature verification survives transport
+/// (word-wrap, quote prefixes, etc.) because the signature is on the decoded binary.
+/// Returns None if glossia encode/decode fails (caller should fall back to raw UTF-8 bytes).
+pub fn glossia_roundtrip_to_bytes(text: &str, encoding: &str) -> Option<Vec<u8>> {
+    let hex_input = glossia::hex_encode(text.as_bytes());
+    // Map frontend encoding names to glossia parameters
+    let encoding_lower = encoding.to_lowercase();
+    let (language, wordlist) = match encoding_lower.as_str() {
+        "latin" => ("latin", "default"),
+        "english" | "english - bip39" => ("english", "bip39"),
+        _ => (encoding_lower.as_str(), "default"),
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        glossia::encode_into_language(
+            &hex_input, language, wordlist, "body",
+            None, 42, false, None, None, None, None,
+        )
+    }));
+    let encoded = match result {
+        Ok(Ok((encoded_text, _, _, _))) => encoded_text,
+        _ => {
+            println!("[RUST] glossia_roundtrip_to_bytes: encode failed for encoding={}", encoding);
+            return None;
+        }
+    };
+    // Decode back to bytes
+    try_glossia_decode_to_bytes(&encoded)
+}
+
+/// Decode a single section of armor body content (non-quoted lines only) to bytes.
+/// Tries glossia decode, then base64 decode. Returns None if all fail.
+pub fn decode_armor_section(content: &str) -> Option<Vec<u8>> {
+    let content = content.trim();
+    if content.is_empty() {
+        return None;
+    }
+    // Try glossia decode first (handles BIP39/Latin encoded content)
+    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
+        return Some(bytes);
+    }
+    // Strip all whitespace from the base64 content
+    let b64_clean: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    if !b64_clean.is_empty() {
+        // Check for NIP-04 format: base64?iv=base64
+        if let Some((payload_b64, iv_b64)) = b64_clean.split_once("?iv=") {
+            if let (Ok(payload), Ok(iv)) = (
+                general_purpose::STANDARD.decode(payload_b64),
+                general_purpose::STANDARD.decode(iv_b64),
+            ) {
+                let mut combined = payload;
+                combined.extend_from_slice(&iv);
+                return Some(combined);
+            }
+        }
+        // NIP-44: pure base64
+        if let Ok(decoded) = general_purpose::STANDARD.decode(&b64_clean) {
+            return Some(decoded);
+        }
+    }
+    None
+}
+
+/// Parse armor structure with depth counting, separating outermost body from nested armor.
+/// Returns (body_text, nested_armor) where nested_armor has one level of "> " prefix stripped.
+/// Handles both non-quoted nested armor (reply chains) and > quoted nested armor.
+fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
+    let body = body.replace("\r\n", "\n");
+    let lines: Vec<&str> = body.lines().collect();
+
+    let contains_begin_body = |l: &str| {
+        l.contains("BEGIN NOSTR NIP-") || l.contains("BEGIN NOSTR SIGNED")
+    };
+    let contains_sig_seal = |l: &str| {
+        l.contains("BEGIN NOSTR SIGNATURE") || l.contains("BEGIN NOSTR SEAL")
+    };
+    let contains_end = |l: &str| l.contains("END NOSTR");
+
+    let mut depth: i32 = 0;
+    let mut in_body = false;
+    let mut in_nested = false;
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut nested_lines: Vec<&str> = Vec::new();
+
+    for line in &lines {
+        if !in_body && !in_nested {
+            if contains_begin_body(line) {
+                depth = 1;
+                in_body = true;
+            }
+            continue;
+        }
+
+        if in_body {
+            if contains_begin_body(line) {
+                depth += 1;
+                in_nested = true;
+                in_body = false;
+                nested_lines.push(line);
+                continue;
+            }
+            if depth == 1 && (contains_sig_seal(line) || contains_end(line)) {
+                break;
+            }
+            body_lines.push(line);
+            continue;
+        }
+
+        if in_nested {
+            nested_lines.push(line);
+            if contains_begin_body(line) {
+                depth += 1;
+            }
+            if contains_end(line) {
+                depth -= 1;
+                if depth == 1 {
+                    in_nested = false;
+                    in_body = true;
+                }
+            }
+        }
+    }
+
+    let body_text = body_lines.join("\n").trim().to_string();
+    if body_text.is_empty() {
+        return None;
+    }
+
+    let nested = if nested_lines.is_empty() {
+        None
+    } else {
+        let stripped: Vec<&str> = nested_lines.iter().map(|l| {
+            if l.starts_with("> ") { &l[2..] }
+            else if *l == ">" { "" }
+            else { *l }
+        }).collect();
+        Some(stripped.join("\n").trim().to_string())
+    };
+
+    Some((body_text, nested))
+}
+
+/// Decode a combined 96-byte signature+pubkey block.
+/// Tries glossia decode first (for encoded content), then raw hex fallback.
+/// Returns (sig_hex_128_chars, pubkey_hex_64_chars) or None.
+/// Try to decode text as a 32-byte pubkey.
+/// Accepts: glossia (32 bytes), npub bech32, hex (64 chars).
+fn try_decode_as_pubkey(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() { return None; }
+
+    // Glossia decode → 32 bytes
+    if let Some(bytes) = try_glossia_decode_to_bytes(trimmed) {
+        if bytes.len() == 32 {
+            return Some(hex::encode(bytes));
+        }
+    }
+
+    let stripped: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // npub bech32
+    if stripped.starts_with("npub1") {
+        if let Ok(pk) = nostr_sdk::prelude::PublicKey::parse(&stripped) {
+            return Some(pk.to_hex());
+        }
+    }
+
+    // Raw hex (64 chars = 32 bytes)
+    if stripped.len() == 64 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(stripped);
+    }
+
+    None
+}
+
+/// Try to decode text as a 64-byte Schnorr signature.
+/// Accepts: glossia (64 bytes), hex (128 chars).
+fn try_decode_as_signature(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() { return None; }
+
+    // Glossia decode → 64 bytes
+    if let Some(bytes) = try_glossia_decode_to_bytes(trimmed) {
+        if bytes.len() == 64 {
+            return Some(hex::encode(bytes));
+        }
+    }
+
+    // Raw hex (128 chars = 64 bytes)
+    let stripped: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.len() == 128 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(stripped);
+    }
+
+    None
+}
+
+/// Decode signature block content into (sig_hex, pubkey_hex).
+/// Three-phase detection for backward compatibility:
+///   1. Combined 96-byte (old format): glossia→96 bytes or hex 192 chars
+///   2. Blank-line split (new format): sig and pubkey separated by empty line
+///   3. Last-line heuristic: last line is npub/hex pubkey, rest is sig
+fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
+    // Phase 1: Combined 96-byte (masked mode — glossia encodes sig||pubkey as one payload)
+    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
+        if bytes.len() == 96 {
+            let sig_hex = hex::encode(&bytes[..64]);
+            let pubkey_hex = hex::encode(&bytes[64..]);
+            return Some((sig_hex, pubkey_hex));
+        }
+    }
+    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.len() == 192 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some((stripped[..128].to_string(), stripped[128..].to_string()));
+    }
+
+    // Phase 2: Default mode — glossia sig + npub/hex pubkey on last line
+    let lines: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if lines.len() >= 2 {
+        let last = lines[lines.len() - 1];
+        if let Some(pk) = try_decode_as_pubkey(last) {
+            let sig_text = lines[..lines.len() - 1].join("\n");
+            if let Some(sig) = try_decode_as_signature(&sig_text) {
+                return Some((sig, pk));
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse a complete ASCII-armored nostr-mail message into a structured result.
+/// Extracts body, signature, seal, profile names, prefix text, and nested quoted armor.
+///
+/// Internally builds a capnp ArmorMessage for schema validation and type identification:
+/// - Body union variant (encrypted/signed/plain) determined from BEGIN tag
+/// - NipVersion enum (nip04/nip44) set from the tag
+/// - SignatureBlock populated with decoded 64-byte sig + 32-byte pubkey
+/// - SealBlock populated with decoded 32-byte pubkey
+/// - Body.quoted recursively populated for nested reply chains
+///
+/// Returns a serde-friendly ParsedArmorMessage for Tauri JSON IPC.
+/// All serde fields are derived from reading the capnp message — nothing bypasses the schema.
+pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedArmorMessage> {
+    use crate::nostr_mail_capnp;
+
+    let preview: String = armor_text.chars().take(120).collect();
+    println!("[RUST] parse_armor_components: input length={} preview={:?}", armor_text.len(), preview);
+
+    // Build the capnp ArmorMessage — this is the parsing target
+    let mut capnp_msg = ::capnp::message::Builder::new_default();
+    let (prefix_text, raw_quoted_text) = {
+        let armor_builder = capnp_msg.init_root::<nostr_mail_capnp::armor_message::Builder>();
+        populate_armor_from_text(armor_builder, armor_text)?
+    };
+
+    // Read the capnp message → serde struct (all fields derived from capnp)
+    let reader = capnp_msg.get_root_as_reader::<nostr_mail_capnp::armor_message::Reader>().ok()?;
+    let mut result = armor_message_to_serde(reader);
+    result.prefix_text = prefix_text;
+    // Override quoted_armor_text with the verbatim text from the input (the capnp
+    // encoded_content field only stores the inner body text, losing delimiters,
+    // signatures, and deeper nesting levels).
+    if raw_quoted_text.is_some() {
+        result.quoted_armor_text = raw_quoted_text;
+    }
+
+    println!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
+        result.body_type, result.encryption_nip, result.signature_hex.is_some(),
+        result.seal_pubkey_hex.is_some(), result.quoted.is_some());
+
+    Some(result)
+}
+
+/// Populate a capnp ArmorMessage builder from armor text.
+/// Writes directly into capnp builders — the capnp message IS the parsing result.
+/// Returns (prefix_text, quoted_armor_text) or None if no armor found.
+/// `quoted_armor_text` is the raw text of nested quoted levels (with delimiters and signatures),
+/// preserved verbatim from the input for round-tripping.
+fn populate_armor_from_text(
+    mut armor_builder: crate::nostr_mail_capnp::armor_message::Builder<'_>,
+    armor_text: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    use crate::nostr_mail_capnp;
+
+    let normalized = armor_text.replace("\r\n", "\n");
+
+    // Extract prefix text before first armor delimiter (accept both "----- BEGIN" and "-----BEGIN")
+    let armor_start = normalized.find("----- BEGIN NOSTR ")
+        .or_else(|| normalized.find("-----BEGIN NOSTR "))
+        .or_else(|| normalized.find("--- BEGIN NOSTR "));
+    let prefix_text = match armor_start {
+        Some(idx) if idx > 0 => {
+            let p = normalized[..idx].trim();
+            if p.is_empty() { None } else { Some(p.to_string()) }
+        }
+        _ => None,
+    };
+    let armor_start = match armor_start {
+        Some(idx) => idx,
+        None => {
+            println!("[RUST] populate_armor_from_text: no armor delimiter found");
+            return None;
+        }
+    };
+
+    // ── Phase A: Line extraction (state machine) ──
+    let lines: Vec<&str> = normalized[armor_start..].lines().collect();
+
+    let is_begin_body = |l: &str| -> bool {
+        let t = l.trim().trim_matches('-').trim();
+        t.starts_with("BEGIN NOSTR NIP-") || t.starts_with("BEGIN NOSTR SIGNED")
+    };
+    let is_begin_sig = |l: &str| -> bool {
+        let t = l.trim().trim_matches('-').trim();
+        t == "BEGIN NOSTR SIGNATURE"
+    };
+    let is_begin_seal = |l: &str| -> bool {
+        let t = l.trim().trim_matches('-').trim();
+        t == "BEGIN NOSTR SEAL"
+    };
+    let is_end = |l: &str| -> bool {
+        let t = l.trim().trim_matches('-').trim();
+        t.starts_with("END NOSTR")
+    };
+
+    let mut depth: i32 = 0;
+    let mut state = "before";
+    let mut begin_tag = String::new();
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut quoted_armor_lines: Vec<&str> = Vec::new();
+    let mut sig_lines: Vec<&str> = Vec::new();
+    let mut seal_lines: Vec<&str> = Vec::new();
+
+    for line in &lines {
+        match state {
+            "before" => {
+                if is_begin_body(line) {
+                    depth = 1;
+                    state = "body";
+                    begin_tag = line.trim().to_string();
+                }
+            }
+            "body" => {
+                if is_begin_body(line) {
+                    depth += 1;
+                    state = "quoted";
+                    quoted_armor_lines.push(line);
+                } else if is_begin_sig(line) && depth == 1 {
+                    state = "sig";
+                } else if is_begin_seal(line) && depth == 1 {
+                    state = "seal";
+                } else if is_end(line) && depth == 1 {
+                    state = "done";
+                } else {
+                    body_lines.push(line);
+                }
+            }
+            "quoted" => {
+                quoted_armor_lines.push(line);
+                if is_begin_body(line) { depth += 1; }
+                else if is_end(line) {
+                    depth -= 1;
+                    if depth == 1 { state = "body"; }
+                }
+            }
+            "sig" => {
+                if is_end(line) { state = "done"; }
+                else if is_begin_seal(line) { state = "seal"; }
+                else { sig_lines.push(line); }
+            }
+            "seal" => {
+                if is_end(line) { state = "done"; }
+                else { seal_lines.push(line); }
+            }
+            _ => {}
+        }
+    }
+
+    if state == "before" {
+        println!("[RUST] populate_armor_from_text: state machine never left 'before'");
+        return None;
+    }
+
+    let body_text = body_lines.join("\n").trim().to_string();
+
+    // ── Phase B: Write directly into capnp builders ──
+
+    // Body: set union variant + decoded bytes + encoded content
+    let mut body_builder = armor_builder.reborrow().init_body();
+    body_builder.set_encoded_content(&body_text);
+
+    let is_encrypted = begin_tag.contains("ENCRYPTED");
+    let is_signed_body = begin_tag.contains("SIGNED");
+
+    if is_encrypted {
+        let mut enc = body_builder.reborrow().init_encrypted();
+        let nip_version = if begin_tag.contains("NIP-04") {
+            nostr_mail_capnp::NipVersion::Nip04
+        } else {
+            nostr_mail_capnp::NipVersion::Nip44
+        };
+        enc.set_nip(nip_version);
+        if let Some(bytes) = decode_armor_section(&body_text) {
+            enc.set_ciphertext(&bytes);
+        }
+    } else if is_signed_body {
+        let mut sgn = body_builder.reborrow().init_signed();
+        if let Some(bytes) = decode_armor_section(&body_text) {
+            sgn.set_plaintext(&bytes);
+        }
+    } else {
+        let mut pln = body_builder.reborrow().init_plain();
+        pln.set_text(&body_text);
+    }
+
+    // Quoted: recursively populate nested ArmorMessage
+    let stripped_quoted: Vec<&str> = quoted_armor_lines.iter().map(|l| {
+        if l.starts_with("> ") { &l[2..] }
+        else if *l == ">" { "" }
+        else { *l }
+    }).collect();
+    let raw_quoted_text = if !stripped_quoted.is_empty() {
+        let quoted_text = stripped_quoted.join("\n").trim().to_string();
+        if !quoted_text.is_empty() {
+            let quoted_builder = body_builder.init_quoted();
+            // Recursive: populate the nested ArmorMessage
+            populate_armor_from_text(quoted_builder, &quoted_text);
+            Some(quoted_text)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Signature block: decode sig+pubkey, write to capnp
+    if !sig_lines.is_empty() {
+        let mut sig_builder = armor_builder.reborrow().init_signature();
+
+        if let Some(name_line) = sig_lines.iter().find(|l| l.trim().starts_with('@')) {
+            sig_builder.set_profile_name(name_line.trim().trim_start_matches('@'));
+        }
+
+        let content_lines: Vec<&str> = sig_lines.iter()
+            .filter(|l| !l.trim().starts_with('@'))
+            .copied()
+            .collect();
+        let all_content = content_lines.join("\n").trim().to_string();
+        if !all_content.is_empty() {
+            sig_builder.set_encoded_sig_pubkey(&all_content);
+            if let Some((sig_hex, pubkey_hex)) = decode_sig_and_pubkey(&all_content) {
+                if let Ok(sig_bytes) = hex::decode(&sig_hex) {
+                    sig_builder.set_signature(&sig_bytes);
+                }
+                if let Ok(pk_bytes) = hex::decode(&pubkey_hex) {
+                    sig_builder.set_pubkey(&pk_bytes);
+                }
+            }
+        }
+    }
+
+    // Seal block: decode pubkey, write to capnp
+    if !seal_lines.is_empty() {
+        let mut seal_builder = armor_builder.reborrow().init_seal();
+
+        if let Some(name_line) = seal_lines.iter().find(|l| l.trim().starts_with('@')) {
+            seal_builder.set_display_name(name_line.trim().trim_start_matches('@'));
+        }
+
+        let content_lines: Vec<&str> = seal_lines.iter()
+            .filter(|l| !l.trim().starts_with('@'))
+            .copied()
+            .collect();
+        let seal_content = content_lines.join("\n").trim().to_string();
+        if !seal_content.is_empty() {
+            if let Some(pk_hex) = try_decode_as_pubkey(&seal_content) {
+                if let Ok(bytes) = hex::decode(&pk_hex) {
+                    seal_builder.set_pubkey(&bytes);
+                }
+            }
+        }
+    }
+
+    Some((prefix_text, raw_quoted_text))
+}
+
+/// Read a capnp ArmorMessage and produce a serde-friendly ParsedArmorMessage.
+/// All fields are derived from the capnp reader — nothing bypasses the schema.
+fn armor_message_to_serde(reader: crate::nostr_mail_capnp::armor_message::Reader) -> crate::types::ParsedArmorMessage {
+    use crate::nostr_mail_capnp;
+
+    // Read body
+    let (body_text, body_type, encryption_nip, body_bytes_b64) = if reader.has_body() {
+        if let Ok(body) = reader.get_body() {
+            let encoded = if body.has_encoded_content() {
+                body.reborrow().get_encoded_content().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            match body.which() {
+                Ok(nostr_mail_capnp::body::Encrypted(enc)) => {
+                    let nip = match enc.get_nip() {
+                        Ok(nostr_mail_capnp::NipVersion::Nip04) => "nip04",
+                        _ => "nip44",
+                    };
+                    let bytes_b64 = if enc.has_ciphertext() {
+                        enc.get_ciphertext().ok().map(|d| general_purpose::STANDARD.encode(d))
+                    } else {
+                        None
+                    };
+                    (encoded, "encrypted".to_string(), Some(nip.to_string()), bytes_b64)
+                }
+                Ok(nostr_mail_capnp::body::Signed(sgn)) => {
+                    let bytes_b64 = if sgn.has_plaintext() {
+                        sgn.get_plaintext().ok().map(|d| general_purpose::STANDARD.encode(d))
+                    } else {
+                        None
+                    };
+                    (encoded, "signed".to_string(), None, bytes_b64)
+                }
+                Ok(nostr_mail_capnp::body::Plain(pln)) => {
+                    let text = pln.get_text().map(|t| t.to_string().unwrap_or_default()).unwrap_or_default();
+                    (text, "plain".to_string(), None, None)
+                }
+                _ => (encoded, "unknown".to_string(), None, None),
+            }
+        } else {
+            (String::new(), "unknown".to_string(), None, None)
+        }
+    } else {
+        (String::new(), "unknown".to_string(), None, None)
+    };
+
+    // Read signature block
+    let (signature_hex, sig_pubkey_hex, profile_name, raw_sig_pubkey) = if reader.has_signature() {
+        if let Ok(sig) = reader.get_signature() {
+            let sig_hex = if sig.has_signature() {
+                sig.get_signature().ok().map(|d| hex::encode(d))
+            } else {
+                None
+            };
+            let pk_hex = if sig.has_pubkey() {
+                sig.get_pubkey().ok().map(|d| hex::encode(d))
+            } else {
+                None
+            };
+            let name = if sig.has_profile_name() {
+                sig.get_profile_name().ok().and_then(|s| s.to_str().ok()).map(|s| s.to_string())
+            } else {
+                None
+            };
+            let raw = if sig.has_encoded_sig_pubkey() {
+                sig.get_encoded_sig_pubkey().ok().and_then(|s| s.to_str().ok()).map(|s| s.to_string())
+            } else {
+                None
+            };
+            (sig_hex, pk_hex, name, raw)
+        } else {
+            (None, None, None, None)
+        }
+    } else {
+        (None, None, None, None)
+    };
+
+    // Read seal block
+    let (seal_pubkey_hex, seal_display_name) = if reader.has_seal() {
+        if let Ok(seal) = reader.get_seal() {
+            let pk_hex = if seal.has_pubkey() {
+                seal.get_pubkey().ok().map(|d| hex::encode(d))
+            } else {
+                None
+            };
+            let name = if seal.has_display_name() {
+                seal.get_display_name().ok().and_then(|s| s.to_str().ok()).map(|s| s.to_string())
+            } else {
+                None
+            };
+            (pk_hex, name)
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let display_name = seal_display_name.or_else(|| profile_name.clone());
+
+    // Read quoted (recursive)
+    // Note: quoted_armor_text is set to None here — parse_armor_components overrides
+    // it with the verbatim text from the input, since capnp only stores structured
+    // fields (encoded_content), not the full armor with delimiters and signatures.
+    let (quoted, quoted_armor_text) = if reader.has_body() {
+        if let Ok(body) = reader.get_body() {
+            if body.has_quoted() {
+                if let Ok(quoted_reader) = body.get_quoted() {
+                    let inner = armor_message_to_serde(quoted_reader);
+                    (Some(Box::new(inner)), None)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    crate::types::ParsedArmorMessage {
+        body_text,
+        body_type,
+        encryption_nip,
+        signature_hex,
+        sig_pubkey_hex,
+        seal_pubkey_hex,
+        profile_name,
+        display_name,
+        raw_sig_pubkey,
+        prefix_text: None, // Set by caller (prefix_text is outside the capnp message)
+        quoted,
+        quoted_armor_text,
+        body_bytes_b64,
+    }
+}
+
+// ── Shared glossia/NIP postprocess helpers ──────────────────────────
+
+/// Post-process glossia decode output: hex→base64 conversion and NIP-04 unpacking.
+/// Mirrors JS: _isHex → _hexToBase64 → _autoUnpack pipeline.
+/// Moved from lib.rs decode_glossia_postprocess so both Tauri commands and email decrypt can use it.
+pub fn glossia_postprocess(decoded: &str, algorithm: &str) -> Result<String, String> {
+    use base64::Engine;
+
+    let is_hex = !decoded.is_empty()
+        && decoded.len() % 2 == 0
+        && decoded.chars().all(|c| c.is_ascii_hexdigit());
+
+    if is_hex {
+        let bytes: Vec<u8> = (0..decoded.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&decoded[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|e| format!("Hex decode failed: {}", e))?;
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // NIP-04 binary unpack: [len_hi, len_lo, payload..., iv(16 bytes)] → base64?iv=base64
+        if algorithm == "nip04" && bytes.len() >= 2 {
+            let payload_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+            if 2 + payload_len <= bytes.len() {
+                let payload_b64 = b64.encode(&bytes[2..2 + payload_len]);
+                let iv_b64 = b64.encode(&bytes[2 + payload_len..]);
+                return Ok(format!("{}?iv={}", payload_b64, iv_b64));
+            }
+        }
+        Ok(b64.encode(&bytes))
+    } else {
+        // Already a valid string (e.g. base64 for NIP-44) — return as-is
+        Ok(decoded.to_string())
+    }
+}
+
+/// Check if content looks like base64 or base64?iv=base64 (already ciphertext, not glossia).
+/// Mirrors JS: /^[A-Za-z0-9+/=?]+$/.test(stripped)
+fn is_base64_content(content: &str) -> bool {
+    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '?')
+}
+
+// is_likely_encrypted_content is defined as pub fn later in this file (line ~3918)
+
+/// Glossia-decode body content to NIP-decrypt-ready ciphertext string.
+/// Mirrors JS: decodeGlossiaArmoredBody — tries latin then english, hex→base64, auto-unpack.
+/// The `nip_hint` is "nip04" or "nip44" from the armor BEGIN tag.
+fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result<String, String> {
+    // If already base64 or base64?iv=base64, return as-is
+    if is_base64_content(encoded_content) {
+        let stripped: String = encoded_content.chars().filter(|c| !c.is_whitespace()).collect();
+        return Ok(stripped);
+    }
+
+    // Try all dialects and pick the longest decoded output.
+    // decode_from_language with the wrong language silently returns a truncated result
+    // (matching only words that happen to overlap), so we can't trust the first success.
+    let languages = ["latin", "english"];
+    let mut best_decoded: Option<(String, String)> = None; // (decoded_hex, lang)
+    let mut last_err = String::new();
+    for lang in &languages {
+        let text = encoded_content.to_string();
+        let lang_str = lang.to_string();
+        let result = std::panic::catch_unwind(move || {
+            glossia::decode_from_language(&text, &lang_str, "default", false)
+        });
+        match result {
+            Ok(Ok(decoded)) => {
+                match &best_decoded {
+                    Some((prev, _)) if prev.len() >= decoded.len() => {
+                        // Previous was longer or equal, keep it
+                    }
+                    _ => {
+                        best_decoded = Some((decoded, lang.to_string()));
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                last_err = format!("{:?}", e);
+            }
+            Err(panic_info) => {
+                let msg = panic_info.downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                last_err = format!("panic: {}", msg);
+            }
+        }
+    }
+
+    // Use the longest decoded result
+    if let Some((decoded, _lang)) = best_decoded {
+        return glossia_postprocess(&decoded, nip_hint);
+    }
+
+    Err(format!("Glossia decode failed for all languages: {}", last_err))
+}
+
+/// Glossia-decode subject (payload_only mode, hit_rate >= 0.8).
+/// Mirrors JS: decodeGlossiaSubject — uses "decode from <dialect> raw" mode.
+fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
+    println!("[RUST] glossia_decode_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
+    if subject.is_empty() || is_likely_encrypted_content(subject) {
+        println!("[RUST] glossia_decode_subject: empty or already encrypted, returning None");
+        return None;
+    }
+
+    // Detect dialect with hit_rate filtering
+    let words: Vec<String> = subject.split_whitespace().map(|w| w.to_lowercase()).collect();
+    println!("[RUST] glossia_decode_subject: word_count={} words={:?}", words.len(), &words[..words.len().min(6)]);
+    if words.is_empty() {
+        return None;
+    }
+    let detect_result = std::panic::catch_unwind(move || {
+        glossia::detect_dialect_best(&words)
+    });
+    let dialect = match detect_result {
+        Ok(Some(best)) => {
+            println!("[RUST] glossia_decode_subject: detected dialect={:?} hit_rate={}", best.language, best.hit_rate);
+            if best.hit_rate >= 0.8 {
+                best.language.clone()
+            } else {
+                println!("[RUST] glossia_decode_subject: hit_rate too low (<0.8), returning None");
+                return None;
+            }
+        }
+        Ok(None) => {
+            println!("[RUST] glossia_decode_subject: no dialect detected, returning None");
+            return None;
+        }
+        Err(e) => {
+            println!("[RUST] glossia_decode_subject: detect_dialect_best panicked: {:?}", e.downcast_ref::<String>());
+            return None;
+        }
+    };
+
+    // Try decoding with both "default" and "raw" wordlists, pick longest
+    let wordlists = ["default", "raw"];
+    let mut best_decoded: Option<String> = None;
+    for wl in &wordlists {
+        let text = subject.to_string();
+        let lang = dialect.clone();
+        let wl_str = wl.to_string();
+        let decode_result = std::panic::catch_unwind(move || {
+            glossia::decode_from_language(&text, &lang, &wl_str, false)
+        });
+        match decode_result {
+            Ok(Ok(decoded)) => {
+                println!("[RUST] glossia_decode_subject: wl={} decoded len={} preview={:?}", wl, decoded.len(), &decoded[..decoded.len().min(40)]);
+                match &best_decoded {
+                    Some(prev) if prev.len() >= decoded.len() => {}
+                    _ => { best_decoded = Some(decoded); }
+                }
+            }
+            Ok(Err(e)) => {
+                println!("[RUST] glossia_decode_subject: wl={} decode error: {:?}", wl, e);
+            }
+            Err(e) => {
+                println!("[RUST] glossia_decode_subject: wl={} decode panicked: {:?}", wl, e.downcast_ref::<String>());
+            }
+        }
+    }
+
+    match best_decoded {
+        Some(decoded) => {
+            let result = glossia_postprocess(&decoded, nip_hint);
+            println!("[RUST] glossia_decode_subject: postprocess result={:?}", result.as_ref().map(|s| &s[..s.len().min(40)]));
+            result.ok()
+        }
+        _ => {
+            println!("[RUST] glossia_decode_subject: no successful decode from any wordlist");
+            None
+        }
+    }
+}
+
+// ── Decrypt pipeline ─────────────────────────────────────────────────
+
+/// JSON manifest structs for legacy email format (serde deserialization).
+#[derive(Debug, serde::Deserialize)]
+struct JsonManifest {
+    body: Option<JsonEncryptedBlob>,
+    attachments: Option<Vec<JsonAttachment>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct JsonEncryptedBlob {
+    ciphertext: String,
+    #[allow(dead_code)]
+    cipher_sha256: Option<String>,
+    #[allow(dead_code)]
+    cipher_size: Option<u64>,
+    key_wrap: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct JsonAttachment {
+    id: String,
+    orig_filename: String,
+    orig_mime: String,
+    cipher_sha256: Option<String>,
+    cipher_size: Option<u64>,
+    key_wrap: String,
+}
+
+/// Determine which pubkey to use for NIP decryption at a given armor level.
+/// Mirrors JS: _decryptFromArmorParts pubkey selection logic.
+/// Returns hex pubkey string.
+fn determine_decrypt_pubkey(
+    sig_pubkey_hex: Option<&str>,
+    seal_pubkey_hex: Option<&str>,
+    user_pubkey_hex: &str,
+    fallback_pubkey: &str,
+) -> Result<String, String> {
+    // Get pubkey from seal or signature block, or fall back to provided pubkey
+    let other_pubkey = match seal_pubkey_hex.or(sig_pubkey_hex) {
+        Some(pk) => pk,
+        None => {
+            // No seal/sig in armor — use fallback pubkey directly
+            if fallback_pubkey.is_empty() {
+                return Err("No pubkey in seal/signature block and no fallback provided".to_string());
+            }
+            if fallback_pubkey.starts_with("npub1") {
+                let pk = nostr_sdk::prelude::PublicKey::parse(fallback_pubkey)
+                    .map_err(|e| format!("Invalid fallback npub: {:?}", e))?;
+                return Ok(pk.to_hex());
+            }
+            return Ok(fallback_pubkey.to_string());
+        }
+    };
+
+    // If seal/sig pubkey is the user's own, use fallback (the other party)
+    if other_pubkey == user_pubkey_hex {
+        if fallback_pubkey.is_empty() {
+            return Err("Cannot determine recipient pubkey (seal pubkey matches user)".to_string());
+        }
+        // Convert npub to hex if needed
+        if fallback_pubkey.starts_with("npub1") {
+            let pk = nostr_sdk::prelude::PublicKey::parse(fallback_pubkey)
+                .map_err(|e| format!("Invalid fallback npub: {:?}", e))?;
+            Ok(pk.to_hex())
+        } else {
+            Ok(fallback_pubkey.to_string())
+        }
+    } else {
+        Ok(other_pubkey.to_string())
+    }
+}
+
+/// Decrypt a single armor block level.
+/// Mirrors JS: _decryptFromArmorParts + manifest detection.
+fn decrypt_single_block(
+    body_text: &str,
+    body_type: &str,
+    encryption_nip: Option<&str>,
+    sig_pubkey_hex: Option<&str>,
+    seal_pubkey_hex: Option<&str>,
+    profile_name: Option<&str>,
+    private_key: &str,
+    user_pubkey_hex: &str,
+    fallback_pubkey: &str,
+) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
+    use base64::Engine;
+
+    println!("[RUST] decrypt_single_block: type={} nip={:?} sig_pk={:?} seal_pk={:?} fallback={:?} body_preview={:?}",
+        body_type, encryption_nip, sig_pubkey_hex.map(|s| &s[..s.len().min(16)]),
+        seal_pubkey_hex.map(|s| &s[..s.len().min(16)]),
+        &fallback_pubkey[..fallback_pubkey.len().min(16)],
+        &body_text[..body_text.len().min(60)]);
+
+    let mut block = crate::types::DecryptedBlock {
+        decrypted_text: None,
+        error: None,
+        was_encrypted: body_type == "encrypted",
+        profile_name: profile_name.map(|s| s.to_string()),
+        body_type: body_type.to_string(),
+    };
+
+    if body_type != "encrypted" {
+        // Signed/plain blocks aren't encrypted — return body text as-is
+        block.decrypted_text = Some(body_text.to_string());
+        return (block, None);
+    }
+
+    let nip = encryption_nip.unwrap_or("nip44");
+
+    // Step 1: Glossia-decode body text → ciphertext string
+    let ciphertext = match glossia_decode_to_ciphertext(body_text, nip) {
+        Ok(ct) => {
+            println!("[RUST] decrypt_single_block: glossia decoded, ciphertext len={}", ct.len());
+            ct
+        }
+        Err(e) => {
+            println!("[RUST] decrypt_single_block: glossia decode FAILED: {}", e);
+            block.error = Some(format!("Glossia decode failed: {}", e));
+            return (block, None);
+        }
+    };
+
+    // Step 2: Determine which pubkey to decrypt with
+    let decrypt_pubkey_hex = match determine_decrypt_pubkey(sig_pubkey_hex, seal_pubkey_hex, user_pubkey_hex, fallback_pubkey) {
+        Ok(pk) => {
+            println!("[RUST] decrypt_single_block: decrypt pubkey={}", &pk[..pk.len().min(16)]);
+            pk
+        }
+        Err(e) => {
+            println!("[RUST] decrypt_single_block: determine_decrypt_pubkey FAILED: {}", e);
+            block.error = Some(e);
+            return (block, None);
+        }
+    };
+
+    // Step 3: NIP decrypt
+    let decrypt_npub = match nostr_sdk::prelude::PublicKey::parse(&decrypt_pubkey_hex) {
+        Ok(pk) => {
+            use nostr_sdk::prelude::ToBech32;
+            pk.to_bech32().unwrap_or_default()
+        }
+        Err(e) => {
+            block.error = Some(format!("Invalid decrypt pubkey: {:?}", e));
+            return (block, None);
+        }
+    };
+
+    let decrypted = match crate::nostr::decrypt_dm_content(private_key, &decrypt_npub, &ciphertext) {
+        Ok(d) => {
+            println!("[RUST] decrypt_single_block: NIP decrypt SUCCESS, len={} preview={:?}", d.len(), &d[..d.len().min(40)]);
+            d
+        }
+        Err(e) => {
+            println!("[RUST] decrypt_single_block: NIP decrypt FAILED: {}", e);
+            block.error = Some(format!("NIP decrypt failed: {}", e));
+            return (block, None);
+        }
+    };
+
+    // Step 4: Detect manifest vs legacy
+    let trimmed = decrypted.trim();
+    if trimmed.starts_with('{') {
+        // Try JSON manifest parse
+        if let Ok(manifest) = serde_json::from_str::<JsonManifest>(trimmed) {
+            if let Some(ref body_blob) = manifest.body {
+                // AES decrypt the manifest body
+                let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.key_wrap) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        block.error = Some(format!("Manifest key_wrap base64 decode failed: {}", e));
+                        return (block, Some(manifest));
+                    }
+                };
+                let ct_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.ciphertext) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        block.error = Some(format!("Manifest ciphertext base64 decode failed: {}", e));
+                        return (block, Some(manifest));
+                    }
+                };
+
+                match crate::crypto::aes_gcm_decrypt_raw(&key_bytes, &ct_bytes) {
+                    Ok(plaintext_bytes) => {
+                        // The plaintext is base64-encoded UTF-8 body (matching JS: atob(aesResult))
+                        match String::from_utf8(plaintext_bytes) {
+                            Ok(b64_body) => {
+                                // Decode the base64 to get the actual text
+                                match base64::engine::general_purpose::STANDARD.decode(b64_body.trim()) {
+                                    Ok(body_bytes) => {
+                                        match String::from_utf8(body_bytes) {
+                                            Ok(text) => block.decrypted_text = Some(text),
+                                            Err(_) => block.decrypted_text = Some(b64_body),
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Not base64 — use as-is (the plaintext IS the body)
+                                        block.decrypted_text = Some(b64_body);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                block.error = Some("Manifest body AES plaintext is not UTF-8".to_string());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        block.error = Some(format!("Manifest AES decrypt failed: {}", e));
+                    }
+                }
+                return (block, Some(manifest));
+            }
+        }
+    }
+
+    // Legacy format: decrypted content is the body text directly
+    block.decrypted_text = Some(decrypted);
+    (block, None)
+}
+
+/// Walk the capnp ArmorMessage tree recursively, decrypting each encrypted block.
+/// Returns results innermost-first (matching JS decryptAllEncryptedBlocks convention).
+fn decrypt_armor_tree(
+    parsed: &crate::types::ParsedArmorMessage,
+    private_key: &str,
+    user_pubkey_hex: &str,
+    fallback_pubkey: &str,
+) -> (Vec<crate::types::DecryptedBlock>, Option<JsonManifest>) {
+    let mut results = Vec::new();
+    let mut outer_manifest = None;
+
+    // Recurse into quoted first (innermost-first ordering)
+    // Propagate current level's sig/seal pubkey as fallback for inner blocks,
+    // so nested blocks can identify the other party when their own sig matches the user.
+    if let Some(ref quoted) = parsed.quoted {
+        let inner_fallback = if fallback_pubkey.is_empty() {
+            parsed.sig_pubkey_hex.as_deref()
+                .or(parsed.seal_pubkey_hex.as_deref())
+                .unwrap_or("")
+        } else {
+            fallback_pubkey
+        };
+        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback);
+        results.extend(inner_results);
+    }
+
+    // NIP-04 mandatory signature verification (spec section 4.1).
+    // NIP-04 (AES-256-CBC) lacks authenticated encryption; the Schnorr signature
+    // serves as the MAC. Verification MUST happen before decryption to prevent
+    // padding oracle attacks.
+    if parsed.encryption_nip.as_deref() == Some("nip04") {
+        match (&parsed.signature_hex, &parsed.sig_pubkey_hex) {
+            (Some(sig_hex), Some(pubkey_hex)) => {
+                // Collect body bytes for verification — use raw decoded bytes (no NIP-04
+                // unpacking) to match extract_ciphertext_binary, which the inline
+                // signature verification uses successfully.
+                let verify_bytes = if let Some(ref b64) = parsed.body_bytes_b64 {
+                    general_purpose::STANDARD.decode(b64).unwrap_or_else(|_| parsed.body_text.as_bytes().to_vec())
+                } else {
+                    extract_ciphertext_binary(&parsed.body_text)
+                };
+                let mut all_bytes = verify_bytes;
+
+                // Concatenate nested quoted body bytes
+                fn collect_quoted_bytes(
+                    quoted: &Option<Box<crate::types::ParsedArmorMessage>>,
+                    buf: &mut Vec<u8>,
+                ) {
+                    if let Some(ref q) = quoted {
+                        if let Some(ref b64) = q.body_bytes_b64 {
+                            if let Ok(bytes) = general_purpose::STANDARD.decode(b64) {
+                                buf.extend_from_slice(&bytes);
+                            }
+                        }
+                        collect_quoted_bytes(&q.quoted, buf);
+                    }
+                }
+                collect_quoted_bytes(&parsed.quoted, &mut all_bytes);
+
+                // Step 7: Verify signature against unpacked canonical bytes
+                let verified = matches!(
+                    crate::crypto::verify_signature_bytes(pubkey_hex, sig_hex, &all_bytes),
+                    Ok(true)
+                );
+
+                if verified {
+                    println!("[RUST] NIP-04 signature verified ({} bytes), proceeding to decrypt", all_bytes.len());
+                } else {
+                    println!("[RUST] NIP-04 signature INVALID — rejecting without decryption");
+                    results.push(crate::types::DecryptedBlock {
+                        decrypted_text: None,
+                        error: Some(
+                            "NIP-04 signature verification failed. The message was rejected \
+                             without decrypting to prevent potential ciphertext manipulation. \
+                             The message may have been tampered with in transit.".to_string()
+                        ),
+                        was_encrypted: true,
+                        profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
+                        body_type: "encrypted".to_string(),
+                    });
+                    return (results, outer_manifest);
+                }
+            }
+            _ => {
+                // No signature on NIP-04 message — reject
+                println!("[RUST] NIP-04 message has no signature — rejecting without decryption");
+                results.push(crate::types::DecryptedBlock {
+                    decrypted_text: None,
+                    error: Some(
+                        "This NIP-04 encrypted message has no signature. NIP-04 requires a \
+                         signature for authentication because it lacks built-in message \
+                         integrity (MAC). The message cannot be safely decrypted. The sender \
+                         may be using an older client that doesn't sign NIP-04 messages.".to_string()
+                    ),
+                    was_encrypted: true,
+                    profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
+                    body_type: "encrypted".to_string(),
+                });
+                return (results, outer_manifest);
+            }
+        }
+    }
+
+    // Decrypt this level
+    let (block, manifest) = decrypt_single_block(
+        &parsed.body_text,
+        &parsed.body_type,
+        parsed.encryption_nip.as_deref(),
+        parsed.sig_pubkey_hex.as_deref(),
+        parsed.seal_pubkey_hex.as_deref(),
+        parsed.profile_name.as_deref().or(parsed.display_name.as_deref()),
+        private_key,
+        user_pubkey_hex,
+        fallback_pubkey,
+    );
+    if manifest.is_some() {
+        outer_manifest = manifest;
+    }
+    results.push(block);
+
+    (results, outer_manifest)
+}
+
+/// Top-level decrypt pipeline: parse armor → decrypt tree → decrypt subject → assemble result.
+/// Mirrors the full JS decryptManifestMessage + decryptAllEncryptedBlocks pipeline.
+pub fn decrypt_email_body_pipeline(
+    private_key: &str,
+    armor_text: &str,
+    subject: &str,
+    sender_pubkey: Option<&str>,
+    recipient_pubkey: Option<&str>,
+) -> Result<crate::types::DecryptEmailResult, String> {
+    println!("[RUST] decrypt_email_body: armor_len={} subject_len={}", armor_text.len(), subject.len());
+
+    // Normalize line endings (spec section 8 step 2)
+    let normalized = armor_text.replace("\r\n", "\n");
+
+    // Parse armor into capnp ArmorMessage → serde struct
+    let parsed = match parse_armor_components(&normalized) {
+        Some(p) => p,
+        None => {
+            println!("[RUST] decrypt_email_body: no armor found");
+            return Ok(crate::types::DecryptEmailResult {
+                subject: subject.to_string(),
+                body: armor_text.to_string(),
+                is_manifest: false,
+                attachments: Vec::new(),
+                block_results: Vec::new(),
+                success: false,
+                error: Some("No armor block found in email body".to_string()),
+                subject_ciphertext: None,
+                sender_pubkey: None,
+            });
+        }
+    };
+
+    // Derive user's pubkey hex from private key
+    let user_pubkey_hex = {
+        let sk = nostr_sdk::prelude::SecretKey::parse(private_key)
+            .map_err(|e| format!("Invalid private key: {:?}", e))?;
+        let keys = nostr_sdk::prelude::Keys::new(sk);
+        keys.public_key().to_hex()
+    };
+
+    // Determine fallback pubkey (the other party's pubkey for decryption)
+    let fallback = sender_pubkey
+        .or(recipient_pubkey)
+        .unwrap_or("");
+
+    // Walk the armor tree, decrypt each level
+    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback);
+
+    // Extract outermost decrypted body (last element in innermost-first array)
+    let outer_block = block_results.last();
+    let body = outer_block
+        .and_then(|b| b.decrypted_text.clone())
+        .unwrap_or_else(|| {
+            outer_block
+                .and_then(|b| b.error.clone())
+                .unwrap_or_else(|| armor_text.to_string())
+        });
+    let success = outer_block.map(|b| b.decrypted_text.is_some()).unwrap_or(false);
+    let error = if success { None } else { outer_block.and_then(|b| b.error.clone()) };
+
+    // Extract attachment metadata from manifest
+    let (is_manifest, attachments) = if let Some(ref m) = manifest {
+        let atts = m.attachments.as_ref().map(|att_list| {
+            att_list.iter().map(|a| crate::types::ManifestAttachmentInfo {
+                id: a.id.clone(),
+                orig_filename: a.orig_filename.clone(),
+                orig_mime: a.orig_mime.clone(),
+                key_wrap_b64: a.key_wrap.clone(),
+                cipher_sha256_hex: a.cipher_sha256.clone(),
+                cipher_size: a.cipher_size.unwrap_or(0),
+            }).collect()
+        }).unwrap_or_default();
+        (true, atts)
+    } else {
+        (false, Vec::new())
+    };
+
+    // Decrypt subject — use armor's embedded pubkey as fallback when sender_pubkey wasn't provided
+    let (decrypted_subject, subject_ciphertext) = if parsed.body_type == "encrypted" {
+        let nip_hint = parsed.encryption_nip.as_deref().unwrap_or("nip44");
+        let subject_fallback = if fallback.is_empty() {
+            // The armor signature/seal block contains the sender's pubkey
+            parsed.sig_pubkey_hex.as_deref()
+                .or(parsed.seal_pubkey_hex.as_deref())
+                .unwrap_or("")
+        } else {
+            fallback
+        };
+        decrypt_subject(subject, private_key, &user_pubkey_hex, subject_fallback, nip_hint)
+    } else {
+        (subject.to_string(), None)
+    };
+
+    // Extract sender pubkey from outermost armor signature (for avatar fallback)
+    let armor_sender_pubkey = if sender_pubkey.is_none() {
+        // No header-provided pubkey — try to derive from verified armor signature
+        parsed.sig_pubkey_hex.as_deref().and_then(|pk_hex| {
+            parsed.signature_hex.as_deref().and_then(|sig_hex| {
+                let binary = extract_ciphertext_binary(armor_text);
+                match crate::crypto::verify_signature_bytes(pk_hex, sig_hex, &binary) {
+                    Ok(true) => {
+                        nostr_sdk::prelude::PublicKey::from_hex(pk_hex).ok()
+                            .and_then(|pk| nostr_sdk::prelude::ToBech32::to_bech32(&pk).ok())
+                    }
+                    _ => None,
+                }
+            })
+        })
+    } else {
+        None
+    };
+
+    println!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={} armor_sender_pubkey={:?}",
+        success, is_manifest, block_results.len(), attachments.len(),
+        armor_sender_pubkey.as_deref().map(|s: &str| &s[..std::cmp::min(s.len(), 20)]));
+
+    Ok(crate::types::DecryptEmailResult {
+        subject: decrypted_subject,
+        body,
+        is_manifest,
+        attachments,
+        block_results,
+        success,
+        error,
+        subject_ciphertext,
+        sender_pubkey: armor_sender_pubkey,
+    })
+}
+
+/// Decrypt the email subject.
+/// Mirrors JS: decodeGlossiaSubject + NIP decrypt.
+/// Returns (decrypted_subject, subject_ciphertext).
+/// subject_ciphertext is the intermediate value after glossia decode / before NIP decrypt,
+/// needed by the frontend for DM↔email subject_hash matching.
+fn decrypt_subject(
+    subject: &str,
+    private_key: &str,
+    _user_pubkey_hex: &str,
+    fallback_pubkey: &str,
+    nip_hint: &str,
+) -> (String, Option<String>) {
+    println!("[RUST] decrypt_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
+    if subject.is_empty() {
+        println!("[RUST] decrypt_subject: empty subject, returning as-is");
+        return (subject.to_string(), None);
+    }
+
+    // Try to get ciphertext from subject
+    let is_encrypted = is_likely_encrypted_content(subject);
+    println!("[RUST] decrypt_subject: is_likely_encrypted={}", is_encrypted);
+    let ciphertext = if is_encrypted {
+        println!("[RUST] decrypt_subject: using subject directly as ciphertext");
+        subject.to_string()
+    } else if let Some(decoded) = glossia_decode_subject(subject, nip_hint) {
+        println!("[RUST] decrypt_subject: glossia decoded to ciphertext len={} preview={:?}", decoded.len(), &decoded[..decoded.len().min(60)]);
+        decoded
+    } else {
+        println!("[RUST] decrypt_subject: glossia decode failed, returning subject as-is");
+        return (subject.to_string(), None);
+    };
+
+    let subject_ciphertext = Some(ciphertext.clone());
+
+    // Determine which pubkey to use — use fallback (other party's pubkey)
+    let decrypt_pubkey = if fallback_pubkey.is_empty() {
+        println!("[RUST] decrypt_subject: no fallback pubkey, returning subject as-is");
+        return (subject.to_string(), subject_ciphertext);
+    } else if fallback_pubkey.starts_with("npub1") {
+        fallback_pubkey.to_string()
+    } else {
+        use nostr_sdk::prelude::ToBech32;
+        match nostr_sdk::prelude::PublicKey::parse(fallback_pubkey) {
+            Ok(pk) => pk.to_bech32().unwrap_or_else(|_| fallback_pubkey.to_string()),
+            Err(_) => {
+                println!("[RUST] decrypt_subject: failed to parse fallback pubkey {:?}", fallback_pubkey);
+                return (subject.to_string(), subject_ciphertext);
+            }
+        }
+    };
+
+    println!("[RUST] decrypt_subject: attempting NIP decrypt with pubkey prefix={:?}", &decrypt_pubkey[..decrypt_pubkey.len().min(20)]);
+    match crate::nostr::decrypt_dm_content(private_key, &decrypt_pubkey, &ciphertext) {
+        Ok(decrypted) => {
+            println!("[RUST] decrypt_subject: success! decrypted={:?}", &decrypted[..decrypted.len().min(60)]);
+            (decrypted, subject_ciphertext)
+        }
+        Err(e) => {
+            println!("[RUST] decrypt_subject: NIP decrypt failed: {:?}", e);
+            (subject.to_string(), subject_ciphertext)
+        }
+    }
+}
+
+/// Decrypt a manifest attachment (separate from body for large payloads).
+pub fn decrypt_attachment_pipeline(
+    attachment_data_b64: &str,
+    key_wrap_b64: &str,
+    cipher_sha256_hex: Option<&str>,
+    orig_filename: &str,
+    orig_mime: &str,
+) -> Result<crate::types::DecryptedAttachment, String> {
+    use base64::Engine;
+    use sha2::{Sha256, Digest};
+
+    println!("[RUST] decrypt_attachment: data_len={} filename={:?}", attachment_data_b64.len(), orig_filename);
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // Decode attachment data
+    let encrypted_data = b64.decode(attachment_data_b64)
+        .map_err(|e| format!("Attachment data base64 decode failed: {}", e))?;
+
+    // Decode AES key
+    let key_bytes = b64.decode(key_wrap_b64)
+        .map_err(|e| format!("key_wrap base64 decode failed: {}", e))?;
+
+    // Verify SHA-256 if provided (warn on mismatch but continue, matching JS behavior)
+    if let Some(expected_hash) = cipher_sha256_hex {
+        let mut hasher = Sha256::new();
+        hasher.update(&encrypted_data);
+        let actual_hash = hex::encode(hasher.finalize());
+        if actual_hash != expected_hash {
+            println!("[RUST] decrypt_attachment_pipeline: hash mismatch (expected {}, got {}) — continuing anyway", expected_hash, actual_hash);
+        }
+    }
+
+    // AES-256-GCM decrypt with padding removal
+    let decrypted = crate::crypto::aes_gcm_decrypt_padded(&key_bytes, &encrypted_data)
+        .map_err(|e| format!("Attachment AES decrypt failed: {}", e))?;
+
+    let size = decrypted.len();
+    let data_b64 = b64.encode(&decrypted);
+
+    Ok(crate::types::DecryptedAttachment {
+        id: String::new(), // Caller sets this
+        filename: orig_filename.to_string(),
+        content_type: orig_mime.to_string(),
+        data_b64,
+        size,
+    })
+}
+
+/// Extract binary ciphertext from the email body for signing/verification.
+/// For ASCII-armored bodies: extracts glossia-encoded or base64 payload and decodes to bytes.
+/// For nested reply chains, uses depth-counting to separate each level and concatenates
+/// decoded bytes from all levels (matching the JS signing behavior).
+/// For non-armored bodies: returns the UTF-8 bytes of the body text.
+pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
+    // Use depth-counting parser to properly handle nested reply armor
+    if let Some((body_text, nested_armor)) = parse_armor_depth(body) {
+        if let Some(mut bytes) = decode_armor_section(&body_text) {
+            if let Some(ref nested) = nested_armor {
+                let nested_bytes = extract_ciphertext_binary(nested);
+                println!("[RUST] extract_ciphertext_binary: concatenating {} outer + {} nested bytes",
+                    bytes.len(), nested_bytes.len());
+                bytes.extend_from_slice(&nested_bytes);
+            }
+            return bytes;
+        }
+    }
+
+    // Non-armored body: return UTF-8 bytes
+    println!("[RUST] extract_ciphertext_binary: plain text, {} bytes", body.len());
+    body.as_bytes().to_vec()
+}
+
+/// Verify email signature using binary ciphertext extraction.
+/// Extracts the binary payload from ASCII armor (or uses raw text bytes),
+/// then verifies the schnorr signature against SHA-256(binary).
 pub fn verify_email_signature(sender_pubkey: &str, signature: &str, body: &str) -> bool {
-    // Normalize the body to match what was signed (handle line ending differences)
-    let normalized_body = normalize_body_for_verification(body);
-    println!("[RUST] verify_email_signature: Verifying signature for pubkey: {}, original body length: {}, normalized body length: {}, signature: {}", 
-        sender_pubkey, body.len(), normalized_body.len(), signature);
-    println!("[RUST] verify_email_signature: Original body first 100 chars: {}", body.chars().take(100).collect::<String>());
-    println!("[RUST] verify_email_signature: Normalized body first 100 chars: {}", normalized_body.chars().take(100).collect::<String>());
-    match crypto::verify_signature(sender_pubkey, signature, &normalized_body) {
+    let binary = extract_ciphertext_binary(body);
+    match crypto::verify_signature_bytes(sender_pubkey, signature, &binary) {
         Ok(valid) => {
-            println!("[RUST] verify_email_signature: Signature verification result: {}", valid);
+            println!("[RUST] verify_email_signature: {} ({} bytes)", if valid { "valid" } else { "INVALID" }, binary.len());
             valid
         },
         Err(e) => {
-            println!("[RUST] verify_email_signature: Error verifying signature: {}", e);
+            println!("[RUST] verify_email_signature: error: {}", e);
             false
         }
     }
+}
+
+/// Verify email signature using the in-body SIGNATURE block (primary trust path).
+/// Returns `Some(true/false)` if an inline signature was found, `None` if no inline sig exists.
+pub fn verify_email_signature_inline(body: &str) -> Option<bool> {
+    let parsed = parse_armor_components(body)?;
+    let sig_hex = parsed.signature_hex.as_ref()?;
+    let pubkey_hex = parsed.sig_pubkey_hex.as_ref()?;
+    let binary = extract_ciphertext_binary(body);
+    match crypto::verify_signature_bytes(pubkey_hex, sig_hex, &binary) {
+        Ok(valid) => {
+            println!("[RUST] verify_email_signature_inline: {} ({} bytes, pubkey={}...)",
+                if valid { "valid" } else { "INVALID" }, binary.len(), &pubkey_hex[..8.min(pubkey_hex.len())]);
+            Some(valid)
+        }
+        Err(e) => {
+            println!("[RUST] verify_email_signature_inline: error: {}", e);
+            Some(false)
+        }
+    }
+}
+
+/// Verify email signature trying both in-body (primary) and header (secondary) trust paths.
+/// Returns (signature_valid, signature_source) where source is "body", "header", "both", or None.
+pub fn verify_email_signature_full(body: &str, raw_headers: &str) -> (Option<bool>, Option<String>) {
+    let body_result = verify_email_signature_inline(body);
+
+    let header_result = {
+        let pubkey = extract_nostr_pubkey_from_headers(raw_headers);
+        let sig = extract_nostr_sig_from_headers(raw_headers);
+        match (pubkey, sig) {
+            (Some(pk), Some(s)) => Some(verify_email_signature(&pk, &s, body)),
+            _ => None,
+        }
+    };
+
+    println!("[RUST] verify_email_signature_full: body={:?}, header={:?}", body_result, header_result);
+
+    match (body_result, header_result) {
+        (Some(true), Some(true)) => (Some(true), Some("both".to_string())),
+        (Some(true), _)          => (Some(true), Some("body".to_string())),
+        (_, Some(true))          => (Some(true), Some("header".to_string())),
+        (Some(false), _) | (_, Some(false)) => (Some(false), None),
+        (None, None)             => (None, None),
+    }
+}
+
+/// Recursively verify ALL signatures in an armor body, including nested quoted blocks.
+/// Returns a Vec of verification results ordered innermost-first
+/// (matching the JS verifyAllSignatures convention for DOM h4 matching).
+pub fn verify_all_signatures_inline(body: &str) -> Vec<crate::types::SignatureVerificationResult> {
+    verify_all_signatures_recursive(body, 0)
+}
+
+fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types::SignatureVerificationResult> {
+    let mut results = Vec::new();
+
+    println!("[RUST] verify_all_sigs_recursive: depth={}, body_len={}, preview={:?}",
+        depth, body.len(), &body[..80.min(body.len())]);
+
+    // Parse armor at this level to get sig/pubkey and body type
+    let parsed = match parse_armor_components(body) {
+        Some(p) => p,
+        None => {
+            println!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_components returned None", depth);
+            return results;
+        }
+    };
+
+    println!("[RUST] verify_all_sigs_recursive: depth={}, parsed: body_type={}, has_sig={}, has_pubkey={}, has_quoted={}",
+        depth, parsed.body_type,
+        parsed.signature_hex.is_some(), parsed.sig_pubkey_hex.is_some(),
+        parsed.quoted.is_some());
+
+    // Use parse_armor_depth to get the nested armor text for recursion
+    let depth_result = parse_armor_depth(body);
+    match &depth_result {
+        Some((_body_text, Some(ref nested_armor))) => {
+            println!("[RUST] verify_all_sigs_recursive: depth={}, found nested armor ({} bytes), recursing",
+                depth, nested_armor.len());
+            let inner_results = verify_all_signatures_recursive(nested_armor, depth + 1);
+            println!("[RUST] verify_all_sigs_recursive: depth={}, inner recursion returned {} results",
+                depth, inner_results.len());
+            results.extend(inner_results);
+        }
+        Some((_body_text, None)) => {
+            println!("[RUST] verify_all_sigs_recursive: depth={}, no nested armor (leaf node)", depth);
+        }
+        None => {
+            println!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_depth returned None", depth);
+        }
+    }
+
+    // Verify this level's signature if present
+    let sig_hex = parsed.signature_hex.as_ref();
+    let pubkey_hex = parsed.sig_pubkey_hex.as_ref();
+
+    if let (Some(sig), Some(pk)) = (sig_hex, pubkey_hex) {
+        // extract_ciphertext_binary already concatenates this level's bytes + all nested bytes
+        let binary = extract_ciphertext_binary(body);
+        let is_valid = match crate::crypto::verify_signature_bytes(pk, sig, &binary) {
+            Ok(valid) => {
+                println!("[RUST] verify_all_signatures: depth={}, {} ({} bytes, pubkey={}...)",
+                    depth, if valid { "valid" } else { "INVALID" }, binary.len(),
+                    &pk[..8.min(pk.len())]);
+                valid
+            }
+            Err(e) => {
+                println!("[RUST] verify_all_signatures: depth={}, error: {}", depth, e);
+                false
+            }
+        };
+
+        results.push(crate::types::SignatureVerificationResult {
+            signature_hex: Some(sig.clone()),
+            pubkey_hex: Some(pk.clone()),
+            is_valid,
+            depth,
+            body_type: parsed.body_type.clone(),
+            profile_name: parsed.profile_name.clone(),
+        });
+    } else {
+        println!("[RUST] verify_all_sigs_recursive: depth={}, no sig/pubkey at this level (sig={}, pk={})",
+            depth, sig_hex.is_some(), pubkey_hex.is_some());
+    }
+
+    println!("[RUST] verify_all_sigs_recursive: depth={}, returning {} total results", depth, results.len());
+    results
 }
 
 /// Extract message ID from email headers
@@ -2484,13 +4286,16 @@ pub fn decrypt_nostr_email_content(config: &EmailConfig, raw_headers: &str, subj
     };
     
     // Try to decrypt body - check for both NIP-04 and NIP-44 ASCII armor
-    let decrypted_body = if body.contains("BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE") || body.contains("BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE") {
-        // Remove the ASCII armor if present (handle both NIP-04 and NIP-44)
+    let decrypted_body = if body.contains("BEGIN NOSTR NIP-04 ENCRYPTED") || body.contains("BEGIN NOSTR NIP-44 ENCRYPTED") {
+        // Remove the ASCII armor if present (handle both legacy MESSAGE and new BODY formats)
         let clean_body = body
             .replace("-----BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE-----", "")
             .replace("-----END NOSTR NIP-04 ENCRYPTED MESSAGE-----", "")
             .replace("-----BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE-----", "")
             .replace("-----END NOSTR NIP-44 ENCRYPTED MESSAGE-----", "")
+            .replace("-----BEGIN NOSTR NIP-04 ENCRYPTED BODY-----", "")
+            .replace("-----BEGIN NOSTR NIP-44 ENCRYPTED BODY-----", "")
+            .replace("-----END NOSTR MESSAGE-----", "")
             .trim()
             .to_string();
         
@@ -2718,6 +4523,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(result.is_ok());
@@ -2738,6 +4544,7 @@ mod tests {
             "Body",
             None,
             Some("<custom-id@example.com>"),
+            None,
             None,
         );
 
@@ -2764,6 +4571,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(result.is_ok());
@@ -2785,6 +4593,7 @@ mod tests {
             None,
             None,
             Some(&empty_attachments),
+            None,
         );
 
         assert!(result.is_ok());
@@ -2815,6 +4624,7 @@ mod tests {
             None,
             None,
             Some(&attachments),
+            None,
         );
 
         assert!(result.is_ok());
@@ -2847,11 +4657,490 @@ mod tests {
     fn test_detect_encryption_format_unknown_plain_text() {
         assert_eq!(crypto::detect_encryption_format("Hello, world!"), "unknown");
     }
+
+    // =====================
+    // extract_ciphertext_binary with glossia
+    // =====================
+
+    #[test]
+    fn test_extract_ciphertext_binary_glossia_in_armor() {
+        // Encode known bytes through glossia, wrap in armor, verify round-trip
+        let original_bytes: Vec<u8> = (0..32).collect(); // 32 bytes of test data
+        let hex_input = glossia::hex_encode(&original_bytes);
+
+        // Encode through glossia pipeline (english/bip39/body dialect)
+        let (encoded, _used, _payload_words, _mode) = glossia::encode_into_language(
+            &hex_input, "english", "bip39", "body",
+            None, 42, false, None, None, None, None,
+        ).expect("glossia encode should succeed");
+
+        // Wrap in armor block (matching frontend format: ----- BEGIN ... -----)
+        let armored = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n{}\n----- END NOSTR NIP-44 ENCRYPTED BODY -----",
+            encoded
+        );
+
+        let result = extract_ciphertext_binary(&armored);
+        assert_eq!(result, original_bytes,
+            "glossia-encoded armored body should decode back to original bytes");
+    }
+
+    #[test]
+    fn test_extract_ciphertext_binary_plain_text_fallback() {
+        // Non-armored body returns UTF-8 bytes
+        let body = "Hello, this is a plain text email body";
+        let result = extract_ciphertext_binary(body);
+        assert_eq!(result, body.as_bytes().to_vec());
+    }
+
+    #[test]
+    fn test_try_glossia_decode_rejects_base64() {
+        // Base64 strings should not match glossia wordlists (hit_rate < 0.3)
+        let b64 = "SGVsbG8gV29ybGQhIFRoaXMgaXMgYSB0ZXN0IG1lc3NhZ2U=";
+        assert!(try_glossia_decode_to_bytes(b64).is_none(),
+            "base64 should not be detected as glossia");
+    }
+
+    #[test]
+    fn test_extract_armor_body_content_with_combined_signature() {
+        // New format: combined SIGNATURE block with sig + pubkey, no separate SEAL
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            some glossia words here\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @alice\n\
+            signature words pubkey words\n\
+            ----- END NOSTR MESSAGE -----";
+        let content = extract_armor_body_content(body).unwrap();
+        assert_eq!(content, "some glossia words here",
+            "should extract only body content, not signature block");
+    }
+
+    #[test]
+    fn test_extract_armor_body_content_with_legacy_signature_seal() {
+        // Legacy format: separate SIGNATURE and SEAL blocks
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            some glossia words here\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @alice\n\
+            signature words\n\
+            ----- BEGIN NOSTR SEAL -----\n\
+            @bob\n\
+            pubkey words\n\
+            ----- END NOSTR MESSAGE -----";
+        let content = extract_armor_body_content(body).unwrap();
+        assert_eq!(content, "some glossia words here",
+            "should extract only body content, not sig/seal blocks (legacy format)");
+    }
+
+    #[test]
+    fn test_extract_armor_body_content_base64() {
+        let b64 = general_purpose::STANDARD.encode(&[1u8, 2, 3, 4, 5]);
+        let body = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n{}\n----- END NOSTR MESSAGE -----",
+            b64
+        );
+        let content = extract_armor_body_content(&body).unwrap();
+        assert_eq!(content, b64, "should cleanly extract base64 content");
+    }
+
+    #[test]
+    fn test_extract_ciphertext_binary_base64_armor() {
+        // Base64 armor should now work correctly with the new parser
+        let original_bytes = vec![1u8, 2, 3, 4, 5];
+        let b64 = general_purpose::STANDARD.encode(&original_bytes);
+        let body = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n{}\n----- END NOSTR MESSAGE -----",
+            b64
+        );
+        let result = extract_ciphertext_binary(&body);
+        assert_eq!(result, original_bytes);
+    }
+
+    #[test]
+    fn test_extract_ciphertext_binary_glossia_with_combined_signature() {
+        // Full signed email: glossia body should decode correctly with combined signature block
+        let original_bytes: Vec<u8> = (0..32).collect();
+        let hex_input = glossia::hex_encode(&original_bytes);
+        let (encoded, _, _, _) = glossia::encode_into_language(
+            &hex_input, "english", "bip39", "body",
+            None, 42, false, None, None, None, None,
+        ).expect("glossia encode should succeed");
+
+        let body = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            {}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @alice\n\
+            some signature words some pubkey words\n\
+            ----- END NOSTR MESSAGE -----",
+            encoded
+        );
+
+        let result = extract_ciphertext_binary(&body);
+        assert_eq!(result, original_bytes,
+            "glossia body should decode correctly with combined signature block");
+    }
+
+    // =============================================
+    // parse_armor_components tests
+    // =============================================
+
+    #[test]
+    fn test_parse_armor_components_encrypted_nip44() {
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert_eq!(result.body_type, "encrypted");
+        assert_eq!(result.encryption_nip.as_deref(), Some("nip44"));
+        assert_eq!(result.body_text, "SGVsbG8gV29ybGQ=");
+        assert!(result.signature_hex.is_none());
+        assert!(result.seal_pubkey_hex.is_none());
+        assert!(result.prefix_text.is_none());
+        assert!(result.quoted.is_none());
+    }
+
+    #[test]
+    fn test_parse_armor_components_encrypted_nip04() {
+        let body = "----- BEGIN NOSTR NIP-04 ENCRYPTED BODY -----\n\
+            SGVsbG8=?iv=dGVzdA==\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert_eq!(result.body_type, "encrypted");
+        assert_eq!(result.encryption_nip.as_deref(), Some("nip04"));
+    }
+
+    #[test]
+    fn test_parse_armor_components_signed_body() {
+        let body = "----- BEGIN NOSTR SIGNED BODY -----\n\
+            some glossia encoded text here\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert_eq!(result.body_type, "signed");
+        assert!(result.encryption_nip.is_none());
+        assert_eq!(result.body_text, "some glossia encoded text here");
+    }
+
+    #[test]
+    fn test_parse_armor_components_with_hex_signature() {
+        // 64-byte sig (128 hex) + 32-byte pubkey (64 hex) = 192 hex total
+        let sig_hex = "aa".repeat(64);   // 128 hex chars
+        let pub_hex = "bb".repeat(32);   // 64 hex chars
+        let combined = format!("{}{}", sig_hex, pub_hex);
+
+        let body = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n\
+            {}\n\
+            ----- END NOSTR MESSAGE -----",
+            combined
+        );
+
+        let result = parse_armor_components(&body).expect("should parse");
+        assert_eq!(result.body_type, "encrypted");
+        assert_eq!(result.signature_hex.as_deref(), Some(sig_hex.as_str()));
+        assert_eq!(result.sig_pubkey_hex.as_deref(), Some(pub_hex.as_str()));
+        assert_eq!(result.profile_name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn test_parse_armor_components_with_seal() {
+        let pub_hex = "cc".repeat(32); // 64 hex chars
+        let body = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8=\n\
+            ----- BEGIN NOSTR SEAL -----\n\
+            @Bob\n\
+            {}\n\
+            ----- END NOSTR MESSAGE -----",
+            pub_hex
+        );
+
+        let result = parse_armor_components(&body).expect("should parse");
+        assert_eq!(result.seal_pubkey_hex.as_deref(), Some(pub_hex.as_str()));
+        assert_eq!(result.display_name.as_deref(), Some("Bob"));
+        assert!(result.signature_hex.is_none());
+    }
+
+    #[test]
+    fn test_parse_armor_components_legacy_separate_seal() {
+        // Legacy format: SIGNATURE block followed by separate SEAL block
+        let sig_hex = "aa".repeat(64);
+        let sig_pub_hex = "bb".repeat(32);
+        let seal_pub_hex = "cc".repeat(32);
+        let combined_sig = format!("{}{}", sig_hex, sig_pub_hex);
+
+        let body = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8=\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n\
+            {}\n\
+            ----- BEGIN NOSTR SEAL -----\n\
+            @Bob\n\
+            {}\n\
+            ----- END NOSTR MESSAGE -----",
+            combined_sig, seal_pub_hex
+        );
+
+        let result = parse_armor_components(&body).expect("should parse");
+        assert_eq!(result.signature_hex.as_deref(), Some(sig_hex.as_str()));
+        assert_eq!(result.sig_pubkey_hex.as_deref(), Some(sig_pub_hex.as_str()));
+        assert_eq!(result.profile_name.as_deref(), Some("Alice"));
+        assert_eq!(result.seal_pubkey_hex.as_deref(), Some(seal_pub_hex.as_str()));
+        assert_eq!(result.display_name.as_deref(), Some("Bob"));
+    }
+
+    #[test]
+    fn test_parse_armor_components_prefix_text() {
+        let body = "Hello, this is plaintext.\n\n\
+            ----- BEGIN NOSTR SIGNED BODY -----\n\
+            glossia content\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert_eq!(result.prefix_text.as_deref(), Some("Hello, this is plaintext."));
+        assert_eq!(result.body_type, "signed");
+    }
+
+    #[test]
+    fn test_parse_armor_components_no_armor() {
+        let body = "Just a plain email with no armor blocks.";
+        assert!(parse_armor_components(body).is_none());
+    }
+
+    #[test]
+    fn test_parse_armor_components_nested_reply() {
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            reply_ciphertext_here\n\
+            ----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            original_ciphertext_here\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @OriginalAuthor\n\
+            aabbccdd\n\
+            ----- END NOSTR MESSAGE -----\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @ReplyAuthor\n\
+            eeff0011\n\
+            ----- END NOSTR MESSAGE -----";
+
+        let result = parse_armor_components(body).expect("should parse outer");
+        assert_eq!(result.body_text, "reply_ciphertext_here");
+        assert_eq!(result.profile_name.as_deref(), Some("ReplyAuthor"));
+
+        // Check nested quoted message
+        assert!(result.quoted.is_some());
+        assert!(result.quoted_armor_text.is_some());
+        let inner = result.quoted.as_ref().unwrap();
+        assert_eq!(inner.body_text, "original_ciphertext_here");
+        assert_eq!(inner.profile_name.as_deref(), Some("OriginalAuthor"));
+        assert_eq!(inner.body_type, "encrypted");
+    }
+
+    #[test]
+    fn test_parse_armor_components_body_bytes_base64() {
+        // Base64 body should decode to bytes and be returned as base64 in body_bytes_b64
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        let result = parse_armor_components(body).expect("should parse");
+        assert!(result.body_bytes_b64.is_some());
+        // "SGVsbG8gV29ybGQ=" decodes to "Hello World"
+        let decoded = general_purpose::STANDARD.decode(result.body_bytes_b64.unwrap()).unwrap();
+        assert_eq!(std::str::from_utf8(&decoded).unwrap(), "Hello World");
+    }
+
+    #[test]
+    fn test_decode_sig_and_pubkey_combined_hex() {
+        // Phase 1: combined 192-char hex (backward compat)
+        let sig = "aa".repeat(64);
+        let pubkey = "bb".repeat(32);
+        let combined = format!("{}{}", sig, pubkey);
+        let (s, p) = decode_sig_and_pubkey(&combined).expect("should split");
+        assert_eq!(s, sig);
+        assert_eq!(p, pubkey);
+    }
+
+    #[test]
+    fn test_decode_sig_and_pubkey_too_short() {
+        assert!(decode_sig_and_pubkey("aabb").is_none());
+    }
+
+    #[test]
+    fn test_decode_sig_and_pubkey_last_line_npub() {
+        // Phase 3: last-line heuristic with npub
+        let sig = "aa".repeat(64);
+        let npub = "npub17umm7nnvf6y2dse2gwyklhq0p9daeqzn6edp523fzfd5utj2upcsm6zk5r";
+        let content = format!("{}\n{}", sig, npub);
+        let (s, p) = decode_sig_and_pubkey(&content).expect("should split");
+        assert_eq!(s, sig);
+        assert_eq!(p.len(), 64);
+    }
+
+    #[test]
+    fn test_try_decode_as_pubkey_npub() {
+        let npub = "npub17umm7nnvf6y2dse2gwyklhq0p9daeqzn6edp523fzfd5utj2upcsm6zk5r";
+        let hex = try_decode_as_pubkey(npub).expect("should decode");
+        assert_eq!(hex.len(), 64);
+    }
+
+    #[test]
+    fn test_try_decode_as_pubkey_hex() {
+        let pk = "bb".repeat(32);
+        let hex = try_decode_as_pubkey(&pk).expect("should decode");
+        assert_eq!(hex, pk);
+    }
+
+    #[test]
+    fn test_try_decode_as_signature_hex() {
+        let sig = "aa".repeat(64);
+        let hex = try_decode_as_signature(&sig).expect("should decode");
+        assert_eq!(hex, sig);
+    }
+
+    #[test]
+    fn test_parse_armor_components_body_bytes_match_extract_ciphertext() {
+        // Critical test: verify that body_bytes_b64 decoded matches extract_ciphertext_binary
+        // for the same input (ensuring signature verification compatibility)
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        let parsed = parse_armor_components(body).expect("should parse");
+        let parsed_bytes = general_purpose::STANDARD.decode(parsed.body_bytes_b64.unwrap()).unwrap();
+        let extract_bytes = extract_ciphertext_binary(body);
+        assert_eq!(parsed_bytes, extract_bytes,
+            "parse_armor_components body bytes must match extract_ciphertext_binary output");
+    }
+
+
+
+    // ── Decrypt pipeline tests ──────────────────────────────────
+
+    #[test]
+    fn test_is_base64_content() {
+        assert!(is_base64_content("SGVsbG8gV29ybGQ="));
+        assert!(is_base64_content("abc123+/=="));
+        assert!(is_base64_content("abc?iv=def")); // NIP-04 format
+        // Note: is_base64_content strips whitespace first (matching JS behavior),
+        // so it only rejects content with non-base64 chars like punctuation
+        assert!(!is_base64_content("Access are acoustic to crawl.")); // period
+        assert!(!is_base64_content("Hello, world!")); // comma and exclamation
+        assert!(!is_base64_content("")); // empty
+    }
+
+    #[test]
+    fn test_is_likely_encrypted_content() {
+        assert!(is_likely_encrypted_content("SGVsbG8gV29ybGQgdGhpcyBpcyBhIHRlc3Q="));
+        assert!(is_likely_encrypted_content("abc123def456ghi789jkl0mn+/=="));
+        assert!(!is_likely_encrypted_content("Re: Meeting tomorrow"));
+        assert!(!is_likely_encrypted_content("short"));
+        assert!(!is_likely_encrypted_content("user@example.com sent a message"));
+    }
+
+    #[test]
+    fn test_glossia_postprocess_hex_nip44() {
+        // Hex input for NIP-44 → base64 output
+        let hex = "48656c6c6f"; // "Hello" in hex
+        let result = glossia_postprocess(hex, "nip44").unwrap();
+        assert_eq!(result, "SGVsbG8="); // base64 of "Hello"
+    }
+
+    #[test]
+    fn test_glossia_postprocess_non_hex() {
+        // Non-hex input → returned as-is
+        let b64 = "SGVsbG8gV29ybGQ=";
+        let result = glossia_postprocess(b64, "nip44").unwrap();
+        assert_eq!(result, b64);
+    }
+
+    #[test]
+    fn test_glossia_postprocess_hex_nip04_unpack() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // Build NIP-04 packed format: [len_hi, len_lo, payload..., iv(16 bytes)]
+        let payload = b"encrypted_data!!"; // 16 bytes
+        let iv = b"0123456789abcdef"; // 16 bytes
+        let payload_len = payload.len() as u16;
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&payload_len.to_be_bytes());
+        packed.extend_from_slice(payload);
+        packed.extend_from_slice(iv);
+
+        let hex: String = packed.iter().map(|b| format!("{:02x}", b)).collect();
+        let result = glossia_postprocess(&hex, "nip04").unwrap();
+
+        // Should be base64(payload)?iv=base64(iv)
+        let expected = format!("{}?iv={}", b64.encode(payload), b64.encode(iv));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_glossia_decode_to_ciphertext_base64_passthrough() {
+        let b64 = "SGVsbG8gV29ybGQ=";
+        let result = glossia_decode_to_ciphertext(b64, "nip44").unwrap();
+        assert_eq!(result, b64);
+    }
+
+    #[test]
+    fn test_glossia_decode_to_ciphertext_nip04_passthrough() {
+        let nip04 = "SGVsbG8=?iv=V29ybGQ=";
+        let result = glossia_decode_to_ciphertext(nip04, "nip04").unwrap();
+        assert_eq!(result, nip04);
+    }
+
+    #[test]
+    fn test_determine_decrypt_pubkey_uses_seal() {
+        let seal = "aa".repeat(32); // 64 hex chars
+        let user = "bb".repeat(32);
+        let result = determine_decrypt_pubkey(None, Some(&seal), &user, "").unwrap();
+        assert_eq!(result, seal);
+    }
+
+    #[test]
+    fn test_determine_decrypt_pubkey_self_send_uses_fallback() {
+        let same = "aa".repeat(32);
+        let fallback = "cc".repeat(32);
+        let result = determine_decrypt_pubkey(None, Some(&same), &same, &fallback).unwrap();
+        assert_eq!(result, fallback);
+    }
+
+    #[test]
+    fn test_determine_decrypt_pubkey_prefers_seal_over_sig() {
+        let seal = "aa".repeat(32);
+        let sig = "bb".repeat(32);
+        let user = "cc".repeat(32);
+        let result = determine_decrypt_pubkey(Some(&sig), Some(&seal), &user, "").unwrap();
+        assert_eq!(result, seal);
+    }
+
+    #[test]
+    fn test_decrypt_single_block_non_encrypted() {
+        let (block, manifest) = decrypt_single_block(
+            "Hello world",
+            "plain",
+            None, None, None, None,
+            "nsec1fake", "aabb", "",
+        );
+        assert!(!block.was_encrypted);
+        assert_eq!(block.decrypted_text.as_deref(), Some("Hello world"));
+        assert!(manifest.is_none());
+    }
+
+    #[test]
+    fn test_json_manifest_parse() {
+        let json = r#"{"body":{"ciphertext":"dGVzdA==","cipher_sha256":"abc123","key_wrap":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},"attachments":[{"id":"a1","orig_filename":"test.pdf","orig_mime":"application/pdf","cipher_sha256":"def456","cipher_size":65536,"key_wrap":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}]}"#;
+        let manifest: JsonManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.body.is_some());
+        assert_eq!(manifest.attachments.as_ref().unwrap().len(), 1);
+        assert_eq!(manifest.attachments.as_ref().unwrap()[0].id, "a1");
+        assert_eq!(manifest.attachments.as_ref().unwrap()[0].orig_filename, "test.pdf");
+    }
 }
 
 pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database::Database) -> Result<Vec<EmailMessage>> {
     use chrono::Utc;
-    use crate::email::extract_nostr_pubkey_from_headers;
+    use crate::email::extract_sender_pubkey_with_armor_fallback;
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -2902,15 +5191,8 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now());
-                        let body_text = if let Some(body_part) = email.subparts.first() {
-                            if let Ok(body_content) = body_part.get_body() {
-                                body_content
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            }
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        };
+                        let body_text = extract_text_body(&email)
+                            .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
                         // Only keep Nostr emails
                         if raw_headers.contains("X-Nostr-Pubkey:") {
@@ -2918,19 +5200,10 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
                                 Err(_) => (subject.clone(), body_text.clone()),
                             };
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             
-                            // Verify signature if present - signature is created on the encrypted body, so verify against body_text
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None // No signature present
-                                }
-                            } else {
-                                None // No pubkey, can't verify
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             let email_message = EmailMessage {
                                 id: _email_id.to_string(),
                                 from,
@@ -2938,6 +5211,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 subject,
                                 body: _final_body.clone(),
                                 raw_body: _final_body.clone(),
+                                html_body: extract_html_body(&email),
                                 date,
                                 is_read: true,
                                 raw_headers: raw_headers.clone(),
@@ -2945,6 +5219,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                 recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                                 message_id: extract_message_id_from_headers(&raw_headers),
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: None, // Not verified in this path
                             };
                             emails.push(email_message);
@@ -2989,34 +5264,18 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             let raw_headers = email.headers.iter().map(|h| format!("{}: {}", h.get_key(), h.get_value())).collect::<Vec<_>>().join("\n");
                             if raw_headers.contains("X-Nostr-Pubkey:") {
                                 let (_final_subject, _final_body) = match decrypt_nostr_email_content(config, &raw_headers, &subject, &body_text) {
                                     Ok((dec_subject, dec_body)) => (dec_subject, dec_body),
                                     Err(_) => (subject.clone(), body_text.clone()),
                                 };
-                                let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                                let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                                 
-                                // Verify signature if present
-                                let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                    if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                        Some(verify_email_signature(pubkey, &sig, &_final_body))
-                                    } else {
-                                        None // No signature present
-                                    }
-                                } else {
-                                    None // No pubkey, can't verify
-                                };
-                                
+                                let (signature_valid, signature_source) = verify_email_signature_full(&_final_body, &raw_headers);
+
                                 let email_message = EmailMessage {
                                     id: _email_id.to_string(),
                                     from,
@@ -3024,6 +5283,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                     subject,
                                     body: _final_body.clone(),
                                     raw_body: _final_body.clone(),
+                                    html_body: extract_html_body(&email),
                                     date,
                                     is_read: true,
                                     raw_headers: raw_headers.clone(),
@@ -3031,6 +5291,7 @@ pub async fn fetch_nostr_emails_smart(config: &EmailConfig, db: &crate::database
                                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                                     message_id: extract_message_id_from_headers(&raw_headers),
                                     signature_valid,
+                                    signature_source,
                                     transport_auth_verified: None, // Not verified in this path
                                 };
                                 emails.push(email_message);
@@ -3170,7 +5431,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 subject: email.subject.clone(), // still encrypted
                 body: email.body.clone(),       // still encrypted
                 body_plain: None,
-                body_html: None,
+                body_html: email.html_body.clone(),
                 received_at: email.date,
                 is_nostr_encrypted: true,
                 sender_pubkey: email.sender_pubkey.clone(),
@@ -3181,7 +5442,9 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 updated_at: Some(chrono::Utc::now()),
                 created_at: existing_email.created_at, // Preserve original creation date
                 signature_valid: email.signature_valid,
+                signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
+                subject_hash: None,
             };
             db.save_email(&updated_email)?;
             println!("[RUST] Updated existing email in DB: message_id={}", email.message_id);
@@ -3196,7 +5459,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 subject: email.subject.clone(), // still encrypted
                 body: email.body.clone(),       // still encrypted
                 body_plain: None,
-                body_html: None,
+                body_html: email.html_body.clone(),
                 received_at: email.date,
                 is_nostr_encrypted: true,
                 sender_pubkey: email.sender_pubkey.clone(),
@@ -3207,7 +5470,9 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 updated_at: None,
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
+                signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
+                subject_hash: None,
             };
             println!("[RUST] Saving email to DB: message_id={}", email.message_id);
             let email_id = db.save_email(&db_email)?;
@@ -3262,11 +5527,22 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
 } 
 
 pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyhow::Result<usize> {
-    
+
     println!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
-    // Fetch latest sent email date from DB using the user's email address
-    let latest = db.get_latest_sent_email_received_at(Some(&config.email_address))?;
-    println!("[RUST] sync_sent_emails_to_db: Latest sent email date: {:?}", latest);
+    // Use the last successful sync timestamp, falling back to the latest sent email date
+    let sync_timestamp = chrono::Utc::now();
+    let latest = match db.get_last_sync_at(&config.email_address, "sent")? {
+        Some(dt) => {
+            println!("[RUST] sync_sent_emails_to_db: Last sent sync at: {:?}", dt);
+            Some(dt)
+        }
+        None => {
+            // First sync with new timestamp tracking — fall back to latest email date
+            let fallback = db.get_latest_sent_email_received_at(Some(&config.email_address))?;
+            println!("[RUST] sync_sent_emails_to_db: No sync timestamp found, falling back to latest sent email date: {:?}", fallback);
+            fallback
+        }
+    };
     
     // Fetch new sent Nostr emails from IMAP (raw, not decrypted)
     // Sync from most recent email sent onward
@@ -3315,7 +5591,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                     subject: email.subject.clone(), // Update with IMAP subject (might be more recent)
                     body: email.body.clone(),       // Update with IMAP body (might be more recent)
                     body_plain: existing_email.body_plain.clone(), // Preserve decrypted body if exists
-                    body_html: existing_email.body_html.clone(),   // Preserve HTML if exists
+                    body_html: existing_email.body_html.clone().or_else(|| email.html_body.clone()), // Preserve HTML if exists, otherwise use IMAP HTML
                     received_at: email.date, // Update with IMAP date
                     is_nostr_encrypted: true,
                     sender_pubkey: email.sender_pubkey.clone(),
@@ -3326,7 +5602,9 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                     updated_at: Some(chrono::Utc::now()),
                     created_at: existing_email.created_at, // Preserve original creation time
                     signature_valid: email.signature_valid,
+                    signature_source: email.signature_source.clone(),
                     transport_auth_verified: email.transport_auth_verified,
+                    subject_hash: None,
                 };
                 match db.save_email(&updated_email) {
                     Ok(id) => println!("[RUST] Updated existing email with IMAP data, id: {}", id),
@@ -3349,7 +5627,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                 subject: email.subject.clone(), // still encrypted
                 body: email.body.clone(),       // still encrypted
                 body_plain: None,
-                body_html: None,
+                body_html: email.html_body.clone(),
                 received_at: email.date,
                 is_nostr_encrypted: true,
                 sender_pubkey: email.sender_pubkey.clone(),
@@ -3360,9 +5638,11 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                 updated_at: None,
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
+                signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
+                subject_hash: None,
             };
-            println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}", 
+            println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}",
                 db_email.message_id, db_email.from_address, db_email.to_address, 
                 db_email.subject.len(), db_email.body.len());
             let email_id = match db.insert_email_direct(&db_email) {
@@ -3426,9 +5706,13 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
             }
         }
     }
-    println!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved", new_count);
+    // Save the sync timestamp so the next sync starts from this point in time
+    if let Err(e) = db.set_last_sync_at(&config.email_address, "sent", sync_timestamp) {
+        println!("[RUST] sync_sent_emails_to_db: Warning: failed to save sync timestamp: {}", e);
+    }
+    println!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved (sync timestamp: {})", new_count, sync_timestamp);
     Ok(new_count)
-} 
+}
 
 pub struct RawNostrEmail {
     pub message_id: String,
@@ -3436,12 +5720,14 @@ pub struct RawNostrEmail {
     pub to: String,
     pub subject: String,
     pub body: String,
+    pub html_body: Option<String>,
     pub date: chrono::DateTime<chrono::Utc>,
     pub sender_pubkey: Option<String>,
     pub recipient_pubkey: Option<String>,
     pub raw_headers: String,
     pub attachments: Vec<crate::database::Attachment>, // Attachments extracted from email (in encrypted form)
     pub signature_valid: Option<bool>,
+    pub signature_source: Option<String>,
     pub transport_auth_verified: Option<bool>,
 }
 
@@ -3449,7 +5735,7 @@ pub struct RawNostrEmail {
 async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>, sync_cutoff_days: Option<i64>, folder_name: &str) -> anyhow::Result<Vec<RawNostrEmail>> {
     use chrono::Utc;
     use mailparse::parse_mail;
-    use crate::email::extract_nostr_pubkey_from_headers;
+    use crate::email::extract_sender_pubkey_with_armor_fallback;
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -3485,16 +5771,17 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
             }
         };
         
-        let date_filter = if latest.is_some() {
-            let unix_timestamp = cutoff.timestamp() - 3600; // 1 hour buffer
-            format!(" AND after:{}", unix_timestamp)
+        let cutoff_with_buffer = cutoff - chrono::Duration::hours(1);
+        let since_filter = if latest.is_some() {
+            let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+            format!(" SINCE {}", since_date)
         } else {
             String::new()
         };
-        
+
         let search_terms = vec![
-            format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
-            format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
+            format!("TEXT \"BEGIN NOSTR\"{}", since_filter),
+            format!("HEADER X-Nostr-Pubkey \"\"{}", since_filter),
         ];
         
         let mut all_emails = Vec::new();
@@ -3526,42 +5813,16 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now());
-                        let body_text = if let Some(body_part) = email.subparts.first() {
-                            if let Ok(body_content) = body_part.get_body() {
-                                body_content
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            }
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        };
+                        let body_text = extract_text_body(&email)
+                            .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                        let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                        let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                         
-                        // Debug: Log body content for signature verification
-                        println!("[RUST] fetch_nostr_emails_from_folder: Body text length: {}, first 100 chars: {}, last 100 chars: {}", 
-                            body_text.len(), 
-                            body_text.chars().take(100).collect::<String>(),
-                            body_text.chars().rev().take(100).collect::<String>().chars().rev().collect::<String>());
-                        println!("[RUST] fetch_nostr_emails_from_folder: Body contains \\n: {}, contains \\r\\n: {}", 
-                            body_text.contains('\n'), body_text.contains("\r\n"));
-                        
-                        let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                            if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                println!("[RUST] fetch_nostr_emails_from_folder: Found signature, verifying...");
-                                Some(verify_email_signature(pubkey, &sig, &body_text))
-                            } else {
-                                println!("[RUST] fetch_nostr_emails_from_folder: No signature found in headers");
-                                None
-                            }
-                        } else {
-                            println!("[RUST] fetch_nostr_emails_from_folder: No sender pubkey found");
-                            None
-                        };
-                        
+                        let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                         let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                        
+
                         // Verify transport authentication
                         let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                             .unwrap_or_else(|e| TransportAuthVerdict {
@@ -3569,25 +5830,27 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                                 method: TransportAuthMethod::None,
                                 reason: format!("Error verifying transport auth: {}", e),
                             });
-                        
+
                         // Skip emails that fail transport authentication
                         if !transport_auth.transport_verified {
                             println!("[RUST] fetch_nostr_emails_from_folder: Email {} failed transport authentication: {}", message_id, transport_auth.reason);
                             continue;
                         }
-                        
+
                         all_emails.push(RawNostrEmail {
                             message_id,
                             from,
                             to,
                             subject,
                             body: body_text,
+                            html_body: extract_html_body(&email),
                             date,
                             sender_pubkey: sender_pubkey.clone(),
                             recipient_pubkey: None,
                             raw_headers,
                             attachments: extracted_attachments,
                             signature_valid,
+                            signature_source,
                             transport_auth_verified: Some(transport_auth.transport_verified),
                         });
                     }
@@ -3640,31 +5903,16 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                     let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now());
-                    let body_text = if let Some(body_part) = email.subparts.first() {
-                        if let Ok(body_content) = body_part.get_body() {
-                            body_content
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        }
-                    } else {
-                        email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                    };
+                    let body_text = extract_text_body(&email)
+                        .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                     
                     let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                    let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                    let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                     
-                    let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                        if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                            Some(verify_email_signature(pubkey, &sig, &body_text))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    
+                    let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                     let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                    
+
                     // Verify transport authentication
                     let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                         .unwrap_or_else(|e| TransportAuthVerdict {
@@ -3672,25 +5920,27 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             method: TransportAuthMethod::None,
                             reason: format!("Error verifying transport auth: {}", e),
                         });
-                    
+
                     // Skip emails that fail transport authentication
                     if !transport_auth.transport_verified {
                         println!("[RUST] fetch_nostr_emails_from_folder (non-Gmail): Email {} failed transport authentication: {}", message_id, transport_auth.reason);
                         continue;
                     }
-                    
+
                     emails.push(RawNostrEmail {
                         message_id,
                         from,
                         to,
                         subject,
                         body: body_text,
+                            html_body: extract_html_body(&email),
                         date,
                         sender_pubkey: sender_pubkey.clone(),
                         recipient_pubkey: None,
                         raw_headers,
                         attachments: extracted_attachments,
                         signature_valid,
+                        signature_source,
                         transport_auth_verified: Some(transport_auth.transport_verified),
                     });
                 }
@@ -3725,16 +5975,17 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                 }
             };
             
-            let date_filter = if latest.is_some() {
-                let unix_timestamp = cutoff.timestamp() - 3600; // 1 hour buffer
-                format!(" AND after:{}", unix_timestamp)
+            let cutoff_with_buffer = cutoff - chrono::Duration::hours(1);
+            let since_filter = if latest.is_some() {
+                let since_date = cutoff_with_buffer.format("%d-%b-%Y").to_string();
+                format!(" SINCE {}", since_date)
             } else {
                 String::new()
             };
-            
+
             let search_terms = vec![
-                format!("X-GM-RAW \"BEGIN NOSTR NIP-{}\"", date_filter),
-                format!("X-GM-RAW \"END NOSTR NIP-{}\"", date_filter),
+                format!("TEXT \"BEGIN NOSTR\"{}", since_filter),
+                format!("HEADER X-Nostr-Pubkey \"\"{}", since_filter),
             ];
             
             let mut all_emails = Vec::new();
@@ -3766,31 +6017,16 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                            
+
                             // Verify transport authentication
                             let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                                 .unwrap_or_else(|e| TransportAuthVerdict {
@@ -3798,25 +6034,27 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                                     method: TransportAuthMethod::None,
                                     reason: format!("Error verifying transport auth: {}", e),
                                 });
-                            
+
                             // Skip emails that fail transport authentication
                             if !transport_auth.transport_verified {
                                 println!("[RUST] fetch_nostr_emails_from_folder: Email {} failed transport authentication: {}", message_id, transport_auth.reason);
                                 continue;
                             }
-                            
+
                             all_emails.push(RawNostrEmail {
                                 message_id,
                                 from,
                                 to,
                                 subject,
                                 body: body_text,
+                            html_body: extract_html_body(&email),
                                 date,
                                 sender_pubkey: sender_pubkey.clone(),
                                 recipient_pubkey: None,
                                 raw_headers,
                                 attachments: extracted_attachments,
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: Some(transport_auth.transport_verified),
                             });
                         }
@@ -3869,31 +6107,16 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now());
-                        let body_text = if let Some(body_part) = email.subparts.first() {
-                            if let Ok(body_content) = body_part.get_body() {
-                                body_content
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            }
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        };
+                        let body_text = extract_text_body(&email)
+                            .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                        let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                        let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                         
-                        let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                            if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                Some(verify_email_signature(pubkey, &sig, &body_text))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        
+                        let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                         let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                        
+
                         // Verify transport authentication
                         let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                             .unwrap_or_else(|e| TransportAuthVerdict {
@@ -3901,25 +6124,27 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
                                 method: TransportAuthMethod::None,
                                 reason: format!("Error verifying transport auth: {}", e),
                             });
-                        
+
                         // Skip emails that fail transport authentication
                         if !transport_auth.transport_verified {
                             println!("[RUST] fetch_nostr_emails_from_folder (non-Gmail): Email {} failed transport authentication: {}", message_id, transport_auth.reason);
                             continue;
                         }
-                        
+
                         emails.push(RawNostrEmail {
                             message_id,
                             from,
                             to,
                             subject,
                             body: body_text,
+                            html_body: extract_html_body(&email),
                             date,
                             sender_pubkey: sender_pubkey.clone(),
                             recipient_pubkey: None,
                             raw_headers,
                             attachments: extracted_attachments,
                             signature_valid,
+                            signature_source,
                             transport_auth_verified: Some(transport_auth.transport_verified),
                         });
                     }
@@ -3933,7 +6158,7 @@ async fn fetch_nostr_emails_from_folder(config: &EmailConfig, latest: Option<chr
 async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>, sync_cutoff_days: Option<i64>) -> anyhow::Result<Vec<RawNostrEmail>> {
     use chrono::Utc;
     use mailparse::parse_mail;
-    use crate::email::extract_nostr_pubkey_from_headers;
+    use crate::email::extract_sender_pubkey_with_armor_fallback;
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -3963,12 +6188,14 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                     to: em.to,
                     subject: em.subject,
                     body: em.body,
+                    html_body: em.html_body,
                     date: em.date,
                     sender_pubkey: em.sender_pubkey.clone(),
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     raw_headers: em.raw_headers,
                     attachments,
                     signature_valid: em.signature_valid,
+                    signature_source: em.signature_source,
                     transport_auth_verified: em.transport_auth_verified,
                 }
             }).collect()
@@ -4002,15 +6229,8 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                         let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(|_| Utc::now());
-                        let body_text = if let Some(body_part) = email.subparts.first() {
-                            if let Ok(body_content) = body_part.get_body() {
-                                body_content
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            }
-                        } else {
-                            email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                        };
+                        let body_text = extract_text_body(&email)
+                            .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                         let raw_headers = email.headers.iter()
                             .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
                             .collect::<Vec<_>>()
@@ -4020,31 +6240,24 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                         let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
                         println!("[RUST] fetch_sent_emails_smart_raw: Extracted {} attachments from email", extracted_attachments.len());
                         
-                        let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                        let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                         
-                        // Verify signature if present (verify on raw body)
-                        let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                            if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                Some(verify_email_signature(pubkey, &sig, &body_text))
-                            } else {
-                                None // No signature present
-                            }
-                        } else {
-                            None // No pubkey, can't verify
-                        };
-                        
+                        let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                         let email_message = RawNostrEmail {
                             message_id: extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string()),
                             from,
                             to,
                             subject,
                             body: body_text,
+                            html_body: extract_html_body(&email),
                             date,
                             sender_pubkey: sender_pubkey.clone(),
                             recipient_pubkey: None, // Will be populated during sync if contact exists
                             raw_headers,
                             attachments: extracted_attachments,
                             signature_valid,
+                            signature_source,
                             transport_auth_verified: None, // Not verified in this path
                         };
                         emails.push(email_message);
@@ -4075,12 +6288,14 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                     to: em.to,
                     subject: em.subject,
                     body: em.body,
+                    html_body: em.html_body,
                     date: em.date,
                     sender_pubkey: em.sender_pubkey.clone(),
                     recipient_pubkey: None, // Inbox emails don't have recipient_pubkey
                     raw_headers: em.raw_headers,
                     attachments,
                     signature_valid: em.signature_valid,
+                    signature_source: em.signature_source,
                     transport_auth_verified: em.transport_auth_verified,
                 }
             }).collect()
@@ -4125,31 +6340,16 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
-                            
+
                             // Verify transport authentication
                             let transport_auth = verify_transport_authentication(Some(body), Some(&email))
                                 .unwrap_or_else(|e| TransportAuthVerdict {
@@ -4157,19 +6357,21 @@ async fn fetch_nostr_emails_smart_raw(config: &EmailConfig, latest: Option<chron
                                     method: TransportAuthMethod::None,
                                     reason: format!("Error verifying transport auth: {}", e),
                                 });
-                            
+
                             let email_message = RawNostrEmail {
                                 message_id,
                                 from,
                                 to,
                                 subject,
                                 body: body_text,
+                            html_body: extract_html_body(&email),
                                 date,
                                 sender_pubkey: sender_pubkey.clone(),
                                 recipient_pubkey: None,
                                 raw_headers,
                                 attachments: extracted_attachments,
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: Some(transport_auth.transport_verified),
                             };
                             emails.push(email_message);
@@ -4190,17 +6392,25 @@ fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::i
     // Use LIST to get all mailboxes
     let mailboxes = session.list(Some(""), Some("*"))?;
     
-    // Common sent folder names (case-insensitive)
-    let sent_patterns = vec![
-        "sent",
-        "sent mail",
-        "sent items",
-        "[gmail]/sent mail",
-    ];
-    
+    // Check for Gmail-specific sent folder first (most specific match)
     for mailbox in mailboxes.iter() {
         let mailbox_name = mailbox.name().to_lowercase();
-        
+        if mailbox_name == "[gmail]/sent mail" {
+            println!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
+            return Ok(Some(mailbox.name().to_string()));
+        }
+    }
+
+    // Common sent folder names (case-insensitive), ordered by specificity
+    let sent_patterns = vec![
+        "sent mail",
+        "sent items",
+        "sent",
+    ];
+
+    for mailbox in mailboxes.iter() {
+        let mailbox_name = mailbox.name().to_lowercase();
+
         // Check if this mailbox matches any sent pattern
         for pattern in &sent_patterns {
             if mailbox_name.contains(pattern) {
@@ -4217,7 +6427,7 @@ fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::i
 async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<Vec<RawNostrEmail>> {
     use chrono::Utc;
     use mailparse::parse_mail;
-    use crate::email::extract_nostr_pubkey_from_headers;
+    use crate::email::{extract_nostr_pubkey_from_headers, extract_sender_pubkey_with_armor_fallback};
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -4296,7 +6506,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
         let emails_result: anyhow::Result<Vec<RawNostrEmail>> = if is_gmail {
             // Pass latest directly to the optimized function
             // fetch_sent_emails_from_gmail_optimized now returns emails and attachments
-            let (email_msgs, attachments_map) = fetch_sent_emails_from_gmail_optimized(&mut session, config, latest)?;
+            let (email_msgs, attachments_map) = fetch_sent_emails_from_gmail_optimized(&mut session, config, latest, &sent_folder)?;
             
             // Create a HashMap for quick lookup of attachments by message_id
             let attachments_by_msg_id: std::collections::HashMap<String, Vec<crate::database::Attachment>> = attachments_map.into_iter().collect();
@@ -4315,7 +6525,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                     }
                     // For sent emails, extract sender_pubkey from headers (it's included when we send)
                     // and try to find recipient_pubkey from contacts
-                    let sender_pubkey = extract_nostr_pubkey_from_headers(&em.raw_headers);
+                    let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&em.raw_headers, &em.body);
                     let recipient_pubkey = None; // Will be populated during sync if contact exists
                     raw_emails.push(RawNostrEmail {
                         message_id: msg_id.clone(),
@@ -4323,12 +6533,14 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                         to: em.to,
                         subject: em.subject,
                         body: em.body,
+                    html_body: em.html_body,
                         date: em.date,
                         sender_pubkey: sender_pubkey,
                         recipient_pubkey: recipient_pubkey,
                         raw_headers: em.raw_headers,
                         attachments,
                         signature_valid: em.signature_valid,
+                        signature_source: em.signature_source,
                         transport_auth_verified: em.transport_auth_verified, // For sent emails, this will be None
                     });
                 }
@@ -4366,32 +6578,16 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             let raw_headers = email.headers.iter()
                                 .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             
-                            // Verify signature if present (verify on raw body)
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None // No signature present
-                                }
-                            } else {
-                                None // No pubkey, can't verify
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             let extracted_msg_id = extract_message_id_from_headers(&raw_headers);
                             if extracted_msg_id.is_none() {
                                 println!("[RUST] fetch_sent_emails_smart_raw (non-TLS): WARNING - Could not extract Message-ID from headers for message {}. Headers preview: {}", idx + 1, raw_headers.chars().take(500).collect::<String>());
@@ -4419,12 +6615,14 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                                 to,
                                 subject,
                                 body: body_text,
+                            html_body: extract_html_body(&email),
                                 date,
                                 sender_pubkey: sender_pubkey.clone(),
                                 recipient_pubkey: None, // Will be populated during sync if contact exists
                                 raw_headers,
                                 attachments: vec![], // Will be extracted during sync
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: None, // Not verified in this path
                             };
                             emails.push(email_message);
@@ -4517,7 +6715,7 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
         let emails_result: anyhow::Result<Vec<RawNostrEmail>> = if is_gmail {
             // Pass latest directly to the optimized function
             // fetch_sent_emails_from_gmail_optimized now returns emails and attachments
-            let (email_msgs, attachments_map) = fetch_sent_emails_from_gmail_optimized(&mut session, config, latest)?;
+            let (email_msgs, attachments_map) = fetch_sent_emails_from_gmail_optimized(&mut session, config, latest, &sent_folder)?;
             
             // Create a HashMap for quick lookup of attachments by message_id
             let attachments_by_msg_id: std::collections::HashMap<String, Vec<crate::database::Attachment>> = attachments_map.into_iter().collect();
@@ -4544,12 +6742,14 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                         to: em.to,
                         subject: em.subject,
                         body: em.body,
+                    html_body: em.html_body,
                         date: em.date,
                         sender_pubkey: em.sender_pubkey.clone(),
                         recipient_pubkey,
                         raw_headers: em.raw_headers,
                         attachments,
                         signature_valid: em.signature_valid,
+                        signature_source: em.signature_source,
                         transport_auth_verified: em.transport_auth_verified,
                     });
                 }
@@ -4600,42 +6800,29 @@ async fn fetch_sent_emails_smart_raw(config: &EmailConfig, latest: Option<chrono
                             let date = chrono::DateTime::parse_from_rfc2822(&date_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now());
-                            let body_text = if let Some(body_part) = email.subparts.first() {
-                                if let Ok(body_content) = body_part.get_body() {
-                                    body_content
-                                } else {
-                                    email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                                }
-                            } else {
-                                email.get_body().unwrap_or_else(|_| "No body content".to_string())
-                            };
+                            let body_text = extract_text_body(&email)
+                                .unwrap_or_else(|| email.get_body().unwrap_or_else(|_| "No body content".to_string()));
                             
                             let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
-                            let sender_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
+                            let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
                             let recipient_pubkey = extract_nostr_pubkey_from_headers(&raw_headers);
                             
-                            let signature_valid = if let Some(pubkey) = &sender_pubkey {
-                                if let Some(sig) = extract_nostr_sig_from_headers(&raw_headers) {
-                                    Some(verify_email_signature(pubkey, &sig, &body_text))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            
+                            let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
+
                             emails.push(RawNostrEmail {
                                 message_id: extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string()),
                                 from,
                                 to,
                                 subject,
                                 body: body_text,
+                            html_body: extract_html_body(&email),
                                 date,
                                 sender_pubkey: sender_pubkey.clone(),
                                 recipient_pubkey,
                                 raw_headers,
                                 attachments: extracted_attachments,
                                 signature_valid,
+                                signature_source,
                                 transport_auth_verified: None,
                             });
                             println!("[RUST] fetch_sent_emails_smart_raw (non-TLS): Successfully parsed email {} from message {}", emails.len(), idx + 1);

@@ -81,85 +81,104 @@ const TauriService = {
         console.log('=== End Tauri API Test ===');
     },
     generateKeypair: async function() {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return window.CryptoService.generateKeypair();
+        }
         return await this.invoke('generate_keypair');
     },
     validatePrivateKey: async function(privateKey) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return window.CryptoService.validatePrivateKey(privateKey);
+        }
         return await this.invoke('validate_private_key', { privateKey });
     },
     validatePublicKey: async function(publicKey) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return window.CryptoService.validatePublicKey(publicKey);
+        }
         return await this.invoke('validate_public_key', { publicKey });
     },
     getPublicKeyFromPrivate: async function(privateKey) {
+        if (window.CryptoService && window.CryptoService.isReady()) {
+            return window.CryptoService.getPublicKeyFromPrivate(privateKey);
+        }
         return await this.invoke('get_public_key_from_private', { privateKey });
     },
     getDefaultPrivateKeyFromConfig: async function() {
         return await this.invoke('get_default_private_key_from_config');
     },
-    signData: async function(privateKey, data) {
-        return await this.invoke('sign_data', { privateKey, data });
+    signData: async function(data) {
+        return await this.invoke('sign_data', { data });
+    },
+    signDataBytes: async function(data) {
+        return await this.invoke('sign_data_bytes', { data: Array.from(data) });
     },
     verifySignature: async function(publicKey, signature, data) {
+        if (data instanceof Uint8Array) {
+            return await this.invoke('verify_signature_bytes', { publicKey, signature, data: Array.from(data) });
+        }
         return await this.invoke('verify_signature', { publicKey, signature, data });
     },
     recheckEmailSignature: async function(messageId) {
         return await this.invoke('recheck_email_signature', { messageId });
     },
-    encryptNip44Message: async function(privateKey, publicKey, message) {
-        return await this.invoke('encrypt_nip04_message', { privateKey, publicKey, message });
+    verifyAllSignatures: async function(armorText) {
+        return await this.invoke('verify_all_signatures', { armorText });
     },
-    encryptNip04MessageLegacy: async function(privateKey, publicKey, message) {
-        return await this.invoke('encrypt_nip04_message_legacy', { privateKey, publicKey, message });
+    extractSignableBytes: async function(body, isArmored, quotedArmor, glossiaEncoding) {
+        return await this.invoke('extract_signable_bytes', { body, isArmored, quotedArmor, glossiaEncoding });
     },
-    
-    encryptMessageWithAlgorithm: async function(privateKey, publicKey, message, algorithm) {
-        return await this.invoke('encrypt_message_with_algorithm', { privateKey, publicKey, message, algorithm });
+    signAndVerifyBytes: async function(data) {
+        return await this.invoke('sign_and_verify_bytes', { data: Array.from(data) });
     },
-    sendDirectMessage: async function(privateKey, recipientPubkey, message, relays) {
-        // Determine if the message is already encrypted
+    encryptNip44Message: async function(publicKey, message) {
+        return await this.invoke('encrypt_nip04_message', { publicKey, message });
+    },
+    encryptNip04MessageLegacy: async function(publicKey, message) {
+        return await this.invoke('encrypt_nip04_message_legacy', { publicKey, message });
+    },
+    encryptMessageWithAlgorithm: async function(publicKey, message, algorithm) {
+        return await this.invoke('encrypt_message_with_algorithm', { publicKey, message, algorithm });
+    },
+    sendDirectMessage: async function(recipientPubkey, message, relays) {
         const isEncrypted = Utils.isLikelyEncryptedContent(message);
-        
-        // Get encryption algorithm from settings
         const settings = window.appState?.getSettings();
         const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
-        
-        // Create the request with explicit content type
         const request = {
-            sender_private_key: privateKey,
             recipient_pubkey: recipientPubkey,
-            content: isEncrypted ? 
-                { Encrypted: message } : 
+            content: isEncrypted ?
+                { Encrypted: message } :
                 { Plaintext: message },
             relays: relays,
             encryption_algorithm: encryptionAlgorithm
         };
-        
         return await this.invoke('send_direct_message', { request });
     },
-    
-    sendEncryptedDirectMessage: async function(privateKey, recipientPubkey, encryptedMessage, relays) {
-        // Get encryption algorithm from settings
-        const settings = window.appState?.getSettings();
-        const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
-        
-        // Explicitly send already-encrypted content
+    sendEncryptedDirectMessage: async function(recipientPubkey, encryptedMessage, relays) {
+        const detectedFormat = window.Utils?.detectEncryptionFormat(encryptedMessage) || 'unknown';
+        let encryptionAlgorithm;
+        if (detectedFormat === 'nip04' || detectedFormat === 'nip44') {
+            encryptionAlgorithm = detectedFormat;
+        } else {
+            const settings = window.appState?.getSettings();
+            encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
+        }
         const request = {
-            sender_private_key: privateKey,
             recipient_pubkey: recipientPubkey,
             content: { Encrypted: encryptedMessage },
             relays: relays,
             encryption_algorithm: encryptionAlgorithm
         };
-        
         return await this.invoke('send_direct_message', { request });
     },
-    fetchDirectMessages: async function(privateKey, relays) {
-        return await this.invoke('fetch_direct_messages', { privateKey, relays });
+    fetchDirectMessages: async function(relays) {
+        return await this.invoke('fetch_direct_messages', { relays });
     },
-    fetchConversations: async function(privateKey, relays) {
-        return await this.invoke('fetch_conversations', { privateKey, relays });
+    fetchConversations: async function(relays) {
+        return await this.invoke('fetch_conversations', { relays });
     },
-    fetchConversationMessages: async function(privateKey, contactPubkey, relays) {
-        return await this.invoke('fetch_conversation_messages', { privateKey, contactPubkey, relays });
+    fetchConversationMessages: async function(contactPubkey, relays) {
+        return await this.invoke('fetch_conversation_messages', { contactPubkey, relays });
     },
     fetchProfile: async function(pubkey, relays) {
         return await this.invoke('fetch_profile', { pubkey, relays });
@@ -170,32 +189,31 @@ const TauriService = {
     decodeNostrIdentifier: async function(identifier) {
         return await this.invoke('decode_nostr_identifier', { identifier });
     },
-    fetchFollowingProfiles: async function(privateKey, relays) {
-        return await this.invoke('fetch_following_profiles', { privateKey, relays });
+    fetchFollowingProfiles: async function(relays) {
+        return await this.invoke('fetch_following_profiles', { relays });
     },
     fetchProfiles: async function(pubkeys, relays) {
         return await this.invoke('fetch_profiles', { pubkeys, relays });
     },
-    publishNostrEvent: async function(privateKey, content, kind, tags, relays) {
-        return await this.invoke('publish_nostr_event', { privateKey, content, kind, tags, relays });
+    publishNostrEvent: async function(content, kind, tags, relays) {
+        return await this.invoke('publish_nostr_event', { content, kind, tags, relays });
     },
-    followUser: async function(privateKey, pubkeyToFollow) {
-        return await this.invoke('follow_user', { privateKey, pubkeyToFollow });
+    followUser: async function(pubkeyToFollow) {
+        return await this.invoke('follow_user', { pubkeyToFollow });
     },
-    publishFollowList: async function(privateKey, userPubkey, relays) {
-        return await this.invoke('publish_follow_list', { privateKey, userPubkey, relays });
+    publishFollowList: async function(userPubkey, relays) {
+        return await this.invoke('publish_follow_list', { userPubkey, relays });
     },
-    updateProfile: async function(privateKey, fields, relays) {
-        return await this.invoke('update_profile', { privateKey, fields, relays });
+    updateProfile: async function(fields, relays) {
+        return await this.invoke('update_profile', { fields, relays });
     },
-    // Update profile using persistent client (more efficient)
-    updateProfilePersistent: async function(privateKey, fields) {
-        return await this.invoke('update_profile_persistent', { privateKey, fields });
+    updateProfilePersistent: async function(fields) {
+        return await this.invoke('update_profile_persistent', { fields });
     },
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
     },
-    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null) {
+    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -205,10 +223,19 @@ const TauriService = {
         }
         if (attachments) {
             args.attachments = attachments;
+        }
+        if (htmlBody) {
+            args.htmlBody = htmlBody;
+        }
+        if (inReplyTo) {
+            args.inReplyTo = inReplyTo;
+        }
+        if (references) {
+            args.references = references;
         }
         return await this.invoke('send_email', args);
     },
-    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null) {
+    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -218,6 +245,15 @@ const TauriService = {
         }
         if (attachments) {
             args.attachments = attachments;
+        }
+        if (htmlBody) {
+            args.htmlBody = htmlBody;
+        }
+        if (inReplyTo) {
+            args.inReplyTo = inReplyTo;
+        }
+        if (references) {
+            args.references = references;
         }
         return await this.invoke('construct_email_headers', args);
     },
@@ -260,10 +296,9 @@ const TauriService = {
     updateContactPictureDataUrl: async function(pubkey, pictureDataUrl) {
         return await this.invoke('update_contact_picture_data_url', { pubkey, pictureDataUrl });
     },
-    getConversations: async function(userPubkey, privateKey) {
-        return await this.invoke('db_get_conversations_with_decrypted_last_message', { 
-            userPubkey, 
-            privateKey 
+    getConversations: async function(userPubkey) {
+        return await this.invoke('db_get_conversations_with_decrypted_last_message', {
+            userPubkey
         });
     },
     getConversationsWithoutDecryption: async function(userPubkey) {
@@ -305,8 +340,8 @@ const TauriService = {
     getRelayStatus: async function() {
         return await this.invoke('get_relay_status');
     },
-    initPersistentNostrClient: async function(privateKey) {
-        return await this.invoke('init_persistent_nostr_client', { privateKey });
+    initPersistentNostrClient: async function() {
+        return await this.invoke('init_persistent_nostr_client', {});
     },
     disconnectNostrClient: async function() {
         return await this.invoke('disconnect_nostr_client');
@@ -348,7 +383,7 @@ const TauriService = {
             imap_host: settings.imap_host,
             imap_port: settings.imap_port,
             use_tls: useTls,
-            private_key: keypair.private_key
+            private_key: null
         };
         
         return await this.invoke('sync_nostr_emails', { config: emailConfig, folder });
@@ -370,7 +405,7 @@ const TauriService = {
             imap_host: settings.imap_host,
             imap_port: settings.imap_port,
             use_tls: settings.use_tls,
-            private_key: keypair.private_key
+            private_key: null
         };
         
         return await this.invoke('sync_sent_emails', { config: emailConfig });
@@ -392,7 +427,7 @@ const TauriService = {
             imap_host: settings.imap_host,
             imap_port: settings.imap_port,
             use_tls: settings.use_tls,
-            private_key: keypair.private_key
+            private_key: null
         };
         
         return await this.invoke('sync_all_emails', { config: emailConfig });
@@ -403,23 +438,23 @@ const TauriService = {
      * You can use camelCase in JS and it will map to the expected snake_case Rust parameter.
      * See: https://tauri.app/v1/guides/features/command/#naming-conventions
      */
-    getDbEmails: async function(limit = 50, offset = 0, nostrOnly = true, userEmail = null) {
-        return await this.invoke('db_get_emails', { limit, offset, nostrOnly, userEmail: userEmail });
+    getDbEmails: async function(limit = 50, offset = 0, nostrOnly = null, userEmail = null, userPubkey = null) {
+        return await this.invoke('db_get_emails', { limit, offset, nostrOnly, userEmail, userPubkey });
     },
-    searchEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
-        return await this.invoke('db_search_emails', { searchQuery, userEmail, privateKey, limit, offset });
+    searchEmails: async function(searchQuery, userEmail = null, limit = null, offset = null) {
+        return await this.invoke('db_search_emails', { searchQuery, userEmail, limit, offset });
     },
-    searchSentEmails: async function(searchQuery, userEmail = null, privateKey = null, limit = null, offset = null) {
-        return await this.invoke('db_search_sent_emails', { searchQuery, userEmail, privateKey, limit, offset });
+    searchSentEmails: async function(searchQuery, userEmail = null, limit = null, offset = null) {
+        return await this.invoke('db_search_sent_emails', { searchQuery, userEmail, limit, offset });
     },
-    getDbSentEmails: async function(limit = 50, offset = 0, userEmail = null) {
-        return await this.invoke('db_get_sent_emails', { limit, offset, userEmail: userEmail });
+    getDbSentEmails: async function(limit = 50, offset = 0, userEmail = null, userPubkey = null) {
+        return await this.invoke('db_get_sent_emails', { limit, offset, userEmail, userPubkey });
     },
     getDbEmail: async function(messageId) {
         return await this.invoke('db_get_email', { messageId: messageId });
     },
-    decryptDmContent: async function(privateKey, senderPubkey, encryptedContent) {
-        return await this.invoke('decrypt_dm_content', { privateKey, senderPubkey, encryptedContent });
+    decryptDmContent: async function(senderPubkey, encryptedContent) {
+        return await this.invoke('decrypt_dm_content', { senderPubkey, encryptedContent });
     },
     filterNewContacts: async function(userPubkey, pubkeys) {
         return await this.invoke('db_filter_new_contacts', { userPubkey, pubkeys });
@@ -478,8 +513,12 @@ const TauriService = {
         return await this.invoke('db_delete_draft', { messageId });
     },
     
-    deleteSentEmail: async function(messageId, userEmail) {
-        return await this.invoke('db_delete_sent_email', { messageId, userEmail });
+    deleteSentEmail: async function(messageId, deleteFromServer, userEmail) {
+        return await this.invoke('db_delete_sent_email', { messageId, deleteFromServer, userEmail });
+    },
+
+    deleteInboxEmail: async function(messageId, deleteFromServer, userEmail) {
+        return await this.invoke('db_delete_inbox_email', { messageId, deleteFromServer, userEmail });
     },
 
     markAsRead: async function(messageId) {
@@ -487,8 +526,8 @@ const TauriService = {
     },
 
     // Live Event Subscription System
-    startLiveEventSubscription: async function(privateKey) {
-        return await this.invoke('start_live_event_subscription', { privateKey });
+    startLiveEventSubscription: async function() {
+        return await this.invoke('start_live_event_subscription', {});
     },
 
     stopLiveEventSubscription: async function() {
@@ -508,12 +547,12 @@ const TauriService = {
         return await this.invoke('db_get_setting', { pubkey, key });
     },
     
-    dbGetAllSettings: async function(pubkey, privateKey) {
-        return await this.invoke('db_get_all_settings', { pubkey, privateKey });
+    dbGetAllSettings: async function(pubkey) {
+        return await this.invoke('db_get_all_settings', { pubkey });
     },
-    
-    dbSaveSettingsBatch: async function(pubkey, settings, privateKey) {
-        return await this.invoke('db_save_settings_batch', { pubkey, settings, privateKey });
+
+    dbSaveSettingsBatch: async function(pubkey, settings) {
+        return await this.invoke('db_save_settings_batch', { pubkey, settings });
     },
     
     // Update email recipient pubkey
@@ -523,6 +562,55 @@ const TauriService = {
     
     updateEmailRecipientPubkeyById: async function(id, recipientPubkey) {
         return await this.invoke('db_update_email_recipient_pubkey_by_id', { id, recipientPubkey });
+    },
+
+    encodeBip39: async function(ciphertext, language, wordlist, mode) {
+        return await this.invoke('encode_bip39', { ciphertext, language, wordlist, mode });
+    },
+
+    decodeBip39: async function(text, language, wordlist, algorithm) {
+        return await this.invoke('decode_bip39', { text, language, wordlist, algorithm });
+    },
+
+    glossiaTranscode: async function(input, metaInstruction, seed) {
+        return await this.invoke('glossia_transcode', { input, metaInstruction, seed: seed ?? null });
+    },
+
+    glossiaDetectDialect: async function(text) {
+        return await this.invoke('glossia_detect_dialect', { text });
+    },
+
+    glossiaEncodeRawBaseN: async function(input, language, wordlist, dialect, seed) {
+        return await this.invoke('glossia_encode_raw_base_n', { input, language, wordlist, dialect, seed: seed ?? null });
+    },
+
+    glossiaDecodeRawBaseN: async function(text, language, wordlist, expectedByteCount) {
+        return await this.invoke('glossia_decode_raw_base_n', { text, language, wordlist, expectedByteCount });
+    },
+
+    glossiaGetDefaultWordlist: async function(language) {
+        return await this.invoke('glossia_get_default_wordlist', { language });
+    },
+
+    parseArmorMessage: async function(armorText) {
+        return await this.invoke('parse_armor_message', { armorText });
+    },
+
+    decryptEmailBody: async function(armorText, subject, senderPubkey, recipientPubkey) {
+        return await this.invoke('decrypt_email_body', {
+            armorText, subject,
+            senderPubkey: senderPubkey || null,
+            recipientPubkey: recipientPubkey || null,
+        });
+    },
+
+    decryptManifestAttachment: async function(attachmentDataB64, keyWrapB64, cipherSha256Hex, origFilename, origMime, attachmentId) {
+        return await this.invoke('decrypt_manifest_attachment', {
+            attachmentDataB64, keyWrapB64,
+            cipherSha256Hex: cipherSha256Hex || null,
+            origFilename, origMime,
+            attachmentId: attachmentId || null,
+        });
     }
 };
-window.TauriService = TauriService; 
+window.TauriService = TauriService;

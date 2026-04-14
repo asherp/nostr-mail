@@ -4,6 +4,8 @@
   "version": "1.0.4-beta",
   "identifier": "com.nostr.mail",
   "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
     "frontendDist": "../frontend"
   },
   "app": {

@@ -91,6 +91,9 @@ class DOMManager {
             publicKeyDisplay: this.getElement('public-key-display'),
             copyPubkeyBtn: this.getElement('copy-pubkey-btn'),
             encryptionAlgorithm: this.getElement('encryption-algorithm'),
+            glossiaEncodingBody: this.getElement('glossia-encoding-body'),
+            glossiaEncodingSignature: this.getElement('glossia-encoding-signature'),
+            glossiaEncodingPubkey: this.getElement('glossia-encoding-pubkey'),
             emailProvider: this.getElement('email-provider'),
             emailAddress: this.getElement('email-address'),
             emailPassword: this.getElement('email-password'),
@@ -116,6 +119,16 @@ class DOMManager {
             qrNprivBtn: this.getElement('qr-npriv-btn'),
             qrNpubBtn: this.getElement('qr-npub-btn'),
             scanQrNprivBtn: this.getElement('scan-qr-npriv-btn'),
+
+            // Profile Switcher
+            profileSwitcher: this.getElement('profile-switcher'),
+            profileSwitcherActive: this.getElement('profile-switcher-active'),
+            profileSwitcherAvatar: this.getElement('profile-switcher-avatar'),
+            profileSwitcherName: this.getElement('profile-switcher-name'),
+            profileSwitcherNpub: this.getElement('profile-switcher-npub'),
+            profileSwitcherDropdown: this.getElement('profile-switcher-dropdown'),
+            profileSwitcherList: this.getElement('profile-switcher-list'),
+            profileSwitcherAdd: this.getElement('profile-switcher-add'),
         };
     }
 

@@ -860,4 +860,50 @@ body.dark-mode .email-body-content-text {
 .message-content[style*="cursor: pointer"]:hover {
     opacity: 0.9;
     transition: opacity 0.2s ease;
-} 
+}
+
+/* Thread badge in email list */
+.thread-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    border-radius: 10px;
+    background: #667eea;
+    color: white;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0 6px;
+    margin-left: 6px;
+}
+
+/* Thread detail view */
+.thread-subject-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border-color, #e0e0e0);
+    font-size: 1.25rem;
+    font-weight: 600;
+}
+
+body.dark-mode .thread-subject-header {
+    border-bottom-color: var(--border-color-dark, #3a3f5c);
+    color: var(--text-color-dark, #e0e0e0);
+}
+
+.thread-detail-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.thread-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+    color: var(--muted-color, #999);
+}

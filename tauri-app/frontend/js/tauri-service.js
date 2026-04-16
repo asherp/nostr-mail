@@ -450,6 +450,15 @@ const TauriService = {
     getDbSentEmails: async function(limit = 50, offset = 0, userEmail = null, userPubkey = null) {
         return await this.invoke('db_get_sent_emails', { limit, offset, userEmail, userPubkey });
     },
+    getDbEmailThreads: async function(limit = 50, offset = 0, nostrOnly = null, userEmail = null, userPubkey = null) {
+        return await this.invoke('db_get_email_threads', { limit, offset, nostrOnly, userEmail, userPubkey });
+    },
+    getDbSentEmailThreads: async function(limit = 50, offset = 0, userEmail = null, userPubkey = null) {
+        return await this.invoke('db_get_sent_email_threads', { limit, offset, userEmail, userPubkey });
+    },
+    getThreadEmails: async function(threadId) {
+        return await this.invoke('db_get_thread_emails', { threadId });
+    },
     getDbEmail: async function(messageId) {
         return await this.invoke('db_get_email', { messageId: messageId });
     },

@@ -51,6 +51,15 @@ pub struct Email {
     /// When set, save_email uses this instead of hashing the (possibly glossia-encoded) subject.
     #[serde(default)]
     pub subject_hash: Option<String>,
+    /// The Message-ID this email is a reply to (extracted from In-Reply-To header).
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// Space-separated chain of ancestor Message-IDs (extracted from References header).
+    #[serde(default)]
+    pub references: Option<String>,
+    /// The root Message-ID of the thread. First entry in References, or own message_id if root.
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -461,6 +470,9 @@ impl Database {
         // Migrate: Add signature_source column to emails table if it doesn't exist
         Self::migrate_add_signature_source_column(&conn)?;
 
+        // Migrate: Add threading columns (in_reply_to, references, thread_id)
+        Self::migrate_add_threading_columns(&conn)?;
+
         // Migrate: Remove duplicate settings entries
         Self::migrate_remove_duplicate_settings(&conn)?;
 
@@ -472,6 +484,8 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_message_id ON emails(message_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_received_at ON emails(received_at)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_subject_hash ON emails(subject_hash)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_thread_id ON emails(thread_id)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_in_reply_to ON emails(in_reply_to)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_event_id ON direct_messages(event_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_created_at ON direct_messages(created_at)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_content_hash ON direct_messages(content_hash)", [])?;
@@ -632,6 +646,113 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// Migration: Add in_reply_to, references, thread_id columns to emails table
+    fn migrate_add_threading_columns(conn: &Connection) -> Result<()> {
+        let columns = {
+            let mut stmt = conn.prepare("PRAGMA table_info(emails)")?;
+            let cols: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?)
+            })?.collect();
+            cols.unwrap_or_default()
+        };
+
+        if !columns.contains(&"in_reply_to".to_string()) {
+            println!("[DB] Adding threading columns to emails table");
+            conn.execute("ALTER TABLE emails ADD COLUMN in_reply_to TEXT", [])?;
+            conn.execute("ALTER TABLE emails ADD COLUMN references_ TEXT", [])?;
+            conn.execute("ALTER TABLE emails ADD COLUMN thread_id TEXT", [])?;
+
+            // Backfill from raw_headers for existing emails
+            println!("[DB] Backfilling threading columns from raw_headers");
+            let mut stmt = conn.prepare(
+                "SELECT id, message_id, raw_headers FROM emails WHERE raw_headers IS NOT NULL AND raw_headers != ''"
+            )?;
+            let rows: Vec<(i64, String, String)> = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?.filter_map(|r| r.ok()).collect();
+
+            let mut backfilled = 0;
+            for (id, message_id, raw_headers) in &rows {
+                let in_reply_to = Self::extract_header(raw_headers, "In-Reply-To");
+                let references = Self::extract_header(raw_headers, "References");
+                let thread_id = Self::compute_thread_id(message_id, references.as_deref(), in_reply_to.as_deref());
+
+                if in_reply_to.is_some() || references.is_some() {
+                    conn.execute(
+                        "UPDATE emails SET in_reply_to = ?1, references_ = ?2, thread_id = ?3 WHERE id = ?4",
+                        params![in_reply_to, references, thread_id, id],
+                    )?;
+                    backfilled += 1;
+                } else {
+                    // Root email: thread_id = own message_id
+                    conn.execute(
+                        "UPDATE emails SET thread_id = ?1 WHERE id = ?2",
+                        params![thread_id, id],
+                    )?;
+                }
+            }
+            // Also set thread_id for emails without raw_headers (sent emails, etc.)
+            conn.execute(
+                "UPDATE emails SET thread_id = message_id WHERE thread_id IS NULL",
+                [],
+            )?;
+            println!("[DB] Backfilled threading for {} emails with headers", backfilled);
+        }
+
+        Ok(())
+    }
+
+    /// Extract a header value from raw email headers.
+    /// Handles folded headers (continuation lines starting with whitespace).
+    fn extract_header(raw_headers: &str, header_name: &str) -> Option<String> {
+        let prefix = format!("{}:", header_name);
+        let mut value = String::new();
+        let mut found = false;
+
+        for line in raw_headers.lines() {
+            if found {
+                // Continuation line (starts with whitespace)
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    value.push(' ');
+                    value.push_str(line.trim());
+                } else {
+                    break;
+                }
+            } else if line.len() >= prefix.len()
+                && line[..prefix.len()].eq_ignore_ascii_case(&prefix)
+            {
+                found = true;
+                value = line[prefix.len()..].trim().to_string();
+            }
+        }
+
+        if found && !value.is_empty() {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    /// Compute the thread_id for an email.
+    /// The thread root is the first Message-ID in the References chain.
+    /// If no References, falls back to In-Reply-To. If neither, uses own message_id.
+    fn compute_thread_id(message_id: &str, references: Option<&str>, in_reply_to: Option<&str>) -> String {
+        // References is ordered: first is root, last is immediate parent
+        if let Some(refs) = references {
+            if let Some(first) = refs.split_whitespace().next() {
+                return Self::normalize_message_id(first);
+            }
+        }
+        // Fallback: if only In-Reply-To, the parent is also the thread root (2-message thread)
+        if let Some(reply_to) = in_reply_to {
+            if let Some(first) = reply_to.split_whitespace().next() {
+                return Self::normalize_message_id(first);
+            }
+        }
+        // Root email: thread_id is own message_id
+        Self::normalize_message_id(message_id)
     }
 
     /// Migration: Remove duplicate settings entries, keeping the most recent one for each (pubkey, key) pair
@@ -1077,20 +1198,24 @@ impl Database {
             }
         });
 
+        let (in_reply_to, references, thread_id) = Self::resolve_threading(email);
+
         if let Some(id) = email.id {
             println!("[DB] save_email: Updating existing email with id={}", id);
             conn.execute(
-                "UPDATE emails SET 
-                    message_id = ?, from_address = ?, to_address = ?, subject = ?, 
-                    body = ?, body_plain = ?, body_html = ?, received_at = ?, 
+                "UPDATE emails SET
+                    message_id = ?, from_address = ?, to_address = ?, subject = ?,
+                    body = ?, body_plain = ?, body_html = ?, received_at = ?,
                     is_nostr_encrypted = ?, sender_pubkey = ?, recipient_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?,
-                    subject_hash = ?, signature_valid = ?, signature_source = ?, transport_auth_verified = ?
+                    subject_hash = ?, signature_valid = ?, signature_source = ?, transport_auth_verified = ?,
+                    in_reply_to = ?, references_ = ?, thread_id = ?
                 WHERE id = ?",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
                     email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                    subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified, id
+                    subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified,
+                    in_reply_to, references, thread_id, id
                 ],
             )?;
             println!("[DB] save_email: Successfully updated email id={}", id);
@@ -1132,13 +1257,14 @@ impl Database {
             println!("[DB] save_email: Email is new, inserting into database");
             println!("[DB] save_email: About to execute INSERT statement");
             match conn.execute(
-                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, signature_source, transport_auth_verified)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
                     email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                    subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified
+                    subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified,
+                    in_reply_to, references, thread_id
                 ],
             ) {
                 Ok(rows_affected) => {
@@ -1168,15 +1294,18 @@ impl Database {
             }
         });
 
+        let (in_reply_to, references, thread_id) = Self::resolve_threading(email);
+
         println!("[DB] insert_email_direct: About to execute INSERT statement");
         match conn.execute(
-            "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, signature_source, transport_auth_verified)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, subject_hash, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 email.message_id, email.from_address, email.to_address, email.subject,
                 email.body, email.body_plain, email.body_html, email.received_at,
                 email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified
+                subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified,
+                in_reply_to, references, thread_id
             ],
         ) {
             Ok(rows_affected) => {
@@ -1202,6 +1331,22 @@ impl Database {
         message_id.trim().trim_start_matches('<').trim_end_matches('>').to_string()
     }
 
+    /// Resolve threading fields for an email.
+    /// If the email already has threading fields set (e.g. from frontend), use those.
+    /// Otherwise, extract from raw_headers. Always computes thread_id.
+    fn resolve_threading(email: &Email) -> (Option<String>, Option<String>, String) {
+        let in_reply_to = email.in_reply_to.clone().or_else(|| {
+            email.raw_headers.as_deref().and_then(|h| Self::extract_header(h, "In-Reply-To"))
+        });
+        let references = email.references.clone().or_else(|| {
+            email.raw_headers.as_deref().and_then(|h| Self::extract_header(h, "References"))
+        });
+        let thread_id = email.thread_id.clone().unwrap_or_else(|| {
+            Self::compute_thread_id(&email.message_id, references.as_deref(), in_reply_to.as_deref())
+        });
+        (in_reply_to, references, thread_id)
+    }
+
     pub fn get_email(&self, message_id: &str) -> Result<Option<Email>> {
         println!("[DB] get_email: Checking for message_id={}", message_id);
         let conn = self.conn.lock().unwrap();
@@ -1214,7 +1359,7 @@ impl Database {
         // SQLite's TRIM and REPLACE can handle the normalization
         // We'll try multiple formats: exact match, normalized match, and with/without angle brackets
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id
              FROM emails
              WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?
              ORDER BY received_at DESC"
@@ -1247,6 +1392,9 @@ impl Database {
                 signature_source: row.get(18)?,
                 transport_auth_verified: row.get(19)?,
                 subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
             };
             println!("[DB] get_email: Found matching email, id={:?}", email.id);
             return Ok(Some(email));
@@ -1262,7 +1410,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
@@ -1323,6 +1471,9 @@ impl Database {
                 signature_source: row.get(18)?,
                 transport_auth_verified: row.get(19)?,
                 subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
             })
         })?;
         rows.collect()
@@ -1358,7 +1509,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
 
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified FROM emails"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id FROM emails"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let mut where_clauses = Vec::new();
@@ -1441,10 +1592,275 @@ impl Database {
                 signature_source: row.get(18)?,
                 transport_auth_verified: row.get(19)?,
                 subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
             })
         })?;
         let emails: Vec<Email> = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(emails)
+    }
+
+    /// Get inbox emails grouped by thread. Returns one row per thread (the most recent email)
+    /// plus message_count and unread_count for that thread.
+    /// Counts ALL emails in a thread (including sent replies) so threads span inbox/sent.
+    pub fn get_email_threads(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>, user_pubkey: Option<&str>) -> Result<Vec<(Email, i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.unwrap_or(50);
+        let offset = offset.unwrap_or(0);
+
+        // Build WHERE clauses for identifying which threads belong to the inbox view
+        let mut filter_clauses = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        filter_clauses.push("is_draft = 0".to_string());
+        if let Some(true) = nostr_only {
+            if let Some(pubkey) = user_pubkey {
+                filter_clauses.push(
+                    "(is_nostr_encrypted = 1 OR signature_valid IS NOT NULL \
+                     OR sender_pubkey IN (SELECT contact_pubkey FROM user_contacts WHERE user_pubkey = ?) \
+                     OR LOWER(TRIM(from_address)) IN (\
+                         SELECT LOWER(TRIM(c.email)) FROM contacts c \
+                         INNER JOIN user_contacts uc ON c.pubkey = uc.contact_pubkey \
+                         WHERE uc.user_pubkey = ? AND c.email IS NOT NULL AND c.email != ''\
+                     ))".to_string()
+                );
+                params.push(Box::new(pubkey.to_string()));
+                params.push(Box::new(pubkey.to_string()));
+            } else {
+                filter_clauses.push("(is_nostr_encrypted = 1 OR signature_valid IS NOT NULL)".to_string());
+            }
+        }
+        if let Some(email) = user_email {
+            filter_clauses.push("LOWER(TRIM(to_address)) = LOWER(TRIM(?))".to_string());
+            params.push(Box::new(email.to_string()));
+        }
+
+        let filter_sql = if filter_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", filter_clauses.join(" AND "))
+        };
+
+        // Two-phase query:
+        // 1) view_threads: find thread_ids that have at least one email matching inbox filters
+        // 2) ranked: rank ALL non-draft emails in those threads (includes sent replies)
+        let query = format!(
+            "WITH view_threads AS (
+                SELECT DISTINCT COALESCE(thread_id, message_id) AS tid
+                FROM emails
+                {}
+            ),
+            ranked AS (
+                SELECT e.*,
+                    ROW_NUMBER() OVER (PARTITION BY COALESCE(e.thread_id, e.message_id) ORDER BY e.received_at DESC, e.id DESC) AS rn,
+                    COUNT(*) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS message_count,
+                    SUM(CASE WHEN e.is_read = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS unread_count
+                FROM emails e
+                WHERE e.is_draft = 0
+                  AND COALESCE(e.thread_id, e.message_id) IN (SELECT tid FROM view_threads)
+            )
+            SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html,
+                   received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
+                   is_draft, is_read, updated_at, created_at, signature_valid, signature_source,
+                   transport_auth_verified, in_reply_to, references_, thread_id,
+                   message_count, unread_count
+            FROM ranked WHERE rn = 1
+            ORDER BY received_at DESC
+            LIMIT ? OFFSET ?",
+            filter_sql
+        );
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let email = Email {
+                id: Some(row.get(0)?),
+                message_id: row.get(1)?,
+                from_address: row.get(2)?,
+                to_address: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                body_plain: row.get(6)?,
+                body_html: row.get(7)?,
+                received_at: row.get(8)?,
+                is_nostr_encrypted: row.get(9)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
+                signature_valid: row.get(17)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
+            };
+            let message_count: i64 = row.get(23)?;
+            let unread_count: i64 = row.get(24)?;
+            Ok((email, message_count, unread_count))
+        })?;
+        rows.collect()
+    }
+
+    /// Get sent emails grouped by thread.
+    /// Counts ALL emails in a thread (including received messages) so threads span inbox/sent.
+    pub fn get_sent_email_threads(&self, limit: Option<i64>, offset: Option<i64>, user_email: Option<&str>) -> Result<Vec<(Email, i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.unwrap_or(50);
+        let offset = offset.unwrap_or(0);
+
+        // Build WHERE clauses for identifying which threads belong to the sent view
+        let mut filter_clauses = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        filter_clauses.push("is_draft = 0".to_string());
+
+        if let Some(email) = user_email {
+            let normalized_user_email = Self::normalize_gmail_address(email);
+            let user_email_lower = email.trim().to_lowercase();
+
+            if email.contains("@gmail.com") {
+                let user_email_no_plus = if let Some(plus_pos) = user_email_lower.find('+') {
+                    if let Some(at_pos) = user_email_lower.find('@') {
+                        format!("{}@{}", &user_email_lower[..plus_pos], &user_email_lower[at_pos+1..])
+                    } else {
+                        user_email_lower.clone()
+                    }
+                } else {
+                    user_email_lower.clone()
+                };
+                let normalized_user_email_no_plus = Self::normalize_gmail_address(&user_email_no_plus);
+
+                filter_clauses.push(
+                    "(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR \
+                     (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ? OR \
+                     (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ?)".to_string()
+                );
+                params.push(Box::new(user_email_lower.clone()));
+                params.push(Box::new(normalized_user_email.clone()));
+                params.push(Box::new(normalized_user_email_no_plus.clone()));
+            } else {
+                filter_clauses.push("LOWER(TRIM(from_address)) = LOWER(TRIM(?))".to_string());
+                params.push(Box::new(user_email_lower));
+            }
+        }
+
+        let filter_sql = if filter_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", filter_clauses.join(" AND "))
+        };
+
+        // Two-phase query: find sent thread_ids, then rank ALL emails in those threads
+        let query = format!(
+            "WITH view_threads AS (
+                SELECT DISTINCT COALESCE(thread_id, message_id) AS tid
+                FROM emails
+                {}
+            ),
+            ranked AS (
+                SELECT e.*,
+                    ROW_NUMBER() OVER (PARTITION BY COALESCE(e.thread_id, e.message_id) ORDER BY e.received_at DESC, e.id DESC) AS rn,
+                    COUNT(*) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS message_count,
+                    SUM(CASE WHEN e.is_read = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS unread_count
+                FROM emails e
+                WHERE e.is_draft = 0
+                  AND COALESCE(e.thread_id, e.message_id) IN (SELECT tid FROM view_threads)
+            )
+            SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html,
+                   received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
+                   is_draft, is_read, updated_at, created_at, signature_valid, signature_source,
+                   transport_auth_verified, in_reply_to, references_, thread_id,
+                   message_count, unread_count
+            FROM ranked WHERE rn = 1
+            ORDER BY received_at DESC
+            LIMIT ? OFFSET ?",
+            filter_sql
+        );
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let email = Email {
+                id: Some(row.get(0)?),
+                message_id: row.get(1)?,
+                from_address: row.get(2)?,
+                to_address: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                body_plain: row.get(6)?,
+                body_html: row.get(7)?,
+                received_at: row.get(8)?,
+                is_nostr_encrypted: row.get(9)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
+                signature_valid: row.get(17)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
+            };
+            let message_count: i64 = row.get(23)?;
+            let unread_count: i64 = row.get(24)?;
+            Ok((email, message_count, unread_count))
+        })?;
+        rows.collect()
+    }
+
+    /// Get all emails in a given thread, ordered by date ascending.
+    pub fn get_thread_emails(&self, thread_id: &str) -> Result<Vec<Email>> {
+        let conn = self.conn.lock().unwrap();
+        let normalized = Self::normalize_message_id(thread_id);
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html,
+                    received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
+                    is_draft, is_read, updated_at, created_at, signature_valid, signature_source,
+                    transport_auth_verified, in_reply_to, references_, thread_id
+             FROM emails
+             WHERE COALESCE(thread_id, message_id) = ? AND is_draft = 0
+             ORDER BY received_at ASC"
+        )?;
+        let rows = stmt.query_map(params![normalized], |row| {
+            Ok(Email {
+                id: Some(row.get(0)?),
+                message_id: row.get(1)?,
+                from_address: row.get(2)?,
+                to_address: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                body_plain: row.get(6)?,
+                body_html: row.get(7)?,
+                received_at: row.get(8)?,
+                is_nostr_encrypted: row.get(9)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
+                signature_valid: row.get(17)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
+            })
+        })?;
+        rows.collect()
     }
 
     pub fn get_latest_nostr_email_received_at(&self) -> Result<Option<DateTime<Utc>>> {
@@ -1729,7 +2145,7 @@ impl Database {
     pub fn find_email_by_subject_hash(&self, subject_hash: &str) -> Result<Option<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id
              FROM emails WHERE subject_hash = ? AND is_nostr_encrypted = 1 LIMIT 1"
         )?;
         let mut rows = stmt.query_map(params![subject_hash], |row| {
@@ -1755,6 +2171,9 @@ impl Database {
                 signature_source: row.get(18)?,
                 transport_auth_verified: row.get(19)?,
                 subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
             })
         })?;
         
@@ -1768,7 +2187,7 @@ impl Database {
     pub fn get_email_by_id(&self, id: i64) -> Result<Option<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id
              FROM emails WHERE id = ? LIMIT 1"
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -1794,6 +2213,9 @@ impl Database {
                 signature_source: row.get(18)?,
                 transport_auth_verified: row.get(19)?,
                 subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
             })
         })?;
         match rows.next() {
@@ -2443,7 +2865,7 @@ impl Database {
     pub fn find_emails_by_message_id(&self, message_id: &str) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id
              FROM emails WHERE message_id = ? ORDER BY received_at DESC"
         )?;
         
@@ -2470,6 +2892,9 @@ impl Database {
                 signature_source: row.get(18)?,
                 transport_auth_verified: row.get(19)?,
                 subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
             })
         })?;
         
@@ -2540,32 +2965,36 @@ impl Database {
     pub fn save_draft(&self, draft: &Email) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
-        
+        let (in_reply_to, references, thread_id) = Self::resolve_threading(draft);
+
         if let Some(id) = draft.id {
             conn.execute(
-                "UPDATE emails SET 
-                    message_id = ?, from_address = ?, to_address = ?, subject = ?, 
-                    body = ?, body_plain = ?, body_html = ?, received_at = ?, 
-                    is_nostr_encrypted = ?, sender_pubkey = ?, recipient_pubkey = ?, raw_headers = ?, 
-                    is_draft = ?, is_read = ?, updated_at = ?
+                "UPDATE emails SET
+                    message_id = ?, from_address = ?, to_address = ?, subject = ?,
+                    body = ?, body_plain = ?, body_html = ?, received_at = ?,
+                    is_nostr_encrypted = ?, sender_pubkey = ?, recipient_pubkey = ?, raw_headers = ?,
+                    is_draft = ?, is_read = ?, updated_at = ?,
+                    in_reply_to = ?, references_ = ?, thread_id = ?
                 WHERE id = ?",
                 params![
                     draft.message_id, draft.from_address, draft.to_address, draft.subject,
                     draft.body, draft.body_plain, draft.body_html, draft.received_at,
                     draft.is_nostr_encrypted, draft.sender_pubkey, draft.recipient_pubkey, draft.raw_headers,
-                    true, draft.is_read, now, id
+                    true, draft.is_read, now,
+                    in_reply_to, references, thread_id, id
                 ],
             )?;
             Ok(id)
         } else {
             let _id = conn.execute(
-                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO emails (message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, created_at, in_reply_to, references_, thread_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     draft.message_id, draft.from_address, draft.to_address, draft.subject,
                     draft.body, draft.body_plain, draft.body_html, draft.received_at,
                     draft.is_nostr_encrypted, draft.sender_pubkey, draft.recipient_pubkey, draft.raw_headers,
-                    true, draft.is_read, now
+                    true, draft.is_read, now,
+                    in_reply_to, references, thread_id
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -2578,7 +3007,7 @@ impl Database {
         let offset = offset.unwrap_or(0);
         
         let mut query = String::from(
-            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified FROM emails WHERE is_draft = 1"
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id FROM emails WHERE is_draft = 1"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         
@@ -2615,6 +3044,9 @@ impl Database {
                 signature_source: row.get(18)?,
                 transport_auth_verified: row.get(19)?,
                 subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
             })
         })?;
         
@@ -3039,6 +3471,9 @@ mod tests {
             signature_source: None,
             transport_auth_verified: None,
             subject_hash: None,
+            in_reply_to: None,
+            references: None,
+            thread_id: None,
         }
     }
 

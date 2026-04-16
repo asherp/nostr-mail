@@ -2144,7 +2144,7 @@ class EmailService {
             console.log('[JS] getDbEmails userEmail:', userEmail, 'userPubkey:', userPubkey);
             console.log('[JS] Email filter preference:', emailFilter, 'nostrOnly:', nostrOnly);
             console.log('[JS] Loading emails with offset:', this.inboxOffset, 'pageSize:', pageSize);
-            const emails = await TauriService.getDbEmails(pageSize, this.inboxOffset, nostrOnly, userEmail, userPubkey);
+            const emails = await TauriService.getDbEmailThreads(pageSize, this.inboxOffset, nostrOnly, userEmail, userPubkey);
             
             // Load attachments for each email in parallel with timeout
             console.log(`[JS] Loading attachments for ${emails.length} inbox emails`);
@@ -2275,7 +2275,7 @@ class EmailService {
             console.log('[JS] Loading sent emails with offset:', this.sentOffset, 'pageSize:', pageSize);
             // Fetch sent emails (where user is sender)
             const userPubkey = keypair ? keypair.public_key : null;
-            let emails = await TauriService.getDbSentEmails(pageSize, this.sentOffset, userEmail, userPubkey);
+            let emails = await TauriService.getDbSentEmailThreads(pageSize, this.sentOffset, userEmail, userPubkey);
             
             // Load attachments for each email in parallel with timeout
             console.log(`[JS] Loading attachments for ${emails.length} sent emails`);
@@ -2934,7 +2934,7 @@ class EmailService {
             <div class="email-content">
                 <div class="email-header">
                     <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
-                    <div class="email-date">${dateDisplay}</div>
+                    <div class="email-date">${dateDisplay}${email.message_count > 1 ? `<span class="thread-badge" title="${email.message_count} messages">${email.message_count}</span>` : ''}</div>
                 </div>
                 ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
                 <div class="email-preview">${previewText}</div>
@@ -2995,7 +2995,13 @@ class EmailService {
             }
         }
 
-        emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
+        emailElement.addEventListener('click', () => {
+            if (email.message_count > 1) {
+                this.showThreadDetail(email.thread_id, 'inbox');
+            } else {
+                this.showEmailDetail(email.id);
+            }
+        });
         return emailElement;
     }
 
@@ -3057,7 +3063,13 @@ class EmailService {
             </div>
         `;
 
-        emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
+        emailElement.addEventListener('click', () => {
+            if (email.message_count > 1) {
+                this.showThreadDetail(email.thread_id, 'inbox');
+            } else {
+                this.showEmailDetail(email.id);
+            }
+        });
         return emailElement;
     }
 
@@ -3993,25 +4005,291 @@ ${attachmentsHtml}
     // Show email list
     showEmailList() {
         try {
-            // Show the email list and hide the detail view
+            // Show the email list and hide detail views (single email + thread)
             const emailList = domManager.get('emailList');
             const emailDetailView = document.getElementById('email-detail-view');
+            const inboxThreadDetailView = document.getElementById('inbox-thread-detail-view');
             const inboxActions = document.getElementById('inbox-actions');
             const inboxTitle = document.getElementById('inbox-title');
 
             if (emailList) emailList.style.display = 'block';
             if (emailDetailView) emailDetailView.style.display = 'none';
+            if (inboxThreadDetailView) inboxThreadDetailView.style.display = 'none';
             if (inboxActions) inboxActions.style.display = 'flex';
-            
+
             // Re-render emails to update unread indicators
             this.renderEmails();
             if (inboxTitle) {
                 inboxTitle.textContent = 'Inbox';
                 inboxTitle.style.display = '';
             }
-            
+            appState.clearCurrentThread();
+
         } catch (error) {
             console.error('Error showing email list:', error);
+        }
+    }
+
+    // Show thread detail view with all messages in a conversation
+    async showThreadDetail(threadId, source = 'inbox') {
+        try {
+            const isInbox = source === 'inbox';
+            const prefix = isInbox ? 'inbox' : 'sent';
+
+            // Toggle UI: hide list, show thread detail
+            const emailList = isInbox ? domManager.get('emailList') : domManager.get('sentList');
+            const actions = document.getElementById(isInbox ? 'inbox-actions' : 'sent-actions');
+            const title = document.getElementById(isInbox ? 'inbox-title' : 'sent-title');
+            const threadDetailView = document.getElementById(`${prefix}-thread-detail-view`);
+            const threadContent = document.getElementById(`${prefix}-thread-detail-content`);
+            const threadSubject = document.getElementById(`${prefix}-thread-subject`);
+
+            if (emailList) emailList.style.display = 'none';
+            if (actions) actions.style.display = 'none';
+            if (title) title.style.display = 'none';
+            if (threadDetailView) threadDetailView.style.display = 'flex';
+
+            // Show loading state
+            if (threadContent) {
+                threadContent.innerHTML = '<div class="thread-loading"><i class="fas fa-spinner fa-spin"></i> Loading conversation...</div>';
+            }
+
+            // Fetch all emails in thread
+            const threadEmails = await TauriService.getThreadEmails(threadId);
+            if (!threadEmails || threadEmails.length === 0) {
+                if (threadContent) threadContent.innerHTML = '<div class="thread-loading">No messages found.</div>';
+                return;
+            }
+
+            appState.setCurrentThread(threadId, threadEmails);
+
+            // Classify each email as sent or received
+            const settings = appState.getSettings();
+            const userEmail = (settings?.email_address || '').trim().toLowerCase();
+            const userPubkey = appState.getKeypair()?.public_key;
+
+            for (const email of threadEmails) {
+                const fromAddr = (email.from || '').trim().toLowerCase();
+                email._isSentByUser = (fromAddr === userEmail) ||
+                    (userPubkey && email.sender_pubkey === userPubkey);
+            }
+
+            // Build contact index if needed
+            if (!this._contactsByPubkey) this._buildContactIndex();
+
+            // Render messages using same per-email decrypt as single email views
+            const keypair = appState.getKeypair();
+            const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+            let threadSubjectText = threadEmails[0].subject;
+            let lastDecryptedSubject = null;
+            let lastDecryptedBody = null;
+
+            if (threadContent) {
+                threadContent.innerHTML = '';
+                for (const email of threadEmails) {
+                    const isSent = email._isSentByUser;
+                    const emailBody = email.body || '';
+                    const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
+
+                    let displayBody = emailBody;
+                    let displaySubject = email.subject;
+                    let sigResults = null;
+                    let blockDecryptResults = null;
+
+                    if (encryptedMatch && keypair) {
+                        // Determine correct pubkey: sender for received, recipient for sent
+                        const senderPubkey = isSent ? null : (email.sender_pubkey || email.nostr_pubkey || null);
+                        let recipientPubkey = null;
+                        if (isSent) {
+                            recipientPubkey = email.recipient_pubkey || null;
+                            if (!recipientPubkey) {
+                                const recipientEmail = email.to || email.to_address;
+                                const contact = recipientEmail ? this._findContact(null, recipientEmail) : null;
+                                if (contact && contact.pubkey) recipientPubkey = contact.pubkey;
+                            }
+                        }
+
+                        try {
+                            const [result, allSigs] = await Promise.all([
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey),
+                                TauriService.verifyAllSignatures(emailBody).catch(e => {
+                                    console.warn('[JS] Thread sig verify error:', e);
+                                    return [];
+                                })
+                            ]);
+                            sigResults = allSigs.length > 0 ? allSigs : null;
+                            displaySubject = result.subject || email.subject;
+                            displayBody = result.success ? result.body : emailBody;
+
+                            if (result.blockResults && result.blockResults.length > 0) {
+                                blockDecryptResults = result.blockResults.map(b => {
+                                    if (!b.wasEncrypted) return null;
+                                    if (b.decryptedText != null) return { decryptedText: b.decryptedText };
+                                    if (b.error) return { error: b.error };
+                                    return null;
+                                });
+                            }
+
+                            // Backfill sender_pubkey from armor if missing
+                            if (result.senderPubkey && !email.sender_pubkey && email.id) {
+                                email.sender_pubkey = result.senderPubkey;
+                            }
+                        } catch (err) {
+                            console.error(`[JS] Thread email ${email.id} decrypt error:`, err);
+                        }
+                    } else {
+                        // Non-encrypted: verify sigs + glossia decode (same as single view)
+                        try {
+                            const [allSigs, signedMsg] = await Promise.all([
+                                TauriService.verifyAllSignatures(emailBody).catch(e => {
+                                    console.warn('[JS] Thread sig verify error:', e);
+                                    return [];
+                                }),
+                                this.decodeGlossiaSignedMessage(emailBody)
+                            ]);
+                            sigResults = allSigs.length > 0 ? allSigs : null;
+                            if (signedMsg && signedMsg.plaintextBody) {
+                                displayBody = signedMsg.plaintextBody;
+                            }
+                        } catch (err) {
+                            console.error(`[JS] Thread email ${email.id} sig/glossia error:`, err);
+                        }
+                    }
+
+                    // Track thread subject from first successful decrypt
+                    if (displaySubject && displaySubject !== email.subject && threadSubjectText === threadEmails[0].subject) {
+                        threadSubjectText = displaySubject;
+                    }
+
+                    // Resolve contact for avatar
+                    const contactPubkey = isSent ? userPubkey : email.sender_pubkey;
+                    const contactEmail = isSent ? userEmail : (email.from || '');
+                    const contact = this._findContact(contactPubkey, contactEmail);
+
+                    let avatarSrc = defaultAvatar;
+                    if (contact) {
+                        const isValidDataUrl = contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
+                        if (isValidDataUrl) {
+                            avatarSrc = contact.picture_data_url;
+                        } else if (contact.picture) {
+                            avatarSrc = contact.picture;
+                        }
+                    }
+                    const senderName = contact?.name || contact?.display_name || email.from || 'Unknown';
+                    const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+
+                    // Signature indicator (inline sig results take priority, same as single view)
+                    const outerSigResult = Array.isArray(sigResults) ? sigResults[sigResults.length - 1] : sigResults;
+                    let signatureIndicator = '';
+                    if (outerSigResult && outerSigResult.isValid === true) {
+                        signatureIndicator = `<span class="signature-indicator verified" title="Inline signature verified"><i class="fas fa-check-circle"></i> Signature Verified</span>`;
+                    } else if (outerSigResult && outerSigResult.isValid === false) {
+                        signatureIndicator = `<span class="signature-indicator invalid" title="Inline signature invalid"><i class="fas fa-times-circle"></i> Signature Invalid</span>`;
+                    } else if (email.signature_valid === true) {
+                        const sigSource = email.signature_source ? ` (${email.signature_source})` : '';
+                        signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                    } else if (email.signature_valid === false) {
+                        signatureIndicator = `<span class="signature-indicator invalid" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+                    }
+
+                    // Transport auth indicator
+                    let transportAuthIndicator = '';
+                    if (email.transport_auth_verified === true) {
+                        transportAuthIndicator = `<span class="transport-auth-indicator verified" title="Email transport authentication verified"><i class="fas fa-envelope"></i> Email Verified</span>`;
+                    }
+
+                    const bodyId = `thread-body-${email.id}`;
+                    const cardDiv = document.createElement('div');
+                    cardDiv.className = 'email-detail-card';
+                    cardDiv.innerHTML = `
+<div class="email-sender-header">
+<div class="email-sender-row">
+<img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
+${signatureIndicator}
+${transportAuthIndicator}
+</div>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
+<details class="email-metadata-details">
+<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
+<div class="email-detail-header vertical">
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
+<div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
+<div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+</div>
+</details>
+</div>
+<pre class="email-raw-content" style="display:none">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+<div class="email-detail-body" id="${bodyId}">${email.html_body ? '' : Utils.escapeHtml(displayBody).replace(/\n/g, '<br>')}</div>
+<pre class="email-raw-content email-raw-body" style="display:none">${Utils.escapeHtml(email.raw_body || '')}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
+                    `;
+                    threadContent.appendChild(cardDiv);
+
+                    // Post-render: same steps as single email detail view
+                    if (email.html_body) {
+                        Utils.renderHtmlBodyInIframe(bodyId, email.html_body, {
+                            decryptedTexts: blockDecryptResults,
+                            startDecrypted: true
+                        });
+                    }
+                    if (!email.html_body) {
+                        Utils.decorateArmorBlocks(bodyId);
+                        this.verifyAndAnnotateSignatureBlocks(displayBody, bodyId);
+                    }
+
+                    // Track last email's decrypted content for reply button
+                    lastDecryptedSubject = displaySubject;
+                    lastDecryptedBody = displayBody;
+                }
+
+                // Scroll to bottom (most recent message)
+                threadContent.scrollTop = threadContent.scrollHeight;
+            }
+
+            if (threadSubject) {
+                threadSubject.textContent = threadSubjectText;
+            }
+
+            // Mark unread emails as read (fire-and-forget)
+            for (const email of threadEmails) {
+                if (!email.is_read && (email.message_id || email.id)) {
+                    this.markAsRead(email.message_id || email.id).catch(() => {});
+                }
+            }
+
+            // Set up back button
+            const backBtn = document.getElementById(`back-to-${isInbox ? 'inbox' : 'sent'}-from-thread`);
+            if (backBtn) {
+                backBtn.onclick = () => {
+                    if (threadDetailView) threadDetailView.style.display = 'none';
+                    appState.clearCurrentThread();
+                    if (isInbox) {
+                        this.showEmailList();
+                    } else {
+                        this.showSentList();
+                    }
+                };
+            }
+
+            // Set up reply button (reply to most recent email)
+            const replyBtn = document.getElementById(`reply-to-${prefix}-thread`);
+            if (replyBtn) {
+                const lastEmail = threadEmails[threadEmails.length - 1];
+                replyBtn.onclick = () => {
+                    this.replyToEmail(
+                        lastEmail,
+                        lastDecryptedSubject || lastEmail.subject,
+                        lastDecryptedBody || lastEmail.body
+                    );
+                };
+            }
+
+        } catch (error) {
+            console.error('[JS] Error showing thread detail:', error);
         }
     }
 
@@ -5977,7 +6255,7 @@ ${attachmentsHtml}
             <div class="email-content">
                 <div class="email-header">
                     <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
-                    <div class="email-date">${dateDisplay}</div>
+                    <div class="email-date">${dateDisplay}${email.message_count > 1 ? `<span class="thread-badge" title="${email.message_count} messages">${email.message_count}</span>` : ''}</div>
                 </div>
                 ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
                 <div class="email-preview">${previewText}</div>
@@ -6037,10 +6315,16 @@ ${attachmentsHtml}
                 });
             }
         }
-        emailElement.addEventListener('click', () => this.showSentDetail(email.id));
+        emailElement.addEventListener('click', () => {
+            if (email.message_count > 1) {
+                this.showThreadDetail(email.thread_id, 'sent');
+            } else {
+                this.showSentDetail(email.id);
+            }
+        });
         return emailElement;
     }
-    
+
     // Render a basic sent email item (without decryption, used as fallback)
     renderSentEmailItemBasic(email) {
         const emailElement = document.createElement('div');
@@ -6098,7 +6382,13 @@ ${attachmentsHtml}
                 </button>
             </div>
         `;
-        emailElement.addEventListener('click', () => this.showSentDetail(email.id));
+        emailElement.addEventListener('click', () => {
+            if (email.message_count > 1) {
+                this.showThreadDetail(email.thread_id, 'sent');
+            } else {
+                this.showSentDetail(email.id);
+            }
+        });
         return emailElement;
     }
 
@@ -7704,15 +7994,18 @@ ${attachmentsHtml}
         try {
             const sentList = domManager.get('sentList');
             const sentDetailView = domManager.get('sentDetailView');
+            const sentThreadDetailView = document.getElementById('sent-thread-detail-view');
             const sentActions = domManager.get('sentActions');
             const sentTitle = domManager.get('sentTitle');
             if (sentList) sentList.style.display = 'block';
             if (sentDetailView) sentDetailView.style.display = 'none';
+            if (sentThreadDetailView) sentThreadDetailView.style.display = 'none';
             if (sentActions) sentActions.style.display = 'flex';
             if (sentTitle) {
                 sentTitle.textContent = 'Sent';
                 sentTitle.style.display = '';
             }
+            appState.clearCurrentThread();
         } catch (error) {
             console.error('Error showing sent email list:', error);
         }

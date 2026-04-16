@@ -217,6 +217,22 @@
                         <!-- Email detail content will be populated here -->
                     </div>
                 </div>
+
+                <!-- Thread Detail View (Inbox) -->
+                <div class="email-detail-view" id="inbox-thread-detail-view" style="display: none;">
+                    <div class="email-detail-header">
+                        <button id="back-to-inbox-from-thread" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Inbox
+                        </button>
+                        <button id="reply-to-inbox-thread" class="btn btn-primary" style="margin-left: 10px;">
+                            <i class="fas fa-reply"></i> Reply
+                        </button>
+                    </div>
+                    <div class="thread-subject-header" id="inbox-thread-subject"></div>
+                    <div class="thread-detail-content" id="inbox-thread-detail-content">
+                        <!-- Thread messages will be populated here -->
+                    </div>
+                </div>
             </div>
 
             <!-- Sent Tab -->
@@ -249,6 +265,22 @@
                     </div>
                     <div class="email-detail-content" id="sent-detail-content">
                         <!-- Sent email detail content will be populated here -->
+                    </div>
+                </div>
+
+                <!-- Thread Detail View (Sent) -->
+                <div class="email-detail-view" id="sent-thread-detail-view" style="display: none;">
+                    <div class="email-detail-header">
+                        <button id="back-to-sent-from-thread" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> Back to Sent
+                        </button>
+                        <button id="reply-to-sent-thread" class="btn btn-primary" style="margin-left: 10px;">
+                            <i class="fas fa-reply"></i> Reply
+                        </button>
+                    </div>
+                    <div class="thread-subject-header" id="sent-thread-subject"></div>
+                    <div class="thread-detail-content" id="sent-thread-detail-content">
+                        <!-- Thread messages will be populated here -->
                     </div>
                 </div>
             </div>

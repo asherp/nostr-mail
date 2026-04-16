@@ -17,6 +17,8 @@ class AppState {
         this.relays = [];
         this.contacts_total = null;
         this.lastLoadedPubkey = null;
+        this.currentThreadId = null;
+        this.currentThreadEmails = [];
     }
 
     // Contact management
@@ -178,6 +180,25 @@ class AppState {
 
     getSelectedDmContact() {
         return this.selectedDmContact;
+    }
+
+    // Thread management
+    setCurrentThread(threadId, emails) {
+        this.currentThreadId = threadId;
+        this.currentThreadEmails = emails;
+    }
+
+    getCurrentThreadId() {
+        return this.currentThreadId;
+    }
+
+    getCurrentThreadEmails() {
+        return this.currentThreadEmails;
+    }
+
+    clearCurrentThread() {
+        this.currentThreadId = null;
+        this.currentThreadEmails = [];
     }
 
     // Utility methods

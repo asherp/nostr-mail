@@ -4096,6 +4096,13 @@ ${attachmentsHtml}
                     let sigResults = null;
                     let blockDecryptResults = null;
 
+                    // Always verify signatures (independent of decrypt — don't let decrypt failures lose sig results)
+                    const allSigs = await TauriService.verifyAllSignatures(emailBody).catch(e => {
+                        console.warn(`[JS] Thread email ${email.id} sig verify error:`, e);
+                        return [];
+                    });
+                    sigResults = allSigs.length > 0 ? allSigs : null;
+
                     if (encryptedMatch && keypair) {
                         // Determine correct pubkey: sender for received, recipient for sent
                         const senderPubkey = isSent ? null : (email.sender_pubkey || email.nostr_pubkey || null);
@@ -4110,14 +4117,7 @@ ${attachmentsHtml}
                         }
 
                         try {
-                            const [result, allSigs] = await Promise.all([
-                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey),
-                                TauriService.verifyAllSignatures(emailBody).catch(e => {
-                                    console.warn('[JS] Thread sig verify error:', e);
-                                    return [];
-                                })
-                            ]);
-                            sigResults = allSigs.length > 0 ? allSigs : null;
+                            const result = await TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey);
                             displaySubject = result.subject || email.subject;
                             displayBody = result.success ? result.body : emailBody;
 
@@ -4138,21 +4138,14 @@ ${attachmentsHtml}
                             console.error(`[JS] Thread email ${email.id} decrypt error:`, err);
                         }
                     } else {
-                        // Non-encrypted: verify sigs + glossia decode (same as single view)
+                        // Non-encrypted: glossia decode for signed messages
                         try {
-                            const [allSigs, signedMsg] = await Promise.all([
-                                TauriService.verifyAllSignatures(emailBody).catch(e => {
-                                    console.warn('[JS] Thread sig verify error:', e);
-                                    return [];
-                                }),
-                                this.decodeGlossiaSignedMessage(emailBody)
-                            ]);
-                            sigResults = allSigs.length > 0 ? allSigs : null;
+                            const signedMsg = await this.decodeGlossiaSignedMessage(emailBody);
                             if (signedMsg && signedMsg.plaintextBody) {
                                 displayBody = signedMsg.plaintextBody;
                             }
                         } catch (err) {
-                            console.error(`[JS] Thread email ${email.id} sig/glossia error:`, err);
+                            console.error(`[JS] Thread email ${email.id} glossia error:`, err);
                         }
                     }
 

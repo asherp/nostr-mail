@@ -4958,9 +4958,11 @@ ${transportAuthIndicator}
         if (!results || results.length === 0) return;
 
         // Annotate DOM elements with verification results (innermost-first order)
+        // IDs are scoped to containerId to avoid collisions in thread view
+        const idPrefix = `${containerId}-sig-block`;
         for (let i = 0; i < results.length; i++) {
             const result = results[i];
-            const el = document.getElementById(`inline-sig-block-${i}`);
+            const el = document.getElementById(`${idPrefix}-${i}`);
             if (!el) continue;
             const indicator = el.querySelector('.inline-sig-indicator');
             if (!indicator) continue;

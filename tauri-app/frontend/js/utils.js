@@ -201,31 +201,33 @@ class Utils {
         // (innerHTML preserves literal > — browsers don't escape it via textContent/innerHTML)
         // Allow zero or more levels of quoting before each delimiter line
         const QP = '(?:>\\s*)*';
+        // Scope block IDs to containerId so multiple emails (e.g. thread view) don't collide
+        const idPrefix = `${containerId}-sig-block`;
         // Match signed nested armor blocks (contain SIGNATURE section) that end with END NOSTR MESSAGE
         // Must match before other patterns to prevent partial matches on nested SIGNATURE/SEAL
         const signedMsgPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR MESSAGE\\s*-{3,})`, 'g');
         let blockIndex = 0;
         html = html.replace(signedMsgPattern, (match) => {
-            const id = `inline-sig-block-${blockIndex++}`;
+            const id = `${idPrefix}-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
         });
         // Match unsigned encrypted armor blocks (with seal but no signature) that end with END NOSTR MESSAGE
         const unsignedEncMsgPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY)\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR MESSAGE\\s*-{3,})`, 'g');
         html = html.replace(unsignedEncMsgPattern, (match) => {
-            const id = `inline-sig-block-${blockIndex++}`;
+            const id = `${idPrefix}-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
         });
         // Match standalone signature block (new format: ends with END NOSTR SIGNATURE or END NOSTR MESSAGE)
         // Also match legacy format: SIGNATURE block followed by SEAL block
         const sigSealPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SIGNATURE|MESSAGE)\\s*-{3,}(?:(?:<br>)*(?:\\s*<br>)*(?:\\s*${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SEAL|MESSAGE)\\s*-{3,}))?)`, 'g');
         html = html.replace(sigSealPattern, (match) => {
-            const id = `inline-sig-block-${blockIndex++}`;
+            const id = `${idPrefix}-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
         });
         // Legacy: wrap standalone seal blocks (pubkey without signature)
         const sealOnlyPattern = new RegExp(`(?<!<\\/div>)(${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SEAL|MESSAGE)\\s*-{3,})`, 'g');
         html = html.replace(sealOnlyPattern, (match) => {
-            const id = `inline-sig-block-${blockIndex++}`;
+            const id = `${idPrefix}-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
         });
         if (blockIndex > 0) {

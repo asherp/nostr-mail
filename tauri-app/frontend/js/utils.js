@@ -73,6 +73,8 @@ class Utils {
         // Auto-resize iframe to fit content
         const resize = () => {
             if (doc.body) {
+                // Reset height so scrollHeight returns content height, not viewport height
+                iframe.style.height = '0';
                 iframe.style.height = doc.body.scrollHeight + 'px';
             }
         };
@@ -83,12 +85,14 @@ class Utils {
         // Collapsible blockquotes: click to toggle nested reply chains
         const setupCollapsible = () => {
             const bqs = doc.querySelectorAll('blockquote');
+            const startCollapsed = options && options.startCollapsed;
             bqs.forEach(bq => {
                 const hint = doc.createElement('div');
                 hint.className = 'collapse-hint';
                 hint.textContent = '\u2026';
-                hint.style.display = 'none';
+                hint.style.display = startCollapsed ? '' : 'none';
                 bq.insertBefore(hint, bq.firstChild);
+                if (startCollapsed) bq.classList.add('collapsed');
                 bq.addEventListener('click', (e) => {
                     // Only toggle when clicking on the left quote bar (within 12px of left edge)
                     const rect = bq.getBoundingClientRect();
@@ -117,6 +121,8 @@ class Utils {
                     setTimeout(resize, 10);
                 });
             }
+            // Resize after hiding sig content so iframe height matches visible content
+            resize();
         };
         // Inline decrypt toggles for encrypted body blocks
         // Inline decrypt toggles — uses pre-computed decryptedTexts from plaintext armor.
@@ -231,6 +237,9 @@ class Utils {
             return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
         });
         if (blockIndex > 0) {
+            // Strip <br> tags adjacent to signature block divs to prevent empty vertical space
+            html = html.replace(/(?:<br\s*\/?>[\s]*)+(?=<div class="inline-sig-block")/gi, '');
+            html = html.replace(/(?:<br\s*\/?>[\s]*)+$/gi, '');
             container.innerHTML = html;
         }
     }

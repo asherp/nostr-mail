@@ -20,7 +20,7 @@ pub use state::{AppState, Relay};
 pub use types::{KeyPair, EmailConfig};
 use storage::{Storage, Contact, UserProfile, AppSettings, EmailDraft};
 use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation};
-use crate::types::{EmailMessage, RelayStatus, RelayConnectionStatus};
+use crate::types::{EmailMessage, EmailThreadSummary, RelayStatus, RelayConnectionStatus};
 
 use nostr_sdk::Metadata;
 use nostr_sdk::ToBech32;
@@ -396,6 +396,31 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
         message_id: Some(email.message_id.clone()),
         signature_valid: email.signature_valid,
         signature_source: email.signature_source.clone(),
+    }
+}
+
+fn map_email_thread_to_summary(email: &DbEmail, message_count: i64, unread_count: i64) -> EmailThreadSummary {
+    let raw_headers = email.raw_headers.clone().unwrap_or_default();
+    EmailThreadSummary {
+        id: email.id.map(|id| id.to_string()).unwrap_or_else(|| email.message_id.clone()),
+        from: email.from_address.clone(),
+        to: email.to_address.clone(),
+        subject: email.subject.clone(),
+        body: email.body.clone(),
+        raw_body: email.body.clone(),
+        html_body: email.body_html.clone(),
+        date: email.received_at,
+        is_read: email.is_read,
+        raw_headers,
+        sender_pubkey: email.sender_pubkey.clone(),
+        recipient_pubkey: email.recipient_pubkey.clone(),
+        message_id: Some(email.message_id.clone()),
+        signature_valid: email.signature_valid,
+        signature_source: email.signature_source.clone(),
+        transport_auth_verified: email.transport_auth_verified,
+        thread_id: email.thread_id.clone().unwrap_or_else(|| email.message_id.clone()),
+        message_count,
+        unread_count,
     }
 }
 
@@ -2688,6 +2713,45 @@ fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Optio
         emails
     };
     let mapped: Vec<EmailMessage> = filtered.iter().map(map_db_email_to_email_message).collect();
+    Ok(mapped)
+}
+
+#[tauri::command]
+fn db_get_email_threads(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailThreadSummary>, String> {
+    let db = state.get_database()?;
+    let threads = db.get_email_threads(limit, offset, nostr_only, user_email.as_deref(), user_pubkey.as_deref()).map_err(|e| e.to_string())?;
+    let mapped: Vec<EmailThreadSummary> = threads.iter().map(|(email, count, unread)| {
+        map_email_thread_to_summary(email, *count, *unread)
+    }).collect();
+    Ok(mapped)
+}
+
+#[tauri::command]
+fn db_get_sent_email_threads(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailThreadSummary>, String> {
+    let db = state.get_database()?;
+    let threads = db.get_sent_email_threads(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
+    // Filter by sender_pubkey if user_pubkey is provided (same as db_get_sent_emails)
+    let filtered: Vec<_> = if let Some(ref upk) = user_pubkey {
+        threads.into_iter().filter(|(e, _, _)| {
+            match &e.sender_pubkey {
+                Some(spk) => spk == upk,
+                None => true,
+            }
+        }).collect()
+    } else {
+        threads
+    };
+    let mapped: Vec<EmailThreadSummary> = filtered.iter().map(|(email, count, unread)| {
+        map_email_thread_to_summary(email, *count, *unread)
+    }).collect();
+    Ok(mapped)
+}
+
+#[tauri::command]
+fn db_get_thread_emails(thread_id: String, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
+    let db = state.get_database()?;
+    let emails = db.get_thread_emails(&thread_id).map_err(|e| e.to_string())?;
+    let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
     Ok(mapped)
 }
 
@@ -5896,6 +5960,9 @@ pub fn run() {
         db_update_email_recipient_pubkey_by_id,
         db_find_emails_by_message_id,
         db_get_sent_emails,
+        db_get_email_threads,
+        db_get_sent_email_threads,
+        db_get_thread_emails,
         db_search_sent_emails,
         db_check_duplicate_message_ids,
         db_get_all_sent_message_ids,

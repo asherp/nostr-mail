@@ -73,6 +73,8 @@ class Utils {
         // Auto-resize iframe to fit content
         const resize = () => {
             if (doc.body) {
+                // Reset height so scrollHeight returns content height, not viewport height
+                iframe.style.height = '0';
                 iframe.style.height = doc.body.scrollHeight + 'px';
             }
         };
@@ -83,12 +85,14 @@ class Utils {
         // Collapsible blockquotes: click to toggle nested reply chains
         const setupCollapsible = () => {
             const bqs = doc.querySelectorAll('blockquote');
+            const startCollapsed = options && options.startCollapsed;
             bqs.forEach(bq => {
                 const hint = doc.createElement('div');
                 hint.className = 'collapse-hint';
                 hint.textContent = '\u2026';
-                hint.style.display = 'none';
+                hint.style.display = startCollapsed ? '' : 'none';
                 bq.insertBefore(hint, bq.firstChild);
+                if (startCollapsed) bq.classList.add('collapsed');
                 bq.addEventListener('click', (e) => {
                     // Only toggle when clicking on the left quote bar (within 12px of left edge)
                     const rect = bq.getBoundingClientRect();
@@ -117,6 +121,8 @@ class Utils {
                     setTimeout(resize, 10);
                 });
             }
+            // Resize after hiding sig content so iframe height matches visible content
+            resize();
         };
         // Inline decrypt toggles for encrypted body blocks
         // Inline decrypt toggles — uses pre-computed decryptedTexts from plaintext armor.
@@ -201,34 +207,39 @@ class Utils {
         // (innerHTML preserves literal > — browsers don't escape it via textContent/innerHTML)
         // Allow zero or more levels of quoting before each delimiter line
         const QP = '(?:>\\s*)*';
+        // Scope block IDs to containerId so multiple emails (e.g. thread view) don't collide
+        const idPrefix = `${containerId}-sig-block`;
         // Match signed nested armor blocks (contain SIGNATURE section) that end with END NOSTR MESSAGE
         // Must match before other patterns to prevent partial matches on nested SIGNATURE/SEAL
         const signedMsgPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY))\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR MESSAGE\\s*-{3,})`, 'g');
         let blockIndex = 0;
         html = html.replace(signedMsgPattern, (match) => {
-            const id = `inline-sig-block-${blockIndex++}`;
+            const id = `${idPrefix}-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
         });
         // Match unsigned encrypted armor blocks (with seal but no signature) that end with END NOSTR MESSAGE
         const unsignedEncMsgPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR NIP-\\d+ ENCRYPTED (?:MESSAGE|BODY)\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR MESSAGE\\s*-{3,})`, 'g');
         html = html.replace(unsignedEncMsgPattern, (match) => {
-            const id = `inline-sig-block-${blockIndex++}`;
+            const id = `${idPrefix}-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
         });
         // Match standalone signature block (new format: ends with END NOSTR SIGNATURE or END NOSTR MESSAGE)
         // Also match legacy format: SIGNATURE block followed by SEAL block
         const sigSealPattern = new RegExp(`(${QP}-{3,}\\s*BEGIN NOSTR SIGNATURE\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SIGNATURE|MESSAGE)\\s*-{3,}(?:(?:<br>)*(?:\\s*<br>)*(?:\\s*${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SEAL|MESSAGE)\\s*-{3,}))?)`, 'g');
         html = html.replace(sigSealPattern, (match) => {
-            const id = `inline-sig-block-${blockIndex++}`;
+            const id = `${idPrefix}-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><span class="inline-sig-indicator pending"><i class="fas fa-spinner fa-spin"></i> Verifying…</span><div class="inline-sig-content">${match}</div></div>`;
         });
         // Legacy: wrap standalone seal blocks (pubkey without signature)
         const sealOnlyPattern = new RegExp(`(?<!<\\/div>)(${QP}-{3,}\\s*BEGIN NOSTR SEAL\\s*-{3,}[\\s\\S]*?${QP}-{3,}\\s*END NOSTR (?:SEAL|MESSAGE)\\s*-{3,})`, 'g');
         html = html.replace(sealOnlyPattern, (match) => {
-            const id = `inline-sig-block-${blockIndex++}`;
+            const id = `${idPrefix}-${blockIndex++}`;
             return `<div class="inline-sig-block" id="${id}"><div class="inline-sig-content">${match}</div></div>`;
         });
         if (blockIndex > 0) {
+            // Strip <br> tags adjacent to signature block divs to prevent empty vertical space
+            html = html.replace(/(?:<br\s*\/?>[\s]*)+(?=<div class="inline-sig-block")/gi, '');
+            html = html.replace(/(?:<br\s*\/?>[\s]*)+$/gi, '');
             container.innerHTML = html;
         }
     }

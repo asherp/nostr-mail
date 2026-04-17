@@ -55,10 +55,10 @@ jobs:
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/asherp/nostr-mail.git
 
         cd _site
-        git init
+        git init -b gh-pages
+        git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/asherp/nostr-mail.git
         git add -A
         git commit -m "Deploy landing page + docs"
-        git push --force origin HEAD:gh-pages
+        git push --force origin gh-pages

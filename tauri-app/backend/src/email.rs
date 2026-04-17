@@ -3278,8 +3278,15 @@ fn decrypt_single_block(
     };
 
     if body_type != "encrypted" {
-        // Signed/plain blocks aren't encrypted — return body text as-is
-        block.decrypted_text = Some(body_text.to_string());
+        // Signed/plain blocks aren't encrypted — try glossia decode to recover plaintext,
+        // then fall back to raw body text if it doesn't look glossia-encoded.
+        let decoded = try_glossia_decode_to_bytes(body_text)
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        if let Some(ref text) = decoded {
+            println!("[RUST] decrypt_single_block: glossia decoded signed/plain body, len={} preview={:?}",
+                text.len(), &text[..text.len().min(60)]);
+        }
+        block.decrypted_text = Some(decoded.unwrap_or_else(|| body_text.to_string()));
         return (block, None);
     }
 
@@ -3569,13 +3576,19 @@ pub fn decrypt_email_body_pipeline(
 
     // Extract outermost decrypted body (last element in innermost-first array)
     let outer_block = block_results.last();
-    let body = outer_block
+    let mut body = outer_block
         .and_then(|b| b.decrypted_text.clone())
         .unwrap_or_else(|| {
             outer_block
                 .and_then(|b| b.error.clone())
                 .unwrap_or_else(|| armor_text.to_string())
         });
+    // Prepend plaintext prefix that appeared before the first armor delimiter
+    if let Some(ref prefix) = parsed.prefix_text {
+        if !prefix.is_empty() {
+            body = format!("{}\n\n{}", prefix, body);
+        }
+    }
     let success = outer_block.map(|b| b.decrypted_text.is_some()).unwrap_or(false);
     let error = if success { None } else { outer_block.and_then(|b| b.error.clone()) };
 
@@ -4524,6 +4537,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
 
         assert!(result.is_ok());
@@ -4544,6 +4559,8 @@ mod tests {
             "Body",
             None,
             Some("<custom-id@example.com>"),
+            None,
+            None,
             None,
             None,
         );
@@ -4572,6 +4589,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
 
         assert!(result.is_ok());
@@ -4593,6 +4612,8 @@ mod tests {
             None,
             None,
             Some(&empty_attachments),
+            None,
+            None,
             None,
         );
 
@@ -4624,6 +4645,8 @@ mod tests {
             None,
             None,
             Some(&attachments),
+            None,
+            None,
             None,
         );
 
@@ -5445,6 +5468,9 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
                 subject_hash: None,
+                in_reply_to: None,
+                references: None,
+                thread_id: None,
             };
             db.save_email(&updated_email)?;
             println!("[RUST] Updated existing email in DB: message_id={}", email.message_id);
@@ -5473,6 +5499,9 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
                 subject_hash: None,
+                in_reply_to: None,
+                references: None,
+                thread_id: None,
             };
             println!("[RUST] Saving email to DB: message_id={}", email.message_id);
             let email_id = db.save_email(&db_email)?;
@@ -5605,6 +5634,9 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                     signature_source: email.signature_source.clone(),
                     transport_auth_verified: email.transport_auth_verified,
                     subject_hash: None,
+                    in_reply_to: None,
+                    references: None,
+                    thread_id: None,
                 };
                 match db.save_email(&updated_email) {
                     Ok(id) => println!("[RUST] Updated existing email with IMAP data, id: {}", id),
@@ -5641,6 +5673,9 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, db: &Database) -> anyh
                 signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
                 subject_hash: None,
+                in_reply_to: None,
+                references: None,
+                thread_id: None,
             };
             println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}",
                 db_email.message_id, db_email.from_address, db_email.to_address, 

@@ -253,9 +253,15 @@
     }
 
     .hero-actions {
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
       gap: 16px;
-      flex-wrap: wrap;
+      max-width: 480px;
+    }
+
+    .hero-actions .btn {
+      width: 100%;
+      justify-content: center;
     }
 
     .btn {
@@ -535,6 +541,27 @@
 
     [data-theme="dark"] .highlight-col { background: rgba(124,58,237,0.1); }
 
+    .integration-note {
+      margin-top: 24px;
+      padding: 18px 22px;
+      background: var(--gradient-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      color: var(--text-secondary);
+      font-size: 0.92rem;
+      line-height: 1.6;
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+    }
+
+    .integration-note i {
+      color: var(--accent-purple);
+      font-size: 1.1rem;
+      margin-top: 3px;
+      flex-shrink: 0;
+    }
+
     /* ===== Tech Stack ===== */
     .tech-grid {
       display: grid;
@@ -692,7 +719,7 @@
 
       .hero-content { max-width: 100%; }
       .hero p { margin-left: auto; margin-right: auto; }
-      .hero-actions { justify-content: center; }
+      .hero-actions { justify-content: center; justify-self: center; }
 
       .hero-visual {
         max-width: 260px;
@@ -797,7 +824,10 @@
           <a href="https://github.com/asherp/nostr-mail/releases/download/v1.0.4-beta/app-universal-release.apk" class="btn btn-primary" target="_blank" rel="noopener">
             <i class="fab fa-android"></i> Download for Android
           </a>
-          <a href="https://github.com/asherp/nostr-mail" class="btn btn-secondary" target="_blank" rel="noopener">
+          <a href="https://zapstore.dev/apps/com.nostr.mail" class="btn btn-primary" target="_blank" rel="noopener">
+            <i class="fas fa-bolt"></i> Get on zapstore
+          </a>
+          <a href="https://github.com/asherp/nostr-mail" class="btn btn-primary" target="_blank" rel="noopener">
             <i class="fab fa-github"></i> GitHub
           </a>
         </div>
@@ -966,6 +996,73 @@
     </div>
   </section>
 
+  <!-- ===== nostr-mail vs Nmail ===== -->
+  <section class="section" id="approaches">
+    <div class="container">
+      <div class="section-header fade-in">
+        <h2>Two approaches to <span class="gradient-text">private email</span></h2>
+        <p>Another project, <a href="https://nostrmail.org" target="_blank" rel="noopener">Nmail</a>, shares the name &ldquo;Nostr Mail&rdquo; and a similar goal, but takes a different architectural approach. Nmail uses Nostr relays as the primary transport layer. Our approach embeds Nostr identity and end-to-end encryption inside the existing email ecosystem (SMTP/IMAP). Both designs are valid&mdash;they just optimize for different tradeoffs.</p>
+      </div>
+      <div class="comparison-table-wrapper fade-in">
+        <table class="comparison-table">
+          <thead>
+            <tr>
+              <th>Aspect</th>
+              <th>nostr-mail</th>
+              <th>Nmail (nostrmail.org)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>End-to-end encryption</td>
+              <td class="highlight-col">E2E across arbitrary email providers (Gmail &harr; Outlook &harr; Proton, etc.)</td>
+              <td>E2E within the Nostr network; messages leaving via SMTP bridges are typically plaintext after the bridge</td>
+            </tr>
+            <tr>
+              <td>Transport</td>
+              <td class="highlight-col">Standard SMTP &amp; IMAP</td>
+              <td>Nostr relays (custom event kinds, e.g. 1301)</td>
+            </tr>
+            <tr>
+              <td>Existing inbox</td>
+              <td class="highlight-col">Native &mdash; works directly in Gmail, Outlook, any IMAP client</td>
+              <td>Requires a bridge service for traditional inboxes</td>
+            </tr>
+            <tr>
+              <td>Metadata hiding</td>
+              <td class="highlight-col">Subject + body encrypted and encoded as natural-looking text (Glossia)</td>
+              <td>Full envelope hidden via NIP-59; relays see minimal metadata</td>
+            </tr>
+            <tr>
+              <td>Discovery</td>
+              <td class="highlight-col">Email address published via profile (kind 0)</td>
+              <td>NIP-05 (<code>user@domain</code> &rarr; pubkey)</td>
+            </tr>
+            <tr>
+              <td>Attachments</td>
+              <td class="highlight-col">AES-256 + NIP-44 key wrapping, embedded in MIME</td>
+              <td>Out-of-band storage (e.g., Blossom servers)</td>
+            </tr>
+            <tr>
+              <td>Archival storage</td>
+              <td class="highlight-col">Backed by existing email providers (IMAP folders, search, retention)</td>
+              <td>Depends on relay availability and retention</td>
+            </tr>
+            <tr>
+              <td>Legacy SMTP interop</td>
+              <td class="highlight-col">Built-in &mdash; can reach any email address globally</td>
+              <td>Requires bridging to reach SMTP users</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="integration-note fade-in">
+        <i class="fas fa-circle-info"></i>
+        We&rsquo;re exploring hybrid models that combine both approaches&mdash;using Nostr relay transport (e.g. NIP-59 gift wrapping) for metadata privacy, while retaining SMTP/IMAP compatibility for universal reach. In that model, our end-to-end encryption layer can ride inside relay-wrapped messages when needed, giving users a spectrum between maximum interoperability and maximum privacy.
+      </p>
+    </div>
+  </section>
+
   <!-- ===== Tech Stack ===== -->
   <section class="section how-it-works" id="tech">
     <div class="container">
@@ -1022,6 +1119,9 @@
           </a>
           <a href="https://github.com/asherp/nostr-mail/releases/download/v1.0.4-beta/app-universal-release.apk" class="btn btn-primary" target="_blank" rel="noopener">
             <i class="fab fa-android"></i> Download for Android
+          </a>
+          <a href="https://zapstore.dev/apps/com.nostr.mail" class="btn btn-primary" target="_blank" rel="noopener">
+            <i class="fas fa-bolt"></i> Get on zapstore
           </a>
           <a href="https://github.com/asherp/nostr-mail" class="btn btn-secondary" target="_blank" rel="noopener">
             <i class="fab fa-github"></i> GitHub

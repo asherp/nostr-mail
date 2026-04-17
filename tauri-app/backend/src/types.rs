@@ -53,6 +53,31 @@ pub struct EmailMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailThreadSummary {
+    // Latest email in the thread (same fields as EmailMessage)
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+    pub raw_body: String,
+    pub html_body: Option<String>,
+    pub date: DateTime<Utc>,
+    pub is_read: bool,
+    pub raw_headers: String,
+    pub sender_pubkey: Option<String>,
+    pub recipient_pubkey: Option<String>,
+    pub message_id: Option<String>,
+    pub signature_valid: Option<bool>,
+    pub signature_source: Option<String>,
+    pub transport_auth_verified: Option<bool>,
+    // Thread metadata
+    pub thread_id: String,
+    pub message_count: i64,
+    pub unread_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NostrEvent {
     pub id: String,
     pub pubkey: String,

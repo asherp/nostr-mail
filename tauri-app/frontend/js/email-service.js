@@ -2144,7 +2144,7 @@ class EmailService {
             console.log('[JS] getDbEmails userEmail:', userEmail, 'userPubkey:', userPubkey);
             console.log('[JS] Email filter preference:', emailFilter, 'nostrOnly:', nostrOnly);
             console.log('[JS] Loading emails with offset:', this.inboxOffset, 'pageSize:', pageSize);
-            const emails = await TauriService.getDbEmails(pageSize, this.inboxOffset, nostrOnly, userEmail, userPubkey);
+            const emails = await TauriService.getDbEmailThreads(pageSize, this.inboxOffset, nostrOnly, userEmail, userPubkey);
             
             // Load attachments for each email in parallel with timeout
             console.log(`[JS] Loading attachments for ${emails.length} inbox emails`);
@@ -2275,7 +2275,7 @@ class EmailService {
             console.log('[JS] Loading sent emails with offset:', this.sentOffset, 'pageSize:', pageSize);
             // Fetch sent emails (where user is sender)
             const userPubkey = keypair ? keypair.public_key : null;
-            let emails = await TauriService.getDbSentEmails(pageSize, this.sentOffset, userEmail, userPubkey);
+            let emails = await TauriService.getDbSentEmailThreads(pageSize, this.sentOffset, userEmail, userPubkey);
             
             // Load attachments for each email in parallel with timeout
             console.log(`[JS] Loading attachments for ${emails.length} sent emails`);
@@ -2934,7 +2934,7 @@ class EmailService {
             <div class="email-content">
                 <div class="email-header">
                     <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
-                    <div class="email-date">${dateDisplay}</div>
+                    <div class="email-date">${dateDisplay}${email.message_count > 1 ? `<span class="thread-badge" title="${email.message_count} messages">${email.message_count}</span>` : ''}</div>
                 </div>
                 ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
                 <div class="email-preview">${previewText}</div>
@@ -2995,7 +2995,13 @@ class EmailService {
             }
         }
 
-        emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
+        emailElement.addEventListener('click', () => {
+            if (email.message_count > 1) {
+                this.showThreadDetail(email.thread_id, 'inbox');
+            } else {
+                this.showEmailDetail(email.id);
+            }
+        });
         return emailElement;
     }
 
@@ -3057,7 +3063,13 @@ class EmailService {
             </div>
         `;
 
-        emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
+        emailElement.addEventListener('click', () => {
+            if (email.message_count > 1) {
+                this.showThreadDetail(email.thread_id, 'inbox');
+            } else {
+                this.showEmailDetail(email.id);
+            }
+        });
         return emailElement;
     }
 
@@ -3532,19 +3544,25 @@ class EmailService {
                         </div>`;
                     }
                     
-                    // Add signature verification indicator
-                    // Extract the outer sig result (last element if array, since DOM order is [quoted, outer])
+                    // Signature indicator — icon only in header, full text in details panel
                     const outerSigResult = Array.isArray(inlineSigResult) ? inlineSigResult[inlineSigResult.length - 1] : inlineSigResult;
-                    let signatureIndicator = '';
-                    const detailSigSource = email.signature_source ? ` (${email.signature_source})` : '';
+                    let signatureIcon = '';
+                    let securityRows = '';
                     if (outerSigResult && outerSigResult.isValid === true) {
-                        signatureIndicator = `<span class="signature-indicator verified" title="Inline signature verified"><i class="fas fa-check-circle"></i> Signature Verified</span>`;
+                        signatureIcon = `<span class="signature-indicator verified" title="Signature Verified"><i class="fas fa-check-circle"></i></span>`;
+                        securityRows += `<div class="security-row verified"><i class="fas fa-check-circle"></i> Signature Verified</div>`;
                     } else if (outerSigResult && outerSigResult.isValid === false) {
-                        signatureIndicator = `<span class="signature-indicator invalid" title="Inline signature invalid"><i class="fas fa-times-circle"></i> Signature Invalid</span>`;
+                        signatureIcon = `<span class="signature-indicator invalid" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
+                        securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
                     } else if (email.signature_valid === true) {
-                        signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${detailSigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                        signatureIcon = `<span class="signature-indicator verified" title="Signature Verified"><i class="fas fa-check-circle"></i></span>`;
+                        securityRows += `<div class="security-row verified"><i class="fas fa-check-circle"></i> Signature Verified</div>`;
                     } else if (email.signature_valid === false) {
-                        signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+                        signatureIcon = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
+                        securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
+                    }
+                    if (email.transport_auth_verified === true) {
+                        securityRows += `<div class="security-row verified"><i class="fas fa-envelope"></i> Email Transport Verified</div>`;
                     }
 
                     // Get sender info for header (O(1) lookup via contact index)
@@ -3567,17 +3585,13 @@ class EmailService {
                     const senderName = senderContact ? (senderContact.name || senderContact.display_name || email.from) : email.from;
                     const timeAgo = Utils.formatTimeAgo(new Date(email.date));
                     
-                    // Update page header (back button and reply button)
+                    // Update page header (back button only — reply moved to card)
                     if (emailDetailHeader) {
                         emailDetailHeader.innerHTML = `
                             <button id="back-to-inbox" class="btn btn-secondary">
                                 <i class="fas fa-arrow-left"></i> Back to Inbox
                             </button>
-                            <button id="reply-to-email" class="btn btn-primary" style="margin-left: 10px;">
-                                <i class="fas fa-reply"></i> Reply
-                            </button>
                         `;
-                        // Re-attach back button event listener
                         const backBtn = emailDetailHeader.querySelector('#back-to-inbox');
                         if (backBtn) {
                             backBtn.addEventListener('click', () => {
@@ -3588,13 +3602,6 @@ class EmailService {
                                     inboxTitle.textContent = 'Inbox';
                                     inboxTitle.style.display = '';
                                 }
-                            });
-                        }
-                        // Attach reply button event listener
-                        const replyBtn = emailDetailHeader.querySelector('#reply-to-email');
-                        if (replyBtn) {
-                            replyBtn.addEventListener('click', () => {
-                                this.replyToEmail(email, subject, body);
                             });
                         }
                     }
@@ -3609,26 +3616,35 @@ class EmailService {
 <div class="email-sender-info">
 <div class="email-sender-name-row">
 <div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
-${signatureIndicator}
-</div>
+${signatureIcon}
 <div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
 </div>
-</div>
 <details class="email-metadata-details">
-<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
-<div class="email-detail-header vertical" id="inbox-email-header-info">
+<summary class="email-metadata-summary">to ${Utils.escapeHtml(email.to)}</summary>
+<div class="email-header-panel" id="inbox-email-header-info">
 <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : ''}
 </div>
 </details>
+</div>
+<div class="thread-card-actions">
+<button class="thread-action-btn thread-reply-btn" title="Reply"><i class="fas fa-reply"></i></button>
+<div class="thread-more-menu">
+<button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
+<div class="thread-more-dropdown">
+<button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+</div>
+</div>
+</div>
+</div>
 </div>
 <pre id="inbox-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="inbox-email-body-info">${email.html_body ? '' : Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
 <pre id="inbox-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
 ${attachmentsHtml}
 </div>
-<button id="inbox-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
                     if (email.html_body) {
                         let htmlToRender = email.html_body;
@@ -3640,12 +3656,68 @@ ${attachmentsHtml}
                         Utils.decorateArmorBlocks('inbox-email-body-info');
                         this.verifyAndAnnotateSignatureBlocks(body, 'inbox-email-body-info');
                     }
-                    const toggleRawBtn = document.getElementById('inbox-toggle-raw-btn');
+                    // Wire up reply and three-dot menu in card header
+                    const inboxReplyBtn = emailDetailContent.querySelector('.thread-reply-btn');
+                    if (inboxReplyBtn) {
+                        inboxReplyBtn.addEventListener('click', () => {
+                            this.replyToEmail(email, subject, body);
+                        });
+                    }
+                    const inboxMoreBtn = emailDetailContent.querySelector('.thread-more-btn');
+                    const inboxMoreDropdown = emailDetailContent.querySelector('.thread-more-dropdown');
+                    if (inboxMoreBtn && inboxMoreDropdown) {
+                        inboxMoreBtn.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            inboxMoreDropdown.classList.toggle('open');
+                        });
+                        document.addEventListener('click', () => inboxMoreDropdown.classList.remove('open'));
+                    }
+
                     const headerInfo = document.getElementById('inbox-email-header-info');
                     const rawHeaderInfo = document.getElementById('inbox-raw-header-info');
                     const bodyInfo = document.getElementById('inbox-email-body-info');
                     const rawBodyInfo = document.getElementById('inbox-raw-body-info');
                     const attachmentsInfo = document.getElementById('inbox-email-attachments');
+
+                    const inboxRawToggle = emailDetailContent.querySelector('.thread-raw-toggle');
+                    if (inboxRawToggle && rawHeaderInfo && rawBodyInfo && bodyInfo) {
+                        let showingRaw = false;
+                        inboxRawToggle.addEventListener('click', () => {
+                            inboxMoreDropdown.classList.remove('open');
+                            showingRaw = !showingRaw;
+                            if (showingRaw) {
+                                rawHeaderInfo.style.display = 'block';
+                                rawBodyInfo.style.display = 'block';
+                                bodyInfo.style.display = 'none';
+                                inboxRawToggle.textContent = 'Hide Raw';
+                                if (attachmentsInfo) {
+                                    attachmentsInfo.querySelectorAll('.attachment-item').forEach(item => {
+                                        const ef = item.getAttribute('data-encrypted-filename');
+                                        const es = item.getAttribute('data-encrypted-size');
+                                        const enc = item.getAttribute('data-is-encrypted') === 'true';
+                                        if (ef) item.querySelector('.attachment-name').textContent = ef;
+                                        if (es) item.querySelector('.attachment-size').textContent = (parseFloat(es) / 1024).toFixed(2) + ' KB';
+                                        if (enc) { item.querySelector('.attachment-status-icon').textContent = '\u{1F512}'; item.querySelector('.attachment-status-text').textContent = 'Encrypted'; }
+                                    });
+                                }
+                            } else {
+                                rawHeaderInfo.style.display = 'none';
+                                rawBodyInfo.style.display = 'none';
+                                bodyInfo.style.display = '';
+                                inboxRawToggle.textContent = 'Show Raw';
+                                if (attachmentsInfo) {
+                                    attachmentsInfo.querySelectorAll('.attachment-item').forEach(item => {
+                                        const df = item.getAttribute('data-decrypted-filename');
+                                        const ds = item.getAttribute('data-decrypted-size');
+                                        const enc = item.getAttribute('data-is-encrypted') === 'true';
+                                        if (df) item.querySelector('.attachment-name').textContent = df;
+                                        if (ds) item.querySelector('.attachment-size').textContent = (parseFloat(ds) / 1024).toFixed(2) + ' KB';
+                                        if (enc) { item.querySelector('.attachment-status-icon').textContent = '\u{1F513}'; item.querySelector('.attachment-status-text').textContent = 'Decrypted'; }
+                                    });
+                                }
+                            }
+                        });
+                    }
                     
                     // Add event listeners for invalid signature indicator in sender header
                     if (email.signature_valid === false) {
@@ -3693,128 +3765,6 @@ ${attachmentsHtml}
                         }
                     }
                     
-                    if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
-                        // Remove any existing event listeners by cloning the button
-                        const newToggleBtn = toggleRawBtn.cloneNode(true);
-                        toggleRawBtn.parentNode.replaceChild(newToggleBtn, toggleRawBtn);
-                        
-                        let showingRaw = false;
-                        newToggleBtn.addEventListener('click', (event) => {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            
-                            showingRaw = !showingRaw;
-                            if (showingRaw) {
-                                headerInfo.classList.add('hidden-header');
-                                rawHeaderInfo.style.display = 'block';
-                                bodyInfo.style.display = 'none';
-                                rawBodyInfo.style.display = 'block';
-                                newToggleBtn.textContent = 'Show Display Content';
-                                
-                                // Hide metadata details when showing raw content
-                                const metadataDetails = headerInfo.closest('.email-metadata-details');
-                                if (metadataDetails) {
-                                    metadataDetails.style.display = 'none';
-                                }
-                                
-                                // Update attachment filenames, sizes, and icons to show encrypted versions
-                                if (attachmentsInfo) {
-                                    const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
-                                    attachmentItems.forEach(item => {
-                                        const encryptedFilename = item.getAttribute('data-encrypted-filename');
-                                        const encryptedSize = item.getAttribute('data-encrypted-size');
-                                        const isEncrypted = item.getAttribute('data-is-encrypted') === 'true';
-                                        const nameElement = item.querySelector('.attachment-name');
-                                        const sizeElement = item.querySelector('.attachment-size');
-                                        const iconElement = item.querySelector('.attachment-status-icon');
-                                        const textElement = item.querySelector('.attachment-status-text');
-                                        
-                                        if (encryptedFilename && nameElement) {
-                                            nameElement.textContent = encryptedFilename;
-                                        }
-                                        
-                                        // Update size to show encrypted size
-                                        if (encryptedSize && sizeElement) {
-                                            const sizeFormatted = (parseFloat(encryptedSize) / 1024).toFixed(2) + ' KB';
-                                            sizeElement.textContent = sizeFormatted;
-                                        }
-                                        
-                                        // Update icon and text to show encrypted state
-                                        if (isEncrypted && iconElement && textElement) {
-                                            iconElement.textContent = '🔒';
-                                            textElement.textContent = 'Encrypted';
-                                        }
-                                    });
-                                }
-                                
-                                // Move attachments after raw body if they exist
-                                if (attachmentsInfo && attachmentsInfo.parentNode) {
-                                    attachmentsInfo.parentNode.removeChild(attachmentsInfo);
-                                    rawBodyInfo.parentNode.insertBefore(attachmentsInfo, rawBodyInfo.nextSibling);
-                                }
-                                
-                                // Move button outside the card (after the card closes)
-                                const emailDetailCard = headerInfo.closest('.email-detail-card');
-                                if (emailDetailCard && emailDetailCard.parentNode) {
-                                    emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
-                                }
-                            } else {
-                                headerInfo.classList.remove('hidden-header');
-                                rawHeaderInfo.style.display = 'none';
-                                bodyInfo.style.display = 'block';
-                                rawBodyInfo.style.display = 'none';
-                                newToggleBtn.textContent = 'Show Raw Content';
-                                
-                                // Show metadata details when showing display content
-                                const metadataDetails = headerInfo.closest('.email-metadata-details');
-                                if (metadataDetails) {
-                                    metadataDetails.style.display = '';
-                                }
-                                
-                                // Update attachment filenames, sizes, and icons to show decrypted versions
-                                if (attachmentsInfo) {
-                                    const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
-                                    attachmentItems.forEach(item => {
-                                        const decryptedFilename = item.getAttribute('data-decrypted-filename');
-                                        const decryptedSize = item.getAttribute('data-decrypted-size');
-                                        const isEncrypted = item.getAttribute('data-is-encrypted') === 'true';
-                                        const nameElement = item.querySelector('.attachment-name');
-                                        const sizeElement = item.querySelector('.attachment-size');
-                                        const iconElement = item.querySelector('.attachment-status-icon');
-                                        const textElement = item.querySelector('.attachment-status-text');
-                                        
-                                        if (decryptedFilename && nameElement) {
-                                            nameElement.textContent = decryptedFilename;
-                                        }
-                                        
-                                        // Update size to show decrypted size
-                                        if (decryptedSize && sizeElement) {
-                                            const sizeFormatted = (parseFloat(decryptedSize) / 1024).toFixed(2) + ' KB';
-                                            sizeElement.textContent = sizeFormatted;
-                                        }
-                                        
-                                        // Update icon and text to show decrypted state
-                                        if (isEncrypted && iconElement && textElement) {
-                                            iconElement.textContent = '🔓';
-                                            textElement.textContent = 'Decrypted';
-                                        }
-                                    });
-                                }
-                                
-                                // Move attachments after regular body if they exist
-                                if (attachmentsInfo && attachmentsInfo.parentNode) {
-                                    attachmentsInfo.parentNode.removeChild(attachmentsInfo);
-                                    bodyInfo.parentNode.insertBefore(attachmentsInfo, bodyInfo.nextSibling);
-                                }
-                                
-                                // Keep button outside the card (after the card closes)
-                                const emailDetailCard = headerInfo.closest('.email-detail-card');
-                                if (emailDetailCard && emailDetailCard.parentNode) {
-                                    emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
-                                }
-                            }
-                        });
-                    }
                 }
             }
         } catch (error) {
@@ -3993,25 +3943,374 @@ ${attachmentsHtml}
     // Show email list
     showEmailList() {
         try {
-            // Show the email list and hide the detail view
+            // Show the email list and hide detail views (single email + thread)
             const emailList = domManager.get('emailList');
             const emailDetailView = document.getElementById('email-detail-view');
+            const inboxThreadDetailView = document.getElementById('inbox-thread-detail-view');
             const inboxActions = document.getElementById('inbox-actions');
             const inboxTitle = document.getElementById('inbox-title');
 
             if (emailList) emailList.style.display = 'block';
             if (emailDetailView) emailDetailView.style.display = 'none';
+            if (inboxThreadDetailView) inboxThreadDetailView.style.display = 'none';
             if (inboxActions) inboxActions.style.display = 'flex';
-            
+
             // Re-render emails to update unread indicators
             this.renderEmails();
             if (inboxTitle) {
                 inboxTitle.textContent = 'Inbox';
                 inboxTitle.style.display = '';
             }
-            
+            appState.clearCurrentThread();
+
         } catch (error) {
             console.error('Error showing email list:', error);
+        }
+    }
+
+    // Show thread detail view with all messages in a conversation
+    async showThreadDetail(threadId, source = 'inbox') {
+        try {
+            const isInbox = source === 'inbox';
+            const prefix = isInbox ? 'inbox' : 'sent';
+
+            // Toggle UI: hide list, show thread detail
+            const emailList = isInbox ? domManager.get('emailList') : domManager.get('sentList');
+            const actions = document.getElementById(isInbox ? 'inbox-actions' : 'sent-actions');
+            const title = document.getElementById(isInbox ? 'inbox-title' : 'sent-title');
+            const threadDetailView = document.getElementById(`${prefix}-thread-detail-view`);
+            const threadContent = document.getElementById(`${prefix}-thread-detail-content`);
+            const threadSubject = document.getElementById(`${prefix}-thread-subject`);
+
+            if (emailList) emailList.style.display = 'none';
+            if (actions) actions.style.display = 'none';
+            if (title) title.style.display = 'none';
+            if (threadDetailView) threadDetailView.style.display = 'flex';
+
+            // Show loading state
+            if (threadContent) {
+                threadContent.innerHTML = '<div class="thread-loading"><i class="fas fa-spinner fa-spin"></i> Loading conversation...</div>';
+            }
+
+            // Fetch all emails in thread
+            const threadEmails = await TauriService.getThreadEmails(threadId);
+            if (!threadEmails || threadEmails.length === 0) {
+                if (threadContent) threadContent.innerHTML = '<div class="thread-loading">No messages found.</div>';
+                return;
+            }
+
+            appState.setCurrentThread(threadId, threadEmails);
+
+            // Classify each email as sent or received
+            const settings = appState.getSettings();
+            const userEmail = (settings?.email_address || '').trim().toLowerCase();
+            const userPubkey = appState.getKeypair()?.public_key;
+
+            for (const email of threadEmails) {
+                const fromAddr = (email.from || '').trim().toLowerCase();
+                email._isSentByUser = (fromAddr === userEmail) ||
+                    (userPubkey && email.sender_pubkey === userPubkey);
+            }
+
+            // Build contact index if needed
+            if (!this._contactsByPubkey) this._buildContactIndex();
+
+            // Render messages using same per-email decrypt as single email views
+            const keypair = appState.getKeypair();
+            const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+            let threadSubjectText = threadEmails[0].subject;
+            let lastDecryptedSubject = null;
+            let lastDecryptedBody = null;
+
+            if (threadContent) {
+                threadContent.innerHTML = '';
+                for (const email of threadEmails) {
+                    const isSent = email._isSentByUser;
+                    const emailBody = email.body || '';
+                    const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
+
+                    let displayBody = emailBody;
+                    let displaySubject = email.subject;
+                    let sigResults = null;
+                    let blockDecryptResults = null;
+
+                    if (encryptedMatch && keypair) {
+                        // Determine correct pubkey: sender for received, recipient for sent
+                        const senderPubkey = isSent ? null : (email.sender_pubkey || email.nostr_pubkey || null);
+                        let recipientPubkey = null;
+                        if (isSent) {
+                            recipientPubkey = email.recipient_pubkey || null;
+                            if (!recipientPubkey) {
+                                const recipientEmail = email.to || email.to_address;
+                                const contact = recipientEmail ? this._findContact(null, recipientEmail) : null;
+                                if (contact && contact.pubkey) recipientPubkey = contact.pubkey;
+                            }
+                        }
+
+                        try {
+                            const [result, allSigs] = await Promise.all([
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey),
+                                TauriService.verifyAllSignatures(emailBody).catch(e => {
+                                    console.warn('[JS] Thread sig verify error:', e);
+                                    return [];
+                                })
+                            ]);
+                            sigResults = allSigs.length > 0 ? allSigs : null;
+                            displaySubject = result.subject || email.subject;
+                            displayBody = result.success ? result.body : emailBody;
+
+                            if (result.blockResults && result.blockResults.length > 0) {
+                                blockDecryptResults = result.blockResults.map(b => {
+                                    if (!b.wasEncrypted) return null;
+                                    if (b.decryptedText != null) return { decryptedText: b.decryptedText };
+                                    if (b.error) return { error: b.error };
+                                    return null;
+                                });
+                            }
+
+                            // Backfill sender_pubkey from armor if missing
+                            if (result.senderPubkey && !email.sender_pubkey && email.id) {
+                                email.sender_pubkey = result.senderPubkey;
+                            }
+                        } catch (err) {
+                            console.error(`[JS] Thread email ${email.id} decrypt error:`, err);
+                        }
+                    } else {
+                        // Non-encrypted: verify sigs + glossia decode (same as single view)
+                        try {
+                            const [allSigs, signedMsg] = await Promise.all([
+                                TauriService.verifyAllSignatures(emailBody).catch(e => {
+                                    console.warn('[JS] Thread sig verify error:', e);
+                                    return [];
+                                }),
+                                this.decodeGlossiaSignedMessage(emailBody)
+                            ]);
+                            sigResults = allSigs.length > 0 ? allSigs : null;
+                            if (signedMsg && signedMsg.plaintextBody) {
+                                displayBody = signedMsg.plaintextBody;
+                            }
+                        } catch (err) {
+                            console.error(`[JS] Thread email ${email.id} sig/glossia error:`, err);
+                        }
+                    }
+
+                    // Track thread subject from first successful decrypt
+                    if (displaySubject && displaySubject !== email.subject && threadSubjectText === threadEmails[0].subject) {
+                        threadSubjectText = displaySubject;
+                    }
+
+                    // Resolve contact for avatar
+                    const contactPubkey = isSent ? userPubkey : email.sender_pubkey;
+                    const contactEmail = isSent ? userEmail : (email.from || '');
+                    const contact = this._findContact(contactPubkey, contactEmail);
+
+                    let avatarSrc = defaultAvatar;
+                    if (contact) {
+                        const isValidDataUrl = contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
+                        if (isValidDataUrl) {
+                            avatarSrc = contact.picture_data_url;
+                        } else if (contact.picture) {
+                            avatarSrc = contact.picture;
+                        }
+                    }
+                    const senderName = contact?.name || contact?.display_name || email.from || 'Unknown';
+                    const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+
+                    // Signature indicator — icon only in header, full text in details panel
+                    const outerSigResult = Array.isArray(sigResults) ? sigResults[sigResults.length - 1] : sigResults;
+                    let signatureIcon = '';
+                    let securityRows = '';
+                    if (outerSigResult && outerSigResult.isValid === true) {
+                        signatureIcon = `<span class="signature-indicator verified" title="Signature Verified"><i class="fas fa-check-circle"></i></span>`;
+                        securityRows += `<div class="security-row verified"><i class="fas fa-check-circle"></i> Signature Verified</div>`;
+                    } else if (outerSigResult && outerSigResult.isValid === false) {
+                        signatureIcon = `<span class="signature-indicator invalid" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
+                        securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
+                    } else if (email.signature_valid === true) {
+                        signatureIcon = `<span class="signature-indicator verified" title="Signature Verified"><i class="fas fa-check-circle"></i></span>`;
+                        securityRows += `<div class="security-row verified"><i class="fas fa-check-circle"></i> Signature Verified</div>`;
+                    } else if (email.signature_valid === false) {
+                        signatureIcon = `<span class="signature-indicator invalid" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
+                        securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
+                    }
+
+                    // Transport auth indicator
+                    let transportAuthIcon = '';
+                    if (email.transport_auth_verified === true) {
+                        transportAuthIcon = `<span class="transport-auth-indicator verified" title="Email Transport Verified"><i class="fas fa-envelope"></i></span>`;
+                        securityRows += `<div class="security-row verified"><i class="fas fa-envelope"></i> Email Transport Verified</div>`;
+                    }
+
+                    // Generate body snippet for collapsed view (use decrypted displayBody, not raw html_body)
+                    const snippetPlain = (displayBody || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+                    const snippet = Utils.escapeHtml(snippetPlain.substring(0, 120));
+
+                    const bodyId = `thread-body-${email.id}`;
+                    const cardDiv = document.createElement('div');
+                    cardDiv.className = 'email-detail-card';
+                    cardDiv.innerHTML = `
+<div class="email-sender-header">
+<div class="email-sender-row">
+<img class="email-sender-avatar" src="${avatarSrc}" alt="${Utils.escapeHtml(senderName)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='email-sender-avatar';">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
+${signatureIcon}
+${transportAuthIcon}
+<span class="email-body-snippet">${snippet}</span>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+<details class="email-metadata-details">
+<summary class="email-metadata-summary">to ${Utils.escapeHtml(email.to)}</summary>
+<div class="email-header-panel">
+<div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
+<div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
+<div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : ''}
+</div>
+</details>
+</div>
+<div class="thread-card-actions">
+<button class="thread-action-btn thread-reply-btn" title="Reply"><i class="fas fa-reply"></i></button>
+<div class="thread-more-menu">
+<button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
+<div class="thread-more-dropdown">
+<button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+</div>
+</div>
+</div>
+</div>
+</div>
+<pre class="email-raw-content" style="display:none">${Utils.escapeHtml(email.raw_headers || '')}</pre>
+<div class="email-detail-body" id="${bodyId}">${email.html_body ? '' : Utils.escapeHtml(displayBody).replace(/\n/g, '<br>')}</div>
+<pre class="email-raw-content email-raw-body" style="display:none">${Utils.escapeHtml(email.raw_body || '')}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
+                    `;
+                    threadContent.appendChild(cardDiv);
+
+                    // Collapse all cards except the last (most recent)
+                    const isLastEmail = (email === threadEmails[threadEmails.length - 1]);
+                    if (!isLastEmail) {
+                        cardDiv.classList.add('collapsed');
+                    }
+
+                    // Click header to toggle collapse/expand
+                    const senderHeader = cardDiv.querySelector('.email-sender-header');
+                    senderHeader.style.cursor = 'pointer';
+                    senderHeader.addEventListener('click', (e) => {
+                        if (e.target.closest('.thread-card-actions, .email-metadata-details, a')) return;
+                        cardDiv.classList.toggle('collapsed');
+                    });
+
+                    // Wire up per-card action buttons
+                    const replyCardBtn = cardDiv.querySelector('.thread-reply-btn');
+                    if (replyCardBtn) {
+                        replyCardBtn.addEventListener('click', () => {
+                            this.replyToEmail(email, displaySubject, displayBody);
+                        });
+                    }
+                    const moreBtn = cardDiv.querySelector('.thread-more-btn');
+                    const moreDropdown = cardDiv.querySelector('.thread-more-dropdown');
+                    if (moreBtn && moreDropdown) {
+                        moreBtn.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            // Close any other open menus
+                            document.querySelectorAll('.thread-more-dropdown.open').forEach(d => {
+                                if (d !== moreDropdown) d.classList.remove('open');
+                            });
+                            moreDropdown.classList.toggle('open');
+                        });
+                    }
+                    const rawToggle = cardDiv.querySelector('.thread-raw-toggle');
+                    if (rawToggle) {
+                        rawToggle.addEventListener('click', () => {
+                            moreDropdown.classList.remove('open');
+                            const bodyDiv = cardDiv.querySelector('.email-detail-body');
+                            const rawHeader = cardDiv.querySelector('.email-raw-content:not(.email-raw-body)');
+                            const rawBody = cardDiv.querySelector('.email-raw-content.email-raw-body');
+                            const showingRaw = rawBody && rawBody.style.display !== 'none';
+                            if (showingRaw) {
+                                if (rawHeader) rawHeader.style.display = 'none';
+                                if (rawBody) rawBody.style.display = 'none';
+                                if (bodyDiv) bodyDiv.style.display = '';
+                                rawToggle.textContent = 'Show Raw';
+                            } else {
+                                if (rawHeader) rawHeader.style.display = 'block';
+                                if (rawBody) rawBody.style.display = 'block';
+                                if (bodyDiv) bodyDiv.style.display = 'none';
+                                rawToggle.textContent = 'Hide Raw';
+                            }
+                        });
+                    }
+
+                    // Post-render: same steps as single email detail view
+                    if (email.html_body) {
+                        let htmlToRender = email.html_body;
+                        if (sigResults) htmlToRender = this.injectHtmlSigBadge(htmlToRender, sigResults);
+                        Utils.renderHtmlBodyInIframe(bodyId, htmlToRender, {
+                            decryptedTexts: blockDecryptResults,
+                            startDecrypted: true,
+                            startCollapsed: true
+                        });
+                    }
+                    if (!email.html_body) {
+                        Utils.decorateArmorBlocks(bodyId);
+                        this.verifyAndAnnotateSignatureBlocks(displayBody, bodyId);
+                    }
+
+                    // Track last email's decrypted content for reply button
+                    lastDecryptedSubject = displaySubject;
+                    lastDecryptedBody = displayBody;
+                }
+
+                // Close menus on outside click
+                document.addEventListener('click', () => {
+                    document.querySelectorAll('.thread-more-dropdown.open').forEach(d => d.classList.remove('open'));
+                }, { once: false });
+
+                // Scroll to bottom (most recent message)
+                threadContent.scrollTop = threadContent.scrollHeight;
+            }
+
+            if (threadSubject) {
+                threadSubject.textContent = threadSubjectText;
+            }
+
+            // Mark unread emails as read (fire-and-forget)
+            for (const email of threadEmails) {
+                if (!email.is_read && (email.message_id || email.id)) {
+                    this.markAsRead(email.message_id || email.id).catch(() => {});
+                }
+            }
+
+            // Set up back button
+            const backBtn = document.getElementById(`back-to-${isInbox ? 'inbox' : 'sent'}-from-thread`);
+            if (backBtn) {
+                backBtn.onclick = () => {
+                    if (threadDetailView) threadDetailView.style.display = 'none';
+                    appState.clearCurrentThread();
+                    if (isInbox) {
+                        this.showEmailList();
+                    } else {
+                        this.showSentList();
+                    }
+                };
+            }
+
+            // Set up reply button (reply to most recent email)
+            const replyBtn = document.getElementById(`reply-to-${prefix}-thread`);
+            if (replyBtn) {
+                const lastEmail = threadEmails[threadEmails.length - 1];
+                replyBtn.onclick = () => {
+                    this.replyToEmail(
+                        lastEmail,
+                        lastDecryptedSubject || lastEmail.subject,
+                        lastDecryptedBody || lastEmail.body
+                    );
+                };
+            }
+
+        } catch (error) {
+            console.error('[JS] Error showing thread detail:', error);
         }
     }
 
@@ -4680,15 +4979,25 @@ ${attachmentsHtml}
         if (!results || results.length === 0) return;
 
         // Annotate DOM elements with verification results (innermost-first order)
+        // IDs are scoped to containerId to avoid collisions in thread view
+        const idPrefix = `${containerId}-sig-block`;
         for (let i = 0; i < results.length; i++) {
             const result = results[i];
-            const el = document.getElementById(`inline-sig-block-${i}`);
+            const el = document.getElementById(`${idPrefix}-${i}`);
             if (!el) continue;
             const indicator = el.querySelector('.inline-sig-indicator');
             if (!indicator) continue;
 
             const pubkeyHex = result.pubkeyHex;
             const signatureHex = result.signatureHex;
+
+            // Toggle raw armor content on indicator click
+            const sigContent = el.querySelector('.inline-sig-content');
+            if (sigContent) {
+                indicator.addEventListener('click', () => {
+                    sigContent.style.display = sigContent.style.display === 'block' ? 'none' : 'block';
+                });
+            }
 
             if (!pubkeyHex || !signatureHex) {
                 indicator.className = 'inline-sig-indicator invalid';
@@ -5977,7 +6286,7 @@ ${attachmentsHtml}
             <div class="email-content">
                 <div class="email-header">
                     <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
-                    <div class="email-date">${dateDisplay}</div>
+                    <div class="email-date">${dateDisplay}${email.message_count > 1 ? `<span class="thread-badge" title="${email.message_count} messages">${email.message_count}</span>` : ''}</div>
                 </div>
                 ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
                 <div class="email-preview">${previewText}</div>
@@ -6037,10 +6346,16 @@ ${attachmentsHtml}
                 });
             }
         }
-        emailElement.addEventListener('click', () => this.showSentDetail(email.id));
+        emailElement.addEventListener('click', () => {
+            if (email.message_count > 1) {
+                this.showThreadDetail(email.thread_id, 'sent');
+            } else {
+                this.showSentDetail(email.id);
+            }
+        });
         return emailElement;
     }
-    
+
     // Render a basic sent email item (without decryption, used as fallback)
     renderSentEmailItemBasic(email) {
         const emailElement = document.createElement('div');
@@ -6098,7 +6413,13 @@ ${attachmentsHtml}
                 </button>
             </div>
         `;
-        emailElement.addEventListener('click', () => this.showSentDetail(email.id));
+        emailElement.addEventListener('click', () => {
+            if (email.message_count > 1) {
+                this.showThreadDetail(email.thread_id, 'sent');
+            } else {
+                this.showSentDetail(email.id);
+            }
+        });
         return emailElement;
     }
 
@@ -6205,14 +6526,18 @@ ${attachmentsHtml}
                 const rawBody = email.raw_body || email.body || '';
                 const rawHeaders = email.raw_headers || '';
                 
-                // Add signature verification indicator
-                let signatureIndicator = '';
-                const sentDetailSigSource = email.signature_source ? ` (${email.signature_source})` : '';
-                // Check signature_valid - handle both boolean and null/undefined cases
+                // Signature indicator — icon only in header, full text in details panel
+                let signatureIcon = '';
+                let securityRows = '';
                 if (email.signature_valid === true || email.signature_valid === 1) {
-                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sentDetailSigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                    signatureIcon = `<span class="signature-indicator verified" title="Signature Verified"><i class="fas fa-check-circle"></i></span>`;
+                    securityRows += `<div class="security-row verified"><i class="fas fa-check-circle"></i> Signature Verified</div>`;
                 } else if (email.signature_valid === false || email.signature_valid === 0) {
-                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+                    signatureIcon = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
+                    securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
+                }
+                if (email.transport_auth_verified === true) {
+                    securityRows += `<div class="security-row verified"><i class="fas fa-envelope"></i> Email Transport Verified</div>`;
                 }
                 
                 // Get sender info (for sent emails, sender is us)
@@ -6308,26 +6633,34 @@ ${attachmentsHtml}
 <div class="email-sender-info">
 <div class="email-sender-name-row">
 <div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
-${signatureIndicator}
-</div>
+${signatureIcon}
 <div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
 </div>
-</div>
 <details class="email-metadata-details">
-<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
-<div class="email-detail-header vertical" id="sent-email-header-info">
+<summary class="email-metadata-summary">to ${Utils.escapeHtml(email.to)}</summary>
+<div class="email-header-panel" id="sent-email-header-info">
 <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : ''}
 </div>
 </details>
+</div>
+<div class="thread-card-actions">
+<div class="thread-more-menu">
+<button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
+<div class="thread-more-dropdown">
+<button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+</div>
+</div>
+</div>
+</div>
 </div>
 <div class="error" style="margin-bottom: 15px;">Cannot decrypt: Decryption failed with all known contact keys. The recipient's pubkey may have changed since this email was sent.</div>
 <pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(rawHeaders)}</pre>
 <div class="email-detail-body" id="sent-email-body-info">${email.html_body ? '' : Utils.escapeHtml(rawBody).replace(/\n/g, '<br>')}</div>
 <pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(rawBody)}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
 </div>
-<button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
                 // This is the error path (no recipient pubkey) - show raw HTML if available
                 if (email.html_body) {
@@ -6384,48 +6717,35 @@ ${signatureIndicator}
                     }
                 }
                 
-                // Set up the toggle button for raw content
-                const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
-                const headerInfo = document.getElementById('sent-email-header-info');
+                // Wire up three-dot menu for sent email (error path)
+                const sentErrMoreBtn = sentDetailContent.querySelector('.thread-more-btn');
+                const sentErrMoreDropdown = sentDetailContent.querySelector('.thread-more-dropdown');
+                if (sentErrMoreBtn && sentErrMoreDropdown) {
+                    sentErrMoreBtn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        sentErrMoreDropdown.classList.toggle('open');
+                    });
+                    document.addEventListener('click', () => sentErrMoreDropdown.classList.remove('open'));
+                }
                 const rawHeaderInfo = document.getElementById('sent-raw-header-info');
                 const bodyInfo = document.getElementById('sent-email-body-info');
                 const rawBodyInfo = document.getElementById('sent-raw-body-info');
-                
-                if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
-                    // Remove any existing event listeners by cloning the button
-                    const newToggleBtn = toggleRawBtn.cloneNode(true);
-                    toggleRawBtn.parentNode.replaceChild(newToggleBtn, toggleRawBtn);
-                    
+                const sentErrRawToggle = sentDetailContent.querySelector('.thread-raw-toggle');
+                if (sentErrRawToggle && rawHeaderInfo && rawBodyInfo && bodyInfo) {
                     let showingRaw = false;
-                    newToggleBtn.addEventListener('click', (event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        
+                    sentErrRawToggle.addEventListener('click', () => {
+                        sentErrMoreDropdown.classList.remove('open');
                         showingRaw = !showingRaw;
                         if (showingRaw) {
-                            headerInfo.classList.add('hidden-header');
                             rawHeaderInfo.style.display = 'block';
-                            bodyInfo.style.display = 'none';
                             rawBodyInfo.style.display = 'block';
-                            newToggleBtn.textContent = 'Show Display Content';
-                            
-                            // Hide metadata details when showing raw content
-                            const metadataDetails = headerInfo.closest('.email-metadata-details');
-                            if (metadataDetails) {
-                                metadataDetails.style.display = 'none';
-                            }
+                            bodyInfo.style.display = 'none';
+                            sentErrRawToggle.textContent = 'Hide Raw';
                         } else {
-                            headerInfo.classList.remove('hidden-header');
                             rawHeaderInfo.style.display = 'none';
-                            bodyInfo.style.display = 'block';
                             rawBodyInfo.style.display = 'none';
-                            newToggleBtn.textContent = 'Show Raw Content';
-                            
-                            // Show metadata details when showing display content
-                            const metadataDetails = headerInfo.closest('.email-metadata-details');
-                            if (metadataDetails) {
-                                metadataDetails.style.display = '';
-                            }
+                            bodyInfo.style.display = '';
+                            sentErrRawToggle.textContent = 'Show Raw';
                         }
                     });
                 }
@@ -6638,23 +6958,26 @@ ${signatureIndicator}
                 </div>`;
             }
             
-            // Add signature verification indicator
-            let signatureIndicator = '';
-            console.log('[JS] Sent updateDetail: inlineSigResult=', inlineSigResult, 'email.signature_valid=', email.signature_valid);
-            // Check inline signature result first (from body armor verification)
-            // Extract the outer sig result (last element if array, since DOM order is [quoted, outer])
+            // Signature indicator — icon only in header, full text in details panel
             const outerSigResult = Array.isArray(inlineSigResult) ? inlineSigResult[inlineSigResult.length - 1] : inlineSigResult;
+            let signatureIcon = '';
+            let securityRows = '';
             if (outerSigResult && outerSigResult.isValid === true) {
-                signatureIndicator = `<span class="signature-indicator verified" title="Inline signature verified"><i class="fas fa-check-circle"></i> Signature Verified</span>`;
+                signatureIcon = `<span class="signature-indicator verified" title="Signature Verified"><i class="fas fa-check-circle"></i></span>`;
+                securityRows += `<div class="security-row verified"><i class="fas fa-check-circle"></i> Signature Verified</div>`;
             } else if (outerSigResult && outerSigResult.isValid === false) {
-                signatureIndicator = `<span class="signature-indicator invalid" title="Inline signature invalid"><i class="fas fa-times-circle"></i> Signature Invalid</span>`;
+                signatureIcon = `<span class="signature-indicator invalid" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
+                securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
             } else if (email.signature_valid === true || email.signature_valid === 1) {
-                const sentUpSigSource = email.signature_source ? ` (${email.signature_source})` : '';
-                signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sentUpSigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
+                signatureIcon = `<span class="signature-indicator verified" title="Signature Verified"><i class="fas fa-check-circle"></i></span>`;
+                securityRows += `<div class="security-row verified"><i class="fas fa-check-circle"></i> Signature Verified</div>`;
             } else if (email.signature_valid === false || email.signature_valid === 0) {
-                signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+                signatureIcon = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
+                securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
             }
-            console.log('[JS] Sent updateDetail: signatureIndicator=', signatureIndicator ? 'SET' : 'EMPTY');
+            if (email.transport_auth_verified === true) {
+                securityRows += `<div class="security-row verified"><i class="fas fa-envelope"></i> Email Transport Verified</div>`;
+            }
 
             // Get sender info (for sent emails, sender is us)
             // IMPORTANT: For sent emails, we are the sender, so we must use OUR pubkey, not email.recipient_pubkey
@@ -6757,26 +7080,34 @@ ${signatureIndicator}
 <div class="email-sender-info">
 <div class="email-sender-name-row">
 <div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
-${signatureIndicator}
-</div>
+${signatureIcon}
 <div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
 </div>
-</div>
 <details class="email-metadata-details">
-<summary class="email-metadata-summary"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></summary>
-<div class="email-detail-header vertical" id="sent-email-header-info">
+<summary class="email-metadata-summary">to ${Utils.escapeHtml(email.to)}</summary>
+<div class="email-header-panel" id="sent-email-header-info">
 <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : ''}
 </div>
 </details>
+</div>
+<div class="thread-card-actions">
+<div class="thread-more-menu">
+<button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
+<div class="thread-more-dropdown">
+<button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+</div>
+</div>
+</div>
+</div>
 </div>
 <pre id="sent-raw-header-info" class="email-raw-content">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="sent-email-body-info">${email.html_body ? '' : Utils.escapeHtml(body).replace(/\n/g, '<br>')}</div>
 <pre id="sent-raw-body-info" class="email-raw-content email-raw-body">${Utils.escapeHtml(email.raw_body)}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
 ${attachmentsHtml}
 </div>
-<button id="sent-toggle-raw-btn" class="btn btn-secondary" style="margin: 18px 0 0 0;">Show Raw Content</button>
 </div>`;
             if (email.html_body) {
                 let htmlToRender = email.html_body;
@@ -6835,118 +7166,35 @@ ${attachmentsHtml}
                 }
             }
             
-            const toggleRawBtn = document.getElementById('sent-toggle-raw-btn');
-            const headerInfo = document.getElementById('sent-email-header-info');
+            // Wire up three-dot menu for sent email
+            const sentMoreBtn = sentDetailContent.querySelector('.thread-more-btn');
+            const sentMoreDropdown = sentDetailContent.querySelector('.thread-more-dropdown');
+            if (sentMoreBtn && sentMoreDropdown) {
+                sentMoreBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    sentMoreDropdown.classList.toggle('open');
+                });
+                document.addEventListener('click', () => sentMoreDropdown.classList.remove('open'));
+            }
             const rawHeaderInfo = document.getElementById('sent-raw-header-info');
             const bodyInfo = document.getElementById('sent-email-body-info');
             const rawBodyInfo = document.getElementById('sent-raw-body-info');
-            const attachmentsInfo = document.getElementById('sent-email-attachments');
-            
-            if (toggleRawBtn && headerInfo && rawHeaderInfo && bodyInfo && rawBodyInfo) {
-                // Remove any existing event listeners by cloning the button
-                const newToggleBtn = toggleRawBtn.cloneNode(true);
-                toggleRawBtn.parentNode.replaceChild(newToggleBtn, toggleRawBtn);
-                
+            const sentRawToggle = sentDetailContent.querySelector('.thread-raw-toggle');
+            if (sentRawToggle && rawHeaderInfo && rawBodyInfo && bodyInfo) {
                 let showingRaw = false;
-                newToggleBtn.addEventListener('click', (event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    
+                sentRawToggle.addEventListener('click', () => {
+                    sentMoreDropdown.classList.remove('open');
                     showingRaw = !showingRaw;
                     if (showingRaw) {
-                        headerInfo.classList.add('hidden-header');
                         rawHeaderInfo.style.display = 'block';
-                        bodyInfo.style.display = 'none';
                         rawBodyInfo.style.display = 'block';
-                        newToggleBtn.textContent = 'Show Display Content';
-                        
-                        // Hide metadata details when showing raw content
-                        const metadataDetails = headerInfo.closest('.email-metadata-details');
-                        if (metadataDetails) {
-                            metadataDetails.style.display = 'none';
-                        }
-                        
-                        // Update attachment filenames and sizes to show encrypted versions
-                        if (attachmentsInfo) {
-                            const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
-                            attachmentItems.forEach(item => {
-                                const encryptedFilename = item.getAttribute('data-encrypted-filename');
-                                const encryptedSize = item.getAttribute('data-encrypted-size');
-                                const nameElement = item.querySelector('.attachment-name');
-                                const sizeElement = item.querySelector('.attachment-size');
-                                
-                                if (encryptedFilename && nameElement) {
-                                    nameElement.textContent = encryptedFilename;
-                                }
-                                
-                                // Update size to show encrypted size
-                                if (encryptedSize && sizeElement) {
-                                    const sizeFormatted = (parseFloat(encryptedSize) / 1024).toFixed(2) + ' KB';
-                                    sizeElement.textContent = sizeFormatted;
-                                }
-                            });
-                        }
-                        
-                        // Move attachments after raw body if they exist
-                        if (attachmentsInfo && attachmentsInfo.parentNode) {
-                            // Remove from current position
-                            attachmentsInfo.parentNode.removeChild(attachmentsInfo);
-                            // Insert after raw body
-                            rawBodyInfo.parentNode.insertBefore(attachmentsInfo, rawBodyInfo.nextSibling);
-                        }
-                        
-                        // Keep button outside the card (after the card closes)
-                        const emailDetailCard = headerInfo.closest('.email-detail-card');
-                        if (emailDetailCard && emailDetailCard.parentNode) {
-                            emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
-                        }
+                        bodyInfo.style.display = 'none';
+                        sentRawToggle.textContent = 'Hide Raw';
                     } else {
-                        headerInfo.classList.remove('hidden-header');
                         rawHeaderInfo.style.display = 'none';
-                        bodyInfo.style.display = 'block';
                         rawBodyInfo.style.display = 'none';
-                        newToggleBtn.textContent = 'Show Raw Content';
-                        
-                        // Show metadata details when showing display content
-                        const metadataDetails = headerInfo.closest('.email-metadata-details');
-                        if (metadataDetails) {
-                            metadataDetails.style.display = '';
-                        }
-                        
-                        // Update attachment filenames and sizes to show decrypted versions
-                        if (attachmentsInfo) {
-                            const attachmentItems = attachmentsInfo.querySelectorAll('.attachment-item');
-                            attachmentItems.forEach(item => {
-                                const decryptedFilename = item.getAttribute('data-decrypted-filename');
-                                const decryptedSize = item.getAttribute('data-decrypted-size');
-                                const nameElement = item.querySelector('.attachment-name');
-                                const sizeElement = item.querySelector('.attachment-size');
-                                
-                                if (decryptedFilename && nameElement) {
-                                    nameElement.textContent = decryptedFilename;
-                                }
-                                
-                                // Update size to show decrypted size
-                                if (decryptedSize && sizeElement) {
-                                    const sizeFormatted = (parseFloat(decryptedSize) / 1024).toFixed(2) + ' KB';
-                                    sizeElement.textContent = sizeFormatted;
-                                }
-                            });
-                        }
-                        
-                        // Move attachments after regular body if they exist
-                        if (attachmentsInfo && attachmentsInfo.parentNode) {
-                            // Remove from current position
-                            attachmentsInfo.parentNode.removeChild(attachmentsInfo);
-                            // Insert after regular body
-                            bodyInfo.parentNode.insertBefore(attachmentsInfo, bodyInfo.nextSibling);
-                        }
-                        
-                        // Keep button outside the card (after the card closes)
-                        const emailDetailCard = headerInfo.closest('.email-detail-card');
-                        if (emailDetailCard && emailDetailCard.parentNode) {
-                            emailDetailCard.parentNode.insertBefore(newToggleBtn, emailDetailCard.nextSibling);
-                        }
+                        bodyInfo.style.display = '';
+                        sentRawToggle.textContent = 'Show Raw';
                     }
                 });
             }
@@ -7704,15 +7952,18 @@ ${attachmentsHtml}
         try {
             const sentList = domManager.get('sentList');
             const sentDetailView = domManager.get('sentDetailView');
+            const sentThreadDetailView = document.getElementById('sent-thread-detail-view');
             const sentActions = domManager.get('sentActions');
             const sentTitle = domManager.get('sentTitle');
             if (sentList) sentList.style.display = 'block';
             if (sentDetailView) sentDetailView.style.display = 'none';
+            if (sentThreadDetailView) sentThreadDetailView.style.display = 'none';
             if (sentActions) sentActions.style.display = 'flex';
             if (sentTitle) {
                 sentTitle.textContent = 'Sent';
                 sentTitle.style.display = '';
             }
+            appState.clearCurrentThread();
         } catch (error) {
             console.error('Error showing sent email list:', error);
         }

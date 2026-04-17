@@ -4231,7 +4231,9 @@ ${transportAuthIndicator}
 
                     // Post-render: same steps as single email detail view
                     if (email.html_body) {
-                        Utils.renderHtmlBodyInIframe(bodyId, email.html_body, {
+                        let htmlToRender = email.html_body;
+                        if (sigResults) htmlToRender = this.injectHtmlSigBadge(htmlToRender, sigResults);
+                        Utils.renderHtmlBodyInIframe(bodyId, htmlToRender, {
                             decryptedTexts: blockDecryptResults,
                             startDecrypted: true
                         });

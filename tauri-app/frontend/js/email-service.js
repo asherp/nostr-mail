@@ -45,6 +45,47 @@ class EmailService {
         this._quotedOriginalArmor = null; // Original message armor to append as quote in replies
         this._replyToMessageId = null; // Message-ID of email being replied to (In-Reply-To header)
         this._replyReferences = null; // References chain for email threading
+        this._previewCache = new Map(); // Cache decrypted preview data by email ID to avoid re-decrypting on re-render
+    }
+
+    // Build indexed contact maps for O(1) lookups during list rendering.
+    // Call once per render pass; the maps are stored on `this` for use by per-item methods.
+    _buildContactIndex() {
+        const contacts = appState.getContacts();
+        this._contactsByPubkey = new Map();
+        this._contactsByEmail = new Map();
+        for (const c of contacts) {
+            if (c.pubkey) {
+                this._contactsByPubkey.set(c.pubkey, c);
+            }
+            if (c.email) {
+                const lower = c.email.trim().toLowerCase();
+                this._contactsByEmail.set(lower, c);
+                // Also index the Gmail-normalized form
+                if (lower.includes('@gmail.com')) {
+                    const [local, domain] = lower.split('@');
+                    const normalized = `${local.split('+')[0]}@${domain}`;
+                    if (normalized !== lower) {
+                        this._contactsByEmail.set(normalized, c);
+                    }
+                }
+            }
+        }
+    }
+
+    // Look up a contact by pubkey, then fall back to email address.
+    _findContact(pubkey, emailAddr) {
+        let contact = pubkey ? this._contactsByPubkey.get(pubkey) || null : null;
+        if (!contact && emailAddr) {
+            const lower = emailAddr.trim().toLowerCase();
+            contact = this._contactsByEmail.get(lower) || null;
+            if (!contact && lower.includes('@gmail.com')) {
+                const [local, domain] = lower.split('@');
+                const normalized = `${local.split('+')[0]}@${domain}`;
+                contact = this._contactsByEmail.get(normalized) || null;
+            }
+        }
+        return contact;
     }
 
     // Get appropriate background color for Nostr contact input based on dark mode
@@ -2150,20 +2191,22 @@ class EmailService {
             
             await Promise.all(attachmentPromises);
             
+            let appendFrom = 0;
             if (append) {
                 // Append new emails to existing ones
                 const existingEmails = appState.getEmails();
+                appendFrom = existingEmails.length;
                 appState.setEmails([...existingEmails, ...emails]);
             } else {
                 // Replace emails (fresh load)
                 appState.setEmails(emails);
             }
-            
+
             // Update offset for next load
             this.inboxOffset += emails.length;
-            
+
             // Show Load More button if we got a full page of results
-            this.renderEmails(emails.length === pageSize);
+            this.renderEmails(emails.length === pageSize, appendFrom);
         } catch (error) {
             console.error('Failed to load emails:', error);
             notificationService.showError('Failed to load emails: ' + error);
@@ -2278,20 +2321,22 @@ class EmailService {
             });
             await Promise.allSettled(attachmentPromises);
             
+            let appendFrom = 0;
             if (append) {
                 // Append new emails to existing ones
                 const existingEmails = appState.getSentEmails();
+                appendFrom = existingEmails.length;
                 appState.setSentEmails([...existingEmails, ...emails]);
             } else {
                 // Replace emails (fresh load)
                 appState.setSentEmails(emails);
             }
-            
+
             // Update offset for next load
             this.sentOffset += emails.length;
-            
+
             // Show Load More button if we got a full page of results
-            this.renderSentEmails(emails.length === pageSize);
+            this.renderSentEmails(emails.length === pageSize, appendFrom);
         } catch (error) {
             console.error('Failed to load sent emails:', error);
             notificationService.showError('Failed to load sent emails: ' + error);
@@ -2565,7 +2610,7 @@ class EmailService {
     //          decryptNostrSentMessageWithFallback, decryptAllEncryptedBlocks,
     //          _decryptFromArmorParts, decodeGlossiaArmoredBody
 
-    async renderEmails(showLoadMore = false) {
+    async renderEmails(showLoadMore = false, appendFrom = 0) {
         const emailList = domManager.get('emailList');
         if (!emailList) return;
         try {
@@ -2574,279 +2619,147 @@ class EmailService {
             if (existingLoadMoreBtn) {
                 existingLoadMoreBtn.remove();
             }
-            
+
             // Get all emails from state
-            const emails = appState.getEmails();
-            
-            if (emails.length === 0) {
+            const allEmails = appState.getEmails();
+
+            if (allEmails.length === 0) {
                 emailList.innerHTML = '<div class="text-center text-muted">No emails found</div>';
                 return;
             }
-            
-            // Check if we should hide undecryptable emails
+
+            // Check if we should hide unverified messages
             const settings = appState.getSettings();
-            const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
             const hideUnverified = settings && settings.hide_unsigned_messages === true;
-            
-            // Always re-render all emails (simpler approach)
-            emailList.innerHTML = '';
-            
-            let renderedCount = 0;
-            
-            for (const email of emails) {
-                console.log('Inbox preview nostr_pubkey for email', email.id, ':', email.nostr_pubkey);
-                const emailElement = document.createElement('div');
-                emailElement.className = `email-item ${!email.is_read ? 'unread' : ''}`;
-                emailElement.dataset.emailId = email.id;
-                // Format the date nicely
-                const emailDate = new Date(email.date);
-                const now = new Date();
-                const diffInHours = (now - emailDate) / (1000 * 60 * 60);
-                let dateDisplay;
-                if (diffInHours < 24) {
-                    dateDisplay = emailDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                } else if (diffInHours < 168) { // 7 days
-                    dateDisplay = emailDate.toLocaleDateString([], { weekday: 'short' });
-                } else {
-                    dateDisplay = emailDate.toLocaleDateString();
+
+            // Only clear DOM on full re-render (not when appending)
+            if (appendFrom <= 0) {
+                emailList.innerHTML = '';
+            }
+
+            // Only render new emails when appending, all emails otherwise
+            const emails = appendFrom > 0 ? allEmails.slice(appendFrom) : allEmails;
+
+            console.log(`[JS] renderEmails: Rendering ${emails.length} inbox emails in parallel (appendFrom=${appendFrom})`);
+
+            // Build contact index once for O(1) lookups across all emails
+            this._buildContactIndex();
+
+            // Filter emails for rendering
+            const filteredEmails = emails.filter(email => {
+                if (hideUnverified && email.signature_valid !== true) {
+                    return false;
                 }
-                // Determine preview text
-                let previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
-                let showSubject = false;
-                let previewSubject = email.subject;
+                return true;
+            });
 
-                // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
-                // Nested blocks (quoted replies) may be a different type — only the
-                // outermost block determines whether this is an encrypted or signed message.
+            // Batch-decrypt uncached encrypted emails in a single IPC call
+            const uncachedEncrypted = filteredEmails.filter(email => {
+                if (this._previewCache.has(`inbox-${email.id}`)) return false;
                 const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-                const outerIsEncrypted = firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+                return firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+            });
 
-                if (outerIsEncrypted) {
-                    const keypair = appState.getKeypair();
-                    if (!keypair) {
-                        previewText = 'Unable to decrypt: no keypair';
-                    } else {
-                        try {
-                            const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
-                            const result = await TauriService.decryptEmailBody(
-                                email.body, email.subject,
-                                senderPubkey, null
-                            );
-                            if (result.success) {
-                                previewSubject = result.subject;
-                                previewText = Utils.escapeHtml(result.body.substring(0, 100));
-                                if (result.body.length > 100) previewText += '...';
-                                showSubject = true;
-                            } else {
-                                previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
-                            }
-                            // Update subject_hash for DM↔email matching
-                            if (result.subjectCiphertext && email.message_id) {
-                                this.hashStringSHA256(result.subjectCiphertext).then(hash => {
+            if (uncachedEncrypted.length > 0 && appState.getKeypair()) {
+                try {
+                    const batchInput = uncachedEncrypted.map(email => ({
+                        id: String(email.id),
+                        armorText: email.body,
+                        subject: email.subject,
+                        senderPubkey: email.sender_pubkey || email.nostr_pubkey || null,
+                        recipientPubkey: null,
+                    }));
+                    console.log(`[JS] Batch decrypting ${batchInput.length} inbox emails in one IPC call`);
+                    const batchResults = await TauriService.decryptEmailBodiesBatch(batchInput);
+
+                    // Build a lookup from email ID to email object for side effects
+                    const emailById = new Map(uncachedEncrypted.map(e => [String(e.id), e]));
+
+                    for (const item of batchResults) {
+                        const email = emailById.get(item.id);
+                        if (item.result && item.result.success) {
+                            let previewText = Utils.escapeHtml(item.result.body.substring(0, 100));
+                            if (item.result.body.length > 100) previewText += '...';
+                            this._previewCache.set(`inbox-${item.id}`, {
+                                previewText,
+                                previewSubject: item.result.subject,
+                                showSubject: true,
+                            });
+                            // Fire-and-forget side effects: subject hash + pubkey backfill
+                            if (item.result.subjectCiphertext && email && email.message_id) {
+                                this.hashStringSHA256(item.result.subjectCiphertext).then(hash => {
                                     window.__TAURI__.core.invoke('db_update_email_subject_hash', {
                                         messageId: email.message_id,
                                         subjectHash: hash,
                                     }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
                                 });
                             }
-                            // Backfill sender_pubkey from armor signature if header was missing
-                            if (result.senderPubkey && !email.sender_pubkey && email.id) {
-                                console.log('[JS] Backfilling sender_pubkey from armor:', result.senderPubkey.substring(0, 20) + '...');
-                                email.sender_pubkey = result.senderPubkey;
+                            if (item.result.senderPubkey && email && !email.sender_pubkey && email.id) {
+                                email.sender_pubkey = item.result.senderPubkey;
                                 window.__TAURI__.core.invoke('db_update_email_sender_pubkey_by_id', {
                                     id: typeof email.id === 'number' ? email.id : parseInt(email.id, 10),
-                                    senderPubkey: result.senderPubkey,
+                                    senderPubkey: item.result.senderPubkey,
                                 }).catch(e => console.warn('[JS] Failed to backfill sender_pubkey:', e));
                             }
-                        } catch (e) {
-                            console.error('[JS] Backend decrypt failed for inbox preview:', e);
-                            previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                        } else {
+                            // Cache the failure too so we don't re-attempt
+                            this._previewCache.set(`inbox-${item.id}`, {
+                                previewText: 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.',
+                                previewSubject: email ? email.subject : '',
+                                showSubject: false,
+                            });
                         }
                     }
-                } else {
-                    // Decode glossia signed message body for preview
-                    let previewBody = email.body || '';
-                    const signedMsg = await this.decodeGlossiaSignedMessage(previewBody);
-                    if (signedMsg && signedMsg.plaintextBody) {
-                        previewBody = signedMsg.plaintextBody;
-                    }
-                    previewText = Utils.escapeHtml(previewBody ? previewBody.substring(0, 100) : '');
-                    if (previewBody && previewBody.length > 100) previewText += '...';
-                    showSubject = true;
+                } catch (e) {
+                    console.error('[JS] Batch decryption failed, falling back to per-email:', e);
+                    // Per-item renderers will decrypt individually as fallback
                 }
-
-                // Check if email is decryptable (for filtering)
-                // Only hide if the body cannot be decrypted (subject decryption failure is less critical)
-                const isDecryptable = !previewText.includes('Unable to decrypt') &&
-                                    !previewText.includes('Your private key could not decrypt this message') &&
-                                    !previewText.includes('could not decrypt') &&
-                                    !previewText.includes('Could not decrypt') &&
-                                    previewText !== 'Unable to decrypt: no keypair';
-                
-                // Skip rendering if we should hide undecryptable emails and this email can't be decrypted
-                if (hideUndecryptable && !isDecryptable) {
-                    continue;
-                }
-                
-                // Skip rendering if we should hide unverified messages and this email doesn't have a valid signature
-                // Hide emails where signature_valid is not true (i.e., false, null, or undefined)
-                if (hideUnverified && email.signature_valid !== true) {
-                    continue;
-                }
-
-                // Add attachment indicator (same style as sent emails)
-                const attachmentCount = email.attachments ? email.attachments.length : 0;
-                const attachmentIndicator = attachmentCount > 0 ? 
-                    `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
-
-                // Add signature verification indicator
-                let signatureIndicator = '';
-                const sigSource = email.signature_source ? ` (${email.signature_source})` : '';
-                if (email.signature_valid === true) {
-                    signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
-                } else if (email.signature_valid === false) {
-                    signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
-                }
-
-                // Add transport authentication indicator
-                let transportAuthIndicator = '';
-                if (email.transport_auth_verified === true) {
-                    transportAuthIndicator = `<span class="transport-auth-indicator verified" title="Email transport authentication verified (DMARC/DKIM/SPF)"><i class="fas fa-envelope"></i> Email Verified</span>`;
-                } else if (email.transport_auth_verified === false) {
-                    transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
-                }
-
-                // Get sender contact for avatar
-                const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
-                const contacts = appState.getContacts();
-                let senderContact = senderPubkey ? contacts.find(c => c.pubkey === senderPubkey) : null;
-                
-                // If not found by pubkey, try to find by email address
-                if (!senderContact) {
-                    const senderEmail = email.from || email.from_address;
-                    if (senderEmail) {
-                        // Normalize Gmail addresses (remove + aliases)
-                        const normalizeGmail = (email) => {
-                            const lower = email.trim().toLowerCase();
-                            if (lower.includes('@gmail.com')) {
-                                const [local, domain] = lower.split('@');
-                                const normalizedLocal = local.split('+')[0];
-                                return `${normalizedLocal}@${domain}`;
-                            }
-                            return lower;
-                        };
-                        
-                        const normalizedEmail = normalizeGmail(senderEmail);
-                        // Try both original and normalized email
-                        senderContact = contacts.find(c => {
-                            if (!c.email) return false;
-                            const contactEmail = c.email.trim().toLowerCase();
-                            return contactEmail === senderEmail.toLowerCase() || contactEmail === normalizedEmail;
-                        });
-                    }
-                }
-                
-                // Avatar fallback logic (copied from dm-service.js)
-                const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
-                let avatarSrc = defaultAvatar;
-                let avatarClass = 'contact-avatar';
-                const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
-                if (senderContact && senderContact.picture_loading) {
-                    avatarClass += ' loading';
-                } else if (isValidDataUrl) {
-                    avatarSrc = senderContact.picture_data_url;
-                } else if (senderContact && senderContact.picture_data_url && !isValidDataUrl && senderContact.picture) {
-                    avatarSrc = senderContact.picture;
-                } else if (senderContact && senderContact.picture) {
-                    avatarSrc = senderContact.picture;
-                }
-
-                emailElement.innerHTML = `
-                    <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.from)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
-                    <div class="email-content">
-                        <div class="email-header">
-                            <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
-                            <div class="email-date">${dateDisplay}</div>
-                        </div>
-                        ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
-                        <div class="email-preview">${previewText}</div>
-                    </div>
-                    <div class="email-actions">
-                        <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteInboxEmailFromList('${Utils.escapeHtml(email.message_id || email.id)}')">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </div>
-                `;
-                
-                // Add hover and click handlers for invalid signature indicator
-                if (email.signature_valid === false) {
-                    const sigIndicator = emailElement.querySelector('.signature-indicator.invalid');
-                    if (sigIndicator) {
-                        const originalText = sigIndicator.textContent;
-                        sigIndicator.addEventListener('mouseenter', () => {
-                            sigIndicator.textContent = 'recheck signature?';
-                        });
-                        sigIndicator.addEventListener('mouseleave', () => {
-                            sigIndicator.textContent = originalText;
-                        });
-                        sigIndicator.addEventListener('click', async (e) => {
-                            e.stopPropagation(); // Prevent email detail from opening
-                            const messageId = sigIndicator.dataset.messageId;
-                            if (messageId) {
-                                sigIndicator.textContent = 'checking...';
-                                sigIndicator.style.opacity = '0.7';
-                                try {
-                                    const result = await TauriService.recheckEmailSignature(messageId);
-                                    if (result === true) {
-                                        // Update the email object
-                                        email.signature_valid = true;
-                                        // Re-render this email item
-                                        sigIndicator.className = 'signature-indicator verified';
-                                        sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
-                                        sigIndicator.title = 'Verified Nostr signature';
-                                        sigIndicator.removeAttribute('data-message-id');
-                                        // Remove hover handlers
-                                        sigIndicator.replaceWith(sigIndicator.cloneNode(true));
-                                        notificationService.showSuccess('Signature verified successfully!');
-                                    } else if (result === false) {
-                                        sigIndicator.textContent = originalText;
-                                        notificationService.showError('Signature is still invalid');
-                                    } else {
-                                        sigIndicator.textContent = originalText;
-                                        notificationService.showWarning('Could not verify signature (missing pubkey or signature)');
-                                    }
-                                } catch (error) {
-                                    console.error('[JS] Failed to recheck signature:', error);
-                                    sigIndicator.textContent = originalText;
-                                    notificationService.showError('Failed to recheck signature: ' + error);
-                                } finally {
-                                    sigIndicator.style.opacity = '1';
-                                }
-                            }
-                        });
-                    }
-                }
-                
-                emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
-                emailList.appendChild(emailElement);
-                renderedCount++;
             }
-            
-            // Show message if no emails were rendered (possibly all filtered out)
-            if (renderedCount === 0) {
+
+            // Process emails in parallel (decryption will hit cache from batch above)
+            const emailPromises = filteredEmails
+                .map(async (email) => {
+                    try {
+                        // Add timeout to prevent hanging on decryption
+                        const timeoutPromise = new Promise((_, reject) =>
+                            setTimeout(() => reject(new Error('Decryption timeout')), 5000)
+                        );
+                        const renderPromise = this.renderInboxEmailItem(email);
+                        return await Promise.race([renderPromise, timeoutPromise]);
+                    } catch (error) {
+                        console.error(`[JS] Error rendering inbox email ${email.id}:`, error);
+                        // Return a basic email item even if rendering fails
+                        return this.renderInboxEmailItemBasic(email);
+                    }
+                });
+
+            // Wait for all emails to be rendered (with timeout protection)
+            const renderedItems = await Promise.allSettled(emailPromises);
+
+            // Add all successfully rendered items to the list (filter out null results)
+            let renderedCount = 0;
+            for (const result of renderedItems) {
+                if (result.status === 'fulfilled' && result.value) {
+                    emailList.appendChild(result.value);
+                    renderedCount++;
+                }
+            }
+
+            // Show message if no emails were rendered (only on full render, not append)
+            if (renderedCount === 0 && appendFrom <= 0) {
                 const settings = appState.getSettings();
                 const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
                 const hideUnverified = settings && settings.hide_unsigned_messages === true;
-                if (hideUndecryptable && emails.length > 0) {
+                if (hideUndecryptable && allEmails.length > 0) {
                     emailList.innerHTML = '<div class="text-center text-muted">No decryptable emails found. All emails are encrypted for a different keypair.</div>';
-                } else if (hideUnverified && emails.length > 0) {
+                } else if (hideUnverified && allEmails.length > 0) {
                     emailList.innerHTML = '<div class="text-center text-muted">No verified emails found. All emails have missing or invalid signatures.</div>';
                 } else {
                     emailList.innerHTML = '<div class="text-center text-muted">No emails found</div>';
                 }
                 return;
             }
-            
+
             // Add Load More button if there might be more emails
             if (showLoadMore) {
                 const loadMoreBtn = document.createElement('button');
@@ -2857,9 +2770,295 @@ class EmailService {
                 loadMoreBtn.addEventListener('click', () => this.loadMoreEmails());
                 emailList.appendChild(loadMoreBtn);
             }
+
+            console.log(`[JS] renderEmails: Successfully rendered ${renderedItems.filter(r => r.status === 'fulfilled').length} emails`);
         } catch (error) {
             console.error('Error rendering emails:', error);
         }
+    }
+
+    // Render a single inbox email item (with decryption, used in parallel rendering)
+    async renderInboxEmailItem(email) {
+        console.log('Inbox preview nostr_pubkey for email', email.id, ':', email.nostr_pubkey);
+        const emailElement = document.createElement('div');
+        emailElement.className = `email-item ${!email.is_read ? 'unread' : ''}`;
+        emailElement.dataset.emailId = email.id;
+        // Format the date nicely
+        const emailDate = new Date(email.date);
+        const now = new Date();
+        const diffInHours = (now - emailDate) / (1000 * 60 * 60);
+        let dateDisplay;
+        if (diffInHours < 24) {
+            dateDisplay = emailDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } else if (diffInHours < 168) { // 7 days
+            dateDisplay = emailDate.toLocaleDateString([], { weekday: 'short' });
+        } else {
+            dateDisplay = emailDate.toLocaleDateString();
+        }
+        // Determine preview text — check cache first to avoid re-decrypting
+        let previewText, showSubject, previewSubject;
+        const cacheKey = `inbox-${email.id}`;
+        const cached = this._previewCache.get(cacheKey);
+
+        if (cached) {
+            previewText = cached.previewText;
+            showSubject = cached.showSubject;
+            previewSubject = cached.previewSubject;
+        } else {
+            previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+            showSubject = false;
+            previewSubject = email.subject;
+
+            // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
+            // Nested blocks (quoted replies) may be a different type — only the
+            // outermost block determines whether this is an encrypted or signed message.
+            const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+            const outerIsEncrypted = firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+
+            if (outerIsEncrypted) {
+                const keypair = appState.getKeypair();
+                if (!keypair) {
+                    previewText = 'Unable to decrypt: no keypair';
+                } else {
+                    try {
+                        const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                        const result = await TauriService.decryptEmailBody(
+                            email.body, email.subject,
+                            senderPubkey, null
+                        );
+                        if (result.success) {
+                            previewSubject = result.subject;
+                            previewText = Utils.escapeHtml(result.body.substring(0, 100));
+                            if (result.body.length > 100) previewText += '...';
+                            showSubject = true;
+                        } else {
+                            previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                        }
+                        // Update subject_hash for DM↔email matching
+                        if (result.subjectCiphertext && email.message_id) {
+                            this.hashStringSHA256(result.subjectCiphertext).then(hash => {
+                                window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                                    messageId: email.message_id,
+                                    subjectHash: hash,
+                                }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
+                            });
+                        }
+                        // Backfill sender_pubkey from armor signature if header was missing
+                        if (result.senderPubkey && !email.sender_pubkey && email.id) {
+                            console.log('[JS] Backfilling sender_pubkey from armor:', result.senderPubkey.substring(0, 20) + '...');
+                            email.sender_pubkey = result.senderPubkey;
+                            window.__TAURI__.core.invoke('db_update_email_sender_pubkey_by_id', {
+                                id: typeof email.id === 'number' ? email.id : parseInt(email.id, 10),
+                                senderPubkey: result.senderPubkey,
+                            }).catch(e => console.warn('[JS] Failed to backfill sender_pubkey:', e));
+                        }
+                    } catch (e) {
+                        console.error('[JS] Backend decrypt failed for inbox preview:', e);
+                        previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
+                    }
+                }
+            } else {
+                // Decode glossia signed message body for preview
+                let previewBody = email.body || '';
+                const signedMsg = await this.decodeGlossiaSignedMessage(previewBody);
+                if (signedMsg && signedMsg.plaintextBody) {
+                    previewBody = signedMsg.plaintextBody;
+                }
+                previewText = Utils.escapeHtml(previewBody ? previewBody.substring(0, 100) : '');
+                if (previewBody && previewBody.length > 100) previewText += '...';
+                showSubject = true;
+            }
+
+            // Cache the result for future re-renders
+            this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
+        }
+
+        // Check if email is decryptable (for filtering)
+        // Only hide if the body cannot be decrypted (subject decryption failure is less critical)
+        const isDecryptable = !previewText.includes('Unable to decrypt') &&
+                            !previewText.includes('Your private key could not decrypt this message') &&
+                            !previewText.includes('could not decrypt') &&
+                            !previewText.includes('Could not decrypt') &&
+                            previewText !== 'Unable to decrypt: no keypair';
+
+        // Return null if we should hide undecryptable emails and this email can't be decrypted
+        const settings = appState.getSettings();
+        const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
+        if (hideUndecryptable && !isDecryptable) {
+            return null;
+        }
+
+        // Add attachment indicator (same style as sent emails)
+        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        const attachmentIndicator = attachmentCount > 0 ?
+            `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
+
+        // Add signature verification indicator
+        let signatureIndicator = '';
+        const sigSource = email.signature_source ? ` (${email.signature_source})` : '';
+        if (email.signature_valid === true) {
+            signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
+        } else if (email.signature_valid === false) {
+            signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+        }
+
+        // Add transport authentication indicator
+        let transportAuthIndicator = '';
+        if (email.transport_auth_verified === true) {
+            transportAuthIndicator = `<span class="transport-auth-indicator verified" title="Email transport authentication verified (DMARC/DKIM/SPF)"><i class="fas fa-envelope"></i> Email Verified</span>`;
+        } else if (email.transport_auth_verified === false) {
+            transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
+        }
+
+        // Get sender contact for avatar (O(1) lookup via pre-built index)
+        const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+        const senderContact = this._findContact(senderPubkey, email.from || email.from_address);
+
+        // Avatar fallback logic (copied from dm-service.js)
+        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+        let avatarSrc = defaultAvatar;
+        let avatarClass = 'contact-avatar';
+        const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+        if (senderContact && senderContact.picture_loading) {
+            avatarClass += ' loading';
+        } else if (isValidDataUrl) {
+            avatarSrc = senderContact.picture_data_url;
+        } else if (senderContact && senderContact.picture_data_url && !isValidDataUrl && senderContact.picture) {
+            avatarSrc = senderContact.picture;
+        } else if (senderContact && senderContact.picture) {
+            avatarSrc = senderContact.picture;
+        }
+
+        emailElement.innerHTML = `
+            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.from)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <div class="email-content">
+                <div class="email-header">
+                    <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
+                    <div class="email-date">${dateDisplay}</div>
+                </div>
+                ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
+                <div class="email-preview">${previewText}</div>
+            </div>
+            <div class="email-actions">
+                <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteInboxEmailFromList('${Utils.escapeHtml(email.message_id || email.id)}')">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+        `;
+
+        // Add hover and click handlers for invalid signature indicator
+        if (email.signature_valid === false) {
+            const sigIndicator = emailElement.querySelector('.signature-indicator.invalid');
+            if (sigIndicator) {
+                const originalText = sigIndicator.textContent;
+                sigIndicator.addEventListener('mouseenter', () => {
+                    sigIndicator.textContent = 'recheck signature?';
+                });
+                sigIndicator.addEventListener('mouseleave', () => {
+                    sigIndicator.textContent = originalText;
+                });
+                sigIndicator.addEventListener('click', async (e) => {
+                    e.stopPropagation(); // Prevent email detail from opening
+                    const messageId = sigIndicator.dataset.messageId;
+                    if (messageId) {
+                        sigIndicator.textContent = 'checking...';
+                        sigIndicator.style.opacity = '0.7';
+                        try {
+                            const result = await TauriService.recheckEmailSignature(messageId);
+                            if (result === true) {
+                                // Update the email object
+                                email.signature_valid = true;
+                                // Re-render this email item
+                                sigIndicator.className = 'signature-indicator verified';
+                                sigIndicator.innerHTML = '<i class="fas fa-pen"></i> Signature Verified';
+                                sigIndicator.title = 'Verified Nostr signature';
+                                sigIndicator.removeAttribute('data-message-id');
+                                // Remove hover handlers
+                                sigIndicator.replaceWith(sigIndicator.cloneNode(true));
+                                notificationService.showSuccess('Signature verified successfully!');
+                            } else if (result === false) {
+                                sigIndicator.textContent = originalText;
+                                notificationService.showError('Signature is still invalid');
+                            } else {
+                                sigIndicator.textContent = originalText;
+                                notificationService.showWarning('Could not verify signature (missing pubkey or signature)');
+                            }
+                        } catch (error) {
+                            console.error('[JS] Failed to recheck signature:', error);
+                            sigIndicator.textContent = originalText;
+                            notificationService.showError('Failed to recheck signature: ' + error);
+                        } finally {
+                            sigIndicator.style.opacity = '1';
+                        }
+                    }
+                });
+            }
+        }
+
+        emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
+        return emailElement;
+    }
+
+    // Render a basic inbox email item (without decryption, used as fallback on timeout)
+    renderInboxEmailItemBasic(email) {
+        const emailElement = document.createElement('div');
+        emailElement.className = `email-item ${!email.is_read ? 'unread' : ''}`;
+        emailElement.dataset.emailId = email.id;
+
+        // Format the date
+        const emailDate = new Date(email.date);
+        const now = new Date();
+        const diffInHours = (now - emailDate) / (1000 * 60 * 60);
+        let dateDisplay;
+        if (diffInHours < 24) {
+            dateDisplay = emailDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } else if (diffInHours < 168) {
+            dateDisplay = emailDate.toLocaleDateString([], { weekday: 'short' });
+        } else {
+            dateDisplay = emailDate.toLocaleDateString();
+        }
+
+        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        const attachmentIndicator = attachmentCount > 0 ?
+            `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
+
+        // Get sender contact for avatar (O(1) lookup via pre-built index)
+        const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+        const senderContact = this._findContact(senderPubkey, email.from || email.from_address);
+
+        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+        let avatarSrc = defaultAvatar;
+        let avatarClass = 'contact-avatar';
+        const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
+        if (senderContact && senderContact.picture_loading) {
+            avatarClass += ' loading';
+        } else if (isValidDataUrl) {
+            avatarSrc = senderContact.picture_data_url;
+        } else if (senderContact && senderContact.picture_data_url && !isValidDataUrl && senderContact.picture) {
+            avatarSrc = senderContact.picture;
+        } else if (senderContact && senderContact.picture) {
+            avatarSrc = senderContact.picture;
+        }
+
+        emailElement.innerHTML = `
+            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.from)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <div class="email-content">
+                <div class="email-header">
+                    <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator}</div>
+                    <div class="email-date">${dateDisplay}</div>
+                </div>
+                <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
+                <div class="email-preview">Loading...</div>
+            </div>
+            <div class="email-actions">
+                <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteInboxEmailFromList('${Utils.escapeHtml(email.message_id || email.id)}')">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+        `;
+
+        emailElement.addEventListener('click', () => this.showEmailDetail(email.id));
+        return emailElement;
     }
 
     // Filter emails with debouncing
@@ -3095,11 +3294,16 @@ class EmailService {
                     // ── Backend decrypt path ──
                     (async () => {
                         try {
-                            console.log('[JS] Calling backend decrypt_email_body...');
-                            const result = await TauriService.decryptEmailBody(
-                                emailBody, email.subject,
-                                senderPubkey, null
-                            );
+                            // Run decryption and signature verification in parallel (they're independent)
+                            console.log('[JS] Calling backend decrypt_email_body + verifyAllSignatures in parallel...');
+                            const [result, allSigs] = await Promise.all([
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, null),
+                                TauriService.verifyAllSignatures(emailBody).catch(e => {
+                                    console.warn('[JS] Signature verification error:', e);
+                                    return [];
+                                })
+                            ]);
+                            const sigResults = allSigs.length > 0 ? allSigs : null;
                             console.log('[JS] Backend decrypt result: success=', result.success, 'isManifest=', result.isManifest, 'blocks=', result.blockResults?.length);
 
                             decryptedSubject = result.subject;
@@ -3139,15 +3343,6 @@ class EmailService {
                                 });
                             }
 
-                            // Verify all signatures recursively via backend
-                            let sigResults = null;
-                            try {
-                                const allSigs = await TauriService.verifyAllSignatures(emailBody);
-                                sigResults = allSigs.length > 0 ? allSigs : null;
-                            } catch (e) {
-                                console.warn('[JS] Signature verification error:', e);
-                            }
-
                             // Backfill sender_pubkey from armor signature if header was missing
                             if (result.senderPubkey && !email.sender_pubkey && email.id) {
                                 console.log('[JS] Backfilling sender_pubkey from armor (detail):', result.senderPubkey.substring(0, 20) + '...');
@@ -3166,17 +3361,16 @@ class EmailService {
                     })();
                 } else {
                     (async () => {
-                        // Verify all signatures recursively (handles nested quoted blocks)
-                        let sigResults = null;
-                        try {
-                            const allSigs = await TauriService.verifyAllSignatures(emailBody);
-                            sigResults = allSigs.length > 0 ? allSigs : null;
-                        } catch (e) {
-                            console.warn('[JS] Signature verification error:', e);
-                        }
-                        // Decode glossia signed message body for display
+                        // Run signature verification and glossia decode in parallel (they're independent)
+                        const [allSigs, signedMsg] = await Promise.all([
+                            TauriService.verifyAllSignatures(emailBody).catch(e => {
+                                console.warn('[JS] Signature verification error:', e);
+                                return [];
+                            }),
+                            this.decodeGlossiaSignedMessage(emailBody)
+                        ]);
+                        const sigResults = allSigs.length > 0 ? allSigs : null;
                         let displayBody = decryptedBody;
-                        const signedMsg = await this.decodeGlossiaSignedMessage(emailBody);
                         if (signedMsg && signedMsg.plaintextBody) {
                             displayBody = signedMsg.plaintextBody;
                         }
@@ -3353,10 +3547,10 @@ class EmailService {
                         signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
                     }
 
-                    // Get sender info for header
+                    // Get sender info for header (O(1) lookup via contact index)
                     const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
-                    const contacts = appState.getContacts();
-                    const senderContact = senderPubkey ? contacts.find(c => c.pubkey === senderPubkey) : null;
+                    if (!this._contactsByPubkey) this._buildContactIndex();
+                    const senderContact = this._findContact(senderPubkey, email.from || email.from_address);
                     
                     // Avatar logic (same as dm-service.js)
                     const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
@@ -3719,10 +3913,8 @@ ${attachmentsHtml}
                 // If no pubkey in email, try to look it up by email address
                 if (!senderPubkey && replyTo) {
                     try {
-                        const contacts = appState.getContacts();
-                        const senderContact = contacts.find(contact => 
-                            contact.email && contact.email.toLowerCase() === replyTo.toLowerCase()
-                        );
+                        if (!this._contactsByPubkey) this._buildContactIndex();
+                        const senderContact = this._findContact(null, replyTo);
                         if (senderContact && senderContact.pubkey) {
                             senderPubkey = senderContact.pubkey;
                         }
@@ -3730,11 +3922,11 @@ ${attachmentsHtml}
                         console.log('[JS] Could not look up pubkey by email:', e);
                     }
                 }
-                
+
                 if (senderPubkey) {
                     // Try to find the contact by pubkey
-                    const contacts = appState.getContacts();
-                    const senderContact = contacts.find(contact => contact.pubkey === senderPubkey);
+                    if (!this._contactsByPubkey) this._buildContactIndex();
+                    const senderContact = this._findContact(senderPubkey, null);
                     
                     if (senderContact) {
                         // Set as selected Nostr contact
@@ -5436,7 +5628,7 @@ ${attachmentsHtml}
     }
 
     // Render sent emails
-    async renderSentEmails(showLoadMore = false) {
+    async renderSentEmails(showLoadMore = false, appendFrom = 0) {
         const sentList = domManager.get('sentList');
         if (!sentList) {
             console.error('[JS] renderSentEmails: sentList element not found');
@@ -5448,37 +5640,117 @@ ${attachmentsHtml}
             if (existingLoadMoreBtn) {
                 existingLoadMoreBtn.remove();
             }
-            
+
             // Get all emails from state
-            const emails = appState.getSentEmails();
-            
-            if (!emails || emails.length === 0) {
+            const allEmails = appState.getSentEmails();
+
+            if (!allEmails || allEmails.length === 0) {
                 sentList.innerHTML = '<div class="text-center text-muted">No sent emails found</div>';
                 return;
             }
-            
-            // Always re-render all emails (simpler approach)
-            sentList.innerHTML = '';
-            
-            console.log(`[JS] renderSentEmails: Rendering ${emails.length} sent emails`);
-            
+
+            // Only clear DOM on full re-render (not when appending)
+            if (appendFrom <= 0) {
+                sentList.innerHTML = '';
+            }
+
+            // Only render new emails when appending, all emails otherwise
+            const emails = appendFrom > 0 ? allEmails.slice(appendFrom) : allEmails;
+
+            console.log(`[JS] renderSentEmails: Rendering ${emails.length} sent emails (appendFrom=${appendFrom})`);
+
+            // Build contact index once for O(1) lookups across all emails
+            this._buildContactIndex();
+
             // Check if we should hide unverified messages
             const settings = appState.getSettings();
             const hideUnverified = settings && settings.hide_unsigned_messages === true;
-            
-            // Process emails in parallel with timeout protection
-            const emailPromises = emails
-                .filter(email => {
-                    // Filter out unverified emails if hideUnverified is enabled
-                    if (hideUnverified && email.signature_valid !== true) {
-                        return false;
+
+            // Filter emails for rendering
+            const filteredEmails = emails.filter(email => {
+                if (hideUnverified && email.signature_valid !== true) {
+                    return false;
+                }
+                return true;
+            });
+
+            // Batch-decrypt uncached encrypted sent emails, resolving pubkeys from contact index
+            const uncachedEncrypted = filteredEmails.filter(email => {
+                if (this._previewCache.has(`sent-${email.id}`)) return false;
+                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+                return firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+            });
+
+            if (uncachedEncrypted.length > 0 && appState.getKeypair()) {
+                try {
+                    const batchInput = uncachedEncrypted.map(email => {
+                        // Resolve recipient pubkey: stored value > contact index lookup
+                        let recipientPubkey = email.recipient_pubkey || email.nostr_pubkey || null;
+                        if (!recipientPubkey) {
+                            const recipientEmail = email.to || email.to_address;
+                            const contact = recipientEmail ? this._findContact(null, recipientEmail) : null;
+                            if (contact && contact.pubkey) {
+                                recipientPubkey = contact.pubkey;
+                                // Backfill on the email object so per-item renderer skips DB lookup too
+                                email.recipient_pubkey = recipientPubkey;
+                            }
+                        }
+                        return {
+                            id: String(email.id),
+                            armorText: email.body,
+                            subject: email.subject,
+                            senderPubkey: null,
+                            recipientPubkey,
+                        };
+                    });
+                    console.log(`[JS] Batch decrypting ${batchInput.length} sent emails in one IPC call`);
+                    const batchResults = await TauriService.decryptEmailBodiesBatch(batchInput);
+
+                    const emailById = new Map(uncachedEncrypted.map(e => [String(e.id), e]));
+
+                    for (const item of batchResults) {
+                        const email = emailById.get(item.id);
+                        if (item.result && item.result.success) {
+                            let previewText = Utils.escapeHtml(item.result.body.substring(0, 100));
+                            if (item.result.body.length > 100) previewText += '...';
+                            this._previewCache.set(`sent-${item.id}`, {
+                                previewText,
+                                previewSubject: item.result.subject,
+                                showSubject: true,
+                            });
+                            // Fire-and-forget side effects
+                            if (item.result.subjectCiphertext && email && email.message_id) {
+                                this.hashStringSHA256(item.result.subjectCiphertext).then(hash => {
+                                    window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                                        messageId: email.message_id,
+                                        subjectHash: hash,
+                                    }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
+                                });
+                            }
+                            // Backfill recipient_pubkey to DB if resolved from contact index
+                            if (email && email.recipient_pubkey && email.id) {
+                                this._saveRecipientPubkeyToDb(email, email.recipient_pubkey)
+                                    .catch(e => console.warn('[JS] Failed to backfill recipient_pubkey:', e));
+                            }
+                        } else {
+                            this._previewCache.set(`sent-${item.id}`, {
+                                previewText: 'Could not decrypt',
+                                previewSubject: email ? email.subject : '',
+                                showSubject: true,
+                            });
+                        }
                     }
-                    return true;
-                })
+                } catch (e) {
+                    console.error('[JS] Batch decryption failed for sent emails, falling back to per-email:', e);
+                }
+            }
+
+            // Process emails in parallel (decryption will hit cache from batch above)
+            const emailPromises = filteredEmails
                 .map(async (email) => {
                 try {
                     // Add timeout to prevent hanging on decryption
-                    const timeoutPromise = new Promise((_, reject) => 
+                    const timeoutPromise = new Promise((_, reject) =>
                         setTimeout(() => reject(new Error('Decryption timeout')), 5000)
                     );
                     const renderPromise = this.renderSentEmailItem(email);
@@ -5502,14 +5774,14 @@ ${attachmentsHtml}
                 }
             }
             
-            // Show message if no emails were rendered (possibly all filtered out)
-            if (renderedCount === 0) {
+            // Show message if no emails were rendered (only on full render, not append)
+            if (renderedCount === 0 && appendFrom <= 0) {
                 const settings = appState.getSettings();
                 const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
                 const hideUnverified = settings && settings.hide_unsigned_messages === true;
-                if (hideUndecryptable && emails.length > 0) {
+                if (hideUndecryptable && allEmails.length > 0) {
                     sentList.innerHTML = '<div class="text-center text-muted">No decryptable emails found. All emails are encrypted for a different keypair.</div>';
-                } else if (hideUnverified && emails.length > 0) {
+                } else if (hideUnverified && allEmails.length > 0) {
                     sentList.innerHTML = '<div class="text-center text-muted">No verified emails found. All emails have missing or invalid signatures.</div>';
                 } else {
                     sentList.innerHTML = '<div class="text-center text-muted">No sent emails found</div>';
@@ -5554,80 +5826,94 @@ ${attachmentsHtml}
             dateDisplay = emailDate.toLocaleDateString();
         }
         
-        let previewText = '';
-        let showSubject = true;
-        let previewSubject = email.subject;
+        // Determine preview text — check cache first to avoid re-decrypting
+        let previewText, showSubject, previewSubject;
+        const cacheKey = `sent-${email.id}`;
+        const cached = this._previewCache.get(cacheKey);
 
-        // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
-        const sentFirstBegin = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-        const sentOuterIsEncrypted = sentFirstBegin && /NIP-\d+ ENCRYPTED/.test(sentFirstBegin[1]);
+        if (cached) {
+            previewText = cached.previewText;
+            showSubject = cached.showSubject;
+            previewSubject = cached.previewSubject;
+        } else {
+            previewText = '';
+            showSubject = true;
+            previewSubject = email.subject;
 
-        if (sentOuterIsEncrypted) {
-            const keypair = appState.getKeypair();
-            if (!keypair) {
-                previewText = 'Unable to decrypt: no keypair';
-            } else {
-                try {
-                    let recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
-                    // If no recipient pubkey, try DB lookup by email address (same as detail view)
-                    if (!recipientPubkey) {
-                        const recipientEmail = email.to || email.to_address;
-                        if (recipientEmail) {
-                            try {
-                                let pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email_including_dms', { email: recipientEmail });
-                                if (!pubkeys || pubkeys.length === 0) {
-                                    pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
+            // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
+            const sentFirstBegin = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+            const sentOuterIsEncrypted = sentFirstBegin && /NIP-\d+ ENCRYPTED/.test(sentFirstBegin[1]);
+
+            if (sentOuterIsEncrypted) {
+                const keypair = appState.getKeypair();
+                if (!keypair) {
+                    previewText = 'Unable to decrypt: no keypair';
+                } else {
+                    try {
+                        let recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
+                        // If no recipient pubkey, try DB lookup by email address (same as detail view)
+                        if (!recipientPubkey) {
+                            const recipientEmail = email.to || email.to_address;
+                            if (recipientEmail) {
+                                try {
+                                    let pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email_including_dms', { email: recipientEmail });
+                                    if (!pubkeys || pubkeys.length === 0) {
+                                        pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
+                                    }
+                                    if (pubkeys && pubkeys.length > 0) {
+                                        recipientPubkey = pubkeys[0];
+                                    }
+                                } catch (e) {
+                                    console.warn('[JS] Sent preview: pubkey lookup failed for', recipientEmail, e);
                                 }
-                                if (pubkeys && pubkeys.length > 0) {
-                                    recipientPubkey = pubkeys[0];
-                                }
-                            } catch (e) {
-                                console.warn('[JS] Sent preview: pubkey lookup failed for', recipientEmail, e);
                             }
                         }
-                    }
-                    const result = await TauriService.decryptEmailBody(
-                        email.body, email.subject,
-                        null, recipientPubkey
-                    );
-                    if (result.success) {
-                        previewSubject = result.subject;
-                        previewText = Utils.escapeHtml(result.body.substring(0, 100));
-                        if (result.body.length > 100) previewText += '...';
-                        showSubject = true;
-                    } else {
+                        const result = await TauriService.decryptEmailBody(
+                            email.body, email.subject,
+                            null, recipientPubkey
+                        );
+                        if (result.success) {
+                            previewSubject = result.subject;
+                            previewText = Utils.escapeHtml(result.body.substring(0, 100));
+                            if (result.body.length > 100) previewText += '...';
+                            showSubject = true;
+                        } else {
+                            previewText = 'Could not decrypt';
+                        }
+                        // Backfill recipient_pubkey to DB if discovered via lookup
+                        if (result.success && recipientPubkey && !email.recipient_pubkey && email.id) {
+                            email.recipient_pubkey = recipientPubkey;
+                            this._saveRecipientPubkeyToDb(email, recipientPubkey)
+                                .catch(e => console.warn('[JS] Failed to backfill recipient_pubkey:', e));
+                        }
+                        // Update subject_hash for DM↔email matching
+                        if (result.subjectCiphertext && email.message_id) {
+                            this.hashStringSHA256(result.subjectCiphertext).then(hash => {
+                                window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                                    messageId: email.message_id,
+                                    subjectHash: hash,
+                                }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
+                            });
+                        }
+                    } catch (e) {
+                        console.error('[JS] Backend decrypt failed for sent preview:', e);
                         previewText = 'Could not decrypt';
                     }
-                    // Backfill recipient_pubkey to DB if discovered via lookup
-                    if (result.success && recipientPubkey && !email.recipient_pubkey && email.id) {
-                        email.recipient_pubkey = recipientPubkey;
-                        this._saveRecipientPubkeyToDb(email, recipientPubkey)
-                            .catch(e => console.warn('[JS] Failed to backfill recipient_pubkey:', e));
-                    }
-                    // Update subject_hash for DM↔email matching
-                    if (result.subjectCiphertext && email.message_id) {
-                        this.hashStringSHA256(result.subjectCiphertext).then(hash => {
-                            window.__TAURI__.core.invoke('db_update_email_subject_hash', {
-                                messageId: email.message_id,
-                                subjectHash: hash,
-                            }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
-                        });
-                    }
-                } catch (e) {
-                    console.error('[JS] Backend decrypt failed for sent preview:', e);
-                    previewText = 'Could not decrypt';
                 }
+            } else {
+                // Decode glossia signed message body for preview
+                let sentPreviewBody = email.body || '';
+                const sentSignedMsg = await this.decodeGlossiaSignedMessage(sentPreviewBody);
+                if (sentSignedMsg && sentSignedMsg.plaintextBody) {
+                    sentPreviewBody = sentSignedMsg.plaintextBody;
+                }
+                previewText = Utils.escapeHtml(sentPreviewBody ? sentPreviewBody.substring(0, 100) : '');
+                if (sentPreviewBody && sentPreviewBody.length > 100) previewText += '...';
+                showSubject = true;
             }
-        } else {
-            // Decode glossia signed message body for preview
-            let sentPreviewBody = email.body || '';
-            const sentSignedMsg = await this.decodeGlossiaSignedMessage(sentPreviewBody);
-            if (sentSignedMsg && sentSignedMsg.plaintextBody) {
-                sentPreviewBody = sentSignedMsg.plaintextBody;
-            }
-            previewText = Utils.escapeHtml(sentPreviewBody ? sentPreviewBody.substring(0, 100) : '');
-            if (sentPreviewBody && sentPreviewBody.length > 100) previewText += '...';
-            showSubject = true;
+
+            // Cache the result for future re-renders
+            this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
         }
 
         // Check if email is decryptable (for filtering)
@@ -5668,32 +5954,9 @@ ${attachmentsHtml}
             transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
         }
 
-        // Get recipient contact for avatar (similar to inbox getting sender contact)
-        const recipientEmail = email.to;
-        const contacts = appState.getContacts();
-        let recipientContact = null;
-        
-        if (recipientEmail) {
-            // Normalize Gmail addresses (remove + aliases)
-            const normalizeGmail = (email) => {
-                const lower = email.trim().toLowerCase();
-                if (lower.includes('@gmail.com')) {
-                    const [local, domain] = lower.split('@');
-                    const normalizedLocal = local.split('+')[0];
-                    return `${normalizedLocal}@${domain}`;
-                }
-                return lower;
-            };
-            
-            const normalizedEmail = normalizeGmail(recipientEmail);
-            // Try both original and normalized email
-            recipientContact = contacts.find(c => {
-                if (!c.email) return false;
-                const contactEmail = c.email.trim().toLowerCase();
-                return contactEmail === recipientEmail.toLowerCase() || contactEmail === normalizedEmail;
-            });
-        }
-        
+        // Get recipient contact for avatar (O(1) lookup via pre-built index)
+        const recipientContact = this._findContact(null, email.to);
+
         // Avatar fallback logic (same as inbox)
         const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
         let avatarSrc = defaultAvatar;
@@ -5801,32 +6064,9 @@ ${attachmentsHtml}
         const attachmentIndicator = attachmentCount > 0 ? 
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
-        // Get recipient contact for avatar (similar to inbox getting sender contact)
-        const recipientEmail = email.to;
-        const contacts = appState.getContacts();
-        let recipientContact = null;
-        
-        if (recipientEmail) {
-            // Normalize Gmail addresses (remove + aliases)
-            const normalizeGmail = (email) => {
-                const lower = email.trim().toLowerCase();
-                if (lower.includes('@gmail.com')) {
-                    const [local, domain] = lower.split('@');
-                    const normalizedLocal = local.split('+')[0];
-                    return `${normalizedLocal}@${domain}`;
-                }
-                return lower;
-            };
-            
-            const normalizedEmail = normalizeGmail(recipientEmail);
-            // Try both original and normalized email
-            recipientContact = contacts.find(c => {
-                if (!c.email) return false;
-                const contactEmail = c.email.trim().toLowerCase();
-                return contactEmail === recipientEmail.toLowerCase() || contactEmail === normalizedEmail;
-            });
-        }
-        
+        // Get recipient contact for avatar (O(1) lookup via pre-built index)
+        const recipientContact = this._findContact(null, email.to);
+
         // Avatar fallback logic (same as inbox)
         const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
         let avatarSrc = defaultAvatar;
@@ -5988,9 +6228,9 @@ ${attachmentsHtml}
                 console.log(`[Sent Email Detail Error] Email recipient_pubkey: ${email.recipient_pubkey || 'null'}`);
                 
                 if (myPubkey) {
-                    // Look up our profile in contacts list (user's profile is now added privately)
-                    const contacts = appState.getContacts();
-                    senderContact = contacts.find(c => c.pubkey === myPubkey) || null;
+                    // Look up our profile in contacts list (O(1) via contact index)
+                    if (!this._contactsByPubkey) this._buildContactIndex();
+                    senderContact = this._findContact(myPubkey, null);
                     if (senderContact) {
                         console.log(`[Sent Email Detail Error] Found our profile in contacts - name: ${senderContact.name}`);
                     } else {
@@ -6465,8 +6705,8 @@ ${signatureIndicator}
                 // If not found, fall back to database lookup
                 if (!senderContact) {
                     console.log(`[Sent Email Detail] Falling back to contacts lookup`);
-                    const contacts = appState.getContacts();
-                    senderContact = contacts.find(c => c.pubkey === myPubkey) || null;
+                    if (!this._contactsByPubkey) this._buildContactIndex();
+                    senderContact = this._findContact(myPubkey, null);
                     if (senderContact) {
                         console.log(`[Sent Email Detail] Found our profile in contacts - name: ${senderContact.name}`);
                     } else {
@@ -6725,11 +6965,16 @@ ${attachmentsHtml}
 
                 if (encryptedBodyMatch && keypair) {
                     try {
-                        console.log('[JS] Calling backend decrypt_email_body for sent email...');
-                        const result = await TauriService.decryptEmailBody(
-                            email.body, email.subject,
-                            null, recipientPubkey
-                        );
+                        // Run decryption and signature verification in parallel (they're independent)
+                        console.log('[JS] Calling backend decrypt_email_body + verifyAllSignatures for sent email in parallel...');
+                        const [result, allSigs] = await Promise.all([
+                            TauriService.decryptEmailBody(email.body, email.subject, null, recipientPubkey),
+                            TauriService.verifyAllSignatures(email.body).catch(e => {
+                                console.warn('[JS] Signature verification error:', e);
+                                return [];
+                            })
+                        ]);
+                        const sigResults = allSigs.length > 0 ? allSigs : null;
                         console.log('[JS] Backend sent decrypt result: success=', result.success, 'isManifest=', result.isManifest);
 
                         decryptedSubject = result.subject;
@@ -6768,32 +7013,22 @@ ${attachmentsHtml}
                             });
                         }
 
-                        // Verify all signatures recursively via backend
-                        let sigResults = null;
-                        try {
-                            const allSigs = await TauriService.verifyAllSignatures(email.body);
-                            sigResults = allSigs.length > 0 ? allSigs : null;
-                        } catch (e) {
-                            console.warn('[JS] Signature verification error:', e);
-                        }
-
                         await updateDetail(decryptedSubject, decryptedBody, manifestResult, result.success, sigResults, decryptResults);
                     } catch (err) {
                         console.error('[JS] Backend decrypt_email_body error for sent:', err);
                         await updateDetail('Could not decrypt', 'Could not decrypt: ' + err.message, null, true);
                     }
                 } else {
-                    // Non-encrypted sent email: verify all signatures recursively
-                    let sigResults = null;
-                    try {
-                        const allSigs = await TauriService.verifyAllSignatures(email.body);
-                        sigResults = allSigs.length > 0 ? allSigs : null;
-                    } catch (e) {
-                        console.warn('[JS] Signature verification error:', e);
-                    }
-                    // Decode glossia signed message body for display
+                    // Non-encrypted sent email: run sig verification and glossia decode in parallel
+                    const [allSigs, signedMsg] = await Promise.all([
+                        TauriService.verifyAllSignatures(email.body).catch(e => {
+                            console.warn('[JS] Signature verification error:', e);
+                            return [];
+                        }),
+                        this.decodeGlossiaSignedMessage(email.body)
+                    ]);
+                    const sigResults = allSigs.length > 0 ? allSigs : null;
                     let displayBody = decryptedBody;
-                    const signedMsg = await this.decodeGlossiaSignedMessage(email.body);
                     if (signedMsg && signedMsg.plaintextBody) {
                         displayBody = signedMsg.plaintextBody;
                     }

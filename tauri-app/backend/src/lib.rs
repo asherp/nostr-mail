@@ -3871,6 +3871,40 @@ fn decrypt_email_body(
 }
 
 #[tauri::command]
+fn decrypt_email_bodies_batch(
+    emails: Vec<types::BatchDecryptInput>,
+    private_key: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<types::BatchDecryptResultItem>, String> {
+    let pk = resolve_private_key(private_key, &state)?;
+    let results = emails
+        .into_iter()
+        .map(|e| {
+            let id = e.id.clone();
+            match email::decrypt_email_body_pipeline(
+                &pk,
+                &e.armor_text,
+                &e.subject,
+                e.sender_pubkey.as_deref(),
+                e.recipient_pubkey.as_deref(),
+            ) {
+                Ok(result) => types::BatchDecryptResultItem {
+                    id,
+                    result: Some(result),
+                    error: None,
+                },
+                Err(err) => types::BatchDecryptResultItem {
+                    id,
+                    result: None,
+                    error: Some(err),
+                },
+            }
+        })
+        .collect();
+    Ok(results)
+}
+
+#[tauri::command]
 fn decrypt_manifest_attachment(
     attachment_data_b64: String,
     key_wrap_b64: String,
@@ -5896,6 +5930,7 @@ pub fn run() {
         encrypt_message_with_algorithm,
         parse_armor_message,
         decrypt_email_body,
+        decrypt_email_bodies_batch,
         decrypt_manifest_attachment,
         encode_bip39,
         decode_bip39,

@@ -324,6 +324,26 @@ pub struct DecryptEmailResult {
     pub sender_pubkey: Option<String>,
 }
 
+/// Input item for batch email decryption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDecryptInput {
+    pub id: String,
+    pub armor_text: String,
+    pub subject: String,
+    pub sender_pubkey: Option<String>,
+    pub recipient_pubkey: Option<String>,
+}
+
+/// Per-item result from batch email decryption (wraps success or error).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDecryptResultItem {
+    pub id: String,
+    pub result: Option<DecryptEmailResult>,
+    pub error: Option<String>,
+}
+
 /// Result from the decrypt_manifest_attachment Tauri command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

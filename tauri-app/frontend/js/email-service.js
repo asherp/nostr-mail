@@ -1467,8 +1467,7 @@ class EmailService {
             const labelSpan = encryptBtn.querySelector('.encrypt-btn-label');
             
             if (iconSpan) iconSpan.className = 'fas fa-lock';
-            const algo = appState.getSettings()?.encryption_algorithm || 'nip44';
-            if (labelSpan) labelSpan.textContent = algo === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
+            if (labelSpan) labelSpan.textContent = 'Encrypt';
             encryptBtn.dataset.encrypted = 'false';
             
             // Re-enable editing
@@ -5039,61 +5038,24 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         return lines.join('\n').trim() || null;
     }
 
-    // Returns { replyText, quotedOriginal } where quotedOriginal includes plaintext quotes and armor.
+    // Returns { replyText, quotedOriginal } where the split point is the first body-level
+    // BEGIN NOSTR armor tag. Everything above (including any "> " quoted plaintext) is the
+    // reply text that will be encrypted/signed; the armor block and below is preserved as
+    // quotedOriginal (not re-encrypted).
     splitReplyAndQuoted(body) {
         if (!body) return { replyText: '', quotedOriginal: '' };
 
-        // New format: quoted original starts at the first armor body BEGIN tag after the user's reply.
-        // The textarea contains: reply text, then optional "> " quoted plaintext, then armor block.
-        // Find the first body-level BEGIN NOSTR tag that isn't at the very start (the start would be the user's own armor).
-        // Only match body-level tags (ENCRYPTED BODY/MESSAGE or SIGNED BODY/MESSAGE), NOT structural
-        // tags like SEAL or SIGNATURE which are part of the current message's armor structure.
+        // Only match body-level tags (ENCRYPTED BODY/MESSAGE or SIGNED BODY/MESSAGE), NOT
+        // structural tags like SEAL or SIGNATURE which are part of the current message's armor.
         const armorIdx = body.search(/\n-{3,}\s*BEGIN NOSTR (?:NIP-(?:04|44) ENCRYPTED |SIGNED )/);
         if (armorIdx >= 0) {
-            // Check if there's also > quoted plaintext just before the armor
-            const beforeArmor = body.substring(0, armorIdx);
-            const afterArmor = body.substring(armorIdx + 1); // +1 to skip \n
-            // Walk backwards from armorIdx to include any > quoted plaintext block
-            const beforeLines = beforeArmor.split('\n');
-            let splitAt = beforeLines.length;
-            for (let i = beforeLines.length - 1; i >= 0; i--) {
-                if (beforeLines[i].startsWith('> ') || beforeLines[i] === '>') {
-                    splitAt = i;
-                } else if (beforeLines[i].trim() === '') {
-                    continue;
-                } else {
-                    break;
-                }
-            }
-            const replyText = beforeLines.slice(0, splitAt).join('\n').trimEnd();
-            const quotedPlain = beforeLines.slice(splitAt).join('\n');
-            const quotedOriginal = (quotedPlain.trim() ? quotedPlain.trim() + '\n\n' : '') + afterArmor.trim();
+            const replyText = body.substring(0, armorIdx).trimEnd();
+            const quotedOriginal = body.substring(armorIdx + 1).trim();
             return { replyText, quotedOriginal };
         }
 
-        // Backwards compat: detect > prefixed lines (old format or forwarded emails)
-        const lines = body.split('\n');
-        let lastNonQuoted = lines.length;
-        for (let i = lines.length - 1; i >= 0; i--) {
-            if (lines[i].startsWith('> ') || lines[i] === '>') {
-                lastNonQuoted = i;
-            } else if (lines[i].trim() === '') {
-                continue;
-            } else {
-                break;
-            }
-        }
-        if (lastNonQuoted >= lines.length) {
-            return { replyText: body, quotedOriginal: '' };
-        }
-        const replyText = lines.slice(0, lastNonQuoted).join('\n').trimEnd();
-        const quotedLines = lines.slice(lastNonQuoted);
-        const stripped = quotedLines.map(l => {
-            if (l.startsWith('> ')) return l.substring(2);
-            if (l === '>') return '';
-            return l;
-        }).join('\n').trim();
-        return { replyText, quotedOriginal: stripped };
+        // No armor boundary — the entire body is the reply (including any "> " quoted plaintext).
+        return { replyText: body, quotedOriginal: '' };
     }
 
     // Wrap raw ciphertext in ASCII armor

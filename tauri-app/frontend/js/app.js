@@ -1058,12 +1058,8 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (encryptBtn) {
             console.log('[JS] Setting up encrypt button event listener');
             encryptBtn.dataset.encrypted = 'false';
-            // Set initial label based on encryption algorithm
             const initLabelSpan = encryptBtn.querySelector('.encrypt-btn-label');
-            if (initLabelSpan) {
-                const algo = appState.getSettings()?.encryption_algorithm || 'nip44';
-                initLabelSpan.textContent = algo === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
-            }
+            if (initLabelSpan) initLabelSpan.textContent = 'Encrypt';
             // Update DM checkbox visibility on initialization
             if (window.emailService) window.emailService.updateDmCheckboxVisibility();
             encryptBtn.addEventListener('click', async function handleEncryptClick() {
@@ -1102,6 +1098,14 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         window.emailService.clearSignature();
                         window.emailService._plainBody = savedPlainBody;
                         window.emailService._htmlBody = savedHtmlBody;
+
+                        // Auto-sign after encrypt: click the sign button to transform
+                        // the SEAL block into a SIGNATURE block. Clicking Signed again
+                        // restores the SEAL-only version (originalBody snapshot).
+                        const signBtnAuto = domManager.get('signBtn');
+                        if (signBtnAuto && signBtnAuto.dataset.signed !== 'true') {
+                            signBtnAuto.click();
+                        }
                     }
                 } else {
                     // Decrypt mode — use the same backend pipeline as sent mail viewing
@@ -1151,10 +1155,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         console.error('Failed to decrypt attachments:', error);
                     }
                     if (iconSpan) iconSpan.className = 'fas fa-lock';
-                    if (labelSpan) {
-                        const algo = appState.getSettings()?.encryption_algorithm || 'nip44';
-                        labelSpan.textContent = algo === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
-                    }
+                    if (labelSpan) labelSpan.textContent = 'Encrypt';
                     encryptBtn.dataset.encrypted = 'false';
                     // Re-enable editing
                     if (subjectInput) subjectInput.disabled = false;
@@ -1200,7 +1201,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                     // Parse armor structure from the full body.
                     // parseArmorComponents handles depth-counting to properly extract
                     // the outermost body, nested quoted armor, sig, and seal.
-                    const armorParts = window.emailService ? window.emailService.parseArmorComponents(rawBodyValue) : null;
+                    const armorParts = window.emailService ? await window.emailService.parseArmorComponents(rawBodyValue) : null;
                     // isArmored = the body starts with armor (user's own encrypted/signed body).
                     // If prefixText exists, armor is a quoted original (plaintext reply case).
                     const isArmored = !!(armorParts && armorParts.bodyText && !armorParts.prefixText);
@@ -1218,7 +1219,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         const splitResult = window.emailService ? window.emailService.splitReplyAndQuoted(rawBodyValue) : { replyText: rawBodyValue, quotedOriginal: '' };
                         bodyValue = splitResult.quotedOriginal ? splitResult.replyText : rawBodyValue;
                         if (splitResult.quotedOriginal && window.emailService) {
-                            const qParts = window.emailService.parseArmorComponents(splitResult.quotedOriginal);
+                            const qParts = await window.emailService.parseArmorComponents(splitResult.quotedOriginal);
                             if (qParts && qParts.prefixText) {
                                 quotedPlaintext = qParts.prefixText;
                                 const armorStart = splitResult.quotedOriginal.indexOf('-----');
@@ -2466,7 +2467,7 @@ NostrMailApp.prototype.updateComposeButtons = function() {
         if (encryptBtn.dataset.encrypted !== 'true') {
             const label = encryptBtn.querySelector('.encrypt-btn-label');
             if (label) {
-                label.textContent = settings.encryption_algorithm === 'nip04' ? 'Encrypt & Sign' : 'Encrypt';
+                label.textContent = 'Encrypt';
             }
         }
     }

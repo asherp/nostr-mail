@@ -60,6 +60,44 @@ The built application will be in `backend/src-tauri/target/release/`
 - **Linux**: `.deb` and `.AppImage` packages
 - **Android**: `.apk` file
 
+## Releasing
+
+The single source of truth for the app version is `tauri-app/backend/tauri.conf.json` → `version`. Both the CI build (`.github/workflows/build.yml`) and the landing page template (`.github/workflows/mkdocs-deploy.yml`) read from it.
+
+### Version format
+
+Use plain semver: `1.0.4`, `1.0.5`, etc. **Do not** add pre-release suffixes like `-beta` or `-rc1` — the Windows MSI bundler rejects non-numeric pre-release identifiers. Pre-release status is instead marked on the GitHub release itself via the `prerelease: true` flag in `build.yml`'s release job. Flip it to `false` when shipping a stable version.
+
+### Release steps
+
+1. Bump `version` in `tauri-app/backend/tauri.conf.json`.
+2. Commit the bump on `master`.
+3. Create an annotated tag matching the version with a `v` prefix:
+   ```bash
+   git tag -a v1.0.5 -m "Release v1.0.5"
+   ```
+4. Push the **tag first**, then the branch:
+   ```bash
+   git push origin v1.0.5
+   # wait for the build workflow's release job to publish assets
+   git push origin master
+   ```
+
+### Why the ordering matters
+
+Two workflows react to a release:
+
+- **`build.yml`** triggers on the tag push. It builds Windows/Linux/macOS installers on three runners, then its `release` job attaches them to a GitHub Release named after the tag. End-to-end: ~15–30 minutes.
+- **`mkdocs-deploy.yml`** triggers on any push to `master`. It reads `tauri.conf.json`, substitutes `{{VERSION_TAG}}` / `{{VERSION}}` placeholders in the landing page, and deploys to GitHub Pages. End-to-end: ~3–5 minutes.
+
+If you push the branch before the tag (or both at once), the landing page will go live pointing at download URLs for a release that doesn't exist yet, because `build.yml` is still compiling. Users hitting the site during that window get 404s on the download buttons.
+
+Pushing the tag first, waiting for the GitHub Release to appear, then pushing the branch closes the window. If you forget and push both together, the landing page self-heals once `build.yml` finishes and the release assets become available — no re-deploy needed.
+
+### Manual trigger
+
+Both workflows also support `workflow_dispatch` from the Actions tab, useful for testing build changes without cutting a release.
+
 ## Code Organization
 
 ### Frontend

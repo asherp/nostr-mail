@@ -41,8 +41,11 @@ jobs:
     - name: Assemble final site
       run: |
         mkdir -p _site/docs _site/assets
-        # Landing page as root
-        cp docs/landing/index.html _site/index.html
+        # Landing page as root, with version placeholders substituted from tauri.conf.json
+        VERSION=$(jq -r .version tauri-app/backend/tauri.conf.json)
+        sed -e "s|{{VERSION_TAG}}|v${VERSION}|g" \
+            -e "s|{{VERSION}}|${VERSION}|g" \
+            docs/landing/index.html > _site/index.html
         # Logo assets for the landing page
         cp tauri-app/frontend/assets/nostr-mail-logo.png _site/assets/
         cp tauri-app/frontend/assets/nostr-mail-logo-white.png _site/assets/

@@ -3044,7 +3044,9 @@ fn is_base64_content(content: &str) -> bool {
 // is_likely_encrypted_content is defined as pub fn later in this file (line ~3918)
 
 /// Glossia-decode body content to NIP-decrypt-ready ciphertext string.
-/// Mirrors JS: decodeGlossiaArmoredBody — tries latin then english, hex→base64, auto-unpack.
+/// Uses `detect_dialect_best` to pick the (language, wordlist) pair that the
+/// prose was encoded with, then decodes once with that pair. Mirrors the
+/// subject path (`glossia_decode_subject`) and `try_glossia_decode_to_bytes`.
 /// The `nip_hint` is "nip04" or "nip44" from the armor BEGIN tag.
 fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result<String, String> {
     // If already base64 or base64?iv=base64, return as-is
@@ -3053,48 +3055,60 @@ fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result
         return Ok(stripped);
     }
 
-    // Try all dialects and pick the longest decoded output.
-    // decode_from_language with the wrong language silently returns a truncated result
-    // (matching only words that happen to overlap), so we can't trust the first success.
-    let languages = ["latin", "english"];
-    let mut best_decoded: Option<(String, String)> = None; // (decoded_hex, lang)
-    let mut last_err = String::new();
-    for lang in &languages {
-        let text = encoded_content.to_string();
-        let lang_str = lang.to_string();
-        let result = std::panic::catch_unwind(move || {
-            glossia::decode_from_language(&text, &lang_str, "default", false)
-        });
-        match result {
-            Ok(Ok(decoded)) => {
-                match &best_decoded {
-                    Some((prev, _)) if prev.len() >= decoded.len() => {
-                        // Previous was longer or equal, keep it
-                    }
-                    _ => {
-                        best_decoded = Some((decoded, lang.to_string()));
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                last_err = format!("{:?}", e);
-            }
-            Err(panic_info) => {
-                let msg = panic_info.downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                last_err = format!("panic: {}", msg);
-            }
+    // Detect dialect (language + wordlist) from the prose itself.
+    let words: Vec<String> = encoded_content.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.is_empty() {
+        return Err("Glossia decode failed: empty input".to_string());
+    }
+    let detect_words = words.clone();
+    let detect_result = std::panic::catch_unwind(move || {
+        glossia::detect_dialect_best(&detect_words)
+    });
+    let best = match detect_result {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Err("Glossia decode failed: no dialect detected".to_string());
         }
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            return Err(format!("Glossia decode failed: detect panicked: {}", msg));
+        }
+    };
+    println!("[RUST] glossia_decode_to_ciphertext: detected dialect={:?} wordlist={:?} hit_rate={}",
+        best.language, best.wordlist, best.hit_rate);
+    if best.hit_rate < 0.3 {
+        return Err(format!(
+            "Glossia decode failed: hit_rate {} too low (<0.3)", best.hit_rate
+        ));
     }
 
-    // Use the longest decoded result
-    if let Some((decoded, _lang)) = best_decoded {
-        return glossia_postprocess(&decoded, nip_hint);
-    }
+    let text = encoded_content.to_string();
+    let language = best.language.clone();
+    let wordlist = best.wordlist.clone();
+    let decode_result = std::panic::catch_unwind(move || {
+        glossia::decode_from_language(&text, &language, &wordlist, false)
+    });
+    let decoded = match decode_result {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => {
+            return Err(format!("Glossia decode failed for {}/{}: {:?}",
+                best.language, best.wordlist, e));
+        }
+        Err(panic_info) => {
+            let msg = panic_info.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            return Err(format!("Glossia decode failed for {}/{}: panic: {}",
+                best.language, best.wordlist, msg));
+        }
+    };
+    println!("[RUST] glossia_decode_to_ciphertext: decoded len={}", decoded.len());
 
-    Err(format!("Glossia decode failed for all languages: {}", last_err))
+    glossia_postprocess(&decoded, nip_hint)
 }
 
 /// Glossia-decode subject (payload_only mode, hit_rate >= 0.8).

@@ -2077,18 +2077,33 @@ class EmailService {
             await TauriService.sendEmail(emailConfig, recipientEmail, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences);
             console.log('[JS] Encrypted email sent successfully');
 
-            // Update the email's subject_hash in DB to match the NIP ciphertext
-            // (not the glossia-encoded subject). This enables DM↔email matching.
-            if (this._subjectCiphertext && messageId) {
+            // Persist a minimal record of this sent email to the local DB immediately,
+            // with subject_hash set to SHA-256(NIP ciphertext). The matching DM's
+            // content_hash hashes the same bytes, so DM↔email linking works the
+            // moment the DM lands — no IMAP-sync round-trip required. A later sync
+            // of the Sent folder updates this row (save_email uses COALESCE so the
+            // correct subject_hash survives).
+            if (messageId) {
                 try {
-                    const hash = await this.hashStringSHA256(this._subjectCiphertext);
-                    await window.__TAURI__.core.invoke('db_update_email_subject_hash', {
-                        messageId: messageId,
+                    const hash = this._subjectCiphertext
+                        ? await this.hashStringSHA256(this._subjectCiphertext)
+                        : null;
+                    await window.__TAURI__.core.invoke('db_save_sent_email_stub', {
+                        messageId,
+                        fromAddress: emailConfig.email_address,
+                        toAddress: recipientEmail,
+                        subject,
+                        body: plainBody,
+                        bodyHtml: this._htmlBody || null,
+                        senderPubkey: keypair?.public_key || null,
+                        recipientPubkey: contact?.pubkey || null,
                         subjectHash: hash,
+                        inReplyTo: this._replyToMessageId || null,
+                        references: this._replyReferences || null,
                     });
-                    console.log('[JS] Updated subject_hash for sent email:', messageId);
+                    console.log('[JS] Saved sent-email stub for message_id:', messageId);
                 } catch (e) {
-                    console.warn('[JS] Failed to update subject_hash:', e);
+                    console.warn('[JS] Failed to save sent-email stub:', e);
                 }
             }
         } catch (error) {

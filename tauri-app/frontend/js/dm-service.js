@@ -58,16 +58,19 @@ class DMService {
                 return;
             }
 
-            // 1. Get sorted list of DM pubkeys
-            const pubkeys = await window.__TAURI__.core.invoke('db_get_all_dm_pubkeys_sorted');
-            
+            const myPubkey = window.appState.getKeypair().public_key;
+
+            // 1. Get sorted list of DM pubkeys scoped to the active profile
+            const pubkeys = await window.__TAURI__.core.invoke('db_get_all_dm_pubkeys_sorted', {
+                userPubkey: myPubkey
+            });
+
             if (!pubkeys || pubkeys.length === 0) {
                 window.appState.setDmContacts([]);
                 this.renderDmContacts();
                 return;
             }
-            
-            const myPubkey = window.appState.getKeypair().public_key;
+
             const dmContacts = [];
 
             for (const contactPubkey of pubkeys) {

@@ -1183,20 +1183,23 @@ impl Database {
 
     // Email operations
     pub fn save_email(&self, email: &Email) -> Result<i64> {
-        println!("[DB] save_email: Starting save for message_id={}, has_id={}", 
+        println!("[DB] save_email: Starting save for message_id={}, has_id={}",
             email.message_id, email.id.is_some());
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
-        
-        // Use pre-computed subject_hash if provided (from NIP ciphertext before glossia),
-        // otherwise fall back to hashing the subject as stored.
-        let subject_hash = email.subject_hash.clone().or_else(|| {
+
+        // INSERT fallback: when no explicit subject_hash is provided for a new encrypted
+        // email, hash the subject as stored. UPDATE preserves the existing value via
+        // COALESCE so a retroactive hash correction (set by the frontend post-send) is
+        // not clobbered by a later IMAP-sync resave that passes subject_hash: None.
+        let insert_subject_hash = email.subject_hash.clone().or_else(|| {
             if email.is_nostr_encrypted {
                 Some(Self::compute_content_hash(&email.subject))
             } else {
                 None
             }
         });
+        let update_subject_hash = email.subject_hash.clone();
 
         let (in_reply_to, references, thread_id) = Self::resolve_threading(email);
 
@@ -1207,14 +1210,14 @@ impl Database {
                     message_id = ?, from_address = ?, to_address = ?, subject = ?,
                     body = ?, body_plain = ?, body_html = ?, received_at = ?,
                     is_nostr_encrypted = ?, sender_pubkey = ?, recipient_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?,
-                    subject_hash = ?, signature_valid = ?, signature_source = ?, transport_auth_verified = ?,
+                    subject_hash = COALESCE(?, subject_hash), signature_valid = ?, signature_source = ?, transport_auth_verified = ?,
                     in_reply_to = ?, references_ = ?, thread_id = ?
                 WHERE id = ?",
                 params![
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
                     email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                    subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified,
+                    update_subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified,
                     in_reply_to, references, thread_id, id
                 ],
             )?;
@@ -1263,7 +1266,7 @@ impl Database {
                     email.message_id, email.from_address, email.to_address, email.subject,
                     email.body, email.body_plain, email.body_html, email.received_at,
                     email.is_nostr_encrypted, email.sender_pubkey, email.recipient_pubkey, email.raw_headers, email.is_draft, email.is_read, now,
-                    subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified,
+                    insert_subject_hash, email.signature_valid, email.signature_source, email.transport_auth_verified,
                     in_reply_to, references, thread_id
                 ],
             ) {
@@ -1279,7 +1282,7 @@ impl Database {
             }
         }
     }
-    
+
     // Insert email directly without checking for duplicates (faster when we already know it's new)
     pub fn insert_email_direct(&self, email: &Email) -> Result<i64> {
         println!("[DB] insert_email_direct: Inserting email directly without duplicate check, message_id={}", email.message_id);
@@ -3325,13 +3328,17 @@ impl Database {
         Ok(())
     }
 
-    /// Get all unique pubkeys (npubs) that appear as sender or recipient in direct_messages, including the user's own pubkey
-    pub fn get_all_dm_pubkeys(&self) -> Result<Vec<String>> {
+    /// Get all unique pubkeys (npubs) that appear as the counterparty of `user_pubkey`
+    /// in direct_messages. Excludes DMs that don't involve `user_pubkey` on either end,
+    /// so rows left over from other profiles sharing this DB are filtered out.
+    pub fn get_all_dm_pubkeys(&self, user_pubkey: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT sender_pubkey FROM direct_messages UNION SELECT recipient_pubkey FROM direct_messages"
+            "SELECT recipient_pubkey FROM direct_messages WHERE sender_pubkey = ?1
+             UNION
+             SELECT sender_pubkey FROM direct_messages WHERE recipient_pubkey = ?1"
         )?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
+        let rows = stmt.query_map(params![user_pubkey], |row| row.get(0))?;
         let mut set = std::collections::HashSet::new();
         for row in rows {
             let pk: String = row?;
@@ -3342,20 +3349,20 @@ impl Database {
         Ok(set.into_iter().collect())
     }
 
-    pub fn get_all_dm_pubkeys_sorted(&self) -> Result<Vec<String>> {
+    pub fn get_all_dm_pubkeys_sorted(&self, user_pubkey: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT pubkey
              FROM (
-               SELECT sender_pubkey as pubkey, created_at FROM direct_messages
+               SELECT recipient_pubkey as pubkey, created_at FROM direct_messages WHERE sender_pubkey = ?1
                UNION ALL
-               SELECT recipient_pubkey as pubkey, created_at FROM direct_messages
+               SELECT sender_pubkey as pubkey, created_at FROM direct_messages WHERE recipient_pubkey = ?1
              )
              WHERE pubkey != ''
              GROUP BY pubkey
              ORDER BY MAX(created_at) DESC"
         )?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
+        let rows = stmt.query_map(params![user_pubkey], |row| row.get(0))?;
         let mut pubkeys = Vec::new();
         for row in rows {
             pubkeys.push(row?);
@@ -4390,12 +4397,16 @@ mod tests {
         let (db, _dir) = create_test_db();
         db.save_dm(&make_dm("ev_pk1", "alice", "bob")).unwrap();
         db.save_dm(&make_dm("ev_pk2", "carol", "alice")).unwrap();
+        db.save_dm(&make_dm("ev_pk3", "dave", "eve")).unwrap(); // unrelated to alice
 
-        let pubkeys = db.get_all_dm_pubkeys().unwrap();
-        assert!(pubkeys.contains(&"alice".to_string()));
+        // Scoped to alice: should see bob (recipient) and carol (sender), not dave/eve
+        let pubkeys = db.get_all_dm_pubkeys("alice").unwrap();
         assert!(pubkeys.contains(&"bob".to_string()));
         assert!(pubkeys.contains(&"carol".to_string()));
-        assert_eq!(pubkeys.len(), 3);
+        assert!(!pubkeys.contains(&"alice".to_string()));
+        assert!(!pubkeys.contains(&"dave".to_string()));
+        assert!(!pubkeys.contains(&"eve".to_string()));
+        assert_eq!(pubkeys.len(), 2);
     }
 
     #[test]

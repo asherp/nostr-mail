@@ -4836,15 +4836,15 @@ fn sync_conversation_events(
 }
 
 #[tauri::command]
-fn db_get_all_dm_pubkeys(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+fn db_get_all_dm_pubkeys(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
-    db.get_all_dm_pubkeys().map_err(|e| e.to_string())
+    db.get_all_dm_pubkeys(&user_pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn db_get_all_dm_pubkeys_sorted(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+fn db_get_all_dm_pubkeys_sorted(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
-    db.get_all_dm_pubkeys_sorted().map_err(|e| e.to_string())
+    db.get_all_dm_pubkeys_sorted(&user_pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -5293,7 +5293,7 @@ async fn handle_live_direct_message(
     
     // Convert sender_pubkey to npub format
     let sender_npub = event.pubkey.to_bech32().map_err(|e| e.to_string())?;
-    
+
     // Find recipient from p tags
     let recipient_npub = event.tags.iter()
         .find(|tag| tag.kind().as_str() == "p")
@@ -5305,7 +5305,7 @@ async fn handle_live_direct_message(
                 .and_then(|pubkey| pubkey.to_bech32().ok())
         })
         .unwrap_or_else(|| user_pubkey.to_bech32().unwrap_or_default());
-    
+
     // Create DirectMessage for database
     let dm = DbDirectMessage {
         id: None,
@@ -5590,6 +5590,59 @@ fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String
 fn db_update_email_subject_hash(message_id: String, subject_hash: String, state: tauri::State<AppState>) -> Result<(), String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     db.update_email_subject_hash(&message_id, &subject_hash).map_err(|e| e.to_string())
+}
+
+/// Save a minimal record of a just-sent encrypted email so DM↔email matching
+/// works immediately, without waiting for the next IMAP sync of the Sent folder.
+///
+/// `subject_hash` must be SHA-256 hex of the NIP ciphertext (pre-glossia) —
+/// the same value the matching DM will be hashed with — so the two rows link up.
+/// A later sync that saves the same message_id will UPDATE this row; save_email
+/// uses COALESCE so the correct subject_hash survives that resave.
+#[tauri::command]
+fn db_save_sent_email_stub(
+    message_id: String,
+    from_address: String,
+    to_address: String,
+    subject: String,
+    body: String,
+    body_html: Option<String>,
+    sender_pubkey: Option<String>,
+    recipient_pubkey: Option<String>,
+    subject_hash: Option<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<i64, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now();
+    let email = crate::database::Email {
+        id: None,
+        message_id,
+        from_address,
+        to_address,
+        subject,
+        body,
+        body_plain: None,
+        body_html,
+        received_at: now,
+        is_nostr_encrypted: true,
+        sender_pubkey,
+        recipient_pubkey,
+        raw_headers: None,
+        is_draft: false,
+        is_read: true,
+        updated_at: Some(now),
+        created_at: now,
+        signature_valid: None,
+        signature_source: None,
+        transport_auth_verified: None,
+        subject_hash,
+        in_reply_to,
+        references,
+        thread_id: None,
+    };
+    db.save_email(&email).map_err(|e| e.to_string())
 }
 
 #[allow(dead_code)]
@@ -6032,6 +6085,7 @@ pub fn run() {
         db_get_matching_email_id,
         db_get_matching_email_body,
         db_update_email_subject_hash,
+        db_save_sent_email_stub,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     

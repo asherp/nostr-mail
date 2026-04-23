@@ -987,7 +987,7 @@ class EmailService {
     // Build HTML alternative body from plaintext components
     buildHtmlAlt(bodyText, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey, quotedHtml) {
         const escHtml = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-        const bodyHtml = escHtml(bodyText).replace(/\n/g, ' ');
+        const bodyHtml = escHtml(bodyText).replace(/\n/g, '<br>');
 
         let sigHtml = '';
         const sigContent = encodedSigPubkey || encodedSig;
@@ -4207,12 +4207,19 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         cardDiv.classList.add('collapsed');
                     }
 
-                    // Click header to toggle collapse/expand
+                    // Click to toggle collapse/expand.
+                    // When collapsed: anywhere on the card (including its padding) expands.
+                    // When expanded: only the sender header collapses — clicks in the body
+                    // or on action buttons don't accidentally collapse.
                     const senderHeader = cardDiv.querySelector('.email-sender-header');
                     senderHeader.style.cursor = 'pointer';
-                    senderHeader.addEventListener('click', (e) => {
+                    cardDiv.addEventListener('click', (e) => {
                         if (e.target.closest('.thread-card-actions, .email-metadata-details, a')) return;
-                        cardDiv.classList.toggle('collapsed');
+                        if (cardDiv.classList.contains('collapsed')) {
+                            cardDiv.classList.remove('collapsed');
+                        } else if (e.target.closest('.email-sender-header')) {
+                            cardDiv.classList.add('collapsed');
+                        }
                     });
 
                     // Wire up per-card action buttons

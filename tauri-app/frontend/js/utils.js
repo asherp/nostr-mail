@@ -164,6 +164,16 @@ class Utils {
                     setTimeout(resize, 10);
                 };
 
+                const textToNodes = (text) => {
+                    const parts = text.split('\n');
+                    const nodes = [];
+                    parts.forEach((part, i) => {
+                        if (i > 0) nodes.push(doc.createElement('br'));
+                        nodes.push(doc.createTextNode(part));
+                    });
+                    return nodes;
+                };
+
                 lock.addEventListener('click', (e) => {
                     e.stopPropagation();
                     if (isDecrypted) {
@@ -172,7 +182,7 @@ class Utils {
                         lock.title = 'Click to decrypt';
                         isDecrypted = false;
                     } else {
-                        replaceContent([doc.createTextNode(decryptedText)]);
+                        replaceContent(textToNodes(decryptedText));
                         lock.className = 'fas fa-lock-open decrypt-toggle';
                         lock.title = 'Click to show encrypted';
                         isDecrypted = true;
@@ -181,7 +191,7 @@ class Utils {
 
                 // Start in decrypted mode if requested
                 if (startDecrypted) {
-                    replaceContent([doc.createTextNode(decryptedText)]);
+                    replaceContent(textToNodes(decryptedText));
                     lock.className = 'fas fa-lock-open decrypt-toggle';
                     lock.title = 'Click to show encrypted';
                     isDecrypted = true;

@@ -116,10 +116,16 @@ else
     echo ""
     echo -e "${BLUE}Tip: Use './build_and_deploy_debug.sh --bundle' for bundled build (no dev server)${NC}"
     echo ""
-    
+
+    # Route the WebView's dev-server requests back to the host over USB so
+    # WiFi reachability / LAN firewalls / AP isolation can't break the loop.
+    DEV_PORT=1430
+    echo -e "${BLUE}Setting up adb reverse tunnel on port $DEV_PORT...${NC}"
+    adb reverse "tcp:$DEV_PORT" "tcp:$DEV_PORT"
+
     # Run cargo tauri android dev
     # This command handles building, signing, and installing automatically
     # Environment variables set before this script will be passed through to the build
     # Example: NOSTR_MAIL_DB=/custom/path ./build_and_deploy_debug.sh
-    cargo tauri android dev
+    TAURI_DEV_HOST=127.0.0.1 cargo tauri android dev
 fi

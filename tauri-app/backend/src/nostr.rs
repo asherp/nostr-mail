@@ -507,7 +507,7 @@ pub fn decrypt_dm_content(
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {:?}", e))?;
     let sender = parse_pubkey(sender_pubkey)
         .map_err(|e| anyhow::anyhow!("Failed to parse sender pubkey: {:?}", e))?;
-    
+
     // Try NIP-44 first (newer standard)
     match nip44::decrypt(&secret_key, &sender, encrypted_content) {
         Ok(decrypted) => {
@@ -517,22 +517,21 @@ pub fn decrypt_dm_content(
             // NIP-44 failed, try NIP-04
         }
     }
-    
+
     // Try NIP-04 format: base64(encrypted_content)?iv=base64(iv)
     match nip04::decrypt(&secret_key, &sender, encrypted_content) {
         Ok(decrypted) => {
             return Ok(decrypted);
         }
         Err(e) => {
-            // Both failed - log error details for debugging
-            eprintln!("[DM DECRYPT] Failed to decrypt: NIP-44 and NIP-04 both failed. Content length: {}, Has '?iv=': {}, Error: {}", 
-                encrypted_content.len(), 
+            eprintln!("[DM DECRYPT] Failed to decrypt: NIP-44 and NIP-04 both failed. Content length: {}, Has '?iv=': {}, Error: {}",
+                encrypted_content.len(),
                 encrypted_content.contains("?iv="),
                 e
             );
         }
     }
-    
+
     Err(anyhow::anyhow!("Failed to decrypt with both NIP-04 and NIP-44. Content length: {}, Has '?iv=': {}", encrypted_content.len(), encrypted_content.contains("?iv=")))
 }
 

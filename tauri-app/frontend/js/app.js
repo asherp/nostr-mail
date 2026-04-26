@@ -632,52 +632,67 @@ NostrMailApp.prototype.ensureDefaultContact = async function() {
         
         // Check if the default contact already exists for this user
         const userContacts = await window.DatabaseService.getAllContacts(userPubkey);
-        const hasDefaultContact = userContacts.some(contact => contact.pubkey === DEFAULT_CONTACT_PUBKEY);
-        
-        if (hasDefaultContact) {
-            console.log('[APP] Default nostr-mail contact already exists for this user');
+        const existingDefault = userContacts.find(contact => contact.pubkey === DEFAULT_CONTACT_PUBKEY);
+
+        // If the contact exists and already has its email populated, we're done.
+        // If it exists but is missing email, fall through to refresh from relays —
+        // the original profile fetch may have failed or the published kind:0
+        // metadata didn't include email yet at first-add time.
+        if (existingDefault && existingDefault.email) {
+            console.log('[APP] Default nostr-mail contact already populated for this user');
             return;
         }
-        
-        console.log('[APP] Default nostr-mail contact not found, creating contact immediately...');
-        
-        // Create contact immediately with default data (don't wait for profile fetch)
-        // This ensures the contact appears instantly in the UI
-        const now = new Date().toISOString();
-        const contact = {
-            pubkey: DEFAULT_CONTACT_PUBKEY,
-            name: 'nostr-mail', // Default name, will be updated when profile is fetched
-            email: null,
-            picture: '',
-            fields: {},
-            picture_data_url: null,
-            picture_loaded: false,
-            picture_loading: false,
-            is_public: false, // Private contact - not in public follow list
-            created_at: now,
-            updated_at: now
-        };
-        
-        // Convert to database format and save as private contact immediately
-        const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
-        await window.DatabaseService.saveContact(dbContact, userPubkey, false); // isPublic = false
-        
-        // Reload contacts from database immediately so user sees the contact right away
-        if (window.contactsService) {
-            await window.contactsService.loadContacts();
+
+        const isNewContact = !existingDefault;
+        let createdAt;
+
+        if (isNewContact) {
+            console.log('[APP] Default nostr-mail contact not found, creating contact immediately...');
+
+            // Create contact immediately with default data (don't wait for profile fetch)
+            // This ensures the contact appears instantly in the UI
+            const now = new Date().toISOString();
+            createdAt = now;
+            const contact = {
+                pubkey: DEFAULT_CONTACT_PUBKEY,
+                name: 'nostr-mail', // Default name, will be updated when profile is fetched
+                email: null,
+                picture: '',
+                fields: {},
+                picture_data_url: null,
+                picture_loaded: false,
+                picture_loading: false,
+                is_public: false, // Private contact - not in public follow list
+                created_at: now,
+                updated_at: now
+            };
+
+            // Convert to database format and save as private contact immediately
+            const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
+            await window.DatabaseService.saveContact(dbContact, userPubkey, false); // isPublic = false
+
+            // Reload contacts from database immediately so user sees the contact right away
+            if (window.contactsService) {
+                await window.contactsService.loadContacts();
+            }
+        } else {
+            console.log('[APP] Default nostr-mail contact exists but missing email — refreshing profile from relays...');
+            createdAt = existingDefault.created_at;
         }
-        
-        // Fetch profile asynchronously in the background and update the contact when ready
-        // This doesn't block the UI - user sees the contact immediately
+
+        // Fetch profile asynchronously in the background and update the contact when ready.
+        // For an existing contact we pass isPublic=null so we don't clobber the user's
+        // existing follow-list state (e.g. if they already follow nostr-mail publicly).
+        const isPublicForRefresh = isNewContact ? false : null;
         window.TauriService.fetchProfilePersistent(DEFAULT_CONTACT_PUBKEY).then(async (profileResult) => {
             if (profileResult) {
                 console.log('[APP] Successfully fetched default nostr-mail profile (async update)');
-                
+
                 // Extract profile information
                 const profile = profileResult;
                 const profileName = profile.fields?.name || profile.fields?.display_name || 'nostr-mail';
                 const email = profile.fields?.email || null;
-                
+
                 // Update the contact with fetched profile data
                 const updatedContact = {
                     pubkey: DEFAULT_CONTACT_PUBKEY,
@@ -688,37 +703,38 @@ NostrMailApp.prototype.ensureDefaultContact = async function() {
                     picture_data_url: null,
                     picture_loaded: false,
                     picture_loading: false,
-                    is_public: false,
-                    created_at: contact.created_at,
+                    created_at: createdAt,
                     updated_at: new Date().toISOString()
                 };
-                
+
                 // Update in database
                 const updatedDbContact = window.DatabaseService.convertContactToDbFormat(updatedContact);
-                await window.DatabaseService.saveContact(updatedDbContact, userPubkey, false);
-                
+                await window.DatabaseService.saveContact(updatedDbContact, userPubkey, isPublicForRefresh);
+
                 // Reload contacts to show updated profile data
                 if (window.contactsService) {
                     await window.contactsService.loadContacts();
                 }
-                
+
                 // Refresh compose dropdown
                 if (window.emailService) {
                     window.emailService.populateNostrContactDropdown();
                 }
             } else {
-                console.warn('[APP] Could not fetch default nostr-mail profile (async), contact created with default name');
+                console.warn('[APP] Could not fetch default nostr-mail profile (async)');
             }
         }).catch((error) => {
             console.error('[APP] Error fetching default nostr-mail profile (async):', error);
         });
-        
+
         // Refresh compose dropdown to include new contact
         if (window.emailService) {
             window.emailService.populateNostrContactDropdown();
         }
-        
-        console.log('[APP] ✅ Default nostr-mail contact added privately for user');
+
+        console.log(isNewContact
+            ? '[APP] ✅ Default nostr-mail contact added privately for user'
+            : '[APP] ✅ Default nostr-mail contact refresh kicked off');
     } catch (error) {
         // Don't block startup if this fails - just log the error
         console.error('[APP] Failed to ensure default contact:', error);
@@ -828,11 +844,24 @@ NostrMailApp.prototype.updateProfileSwitcher = async function() {
     if (npubEl) npubEl.textContent = truncatedNpub;
 
     if (avatarEl) {
+        avatarEl.textContent = profileManager.getAccountInitial(pubkey);
         const picture = profileManager.getAccountPicture(pubkey);
         if (picture) {
-            avatarEl.innerHTML = `<img src="${picture}" alt="${displayName}">`;
-        } else {
-            avatarEl.textContent = profileManager.getAccountInitial(pubkey);
+            try {
+                let dataUrl = await TauriService.getCachedProfileImage(pubkey, picture);
+                if (!dataUrl) {
+                    dataUrl = await TauriService.fetchImage(picture);
+                    if (dataUrl) {
+                        TauriService.cacheProfileImage(pubkey, dataUrl);
+                    }
+                }
+                const current = appState.getKeypair();
+                if (dataUrl && current && current.public_key === pubkey) {
+                    avatarEl.innerHTML = `<img src="${dataUrl}" alt="${displayName}">`;
+                }
+            } catch (e) {
+                // keep initial fallback
+            }
         }
     }
 }
@@ -857,16 +886,12 @@ NostrMailApp.prototype.renderProfileSwitcherList = async function() {
         const truncatedNpub = account.public_key.length > 20
             ? account.public_key.substring(0, 10) + '...' + account.public_key.substring(account.public_key.length - 4)
             : account.public_key;
-        const picture = profileManager.getAccountPicture(account.public_key);
         const initial = profileManager.getAccountInitial(account.public_key);
-        const avatarContent = picture
-            ? `<img src="${picture}" alt="${displayName}">`
-            : initial;
 
         return `
             <div class="profile-switcher-item ${isActive ? 'active' : ''}" data-pubkey="${account.public_key}">
                 <span class="profile-switcher-item-check">${isActive ? '<i class="fas fa-check"></i>' : ''}</span>
-                <div class="profile-switcher-item-avatar">${avatarContent}</div>
+                <div class="profile-switcher-item-avatar" data-pubkey="${account.public_key}">${initial}</div>
                 <div class="profile-switcher-item-info">
                     <span class="profile-switcher-item-name">${displayName}</span>
                     <span class="profile-switcher-item-npub">${truncatedNpub}</span>
@@ -877,6 +902,30 @@ NostrMailApp.prototype.renderProfileSwitcherList = async function() {
             </div>
         `;
     }).join('');
+
+    accounts.forEach(account => {
+        const picture = profileManager.getAccountPicture(account.public_key);
+        if (!picture) return;
+        const avatarEl = listEl.querySelector(`.profile-switcher-item-avatar[data-pubkey="${account.public_key}"]`);
+        if (!avatarEl) return;
+        const displayName = profileManager.getAccountDisplayName(account.public_key);
+        (async () => {
+            try {
+                let dataUrl = await TauriService.getCachedProfileImage(account.public_key, picture);
+                if (!dataUrl) {
+                    dataUrl = await TauriService.fetchImage(picture);
+                    if (dataUrl) {
+                        TauriService.cacheProfileImage(account.public_key, dataUrl);
+                    }
+                }
+                if (dataUrl && avatarEl.isConnected) {
+                    avatarEl.innerHTML = `<img src="${dataUrl}" alt="${displayName}">`;
+                }
+            } catch (e) {
+                // keep initial fallback
+            }
+        })();
+    });
 }
 
 // Setup profile switcher event listeners
@@ -1022,7 +1071,11 @@ NostrMailApp.prototype.handleRemoveAccount = async function(pubkey) {
 // Setup event listeners
 NostrMailApp.prototype.setupEventListeners = function() {
     console.log('Setting up event listeners...');
-    
+
+    // QR/camera buttons live in the static settings DOM, so wire them once at
+    // init — independent of whether user settings have been loaded yet.
+    this.setupQrCodeEventListeners();
+
     try {
         // Navigation
         const navItems = domManager.get('navItems');
@@ -3487,7 +3540,6 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         
         // Update public key display if npriv is available
         await this.updatePublicKeyDisplay();
-        this.setupQrCodeEventListeners();
         
         // Clear flag after a short delay to allow any pending events to settle
         setTimeout(() => {
@@ -4587,12 +4639,18 @@ NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) 
     
     // Update header title and back button visibility
     const profileBackButton = document.getElementById('profile-back-to-contacts-btn');
+    const navBackButton = document.querySelector('#profile .back-to-nav-btn');
     if (profileHeader) {
         if (isViewingOwnProfile) {
             profileHeader.textContent = 'Profile';
-            // Hide back button when viewing own profile
+            // Hide contacts back button when viewing own profile
             if (profileBackButton) {
                 profileBackButton.style.display = 'none';
+            }
+            // Clear any !important left over from a prior contact view, so
+            // showPage() (portrait) or the landscape CSS rule can show it
+            if (navBackButton) {
+                navBackButton.style.removeProperty('display');
             }
         } else {
             // Get contact name if available
@@ -4600,9 +4658,13 @@ NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) 
             const contact = contacts.find(c => c.pubkey === this.viewingProfilePubkey);
             const name = contact?.name || profile?.fields?.name || profile?.fields?.display_name || 'Contact Profile';
             profileHeader.textContent = name;
-            // Show back button when viewing contact profile
+            // Show back-to-contacts button; hide back-to-nav so only one is visible
+            // (use !important to beat landscape responsive.css rule)
             if (profileBackButton) {
                 profileBackButton.style.display = 'flex';
+            }
+            if (navBackButton) {
+                navBackButton.style.setProperty('display', 'none', 'important');
             }
         }
     }

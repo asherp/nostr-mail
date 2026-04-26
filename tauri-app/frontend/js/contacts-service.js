@@ -780,8 +780,9 @@ class ContactsService {
                     try {
                         const userPubkey = window.appState.getKeypair().public_key;
                         const dbContact = window.DatabaseService.convertContactToDbFormat(updatedContact);
-                        // Keep existing is_public status (default to true if updating)
-                        await window.DatabaseService.saveContact(dbContact, userPubkey, true);
+                        // Refresh profile data only — preserve existing is_public flag
+                        // (passing null skips the user_contacts upsert).
+                        await window.DatabaseService.saveContact(dbContact, userPubkey, null);
                         console.log('[JS] Updated contact in database:', contact.pubkey);
                     } catch (dbError) {
                         console.warn('[JS] Failed to update contact in database:', dbError);
@@ -2545,8 +2546,9 @@ class ContactsService {
                     try {
                         const userPubkey = window.appState.getKeypair().public_key;
                         const dbContact = window.DatabaseService.convertContactToDbFormat(selectedContact);
-                        // Keep existing is_public status (default to true if updating)
-                        await window.DatabaseService.saveContact(dbContact, userPubkey, true);
+                        // Refresh profile data only — preserve existing is_public flag
+                        // (passing null skips the user_contacts upsert).
+                        await window.DatabaseService.saveContact(dbContact, userPubkey, null);
                     } catch (dbError) {
                         console.error('[JS] Failed to save updated contact to database:', dbError);
                         // Continue anyway - contact is updated in memory

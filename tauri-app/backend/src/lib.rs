@@ -694,7 +694,10 @@ fn keychain_remove_account(public_key: String, state: tauri::State<AppState>) ->
 
 #[tauri::command]
 fn keychain_list_accounts(state: tauri::State<AppState>) -> Result<Vec<AccountInfo>, String> {
-    let pubkeys = state.keychain.list_pubkeys()?;
+    println!("[RUST] keychain_list_accounts called");
+    let pubkeys = state.keychain.list_pubkeys()
+        .map_err(|e| { println!("[RUST] keychain.list_pubkeys error: {}", e); e })?;
+    println!("[RUST] keychain_list_accounts -> {} pubkeys", pubkeys.len());
     let active_pubkey = state.current_private_key.lock().unwrap()
         .as_ref()
         .and_then(|pk| crypto::get_public_key_from_private(pk).ok());

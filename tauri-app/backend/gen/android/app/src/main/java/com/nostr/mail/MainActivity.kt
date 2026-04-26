@@ -6,6 +6,7 @@ import androidx.activity.enableEdgeToEdge
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
+    VaultStorage.init(this)
     super.onCreate(savedInstanceState)
   }
 }

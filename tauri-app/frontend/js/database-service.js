@@ -27,9 +27,11 @@ class DatabaseService {
         try {
             const id = await window.__TAURI__.core.invoke('db_save_contact', { contact });
             console.log('Contact saved with ID:', id);
-            
-            // Also add the user-contact relationship if userPubkey is provided
-            if (userPubkey && contact.pubkey) {
+
+            // Also add the user-contact relationship if userPubkey is provided.
+            // Pass isPublic=null to refresh profile data only — leaves any
+            // existing user_contacts row (and its is_public flag) untouched.
+            if (userPubkey && contact.pubkey && isPublic !== null) {
                 try {
                     await window.__TAURI__.core.invoke('db_add_user_contact', {
                         userPubkey: userPubkey,

@@ -55,6 +55,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "1.0"
+jni = "0.21"
+ndk-context = "0.1"
 
 # Non-Android dependencies (use native-tls)
 [target.'cfg(not(target_os = "android"))'.dependencies]

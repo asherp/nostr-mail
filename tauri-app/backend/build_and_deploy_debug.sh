@@ -46,16 +46,16 @@ adb devices -l | grep "device$" | while read line; do
 done
 echo ""
 
-# Check if app is already installed and uninstall if needed
-# This is necessary because debug and release builds use different signing keys
+# NOTE: We deliberately do NOT preemptively `adb uninstall` here. Uninstalling
+# wipes app data, including the encrypted keypair vault and the SQLite DB.
+# Two debug builds in a row sign with the same debug keystore so `adb install -r`
+# (which `cargo tauri android dev` performs internally) just upgrades in place.
+# If you're switching between debug and release builds you'll see a signature
+# mismatch — in that case run `adb uninstall com.nostr.mail` manually once,
+# then rerun this script.
 PACKAGE_NAME="com.nostr.mail"
 if adb shell pm list packages | grep -q "^package:$PACKAGE_NAME$"; then
-    echo -e "${YELLOW}App is already installed. Uninstalling to avoid signature mismatch...${NC}"
-    echo -e "${YELLOW}(Debug builds use a different signing key than release builds)${NC}"
-    adb uninstall "$PACKAGE_NAME" || {
-        echo -e "${YELLOW}Note: Uninstall had issues, but continuing anyway...${NC}"
-    }
-    echo -e "${GREEN}✓ Previous installation removed${NC}"
+    echo -e "${BLUE}App is already installed; using upgrade install (data preserved).${NC}"
     echo ""
 fi
 

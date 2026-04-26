@@ -19,7 +19,7 @@ icon: tauri-app/backend/icons/icon.png
 tags: nostr email encryption privacy freedom-tech pgp
 license: Apache-2.0
 assets:
-  - tauri-app/backend/gen/android/app/build/outputs/apk/universal/release/.*\.apk
+  - NostrMail.*\.apk
   - NostrMail.*\.dmg
 remote_metadata:
   - github

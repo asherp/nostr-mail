@@ -796,50 +796,26 @@ body.dark-mode .email-list-strong {
     width: 100%;
 }
 
-.email-body-summary {
+.email-match-subject {
     padding: 0;
-    margin: 0;
+    margin: 0 0 4px 0;
     background: transparent;
     font-size: 14px;
     line-height: 1.4;
     color: inherit;
-    border: none;
-    cursor: pointer;
-    outline: none;
+    font-weight: 600;
     word-wrap: break-word;
     white-space: pre-wrap;
     display: block;
     width: 100%;
 }
 
-.email-body-summary::before {
-    content: '▶';
-    font-size: 10px;
-    margin-right: 4px;
-    transition: transform 0.2s ease;
-    color: inherit;
-    display: inline-block;
-}
-
-.email-body-expandable .email-body-summary[data-expanded="true"]::before {
-    transform: rotate(90deg);
-}
-
-.email-body-summary .message-text {
-    margin-bottom: 4px;
-    font-size: 14px;
-    line-height: 1.4;
-    word-wrap: break-word;
-    white-space: pre-wrap;
-}
-
-.email-body-summary .message-meta {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 6px;
+.email-body-quoted-hint {
+    margin-top: 6px;
     font-size: 11px;
-    opacity: 0.7;
+    font-style: italic;
+    opacity: 0.6;
+    text-align: center;
 }
 
 .email-body-content {

@@ -26,3 +26,8 @@ relay.log
 # Rust build files
 target/
 **/target/
+
+# Slidev
+slides/node_modules/
+slides/dist/
+slides/.slidev/

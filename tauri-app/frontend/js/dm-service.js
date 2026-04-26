@@ -969,16 +969,12 @@ class DMService {
                         emailEmoji = '<span class="email-emoji"><i class="fas fa-envelope"></i></span>';                    }
 
                     if (message.hasEmailMatch) {
-                        // For messages with email matches, replace DM content with details
-                        const dmContent = `
-                            <div class="email-body-expandable">
-                                <div class="email-body-summary" data-expanded="false">${window.Utils.escapeHtml(message.content)}</div>
-                            </div>
-                        `;
-                        
+                        // Email-match messages: always show subject + body inline.
+                        // Quoted reply chains are hidden — envelope icon opens the full email.
                         messageElement.innerHTML = `
                             <div class="message-content">
-                                ${dmContent}
+                                <div class="email-match-subject">${window.Utils.escapeHtml(message.content)}</div>
+                                <div class="email-body-expandable"></div>
                                 <div class="message-meta">
                                     <div class="message-time">${dateTimeDisplay}</div>
                                     ${statusIcon}
@@ -986,26 +982,14 @@ class DMService {
                                 </div>
                             </div>
                         `;
-                        
-                        // Handle click toggle to load email body
+
                         const expandableElement = messageElement.querySelector('.email-body-expandable');
-                        const summaryElement = messageElement.querySelector('.email-body-summary');
-                        if (expandableElement && summaryElement) {
-                            summaryElement.addEventListener('click', async (event) => {
-                                const isExpanded = summaryElement.getAttribute('data-expanded') === 'true';
-                                if (!isExpanded) {
-                                    summaryElement.setAttribute('data-expanded', 'true');
-                                    await this.loadEmailBody(message, expandableElement, contactPubkey);
-                                } else {
-                                    summaryElement.setAttribute('data-expanded', 'false');
-                                    // Remove all loaded content (body, attachments, etc.) except the summary
-                                    Array.from(expandableElement.children).forEach(child => {
-                                        if (child !== summaryElement) child.remove();
-                                    });
-                                }
+                        if (expandableElement && message.event_id) {
+                            this.loadEmailBody(message, expandableElement, contactPubkey).catch(err => {
+                                console.error('[JS] DM: Failed to auto-load email body:', err);
                             });
                         }
-                        
+
                         // Handle email icon click - navigate to email (sent or inbox)
                         if (message.hasEmailMatch && message.event_id) {
                             const emailIcon = messageElement.querySelector('.email-emoji-clickable');                            if (emailIcon) {
@@ -1630,6 +1614,34 @@ class DMService {
         }
     }
 
+    // Trim reply chains from a body so the inline preview shows only this message's text.
+    // Cuts at the first nested NOSTR armor delimiter or the first '>' quoted line, and
+    // drops any trailing "On <date> ... wrote:" attribution.
+    _stripQuotedBlocks(body) {
+        if (!body) return { trimmedBody: body, hadQuotes: false };
+
+        const nestedStart = body.search(/\n-{3,}\s*BEGIN NOSTR /);
+        if (nestedStart >= 0) {
+            return { trimmedBody: body.substring(0, nestedStart).trim(), hadQuotes: true };
+        }
+
+        const lines = body.split('\n');
+        const out = [];
+        let hadQuotes = false;
+        for (const line of lines) {
+            if (line.startsWith('>')) {
+                hadQuotes = true;
+                break;
+            }
+            out.push(line);
+        }
+        while (out.length > 0 && /^On .* wrote:?\s*$/.test(out[out.length - 1].trim())) {
+            out.pop();
+            hadQuotes = true;
+        }
+        return { trimmedBody: out.join('\n').trim(), hadQuotes };
+    }
+
     // Load email body into expandable element
     async loadEmailBody(message, expandableElement, contactPubkey) {
         // Check if content is already loaded
@@ -1669,6 +1681,9 @@ class DMService {
                     finalBody = await this._tryFrontendDecrypt(emailResult.body, decryptPubkey);
                 }
 
+                const { trimmedBody, hadQuotes } = this._stripQuotedBlocks(finalBody);
+                finalBody = trimmedBody;
+
                 // Build manifest from backend attachment metadata (if available)
                 let manifest = null;
                 if (emailResult.attachments && emailResult.attachments.length > 0) {
@@ -1689,6 +1704,13 @@ class DMService {
                 emailDiv.className = 'email-body-content-text';
                 emailDiv.textContent = finalBody;
                 expandableElement.appendChild(emailDiv);
+
+                if (hadQuotes) {
+                    const hint = document.createElement('div');
+                    hint.className = 'email-body-quoted-hint';
+                    hint.textContent = '— quoted text hidden, open the email to view —';
+                    expandableElement.appendChild(hint);
+                }
                 
                 // Display attachments if email_id is available
                 if (emailResult.email_id) {

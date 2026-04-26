@@ -65,7 +65,7 @@ class NotificationService {
                 border-radius: 8px;
                 color: white;
                 font-weight: 500;
-                z-index: 1001;
+                z-index: 9999;
                 animation: slideIn 0.3s ease;
                 background: ${this.getBackgroundForType(type)};
                 box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
@@ -161,7 +161,7 @@ class NotificationService {
             border-radius: 8px;
             color: white;
             font-weight: 500;
-            z-index: 1001;
+            z-index: 9999;
             animation: slideIn 0.3s ease;
             background: linear-gradient(135deg, #6c757d, #495057);
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);

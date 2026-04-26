@@ -98,6 +98,11 @@
     .app-container.navbar-mode .main-content {
         display: none;
     }
+
+    /* Restore profile switcher in full-screen menu (overrides 768px hide) */
+    .app-container.navbar-mode .profile-switcher {
+        display: block;
+    }
     
     /* Page Mode - Show main content with slide animation */
     .app-container:not(.navbar-mode) .main-content {

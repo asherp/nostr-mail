@@ -19,3 +19,19 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# VaultStorage is invoked from Rust via JNI lookup-by-name. R8 sees no
+# Kotlin/Java callers and would otherwise rename or strip it, causing JNI
+# class lookup to fail at runtime and the Rust keychain layer to silently
+# fall back to in-memory storage (vault wipes on every app restart).
+-keep class com.nostr.mail.VaultStorage { *; }
+-keep class com.nostr.mail.VaultStorage$* { *; }
+
+# Jetpack Security (EncryptedFile/MasterKey) is implemented on Tink, which
+# relies on reflection for keyset and primitive registration. Without these
+# rules, EncryptedFile decryption fails in release builds.
+-keep class androidx.security.crypto.** { *; }
+-keep class com.google.crypto.tink.** { *; }
+-keepclassmembers class com.google.crypto.tink.** { *; }
+-keep class com.google.crypto.tink.proto.** { *; }
+-dontwarn com.google.crypto.tink.**

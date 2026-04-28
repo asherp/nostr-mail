@@ -39,7 +39,7 @@ class Utils {
             hr { border-color: #374151 !important; }
         ` : '';
         doc.write(`<!DOCTYPE html><html><head>
-            <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+            <link href="vendor/fontawesome/css/all.min.css" rel="stylesheet">
             <style>
             body { margin: 0; padding: 8px; font-family: sans-serif; line-height: 1.6;
                    color: ${isDark ? '#e0e0e0' : '#111827'};

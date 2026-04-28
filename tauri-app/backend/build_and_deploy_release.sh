@@ -46,18 +46,7 @@ adb devices -l | grep "device$" | while read line; do
 done
 echo ""
 
-# Check if app is already installed and uninstall if needed
-# This is necessary because debug and release builds use different signing keys
 PACKAGE_NAME="com.nostr.mail"
-if adb shell pm list packages | grep -q "^package:$PACKAGE_NAME$"; then
-    echo -e "${YELLOW}App is already installed. Uninstalling to avoid signature mismatch...${NC}"
-    echo -e "${YELLOW}(Release builds use a different signing key than debug builds)${NC}"
-    adb uninstall "$PACKAGE_NAME" || {
-        echo -e "${YELLOW}Note: Uninstall had issues, but continuing anyway...${NC}"
-    }
-    echo -e "${GREEN}✓ Previous installation removed${NC}"
-    echo ""
-fi
 
 # Change to script directory
 cd "$SCRIPT_DIR"
@@ -102,9 +91,47 @@ if [ -z "$APK_PATH" ]; then
 fi
 
 echo -e "${GREEN}Found APK: $APK_PATH${NC}"
-echo -e "${BLUE}Installing on device...${NC}"
+echo -e "${BLUE}Installing on device (preserving app data)...${NC}"
 
-# Install the APK
-adb install -r "$APK_PATH"
+# Try to install in-place first. -r preserves /data/data/<pkg>/ (your SQLite DB).
+# Only fall back to uninstall+install if the signature mismatch makes it impossible —
+# and require explicit confirmation, since uninstall destroys all local data.
+set +e
+INSTALL_OUTPUT=$(adb install -r "$APK_PATH" 2>&1)
+INSTALL_RC=$?
+set -e
 
-echo -e "${GREEN}✓ Release app installed successfully!${NC}"
+if [ $INSTALL_RC -eq 0 ]; then
+    echo -e "${GREEN}✓ Release app installed successfully (data preserved)!${NC}"
+    exit 0
+fi
+
+echo -e "${RED}Install failed:${NC}"
+echo "$INSTALL_OUTPUT"
+
+if echo "$INSTALL_OUTPUT" | grep -qE "INSTALL_FAILED_UPDATE_INCOMPATIBLE|signatures do not match|INCONSISTENT_CERTIFICATES"; then
+    echo ""
+    echo -e "${RED}===========================================================${NC}"
+    echo -e "${RED}SIGNATURE MISMATCH${NC}"
+    echo -e "${RED}===========================================================${NC}"
+    echo -e "${YELLOW}The installed APK was signed with a different key than this build.${NC}"
+    echo -e "${YELLOW}The only way to install this APK is to UNINSTALL the existing app first.${NC}"
+    echo -e "${RED}UNINSTALLING WILL DELETE ALL LOCAL APP DATA, INCLUDING YOUR SQLite DATABASE${NC}"
+    echo -e "${RED}at /data/data/$PACKAGE_NAME/files/nostr-mail/nostr_mail.db.${NC}"
+    echo ""
+    echo -e "${YELLOW}Recommended: rebuild with the same signing key as the installed version.${NC}"
+    echo ""
+    read -rp "Type 'DELETE MY DATA' to uninstall and reinstall, or anything else to abort: " confirm
+    if [ "$confirm" = "DELETE MY DATA" ]; then
+        echo -e "${YELLOW}Uninstalling $PACKAGE_NAME...${NC}"
+        adb uninstall "$PACKAGE_NAME"
+        echo -e "${BLUE}Installing fresh APK...${NC}"
+        adb install "$APK_PATH"
+        echo -e "${GREEN}✓ Release app installed (data was wiped).${NC}"
+    else
+        echo -e "${GREEN}Aborted. Your existing app data is preserved.${NC}"
+        exit 1
+    fi
+else
+    exit $INSTALL_RC
+fi

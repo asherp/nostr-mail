@@ -89,3 +89,10 @@ path = "src/bin/verify_sig.rs"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

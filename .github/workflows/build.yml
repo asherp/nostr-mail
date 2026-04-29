@@ -222,23 +222,37 @@ jobs:
           keyPassword=${ANDROID_KEY_PASSWORD}
           EOF
 
-      - name: Build Android APK
+      - name: Build Android APK (universal)
         working-directory: tauri-app/backend
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
-        run: cargo tauri android build --apk
+        run: cargo tauri android build --apk=true
 
-      - name: Rename universal APK with version
+      - name: Save universal APK
         run: |
-          APK=$(find tauri-app/backend/gen/android/app/build/outputs/apk/universal/release -name "*.apk" -not -name "*unaligned*" | head -1)
           VERSION=$(node -p "require('./tauri-app/backend/tauri.conf.json').version")
+          APK=$(find tauri-app/backend/gen/android/app/build/outputs/apk/universal/release -name "*.apk" -not -name "*unaligned*" | head -1)
           cp "$APK" "NostrMail_${VERSION}_universal.apk"
 
-      - name: Upload Android APK
+      - name: Build Android APK (arm64-only)
+        working-directory: tauri-app/backend
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: cargo tauri android build --apk=true --target aarch64
+
+      - name: Save arm64 APK
+        run: |
+          VERSION=$(node -p "require('./tauri-app/backend/tauri.conf.json').version")
+          APK=$(find tauri-app/backend/gen/android/app/build/outputs/apk/universal/release -name "*.apk" -not -name "*unaligned*" | head -1)
+          cp "$APK" "NostrMail_${VERSION}_arm64.apk"
+
+      - name: Upload Android APKs
         uses: actions/upload-artifact@v4
         with:
           name: nostr-mail-android-apk
-          path: NostrMail_*_universal.apk
+          path: |
+            NostrMail_*_universal.apk
+            NostrMail_*_arm64.apk
           if-no-files-found: warn
 
   release:

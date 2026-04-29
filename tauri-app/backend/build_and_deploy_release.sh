@@ -61,8 +61,8 @@ echo ""
 echo -e "${YELLOW}Note: Make sure you have configured your release signing key!${NC}"
 echo ""
 
-# Build the app in release mode
-cargo tauri android build
+# Build the app in release mode (arm64-only — matches all modern Android devices)
+cargo tauri android build --apk=true --target aarch64
 
 # Find the built APK - prioritize release APKs
 # Look for release APKs first

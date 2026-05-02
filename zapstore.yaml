@@ -1,9 +1,10 @@
 name: NostrMail
-summary: A modern, cross-platform email encryption tool that bridges Nostr and email protocols
+repository: https://github.com/asherp/nostr-mail
+pubkey: npub1agg7melcvmue7vwj2wqdh2666454xv5vsdu7n2tmkv73fl0a0tsq7asr9j
 description: |
   ⚠️ **Pre-release Notice:** This is a pre-release build and may have bugs. We recommend generating a new keypair rather than using an existing one.
   
-  NostrMail encrypts email content using a symmetric key derived from a combination of the sender's private key and the receiver's public key. Both sender and receiver derive a shared secret known only to them, which is used to protect their communications.
+  NostrMail encrypts email content using  NIP-44/NIP-04.
   
   This application can use any email server for delivery while leveraging Nostr's decentralized social key registry for key discovery and management.
   
@@ -13,13 +14,15 @@ description: |
   - Nostr direct messages and contact management
   - Profile management with Nostr social key registry
   - Cross-platform support (Windows, macOS, Linux, Android)
-repository: https://github.com/asherp/nostr-mail
-homepage: https://nostr-mail.com
+summary: An email client providing encryption and signatures within standard email, comaptible all imap/smtp servers (gmail, yahoo, business). 
+website: https://nostr-mail.com
 icon: tauri-app/backend/icons/icon.png
-tags: nostr email encryption privacy freedom-tech pgp
-license: Apache-2.0
-assets:
-  - NostrMail.*\.apk
-  - NostrMail.*\.dmg
-remote_metadata:
-  - github
+supported_nips:
+    - 'NIP-01'
+    - 'NIP-02'
+    - 'NIP-04'
+    - 'NIP-17'
+    - 'NIP-19'
+    - 'NIP-44'
+metadata_sources:
+    - github

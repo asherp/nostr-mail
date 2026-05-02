@@ -80,7 +80,7 @@ jobs:
           shared-key: ${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
+        run: cargo install tauri-cli --version "2.9.6" --locked --force
 
       - name: Import Apple signing certificate
         if: matrix.platform == 'macos'
@@ -201,7 +201,7 @@ jobs:
           shared-key: android
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
+        run: cargo install tauri-cli --version "2.9.6" --locked --force
 
       - name: Decode signing keystore
         env:

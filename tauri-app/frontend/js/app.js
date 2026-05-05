@@ -4712,20 +4712,21 @@ NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) 
     if (profileHeader) {
         if (isViewingOwnProfile) {
             profileHeader.textContent = 'Profile';
-            // Hide BOTH back buttons. You only reach your own profile via the
-            // sidebar nav (or via the active-account chip), so there's nothing
-            // meaningful for "Back" to go to — and the previous behavior of
-            // letting the landscape CSS rule re-show `back-to-nav-btn`
-            // produced a button that looked like history navigation but had no
-            // history target.
-            // The !important on `back-to-nav-btn` beats the
-            // `responsive.css:502` rule (which uses `!important` to enforce
-            // icon-only sizing in landscape ≤1024px viewports).
             if (profileBackButton) {
                 profileBackButton.style.display = 'none';
             }
+            // On mobile portrait the sidebar nav is a separate full-screen page,
+            // so back-to-nav is the only way to return to it. On desktop and
+            // landscape mobile the nav is always visible, so the button is a
+            // dead end — hide it with !important to beat responsive.css:502
+            // (which forces it visible in landscape ≤1024px).
             if (navBackButton) {
-                navBackButton.style.setProperty('display', 'none', 'important');
+                if (this.isMobilePortrait()) {
+                    navBackButton.style.removeProperty('display');
+                    navBackButton.style.display = 'flex';
+                } else {
+                    navBackButton.style.setProperty('display', 'none', 'important');
+                }
             }
         } else {
             // Get contact name if available

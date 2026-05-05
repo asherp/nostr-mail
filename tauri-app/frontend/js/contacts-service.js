@@ -661,27 +661,52 @@ class ContactsService {
         }
     }
 
+    // Toggle the contacts tab's back-to-nav button visibility.
+    // When viewing a contact's detail we hide back-to-nav so only the
+    // back-to-contacts button is shown (avoids two back buttons).
+    // When showing the list, we restore the back-to-nav button only on
+    // mobile portrait (where the nav menu is a separate full-screen page).
+    _updateContactsNavBackBtn(inDetailView) {
+        const navBackBtn = document.querySelector('#contacts .back-to-nav-btn');
+        if (navBackBtn) {
+            if (inDetailView) {
+                navBackBtn.style.setProperty('display', 'none', 'important');
+            } else {
+                navBackBtn.style.removeProperty('display');
+                const isPortrait = window.app && window.app.isMobilePortrait && window.app.isMobilePortrait();
+                navBackBtn.style.display = isPortrait ? 'flex' : 'none';
+            }
+        }
+        // Hide the "Contacts" h2 in the tab header while viewing a contact's
+        // detail so the back button (labeled "Contacts") is the only header element.
+        const title = document.querySelector('#contacts .tab-header h2');
+        if (title) {
+            title.style.display = inDetailView ? 'none' : '';
+        }
+    }
+
     // Show contact detail view within contacts tab
     showContactDetailView(contact) {
         const contactsContainer = document.querySelector('.contacts-container');
         const contactsSidebar = document.querySelector('.contacts-sidebar');
         const contactsDetail = window.domManager.get('contactsDetail');
         const backButton = document.getElementById('contacts-back-btn');
-        
+
         if (!contactsContainer || !contactsDetail) {
             console.warn('[JS] Contacts container or detail element not found');
             return;
         }
-        
+
         // Switch to detail view state
         contactsContainer.classList.remove('contacts-list-view');
         contactsContainer.classList.add('contacts-detail-view');
-        
+
         // Show back button
         if (backButton) {
             backButton.style.display = 'inline-flex';
         }
-        
+        this._updateContactsNavBackBtn(true);
+
         // Render contact detail
         this.renderContactDetail(contact);
         
@@ -706,11 +731,12 @@ class ContactsService {
         // Switch to list view state
         contactsContainer.classList.remove('contacts-detail-view');
         contactsContainer.classList.add('contacts-list-view');
-        
+
         // Hide back button
         if (backButton) {
             backButton.style.display = 'none';
         }
+        this._updateContactsNavBackBtn(false);
         
         // Clear selected contact
         window.appState.setSelectedContact(null);
@@ -1443,12 +1469,13 @@ class ContactsService {
         // Switch to detail view state
         contactsContainer.classList.remove('contacts-list-view');
         contactsContainer.classList.add('contacts-detail-view');
-        
+
         // Show back button
         if (backButton) {
             backButton.style.display = 'inline-flex';
         }
-        
+        this._updateContactsNavBackBtn(true);
+
         try {
             console.log('Fetched profile:', profile);
             console.log('Profile picture field:', profile.fields.picture);

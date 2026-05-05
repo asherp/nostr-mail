@@ -381,11 +381,15 @@ class DMService {
                 dmConversationHeader.style.display = 'none';
             }
             
-            // Hide back button in tab-header initially
+            // Restore back-to-nav visibility for list view (visible on mobile
+            // portrait so the user can return to the full-screen nav menu;
+            // hidden on desktop where the sidebar is always visible).
             const tabHeader = document.querySelector('#dm .tab-header');
             const tabHeaderBackBtn = tabHeader?.querySelector('.back-to-nav-btn');
             if (tabHeaderBackBtn) {
-                tabHeaderBackBtn.style.display = 'none';
+                const isPortrait = window.app && window.app.isMobilePortrait && window.app.isMobilePortrait();
+                tabHeaderBackBtn.style.removeProperty('display');
+                tabHeaderBackBtn.style.display = isPortrait ? 'flex' : 'none';
             }
         }
         // If already in conversation view with a selected contact, preserve that state
@@ -684,10 +688,12 @@ class DMService {
             }
             const tabHeaderBackBtn = tabHeader?.querySelector('.back-to-nav-btn');
             if (tabHeaderBackBtn) {
-                tabHeaderBackBtn.style.display = 'none';
+                const isPortrait = window.app && window.app.isMobilePortrait && window.app.isMobilePortrait();
+                tabHeaderBackBtn.style.removeProperty('display');
+                tabHeaderBackBtn.style.display = isPortrait ? 'flex' : 'none';
                 tabHeaderBackBtn.onclick = null;
             }
-            
+
             // Optionally clear selected contact (or keep it selected)
             // window.appState.setSelectedDmContact(null);
         } catch (error) {
@@ -757,7 +763,7 @@ class DMService {
             if (!backToMessagesBtn && tabHeader) {
                 backToMessagesBtn = document.createElement('button');
                 backToMessagesBtn.className = 'btn btn-secondary dm-back-to-messages-btn';
-                backToMessagesBtn.innerHTML = '<i class="fas fa-arrow-left"></i> Back to Messages';
+                backToMessagesBtn.innerHTML = '<i class="fas fa-arrow-left"></i> Messages';
                 const headerLeft = tabHeader.querySelector('div');
                 if (headerLeft) {
                     headerLeft.appendChild(backToMessagesBtn);

@@ -125,40 +125,7 @@
     .app-container:not(.navbar-mode) .sidebar {
         display: none;
     }
-    
-    /* Back button styling */
-    .back-to-nav-btn {
-        display: flex;
-        align-items: center;
-        gap: var(--spacing-sm);
-        padding: var(--spacing-sm) var(--spacing-md);
-        background: none;
-        border: 1px solid #e0e0e0;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 0.9rem;
-        color: #333;
-        transition: all 0.2s ease;
-    }
-    
-    .back-to-nav-btn:hover {
-        background-color: #f0f0f0;
-    }
-    
-    .back-to-nav-btn i {
-        font-size: 1rem;
-    }
-    
-    /* Dark mode back button */
-    body.dark-mode .back-to-nav-btn {
-        border-color: #444;
-        color: #e0e0e0;
-    }
-    
-    body.dark-mode .back-to-nav-btn:hover {
-        background-color: #2a2a2a;
-    }
-    
+
     /* Safe area support for mobile */
     @supports (padding: max(0px)) {
         .tab-header {

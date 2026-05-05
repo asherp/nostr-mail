@@ -3607,7 +3607,7 @@ class EmailService {
                     if (emailDetailHeader) {
                         emailDetailHeader.innerHTML = `
                             <button id="back-to-inbox" class="btn btn-secondary">
-                                <i class="fas fa-arrow-left"></i> Back to Inbox
+                                <i class="fas fa-arrow-left"></i> Inbox
                             </button>
                         `;
                         const backBtn = emailDetailHeader.querySelector('#back-to-inbox');
@@ -6590,7 +6590,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 if (sentDetailHeader) {
                     sentDetailHeader.innerHTML = `
                         <button id="back-to-sent" class="btn btn-secondary">
-                            <i class="fas fa-arrow-left"></i> Back to Sent
+                            <i class="fas fa-arrow-left"></i> Sent
                         </button>
                     `;
                     // Re-attach back button event listener

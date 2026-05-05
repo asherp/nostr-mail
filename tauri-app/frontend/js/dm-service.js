@@ -525,29 +525,22 @@ class DMService {
             let dmContacts = window.appState.getDmContacts();
             let contact = dmContacts.find(c => c.pubkey === contactPubkey);
             
-            // If not found in DM contacts, look it up from main contacts and create a temporary entry
-            // This allows showing a conversation for a contact that doesn't have messages yet
+            // If not found in DM contacts, look it up from main contacts and create a temporary entry.
+            // This allows showing a conversation for a contact that doesn't have messages yet, and
+            // also for a stranger pubkey the user chose to chat with without saving.
             if (!contact) {
                 const myPubkey = window.appState.getKeypair()?.public_key;
                 const mainContact = window.appState.getContacts().find(c => c.pubkey === contactPubkey);
-                
-                if (mainContact || contactPubkey === myPubkey) {
-                    // Create a temporary contact object for displaying the conversation
-                    // This contact is NOT added to the DM contacts list (to avoid showing empty conversations)
-                    // It's only used for the conversation view
-                    contact = {
-                        pubkey: contactPubkey,
-                        name: contactPubkey === myPubkey ? 'Myself' : (mainContact?.name || contactPubkey.substring(0, 16) + '...'),
-                        lastMessage: '',
-                        lastMessageTime: new Date(),
-                        messageCount: 0,
-                        picture_data_url: mainContact?.picture_data_url || null,
-                        profileLoaded: !!mainContact
-                    };
-                } else {
-                    console.error('Contact not found:', contactPubkey);
-                    return;
-                }
+
+                contact = {
+                    pubkey: contactPubkey,
+                    name: contactPubkey === myPubkey ? 'Myself' : (mainContact?.name || contactPubkey.substring(0, 16) + '...'),
+                    lastMessage: '',
+                    lastMessageTime: new Date(),
+                    messageCount: 0,
+                    picture_data_url: mainContact?.picture_data_url || null,
+                    profileLoaded: !!mainContact
+                };
             }
             
             // Set selected contact
@@ -1550,30 +1543,148 @@ class DMService {
     }
 
     // Send direct message to contact from contacts page
-    sendDirectMessageToContact(pubkey) {
-        // Find the contact in main contacts list
+    async sendDirectMessageToContact(pubkey) {
         const contact = window.appState.getContacts().find(c => c.pubkey === pubkey);
         const myPubkey = window.appState.getKeypair()?.public_key;
-        if (!contact && pubkey !== myPubkey) {
-            window.notificationService.showError('Contact not found');
+
+        if (contact || pubkey === myPubkey) {
+            this._openDmConversation(pubkey);
             return;
         }
-        
-        // Don't add to DM contacts here - showDmConversation will handle creating a temporary contact
-        // if needed. This prevents empty conversations from appearing in the list.
-        
-        // Switch to the DM tab using switchTab instead of clicking
+
+        // Unknown pubkey — fetch profile and prompt the user.
+        const loading = window.notificationService.showLoading
+            ? window.notificationService.showLoading('Looking up recipient…')
+            : null;
+        let profile = null;
+        try {
+            profile = await window.TauriService.fetchProfilePersistent(pubkey);
+        } catch (err) {
+            console.error('Failed to fetch profile for unknown DM recipient:', err);
+        } finally {
+            if (loading && window.notificationService.hideLoading) {
+                window.notificationService.hideLoading(loading);
+            }
+        }
+
+        if (profile) {
+            this._promptUnknownRecipient(pubkey, profile);
+        } else {
+            this._promptNoProfileWarn(pubkey);
+        }
+    }
+
+    // Switch to the DM tab and open the conversation view for the given pubkey.
+    _openDmConversation(pubkey) {
         window.app.switchTab('dm');
-        
-        // Wait for tab to initialize and DM contacts to be rendered
         setTimeout(() => {
-            // Ensure DM contacts are rendered
             if (window.dmService) {
                 window.dmService.renderDmContacts();
             }
-            // Now show the conversation
             this.showDmConversation(pubkey);
         }, 100);
+    }
+
+    // Prompt the user about an unknown DM recipient with a fetched profile.
+    // Three choices: add privately, add publicly (NIP-02 follow), or just chat.
+    _promptUnknownRecipient(pubkey, profile) {
+        const fields = profile?.fields || {};
+        const displayName = fields.name || fields.display_name || (pubkey.substring(0, 16) + '…');
+        const picture = fields.picture || '';
+        const shortKey = pubkey.length > 24 ? `${pubkey.slice(0, 12)}…${pubkey.slice(-8)}` : pubkey;
+
+        const modal = document.createElement('div');
+        modal.className = 'unknown-recipient-modal';
+        modal.innerHTML = `
+            <div class="unknown-recipient-overlay">
+                <div class="unknown-recipient-dialog">
+                    <h3>Recipient not in your contacts</h3>
+                    <div class="unknown-recipient-profile">
+                        ${picture ? `<img class="unknown-recipient-avatar" src="${picture}" alt="" onerror="this.style.display='none'">` : ''}
+                        <div class="unknown-recipient-meta">
+                            <div class="unknown-recipient-name"></div>
+                            <div class="unknown-recipient-pubkey"></div>
+                        </div>
+                    </div>
+                    <p>How would you like to handle this contact?</p>
+                    <div class="unknown-recipient-actions">
+                        <button class="btn btn-secondary" data-action="just-chat">Just chat</button>
+                        <button class="btn btn-secondary" data-action="add-private">Add privately</button>
+                        <button class="btn btn-primary" data-action="add-public">Add publicly (follow)</button>
+                    </div>
+                    <div class="unknown-recipient-cancel-row">
+                        <button class="btn btn-small btn-secondary" data-action="cancel">Cancel</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        modal.querySelector('.unknown-recipient-name').textContent = displayName;
+        modal.querySelector('.unknown-recipient-pubkey').textContent = shortKey;
+        document.body.appendChild(modal);
+
+        const cleanup = () => {
+            if (modal.parentNode) modal.parentNode.removeChild(modal);
+        };
+
+        modal.addEventListener('click', async (e) => {
+            const action = e.target?.dataset?.action;
+            if (!action) return;
+            if (action === 'cancel') {
+                cleanup();
+                return;
+            }
+            cleanup();
+            try {
+                if (action === 'add-private') {
+                    await window.contactsService.saveContactDirect(pubkey, profile, { isPublic: false });
+                    window.notificationService.showSuccess(`Added ${displayName} privately`);
+                } else if (action === 'add-public') {
+                    await window.contactsService.saveContactDirect(pubkey, profile, { isPublic: true });
+                    window.notificationService.showSuccess(`Now following ${displayName}`);
+                }
+            } catch (err) {
+                console.error('Failed to save contact:', err);
+                window.notificationService.showError('Failed to save contact: ' + err);
+                return;
+            }
+            this._openDmConversation(pubkey);
+        });
+    }
+
+    // Prompt when no kind:0 profile was found on the configured relays.
+    _promptNoProfileWarn(pubkey) {
+        const shortKey = pubkey.length > 24 ? `${pubkey.slice(0, 12)}…${pubkey.slice(-8)}` : pubkey;
+        const modal = document.createElement('div');
+        modal.className = 'no-profile-warn-modal';
+        modal.innerHTML = `
+            <div class="no-profile-warn-overlay">
+                <div class="no-profile-warn-dialog">
+                    <h3>No profile found</h3>
+                    <p>No profile was found for this pubkey on your configured relays:</p>
+                    <div class="no-profile-warn-pubkey"></div>
+                    <p>Send anyway?</p>
+                    <div class="no-profile-warn-actions">
+                        <button class="btn btn-secondary" data-action="cancel">Cancel</button>
+                        <button class="btn btn-primary" data-action="send-anyway">Send anyway</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        modal.querySelector('.no-profile-warn-pubkey').textContent = shortKey;
+        document.body.appendChild(modal);
+
+        const cleanup = () => {
+            if (modal.parentNode) modal.parentNode.removeChild(modal);
+        };
+
+        modal.addEventListener('click', (e) => {
+            const action = e.target?.dataset?.action;
+            if (!action) return;
+            cleanup();
+            if (action === 'send-anyway') {
+                this._openDmConversation(pubkey);
+            }
+        });
     }
 
     // Navigate to contacts page and select contact if it exists

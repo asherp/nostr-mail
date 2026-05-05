@@ -606,4 +606,94 @@ body.dark-mode .dm-send-btn:disabled {
     .message {
         max-width: 85%;
     }
+}
+
+/* Unknown DM recipient + no-profile prompts */
+.unknown-recipient-modal,
+.no-profile-warn-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.unknown-recipient-overlay,
+.no-profile-warn-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.unknown-recipient-dialog,
+.no-profile-warn-dialog {
+    background: var(--card-bg, #fff);
+    color: var(--text-color, #111);
+    padding: 1.25rem 1.5rem;
+    border-radius: 10px;
+    max-width: 440px;
+    width: calc(100% - 2rem);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.unknown-recipient-dialog h3,
+.no-profile-warn-dialog h3 {
+    margin: 0 0 0.75rem 0;
+}
+
+.unknown-recipient-profile {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 0.5rem 0 1rem 0;
+}
+
+.unknown-recipient-avatar {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    object-fit: cover;
+}
+
+.unknown-recipient-name {
+    font-weight: 600;
+}
+
+.unknown-recipient-pubkey,
+.no-profile-warn-pubkey {
+    font-family: monospace;
+    font-size: 0.85rem;
+    opacity: 0.75;
+    word-break: break-all;
+}
+
+.unknown-recipient-actions,
+.no-profile-warn-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 1rem;
+}
+
+.unknown-recipient-cancel-row {
+    margin-top: 0.5rem;
+    text-align: right;
+}
+
+body.dark-mode .unknown-recipient-dialog,
+body.dark-mode .no-profile-warn-dialog {
+    background: #232946;
+    color: #e0e0e0;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+}
+
+body.dark-mode .unknown-recipient-pubkey,
+body.dark-mode .no-profile-warn-pubkey {
+    color: #b8c0d8;
+    opacity: 0.85;
 } 

@@ -2498,6 +2498,51 @@ class ContactsService {
         }
     }
 
+    // Save a contact directly without going through confirmFollowContact's UI flow.
+    // Used by callers that already prompted the user (e.g. the DM-to-stranger modal)
+    // and just need to persist + optionally publish a kind:3 follow.
+    // Profile may be null/undefined when no kind:0 was found — in that case we save
+    // a minimal contact row keyed only by pubkey.
+    async saveContactDirect(pubkey, profile, { isPublic = false } = {}) {
+        const userPubkey = window.appState.getKeypair()?.public_key;
+        if (!userPubkey) {
+            throw new Error('No active keypair');
+        }
+
+        const fields = profile?.fields || {};
+        const profileName =
+            fields.name ||
+            fields.display_name ||
+            pubkey.substring(0, 16) + '...';
+        const email = fields.email || '';
+
+        if (isPublic) {
+            await window.TauriService.followUser(pubkey);
+        }
+
+        const now = new Date().toISOString();
+        const contact = {
+            pubkey,
+            name: profileName,
+            email,
+            picture: fields.picture || '',
+            fields,
+            picture_data_url: null,
+            picture_loaded: false,
+            picture_loading: false,
+            created_at: now,
+            updated_at: now,
+        };
+        const dbContact = window.DatabaseService.convertContactToDbFormat(contact);
+        await window.DatabaseService.saveContact(dbContact, userPubkey, isPublic);
+        window.appState.addContact(contact);
+
+        if (window.emailService) {
+            window.emailService.populateNostrContactDropdown();
+        }
+        return contact;
+    }
+
     // Refresh the selected contact's profile
     async refreshSelectedContactProfile() {
         const selectedContact = window.appState.getSelectedContact();

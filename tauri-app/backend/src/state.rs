@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::database::Database;
 use crate::keychain::KeychainManager;
 use nostr_sdk::prelude::*;
@@ -41,6 +41,25 @@ pub struct AppState {
     pub pending_auth_challenges: Arc<Mutex<std::collections::HashMap<String, String>>>, // Track pending AUTH challenges: URL -> challenge string
     pub current_private_key: Arc<Mutex<Option<String>>>, // Store current private key in bech32 format for AUTH
     pub keychain: KeychainManager,
+    /// Per-session cache of contact pubkeys whose NIP-65 outbox we've already
+    /// fetched. Prevents duplicate work when re-subscribing or when contacts
+    /// reappear via the live handler. Cleared on client reinit.
+    pub outbox_fetched: Arc<RwLock<HashSet<PublicKey>>>,
+    /// Per-session cache of recipients' NIP-17 send routing.
+    /// `Some(urls)` = fetched (urls may be empty if neither 10050 nor 10002 found).
+    /// Absent key = not yet fetched. Cleared on client reinit.
+    pub inbox_fetched: Arc<RwLock<HashMap<PublicKey, Vec<String>>>>,
+    /// Per-session cache of "does this recipient publish a non-empty kind
+    /// 10050?". Distinct from `inbox_fetched` because that one stores the
+    /// combined inbox-or-kind-10002-fallback URL set used for routing —
+    /// which loses the "no 10050 specifically" signal we need for the
+    /// NIP-04 fallback decision. `true` = has kind 10050 → can read NIP-17;
+    /// `false` = no 10050 → fall back to NIP-04. Cleared on client reinit.
+    pub nip17_capable: Arc<RwLock<HashMap<PublicKey, bool>>>,
+    /// Whether we've already published our own kind 10050 + 10002 in this
+    /// session. Prevents republishing on reconnect storms; flipped back to
+    /// false by `republish_relay_lists` when settings change.
+    pub relay_lists_published_session: Arc<Mutex<bool>>,
 }
 
 impl AppState {
@@ -58,6 +77,10 @@ impl AppState {
             pending_auth_challenges: Arc::new(Mutex::new(std::collections::HashMap::new())),
             current_private_key: Arc::new(Mutex::new(None)),
             keychain: KeychainManager::new(),
+            outbox_fetched: Arc::new(RwLock::new(HashSet::new())),
+            inbox_fetched: Arc::new(RwLock::new(HashMap::new())),
+            nip17_capable: Arc::new(RwLock::new(HashMap::new())),
+            relay_lists_published_session: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -89,9 +112,14 @@ impl AppState {
         // Create new client
         let client = Client::new(keys.clone());
         
-        // Load relays from database (required - no fallback)
+        // Load relays from database (required - no fallback). Scoped to the
+        // pubkey we're about to log in as — `get_current_keys()` may still be
+        // returning the previous account here, so use the local `keys` we
+        // just built. First-read for a new account triggers lazy seeding from
+        // the `''` template bucket inside `get_all_relays`.
         let db = self.get_database()?;
-        let db_relays = db.get_all_relays()
+        let owner_pubkey = keys.public_key().to_hex();
+        let db_relays = db.get_all_relays(&owner_pubkey)
             .map_err(|e| format!("Failed to load relays from database: {}", e))?;
         
         println!("[RUST] Loaded {} relays from database for client init", db_relays.len());
@@ -166,6 +194,14 @@ impl AppState {
         *self.nostr_client.lock().unwrap() = Some(client.clone());
         *self.current_keys.lock().unwrap() = Some(keys.clone());
         *self.current_private_key.lock().unwrap() = Some(private_key.to_string());
+
+        // New identity / fresh client → reset all per-session caches so
+        // contact NIP-65/NIP-17 lookups happen against the new client and
+        // we re-evaluate whether to publish our own relay lists.
+        self.outbox_fetched.write().await.clear();
+        self.inbox_fetched.write().await.clear();
+        self.nip17_capable.write().await.clear();
+        *self.relay_lists_published_session.lock().unwrap() = false;
         
         // Check if there was an active subscription that needs to be restarted
         let subscription_to_restart = {
@@ -575,8 +611,9 @@ mod tests {
         state.init_database(&db_path).unwrap();
         let db = state.get_database().unwrap();
 
-        // Verify the database is functional
-        let relays = db.get_all_relays().unwrap();
+        // Verify the database is functional. Use the '' (template) bucket
+        // since no user is logged in.
+        let relays = db.get_all_relays("").unwrap();
         assert!(relays.is_empty()); // empty config -> no seeded relays
     }
 

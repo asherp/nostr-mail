@@ -149,6 +149,10 @@ pub struct DirectMessageRequest {
     pub content: MessageContent,
     pub relays: Vec<String>,
     pub encryption_algorithm: Option<String>, // "nip04" or "nip44"
+    /// Optional RFC-822 Message-ID; on the nip44 (NIP-17) branch this becomes a
+    /// `["message-id", ...]` rumor tag for DM<->email matching.
+    #[serde(default)]
+    pub message_id: Option<String>,
 }
 
 /// Connection status for a relay

@@ -71,6 +71,13 @@ pub struct DirectMessage {
     pub content: String,
     pub created_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
+    #[serde(default)]
+    pub email_message_id: Option<String>,
+    /// First relay we received this event from (per `RelayPoolNotification::Event`,
+    /// which only fires on first sight). NULL for self-wraps and bulk-fetched DMs
+    /// where per-event relay attribution isn't available.
+    #[serde(default)]
+    pub received_from_relay: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -103,7 +110,21 @@ pub struct DbRelay {
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Whether this relay is included in the user's NIP-17 inbox (kind 10050)
+    /// publication. Defaults true for legacy rows so existing relays stay
+    /// usable as DM inbox out of the box.
+    #[serde(default = "default_true")]
+    pub use_for_dms: bool,
+    /// Owning pubkey (hex). Empty string `""` is the install-wide template
+    /// bucket: rows seeded from `nostr-mail-config.json` live here, and on
+    /// first read for a logged-in pubkey they get cloned into per-pubkey
+    /// rows. The frontend never sets this — the backend overrides it from
+    /// `state.get_current_keys()` on every command.
+    #[serde(default)]
+    pub pubkey: String,
 }
+
+fn default_true() -> bool { true }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Attachment {
@@ -224,8 +245,9 @@ impl Database {
                                     relay_obj.get("url").and_then(|u| u.as_str()),
                                     relay_obj.get("is_active").and_then(|a| a.as_bool()).unwrap_or(true)
                                 ) {
+                                    // Seed into the template bucket (pubkey = '').
                                     conn.execute(
-                                        "INSERT OR IGNORE INTO relays (url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                                        "INSERT OR IGNORE INTO relays (pubkey, url, is_active, created_at, updated_at) VALUES ('', ?, ?, ?, ?)",
                                         params![url, is_active, now, now],
                                     )?;
                                     println!("[DB] Seeded relay: {} (active: {})", url, is_active);
@@ -353,7 +375,8 @@ impl Database {
                 recipient_pubkey TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at DATETIME NOT NULL,
-                received_at DATETIME NOT NULL
+                received_at DATETIME NOT NULL,
+                received_from_relay TEXT
             )",
             [],
         )?;
@@ -403,12 +426,19 @@ impl Database {
             }
         }
 
-        // Relays table
+        // Relays table. URL uniqueness is scoped per-pubkey via the composite
+        // index `idx_relays_pubkey_url_unique` created below — NOT inline on
+        // the column — so two accounts can each have the same relay URL with
+        // independent active/use_for_dms flags. The `pubkey TEXT NOT NULL
+        // DEFAULT ''` mirrors the `user_settings` pattern: empty-string is the
+        // install-wide template bucket.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS relays (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url TEXT UNIQUE NOT NULL,
+                pubkey TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL,
                 is_active BOOLEAN NOT NULL,
+                use_for_dms BOOLEAN NOT NULL DEFAULT 1,
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL
             )",
@@ -455,6 +485,20 @@ impl Database {
         // Migrate: Add hash columns to emails and direct_messages tables if they don't exist
         Self::migrate_add_hash_columns(&conn)?;
 
+        // Migrate: Add email_message_id column to direct_messages for NIP-17 message-id rumor tag
+        Self::migrate_add_dm_email_message_id_column(&conn)?;
+
+        // Migrate: Add received_from_relay column to direct_messages so the debug
+        // modal can show which relay first delivered each event.
+        Self::migrate_add_dm_received_from_relay_column(&conn)?;
+
+        // Migrate: Add use_for_dms column to relays for NIP-17 inbox-relay (kind 10050) publishing
+        Self::migrate_add_relay_use_for_dms_column(&conn)?;
+
+        // Migrate: Add pubkey column to relays so settings are scoped per-account.
+        // Must run AFTER use_for_dms migration so the table-rebuild can copy it across.
+        Self::migrate_add_relay_pubkey_column(&conn)?;
+
         // Migrate: Add user_contacts junction table if it doesn't exist
         Self::migrate_add_user_contacts_table(&conn)?;
         
@@ -489,6 +533,7 @@ impl Database {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_event_id ON direct_messages(event_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_created_at ON direct_messages(created_at)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_content_hash ON direct_messages(content_hash)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_email_message_id ON direct_messages(email_message_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_key ON user_settings(key)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_pubkey ON user_settings(pubkey)", [])?;
         // Drop old non-unique index if it exists (we're replacing it with a unique one)
@@ -497,6 +542,12 @@ impl Database {
         // Note: migrate_remove_duplicate_settings is called before this in the migration section
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_settings_pubkey_key_unique ON user_settings(pubkey, key)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_relays_url ON relays(url)", [])?;
+        // Per-pubkey uniqueness: replaces the old inline UNIQUE on `url`.
+        // Two accounts can each store the same URL with their own flags.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_relays_pubkey_url_unique ON relays(pubkey, url)",
+            [],
+        )?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_email_id ON attachments(email_id)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user_pubkey ON conversations(user_pubkey, last_timestamp DESC)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_contact_pubkey ON conversations(contact_pubkey)", [])?;
@@ -576,6 +627,139 @@ impl Database {
                 }
                 println!("[DB] Backfilled {} DM hashes", count);
             }
+        }
+
+        Ok(())
+    }
+
+    /// Migration: Add use_for_dms column to relays for NIP-17 inbox-relay (kind 10050) publishing
+    fn migrate_add_relay_use_for_dms_column(conn: &Connection) -> Result<()> {
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(relays)")?;
+            let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?)
+            })?.collect();
+            columns.map(|cols| cols.contains(&"use_for_dms".to_string())).unwrap_or(false)
+        };
+
+        if !has_column {
+            println!("[DB] Adding use_for_dms column to relays table (default 1)");
+            conn.execute(
+                "ALTER TABLE relays ADD COLUMN use_for_dms BOOLEAN NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Migration: Add `pubkey` column to relays and remove the inline UNIQUE
+    /// constraint on `url`, so that relay settings can be scoped per-account.
+    ///
+    /// SQLite cannot drop a column-level UNIQUE in place, so we use the standard
+    /// table-rebuild idiom: create a new table with the desired schema, copy
+    /// rows over (existing rows go into the `''` template bucket), drop the old
+    /// table, rename. Wrapped in a transaction so a partial failure leaves the
+    /// original table intact.
+    fn migrate_add_relay_pubkey_column(conn: &Connection) -> Result<()> {
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(relays)")?;
+            let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?)
+            })?.collect();
+            columns.map(|cols| cols.contains(&"pubkey".to_string())).unwrap_or(false)
+        };
+
+        if has_column {
+            return Ok(());
+        }
+
+        println!("[DB] Migrating relays table: adding pubkey column + per-pubkey URL uniqueness");
+
+        // Drop the old single-column index — it'll be recreated by init_tables
+        // after migrations, on the rebuilt table.
+        let _ = conn.execute("DROP INDEX IF EXISTS idx_relays_url", []);
+
+        conn.execute("BEGIN", [])?;
+
+        let rebuild = (|| -> Result<()> {
+            conn.execute(
+                "CREATE TABLE relays_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pubkey TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL,
+                    is_active BOOLEAN NOT NULL,
+                    use_for_dms BOOLEAN NOT NULL DEFAULT 1,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )",
+                [],
+            )?;
+            // Copy existing rows; empty pubkey = template bucket.
+            conn.execute(
+                "INSERT INTO relays_new (id, pubkey, url, is_active, use_for_dms, created_at, updated_at)
+                 SELECT id, '', url, is_active, use_for_dms, created_at, updated_at FROM relays",
+                [],
+            )?;
+            conn.execute("DROP TABLE relays", [])?;
+            conn.execute("ALTER TABLE relays_new RENAME TO relays", [])?;
+            Ok(())
+        })();
+
+        match rebuild {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+                println!("[DB] relays table rebuilt with pubkey column (existing rows in '' template bucket)");
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Migration: Add email_message_id column to direct_messages for NIP-17 message-id rumor tag
+    fn migrate_add_dm_email_message_id_column(conn: &Connection) -> Result<()> {
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(direct_messages)")?;
+            let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?)
+            })?.collect();
+            columns.map(|cols| cols.contains(&"email_message_id".to_string())).unwrap_or(false)
+        };
+
+        if !has_column {
+            println!("[DB] Adding email_message_id column to direct_messages table");
+            conn.execute(
+                "ALTER TABLE direct_messages ADD COLUMN email_message_id TEXT",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Migration: Add received_from_relay column to direct_messages. Stores
+    /// the URL of the relay that first delivered each event (per
+    /// `RelayPoolNotification::Event`, which only fires once per event).
+    /// Existing rows backfill to NULL.
+    fn migrate_add_dm_received_from_relay_column(conn: &Connection) -> Result<()> {
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(direct_messages)")?;
+            let columns: Result<Vec<String>, _> = stmt.query_map([], |row| {
+                Ok(row.get::<_, String>(1)?)
+            })?.collect();
+            columns.map(|cols| cols.contains(&"received_from_relay".to_string())).unwrap_or(false)
+        };
+
+        if !has_column {
+            println!("[DB] Adding received_from_relay column to direct_messages table");
+            conn.execute(
+                "ALTER TABLE direct_messages ADD COLUMN received_from_relay TEXT",
+                [],
+            )?;
         }
 
         Ok(())
@@ -1973,23 +2157,26 @@ impl Database {
         
         let result = if let Some(id) = dm.id {
             conn.execute(
-                "UPDATE direct_messages SET 
-                    event_id = ?, sender_pubkey = ?, recipient_pubkey = ?, content = ?, 
-                    created_at = ?, received_at = ?, content_hash = ?
+                "UPDATE direct_messages SET
+                    event_id = ?, sender_pubkey = ?, recipient_pubkey = ?, content = ?,
+                    created_at = ?, received_at = ?, content_hash = ?, email_message_id = ?,
+                    received_from_relay = ?
                 WHERE id = ?",
                 params![
                     dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.created_at, dm.received_at, content_hash, id
+                    dm.created_at, dm.received_at, content_hash, dm.email_message_id,
+                    dm.received_from_relay, id
                 ],
             )?;
             id
         } else {
             let _id = conn.execute(
-                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash, email_message_id, received_from_relay)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.created_at, dm.received_at, content_hash
+                    dm.created_at, dm.received_at, content_hash, dm.email_message_id,
+                    dm.received_from_relay
                 ],
             )?;
             conn.last_insert_rowid()
@@ -2019,11 +2206,12 @@ impl Database {
             // Compute hash for DM content
             let content_hash = Self::compute_content_hash(&dm.content);
             conn.execute(
-                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash, email_message_id, received_from_relay)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.created_at, dm.received_at, content_hash
+                    dm.created_at, dm.received_at, content_hash, dm.email_message_id,
+                    dm.received_from_relay
                 ],
             )?;
             inserted += 1;
@@ -2044,12 +2232,12 @@ impl Database {
     pub fn get_dms_for_conversation(&self, user_pubkey: &str, contact_pubkey: &str) -> Result<Vec<DirectMessage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at
-             FROM direct_messages 
+            "SELECT id, event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, email_message_id, received_from_relay
+             FROM direct_messages
              WHERE (sender_pubkey = ? AND recipient_pubkey = ?) OR (sender_pubkey = ? AND recipient_pubkey = ?)
              ORDER BY created_at ASC"
         )?;
-        
+
         let rows = stmt.query_map(params![user_pubkey, contact_pubkey, contact_pubkey, user_pubkey], |row| {
             Ok(DirectMessage {
                 id: Some(row.get(0)?),
@@ -2059,9 +2247,11 @@ impl Database {
                 content: row.get(4)?,
                 created_at: row.get(5)?,
                 received_at: row.get(6)?,
+                email_message_id: row.get(7)?,
+                received_from_relay: row.get(8)?,
             })
         })?;
-        
+
         rows.collect()
     }
 
@@ -2144,6 +2334,23 @@ impl Database {
         }
     }
 
+    /// Get DM email_message_id by event_id (for NIP-17 message-id matching).
+    /// Returns None if the column is NULL or the DM doesn't exist.
+    pub fn get_dm_email_message_id_by_event_id(&self, event_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT email_message_id FROM direct_messages WHERE event_id = ?"
+        )?;
+        let mut rows = stmt.query_map(params![event_id], |row| {
+            Ok(row.get::<_, Option<String>>(0)?)
+        })?;
+        match rows.next() {
+            Some(Ok(opt)) => Ok(opt),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
     /// Find email by subject hash (for fast DM-email matching)
     pub fn find_email_by_subject_hash(&self, subject_hash: &str) -> Result<Option<Email>> {
         let conn = self.conn.lock().unwrap();
@@ -2180,6 +2387,49 @@ impl Database {
             })
         })?;
         
+        match rows.next() {
+            Some(Ok(email)) => Ok(Some(email)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Find email by RFC-822 Message-ID (used for NIP-17 message-id rumor tag matching).
+    pub fn find_email_by_message_id(&self, message_id: &str) -> Result<Option<Email>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id
+             FROM emails WHERE message_id = ? AND is_nostr_encrypted = 1 LIMIT 1"
+        )?;
+        let mut rows = stmt.query_map(params![message_id], |row| {
+            Ok(Email {
+                id: Some(row.get(0)?),
+                message_id: row.get(1)?,
+                from_address: row.get(2)?,
+                to_address: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                body_plain: row.get(6)?,
+                body_html: row.get(7)?,
+                received_at: row.get(8)?,
+                is_nostr_encrypted: row.get(9)?,
+                sender_pubkey: row.get(10)?,
+                recipient_pubkey: row.get(11)?,
+                raw_headers: row.get(12)?,
+                is_draft: row.get(13)?,
+                is_read: row.get(14)?,
+                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
+                signature_valid: row.get(17)?,
+                signature_source: row.get(18)?,
+                transport_auth_verified: row.get(19)?,
+                subject_hash: None,
+                in_reply_to: row.get(20)?,
+                references: row.get(21)?,
+                thread_id: row.get(22)?,
+            })
+        })?;
+
         match rows.next() {
             Some(Ok(email)) => Ok(Some(email)),
             Some(Err(e)) => Err(e),
@@ -2542,15 +2792,16 @@ impl Database {
                             relay_obj.get("url").and_then(|u| u.as_str()),
                             relay_obj.get("is_active").and_then(|a| a.as_bool()).unwrap_or(true)
                         ) {
+                            // Config-driven imports populate the template bucket (pubkey = '').
                             let exists: bool = conn.query_row(
-                                "SELECT EXISTS(SELECT 1 FROM relays WHERE url = ?)",
+                                "SELECT EXISTS(SELECT 1 FROM relays WHERE pubkey = '' AND url = ?)",
                                 params![url],
                                 |row| row.get(0)
                             ).unwrap_or(false);
-                            
+
                             if !exists {
                                 conn.execute(
-                                    "INSERT INTO relays (url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                                    "INSERT INTO relays (pubkey, url, is_active, created_at, updated_at) VALUES ('', ?, ?, ?, ?)",
                                     params![url, is_active, now, now],
                                 )?;
                                 added_count += 1;
@@ -2621,16 +2872,16 @@ impl Database {
             let mut added_count = 0;
             let mut skipped_count = 0;
             for relay_url in relays {
-                // Check if relay already exists
+                // Config-driven imports populate the template bucket (pubkey = '').
                 let exists: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM relays WHERE url = ?)",
+                    "SELECT EXISTS(SELECT 1 FROM relays WHERE pubkey = '' AND url = ?)",
                     params![relay_url],
                     |row| row.get(0)
                 ).unwrap_or(false);
-                
+
                 if !exists {
                     conn.execute(
-                        "INSERT INTO relays (url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                        "INSERT INTO relays (pubkey, url, is_active, created_at, updated_at) VALUES ('', ?, ?, ?, ?)",
                         params![relay_url, true, now, now],
                     )?;
                     println!("[DB] Added relay: {} (active: true)", relay_url);
@@ -2696,44 +2947,112 @@ impl Database {
     }
 
     // Relay operations
-    pub fn save_relay(&self, relay: &DbRelay) -> Result<i64> {
+    //
+    // All relay reads/writes are scoped per-pubkey. The `pubkey` parameter is
+    // the active user's hex pubkey, or `""` for the install-wide template
+    // bucket (pre-login state, or rows seeded from `nostr-mail-config.json`).
+    // The Tauri command layer derives this from `state.get_current_keys()`.
+
+    pub fn save_relay(&self, pubkey: &str, relay: &DbRelay) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         if let Some(id) = relay.id {
+            // UPDATE keys off id (globally unique). Pubkey can change too if
+            // a row is being re-keyed during migration, but the common path
+            // is just touching flags/timestamp.
             conn.execute(
-                "UPDATE relays SET url = ?, is_active = ?, updated_at = ? WHERE id = ?",
-                params![relay.url, relay.is_active, now, id],
+                "UPDATE relays SET pubkey = ?, url = ?, is_active = ?, use_for_dms = ?, updated_at = ? WHERE id = ?",
+                params![pubkey, relay.url, relay.is_active, relay.use_for_dms, now, id],
             )?;
             Ok(id)
         } else {
             conn.execute(
-                "INSERT INTO relays (url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                params![relay.url, relay.is_active, now, now],
+                "INSERT INTO relays (pubkey, url, is_active, use_for_dms, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![pubkey, relay.url, relay.is_active, relay.use_for_dms, now, now],
             )?;
             Ok(conn.last_insert_rowid())
         }
     }
 
-    pub fn get_all_relays(&self) -> Result<Vec<DbRelay>> {
+    /// Returns all relays for `pubkey`. If `pubkey` is non-empty and that
+    /// account has no rows yet, clones every row from the `''` template
+    /// bucket into per-pubkey rows first (lazy first-login seeding).
+    pub fn get_all_relays(&self, pubkey: &str) -> Result<Vec<DbRelay>> {
         let conn = self.conn.lock().unwrap();
+
+        if !pubkey.is_empty() {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM relays WHERE pubkey = ?",
+                params![pubkey],
+                |row| row.get(0),
+            )?;
+            if count == 0 {
+                let now = Utc::now();
+                let cloned = conn.execute(
+                    "INSERT INTO relays (pubkey, url, is_active, use_for_dms, created_at, updated_at)
+                     SELECT ?, url, is_active, use_for_dms, ?, ? FROM relays WHERE pubkey = ''",
+                    params![pubkey, now, now],
+                )?;
+                if cloned > 0 {
+                    println!("[DB] First read for pubkey {}…: cloned {} relay(s) from template bucket",
+                        &pubkey[..pubkey.len().min(8)], cloned);
+                }
+            }
+        }
+
         let mut stmt = conn.prepare(
-            "SELECT id, url, is_active, created_at, updated_at FROM relays ORDER BY url"
+            "SELECT id, pubkey, url, is_active, use_for_dms, created_at, updated_at
+             FROM relays WHERE pubkey = ? ORDER BY url"
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![pubkey], |row| {
             Ok(DbRelay {
                 id: Some(row.get(0)?),
-                url: row.get(1)?,
-                is_active: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
+                pubkey: row.get(1)?,
+                url: row.get(2)?,
+                is_active: row.get(3)?,
+                use_for_dms: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })?;
         rows.collect()
     }
 
-    pub fn delete_relay(&self, url: &str) -> Result<()> {
+    /// Active relays the given pubkey has flagged as their NIP-17 DM inbox (kind 10050).
+    pub fn get_dm_relays(&self, pubkey: &str) -> Result<Vec<DbRelay>> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM relays WHERE url = ?", params![url])?;
+        let mut stmt = conn.prepare(
+            "SELECT id, pubkey, url, is_active, use_for_dms, created_at, updated_at
+             FROM relays WHERE pubkey = ? AND is_active = 1 AND use_for_dms = 1 ORDER BY url"
+        )?;
+        let rows = stmt.query_map(params![pubkey], |row| {
+            Ok(DbRelay {
+                id: Some(row.get(0)?),
+                pubkey: row.get(1)?,
+                url: row.get(2)?,
+                is_active: row.get(3)?,
+                use_for_dms: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Toggle a relay's DM-inbox flag for the given pubkey without touching other fields.
+    pub fn set_relay_dm_flag(&self, pubkey: &str, url: &str, use_for_dms: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "UPDATE relays SET use_for_dms = ?, updated_at = ? WHERE pubkey = ? AND url = ?",
+            params![use_for_dms, now, pubkey, url],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_relay(&self, pubkey: &str, url: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM relays WHERE pubkey = ? AND url = ?", params![pubkey, url])?;
         Ok(())
     }
 
@@ -3494,6 +3813,8 @@ mod tests {
             content: "Hello from DM".to_string(),
             created_at: now,
             received_at: now,
+            email_message_id: None,
+            received_from_relay: None,
         }
     }
 
@@ -3508,7 +3829,7 @@ mod tests {
         let contacts = db.get_all_contacts("nonexistent_user").unwrap();
         assert!(contacts.is_empty());
 
-        let relays = db.get_all_relays().unwrap();
+        let relays = db.get_all_relays("").unwrap();
         // Should be empty because config has no relays and we set NOSTR_MAIL_CONFIG
         assert!(relays.is_empty());
 
@@ -3848,24 +4169,32 @@ mod tests {
     // Relay CRUD
     // =====================
 
+    /// Hex pubkey for test scoping. Real pubkeys are 64 hex chars; the schema
+    /// doesn't validate length, so a short marker is fine for unit tests.
+    const TEST_PUBKEY_A: &str = "aaaaaaaa";
+    const TEST_PUBKEY_B: &str = "bbbbbbbb";
+
     #[test]
     fn test_save_and_get_relays() {
         let (db, _dir) = create_test_db();
         let now = Utc::now();
         let relay = DbRelay {
             id: None,
+            pubkey: String::new(),
             url: "wss://relay.example.com".to_string(),
             is_active: true,
             created_at: now,
             updated_at: now,
+            use_for_dms: true,
         };
 
-        let id = db.save_relay(&relay).unwrap();
+        let id = db.save_relay(TEST_PUBKEY_A, &relay).unwrap();
         assert!(id > 0);
 
-        let relays = db.get_all_relays().unwrap();
+        let relays = db.get_all_relays(TEST_PUBKEY_A).unwrap();
         assert_eq!(relays.len(), 1);
         assert_eq!(relays[0].url, "wss://relay.example.com");
+        assert_eq!(relays[0].pubkey, TEST_PUBKEY_A);
         assert!(relays[0].is_active);
     }
 
@@ -3875,15 +4204,17 @@ mod tests {
         let now = Utc::now();
         let relay = DbRelay {
             id: None,
+            pubkey: String::new(),
             url: "wss://relay.delete.me".to_string(),
             is_active: true,
             created_at: now,
             updated_at: now,
+            use_for_dms: true,
         };
-        db.save_relay(&relay).unwrap();
+        db.save_relay(TEST_PUBKEY_A, &relay).unwrap();
 
-        db.delete_relay("wss://relay.delete.me").unwrap();
-        let relays = db.get_all_relays().unwrap();
+        db.delete_relay(TEST_PUBKEY_A, "wss://relay.delete.me").unwrap();
+        let relays = db.get_all_relays(TEST_PUBKEY_A).unwrap();
         assert!(relays.is_empty());
     }
 
@@ -3893,26 +4224,99 @@ mod tests {
         let now = Utc::now();
         let relay = DbRelay {
             id: None,
+            pubkey: String::new(),
             url: "wss://relay.update.me".to_string(),
             is_active: true,
             created_at: now,
             updated_at: now,
+            use_for_dms: true,
         };
-        let id = db.save_relay(&relay).unwrap();
+        let id = db.save_relay(TEST_PUBKEY_A, &relay).unwrap();
 
         // Update via save with explicit id
         let updated = DbRelay {
             id: Some(id),
+            pubkey: TEST_PUBKEY_A.to_string(),
             url: "wss://relay.update.me".to_string(),
             is_active: false,
             created_at: now,
             updated_at: now,
+            use_for_dms: true,
         };
-        db.save_relay(&updated).unwrap();
+        db.save_relay(TEST_PUBKEY_A, &updated).unwrap();
 
-        let relays = db.get_all_relays().unwrap();
+        let relays = db.get_all_relays(TEST_PUBKEY_A).unwrap();
         assert_eq!(relays.len(), 1);
         assert!(!relays[0].is_active);
+    }
+
+    #[test]
+    fn test_relays_scoped_per_pubkey() {
+        // Two accounts with the same URL but independent flags.
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        let mk = |url: &str, dm: bool| DbRelay {
+            id: None,
+            pubkey: String::new(),
+            url: url.to_string(),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+            use_for_dms: dm,
+        };
+
+        db.save_relay(TEST_PUBKEY_A, &mk("wss://shared.example.com", true)).unwrap();
+        db.save_relay(TEST_PUBKEY_B, &mk("wss://shared.example.com", false)).unwrap();
+
+        let a = db.get_all_relays(TEST_PUBKEY_A).unwrap();
+        let b = db.get_all_relays(TEST_PUBKEY_B).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert!(a[0].use_for_dms);
+        assert!(!b[0].use_for_dms);
+
+        // DM-relay queries reflect the per-account flag.
+        assert_eq!(db.get_dm_relays(TEST_PUBKEY_A).unwrap().len(), 1);
+        assert_eq!(db.get_dm_relays(TEST_PUBKEY_B).unwrap().len(), 0);
+
+        // Deleting under one account leaves the other intact.
+        db.delete_relay(TEST_PUBKEY_A, "wss://shared.example.com").unwrap();
+        assert_eq!(db.get_all_relays(TEST_PUBKEY_A).unwrap().len(), 0);
+        assert_eq!(db.get_all_relays(TEST_PUBKEY_B).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_relays_lazy_seed_from_template_bucket() {
+        // Existing rows in the '' template bucket should clone into a per-pubkey
+        // bucket on first read. Subsequent reads return only per-pubkey rows.
+        let (db, _dir) = create_test_db();
+        let now = Utc::now();
+        let template = DbRelay {
+            id: None,
+            pubkey: String::new(),
+            url: "wss://template.example.com".to_string(),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+            use_for_dms: true,
+        };
+        db.save_relay("", &template).unwrap();
+        assert_eq!(db.get_all_relays("").unwrap().len(), 1);
+
+        // First read for a new account: should clone the template row.
+        let cloned = db.get_all_relays(TEST_PUBKEY_A).unwrap();
+        assert_eq!(cloned.len(), 1);
+        assert_eq!(cloned[0].url, "wss://template.example.com");
+        assert_eq!(cloned[0].pubkey, TEST_PUBKEY_A);
+
+        // Second read: no re-clone (only one per-pubkey row, not two).
+        let again = db.get_all_relays(TEST_PUBKEY_A).unwrap();
+        assert_eq!(again.len(), 1);
+
+        // Edits under the per-account bucket don't bleed back to the template.
+        db.set_relay_dm_flag(TEST_PUBKEY_A, "wss://template.example.com", false).unwrap();
+        let template_after = db.get_all_relays("").unwrap();
+        assert!(template_after[0].use_for_dms, "template should remain DM-flagged");
     }
 
     // =====================

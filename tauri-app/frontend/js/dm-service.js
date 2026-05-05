@@ -19,6 +19,183 @@ class DMService {
     }
 
     // Decrypt a single DM content string via NIP-44/NIP-04.
+    /// Sniff the format of a stored DM content string. Mirrors the backend's
+    /// `crypto::detect_encryption_format` heuristic so the debug modal can
+    /// label what's actually stored.
+    ///
+    /// Returns one of:
+    ///   - 'nip04'      → "<base64>?iv=<base64>" — kind 4 ciphertext as stored
+    ///   - 'nip44'      → base64 starting with version byte 0x01 or 0x02
+    ///   - 'plaintext'  → anything else (typical for NIP-17 rumor.content,
+    ///                    which is plaintext after the wrap+seal layers were
+    ///                    already removed at unwrap time)
+    _detectStoredFormat(s) {
+        if (!s || typeof s !== 'string') return 'plaintext';
+        if (s.includes('?iv=')) return 'nip04';
+        // NIP-44: base64 of [version_byte, nonce, ciphertext, mac]. Version
+        // byte 1 is reserved/draft; version byte 2 is the spec'd format. We
+        // accept either as a hint without doing a full base64 decode.
+        try {
+            // Atob only; if it fails we treat as plaintext.
+            const decoded = atob(s.length > 256 ? s.slice(0, 256) : s);
+            const v = decoded.charCodeAt(0);
+            if (v === 0x01 || v === 0x02) return 'nip44';
+        } catch (_) {}
+        return 'plaintext';
+    }
+
+    /// Open a modal that surfaces the underlying DM record. Read-only —
+    /// purely for debugging (verifying event id, sender/recipient pubkeys,
+    /// stored content vs. decrypted plaintext, email-match linkage).
+    _showDmDebugModal(message, isMe) {
+        // Drop any prior modal so repeated clicks don't stack overlays.
+        const existing = document.getElementById('dmDebugModal');
+        if (existing) existing.remove();
+
+        const escape = (s) => window.Utils?.escapeHtml(String(s ?? '')) ?? String(s ?? '');
+
+        // Coerce created_at into both raw epoch + locale string.
+        let createdAtRaw = message.created_at;
+        let createdAtIso = '';
+        try {
+            const ms = (typeof createdAtRaw === 'number') ? createdAtRaw * 1000 : Date.parse(createdAtRaw);
+            const d = new Date(ms);
+            if (!Number.isNaN(d.getTime())) createdAtIso = d.toLocaleString();
+        } catch (_) {}
+
+        let receivedAtIso = '';
+        if (message.received_at) {
+            try {
+                const d = new Date(message.received_at);
+                if (!Number.isNaN(d.getTime())) receivedAtIso = d.toLocaleString();
+            } catch (_) {}
+        }
+
+        const storedFormat = this._detectStoredFormat(message.raw_content);
+        const formatLabel = {
+            nip04:     'nip04 (kind 4 ciphertext: base64?iv=base64)',
+            nip44:     'nip44 (base64 with version byte 0x01/0x02)',
+            plaintext: 'plaintext (typical for NIP-17: rumor.content already unwrapped)',
+        }[storedFormat] ?? storedFormat;
+
+        // Each row is [label, value]. Single "Copy as JSON" button in the
+        // header takes the whole modal — no per-row copy noise.
+        const receivedFromRelayLabel = message.received_from_relay
+            ? message.received_from_relay
+            : '(unknown — bulk fetch or self-echo)';
+
+        const rows = [
+            ['Direction', isMe ? 'sent (me → contact)' : 'received (contact → me)'],
+            ['Stored format', formatLabel],
+            ['Received from relay', receivedFromRelayLabel],
+            ['DB id', message.id ?? ''],
+            ['event_id', message.event_id ?? ''],
+            ['sender_pubkey', message.sender_pubkey ?? ''],
+            ['recipient_pubkey', message.recipient_pubkey ?? ''],
+            ['created_at', createdAtIso ? `${createdAtRaw}  (${createdAtIso})` : String(createdAtRaw ?? '')],
+            ['received_at', receivedAtIso || (message.received_at ?? '')],
+            ['email_message_id', message.email_message_id ?? '(none)'],
+            ['hasEmailMatch', message.hasEmailMatch ? 'true' : 'false'],
+            ['is_sent', message.is_sent ? 'true' : 'false'],
+            ['confirmed', message.confirmed ? 'true' : 'false'],
+        ];
+
+        const rowHtml = rows.map(([k, v]) => {
+            const val = escape(v);
+            return `
+                <div class="dm-debug-row">
+                    <div class="dm-debug-key">${escape(k)}</div>
+                    <div class="dm-debug-val"><code>${val || '<span class="dm-debug-empty">(empty)</span>'}</code></div>
+                </div>
+            `;
+        }).join('');
+
+        const rawContent = escape(message.raw_content ?? '(not preserved — refresh conversation)');
+        const decryptedContent = escape(message.content ?? '');
+
+        // Snapshot to copy. Keys mirror the row labels (snake_case) so it
+        // round-trips cleanly into other tools / bug reports.
+        const jsonSnapshot = {
+            direction: isMe ? 'sent' : 'received',
+            stored_format: storedFormat,
+            received_from_relay: message.received_from_relay ?? null,
+            db_id: message.id ?? null,
+            event_id: message.event_id ?? null,
+            sender_pubkey: message.sender_pubkey ?? null,
+            recipient_pubkey: message.recipient_pubkey ?? null,
+            created_at: message.created_at ?? null,
+            created_at_iso: createdAtIso || null,
+            received_at: message.received_at ?? null,
+            received_at_iso: receivedAtIso || null,
+            email_message_id: message.email_message_id ?? null,
+            has_email_match: !!message.hasEmailMatch,
+            is_sent: !!message.is_sent,
+            confirmed: !!message.confirmed,
+            decrypted_content: message.content ?? null,
+            stored_content: message.raw_content ?? null,
+        };
+        const jsonText = JSON.stringify(jsonSnapshot, null, 2);
+        // Stash on the overlay element (set after creation) for the click handler.
+
+        // Section note: when the stored format is plaintext (NIP-17 typical),
+        // the "stored" and "decrypted" blocks will match. Surface that so the
+        // user doesn't think the modal is broken.
+        const storedNote = storedFormat === 'plaintext'
+            ? `<div class="dm-debug-note">For NIP-17 messages the wrap+seal layers were already removed at unwrap time — what's stored in the <code>direct_messages</code> row is the inner kind-14 rumor content, which is plaintext. So this matches the decrypted block above.</div>`
+            : `<div class="dm-debug-note">${storedFormat === 'nip04' ? 'NIP-04 kind-4 ciphertext as received from the relay.' : 'NIP-44 base64-encoded ciphertext.'} The decrypted block above is the result of running this through <code>decrypt_dm_content</code>.</div>`;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'dmDebugModal';
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width: 720px;">
+                <div class="modal-header">
+                    <h3>Message debug info</h3>
+                    <div class="dm-debug-header-actions">
+                        <button class="dm-debug-copy-json" type="button"><i class="fas fa-copy"></i> Copy as JSON</button>
+                        <button class="modal-close" type="button" aria-label="Close">&times;</button>
+                    </div>
+                </div>
+                <div class="modal-body">
+                    <div class="dm-debug-grid">${rowHtml}</div>
+
+                    <div class="dm-debug-section">
+                        <div class="dm-debug-section-title">Decrypted content (rendered to user)</div>
+                        <pre class="dm-debug-pre">${decryptedContent}</pre>
+                    </div>
+
+                    <div class="dm-debug-section">
+                        <div class="dm-debug-section-title">Stored content (direct_messages.content row)</div>
+                        ${storedNote}
+                        <pre class="dm-debug-pre">${rawContent}</pre>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        // Wire close behavior: × button + click-on-overlay (but not inside modal).
+        const close = () => overlay.remove();
+        overlay.querySelector('.modal-close')?.addEventListener('click', close);
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) close();
+        });
+
+        // Wire single "Copy as JSON" button: dumps the whole snapshot to clipboard.
+        const copyBtn = overlay.querySelector('.dm-debug-copy-json');
+        copyBtn?.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+                await navigator.clipboard.writeText(jsonText);
+                const orig = copyBtn.innerHTML;
+                copyBtn.innerHTML = '<i class="fas fa-check"></i> Copied';
+                setTimeout(() => { copyBtn.innerHTML = orig; }, 1200);
+            } catch (_) {
+                // Clipboard API may be denied — silently ignore.
+            }
+        });
+    }
+
     async _decryptDmContent(encryptedContent, contactPubkey) {
         const keypair = window.appState.getKeypair();
         if (!keypair) return '[No keypair]';
@@ -41,9 +218,12 @@ class DMService {
 
         if (!rawMessages || rawMessages.length === 0) return [];
 
-        // Decrypt each message — use the other party's pubkey for the shared secret
+        // Decrypt each message — use the other party's pubkey for the shared secret.
+        // Preserve the original ciphertext on `raw_content` so the debug-info modal
+        // can show what's actually stored in the DB.
         for (const msg of rawMessages) {
             const otherPubkey = (msg.sender_pubkey === myPubkey) ? msg.recipient_pubkey : msg.sender_pubkey;
+            msg.raw_content = msg.content;
             msg.content = await this._decryptDmContent(msg.content, otherPubkey);
         }
 
@@ -700,6 +880,15 @@ class DMService {
                     content: msg.content || '',
                     created_at: msg.created_at || msg.timestamp,
                     sender_pubkey: msg.sender_pubkey,
+                    // Preserve the rest of the DirectMessage shape so the debug
+                    // modal can show the full record. These fields don't affect
+                    // rendering but are essential for diagnosing send/receive
+                    // issues from the in-app inspector.
+                    recipient_pubkey: msg.recipient_pubkey ?? null,
+                    received_at: msg.received_at ?? null,
+                    email_message_id: msg.email_message_id ?? null,
+                    received_from_relay: msg.received_from_relay ?? null,
+                    raw_content: msg.raw_content ?? null,
                     is_sent: msg.sender_pubkey === myPubkey,
                     confirmed: true, // All DB messages are confirmed
                     hasEmailMatch: hasEmailMatch // New field to track email matches
@@ -872,6 +1061,37 @@ class DMService {
                     this.navigateToContact(contactPubkey);
                 });
             }
+
+            // Probe NIP-17 capability for the recipient. If they haven't
+            // published a kind 10050, the backend will transparently fall
+            // back to NIP-04 on send — surface a warning banner so the user
+            // knows the encryption is weaker (NIP-04 is deprecated and
+            // leaks recipient metadata to relays). Fire-and-update so the
+            // conversation renders without waiting on the network call.
+            // Cached server-side per session, so re-opens are instant.
+            // The backend command accepts either npub or hex pubkey.
+            TauriService.recipientSupportsNip17(contactPubkey)
+                .then(supports => {
+                    if (supports) return;
+                    // Idempotent: don't add a second banner if a previous
+                    // resolve already inserted one (rapid reopen cycles).
+                    if (dmMessages.querySelector('.conversation-encryption-warning')) return;
+                    const warning = document.createElement('div');
+                    warning.className = 'conversation-encryption-warning';
+                    warning.innerHTML = `
+                        <i class="fas fa-triangle-exclamation"></i>
+                        <span>This contact hasn't advertised a NIP-17 inbox. Messages will be sent using legacy <strong>NIP-04</strong> encryption, which is deprecated and leaks recipient metadata to relays.</span>
+                    `;
+                    // Insert as a sibling ABOVE the header (the header is a
+                    // horizontal flex row; nesting the banner inside would
+                    // squeeze it next to the avatar).
+                    dmMessages.insertBefore(warning, headerElement);
+                })
+                .catch(err => {
+                    // Network failure here is non-fatal — we just don't know
+                    // whether to warn, so stay silent rather than false-alarm.
+                    console.warn('[JS] recipientSupportsNip17 lookup failed:', err);
+                });
             
             if (messages.length === 0) {
                 // Show empty state message
@@ -972,6 +1192,7 @@ class DMService {
                                     <div class="message-time">${dateTimeDisplay}</div>
                                     ${statusIcon}
                                     <span class="email-emoji email-emoji-clickable" style="cursor: pointer;" title="${isMe ? 'Click to view sent email' : 'Click to view received email'}"><i class="fas fa-envelope"></i></span>
+                                    <span class="message-meta-info" style="cursor: pointer;" title="Show message debug info"><i class="fas fa-circle-info"></i></span>
                                 </div>
                             </div>
                         `;
@@ -1090,11 +1311,22 @@ class DMService {
                                 <div class="message-meta">
                                     <div class="message-time">${dateTimeDisplay}</div>
                                     ${statusIcon}
+                                    <span class="message-meta-info" style="cursor: pointer;" title="Show message debug info"><i class="fas fa-circle-info"></i></span>
                                 </div>
                             </div>
                         `;
                     }
-                    
+
+                    // Wire the debug-info icon (present on both message variants).
+                    const infoIcon = messageElement.querySelector('.message-meta-info');
+                    if (infoIcon) {
+                        infoIcon.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            this._showDmDebugModal(message, isMe);
+                        });
+                    }
+
                     messagesContainer.appendChild(messageElement);
                 });
                 

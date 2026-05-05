@@ -70,7 +70,8 @@ async fn sync_relay_states_internal(state: &AppState) -> Vec<String> {
                 return updated_relays;
             }
         };
-        let all_db_relays = match db.get_all_relays() {
+        let pubkey_hex = current_pubkey_hex_or_empty(state);
+        let all_db_relays = match db.get_all_relays(&pubkey_hex) {
             Ok(relays) => relays,
             Err(e) => {
                 println!("[RUST] sync_relay_states_internal: Failed to get relays from database: {}", e);
@@ -151,7 +152,7 @@ async fn sync_relay_states_internal(state: &AppState) -> Vec<String> {
                     continue;
                 }
             };
-            let all_relays = match db.get_all_relays() {
+            let all_relays = match db.get_all_relays(&pubkey_hex) {
                 Ok(relays) => relays,
                 Err(_) => {
                     updated_relays.push(relay_url);
@@ -161,12 +162,14 @@ async fn sync_relay_states_internal(state: &AppState) -> Vec<String> {
             if let Some(db_relay) = all_relays.iter().find(|r| r.url == relay_url) {
                 let updated_relay = crate::database::DbRelay {
                     id: db_relay.id,
+                    pubkey: db_relay.pubkey.clone(),
                     url: relay_url.clone(),
                     is_active: false,
                     created_at: db_relay.created_at,
                     updated_at: chrono::Utc::now(),
+                    use_for_dms: db_relay.use_for_dms,
                 };
-                if let Err(e) = db.save_relay(&updated_relay) {
+                if let Err(e) = db.save_relay(&db_relay.pubkey, &updated_relay) {
                     println!("[RUST] sync_relay_states_internal: Failed to update relay in database: {}", e);
                 }
             }
@@ -430,152 +433,545 @@ async fn send_direct_message_persistent(
     recipient_pubkey: &str,
     content: &MessageContent,
     encryption_algorithm: Option<&str>,
+    message_id: Option<&str>,
+    state: &AppState,
+    app_handle: Option<&tauri::AppHandle>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+
+    println!("[RUST] send_direct_message_persistent called");
+
+    // Get or initialize the persistent client
+    let client = state.get_nostr_client(Some(private_key)).await?;
+
+    // Parse recipient pubkey
+    let recipient = PublicKey::from_bech32(recipient_pubkey).map_err(|e| e.to_string())?;
+
+    // Get keys for encryption
+    let keys = state.get_current_keys().ok_or("No keys available")?;
+
+    // Determine encryption algorithm (default to NIP-44)
+    let algorithm = encryption_algorithm.unwrap_or("nip44");
+    println!("[RUST] Using encryption algorithm: {}", algorithm);
+
+    // Dispatch by configured algorithm. For NIP-44, also probe recipient
+    // capability — if they haven't published a kind-10050 inbox they can't
+    // read NIP-17 gift wraps, and we transparently fall back to NIP-04.
+    // Per NIP-17 spec: "If [kind 10050] is not found that indicates the
+    // user is not ready to receive messages under this NIP and clients
+    // shouldn't try." Falling back to NIP-04 (rather than refusing to send)
+    // keeps interop with legacy clients like Primal that don't yet
+    // implement NIP-17. The frontend separately surfaces a warning banner
+    // so the user knows the encryption is weaker for that contact.
+    if algorithm == "nip44" {
+        if recipient_has_kind_10050(&client, state, recipient).await {
+            return send_gift_wrapped_dm(
+                &client,
+                &keys,
+                &recipient,
+                content,
+                message_id,
+                state,
+                app_handle,
+            ).await;
+        }
+        println!("[RUST] Recipient {} has no kind 10050 — falling back to NIP-04", recipient.to_hex());
+        return send_legacy_nip04(&client, &keys, &recipient, content, encryption_algorithm, state, app_handle).await;
+    }
+
+    if algorithm == "nip04" {
+        return send_legacy_nip04(&client, &keys, &recipient, content, encryption_algorithm, state, app_handle).await;
+    }
+
+    Err(format!("Unsupported encryption algorithm: {}", algorithm))
+}
+
+/// Legacy kind-4 NIP-04 direct-message send path. Used both by the explicit
+/// `encryption_algorithm = "nip04"` setting and by the NIP-44 → NIP-04
+/// transparent fallback when the recipient hasn't published a kind 10050.
+///
+/// `encryption_algorithm` is plumbed through purely for the format-mismatch
+/// warning when the caller passes pre-encrypted content with a label that
+/// doesn't match the detected format on the wire — this preserves existing
+/// diagnostic behavior.
+async fn send_legacy_nip04(
+    client: &nostr_sdk::Client,
+    keys: &nostr_sdk::Keys,
+    recipient: &nostr_sdk::PublicKey,
+    content: &MessageContent,
+    encryption_algorithm: Option<&str>,
     state: &AppState,
     app_handle: Option<&tauri::AppHandle>,
 ) -> Result<String, String> {
     use nostr_sdk::prelude::*;
     use crate::types::MessageContent;
-    
-    println!("[RUST] send_direct_message_persistent called");
-    
-    // Get or initialize the persistent client
-    let client = state.get_nostr_client(Some(private_key)).await?;
-    
-    // Parse recipient pubkey
-    let recipient = PublicKey::from_bech32(recipient_pubkey).map_err(|e| e.to_string())?;
-    
-    // Get keys for encryption
-    let keys = state.get_current_keys().ok_or("No keys available")?;
-    
-    // Determine encryption algorithm (default to NIP-44)
-    let algorithm = encryption_algorithm.unwrap_or("nip44");
-    println!("[RUST] Using encryption algorithm: {}", algorithm);
-    
-    // Handle content based on type
+
     let encrypted_content = match content {
         MessageContent::Plaintext(text) => {
-            println!("[RUST] Encrypting plaintext message");
-            match algorithm {
-                "nip04" => {
-                    nip04::encrypt(keys.secret_key(), &recipient, text)
-                        .map_err(|e| e.to_string())?
-                },
-                "nip44" => {
-                    nip44::encrypt(keys.secret_key(), &recipient, text, nip44::Version::default())
-                        .map_err(|e| e.to_string())?
-                },
-                _ => {
-                    return Err(format!("Unsupported encryption algorithm: {}", algorithm));
-                }
-            }
+            println!("[RUST] Encrypting plaintext message (NIP-04)");
+            nip04::encrypt(keys.secret_key(), recipient, text)
+                .map_err(|e| e.to_string())?
         },
         MessageContent::Encrypted(encrypted) => {
             println!("[RUST] Using pre-encrypted content");
-            // Detect the actual encryption format of the already-encrypted content
-            let detected_format = crypto::detect_encryption_format(&encrypted);
+            let detected_format = crypto::detect_encryption_format(encrypted);
             println!("[RUST] Detected encryption format: {} (algorithm parameter: {:?})", detected_format, encryption_algorithm);
-            
-            // Warn if detected format doesn't match the algorithm parameter
             if let Some(alg_param) = encryption_algorithm {
                 let alg_normalized = alg_param.to_lowercase();
                 if detected_format != "unknown" && detected_format != alg_normalized {
                     println!("[RUST] WARNING: Format mismatch! Detected format: {}, but algorithm parameter says: {}", detected_format, alg_normalized);
                 }
             }
-            
             encrypted.clone()
         }
     };
-    
-    // Build and sign the event first to get the event ID
+
     let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, &encrypted_content)
-        .tag(Tag::public_key(recipient));
-    
-    let event = event_builder.build(keys.public_key()).sign_with_keys(&keys).map_err(|e| e.to_string())?;
+        .tag(Tag::public_key(*recipient));
+    let event = event_builder.build(keys.public_key()).sign_with_keys(keys).map_err(|e| e.to_string())?;
     let event_id = event.id.to_hex();
-    let _event_timestamp = event.created_at.as_u64();
-    
-    println!("[RUST] Built and signed event with ID: {}", event_id);
-    
-    // Send the event to relays (DO NOT save to database here - persistence happens when live handler receives confirmation)
-    let _send_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    println!("[RUST] Built and signed kind-4 event with ID: {}", event_id);
+
     let output = client.send_event(&event).await.map_err(|e| e.to_string())?;
-    let _send_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
-    
-    println!("[RUST] Message sent to relays. Success: {}, Failed: {}", 
-        output.success.len(), output.failed.len());
-    
-    // Clear successfully connected relays from failed map
+    println!("[RUST] kind-4 sent. Success: {}, Failed: {}", output.success.len(), output.failed.len());
+
+    // Clear successfully connected relays from the failed map.
     if !output.success.is_empty() {
         let mut failed_map = state.failed_relays.lock().unwrap();
         for relay_url in &output.success {
             let relay_url_str = relay_url.to_string();
             if let Some(error_msg) = failed_map.remove(&relay_url_str) {
-                println!("[RUST] Cleared relay {} from failed_relays map (successfully connected). Previous error: {}", relay_url_str, error_msg);
+                println!("[RUST] Cleared relay {} from failed_relays map. Previous error: {}", relay_url_str, error_msg);
             }
         }
     }
-    
-    // Update relay status based on failures
+
     if !output.failed.is_empty() {
         let updated_relays = update_relay_status_from_send_failures(&output.failed, state).await;
-        // Emit event to frontend if relays were updated (e.g., auth failures)
         if !updated_relays.is_empty() {
             if let Some(ref app_handle) = app_handle {
                 if let Err(e) = app_handle.emit("relay-status-changed", &serde_json::json!({
                     "updated_relays": updated_relays
                 })) {
                     println!("[RUST] Failed to emit relay-status-changed event: {}", e);
-                } else {
-                    println!("[RUST] Emitted relay-status-changed event for {} relay(s)", updated_relays.len());
                 }
             }
         }
     }
-    
-    // Check if at least one relay succeeded - if all failed, return an error
+
     if output.success.is_empty() {
         let failed_details: Vec<String> = output.failed.iter()
             .map(|(url, err)| format!("{}: {}", url, err))
             .collect();
         let error_msg = format!(
-            "Failed to send message to any relay. All {} relays failed: {}", 
+            "Failed to send NIP-04 message to any relay. All {} relays failed: {}",
             output.failed.len(),
             failed_details.join("; ")
         );
         println!("[RUST] {}", error_msg);
         return Err(error_msg);
     }
-    
-    // CRITICAL FIX: Relays don't immediately echo sent messages back to the sender.
-    // Manually trigger the live handler immediately after successful send to avoid delay.
-    // This ensures the sender sees their message instantly, matching receiver experience.
-    if output.success.len() > 0 {
-        if let Some(app_handle) = app_handle {
-            println!("[RUST] Manually triggering live handler for sent message (relays don't echo immediately)");
-            
-            // Process the sent message through the live handler immediately
-            // This uses the same code path as relay notifications, ensuring consistency
-            let app_handle_clone = app_handle.clone();
-            let state_clone = state.clone();
-            let user_pubkey_clone = keys.public_key();
-            let event_clone = event.clone();
-            
-            // Spawn async task to handle without blocking
-            tokio::spawn(async move {
-                if let Err(e) = handle_live_direct_message(&event_clone, &app_handle_clone, &state_clone, &user_pubkey_clone).await {
-                    println!("[RUST] Error manually handling sent DM: {}", e);
-                } else {
-                    println!("[RUST] Successfully processed sent message via manual handler");
-                }
-            });
-        } else {
-            println!("[RUST] App handle not available, cannot manually trigger handler (message will appear when relay echoes it back)");
+
+    // Self-echo via the live handler so the sender's UI shows the message
+    // instantly without waiting for a relay to bounce it back.
+    if let Some(app_handle) = app_handle {
+        let app_handle_clone = app_handle.clone();
+        let state_clone = state.clone();
+        let user_pubkey_clone = keys.public_key();
+        let event_clone = event.clone();
+        tokio::spawn(async move {
+            // Self-echo: no relay attribution (we built the event locally).
+            if let Err(e) = handle_live_direct_message(&event_clone, &app_handle_clone, &state_clone, &user_pubkey_clone, None).await {
+                println!("[RUST] Error manually handling sent NIP-04 DM: {}", e);
+            }
+        });
+    }
+
+    Ok(event_id)
+}
+
+/// Publish (or refresh) our own NIP-17 inbox (kind 10050) and NIP-65 outbox
+/// (kind 10002) so other clients know where to deliver DMs and where to find
+/// our writes. Idempotent: fetches existing events, compares URL sets to the
+/// user's current relay settings, and only publishes when something differs.
+///
+/// `force = true` skips the "already published this session" guard — used by
+/// the `republish_relay_lists` Tauri command after the user changes settings.
+async fn publish_self_relay_lists(
+    client: &nostr_sdk::Client,
+    state: &AppState,
+    user_pubkey: nostr_sdk::PublicKey,
+    force: bool,
+) -> Result<(), String> {
+    use nostr_sdk::prelude::*;
+
+    if !force {
+        let already = *state.relay_lists_published_session.lock().unwrap();
+        if already {
+            return Ok(());
         }
     }
-    
-    // Return the actual event ID - frontend will receive confirmation via manual handler
-    Ok(event_id)
+
+    let db = state.get_database()?;
+    let pubkey_hex = user_pubkey.to_hex();
+    let dm_relays = db.get_dm_relays(&pubkey_hex).map_err(|e| e.to_string())?;
+    let active_relays = db.get_all_relays(&pubkey_hex).map_err(|e| e.to_string())?
+        .into_iter().filter(|r| r.is_active).collect::<Vec<_>>();
+
+    let desired_inbox: std::collections::BTreeSet<String> =
+        dm_relays.iter().map(|r| r.url.clone()).collect();
+    let desired_outbox: std::collections::BTreeSet<String> =
+        active_relays.iter().map(|r| r.url.clone()).collect();
+
+    let keys = state.get_current_keys().ok_or("no keys available to sign relay lists")?;
+
+    // Helper: read existing relay tags off an event for comparison.
+    let extract_existing = |events: Events, tag_name: &str| -> std::collections::BTreeSet<String> {
+        let event = events.into_iter().max_by_key(|e| e.created_at.as_u64());
+        let mut set = std::collections::BTreeSet::new();
+        if let Some(ev) = event {
+            for tag in ev.tags.iter() {
+                let s = tag.as_slice();
+                if s.first().map(|x| x.as_str()) == Some(tag_name) {
+                    if let Some(u) = s.get(1) {
+                        if !u.is_empty() {
+                            set.insert(u.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        set
+    };
+
+    // --- kind 10050 (NIP-17 DM inbox) ---
+    let inbox_filter = Filter::new()
+        .kind(Kind::from(10050u16))
+        .author(user_pubkey)
+        .limit(1);
+    let existing_inbox = match client.fetch_events(inbox_filter, std::time::Duration::from_secs(2)).await {
+        Ok(events) => extract_existing(events, "relay"),
+        Err(e) => {
+            println!("[RUST] self-publish: kind 10050 fetch failed (will republish anyway): {}", e);
+            std::collections::BTreeSet::new()
+        }
+    };
+    if existing_inbox != desired_inbox {
+        if desired_inbox.is_empty() {
+            println!("[RUST] self-publish: skipping kind 10050 — no DM-flagged relays configured");
+        } else {
+            let tags: Vec<Tag> = desired_inbox.iter()
+                .map(|url| Tag::custom(TagKind::custom("relay"), [url.clone()]))
+                .collect();
+            let event = EventBuilder::new(Kind::from(10050u16), "")
+                .tags(tags)
+                .build(user_pubkey)
+                .sign_with_keys(&keys)
+                .map_err(|e| format!("sign 10050: {}", e))?;
+            match client.send_event(&event).await {
+                Ok(out) => println!(
+                    "[RUST] self-publish: kind 10050 with {} relay(s) — success={} failed={}",
+                    desired_inbox.len(), out.success.len(), out.failed.len()
+                ),
+                Err(e) => println!("[RUST] self-publish: kind 10050 send failed: {}", e),
+            }
+        }
+    } else {
+        println!("[RUST] self-publish: kind 10050 already up to date ({} relays)", desired_inbox.len());
+    }
+
+    // --- kind 10002 (NIP-65 general outbox/inbox) ---
+    let outbox_filter = Filter::new()
+        .kind(Kind::RelayList)
+        .author(user_pubkey)
+        .limit(1);
+    let existing_outbox = match client.fetch_events(outbox_filter, std::time::Duration::from_secs(2)).await {
+        Ok(events) => extract_existing(events, "r"),
+        Err(e) => {
+            println!("[RUST] self-publish: kind 10002 fetch failed (will republish anyway): {}", e);
+            std::collections::BTreeSet::new()
+        }
+    };
+    if existing_outbox != desired_outbox {
+        if desired_outbox.is_empty() {
+            println!("[RUST] self-publish: skipping kind 10002 — no active relays configured");
+        } else {
+            // Omit read/write marker = both directions per NIP-65.
+            let tags: Vec<Tag> = desired_outbox.iter()
+                .map(|url| Tag::custom(TagKind::custom("r"), [url.clone()]))
+                .collect();
+            let event = EventBuilder::new(Kind::RelayList, "")
+                .tags(tags)
+                .build(user_pubkey)
+                .sign_with_keys(&keys)
+                .map_err(|e| format!("sign 10002: {}", e))?;
+            match client.send_event(&event).await {
+                Ok(out) => println!(
+                    "[RUST] self-publish: kind 10002 with {} relay(s) — success={} failed={}",
+                    desired_outbox.len(), out.success.len(), out.failed.len()
+                ),
+                Err(e) => println!("[RUST] self-publish: kind 10002 send failed: {}", e),
+            }
+        }
+    } else {
+        println!("[RUST] self-publish: kind 10002 already up to date ({} relays)", desired_outbox.len());
+    }
+
+    *state.relay_lists_published_session.lock().unwrap() = true;
+    Ok(())
+}
+
+/// Resolve the relays to publish a NIP-17 gift wrap to for the given target
+/// pubkey, using this cascade:
+/// 1. cached lookup result for this session
+/// 2. recipient's NIP-17 inbox (kind 10050)
+/// 3. recipient's NIP-65 read relays (kind 10002 with `read` or no marker)
+///
+/// Returns `Some(urls)` only when at least one URL was resolved. Returns
+/// `None` when nothing was found — caller should fall back to broadcasting
+/// to all connected relays. Caches the result (including empty) on AppState.
+/// Cache-aware "does this recipient publish a NIP-17 inbox (kind 10050)?"
+///
+/// Answers the capability question used to decide between gift-wrap (NIP-17)
+/// and legacy NIP-04 send for chat DMs. Distinct from `resolve_send_relays_for`
+/// because that helper conflates the kind-10050 inbox set with kind-10002 read
+/// fallback; for the fallback decision we need a sharper signal than "any URLs
+/// were found at all."
+///
+/// Per-session cache lives on `state.nip17_capable`. First call hits the
+/// network; subsequent calls (Tauri command for UI banner, plus the dispatch
+/// check on send) read from the cache.
+async fn recipient_has_kind_10050(
+    client: &nostr_sdk::Client,
+    state: &AppState,
+    target: nostr_sdk::PublicKey,
+) -> bool {
+    {
+        let cache = state.nip17_capable.read().await;
+        if let Some(&v) = cache.get(&target) {
+            return v;
+        }
+    }
+    let inbox = crate::nostr::fetch_inbox_relays(client, target).await;
+    let has = !inbox.is_empty();
+    state.nip17_capable.write().await.insert(target, has);
+    // Opportunistically prime `inbox_fetched` too — `send_gift_wrapped_dm`
+    // re-fetches via `resolve_send_relays_for` immediately after, so seeding
+    // the routing cache here saves one network round-trip on first send.
+    if has {
+        state.inbox_fetched.write().await.insert(target, inbox);
+    }
+    has
+}
+
+/// Ensure the given relay URLs are present in the client pool, adding any
+/// missing ones and connecting. `Client::send_event_to` rejects URLs the
+/// client doesn't know about with "relay not found", so any send-routing
+/// caller must run its target URL list through this helper first.
+///
+/// Idempotent: re-adding a connected relay is a noop in the SDK. Returns
+/// the URLs unchanged for chaining convenience.
+async fn ensure_relays_in_client(
+    client: &nostr_sdk::Client,
+    urls: &[String],
+) {
+    if urls.is_empty() {
+        return;
+    }
+    let existing: std::collections::HashSet<String> = client.relays().await.keys()
+        .map(|u| u.to_string())
+        .collect();
+    let mut added = 0usize;
+    for url in urls {
+        if existing.contains(url) {
+            continue;
+        }
+        match client.add_relay(url).await {
+            Ok(_) => added += 1,
+            Err(e) => println!("[RUST] ensure_relays_in_client: failed to add {}: {}", url, e),
+        }
+    }
+    if added > 0 {
+        client.connect().await;
+        println!("[RUST] ensure_relays_in_client: added + connected {} relay(s)", added);
+    }
+}
+
+async fn resolve_send_relays_for(
+    client: &nostr_sdk::Client,
+    state: &AppState,
+    target: nostr_sdk::PublicKey,
+) -> Option<Vec<String>> {
+    {
+        let cache = state.inbox_fetched.read().await;
+        if let Some(urls) = cache.get(&target) {
+            // Cache hit: still ensure the URLs are in the client pool, in
+            // case they were never added (e.g. seeded by `recipient_has_kind_10050`
+            // before any send routing happened) or got removed.
+            if urls.is_empty() {
+                return None;
+            }
+            let urls_clone = urls.clone();
+            drop(cache);
+            ensure_relays_in_client(client, &urls_clone).await;
+            return Some(urls_clone);
+        }
+    }
+
+    let inbox = crate::nostr::fetch_inbox_relays(client, target).await;
+    let resolved = if !inbox.is_empty() {
+        println!("[RUST] NIP-17 routing: {} inbox relays for {}", inbox.len(), target.to_hex());
+        inbox
+    } else {
+        let read = crate::nostr::fetch_read_relays(client, target).await;
+        if !read.is_empty() {
+            println!("[RUST] NIP-17 routing: no kind 10050; using {} read relays for {}", read.len(), target.to_hex());
+        } else {
+            println!("[RUST] NIP-17 routing: no list found for {}, will broadcast", target.to_hex());
+        }
+        read
+    };
+
+    state.inbox_fetched.write().await.insert(target, resolved.clone());
+
+    if resolved.is_empty() {
+        return None;
+    }
+    ensure_relays_in_client(client, &resolved).await;
+    Some(resolved)
+}
+
+/// NIP-17 gift-wrapped direct message send path.
+///
+/// Builds a kind-14 rumor (with optional `["message-id", ...]` tag for DM<->email
+/// matching), then publishes TWO gift wraps (kind 1059): one addressed to the
+/// recipient, one self-addressed for readback on fresh installs / second devices.
+/// `Client::send_private_msg` only sends the recipient wrap, so we go through
+/// `EventBuilder::gift_wrap` directly.
+///
+/// Returns the self-wrap event id — this is what our own kind 1059 subscription
+/// will see, so the DB row will be keyed by it.
+async fn send_gift_wrapped_dm(
+    client: &nostr_sdk::Client,
+    keys: &nostr_sdk::Keys,
+    recipient: &nostr_sdk::PublicKey,
+    content: &MessageContent,
+    message_id: Option<&str>,
+    state: &AppState,
+    app_handle: Option<&tauri::AppHandle>,
+) -> Result<String, String> {
+    use nostr_sdk::prelude::*;
+    use crate::types::MessageContent;
+
+    // The body of the rumor: plaintext for chat, or the email's NIP ciphertext blob
+    // verbatim for email-DMs (preserves the existing subject_hash <-> content_hash match).
+    let rumor_body: String = match content {
+        MessageContent::Plaintext(text) => text.clone(),
+        MessageContent::Encrypted(blob) => blob.clone(),
+    };
+
+    // Optional rumor tags. message-id goes inside the seal — encrypted twice,
+    // invisible to relays, only readable by the recipient.
+    let mut rumor_extra_tags: Vec<Tag> = Vec::new();
+    if let Some(mid) = message_id {
+        if !mid.is_empty() {
+            rumor_extra_tags.push(Tag::custom(TagKind::custom("message-id"), [mid.to_string()]));
+            println!("[RUST] NIP-17 rumor will carry message-id tag: {}", mid);
+        }
+    }
+
+    let our_pubkey = keys.public_key();
+
+    // Build the unsigned rumor once and gift-wrap it twice.
+    let rumor: UnsignedEvent = EventBuilder::private_msg_rumor(*recipient, rumor_body)
+        .tags(rumor_extra_tags)
+        .build(our_pubkey);
+
+    let wrap_to_recipient = EventBuilder::gift_wrap(keys, recipient, rumor.clone(), [])
+        .await
+        .map_err(|e| format!("gift_wrap (recipient) failed: {}", e))?;
+    let wrap_to_self = EventBuilder::gift_wrap(keys, &our_pubkey, rumor, [])
+        .await
+        .map_err(|e| format!("gift_wrap (self) failed: {}", e))?;
+
+    let recipient_wrap_id = wrap_to_recipient.id.to_hex();
+    let self_wrap_id = wrap_to_self.id.to_hex();
+    println!("[RUST] NIP-17 wraps built. recipient={}, self={}", recipient_wrap_id, self_wrap_id);
+
+    // Resolve target relays via NIP-17 inbox cascade. None ⇒ broadcast fallback.
+    let recipient_routed = resolve_send_relays_for(client, state, *recipient).await;
+
+    // Send recipient wrap first. If it fails everywhere, surface the error.
+    let recipient_output = match recipient_routed.as_ref() {
+        Some(urls) => client.send_event_to(urls.iter().map(|s| s.as_str()), &wrap_to_recipient).await,
+        None => client.send_event(&wrap_to_recipient).await,
+    }.map_err(|e| format!("send recipient wrap failed: {}", e))?;
+    println!(
+        "[RUST] NIP-17 recipient wrap sent. success={} failed={}",
+        recipient_output.success.len(), recipient_output.failed.len()
+    );
+
+    if !recipient_output.success.is_empty() {
+        let mut failed_map = state.failed_relays.lock().unwrap();
+        for relay_url in &recipient_output.success {
+            let relay_url_str = relay_url.to_string();
+            failed_map.remove(&relay_url_str);
+        }
+    }
+    if !recipient_output.failed.is_empty() {
+        let updated_relays = update_relay_status_from_send_failures(&recipient_output.failed, state).await;
+        if !updated_relays.is_empty() {
+            if let Some(ref app_handle) = app_handle {
+                let _ = app_handle.emit("relay-status-changed", &serde_json::json!({
+                    "updated_relays": updated_relays
+                }));
+            }
+        }
+    }
+    if recipient_output.success.is_empty() {
+        let failed_details: Vec<String> = recipient_output.failed.iter()
+            .map(|(url, err)| format!("{}: {}", url, err))
+            .collect();
+        return Err(format!(
+            "Failed to send NIP-17 wrap to any relay. All {} relays failed: {}",
+            recipient_output.failed.len(),
+            failed_details.join("; ")
+        ));
+    }
+
+    // Self-wrap is best-effort: if it fails, we still keep our local DB row via
+    // the manual handler trigger below; only second-device readback is impacted.
+    // Route via our own kind 10050 if we've published one — otherwise broadcast.
+    let self_routed = resolve_send_relays_for(client, state, our_pubkey).await;
+    let self_send = match self_routed.as_ref() {
+        Some(urls) => client.send_event_to(urls.iter().map(|s| s.as_str()), &wrap_to_self).await,
+        None => client.send_event(&wrap_to_self).await,
+    };
+    match self_send {
+        Ok(out) => println!(
+            "[RUST] NIP-17 self wrap sent. success={} failed={}",
+            out.success.len(), out.failed.len()
+        ),
+        Err(e) => println!("[RUST] NIP-17 self wrap publish failed: {} (continuing)", e),
+    }
+
+    // Manually trigger the gift-wrap live handler for the self-wrap so the
+    // sender sees their own message instantly — relays may not echo back fast
+    // enough. Mirrors the kind-4 path.
+    if let Some(app_handle) = app_handle {
+        let app_handle_clone = app_handle.clone();
+        let state_clone = state.clone();
+        let user_pubkey_clone = our_pubkey;
+        let event_clone = wrap_to_self.clone();
+        tokio::spawn(async move {
+            // Self-echo: no relay attribution (we built the wrap locally).
+            if let Err(e) = handle_live_gift_wrap(&event_clone, &app_handle_clone, &state_clone, &user_pubkey_clone, None).await {
+                println!("[RUST] Error manually handling sent gift wrap: {}", e);
+            }
+        });
+    }
+
+    Ok(self_wrap_id)
 }
 
 #[tauri::command]
@@ -863,6 +1259,7 @@ async fn send_direct_message(
         &request.recipient_pubkey,
         &request.content,
         request.encryption_algorithm.as_deref(),
+        request.message_id.as_deref(),
         &state,
         Some(&app_handle)
     )
@@ -1005,13 +1402,14 @@ async fn fetch_profile_persistent(pubkey: String, state: tauri::State<'_, AppSta
         
         // Fallback: Try using a fresh client connection
         let db = state.get_database().map_err(|e| format!("Failed to get database: {}", e))?;
-        let db_relays = db.get_all_relays()
+        let owner_pubkey = current_pubkey_hex_or_empty(&state);
+        let db_relays = db.get_all_relays(&owner_pubkey)
             .map_err(|e| format!("Failed to load relays from database: {}", e))?;
         let relay_urls: Vec<String> = db_relays.iter()
             .filter(|r| r.is_active)
             .map(|r| r.url.clone())
             .collect();
-        
+
         if !relay_urls.is_empty() {
             println!("[RUST] Fallback: Querying {} relays with fresh connection", relay_urls.len());
             match crate::nostr::fetch_events(&pubkey, Some(0), &relay_urls).await {
@@ -1950,15 +2348,16 @@ async fn fetch_profiles_persistent(pubkeys: Vec<String>, state: tauri::State<'_,
             fetch_duration, profile_events.len());
         
         // Fallback: Try using single fetches for remaining pubkeys
-        let db_relays = db.get_all_relays()
+        let owner_pubkey = current_pubkey_hex_or_empty(&state);
+        let db_relays = db.get_all_relays(&owner_pubkey)
             .map_err(|e| format!("Failed to load relays from database: {}", e))?;
         let relay_urls: Vec<String> = db_relays.iter()
             .filter(|r| r.is_active)
             .map(|r| r.url.clone())
             .collect();
-        
+
         if !relay_urls.is_empty() {
-            println!("[RUST] Fallback: Querying {} relays with fresh connection for {} pubkeys", 
+            println!("[RUST] Fallback: Querying {} relays with fresh connection for {} pubkeys",
                 relay_urls.len(), pubkeys_to_fetch.len());
             
             // Try fetching each pubkey individually using fallback
@@ -3627,25 +4026,42 @@ fn db_save_settings_batch(pubkey: String, settings: std::collections::HashMap<St
 }
 
 // Database commands for relays
+//
+// Relay rows are scoped per-pubkey. The Tauri command layer derives the
+// owning pubkey from `state.get_current_keys()` so the frontend never has to
+// send it. Pre-login (no keys loaded) the commands fall back to the `''`
+// template bucket, which is what the Settings page sees before sign-in.
+
+/// Returns the active user's hex pubkey, or `""` if no keys are loaded.
+/// `""` is the install-wide template bucket used by the seeded defaults.
+fn current_pubkey_hex_or_empty(state: &AppState) -> String {
+    state.get_current_keys()
+        .map(|k| k.public_key().to_hex())
+        .unwrap_or_default()
+}
+
 #[tauri::command]
 fn db_save_relay(relay: DbRelay, state: tauri::State<AppState>) -> Result<i64, String> {
     println!("[RUST] db_save_relay called");
     let db = state.get_database()?;
-    db.save_relay(&relay).map_err(|e| e.to_string())
+    let pubkey = current_pubkey_hex_or_empty(&state);
+    db.save_relay(&pubkey, &relay).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn db_get_all_relays(state: tauri::State<AppState>) -> Result<Vec<DbRelay>, String> {
     println!("[RUST] db_get_all_relays called");
     let db = state.get_database()?;
-    db.get_all_relays().map_err(|e| e.to_string())
+    let pubkey = current_pubkey_hex_or_empty(&state);
+    db.get_all_relays(&pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn db_delete_relay(url: String, state: tauri::State<AppState>) -> Result<(), String> {
     println!("[RUST] db_delete_relay called for url: {}", url);
     let db = state.get_database()?;
-    db.delete_relay(&url).map_err(|e| e.to_string())
+    let pubkey = current_pubkey_hex_or_empty(&state);
+    db.delete_relay(&pubkey, &url).map_err(|e| e.to_string())
 }
 
 // Database utility commands
@@ -4632,6 +5048,11 @@ fn sync_dms_from_events(events: Vec<NostrEvent>, db: crate::database::Database) 
         } else {
             raw_recipient.clone()
         };
+        // Pull `["message-id", ...]` tag if present (NIP-17 email-DM rumor).
+        let email_message_id = event.tags.iter()
+            .find(|tag| tag.get(0).map(|s| s == "message-id").unwrap_or(false))
+            .and_then(|tag| tag.get(1).cloned());
+
         DbDirectMessage {
             id: None,
             event_id: event.id.clone(),
@@ -4640,6 +5061,9 @@ fn sync_dms_from_events(events: Vec<NostrEvent>, db: crate::database::Database) 
             content: event.content.clone(),
             created_at: chrono::DateTime::from_timestamp(event.created_at, 0).unwrap_or_else(|| chrono::Utc::now()),
             received_at: chrono::Utc::now(),
+            email_message_id,
+            // Bulk fetch returns events without per-event relay attribution.
+            received_from_relay: None,
         }
     }).collect();
     // Save new DMs
@@ -4809,6 +5233,12 @@ fn sync_conversation_events(
             continue; // Skip messages not to user or contact
         }
         
+        // Pull `["message-id", ...]` if this event came from a NIP-17 unwrap path.
+        let email_message_id = event.tags.iter()
+            .find(|tag| tag.kind().as_str() == "message-id")
+            .and_then(|tag| tag.content())
+            .map(|s| s.to_string());
+
         let dm = DbDirectMessage {
             id: None,
             event_id: event.id.to_hex(),
@@ -4818,8 +5248,11 @@ fn sync_conversation_events(
             created_at: chrono::DateTime::from_timestamp(event.created_at.as_u64() as i64, 0)
                 .unwrap_or_else(|| chrono::Utc::now()),
             received_at: chrono::Utc::now(),
+            email_message_id,
+            // This batch path doesn't carry per-event relay attribution.
+            received_from_relay: None,
         };
-        
+
         match db.save_dm(&dm) {
             Ok(_) => saved_count += 1,
             Err(e) => {
@@ -4943,6 +5376,227 @@ async fn update_profile_persistent(private_key: Option<String>, fields: std::col
     Ok(())
 }
 
+/// Discover and add each DM contact's NIP-65 outbox write relays to the
+/// persistent client, so the upcoming kind-4 / kind-1059 subscription queries
+/// the relays those contacts actually publish to (gossip / outbox model).
+///
+/// This is the fix for "contact uses Primal/Amethyst whose write relays don't
+/// overlap our default set, so we never see their messages." Without this we
+/// only get events that happen to land on our hardcoded relays.
+///
+/// Skips pubkeys we've already fetched in this session (cached on AppState).
+/// Returns the number of NEW relay URLs added to the client. Best-effort:
+/// individual fetch failures are logged and skipped, never propagated.
+async fn fetch_and_add_contact_outboxes(
+    client: &nostr_sdk::Client,
+    state: &AppState,
+    user_pubkey_bech32: &str,
+) -> usize {
+    use nostr_sdk::prelude::*;
+
+    let db = match state.get_database() {
+        Ok(db) => db,
+        Err(e) => {
+            println!("[RUST] outbox: db unavailable: {}", e);
+            return 0;
+        }
+    };
+
+    let contact_pubkeys = match db.get_all_dm_pubkeys(user_pubkey_bech32) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[RUST] outbox: failed to load DM contacts: {}", e);
+            return 0;
+        }
+    };
+
+    if contact_pubkeys.is_empty() {
+        return 0;
+    }
+
+    // Filter to contacts we haven't fetched this session, parsing to PublicKey.
+    let to_fetch: Vec<PublicKey> = {
+        let cache = state.outbox_fetched.read().await;
+        contact_pubkeys.into_iter()
+            .filter_map(|pk_str| {
+                PublicKey::from_bech32(&pk_str)
+                    .or_else(|_| PublicKey::from_hex(&pk_str))
+                    .ok()
+            })
+            .filter(|pk| !cache.contains(pk))
+            .collect()
+    };
+
+    if to_fetch.is_empty() {
+        return 0;
+    }
+
+    println!("[RUST] outbox: fetching NIP-65 for {} contact(s)", to_fetch.len());
+
+    // Fetch in parallel with a small concurrency cap to avoid saturating relays.
+    use tokio::task::JoinSet;
+    let mut joinset: JoinSet<(PublicKey, Vec<String>)> = JoinSet::new();
+    for pk in to_fetch {
+        let client_clone = client.clone();
+        joinset.spawn(async move {
+            let urls = crate::nostr::fetch_outbox_relays(&client_clone, pk).await;
+            (pk, urls)
+        });
+    }
+
+    // Track existing client relays to compute "newly added" count.
+    let existing: std::collections::HashSet<String> = client.relays().await.keys()
+        .map(|u| u.to_string())
+        .collect();
+
+    let mut newly_added: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_fetched: Vec<PublicKey> = Vec::new();
+
+    while let Some(result) = joinset.join_next().await {
+        let (pk, urls) = match result {
+            Ok(t) => t,
+            Err(e) => {
+                println!("[RUST] outbox: fetch task panicked: {}", e);
+                continue;
+            }
+        };
+        all_fetched.push(pk);
+        for url in urls {
+            if existing.contains(&url) || newly_added.contains(&url) {
+                continue;
+            }
+            match client.add_relay(&url).await {
+                Ok(_) => {
+                    newly_added.insert(url);
+                }
+                Err(e) => {
+                    println!("[RUST] outbox: failed to add relay {}: {}", url, e);
+                }
+            }
+        }
+    }
+
+    // Mark all attempted contacts as fetched (even if their outbox was empty —
+    // re-querying won't help in this session).
+    {
+        let mut cache = state.outbox_fetched.write().await;
+        for pk in all_fetched {
+            cache.insert(pk);
+        }
+    }
+
+    if !newly_added.is_empty() {
+        println!("[RUST] outbox: added {} new relay(s) from contact NIP-65 lists", newly_added.len());
+        // Connect any newly-added relays so the upcoming subscription reaches them.
+        // The SDK's add_relay doesn't auto-connect on an existing client.
+        client.connect().await;
+    }
+
+    newly_added.len()
+}
+
+/// Single-pubkey outbox discovery: fetch the contact's NIP-65 write relays,
+/// add any new ones to the persistent client. Returns count of newly-added
+/// relays. Caches the pubkey so subsequent calls in the same session no-op.
+async fn fetch_outbox_for_pubkey(
+    client: &nostr_sdk::Client,
+    state: &AppState,
+    pubkey: nostr_sdk::PublicKey,
+) -> usize {
+    {
+        let cache = state.outbox_fetched.read().await;
+        if cache.contains(&pubkey) {
+            return 0;
+        }
+    }
+
+    let urls = crate::nostr::fetch_outbox_relays(client, pubkey).await;
+
+    state.outbox_fetched.write().await.insert(pubkey);
+
+    if urls.is_empty() {
+        return 0;
+    }
+
+    let existing: std::collections::HashSet<String> = client.relays().await.keys()
+        .map(|u| u.to_string())
+        .collect();
+
+    let mut added = 0usize;
+    for url in urls {
+        if existing.contains(&url) {
+            continue;
+        }
+        match client.add_relay(&url).await {
+            Ok(_) => added += 1,
+            Err(e) => println!("[RUST] outbox: failed to add relay {}: {}", url, e),
+        }
+    }
+
+    if added > 0 {
+        client.connect().await;
+        println!("[RUST] outbox: added {} relay(s) from contact {}", added, pubkey.to_hex());
+    }
+    added
+}
+
+/// Resubscribe with the existing filters so the relay pool extends the
+/// subscription to any newly-added relays. Re-uses the active subscription's
+/// filters and updates its `subscription_ids` in place.
+async fn resubscribe_active(client: &nostr_sdk::Client, state: &AppState) -> Result<(), String> {
+    let filters: Vec<nostr_sdk::Filter> = {
+        let guard = state.active_subscription.read().await;
+        match guard.as_ref() {
+            Some(sub) => sub.filters.clone(),
+            None => return Ok(()), // No subscription running, nothing to do
+        }
+    };
+
+    let mut new_ids = Vec::new();
+    for filter in &filters {
+        match client.subscribe(filter.clone(), None).await {
+            Ok(output) => new_ids.push(output.val),
+            Err(e) => {
+                println!("[RUST] resubscribe failed for one filter: {}", e);
+                return Err(format!("resubscribe failed: {}", e));
+            }
+        }
+    }
+
+    let mut guard = state.active_subscription.write().await;
+    if let Some(ref mut sub) = guard.as_mut() {
+        sub.subscription_ids = new_ids;
+    }
+    println!("[RUST] resubscribed active filters on widened relay set");
+    Ok(())
+}
+
+/// Get a clone of the persistent client, if one exists, for the outbox
+/// discovery background task. Returns None if the client isn't initialized
+/// (in which case there's nothing to subscribe with anyway).
+async fn client_for_outbox_discovery(state: &AppState) -> Option<nostr_sdk::Client> {
+    let guard = state.nostr_client.lock().unwrap();
+    guard.as_ref().cloned()
+}
+
+/// Spawn a background task: fetch outbox for `pubkey`, and if any new relays
+/// were added, resubscribe so the running filters extend to those relays.
+/// Non-blocking so live handlers stay snappy.
+fn spawn_outbox_discovery(
+    client: nostr_sdk::Client,
+    state: AppState,
+    pubkey: nostr_sdk::PublicKey,
+) {
+    tokio::spawn(async move {
+        let added = fetch_outbox_for_pubkey(&client, &state, pubkey).await;
+        if added > 0 {
+            if let Err(e) = resubscribe_active(&client, &state).await {
+                println!("[RUST] outbox: resubscribe error after adding {} relay(s): {}", added, e);
+            }
+        }
+    });
+}
+
 // Live Event Subscription System
 #[tauri::command]
 async fn start_live_event_subscription(
@@ -4961,8 +5615,15 @@ async fn start_live_event_subscription(
     let keys = Keys::new(secret_key);
     let user_pubkey = keys.public_key();
     
-    println!("[RUST] Starting subscription for user: {}", user_pubkey.to_bech32().unwrap_or_default());
-    
+    let user_pubkey_bech32 = user_pubkey.to_bech32().unwrap_or_default();
+    println!("[RUST] Starting subscription for user: {}", user_pubkey_bech32);
+
+    // NIP-65 outbox model: discover each DM contact's write relays and add
+    // them to the persistent client BEFORE creating the subscription. Without
+    // this, contacts whose outbox doesn't overlap our fixed relay set are
+    // invisible — Amethyst-style gossip routing fixes that.
+    let _added = fetch_and_add_contact_outboxes(&client, &state, &user_pubkey_bech32).await;
+
     // Get the latest DM timestamp for 'since' parameter to avoid gaps
     let since_timestamp = {
         let db = state.get_database().map_err(|e| e.to_string())?;
@@ -4994,8 +5655,22 @@ async fn start_live_event_subscription(
         dm_received_filter = dm_received_filter.since(Timestamp::from(since as u64));
     }
     filters.push(dm_received_filter);
-    
-    // Filter 3: Profile updates for user's own profile
+
+    // Filter 3: NIP-17 gift wraps (kind 1059) addressed to the user. Wraps are
+    // signed by random one-shot keys, so we filter on `#p` only (no author).
+    // Per NIP-59 the wrap's created_at is randomized up to 2 days in the past,
+    // so subtract 2 days from `since` to avoid missing recent wraps.
+    let mut gift_wrap_filter = Filter::new()
+        .kind(Kind::GiftWrap)
+        .pubkey(user_pubkey);
+
+    if let Some(since) = since_timestamp {
+        let adjusted = since.saturating_sub(172800); // 2 days
+        gift_wrap_filter = gift_wrap_filter.since(Timestamp::from(adjusted as u64));
+    }
+    filters.push(gift_wrap_filter);
+
+    // Filter 4: Profile updates for user's own profile
     let mut profile_filter = Filter::new()
         .kind(Kind::Metadata)
         .author(user_pubkey);
@@ -5036,19 +5711,83 @@ async fn start_live_event_subscription(
     };
     
     *state.active_subscription.write().await = Some(subscription);
-    
+
     // Spawn task to handle notifications
     let client_clone = client.clone();
     let app_handle_clone = app_handle.clone();
     let state_clone = state.inner().clone();
     let user_pubkey_clone = user_pubkey;
-    
+
     tokio::spawn(async move {
         handle_subscription_notifications(client_clone, app_handle_clone, state_clone, user_pubkey_clone).await;
     });
-    
+
+    // Background: publish/refresh our own kind 10050 + 10002 so other clients
+    // can find us. Idempotent — no-op if already up to date this session.
+    {
+        let client_for_publish = client.clone();
+        let state_for_publish = state.inner().clone();
+        tokio::spawn(async move {
+            if let Err(e) = publish_self_relay_lists(&client_for_publish, &state_for_publish, user_pubkey, false).await {
+                println!("[RUST] self-publish error: {}", e);
+            }
+        });
+    }
+
     println!("[RUST] Live event subscription started successfully");
     Ok(())
+}
+
+/// Re-publish kind 10050 + kind 10002 immediately. Frontend calls this after
+/// the user changes which relays are flagged for DM use, so other clients can
+/// learn the new inbox set without waiting for a session restart.
+#[tauri::command]
+async fn republish_relay_lists(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let client = {
+        let g = state.nostr_client.lock().unwrap();
+        g.as_ref().cloned()
+    };
+    let client = client.ok_or("nostr client not initialized")?;
+    let keys = state.get_current_keys().ok_or("no keys loaded")?;
+    *state.relay_lists_published_session.lock().unwrap() = false;
+    publish_self_relay_lists(&client, &state, keys.public_key(), true).await
+}
+
+/// Toggle a relay's "use for DMs" flag in the local DB. Caller (frontend)
+/// is expected to follow up with `republish_relay_lists` to push the change
+/// to the network.
+#[tauri::command]
+fn set_relay_dm_flag(
+    url: String,
+    use_for_dms: bool,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let db = state.get_database()?;
+    let pubkey = current_pubkey_hex_or_empty(&state);
+    db.set_relay_dm_flag(&pubkey, &url, use_for_dms).map_err(|e| e.to_string())
+}
+
+/// Whether the given recipient has published a NIP-17 inbox (kind 10050).
+/// Frontend calls this on conversation open to decide whether to show the
+/// "legacy NIP-04 fallback in use" warning banner. Result is memoized in
+/// `state.nip17_capable` for the session.
+#[tauri::command]
+async fn recipient_supports_nip17(
+    recipient_pubkey: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    use nostr_sdk::prelude::*;
+    let client = {
+        let g = state.nostr_client.lock().unwrap();
+        g.as_ref().cloned()
+    };
+    let client = client.ok_or("nostr client not initialized")?;
+    let pubkey = PublicKey::from_bech32(&recipient_pubkey)
+        .or_else(|_| PublicKey::from_hex(&recipient_pubkey))
+        .map_err(|e| format!("invalid pubkey: {}", e))?;
+    Ok(recipient_has_kind_10050(&client, &state, pubkey).await)
 }
 
 #[tauri::command]
@@ -5168,16 +5907,22 @@ async fn handle_subscription_notifications(
         
         while let Ok(notification) = notifications.recv().await {
             match notification {
-                RelayPoolNotification::Event { event, .. } => {
+                RelayPoolNotification::Event { event, relay_url, .. } => {
                     match event.kind {
                         Kind::EncryptedDirectMessage => {
                             let _notification_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
                             let _event_id = event.id.to_hex();
                             let _is_sent = event.pubkey == user_pubkey;
-                            
-                            println!("[RUST] Processing DM: {}", event.id.to_hex()[..8].to_string() + "...");
-                            if let Err(e) = handle_live_direct_message(&event, &app_handle, &state, &user_pubkey).await {
+
+                            println!("[RUST] Processing DM: {} (from {})", event.id.to_hex()[..8].to_string() + "...", relay_url);
+                            if let Err(e) = handle_live_direct_message(&event, &app_handle, &state, &user_pubkey, Some(&relay_url)).await {
                                 println!("[RUST] Error handling DM: {}", e);
+                            }
+                        },
+                        Kind::GiftWrap => {
+                            println!("[RUST] Processing gift wrap: {} (from {})", event.id.to_hex()[..8].to_string() + "...", relay_url);
+                            if let Err(e) = handle_live_gift_wrap(&event, &app_handle, &state, &user_pubkey, Some(&relay_url)).await {
+                                println!("[RUST] Error handling gift wrap: {}", e);
                             }
                         },
                         Kind::Metadata => {
@@ -5283,17 +6028,30 @@ async fn handle_subscription_notifications(
     println!("[RUST] Notification handler stopped");
 }
 
-// Handle live direct message events
+// Handle live direct message events. `relay_url` is `None` for the manual
+// trigger after our own send (we don't go through the network for self-echo).
 async fn handle_live_direct_message(
     event: &nostr_sdk::Event,
     app_handle: &tauri::AppHandle,
     state: &AppState,
     user_pubkey: &PublicKey,
+    relay_url: Option<&RelayUrl>,
 ) -> Result<(), String> {
     let _handler_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
     let _event_id = event.id.to_hex();
     let _is_sent = event.pubkey == *user_pubkey;
-    
+
+    // Discover this contact's NIP-65 outbox in the background. If we got this
+    // event already, the contact's relays must overlap with ours — but if the
+    // contact uses other relays too (typical), discovering them ensures we
+    // catch their *next* messages, even ones that don't reach our current set.
+    if event.pubkey != *user_pubkey {
+        let client_for_discovery = client_for_outbox_discovery(state).await;
+        if let Some(c) = client_for_discovery {
+            spawn_outbox_discovery(c, state.clone(), event.pubkey);
+        }
+    }
+
     // Convert sender_pubkey to npub format
     let sender_npub = event.pubkey.to_bech32().map_err(|e| e.to_string())?;
 
@@ -5309,6 +6067,8 @@ async fn handle_live_direct_message(
         })
         .unwrap_or_else(|| user_pubkey.to_bech32().unwrap_or_default());
 
+    let received_from_relay = relay_url.map(|u| u.to_string());
+
     // Create DirectMessage for database
     let dm = DbDirectMessage {
         id: None,
@@ -5319,8 +6079,10 @@ async fn handle_live_direct_message(
         created_at: chrono::DateTime::from_timestamp(event.created_at.as_u64() as i64, 0)
             .unwrap_or_else(|| chrono::Utc::now()),
         received_at: chrono::Utc::now(),
+        email_message_id: None,
+        received_from_relay: received_from_relay.clone(),
     };
-    
+
     // Save to database (will handle deduplication via UNIQUE constraint)
     let db = state.get_database().map_err(|e| e.to_string())?;
     let _save_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
@@ -5328,7 +6090,7 @@ async fn handle_live_direct_message(
         Ok(_) => {
             let _save_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             println!("[RUST] Saved live DM to database");
-            
+
             // Emit event to frontend
             let _emit_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             let dm_payload = serde_json::json!({
@@ -5337,7 +6099,8 @@ async fn handle_live_direct_message(
                 "recipient_pubkey": recipient_npub,
                 "content": event.content,
                 "created_at": event.created_at.as_u64(),
-                "is_live": true
+                "is_live": true,
+                "received_from_relay": received_from_relay,
             });
             
             if let Err(e) = app_handle.emit("dm-received", &dm_payload) {
@@ -5357,7 +6120,121 @@ async fn handle_live_direct_message(
             }
         }
     }
-    
+
+    Ok(())
+}
+
+/// Handle a live NIP-17 gift wrap (kind 1059): unwrap with our key, persist the
+/// inner kind-14 rumor as a DM row, and emit `dm-received` so the frontend
+/// updates instantly. Stores `rumor.content` verbatim — both for chat (plaintext)
+/// and email-DM (NIP ciphertext blob); the DB hash continues to match the
+/// email's `subject_hash` in the email-DM case.
+async fn handle_live_gift_wrap(
+    event: &nostr_sdk::Event,
+    app_handle: &tauri::AppHandle,
+    state: &AppState,
+    user_pubkey: &PublicKey,
+    relay_url: Option<&RelayUrl>,
+) -> Result<(), String> {
+    use nostr_sdk::prelude::*;
+
+    // Need our keys to decrypt the wrap.
+    let keys = state.get_current_keys().ok_or("No keys available for gift-wrap unwrap")?;
+
+    let unwrapped = match nip59::extract_rumor(&keys, event).await {
+        Ok(u) => u,
+        Err(e) => {
+            // Not for us, or malformed — log at debug level and bail.
+            println!("[RUST] gift wrap not unwrappable: {} (event {})", e, event.id.to_hex());
+            return Ok(());
+        }
+    };
+
+    let UnwrappedGift { sender, rumor } = unwrapped;
+
+    // Discover this sender's NIP-65 outbox in the background so we catch
+    // their next gift wraps on whichever relays they actually publish to.
+    // Skip self-wraps (sender == us).
+    if sender != *user_pubkey {
+        if let Some(c) = client_for_outbox_discovery(state).await {
+            spawn_outbox_discovery(c, state.clone(), sender);
+        }
+    }
+
+    // The rumor's `p` tag tells us the intended recipient (rumor.pubkey is the sender).
+    // For wraps we receive that we authored ourselves (self-wrap for readback), the
+    // rumor's `p` tag points at the actual recipient.
+    let rumor_p_tag = rumor.tags
+        .find(TagKind::p())
+        .and_then(|t| t.content());
+    let recipient_pubkey: PublicKey = match rumor_p_tag {
+        Some(hex_or_npub) => PublicKey::parse(hex_or_npub)
+            .unwrap_or(*user_pubkey),
+        None => *user_pubkey,
+    };
+
+    let sender_npub = sender.to_bech32().map_err(|e| e.to_string())?;
+    let recipient_npub = recipient_pubkey.to_bech32().map_err(|e| e.to_string())?;
+
+    // Pull the message-id rumor tag if present (email-DM case).
+    let email_message_id = rumor.tags
+        .find(TagKind::custom("message-id"))
+        .and_then(|t| t.content())
+        .map(|s| s.to_string());
+
+    if let Some(ref mid) = email_message_id {
+        println!("[RUST] gift wrap rumor carries message-id: {}", mid);
+    }
+
+    let received_from_relay = relay_url.map(|u| u.to_string());
+
+    let dm = DbDirectMessage {
+        id: None,
+        // Use the OUTER wrap's event_id for dedup (UNIQUE constraint on event_id).
+        // Same wrap delivered by multiple relays gets one row. The recipient's
+        // wrap and the sender's self-wrap have different event_ids, so both
+        // sides naturally store their own wrap.
+        event_id: event.id.to_hex(),
+        sender_pubkey: sender_npub.clone(),
+        recipient_pubkey: recipient_npub.clone(),
+        // Verbatim — preserves email-DM hash matching.
+        content: rumor.content.clone(),
+        // Inner rumor's timestamp (the actual send time), not the wrap's tweaked one.
+        created_at: chrono::DateTime::from_timestamp(rumor.created_at.as_u64() as i64, 0)
+            .unwrap_or_else(|| chrono::Utc::now()),
+        received_at: chrono::Utc::now(),
+        email_message_id,
+        received_from_relay: received_from_relay.clone(),
+    };
+
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    match db.save_dm(&dm) {
+        Ok(_) => {
+            let dm_payload = serde_json::json!({
+                "event_id": dm.event_id,
+                "sender_pubkey": dm.sender_pubkey,
+                "recipient_pubkey": dm.recipient_pubkey,
+                "content": dm.content,
+                "created_at": rumor.created_at.as_u64(),
+                "is_live": true,
+                "transport": "nip17",
+                "email_message_id": dm.email_message_id,
+                "received_from_relay": received_from_relay,
+            });
+            if let Err(e) = app_handle.emit("dm-received", &dm_payload) {
+                println!("[RUST] Failed to emit dm-received (nip17): {}", e);
+            }
+        }
+        Err(e) => {
+            if e.to_string().contains("UNIQUE constraint failed") {
+                // Duplicate wrap (already saved) — fine.
+            } else {
+                println!("[RUST] Failed to save unwrapped DM: {}", e);
+                return Err(format!("Failed to save unwrapped DM: {}", e));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -5567,25 +6444,35 @@ fn db_mark_as_read(message_id: String, state: tauri::State<AppState>) -> Result<
 #[tauri::command]
 fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String, _contact_pubkey: String, state: tauri::State<AppState>) -> Result<bool, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
-    
-    // Get the DM content hash for fast lookup
+
+    // 1. NIP-17 message-id rumor tag (preferred, exact-match link to email).
+    if let Some(mid) = db.get_dm_email_message_id_by_event_id(&dm_event_id)
+        .map_err(|e| e.to_string())? {
+        if !mid.is_empty() {
+            if let Some(_email) = db.find_email_by_message_id(&mid)
+                .map_err(|e| e.to_string())? {
+                println!("[RUST] dm-email match via message-id ({})", mid);
+                return Ok(true);
+            }
+        }
+    }
+
+    // 2. Hash fallback (legacy NIP-04 / NIP-44 over kind-4, or NIP-17 senders that
+    //    didn't set the message-id tag). Compares SHA-256 of stored DM content
+    //    against the email's subject_hash.
     let dm_content_hash = match db.get_dm_content_hash_by_event_id(&dm_event_id)
         .map_err(|e| e.to_string())? {
         Some(hash) => hash,
-        None => {
-            return Ok(false);
-        }
+        None => return Ok(false),
     };
-    
-    // Use hash-based lookup instead of scanning all emails
+
     match db.find_email_by_subject_hash(&dm_content_hash)
         .map_err(|e| e.to_string())? {
         Some(_email) => {
+            println!("[RUST] dm-email match via subject_hash fallback");
             Ok(true)
         },
-        None => {
-            Ok(false)
-        }
+        None => Ok(false),
     }
 }
 
@@ -6078,6 +6965,9 @@ pub fn run() {
         start_live_event_subscription,
         stop_live_event_subscription,
         get_live_subscription_status,
+        republish_relay_lists,
+        set_relay_dm_flag,
+        recipient_supports_nip17,
         db_save_draft,
         db_get_drafts,
         db_delete_draft,
@@ -6172,7 +7062,10 @@ pub async fn http_db_get_all_contacts(user_pubkey: String, app_state: std::sync:
 
 pub async fn http_db_get_all_relays(app_state: std::sync::Arc<AppState>) -> Result<Vec<DbRelay>, String> {
     let db = app_state.get_database()?;
-    db.get_all_relays().map_err(|e| e.to_string())
+    let pubkey = app_state.get_current_keys()
+        .map(|k| k.public_key().to_hex())
+        .unwrap_or_default();
+    db.get_all_relays(&pubkey).map_err(|e| e.to_string())
 }
 
 pub async fn http_db_get_emails(
@@ -6219,8 +7112,11 @@ pub async fn http_sync_relay_states(app_state: std::sync::Arc<AppState>) -> Resu
         let connected_relays = client.relays().await;
         
         let db = app_state.get_database().map_err(|e| e.to_string())?;
-        let all_db_relays = db.get_all_relays().map_err(|e| e.to_string())?;
-        
+        let owner_pubkey = app_state.get_current_keys()
+            .map(|k| k.public_key().to_hex())
+            .unwrap_or_default();
+        let all_db_relays = db.get_all_relays(&owner_pubkey).map_err(|e| e.to_string())?;
+
         let mut relays_to_update = Vec::new();
         for db_relay in all_db_relays.iter() {
             if db_relay.is_active {
@@ -6230,28 +7126,30 @@ pub async fn http_sync_relay_states(app_state: std::sync::Arc<AppState>) -> Resu
                 }
             }
         }
-        
+
         for relay_url in relays_to_update {
             let mut relays_guard = app_state.relays.lock().unwrap();
             if let Some(relay) = relays_guard.iter_mut().find(|r| r.url == relay_url) {
                 relay.is_active = false;
             }
-            
+
             let db = app_state.get_database().map_err(|e| e.to_string())?;
-            let all_relays = db.get_all_relays().map_err(|e| e.to_string())?;
+            let all_relays = db.get_all_relays(&owner_pubkey).map_err(|e| e.to_string())?;
             if let Some(db_relay) = all_relays.iter().find(|r| r.url == relay_url) {
                 let updated_relay = crate::database::DbRelay {
                     id: db_relay.id,
+                    pubkey: db_relay.pubkey.clone(),
                     url: relay_url.clone(),
                     is_active: false,
                     created_at: db_relay.created_at,
                     updated_at: chrono::Utc::now(),
+                    use_for_dms: db_relay.use_for_dms,
                 };
-                if let Err(e) = db.save_relay(&updated_relay) {
+                if let Err(e) = db.save_relay(&db_relay.pubkey, &updated_relay) {
                     println!("[RUST] Failed to update relay in database: {}", e);
                 }
             }
-            
+
             updated_relays.push(relay_url);
         }
     }

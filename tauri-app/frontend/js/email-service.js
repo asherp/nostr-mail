@@ -2042,13 +2042,17 @@ class EmailService {
                 console.log('[JS] Sending matching DM to contact:', contact.name);
                 // Send the NIP ciphertext (base64) directly as the DM content.
                 // This is already NIP-encrypted, so other Nostr clients can decrypt it.
+                // Pass the email's RFC-822 Message-ID so the NIP-17 path can
+                // attach a ["message-id", ...] rumor tag for direct DM<->email
+                // matching (alongside the legacy subject_hash<->content_hash path).
                 const dmCiphertext = this._subjectCiphertext;
                 if (dmCiphertext) {
                     try {
                         const dmResult = await TauriService.sendEncryptedDirectMessage(
                             contact.pubkey,
                             dmCiphertext,
-                            activeRelays
+                            activeRelays,
+                            messageId
                         );
                         console.log('[JS] DM sent successfully, event ID:', dmResult);
                         notificationService.showSuccess(`DM sent successfully (event ID: ${dmResult.substring(0, 16)}...)`);

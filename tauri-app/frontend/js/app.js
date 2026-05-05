@@ -2335,10 +2335,36 @@ NostrMailApp.prototype.tryDirectMessageInsertion = async function(dmData) {
                 <div class="message-meta">
                     <div class="message-time">${dateTimeDisplay}</div>
                     <span class="message-status live-message" title="Live message">⚡</span>
+                    <span class="message-meta-info" style="cursor: pointer;" title="Show message debug info"><i class="fas fa-circle-info"></i></span>
                 </div>
             </div>
         `;
-        
+
+        // Wire the debug-info icon. Build a synthetic `message` shape that
+        // matches what dm-service renders so the modal works identically.
+        const liveInfoIcon = messageDiv.querySelector('.message-meta-info');
+        if (liveInfoIcon && window.dmService && typeof window.dmService._showDmDebugModal === 'function') {
+            liveInfoIcon.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                window.dmService._showDmDebugModal({
+                    id: dmData.id,
+                    event_id: dmData.event_id,
+                    sender_pubkey: dmData.sender_pubkey,
+                    recipient_pubkey: dmData.recipient_pubkey,
+                    content: displayContent,
+                    raw_content: dmData.content,
+                    created_at: dmData.created_at,
+                    received_at: dmData.received_at,
+                    email_message_id: dmData.email_message_id,
+                    received_from_relay: dmData.received_from_relay,
+                    hasEmailMatch: false,
+                    is_sent: isOutgoing,
+                    confirmed: false,
+                }, isOutgoing);
+            });
+        }
+
         // Add to messages container
         messagesContainer.appendChild(messageDiv);
         
@@ -3891,6 +3917,11 @@ NostrMailApp.prototype.renderRelays = async function() {
                 <i class="fas fa-exclamation-circle"></i> ${errorMessage}
             </div>` : '';
             
+        // use_for_dms defaults to true if missing (matches DB default for legacy rows).
+        const useForDms = relay.use_for_dms !== false;
+        const dmTooltip = relay.is_active
+            ? 'Advertise this relay in your NIP-17 DM inbox (kind 10050) so other clients deliver DMs here'
+            : 'Activate the relay first to publish it as a DM inbox';
         relayItem.innerHTML = `
             <div class="relay-item-info">
                 <span class="relay-item-url">${relay.url}</span>
@@ -3902,15 +3933,20 @@ NostrMailApp.prototype.renderRelays = async function() {
             </div>
             <div class="relay-item-actions">
                 ${retryButtonHtml}
-                <label class="toggle-switch">
-                    <input type="checkbox" ${relay.is_active ? 'checked' : ''} data-relay-id="${relay.id}" data-relay-url="${relay.url}">
+                <label class="relay-toggle-group${relay.is_active ? '' : ' disabled'}" title="${dmTooltip}">
+                    <span class="relay-toggle-caption"><i class="fas fa-comments"></i> DM inbox</span>
+                    <input type="checkbox" class="relay-switch dm-relay-checkbox" ${useForDms ? 'checked' : ''} ${relay.is_active ? '' : 'disabled'} data-relay-url="${relay.url}">
+                </label>
+                <label class="relay-toggle-group" title="Connect to this relay (and publish it in your kind 10002 relay list)">
+                    <span class="relay-toggle-caption">Active</span>
+                    <input type="checkbox" class="relay-switch active-relay-checkbox" ${relay.is_active ? 'checked' : ''} data-relay-id="${relay.id}" data-relay-url="${relay.url}">
                 </label>
                 <button class="btn btn-danger btn-small" data-relay-id="${relay.id}" data-relay-url="${relay.url}">
                     <i class="fas fa-trash"></i>
                 </button>
             </div>
         `;
-        
+
         // Insert before the add-relay-section
         if (addRelaySection) {
             relaysList.insertBefore(relayItem, addRelaySection);
@@ -3919,8 +3955,22 @@ NostrMailApp.prototype.renderRelays = async function() {
         }
     });
     // Add event listeners after rendering
-    relaysList.querySelectorAll('input[type="checkbox"]').forEach(toggle => {
+    relaysList.querySelectorAll('input.active-relay-checkbox').forEach(toggle => {
         toggle.addEventListener('change', (e) => this.toggleRelayById(e.target.dataset.relayId, e.target.dataset.relayUrl));
+    });
+    relaysList.querySelectorAll('input.dm-relay-checkbox').forEach(toggle => {
+        toggle.addEventListener('change', async (e) => {
+            const url = e.target.dataset.relayUrl;
+            const useForDms = e.target.checked;
+            try {
+                await window.__TAURI__.core.invoke('set_relay_dm_flag', { url, useForDms });
+                await window.__TAURI__.core.invoke('republish_relay_lists');
+                console.log(`[JS] DM-flag for ${url} set to ${useForDms}, kind 10050 republished`);
+            } catch (err) {
+                console.error('[JS] Failed to update DM-relay flag:', err);
+                e.target.checked = !useForDms; // revert UI on failure
+            }
+        });
     });
     relaysList.querySelectorAll('.btn-danger').forEach(button => {
         button.addEventListener('click', (e) => this.removeRelayById(e.currentTarget.dataset.relayId, e.currentTarget.dataset.relayUrl));
@@ -4066,12 +4116,18 @@ NostrMailApp.prototype.addRelay = async function() {
                         id: null,
                         url,
                         is_active: true,
+                        use_for_dms: true,
                         created_at: new Date().toISOString(),
                         updated_at: new Date().toISOString()
                     }
                 });
                 domManager.clear('newRelayUrl');
                 await this.loadRelaysFromDatabase();
+                // Newly-added relay → republish kind 10002 (and 10050 since
+                // we default new relays to use_for_dms = true).
+                window.__TAURI__.core.invoke('republish_relay_lists').catch(e =>
+                    console.warn('[JS] republish_relay_lists after add failed:', e)
+                );
                 
                 // Add the new relay to the existing client without disconnecting others
                 try {
@@ -4117,16 +4173,25 @@ NostrMailApp.prototype.toggleRelayById = async function(relayId, relayUrl) {
             const intermediateStatus = newActiveState ? 'Connecting' : 'Disconnecting';
             this.updateSingleRelayStatus(relayUrl, intermediateStatus);
             
-            // Update the database first
+            // Update the database first. Preserve use_for_dms so that toggling
+            // active state doesn't accidentally re-enable DM-inclusion for a
+            // relay the user previously excluded.
             await TauriService.invoke('db_save_relay', {
                 relay: {
                     id: relay.id || null,
                     url: relay.url,
                     is_active: newActiveState,
+                    use_for_dms: relay.use_for_dms !== false,
                     created_at: relay.created_at,
                     updated_at: new Date().toISOString()
                 }
             });
+
+            // Active set changed → republish kind 10002 (and 10050 if this relay
+            // is also DM-flagged). Idempotent: no-op if URL set unchanged.
+            window.__TAURI__.core.invoke('republish_relay_lists').catch(e =>
+                console.warn('[JS] republish_relay_lists after toggle failed:', e)
+            );
             
             // Update the backend Nostr client connection immediately
             try {
@@ -4204,7 +4269,11 @@ NostrMailApp.prototype.removeRelayById = async function(relayId, relayUrl) {
             
             await TauriService.invoke('db_delete_relay', { url: relay.url });
             await this.loadRelaysFromDatabase();
-            
+            // Removed relay → republish kind 10050 + 10002 to drop it.
+            window.__TAURI__.core.invoke('republish_relay_lists').catch(e =>
+                console.warn('[JS] republish_relay_lists after remove failed:', e)
+            );
+
             // Restore scroll position after update (adjust for removed item)
             if (relaysList) {
                 relaysList.scrollTop = Math.max(0, scrollTop - 60); // Approximate height of one relay item
@@ -4643,14 +4712,20 @@ NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) 
     if (profileHeader) {
         if (isViewingOwnProfile) {
             profileHeader.textContent = 'Profile';
-            // Hide contacts back button when viewing own profile
+            // Hide BOTH back buttons. You only reach your own profile via the
+            // sidebar nav (or via the active-account chip), so there's nothing
+            // meaningful for "Back" to go to — and the previous behavior of
+            // letting the landscape CSS rule re-show `back-to-nav-btn`
+            // produced a button that looked like history navigation but had no
+            // history target.
+            // The !important on `back-to-nav-btn` beats the
+            // `responsive.css:502` rule (which uses `!important` to enforce
+            // icon-only sizing in landscape ≤1024px viewports).
             if (profileBackButton) {
                 profileBackButton.style.display = 'none';
             }
-            // Clear any !important left over from a prior contact view, so
-            // showPage() (portrait) or the landscape CSS rule can show it
             if (navBackButton) {
-                navBackButton.style.removeProperty('display');
+                navBackButton.style.setProperty('display', 'none', 'important');
             }
         } else {
             // Get contact name if available

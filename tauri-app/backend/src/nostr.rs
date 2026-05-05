@@ -107,150 +107,6 @@ pub async fn publish_event(
     Ok(event_id.to_hex())
 }
 
-#[allow(dead_code)]
-pub async fn send_direct_message(
-    private_key: &str,
-    recipient_pubkey: &str,
-    message: &str,
-    relays: &[String],
-) -> Result<String> {
-    // Initialize rustls on Android before creating client
-    init_android_rustls();
-    
-    // Parse keys from bech32 format
-    let secret_key = SecretKey::from_bech32(private_key)?;
-    let keys = Keys::new(secret_key.clone());
-    let recipient = PublicKey::from_bech32(recipient_pubkey)?;
-    
-    // Create client
-    let client = Client::new(keys.clone());
-    if relays.is_empty() {
-        client.add_relay("wss://nostr-pub.wellorder.net").await?;
-        client.add_relay("wss://relay.damus.io").await?;
-    } else {
-        for relay in relays {
-            client.add_relay(relay.clone()).await?;
-        }
-    }
-    client.connect().await;
-    
-    // Check if the message is already encrypted (base64-like pattern, reasonable length)
-    let is_already_encrypted = message.len() >= 20 && 
-        message.chars().all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '+' || c == '/' || c == '=') &&
-        !message.contains('@') && 
-        !message.contains("Re:") && 
-        !message.contains("Fwd:") &&
-        !message.contains("FW:") &&
-        !message.contains("Subject:") &&
-        !message.contains("From:") &&
-        !message.contains("To:");
-    
-    let encrypted_content = if is_already_encrypted {
-        println!("[NOSTR] Message appears to be already encrypted, using as-is");
-        message.to_string()
-    } else {
-        println!("[NOSTR] Encrypting message using NIP-04");
-        // Encrypt the message using NIP-04
-        nip04::encrypt(&secret_key, &recipient, message)?
-    };
-    
-    println!("[NOSTR] Final encrypted content: {}", &encrypted_content[..encrypted_content.len().min(50)]);
-    
-    // Create the encrypted direct message event manually
-    let event = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content)
-        .tag(Tag::public_key(recipient))
-        .build(keys.public_key())
-        .sign_with_keys(&keys)?;
-    
-    println!("[NOSTR] Created encrypted direct message event with ID: {}", event.id.to_hex());
-    println!("[NOSTR] Event content length: {}", event.content.len());
-    println!("[NOSTR] Event tags: {:?}", event.tags);
-    
-    // Send the event to relays
-    let event_id = client.send_event(&event).await?;
-    
-    println!("[NOSTR] Successfully sent encrypted direct message, event ID: {}", event_id.to_hex());
-    
-    Ok(event_id.to_hex())
-}
-
-#[allow(dead_code)]
-pub async fn send_direct_message_with_content(
-    private_key: &str,
-    recipient_pubkey: &str,
-    content: &crate::types::MessageContent,
-    relays: &[String],
-    encryption_algorithm: Option<&str>,
-) -> Result<String> {
-    // Initialize rustls on Android before creating client
-    init_android_rustls();
-    
-    // Parse keys from bech32 format
-    let secret_key = SecretKey::from_bech32(private_key)?;
-    let keys = Keys::new(secret_key.clone());
-    let recipient = PublicKey::from_bech32(recipient_pubkey)?;
-    
-    // Create client
-    let client = Client::new(keys.clone());
-    if relays.is_empty() {
-        client.add_relay("wss://nostr-pub.wellorder.net").await?;
-        client.add_relay("wss://relay.damus.io").await?;
-    } else {
-        for relay in relays {
-            client.add_relay(relay.clone()).await?;
-        }
-    }
-    client.connect().await;
-    
-    // Determine encryption algorithm (default to NIP-44)
-    let algorithm = encryption_algorithm.unwrap_or("nip44");
-    println!("[NOSTR] Using encryption algorithm: {}", algorithm);
-    
-    // Handle content based on its type
-    let encrypted_content = match content {
-        crate::types::MessageContent::Plaintext(text) => {
-            println!("[NOSTR] Encrypting plaintext message using {}", algorithm.to_uppercase());
-            match algorithm {
-                "nip04" => {
-                    // Use NIP-04 encryption
-                    nip04::encrypt(&secret_key, &recipient, text)?
-                },
-                "nip44" => {
-                    // Use NIP-44 encryption
-                    nip44::encrypt(&secret_key, &recipient, text, nip44::Version::default())?
-                },
-                _ => {
-                    println!("[NOSTR] Unknown encryption algorithm: {}, defaulting to NIP-44", algorithm);
-                    nip44::encrypt(&secret_key, &recipient, text, nip44::Version::default())?
-                }
-            }
-        },
-        crate::types::MessageContent::Encrypted(text) => {
-            println!("[NOSTR] Using already encrypted content as-is");
-            text.clone()
-        },
-    };
-    
-    println!("[NOSTR] Final encrypted content: {}", &encrypted_content[..encrypted_content.len().min(50)]);
-    
-    // Create the encrypted direct message event manually
-    let event = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content)
-        .tag(Tag::public_key(recipient))
-        .build(keys.public_key())
-        .sign_with_keys(&keys)?;
-    
-    println!("[NOSTR] Created encrypted direct message event with ID: {}", event.id.to_hex());
-    println!("[NOSTR] Event content length: {}", event.content.len());
-    println!("[NOSTR] Event tags: {:?}", event.tags);
-    
-    // Send the event to relays
-    let event_id = client.send_event(&event).await?;
-    
-    println!("[NOSTR] Successfully sent encrypted direct message, event ID: {}", event_id.to_hex());
-    
-    Ok(event_id.to_hex())
-}
-
 pub async fn check_message_confirmation(event_id: &str, relays: &[String]) -> Result<bool> {
     println!("[NOSTR] check_message_confirmation called for event: {}", event_id);
     
@@ -319,49 +175,58 @@ pub struct ConversationMessage {
     pub is_sent: bool,
 }
 
-/// Fetch direct messages using a provided client (for use with persistent client)
+/// Fetch direct messages using a provided client (for use with persistent client).
+///
+/// Fetches both kind 4 (legacy NIP-04 / NIP-44-over-kind-4) and kind 1059
+/// (NIP-17 gift wraps). Gift wraps are unwrapped here and projected into the
+/// same `NostrEvent` shape as the rumor (kind 14): `id` is the outer wrap's id
+/// (for dedup), `pubkey` / `created_at` / `tags` / `content` come from the
+/// inner rumor. Per NIP-59 the wrap's created_at is randomized up to 2 days in
+/// the past, so when filtering by `since` we subtract 2 days for the wrap
+/// filter to avoid missing recent wraps.
 pub async fn fetch_direct_messages_with_client(
     client: &Client,
     keys: &Keys,
     since: Option<i64>,
 ) -> Result<Vec<NostrEvent>> {
-    // Create filter for encrypted direct messages - fetch both sent and received
+    // Kind 4 (legacy NIP-04) — fetch both sent and received.
     let mut sent_filter = Filter::new()
         .kind(Kind::EncryptedDirectMessage)
         .author(keys.public_key());
     let mut received_filter = Filter::new()
         .kind(Kind::EncryptedDirectMessage)
         .pubkey(keys.public_key());
+    // Kind 1059 (NIP-17 gift wraps) — random author, filter on #p only.
+    // self-wraps are addressed to us so this catches our own sent messages too.
+    let mut gift_wrap_filter = Filter::new()
+        .kind(Kind::GiftWrap)
+        .pubkey(keys.public_key());
     if let Some(since_ts) = since {
         let ts = Timestamp::from(since_ts as u64);
         sent_filter = sent_filter.since(ts);
         received_filter = received_filter.since(ts);
+        let wrap_since = since_ts.saturating_sub(172800); // 2 days, see nip59 RANGE_RANDOM_TIMESTAMP_TWEAK
+        gift_wrap_filter = gift_wrap_filter.since(Timestamp::from(wrap_since as u64));
     }
-    
-    // Get events for both sent and received
-    // Use shorter timeout (2 seconds) optimized for mock servers, same as profile fetch
+
+    // Get events for all three filters
     let sent_events = client.fetch_events(sent_filter, Duration::from_secs(2)).await?;
     let received_events = client.fetch_events(received_filter, Duration::from_secs(2)).await?;
-    
-    // Combine and deduplicate events
-    let mut all_events = sent_events;
-    all_events.extend(received_events);
-    
-    // Remove duplicates based on event ID
-    let mut unique_events = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
-    
-    for event in all_events {
+    let gift_wraps = client.fetch_events(gift_wrap_filter, Duration::from_secs(2)).await?;
+
+    // Combine kind-4 events and dedupe.
+    let mut all_kind4 = sent_events;
+    all_kind4.extend(received_events);
+    let mut unique_kind4 = Vec::new();
+    let mut seen_ids: std::collections::HashSet<EventId> = std::collections::HashSet::new();
+    for event in all_kind4 {
         if seen_ids.insert(event.id) {
-            unique_events.push(event);
+            unique_kind4.push(event);
         }
     }
-    
-    // Sort by timestamp (newest first)
-    unique_events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    
-    // Convert to our format
-    let nostr_events: Vec<NostrEvent> = unique_events.into_iter().map(|event| {
+
+    // Convert kind-4 events to NostrEvent.
+    let mut nostr_events: Vec<NostrEvent> = unique_kind4.into_iter().map(|event| {
         NostrEvent {
             id: event.id.to_hex(),
             pubkey: event.pubkey.to_bech32().unwrap_or_default(),
@@ -372,7 +237,36 @@ pub async fn fetch_direct_messages_with_client(
             sig: event.sig.to_string(),
         }
     }).collect();
-    
+
+    // Unwrap each gift wrap; skip any that fail (not for us, malformed, etc.)
+    for wrap in gift_wraps {
+        if !seen_ids.insert(wrap.id) {
+            continue;
+        }
+        let unwrapped = match nip59::extract_rumor(keys, &wrap).await {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("[NOSTR] gift wrap {} unwrap failed: {}", wrap.id.to_hex(), e);
+                continue;
+            }
+        };
+        // Project the rumor into NostrEvent shape. id stays as the outer wrap's
+        // id (for dedup); everything else comes from the rumor.
+        let rumor = unwrapped.rumor;
+        nostr_events.push(NostrEvent {
+            id: wrap.id.to_hex(),
+            pubkey: rumor.pubkey.to_bech32().unwrap_or_default(),
+            created_at: rumor.created_at.as_u64() as i64,
+            kind: rumor.kind.as_u16(),
+            tags: rumor.tags.iter().map(|tag| tag.as_slice().to_vec()).collect(),
+            content: rumor.content,
+            sig: String::new(), // rumor is unsigned per NIP-17
+        });
+    }
+
+    // Sort by timestamp (newest first)
+    nostr_events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
     Ok(nostr_events)
 }
 
@@ -497,12 +391,154 @@ pub fn parse_profile_from_event(event: &NostrEvent) -> Result<Profile> {
     })
 }
 
-// Utility function to decrypt DM content
+/// Fetch a contact's NIP-65 outbox (kind 10002) write relays via the persistent
+/// client. Returns normalized URLs (trimmed) for relay tags marked `"write"` or
+/// with no marker (which means both read+write per NIP-65). Returns an empty
+/// vec if no kind-10002 event is found or any error occurs — caller should
+/// treat that as "no outbox known, skip."
+pub async fn fetch_outbox_relays(client: &Client, pubkey: PublicKey) -> Vec<String> {
+    let filter = Filter::new()
+        .kind(Kind::RelayList)
+        .author(pubkey)
+        .limit(1);
+    let events = match client.fetch_events(filter, Duration::from_secs(2)).await {
+        Ok(events) => events,
+        Err(e) => {
+            eprintln!("[NOSTR] fetch_outbox_relays failed for {}: {}", pubkey.to_hex(), e);
+            return Vec::new();
+        }
+    };
+
+    // RelayList is replaceable; pick the most recent.
+    let event = match events.into_iter().max_by_key(|e| e.created_at.as_u64()) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+
+    let mut urls = Vec::new();
+    for tag in event.tags.iter() {
+        let slice = tag.as_slice();
+        if slice.first().map(|s| s.as_str()) != Some("r") {
+            continue;
+        }
+        let url = match slice.get(1) {
+            Some(u) if !u.is_empty() => u.trim().to_string(),
+            _ => continue,
+        };
+        // Marker is optional: if absent, relay is read+write. If "read", skip
+        // (we want write relays only — that's where the user *publishes*).
+        let is_write = match slice.get(2).map(|s| s.as_str()) {
+            None | Some("") => true,
+            Some("write") => true,
+            Some("read") => false,
+            Some(_) => true, // Unknown marker — treat as both, like most clients
+        };
+        if is_write {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+/// Fetch a contact's NIP-17 DM inbox (kind 10050) relays via the persistent
+/// client. Reads `["relay", url]` tags (NIP-17 spec — note the tag NAME is
+/// `"relay"`, not `"r"` like NIP-65). Returns trimmed URLs, or empty vec on
+/// any failure or absent list.
+pub async fn fetch_inbox_relays(client: &Client, pubkey: PublicKey) -> Vec<String> {
+    let filter = Filter::new()
+        .kind(Kind::from(10050u16))
+        .author(pubkey)
+        .limit(1);
+    let events = match client.fetch_events(filter, Duration::from_secs(2)).await {
+        Ok(events) => events,
+        Err(e) => {
+            eprintln!("[NOSTR] fetch_inbox_relays failed for {}: {}", pubkey.to_hex(), e);
+            return Vec::new();
+        }
+    };
+
+    let event = match events.into_iter().max_by_key(|e| e.created_at.as_u64()) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+
+    let mut urls = Vec::new();
+    for tag in event.tags.iter() {
+        let slice = tag.as_slice();
+        if slice.first().map(|s| s.as_str()) != Some("relay") {
+            continue;
+        }
+        if let Some(u) = slice.get(1) {
+            if !u.is_empty() {
+                urls.push(u.trim().to_string());
+            }
+        }
+    }
+    urls
+}
+
+/// Fetch a contact's NIP-65 read relays (kind 10002 with marker `read` or
+/// unmarked = both). Used as a second-tier fallback for NIP-17 send routing
+/// when the recipient hasn't published a kind 10050.
+pub async fn fetch_read_relays(client: &Client, pubkey: PublicKey) -> Vec<String> {
+    let filter = Filter::new()
+        .kind(Kind::RelayList)
+        .author(pubkey)
+        .limit(1);
+    let events = match client.fetch_events(filter, Duration::from_secs(2)).await {
+        Ok(events) => events,
+        Err(e) => {
+            eprintln!("[NOSTR] fetch_read_relays failed for {}: {}", pubkey.to_hex(), e);
+            return Vec::new();
+        }
+    };
+
+    let event = match events.into_iter().max_by_key(|e| e.created_at.as_u64()) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+
+    let mut urls = Vec::new();
+    for tag in event.tags.iter() {
+        let slice = tag.as_slice();
+        if slice.first().map(|s| s.as_str()) != Some("r") {
+            continue;
+        }
+        let url = match slice.get(1) {
+            Some(u) if !u.is_empty() => u.trim().to_string(),
+            _ => continue,
+        };
+        let is_read = match slice.get(2).map(|s| s.as_str()) {
+            None | Some("") => true,
+            Some("read") => true,
+            Some("write") => false,
+            Some(_) => true,
+        };
+        if is_read {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+// Utility function to decrypt DM content.
+//
+// NIP-17 chat rumors store plaintext directly as the row's `content`. Such rows
+// don't need (and would fail) NIP-44/NIP-04 decryption. We detect this up front
+// via `crypto::detect_encryption_format` and pass plaintext through unchanged.
+// Only content that actually looks like NIP ciphertext goes through the
+// decrypt attempts.
 pub fn decrypt_dm_content(
     private_key: &str,
     sender_pubkey: &str,
     encrypted_content: &str,
 ) -> Result<String> {
+    // Plaintext NIP-17 rumor content — return verbatim, don't attempt decrypt.
+    let detected_format = crate::crypto::detect_encryption_format(encrypted_content);
+    if detected_format == "unknown" {
+        return Ok(encrypted_content.to_string());
+    }
+
     let secret_key = SecretKey::from_bech32(private_key)
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {:?}", e))?;
     let sender = parse_pubkey(sender_pubkey)

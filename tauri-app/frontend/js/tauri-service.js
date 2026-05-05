@@ -140,7 +140,7 @@ const TauriService = {
     encryptMessageWithAlgorithm: async function(publicKey, message, algorithm) {
         return await this.invoke('encrypt_message_with_algorithm', { publicKey, message, algorithm });
     },
-    sendDirectMessage: async function(recipientPubkey, message, relays) {
+    sendDirectMessage: async function(recipientPubkey, message, relays, messageId) {
         const isEncrypted = Utils.isLikelyEncryptedContent(message);
         const settings = window.appState?.getSettings();
         const encryptionAlgorithm = settings?.encryption_algorithm || 'nip44';
@@ -150,11 +150,12 @@ const TauriService = {
                 { Encrypted: message } :
                 { Plaintext: message },
             relays: relays,
-            encryption_algorithm: encryptionAlgorithm
+            encryption_algorithm: encryptionAlgorithm,
+            message_id: messageId || null
         };
         return await this.invoke('send_direct_message', { request });
     },
-    sendEncryptedDirectMessage: async function(recipientPubkey, encryptedMessage, relays) {
+    sendEncryptedDirectMessage: async function(recipientPubkey, encryptedMessage, relays, messageId) {
         const detectedFormat = window.Utils?.detectEncryptionFormat(encryptedMessage) || 'unknown';
         let encryptionAlgorithm;
         if (detectedFormat === 'nip04' || detectedFormat === 'nip44') {
@@ -167,7 +168,8 @@ const TauriService = {
             recipient_pubkey: recipientPubkey,
             content: { Encrypted: encryptedMessage },
             relays: relays,
-            encryption_algorithm: encryptionAlgorithm
+            encryption_algorithm: encryptionAlgorithm,
+            message_id: messageId || null
         };
         return await this.invoke('send_direct_message', { request });
     },
@@ -339,6 +341,13 @@ const TauriService = {
     },
     getRelayStatus: async function() {
         return await this.invoke('get_relay_status');
+    },
+    // Returns true iff `recipientPubkey` has published a NIP-17 inbox
+    // (kind 10050). When false, the conversation page surfaces a warning
+    // banner explaining the message will be sent via legacy NIP-04 instead.
+    // Backend memoizes the result for the session.
+    recipientSupportsNip17: async function(recipientPubkey) {
+        return await this.invoke('recipient_supports_nip17', { recipientPubkey });
     },
     initPersistentNostrClient: async function() {
         return await this.invoke('init_persistent_nostr_client', {});

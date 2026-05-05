@@ -137,14 +137,30 @@ body.dark-mode .status-disconnecting .fa-spinner {
 .relay-item-actions {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 16px;
 }
 
-.relay-item-actions .toggle-switch {
+.relay-item-actions .relay-toggle-group {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: 6px;
     cursor: pointer;
+}
+
+.relay-item-actions .relay-toggle-group.disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.relay-item-actions .relay-toggle-caption {
+    font-size: 0.85em;
+    color: #555;
+    white-space: nowrap;
+    user-select: none;
+}
+
+body.dark-mode .relay-item-actions .relay-toggle-caption {
+    color: #c0c0c0;
 }
 
 .relay-item-actions input[type="checkbox"] {
@@ -157,6 +173,11 @@ body.dark-mode .status-disconnecting .fa-spinner {
     position: relative;
     cursor: pointer;
     transition: background-color 0.3s;
+    margin: 0;
+}
+
+.relay-item-actions input[type="checkbox"]:disabled {
+    cursor: not-allowed;
 }
 
 .relay-item-actions input[type="checkbox"]::before {

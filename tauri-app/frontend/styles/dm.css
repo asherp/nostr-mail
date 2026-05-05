@@ -254,6 +254,45 @@ body.dark-mode .dm-search-icon {
     position: relative;
 }
 
+/* Banner that appears above the conversation header when the recipient
+   hasn't published a NIP-17 inbox (kind 10050). Indicates that messages
+   in this conversation transparently fall back to legacy NIP-04, which
+   leaks recipient metadata to relays. Mirrors `.dm-debug-note` palette
+   for consistency. */
+.conversation-encryption-warning {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 14px;
+    background: #fff8e1;
+    border-bottom: 1px solid #f0c878;
+    color: #6c5e1a;
+    font-size: 13px;
+    line-height: 1.4;
+    flex-shrink: 0;
+}
+
+.conversation-encryption-warning i {
+    color: #b8860b;
+    font-size: 14px;
+    margin-top: 2px;
+    flex-shrink: 0;
+}
+
+.conversation-encryption-warning strong {
+    font-weight: 700;
+}
+
+body.dark-mode .conversation-encryption-warning {
+    background: #3a3320;
+    color: #d4cba0;
+    border-bottom-color: #c4a050;
+}
+
+body.dark-mode .conversation-encryption-warning i {
+    color: #e0b85a;
+}
+
 /* Back button styling */
 .dm-back-to-list-btn {
     display: flex;
@@ -430,6 +469,208 @@ body.dark-mode .dm-back-to-list-btn:hover {
 
 .message-status.confirmed {
     color: #2196F3;
+}
+
+/* DM debug modal: make body scrollable when content overflows. The base
+   `.modal` rule sets `max-height: 80vh; overflow: hidden`, so without a
+   flex layout the body just gets clipped. Mirrors `#headersModal`. */
+#dmDebugModal .modal {
+    display: flex;
+    flex-direction: column;
+}
+#dmDebugModal .modal-body {
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+/* Debug-info icon — opens the per-message debug modal. Mirrors the
+   email-emoji visual treatment so it sits unobtrusively in message-meta. */
+.message-meta .message-meta-info {
+    font-size: 12px;
+    opacity: 0.55;
+    margin-left: 2px;
+    transition: opacity 0.15s ease;
+}
+
+.message-meta .message-meta-info:hover {
+    opacity: 1;
+}
+
+.message-sent .message-meta .message-meta-info {
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.message-received .message-meta .message-meta-info {
+    color: var(--muted-color);
+}
+
+/* DM debug modal contents. Single linear stack of label+value rows; each
+   row puts the label inline with its value so the modal scans top-to-bottom
+   in one column. Long values wrap onto a second line under the label. */
+.dm-debug-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 16px;
+    font-size: 13px;
+}
+
+.dm-debug-row {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.dm-debug-key {
+    color: #6c757d;
+    font-weight: 600;
+    white-space: nowrap;
+    flex: 0 0 auto;
+}
+
+.dm-debug-val {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    word-break: break-all;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.dm-debug-val code {
+    background: #f5f5f5;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.dm-debug-empty {
+    color: #adb5bd;
+    font-style: italic;
+}
+
+/* Single header-level "Copy as JSON" button. Sits next to the close button
+   in the modal-header, so the whole snapshot can be lifted into a bug
+   report or external tool with one click. */
+.dm-debug-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.dm-debug-copy-json {
+    background: #f0f4ff;
+    border: 1px solid #c8d2eb;
+    color: #4a5568;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 5px 12px;
+    border-radius: 5px;
+    transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.dm-debug-copy-json:hover {
+    background: #dde6fb;
+    border-color: #a8b8d8;
+    color: #2d3748;
+}
+
+body.dark-mode .dm-debug-copy-json {
+    background: #2d3748;
+    border-color: #4a5568;
+    color: #cbd5e0;
+}
+
+body.dark-mode .dm-debug-copy-json:hover {
+    background: #3a4a64;
+    border-color: #5a6a84;
+    color: #e2e8f0;
+}
+
+.dm-debug-section {
+    margin-top: 14px;
+}
+
+.dm-debug-section-title {
+    font-weight: 600;
+    font-size: 12px;
+    color: #6c757d;
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.dm-debug-note {
+    font-size: 12px;
+    color: #6c757d;
+    background: #fff8e1;
+    border-left: 3px solid #f0c878;
+    padding: 6px 10px;
+    margin-bottom: 6px;
+    border-radius: 3px;
+    line-height: 1.5;
+}
+
+.dm-debug-note code {
+    font-size: 11px;
+    background: rgba(0, 0, 0, 0.06);
+    padding: 0 4px;
+    border-radius: 3px;
+}
+
+body.dark-mode .dm-debug-note {
+    background: #3a3320;
+    color: #d4cba0;
+    border-left-color: #c4a050;
+}
+
+body.dark-mode .dm-debug-note code {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.dm-debug-pre {
+    background: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 220px;
+    overflow-y: auto;
+    margin: 0;
+}
+
+body.dark-mode .dm-debug-key,
+body.dark-mode .dm-debug-section-title {
+    color: #adb5bd;
+}
+
+body.dark-mode .dm-debug-val code {
+    background: #2d3748;
+    color: #e2e8f0;
+}
+
+body.dark-mode .dm-debug-pre {
+    background: #2d3748;
+    border-color: #4a5568;
+    color: #e2e8f0;
+}
+
+body.dark-mode .dm-debug-copy {
+    color: #adb5bd;
+}
+
+body.dark-mode .dm-debug-copy:hover {
+    color: #e2e8f0;
+    background-color: #4a5568;
 }
 
 /* Email emoji styling */
@@ -696,4 +937,4 @@ body.dark-mode .unknown-recipient-pubkey,
 body.dark-mode .no-profile-warn-pubkey {
     color: #b8c0d8;
     opacity: 0.85;
-} 
+}

@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
-// Embed config file at compile time for Android builds
-#[cfg(target_os = "android")]
+// Embed config file at compile time so packaged builds always have defaults,
+// regardless of whether nostr-mail-config.json is shipped alongside the binary.
 const EMBEDDED_CONFIG: &str = include_str!("../nostr-mail-config.json");
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -156,57 +156,27 @@ impl Database {
         let db = Database { conn: Arc::new(Mutex::new(conn)) };
         db.init_tables()?;
         
-        // Determine config path: use NOSTR_MAIL_CONFIG if set, otherwise use platform-specific approach
+        // In test mode (NOSTR_MAIL_CONFIG set), load config from the given path.
+        // Otherwise use the embedded JSON — packaged installs (Windows, macOS, Linux,
+        // Android) all rely on this since CARGO_MANIFEST_DIR doesn't exist on the user's machine.
         let is_test_mode = std::env::var("NOSTR_MAIL_CONFIG").is_ok();
-        
-        #[cfg(target_os = "android")]
-        {
-            // On Android, use embedded config content
-            if !is_test_mode {
-                println!("[DB] Loading config data from embedded config (Android)");
-                let config_loaded = db.load_config_data_from_str(EMBEDDED_CONFIG).is_ok();
-                if !config_loaded {
-                    println!("[DB] Warning: Failed to parse embedded config data");
-                } else {
-                    println!("[DB] Successfully loaded config data from embedded config");
-                }
-            } else {
-                // Test mode: use environment variable path
-                let config_path = std::env::var("NOSTR_MAIL_CONFIG").unwrap();
-                println!("[DB] Loading config data from: {} (test mode)", config_path);
-                let config_loaded = db.load_config_data(&config_path).is_ok();
-                if !config_loaded {
-                    println!("[DB] Failed to load test config from {}: file not found or invalid", config_path);
-                } else {
-                    println!("[DB] Successfully loaded config data from {}", config_path);
-                }
-            }
-        }
-        
-        #[cfg(not(target_os = "android"))]
-        {
-            // On desktop, use file path
-            let config_path = if is_test_mode {
-                std::env::var("NOSTR_MAIL_CONFIG").unwrap()
-            } else {
-                // Default to nostr-mail-config.json in backend directory
-                let default_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("nostr-mail-config.json");
-                default_path.to_string_lossy().to_string()
-            };
-            
-            // Load config data - this will handle relay seeding from the config file
-            println!("[DB] Loading config data from: {}", config_path);
+
+        if is_test_mode {
+            let config_path = std::env::var("NOSTR_MAIL_CONFIG").unwrap();
+            println!("[DB] Loading config data from: {} (test mode)", config_path);
             let config_loaded = db.load_config_data(&config_path).is_ok();
-            
             if !config_loaded {
-                if is_test_mode {
-                    println!("[DB] Failed to load test config from {}: file not found or invalid", config_path);
-                } else {
-                    println!("[DB] Warning: Failed to load config from {}: file not found or invalid", config_path);
-                }
+                println!("[DB] Failed to load test config from {}: file not found or invalid", config_path);
             } else {
                 println!("[DB] Successfully loaded config data from {}", config_path);
+            }
+        } else {
+            println!("[DB] Loading config data from embedded config");
+            let config_loaded = db.load_config_data_from_str(EMBEDDED_CONFIG).is_ok();
+            if !config_loaded {
+                println!("[DB] Warning: Failed to parse embedded config data");
+            } else {
+                println!("[DB] Successfully loaded config data from embedded config");
             }
         }
         
@@ -277,21 +247,14 @@ impl Database {
         Ok(())
     }
     
-    /// Get config file content - embedded on Android, from file on desktop
+    /// Get config file content. In test mode (NOSTR_MAIL_CONFIG set), reads from
+    /// that path so tests can swap in their own config. Otherwise returns the
+    /// JSON embedded at compile time.
     fn get_config_content() -> std::result::Result<String, String> {
-        #[cfg(target_os = "android")]
-        {
-            // On Android, use embedded config
-            Ok(EMBEDDED_CONFIG.to_string())
+        if let Ok(path) = std::env::var("NOSTR_MAIL_CONFIG") {
+            return std::fs::read_to_string(&path).map_err(|e| format!("{}", e));
         }
-        
-        #[cfg(not(target_os = "android"))]
-        {
-            // On desktop, read from file
-            let json_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("nostr-mail-config.json");
-            std::fs::read_to_string(&json_path)
-                .map_err(|e| format!("{}", e))
-        }
+        Ok(EMBEDDED_CONFIG.to_string())
     }
 
     /// Compute SHA256 hash of encrypted content for fast lookups

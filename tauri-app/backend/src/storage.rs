@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-// Embed config file at compile time for Android builds
-#[cfg(target_os = "android")]
+// Embed config file at compile time so packaged builds always have defaults,
+// regardless of whether nostr-mail-config.json is shipped alongside the binary.
 const EMBEDDED_CONFIG: &str = include_str!("../nostr-mail-config.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,21 +348,13 @@ impl Storage {
         ]
     }
     
-    /// Get config file content - embedded on Android, from file on desktop
+    /// Get config file content. In test mode (NOSTR_MAIL_CONFIG set), reads from
+    /// that path. Otherwise returns the JSON embedded at compile time.
     fn get_config_content() -> std::result::Result<String, String> {
-        #[cfg(target_os = "android")]
-        {
-            // On Android, use embedded config
-            Ok(EMBEDDED_CONFIG.to_string())
+        if let Ok(path) = std::env::var("NOSTR_MAIL_CONFIG") {
+            return fs::read_to_string(&path).map_err(|e| format!("{}", e));
         }
-        
-        #[cfg(not(target_os = "android"))]
-        {
-            // On desktop, read from file
-            let json_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("nostr-mail-config.json");
-            fs::read_to_string(&json_path)
-                .map_err(|e| format!("{}", e))
-        }
+        Ok(EMBEDDED_CONFIG.to_string())
     }
     
     // Utility methods

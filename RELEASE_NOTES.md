@@ -1,3 +1,27 @@
+# Release Notes - v1.0.6
+
+## Overview
+
+v1.0.6 is a patch release that fixes default-relay seeding on packaged desktop installs. v1.0.5 baked the build machine's source path into the binary, so first-run relay seeding silently failed on every Mac, Windows, and Linux machine that wasn't the build host — leaving new installs with no default relays. The config JSON is now embedded into the binary on every platform.
+
+## What's Fixed
+
+### 🛰️ Default Relays on Fresh Installs (All Desktop Platforms)
+- Default relay list (`nostr-mail-config.json`) is now embedded at compile time on macOS, Windows, and Linux — matching the existing Android behavior
+- Previous releases resolved the config via `env!("CARGO_MANIFEST_DIR")`, which expands to the build machine's source path. On packaged installs that directory doesn't exist, so seeding silently no-op'd and new accounts started with an empty relay list
+- `NOSTR_MAIL_CONFIG` env var still overrides the embedded config for tests
+
+### 🌐 Landing Page
+- Added Windows (NSIS setup) and Linux (AppImage) download buttons
+- Fixed Android download link (was pointing at the dropped universal APK; now points at the arm64 APK that releases actually ship)
+
+## Upgrade Notes
+
+- Existing installs with a populated relay list are unaffected — the seeding path only runs when the relays table is empty
+- If your previous install ended up with no default relays due to this bug, restart the app on v1.0.6: the lazy first-read seeding clones the embedded defaults into your account's relay list on next access
+
+---
+
 # Release Notes - v1.0.5
 
 ## Overview

@@ -88,6 +88,180 @@ class EmailService {
         return contact;
     }
 
+    // Default avatar (gray silhouette SVG).
+    _defaultAvatarDataUrl() {
+        return 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+    }
+
+    // Resolve sender identity for incoming email rendering.
+    // SECURITY: when a Nostr pubkey is attached to the email, contacts are matched
+    // ONLY by pubkey. Falling back to From: address would let an attacker spoof the
+    // SMTP header to borrow a known contact's avatar/name while signing with their
+    // own key — combined with the green Signature Verified badge that would look
+    // like the contact signed it.
+    _resolveSender(email) {
+        if (!this._contactsByPubkey) this._buildContactIndex();
+
+        const senderPubkey = email.sender_pubkey || email.nostr_pubkey || null;
+        const signatureValid = email.signature_valid === true || email.signature_valid === 1;
+        const fromAddress = email.from || email.from_address || '';
+        const defaultAvatar = this._defaultAvatarDataUrl();
+
+        let contact = null;
+        let isUnknownSigner = false;
+
+        if (senderPubkey) {
+            contact = this._contactsByPubkey.get(senderPubkey) || null;
+            if (!contact) isUnknownSigner = true;
+        } else {
+            contact = this._findContact(null, fromAddress);
+        }
+
+        let avatarSrc = defaultAvatar;
+        let avatarClass = 'contact-avatar';
+        if (contact) {
+            const validDataUrl = contact.picture_data_url
+                && contact.picture_data_url.startsWith('data:image')
+                && contact.picture_data_url !== 'data:application/octet-stream;base64,';
+            if (contact.picture_loading) {
+                avatarClass += ' loading';
+            } else if (validDataUrl) {
+                avatarSrc = contact.picture_data_url;
+            } else if (contact.picture) {
+                avatarSrc = contact.picture;
+            }
+        }
+
+        // For unknown signers we display the From: email address as the identity
+        // label (the user already knows what email address this arrived from).
+        // The cryptographic identity surfaces separately as the "Unknown contact"
+        // chip and inside the expanded metadata's Profile: <npub> row. Only fall
+        // back to truncated hex when there is no From: at all.
+        let identityName;
+        if (contact) {
+            identityName = contact.name || contact.display_name || fromAddress;
+        } else if (fromAddress) {
+            identityName = fromAddress;
+        } else if (senderPubkey) {
+            identityName = senderPubkey.substring(0, 16) + '...';
+        } else {
+            identityName = '';
+        }
+
+        return {
+            senderPubkey,
+            signatureValid,
+            hasSignature: !!senderPubkey,
+            contact,
+            isUnknownSigner,
+            identityName,
+            fromAddress,
+            avatarSrc,
+            avatarClass,
+            defaultAvatar,
+        };
+    }
+
+    // Render the sender line for a list card: identity (contact name or the
+    // From: address) with badges attached. When the contact is known and the
+    // identity name differs from the From: address, the raw From: is shown
+    // muted alongside. When the signer is unknown, the identity name IS the
+    // From: address (set by _resolveSender), so the secondary span is omitted
+    // to avoid duplication.
+    _renderSenderLine(senderInfo, signatureIndicator) {
+        const name = Utils.escapeHtml(senderInfo.identityName);
+        const from = Utils.escapeHtml(senderInfo.fromAddress);
+        const unknownBadge = this._renderUnknownContactBadge(senderInfo);
+        if (senderInfo.hasSignature) {
+            const showSecondary = senderInfo.fromAddress
+                && senderInfo.identityName !== senderInfo.fromAddress;
+            const secondary = showSecondary
+                ? ` <span class="email-sender-secondary">&lt;${from}&gt;</span>`
+                : '';
+            return `${name} ${signatureIndicator}${unknownBadge}${secondary}`;
+        }
+        return `${from} ${signatureIndicator}`;
+    }
+
+    // Warning chip shown when the signer's pubkey is not in the user's contacts.
+    // Clickable: opens the profile preview modal (wired by _wireViewProfileButtons).
+    // This is the single entry point for viewing/adding an unknown signer's profile.
+    _renderUnknownContactBadge(senderInfo) {
+        if (!senderInfo.isUnknownSigner || !senderInfo.senderPubkey) return '';
+        const pk = Utils.escapeHtml(senderInfo.senderPubkey);
+        return ` <button type="button" class="unknown-contact-indicator view-profile-btn" data-pubkey="${pk}" title="This signer's pubkey is not in your contacts. Click to view their profile."><i class="fas fa-question-circle"></i> Unknown contact</button>`;
+    }
+
+    // Synchronously convert a hex pubkey to npub form. Falls back to hex when
+    // the crypto-service NIP-19 module hasn't loaded yet.
+    _pubkeyToNpub(pubkey) {
+        if (!pubkey) return '';
+        try {
+            if (window.cryptoService && window.cryptoService._nip19) {
+                return window.cryptoService._nip19.npubEncode(pubkey);
+            }
+        } catch (e) {
+            console.warn('[JS] npubEncode failed, using hex:', e);
+        }
+        return pubkey;
+    }
+
+    // Header row for the expanded email-metadata <details> panel that shows
+    // the signer's npub plus a "View Profile" chip linking to their kind:0.
+    // Returns empty string when there is no Nostr pubkey on the email.
+    _renderProfileMetadataRow(senderInfo) {
+        if (!senderInfo || !senderInfo.senderPubkey) return '';
+        const pk = Utils.escapeHtml(senderInfo.senderPubkey);
+        const npub = Utils.escapeHtml(this._pubkeyToNpub(senderInfo.senderPubkey));
+        return `<div class="email-header-row"><span class="email-header-label">Profile:</span> <span class="email-header-value email-profile-npub"><code>${npub}</code><button type="button" class="view-profile-chip view-profile-btn" data-pubkey="${pk}" title="View Nostr profile"><i class="fas fa-id-badge"></i> View Profile</button></span></div>`;
+    }
+
+    // Open the Nostr profile (kind:0) for the given pubkey using the standard
+    // contacts-page profile detail view — same UI as the contact-search /
+    // Add-Contact flow, including the public/private follow toggle. Reuses
+    // the existing contacts-page rendering rather than maintaining a parallel
+    // modal layout.
+    async viewSenderProfile(pubkey) {
+        if (!pubkey) return;
+        if (!window.contactsService || typeof window.contactsService.showProfileForAdding !== 'function') {
+            notificationService.showError('Contacts service not available');
+            return;
+        }
+        try {
+            notificationService.showInfo('Fetching profile from relays...');
+            const profile = await TauriService.fetchProfilePersistent(pubkey);
+            if (!profile) {
+                notificationService.showError('Could not fetch profile for this public key');
+                return;
+            }
+            if (window.app && typeof window.app.switchTab === 'function') {
+                window.app.switchTab('contacts');
+            }
+            if (typeof window.contactsService.loadContacts === 'function') {
+                await window.contactsService.loadContacts();
+            }
+            await new Promise(r => setTimeout(r, 100));
+            await window.contactsService.showProfileForAdding(pubkey, profile);
+        } catch (err) {
+            console.error('[JS] Failed to view sender profile:', err);
+            notificationService.showError('Failed to fetch sender profile: ' + (err.message || err));
+        }
+    }
+
+    // Wire any .view-profile-btn elements inside a container to viewSenderProfile.
+    _wireViewProfileButtons(container) {
+        if (!container) return;
+        container.querySelectorAll('.view-profile-btn').forEach(btn => {
+            if (btn.dataset.wired === '1') return;
+            btn.dataset.wired = '1';
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const pk = btn.dataset.pubkey;
+                if (pk) this.viewSenderProfile(pk);
+            });
+        });
+    }
+
     // Get appropriate background color for Nostr contact input based on dark mode
     getNostrContactInputBackgroundColor() {
         const isDarkMode = document.body.classList.contains('dark-mode');
@@ -943,6 +1117,194 @@ class EmailService {
         }
 
         console.log('[JS] NIP-04 auto-sign complete, signature:', signature.substring(0, 16) + '...');
+    }
+
+    // Sign the compose body currently in the DOM.
+    // Reads messageBody from the DOM, parses armor, extracts signable bytes via backend,
+    // signs+verifies, rebuilds armored body with SIGNATURE block, updates DOM + _plainBody +
+    // _htmlBody, and toggles signBtn UI state. Throws on any failure so callers can abort.
+    //
+    // This is the awaitable replacement for dispatching signBtn.click() — both the manual
+    // Encrypt button and the auto-sign step inside sendEncryptedEmail call this directly.
+    // Fixes two bugs vs. the previous click-handler version:
+    //   1. Honors gs.encodeSigPubkey's `combined` flag (handler ignored it, leaving
+    //      encodedSig/encodedPubkey undefined when metaPubkey was set → no SIGNATURE block).
+    //   2. Derives isEncrypted from the parsed armor's bodyType instead of relying on
+    //      encryptBtn.dataset.encrypted (which is only set on the manual encrypt path).
+    async signComposedBody() {
+        const signBtn = domManager.get('signBtn');
+        const iconSpan = signBtn && signBtn.querySelector('.sign-btn-icon i');
+        const labelSpan = signBtn && signBtn.querySelector('.sign-btn-label');
+
+        const keypair = appState.getKeypair();
+        if (!keypair) {
+            throw new Error('No keypair available for signing.');
+        }
+
+        const rawBodyValue = domManager.getValue('messageBody') || '';
+        if (!rawBodyValue) {
+            throw new Error('Message body must be filled to sign.');
+        }
+
+        const gs = window.GlossiaService;
+        const metaSig = this.getGlossiaEncodingSignature();
+        const metaPubkey = this.getGlossiaEncodingPubkey();
+
+        // Parse armor structure via the capnp-validated Rust parser. The capnp ArmorMessage
+        // schema is the canonical parsing target — see docs/encryption-architecture.md §8.
+        const armorParts = await this.parseArmorComponentsRust(rawBodyValue);
+        const isArmored = !!(armorParts && armorParts.bodyText && !armorParts.prefixText);
+        // Detect encrypted state from the armor itself, not from encryptBtn.dataset.encrypted
+        // (the auto-encrypt path never toggles that button, so trusting it would mis-classify
+        // freshly auto-encrypted bodies as plaintext and produce broken output).
+        const isEncrypted = !!(isArmored && armorParts.isEncryptedBody);
+
+        let bodyValue;
+        let quotedPlaintext = null;
+
+        if (isArmored) {
+            bodyValue = armorParts.bodyText;
+            this._quotedOriginalArmor = armorParts.quotedArmor || null;
+        } else {
+            const splitResult = this.splitReplyAndQuoted(rawBodyValue);
+            bodyValue = splitResult.quotedOriginal ? splitResult.replyText : rawBodyValue;
+            if (splitResult.quotedOriginal) {
+                const qParts = await this.parseArmorComponentsRust(splitResult.quotedOriginal);
+                if (qParts && qParts.prefixText) {
+                    quotedPlaintext = qParts.prefixText;
+                    const armorStart = splitResult.quotedOriginal.indexOf('-----');
+                    this._quotedOriginalArmor = armorStart >= 0
+                        ? splitResult.quotedOriginal.substring(armorStart).trim()
+                        : splitResult.quotedOriginal;
+                } else {
+                    this._quotedOriginalArmor = splitResult.quotedOriginal;
+                }
+            }
+        }
+
+        const quotedArmorForSig = this._quotedOriginalArmor || null;
+        const glossiaEncoding = !isArmored ? (this.getGlossiaEncoding() || null) : null;
+        const dataBytes = new Uint8Array(await TauriService.extractSignableBytes(
+            bodyValue, isArmored, quotedArmorForSig, glossiaEncoding
+        ));
+
+        const [signature, isValid] = await TauriService.signAndVerifyBytes(dataBytes);
+        if (!isValid) {
+            throw new Error('Signature verification failed.');
+        }
+
+        const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
+        let encodedSig = null;
+        let encodedPubkey = null;
+        let encodedSigPubkey = null;
+
+        if (gs) {
+            const result = await gs.encodeSigPubkey(signature, pubkeyHex, metaSig, metaPubkey);
+            if (result.combined) {
+                encodedSigPubkey = result.encodedSigPubkey;
+            } else {
+                encodedSig = result.encodedSig;
+                encodedPubkey = result.encodedPubkey;
+            }
+        } else {
+            encodedSig = signature;
+            encodedPubkey = pubkeyHex;
+        }
+
+        // Look up sender name from profile cache or contacts
+        let profileName = null;
+        let displayName = null;
+        try {
+            const cached = localStorage.getItem('nostr_mail_profiles');
+            if (cached) {
+                const profile = JSON.parse(cached)[keypair.public_key];
+                profileName = profile?.fields?.name || null;
+                displayName = profile?.fields?.display_name || null;
+            }
+        } catch (_) {}
+        if (!profileName && !displayName) {
+            const contacts = appState.getContacts() || [];
+            const selfContact = contacts.find(c => c.pubkey === pubkeyHex);
+            profileName = selfContact?.name || null;
+        }
+
+        // Build new armored body
+        const encAlgo = isEncrypted ? (appState.getSettings()?.encryption_algorithm || 'nip44') : null;
+        let newBody;
+        if (isArmored) {
+            newBody = this.buildPlainBody(
+                bodyValue, encodedSig, encodedPubkey,
+                profileName, displayName, isEncrypted, encAlgo, null, encodedSigPubkey,
+                this._quotedOriginalArmor
+            );
+        } else {
+            // Plaintext: glossia-encode body and build SIGNED BODY armor per spec 3.2
+            const origPlain = quotedPlaintext ? bodyValue + '\n\n' + quotedPlaintext : bodyValue;
+            let plainBodyText = bodyValue;
+            if (gs) {
+                const metaBody = this.getGlossiaEncoding();
+                if (metaBody) {
+                    try {
+                        const encoded = await gs.transcode(bodyValue, `encode into ${metaBody}`);
+                        plainBodyText = encoded.output;
+                    } catch (e) {
+                        console.warn('[JS] Sign: glossia-encode plaintext body failed:', e);
+                    }
+                }
+            }
+            newBody = this.buildPlainBody(
+                plainBodyText, encodedSig, encodedPubkey,
+                profileName, displayName, false, null, origPlain, encodedSigPubkey,
+                this._quotedOriginalArmor
+            );
+        }
+        domManager.setValue('messageBody', newBody);
+
+        // Update sign button state
+        if (signBtn) {
+            signBtn.dataset.signed = 'true';
+            signBtn.dataset.signature = signature;
+            signBtn.dataset.originalBody = rawBodyValue;
+            if (iconSpan) iconSpan.className = 'fas fa-check-circle';
+            if (labelSpan) labelSpan.textContent = 'Signed';
+            signBtn.classList.add('signed');
+        }
+
+        // Build HTML alternative body for multipart email
+        const quotedHtmlContent = await this.buildRecursiveQuotedHtml(
+            this._quotedOriginalArmor, quotedPlaintext
+        );
+        this._htmlBody = this.buildHtmlAlt(
+            bodyValue, encodedSig, encodedPubkey, profileName, displayName,
+            metaSig, metaPubkey, encodedSigPubkey, quotedHtmlContent
+        );
+
+        // Rebuild _plainBody for the multipart MIME alt
+        const origPlainForMime = (!isEncrypted && quotedPlaintext)
+            ? bodyValue + '\n\n' + quotedPlaintext
+            : (isEncrypted ? null : bodyValue);
+        let plainBodyText = bodyValue;
+        if (!isEncrypted && gs) {
+            const metaBody = this.getGlossiaEncoding();
+            if (metaBody) {
+                try {
+                    const encoded = await gs.transcode(bodyValue, `encode into ${metaBody}`);
+                    plainBodyText = encoded.output;
+                } catch (e) {
+                    console.warn('[JS] Failed to glossia-encode plaintext body:', e);
+                }
+            }
+        }
+        this._plainBody = this.buildPlainBody(
+            plainBodyText, encodedSig, encodedPubkey, profileName, displayName,
+            isEncrypted, encAlgo, origPlainForMime, encodedSigPubkey,
+            this._quotedOriginalArmor
+        );
+        if (this._plainBody) {
+            domManager.setValue('messageBody', this._plainBody);
+        }
+
+        console.log('[JS] signComposedBody: signed and verified');
     }
 
     // Inject a signature verification badge into an HTML email body.
@@ -2027,10 +2389,28 @@ class EmailService {
                 // Restore original contact selection
                 this.selectedNostrContact = originalContact;
             }
-            
-            console.log('[JS] Email encryption check:', { 
-                isSubjectEncrypted, 
-                isBodyEncrypted, 
+
+            // Auto-sign after encryption. Calls signComposedBody() directly so the result
+            // is awaitable and failures propagate (vs. dispatching signBtn.click() which
+            // ran an async event listener with no Promise to await).
+            const autoSign = settings && settings.automatically_sign !== false;
+            const signBtnAuto = domManager.get('signBtn');
+            if (autoSign && signBtnAuto && signBtnAuto.dataset.signed !== 'true' && isEmailEncrypted) {
+                console.log('[JS] Auto-sign: signing after auto-encrypt');
+                try {
+                    await this.signComposedBody();
+                    subject = domManager.getValue('subject') || subject;
+                    body = domManager.getValue('messageBody') || body;
+                } catch (e) {
+                    console.error('[JS] Auto-sign failed; aborting send:', e);
+                    notificationService.showError('Auto-sign failed: ' + (e && e.message ? e.message : e));
+                    return;
+                }
+            }
+
+            console.log('[JS] Email encryption check:', {
+                isSubjectEncrypted,
+                isBodyEncrypted,
                 isEmailEncrypted,
                 shouldSendDm,
                 subjectPreview: subject.substring(0, 50),
@@ -2928,30 +3308,22 @@ class EmailService {
             transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
         }
 
-        // Get sender contact for avatar (O(1) lookup via pre-built index)
-        const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
-        const senderContact = this._findContact(senderPubkey, email.from || email.from_address);
-
-        // Avatar fallback logic (copied from dm-service.js)
-        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
-        let avatarSrc = defaultAvatar;
-        let avatarClass = 'contact-avatar';
-        const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
-        if (senderContact && senderContact.picture_loading) {
-            avatarClass += ' loading';
-        } else if (isValidDataUrl) {
-            avatarSrc = senderContact.picture_data_url;
-        } else if (senderContact && senderContact.picture_data_url && !isValidDataUrl && senderContact.picture) {
-            avatarSrc = senderContact.picture;
-        } else if (senderContact && senderContact.picture) {
-            avatarSrc = senderContact.picture;
-        }
+        // Resolve sender identity (strict pubkey match when signed — see _resolveSender)
+        const senderInfo = this._resolveSender(email);
+        // Suppress the green "Signature Verified" badge for unknown signers —
+        // a valid signature from a stranger isn't trust-worthy in itself, and
+        // the "Unknown contact" chip is doing the warning. Invalid sigs still
+        // show the red badge.
+        const effectiveSigIndicator = (senderInfo.isUnknownSigner && email.signature_valid === true)
+            ? ''
+            : signatureIndicator;
+        const senderLine = this._renderSenderLine(senderInfo, effectiveSigIndicator);
 
         emailElement.innerHTML = `
-            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.from)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <img class="${senderInfo.avatarClass}" src="${senderInfo.avatarSrc}" alt="${Utils.escapeHtml(senderInfo.identityName)}'s avatar" onerror="this.onerror=null;this.src='${senderInfo.defaultAvatar}';this.className='contact-avatar';">
             <div class="email-content">
                 <div class="email-header">
-                    <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator} ${signatureIndicator} ${transportAuthIndicator}</div>
+                    <div class="email-sender email-list-strong">${senderLine} ${attachmentIndicator} ${transportAuthIndicator}</div>
                     <div class="email-date">${dateDisplay}${email.message_count > 1 ? `<span class="thread-badge" title="${email.message_count} messages">${email.message_count}</span>` : ''}</div>
                 </div>
                 ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
@@ -2963,6 +3335,8 @@ class EmailService {
                 </button>
             </div>
         `;
+
+        this._wireViewProfileButtons(emailElement);
 
         // Add hover and click handlers for invalid signature indicator
         if (email.signature_valid === false) {
@@ -3046,29 +3420,15 @@ class EmailService {
         const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
-        // Get sender contact for avatar (O(1) lookup via pre-built index)
-        const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
-        const senderContact = this._findContact(senderPubkey, email.from || email.from_address);
-
-        const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
-        let avatarSrc = defaultAvatar;
-        let avatarClass = 'contact-avatar';
-        const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
-        if (senderContact && senderContact.picture_loading) {
-            avatarClass += ' loading';
-        } else if (isValidDataUrl) {
-            avatarSrc = senderContact.picture_data_url;
-        } else if (senderContact && senderContact.picture_data_url && !isValidDataUrl && senderContact.picture) {
-            avatarSrc = senderContact.picture;
-        } else if (senderContact && senderContact.picture) {
-            avatarSrc = senderContact.picture;
-        }
+        // Resolve sender identity (strict pubkey match when signed — see _resolveSender)
+        const senderInfo = this._resolveSender(email);
+        const senderLine = this._renderSenderLine(senderInfo, '');
 
         emailElement.innerHTML = `
-            <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.from)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
+            <img class="${senderInfo.avatarClass}" src="${senderInfo.avatarSrc}" alt="${Utils.escapeHtml(senderInfo.identityName)}'s avatar" onerror="this.onerror=null;this.src='${senderInfo.defaultAvatar}';this.className='contact-avatar';">
             <div class="email-content">
                 <div class="email-header">
-                    <div class="email-sender email-list-strong">${Utils.escapeHtml(email.from)} ${attachmentIndicator}</div>
+                    <div class="email-sender email-list-strong">${senderLine} ${attachmentIndicator}</div>
                     <div class="email-date">${dateDisplay}</div>
                 </div>
                 <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
@@ -3080,6 +3440,8 @@ class EmailService {
                 </button>
             </div>
         `;
+
+        this._wireViewProfileButtons(emailElement);
 
         emailElement.addEventListener('click', () => {
             if (email.message_count > 1) {
@@ -3583,24 +3945,24 @@ class EmailService {
                         securityRows += `<div class="security-row verified"><i class="fas fa-envelope"></i> Email Transport Verified</div>`;
                     }
 
-                    // Get sender info for header (O(1) lookup via contact index)
-                    const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
-                    if (!this._contactsByPubkey) this._buildContactIndex();
-                    const senderContact = this._findContact(senderPubkey, email.from || email.from_address);
-                    
-                    // Avatar logic (same as dm-service.js)
-                    const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
-                    let avatarSrc = defaultAvatar;
-                    const isValidDataUrl = senderContact && senderContact.picture_data_url && senderContact.picture_data_url.startsWith('data:image') && senderContact.picture_data_url !== 'data:application/octet-stream;base64,';
-                    if (senderContact && !senderContact.picture_loading) {
-                        if (isValidDataUrl) {
-                            avatarSrc = senderContact.picture_data_url;
-                        } else if (senderContact.picture) {
-                            avatarSrc = senderContact.picture;
-                        }
+                    // Resolve sender identity (strict pubkey match when signed — see _resolveSender)
+                    const senderInfo = this._resolveSender(email);
+                    const avatarSrc = senderInfo.avatarSrc;
+                    const defaultAvatar = senderInfo.defaultAvatar;
+                    const senderName = senderInfo.identityName;
+                    const fromAddressLabel = senderInfo.hasSignature
+                        && senderInfo.fromAddress
+                        && senderInfo.identityName !== senderInfo.fromAddress
+                        ? `<span class="email-sender-secondary">&lt;${Utils.escapeHtml(senderInfo.fromAddress)}&gt;</span>`
+                        : '';
+                    const unknownBadgeInline = this._renderUnknownContactBadge(senderInfo);
+                    const profileMetadataRow = this._renderProfileMetadataRow(senderInfo);
+                    // Hide the green sig icon in the header for unknown signers;
+                    // the security panel still shows the full "Signature Verified" row.
+                    const isValidSig = (outerSigResult && outerSigResult.isValid === true) || email.signature_valid === true;
+                    if (senderInfo.isUnknownSigner && isValidSig) {
+                        signatureIcon = '';
                     }
-                    
-                    const senderName = senderContact ? (senderContact.name || senderContact.display_name || email.from) : email.from;
                     const timeAgo = Utils.formatTimeAgo(new Date(email.date));
                     
                     // Update page header (back button only — reply moved to card)
@@ -3635,6 +3997,8 @@ class EmailService {
 <div class="email-sender-name-row">
 <div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
 ${signatureIcon}
+${unknownBadgeInline}
+${fromAddressLabel}
 <div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
 </div>
 <details class="email-metadata-details">
@@ -3643,6 +4007,7 @@ ${signatureIcon}
 <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+${profileMetadataRow}
 ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : ''}
 </div>
 </details>
@@ -3681,6 +4046,7 @@ ${attachmentsHtml}
                             this.replyToEmail(email, subject, body);
                         });
                     }
+                    this._wireViewProfileButtons(emailDetailContent);
                     const inboxMoreBtn = emailDetailContent.querySelector('.thread-more-btn');
                     const inboxMoreDropdown = emailDetailContent.querySelector('.thread-more-dropdown');
                     if (inboxMoreBtn && inboxMoreDropdown) {
@@ -4117,21 +4483,49 @@ ${attachmentsHtml}
                         threadSubjectText = displaySubject;
                     }
 
-                    // Resolve contact for avatar
-                    const contactPubkey = isSent ? userPubkey : email.sender_pubkey;
-                    const contactEmail = isSent ? userEmail : (email.from || '');
-                    const contact = this._findContact(contactPubkey, contactEmail);
-
+                    // Resolve contact for avatar. For received messages we use
+                    // strict pubkey-only matching via _resolveSender (anti-spoofing).
+                    // For sent messages the "sender" is the local user, so email-fallback is fine.
                     let avatarSrc = defaultAvatar;
-                    if (contact) {
-                        const isValidDataUrl = contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
-                        if (isValidDataUrl) {
-                            avatarSrc = contact.picture_data_url;
-                        } else if (contact.picture) {
-                            avatarSrc = contact.picture;
+                    let senderName;
+                    let isUnknownSigner = false;
+                    let unknownSignerPubkey = null;
+                    let fromAddressLabelThread = '';
+                    if (isSent) {
+                        const contact = this._findContact(userPubkey, userEmail);
+                        if (contact) {
+                            const isValidDataUrl = contact.picture_data_url && contact.picture_data_url.startsWith('data:image') && contact.picture_data_url !== 'data:application/octet-stream;base64,';
+                            if (isValidDataUrl) avatarSrc = contact.picture_data_url;
+                            else if (contact.picture) avatarSrc = contact.picture;
+                        }
+                        senderName = contact?.name || contact?.display_name || email.from || 'Unknown';
+                    } else {
+                        const senderInfo = this._resolveSender(email);
+                        avatarSrc = senderInfo.avatarSrc;
+                        senderName = senderInfo.identityName;
+                        isUnknownSigner = senderInfo.isUnknownSigner;
+                        unknownSignerPubkey = senderInfo.senderPubkey;
+                        if (senderInfo.hasSignature
+                            && senderInfo.fromAddress
+                            && senderInfo.identityName !== senderInfo.fromAddress) {
+                            fromAddressLabelThread = `<span class="email-sender-secondary">&lt;${Utils.escapeHtml(senderInfo.fromAddress)}&gt;</span>`;
                         }
                     }
-                    const senderName = contact?.name || contact?.display_name || email.from || 'Unknown';
+                    const unknownBadgeThread = (isUnknownSigner && unknownSignerPubkey)
+                        ? ` <button type="button" class="unknown-contact-indicator view-profile-btn" data-pubkey="${Utils.escapeHtml(unknownSignerPubkey)}" title="This signer's pubkey is not in your contacts. Click to view their profile."><i class="fas fa-question-circle"></i> Unknown contact</button>`
+                        : '';
+                    const profileMetadataRowThread = unknownSignerPubkey || (!isSent && (email.sender_pubkey || email.nostr_pubkey))
+                        ? this._renderProfileMetadataRow({
+                            senderPubkey: unknownSignerPubkey || email.sender_pubkey || email.nostr_pubkey,
+                            isUnknownSigner: isUnknownSigner,
+                        })
+                        : '';
+                    // Suppress green inline sig icon for unknown signers; the
+                    // expanded security panel still shows the full row.
+                    if (isUnknownSigner) {
+                        const sigIsValid = (outerSigResult && outerSigResult.isValid === true) || email.signature_valid === true;
+                        if (sigIsValid) signatureIcon = '';
+                    }
                     const timeAgo = Utils.formatTimeAgo(new Date(email.date));
 
                     // Signature indicator — icon only in header, full text in details panel
@@ -4174,6 +4568,8 @@ ${attachmentsHtml}
 <div class="email-sender-name-row">
 <div class="email-sender-name">${Utils.escapeHtml(senderName)}</div>
 ${signatureIcon}
+${unknownBadgeThread}
+${fromAddressLabelThread}
 ${transportAuthIcon}
 <span class="email-body-snippet">${snippet}</span>
 <div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
@@ -4184,6 +4580,7 @@ ${transportAuthIcon}
 <div class="email-header-row"><span class="email-header-label">From:</span> <span class="email-header-value">${Utils.escapeHtml(email.from)}</span></div>
 <div class="email-header-row"><span class="email-header-label">To:</span> <span class="email-header-value">${Utils.escapeHtml(email.to)}</span></div>
 <div class="email-header-row"><span class="email-header-label">Date:</span> <span class="email-header-value">${new Date(email.date).toLocaleString()}</span></div>
+${profileMetadataRowThread}
 ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : ''}
 </div>
 </details>
@@ -4233,6 +4630,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                             this.replyToEmail(email, displaySubject, displayBody);
                         });
                     }
+                    this._wireViewProfileButtons(cardDiv);
                     const moreBtn = cardDiv.querySelector('.thread-more-btn');
                     const moreDropdown = cardDiv.querySelector('.thread-more-dropdown');
                     if (moreBtn && moreDropdown) {
@@ -5959,17 +6357,10 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             // Build contact index once for O(1) lookups across all emails
             this._buildContactIndex();
 
-            // Check if we should hide unverified messages
-            const settings = appState.getSettings();
-            const hideUnverified = settings && settings.hide_unsigned_messages === true;
-
-            // Filter emails for rendering
-            const filteredEmails = emails.filter(email => {
-                if (hideUnverified && email.signature_valid !== true) {
-                    return false;
-                }
-                return true;
-            });
+            // Sent emails are authored by the current user — the hide_unsigned_messages
+            // setting is for protecting against unverified inbound senders and does not
+            // apply here. Always show your own sent mail.
+            const filteredEmails = emails;
 
             // Batch-decrypt uncached encrypted sent emails, resolving pubkeys from contact index
             const uncachedEncrypted = filteredEmails.filter(email => {
@@ -6075,11 +6466,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             if (renderedCount === 0 && appendFrom <= 0) {
                 const settings = appState.getSettings();
                 const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
-                const hideUnverified = settings && settings.hide_unsigned_messages === true;
                 if (hideUndecryptable && allEmails.length > 0) {
                     sentList.innerHTML = '<div class="text-center text-muted">No decryptable emails found. All emails are encrypted for a different keypair.</div>';
-                } else if (hideUnverified && allEmails.length > 0) {
-                    sentList.innerHTML = '<div class="text-center text-muted">No verified emails found. All emails have missing or invalid signatures.</div>';
                 } else {
                     sentList.innerHTML = '<div class="text-center text-muted">No sent emails found</div>';
                 }

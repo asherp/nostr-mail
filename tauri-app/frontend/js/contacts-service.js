@@ -1519,15 +1519,10 @@ class ContactsService {
                 const followSection = document.createElement('div');
                 followSection.className = 'follow-section';
                 followSection.style.marginBottom = '1rem';
-                followSection.style.padding = '1rem';
-                followSection.style.border = '1px solid var(--border-color, #333)';
-                followSection.style.borderRadius = '8px';
-                followSection.style.backgroundColor = 'var(--card-bg, rgba(255,255,255,0.05))';
                 
                 // Create follow button first so it can be referenced in checkbox handler
                 const followBtn = document.createElement('button');
                 followBtn.className = 'btn btn-primary follow-btn';
-                followBtn.style.width = '100%';
                 
                 // Only show checkbox if contact already exists (allows toggling public/private)
                 if (contactExists) {
@@ -1655,15 +1650,10 @@ class ContactsService {
                             const followSection2 = document.createElement('div');
                             followSection2.className = 'follow-section';
                             followSection2.style.marginBottom = '1rem';
-                            followSection2.style.padding = '1rem';
-                            followSection2.style.border = '1px solid var(--border-color, #333)';
-                            followSection2.style.borderRadius = '8px';
-                            followSection2.style.backgroundColor = 'var(--card-bg, rgba(255,255,255,0.05))';
                             
                             // Create follow button first so it can be referenced in checkbox handler
                             const followBtn2 = document.createElement('button');
                             followBtn2.className = 'btn btn-primary follow-btn';
-                            followBtn2.style.width = '100%';
                             
                             // Only show checkbox if contact already exists
                             if (contactExists) {
@@ -1782,15 +1772,10 @@ class ContactsService {
                             const followSection2 = document.createElement('div');
                             followSection2.className = 'follow-section';
                             followSection2.style.marginBottom = '1rem';
-                            followSection2.style.padding = '1rem';
-                            followSection2.style.border = '1px solid var(--border-color, #333)';
-                            followSection2.style.borderRadius = '8px';
-                            followSection2.style.backgroundColor = 'var(--card-bg, rgba(255,255,255,0.05))';
                             
                             // Create follow button first so it can be referenced in checkbox handler
                             const followBtn2 = document.createElement('button');
                             followBtn2.className = 'btn btn-primary follow-btn';
-                            followBtn2.style.width = '100%';
                             
                             // Only show checkbox if contact already exists
                             if (contactExists) {
@@ -1989,7 +1974,7 @@ class ContactsService {
                 const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
                 const pubkeyValue = document.getElementById('recipient-pubkey-value');
                 if (pubkeyDisplay && pubkeyValue) {
-                    pubkeyValue.textContent = contact.pubkey;
+                    pubkeyValue.value = contact.pubkey;
                     pubkeyDisplay.style.display = 'block';
                 }
                 
@@ -2795,33 +2780,35 @@ class ContactsService {
                 isPublic: isPublic
             });
 
+            // Update the visible label and description immediately. These DOM
+            // elements live in the toggle markup itself and exist regardless of
+            // whether the contact is selected or in the in-memory contacts list,
+            // so the update must not be gated on either.
+            const labelElement = document.getElementById(`privacy-label-${contactPubkey}`);
+            const descElement = document.getElementById(`privacy-desc-${contactPubkey}`);
+            if (labelElement) {
+                labelElement.textContent = isPublic ? 'Public' : 'Private';
+            }
+            if (descElement) {
+                descElement.textContent = isPublic
+                    ? 'Visible in your public follow list'
+                    : 'Not in your public follow list';
+            }
+
             // Update in app state
             const contacts = window.appState.getContacts();
             const contactIndex = contacts.findIndex(c => c.pubkey === contactPubkey);
             if (contactIndex !== -1) {
                 contacts[contactIndex].is_public = isPublic;
                 window.appState.setContacts(contacts);
-                
+
                 // Update the selected contact if it's the one being toggled
                 const selectedContact = window.appState.getSelectedContact();
                 if (selectedContact && selectedContact.pubkey === contactPubkey) {
                     selectedContact.is_public = isPublic;
                     window.appState.setSelectedContact(selectedContact);
-                    
-                    // Update the label and description text immediately
-                    const labelElement = document.getElementById(`privacy-label-${contactPubkey}`);
-                    const descElement = document.getElementById(`privacy-desc-${contactPubkey}`);
-                    
-                    if (labelElement) {
-                        labelElement.textContent = isPublic ? 'Public' : 'Private';
-                    }
-                    if (descElement) {
-                        descElement.textContent = isPublic 
-                            ? 'Visible in your public follow list' 
-                            : 'Not in your public follow list';
-                    }
                 }
-                
+
                 // Re-render the contacts list
                 this.renderContacts();
             }

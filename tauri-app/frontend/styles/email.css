@@ -115,6 +115,114 @@ body.dark-mode .signature-indicator.invalid {
     color: #f87171;
 }
 
+/* Secondary From: address shown next to a cryptographically-bound identity.
+   The Nostr identity (contact name or truncated npub) is the primary label
+   and carries the signature badge; the SMTP From: header — which can be
+   spoofed — is shown muted as supporting context only. */
+.email-sender-secondary {
+    font-size: 0.8125rem;
+    color: #6b7280;
+    font-weight: 400;
+    margin-left: 4px;
+    word-break: break-all;
+}
+
+body.dark-mode .email-sender-secondary {
+    color: #9ca3af;
+}
+
+/* "Unknown contact" warning chip — shown when a signature verifies against a
+   pubkey that's not in the user's contacts. Clickable: opens the View Profile
+   modal (shares the .view-profile-btn hook). */
+.unknown-contact-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: 1;
+    padding: 3px 8px;
+    margin-left: 4px;
+    background: #fef3c7;
+    color: #92400e;
+    border: 1px solid #fbbf24;
+    border-radius: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    vertical-align: middle;
+    transition: opacity 0.15s ease;
+}
+
+.unknown-contact-indicator:hover {
+    opacity: 0.85;
+}
+
+body.dark-mode .unknown-contact-indicator {
+    background: #422006;
+    color: #fde68a;
+    border-color: #92400e;
+}
+
+.view-profile-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 4px;
+}
+
+/* Profile: <npub> row inside the expanded email metadata dropdown. The npub
+   is wrapped in <code> for monospace; the chip beside it opens the profile. */
+.email-profile-npub {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    word-break: break-all;
+}
+
+.email-profile-npub code {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8125rem;
+    background: #f3f4f6;
+    border-radius: 4px;
+    padding: 2px 6px;
+    color: #111827;
+    word-break: break-all;
+}
+
+body.dark-mode .email-profile-npub code {
+    background: #1f2937;
+    color: #f9fafb;
+}
+
+.view-profile-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: 1;
+    padding: 3px 8px;
+    background: #e0e7ff;
+    color: #3730a3;
+    border: 1px solid #c7d2fe;
+    border-radius: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity 0.15s ease;
+}
+
+.view-profile-chip:hover {
+    opacity: 0.85;
+}
+
+body.dark-mode .view-profile-chip {
+    background: #1e1b4b;
+    color: #a5b4fc;
+    border-color: #3730a3;
+}
+
+
 /* Inline signature/seal blocks in email body */
 .inline-sig-block {
     margin: 4px 0;
@@ -554,18 +662,10 @@ body.dark-mode .email-security-info .security-row.invalid {
     gap: 12px;
     padding: 10px 0;
     border-bottom: 1px solid #f3f4f6;
-    transition: background-color 0.2s ease;
 }
 
 .email-header-row:last-of-type {
     border-bottom: none;
-}
-
-.email-header-row:hover {
-    background-color: #f9fafb;
-    margin: 0 -8px;
-    padding: 10px 8px;
-    border-radius: 6px;
 }
 
 /* Label styling */
@@ -638,10 +738,6 @@ body.dark-mode .email-detail-header.vertical {
 
 body.dark-mode .email-detail-header.vertical:hover {
     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.4) !important;
-}
-
-body.dark-mode .email-header-row:hover {
-    background-color: #111827;
 }
 
 body.dark-mode .email-subject-row {

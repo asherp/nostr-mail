@@ -1,0 +1,1948 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+        <link rel="canonical" href="https://nostr-mail.com/docs/nostr-mail-spec/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Nostr-Mail Protocol Specification - nostr-mail</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#nostr-mail-protocol-specification" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="nostr-mail" class="md-header__button md-logo" aria-label="nostr-mail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nostr-mail
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Nostr-Mail Protocol Specification
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/asherp/nostr-mail" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    nostr-mail
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="nostr-mail" class="md-nav__button md-logo" aria-label="nostr-mail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nostr-mail
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/asherp/nostr-mail" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    nostr-mail
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quick-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../nostr-clients/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Nostr Clients
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guides
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/inbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Inbox Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/sent/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Sent Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/drafts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Drafts Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/direct-messages/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Direct Messages
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/contacts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contacts Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/profile/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Profile Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/settings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Technical Documentation
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Technical Documentation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../nip44/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    NIP-44 Encryption
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Legacy Documentation
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Legacy Documentation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../legacy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Legacy Docker Setup
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Additional Documentation
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Additional Documentation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../NIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    NIP
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Techstack/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Techstack
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../related_work/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Related Work
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../WorkLog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    WorkLog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-armor-block-format" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Armor Block Format
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Armor Block Format">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-block-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.1 Block Types
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-legacy-tag-names-backwards-compatibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.2 Legacy Tag Names (Backwards Compatibility)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-message-formats" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Message Formats
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Message Formats">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-signed-encrypted" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.1 Signed + Encrypted
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-signed-plaintext" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.2 Signed Plaintext
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#33-unsigned-encrypted-with-seal-nip-44-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.3 Unsigned + Encrypted (with Seal) — NIP-44 only
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#34-unsigned-plaintext-with-optional-seal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.4 Unsigned Plaintext (with optional Seal)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#35-reply-format" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5 Reply Format
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3.5 Reply Format">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#350-signature-coverage-in-replies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5.0 Signature Coverage in Replies
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#351-encrypted-reply" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5.1 Encrypted Reply
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#352-signed-plaintext-reply" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5.2 Signed Plaintext Reply
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#353-reply-chains" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5.3 Reply Chains
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#354-quote-prefix-handling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5.4 Quote Prefix Handling
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-composable-signing-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Composable Signing Model
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Composable Signing Model">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-mandatory-signing-for-nip-04" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 Mandatory Signing for NIP-04
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-content-encoding-glossia" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Content Encoding (Glossia)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Content Encoding (Glossia)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#51-nip-04-bitpacking" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.1 NIP-04 Bitpacking
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-mime-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. MIME Structure
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. MIME Structure">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#61-mime-headers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.1 MIME Headers
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#62-html-rendering" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2 HTML Rendering
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6.2 HTML Rendering">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#621-general-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2.1 General Structure
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#622-body-content" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2.2 Body Content
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#623-reply-threading" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2.3 Reply Threading
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#624-signature-display" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2.4 Signature Display
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#625-inline-styles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2.5 Inline Styles
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-identity-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Identity Model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-decoder-algorithm" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Decoder Algorithm
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-versioning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. Versioning
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="nostr-mail-protocol-specification">Nostr-Mail Protocol Specification<a class="headerlink" href="#nostr-mail-protocol-specification" title="Permanent link">&para;</a></h1>
+<p><strong>Version:</strong> 0.2.0-draft
+<strong>Date:</strong> 2026-03-26</p>
+<h2 id="1-overview">1. Overview<a class="headerlink" href="#1-overview" title="Permanent link">&para;</a></h2>
+<p>Nostr-Mail is a protocol for sending Nostr-encrypted and/or Nostr-signed messages over standard email (SMTP/IMAP). It embeds cryptographic content in ASCII armor blocks within the <code>text/plain</code> part of an email, enabling end-to-end encryption and identity verification while remaining compatible with all email infrastructure.</p>
+<h2 id="2-armor-block-format">2. Armor Block Format<a class="headerlink" href="#2-armor-block-format" title="Permanent link">&para;</a></h2>
+<p>All Nostr-Mail content is enclosed in ASCII armor blocks using <code>-----</code> delimiters. Blocks are identified by type-specific tags.</p>
+<h3 id="21-block-types">2.1 Block Types<a class="headerlink" href="#21-block-types" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Tag</th>
+<th>Role</th>
+<th>Contains</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BEGIN NOSTR NIP-XX ENCRYPTED BODY</code></td>
+<td>Encrypted content</td>
+<td>Ciphertext (NIP-04 or NIP-44)</td>
+</tr>
+<tr>
+<td><code>BEGIN NOSTR SIGNED BODY</code></td>
+<td>Signed plaintext</td>
+<td>Plaintext body content</td>
+</tr>
+<tr>
+<td><code>BEGIN NOSTR SIGNATURE</code></td>
+<td>Proof of authorship + identity</td>
+<td>Schnorr signature (64 bytes) followed by sender's pubkey (32 bytes)</td>
+</tr>
+<tr>
+<td><code>BEGIN NOSTR SEAL</code></td>
+<td>Identity declaration</td>
+<td>Sender's Nostr public key (unsigned messages only)</td>
+</tr>
+<tr>
+<td><code>END NOSTR MESSAGE</code></td>
+<td>Closing tag</td>
+<td>Terminates the outermost block</td>
+</tr>
+<tr>
+<td><code>END NOSTR SEAL</code></td>
+<td>Closing tag</td>
+<td>Terminates standalone seal blocks</td>
+</tr>
+</tbody>
+</table>
+<p>The encryption type is embedded directly in the BEGIN tag (e.g., <code>BEGIN NOSTR NIP-44 ENCRYPTED BODY</code>), keeping the format self-describing without metadata lines.</p>
+<h3 id="22-legacy-tag-names-backwards-compatibility">2.2 Legacy Tag Names (Backwards Compatibility)<a class="headerlink" href="#22-legacy-tag-names-backwards-compatibility" title="Permanent link">&para;</a></h3>
+<p>Decoders MUST accept the following legacy tag names:</p>
+<table>
+<thead>
+<tr>
+<th>Legacy Tag</th>
+<th>Equivalent New Tag</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BEGIN NOSTR SIGNED MESSAGE</code></td>
+<td><code>BEGIN NOSTR SIGNED BODY</code></td>
+</tr>
+<tr>
+<td><code>BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE</code></td>
+<td><code>BEGIN NOSTR NIP-04 ENCRYPTED BODY</code></td>
+</tr>
+<tr>
+<td><code>BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE</code></td>
+<td><code>BEGIN NOSTR NIP-44 ENCRYPTED BODY</code></td>
+</tr>
+<tr>
+<td><code>END NOSTR NIP-04 ENCRYPTED MESSAGE</code></td>
+<td><code>END NOSTR MESSAGE</code></td>
+</tr>
+<tr>
+<td><code>END NOSTR NIP-44 ENCRYPTED MESSAGE</code></td>
+<td><code>END NOSTR MESSAGE</code></td>
+</tr>
+</tbody>
+</table>
+<p>Encoders MUST produce only the new format. Decoders MUST accept both old and new formats via <code>(?:MESSAGE|BODY)</code> alternations in regex patterns.</p>
+<p>Additionally, decoders MUST accept the legacy format where SIGNATURE and SEAL are separate blocks (i.e., a <code>BEGIN NOSTR SEAL</code> block following <code>BEGIN NOSTR SIGNATURE</code>). In the new format, the SIGNATURE block contains both signature and pubkey; the SEAL block is only used for unsigned messages.</p>
+<h2 id="3-message-formats">3. Message Formats<a class="headerlink" href="#3-message-formats" title="Permanent link">&para;</a></h2>
+<h3 id="31-signed-encrypted">3.1 Signed + Encrypted<a class="headerlink" href="#31-signed-encrypted" title="Permanent link">&para;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1">----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----</span>
+<span class="o">&lt;</span><span class="n">ciphertext</span><span class="p">,</span><span class="w"> </span><span class="n">optionally</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR SIGNATURE -----</span>
+<span class="nv">@ProfileName</span>
+<span class="o">&lt;</span><span class="nl">signature</span><span class="p">:</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="n">hex</span><span class="w"> </span><span class="p">(</span><span class="mi">64</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span>
+<span class="o">&lt;</span><span class="nl">pubkey</span><span class="p">:</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="p">,</span><span class="w"> </span><span class="n">hex</span><span class="p">,</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="n">npub</span><span class="o">&gt;</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+</code></pre></div>
+
+<h3 id="32-signed-plaintext">3.2 Signed Plaintext<a class="headerlink" href="#32-signed-plaintext" title="Permanent link">&para;</a></h3>
+<p>The armored body contains the glossia-encoded plaintext. Glossia encoding is required (not optional) for signed plaintext, because the signature is computed over the decoded binary bytes. Raw plaintext cannot be reliably round-tripped through email transport (line wrapping, whitespace normalization, quote prefixes), so glossia encoding is the canonical representation that ensures signature verification succeeds regardless of how the message is reformatted in transit.</p>
+<p>The original plaintext also appears above the armor block for readability in non-Nostr-Mail clients. Nostr-Mail clients SHOULD display the decoded glossia content from within the armor block rather than the plaintext above it, as the armor content is the verified payload.</p>
+<div class="codehilite"><pre><span></span><code><span class="o">&lt;</span><span class="n">plaintext</span><span class="w"> </span><span class="n">body</span><span class="o">&gt;</span>
+
+<span class="c1">----- BEGIN NOSTR SIGNED BODY -----</span>
+<span class="o">&lt;</span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="w"> </span><span class="n">plaintext</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR SIGNATURE -----</span>
+<span class="nv">@ProfileName</span>
+<span class="o">&lt;</span><span class="nl">signature</span><span class="p">:</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="n">hex</span><span class="w"> </span><span class="p">(</span><span class="mi">64</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span>
+<span class="o">&lt;</span><span class="nl">pubkey</span><span class="p">:</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="p">,</span><span class="w"> </span><span class="n">hex</span><span class="p">,</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="n">npub</span><span class="o">&gt;</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+</code></pre></div>
+
+<p>Signature and pubkey are encoded independently with separate glossia settings. Decoders MUST accept both the new separate format and the legacy combined format (sig + pubkey encoded together as a single 96-byte payload).</p>
+<h3 id="33-unsigned-encrypted-with-seal-nip-44-only">3.3 Unsigned + Encrypted (with Seal) — NIP-44 only<a class="headerlink" href="#33-unsigned-encrypted-with-seal-nip-44-only" title="Permanent link">&para;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1">----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----</span>
+<span class="o">&lt;</span><span class="n">ciphertext</span><span class="p">,</span><span class="w"> </span><span class="n">optionally</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR SEAL -----</span>
+<span class="nv">@DisplayName</span>
+<span class="o">&lt;</span><span class="nl">pubkey</span><span class="p">:</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="p">,</span><span class="w"> </span><span class="n">hex</span><span class="p">,</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="n">npub</span><span class="o">&gt;</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+</code></pre></div>
+
+<p>The SEAL block provides the sender's pubkey, which is required for NIP-44 decryption and survives forwarding (unlike MIME headers). Decoders MUST accept glossia-encoded, hex-encoded, and npub (bech32-encoded, <code>npub1...</code>) formats for pubkeys in SEAL blocks.</p>
+<p><strong>NIP-04 messages MUST NOT use this format.</strong> Because NIP-04 (AES-256-CBC) lacks authenticated encryption, an unsigned NIP-04 message is vulnerable to ciphertext manipulation (bit-flipping, padding oracle attacks). NIP-04 encrypted messages MUST include a SIGNATURE block (see Section 3.1). See Section 4.1 for rationale.</p>
+<h3 id="34-unsigned-plaintext-with-optional-seal">3.4 Unsigned Plaintext (with optional Seal)<a class="headerlink" href="#34-unsigned-plaintext-with-optional-seal" title="Permanent link">&para;</a></h3>
+<p>Body text is not armored. A standalone seal block may follow:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">Hello</span><span class="p">,</span><span class="w"> </span><span class="n">this</span><span class="w"> </span><span class="k">is</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">plaintext</span><span class="w"> </span><span class="n">message</span><span class="p">.</span>
+
+<span class="c1">----- BEGIN NOSTR SEAL -----</span>
+<span class="nv">@DisplayName</span>
+<span class="o">&lt;</span><span class="nl">pubkey</span><span class="p">:</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="p">,</span><span class="w"> </span><span class="n">hex</span><span class="p">,</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="n">npub</span><span class="o">&gt;</span>
+<span class="c1">----- END NOSTR SEAL -----</span>
+</code></pre></div>
+
+<h3 id="35-reply-format">3.5 Reply Format<a class="headerlink" href="#35-reply-format" title="Permanent link">&para;</a></h3>
+<p>When replying, the new reply content is encrypted independently, but the reply's signature covers the entire conversation — the reply body bytes concatenated with all nested quoted body bytes (flattened). The original message is nested inside the outer armor block, before the reply's SIGNATURE. Inner signatures are preserved for independent verification of earlier messages. Nesting depth is determined by BEGIN/END tag pairing, not by quote prefixes.</p>
+<h4 id="350-signature-coverage-in-replies">3.5.0 Signature Coverage in Replies<a class="headerlink" href="#350-signature-coverage-in-replies" title="Permanent link">&para;</a></h4>
+<p>Each signature covers the <strong>flat concatenation</strong> of its own body's decoded bytes plus all nested quoted body bytes, recursively:</p>
+<div class="codehilite"><pre><span></span><code>L1 original signature covers:  decode(L1)
+L2 reply signature covers:     decode(L2) || decode(L1)
+L3 reply signature covers:     decode(L3) || decode(L2) || decode(L1)
+</code></pre></div>
+
+<p>Where <code>decode()</code> means glossia-decoding (for encoded content) or base64-decoding (for raw ciphertext) the armor body content at that level, and <code>||</code> is byte concatenation.</p>
+<p>This ensures that each reply author authenticates not just their own message but the entire conversation history they are responding to. A tampered inner message will cause the outer signature to fail verification, providing chain-of-custody integrity.</p>
+<h4 id="351-encrypted-reply">3.5.1 Encrypted Reply<a class="headerlink" href="#351-encrypted-reply" title="Permanent link">&para;</a></h4>
+<div class="codehilite"><pre><span></span><code><span class="c1">----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----</span>
+<span class="o">&lt;</span><span class="n">reply</span><span class="w"> </span><span class="n">ciphertext</span><span class="p">,</span><span class="w"> </span><span class="n">encrypted</span><span class="w"> </span><span class="n">independently</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----</span>
+<span class="o">&lt;</span><span class="n">original</span><span class="w"> </span><span class="n">message</span><span class="w"> </span><span class="n">ciphertext</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR SIGNATURE -----</span>
+<span class="nv">@OriginalAuthor</span>
+<span class="o">&lt;</span><span class="n">original</span><span class="w"> </span><span class="n">signature</span><span class="w"> </span><span class="p">(</span><span class="mi">64</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span><span class="w">              </span><span class="err">←</span><span class="w"> </span><span class="nl">signs</span><span class="p">:</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">original</span><span class="p">)</span>
+<span class="o">&lt;</span><span class="n">original</span><span class="w"> </span><span class="n">author</span><span class="w"> </span><span class="n">pubkey</span><span class="w"> </span><span class="p">(</span><span class="mi">32</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+<span class="c1">----- BEGIN NOSTR SIGNATURE -----</span>
+<span class="nv">@ReplyAuthor</span>
+<span class="o">&lt;</span><span class="n">reply</span><span class="w"> </span><span class="n">signature</span><span class="w"> </span><span class="p">(</span><span class="mi">64</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span><span class="w">                 </span><span class="err">←</span><span class="w"> </span><span class="nl">signs</span><span class="p">:</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">original</span><span class="p">)</span>
+<span class="o">&lt;</span><span class="n">reply</span><span class="w"> </span><span class="n">author</span><span class="w"> </span><span class="n">pubkey</span><span class="w"> </span><span class="p">(</span><span class="mi">32</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+</code></pre></div>
+
+<h4 id="352-signed-plaintext-reply">3.5.2 Signed Plaintext Reply<a class="headerlink" href="#352-signed-plaintext-reply" title="Permanent link">&para;</a></h4>
+<p>In a signed plaintext reply, the new reply text appears above the armor block for readability. When composing a reply, any text above the outermost armor block in the original message (including the original's plaintext and any previously quoted text) is carried forward as email-quoted lines (prefixed with <code>&gt;</code>). This quoted plaintext is informational only — the verifiable content is always inside the armor blocks.</p>
+<div class="codehilite"><pre><span></span><code><span class="o">&lt;</span><span class="k">new</span><span class="w"> </span><span class="n">reply</span><span class="w"> </span><span class="n">plaintext</span><span class="o">&gt;</span>
+
+<span class="o">&gt;</span><span class="w"> </span><span class="o">&lt;</span><span class="n">previous</span><span class="w"> </span><span class="n">plaintext</span><span class="p">,</span><span class="w"> </span><span class="n">email</span><span class="o">-</span><span class="n">quoted</span><span class="o">&gt;</span>
+
+<span class="c1">----- BEGIN NOSTR SIGNED BODY -----</span>
+<span class="o">&lt;</span><span class="n">reply</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="w"> </span><span class="n">plaintext</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR SIGNED BODY -----</span>
+<span class="o">&lt;</span><span class="n">original</span><span class="w"> </span><span class="n">glossia</span><span class="o">-</span><span class="n">encoded</span><span class="w"> </span><span class="n">plaintext</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR SIGNATURE -----</span>
+<span class="nv">@OriginalAuthor</span>
+<span class="o">&lt;</span><span class="n">original</span><span class="w"> </span><span class="n">signature</span><span class="w"> </span><span class="p">(</span><span class="mi">64</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span><span class="w">              </span><span class="err">←</span><span class="w"> </span><span class="nl">signs</span><span class="p">:</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">original</span><span class="p">)</span>
+<span class="o">&lt;</span><span class="n">original</span><span class="w"> </span><span class="n">author</span><span class="w"> </span><span class="n">pubkey</span><span class="w"> </span><span class="p">(</span><span class="mi">32</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+<span class="c1">----- BEGIN NOSTR SIGNATURE -----</span>
+<span class="nv">@ReplyAuthor</span>
+<span class="o">&lt;</span><span class="n">reply</span><span class="w"> </span><span class="n">signature</span><span class="w"> </span><span class="p">(</span><span class="mi">64</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span><span class="w">                 </span><span class="err">←</span><span class="w"> </span><span class="nl">signs</span><span class="p">:</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">original</span><span class="p">)</span>
+<span class="o">&lt;</span><span class="n">reply</span><span class="w"> </span><span class="n">author</span><span class="w"> </span><span class="n">pubkey</span><span class="w"> </span><span class="p">(</span><span class="mi">32</span><span class="w"> </span><span class="n">bytes</span><span class="p">)</span><span class="o">&gt;</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+</code></pre></div>
+
+<h4 id="353-reply-chains">3.5.3 Reply Chains<a class="headerlink" href="#353-reply-chains" title="Permanent link">&para;</a></h4>
+<p>For reply chains, nesting increases with each level. Signatures close in innermost-first order. Each signature covers the flat concatenation of all body bytes from its level inward:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">----- BEGIN NOSTR ... -----</span>
+<span class="o">&lt;</span><span class="n">L3</span><span class="w"> </span><span class="n">reply</span><span class="w"> </span><span class="n">body</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR ... -----</span>
+<span class="o">&lt;</span><span class="n">L2</span><span class="w"> </span><span class="n">reply</span><span class="w"> </span><span class="n">body</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR ... -----</span>
+<span class="o">&lt;</span><span class="n">L1</span><span class="w"> </span><span class="n">original</span><span class="w"> </span><span class="n">body</span><span class="o">&gt;</span>
+<span class="c1">----- BEGIN NOSTR SIGNATURE -----</span>
+<span class="nv">@L1Author</span><span class="w">                            </span><span class="err">←</span><span class="w"> </span><span class="nl">signs</span><span class="p">:</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">L1</span><span class="p">)</span>
+<span class="p">...</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+<span class="c1">----- BEGIN NOSTR SIGNATURE -----</span>
+<span class="nv">@L2Author</span><span class="w">                            </span><span class="err">←</span><span class="w"> </span><span class="nl">signs</span><span class="p">:</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">L2</span><span class="p">)</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">L1</span><span class="p">)</span>
+<span class="p">...</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+<span class="c1">----- BEGIN NOSTR SIGNATURE -----</span>
+<span class="nv">@L3Author</span><span class="w">                            </span><span class="err">←</span><span class="w"> </span><span class="nl">signs</span><span class="p">:</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">L3</span><span class="p">)</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">L2</span><span class="p">)</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">decode</span><span class="p">(</span><span class="n">L1</span><span class="p">)</span>
+<span class="p">...</span>
+<span class="c1">----- END NOSTR MESSAGE -----</span>
+</code></pre></div>
+
+<h4 id="354-quote-prefix-handling">3.5.4 Quote Prefix Handling<a class="headerlink" href="#354-quote-prefix-handling" title="Permanent link">&para;</a></h4>
+<p>Decoders MUST also accept armor block delimiters preceded by <code>&gt;</code> quote prefixes, since email clients may add quote prefixes when forwarding or replying. Glossia decoders naturally ignore quote prefixes as non-payload words.</p>
+<h2 id="4-composable-signing-model">4. Composable Signing Model<a class="headerlink" href="#4-composable-signing-model" title="Permanent link">&para;</a></h2>
+<p>Signing is user-controlled for NIP-44 messages and can be applied at any stage to the current body bytes. <strong>For NIP-04 messages, signing is mandatory</strong> — encoders MUST produce a SIGNATURE block, and decoders MUST reject NIP-04 messages without one (see Section 4.1).</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>What gets signed</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sign plaintext</td>
+<td><code>SHA-256(decode(armor_body) \|\| decode(quoted_bodies))</code></td>
+<td>Proves authorship of content + conversation history</td>
+</tr>
+<tr>
+<td>Sign then encrypt</td>
+<td>Signature inside ciphertext</td>
+<td>Only recipient can verify</td>
+</tr>
+<tr>
+<td>Encrypt then sign</td>
+<td><code>SHA-256(decode(armor_body) \|\| decode(quoted_bodies))</code></td>
+<td>Proves sender without revealing content</td>
+</tr>
+<tr>
+<td>Sign, encrypt, sign</td>
+<td>Both layers</td>
+<td>Full trust chain</td>
+</tr>
+</tbody>
+</table>
+<p>The signing target is the <strong>flat concatenation</strong> of the decoded bytes from the current armor body and all nested quoted armor bodies (recursively). For glossia-encoded content, decoding means transcoding the prose back to binary. For base64 content, it means base64-decoding. The signature is never on the raw plaintext or the encoded prose itself — it is on the canonical decoded bytes, which survive transport regardless of reformatting.</p>
+<p>For messages with no quoted content, this reduces to <code>SHA-256(decode(armor_body))</code>. For replies, the concatenation provides chain-of-custody integrity — modifying any message in the conversation history invalidates all subsequent signatures.</p>
+<h3 id="41-mandatory-signing-for-nip-04">4.1 Mandatory Signing for NIP-04<a class="headerlink" href="#41-mandatory-signing-for-nip-04" title="Permanent link">&para;</a></h3>
+<p>NIP-04 uses AES-256-CBC without a MAC (unauthenticated encryption). Without an external integrity check, NIP-04 ciphertext is vulnerable to:</p>
+<ul>
+<li><strong>Padding oracle attacks</strong>: An attacker who can modify the ciphertext and observe whether decryption produces valid or invalid PKCS7 padding can recover the plaintext one byte at a time — without knowing the key.</li>
+<li><strong>Bit-flipping</strong>: In CBC mode, flipping bits in ciphertext block <em>N</em> produces predictable changes to plaintext block <em>N+1</em>, allowing targeted message tampering.</li>
+</ul>
+<p>The Schnorr signature over <code>SHA-256(ciphertext_bytes)</code> serves as the authentication mechanism that NIP-04 itself lacks. This converts NIP-04 into an Encrypt-then-Sign (EtS) scheme, binding the ciphertext to the sender's identity and preventing tampering.</p>
+<p><strong>Compose-time requirement</strong>: Encoders MUST produce a SIGNATURE block for all NIP-04 encrypted messages. A compose UI MUST either auto-sign NIP-04 messages or prevent sending unsigned NIP-04 messages.</p>
+<p><strong>Decode-time requirement</strong>: Decoders MUST verify the signature <strong>before</strong> attempting NIP-04 decryption. If the signature is missing or invalid, the decoder MUST reject the message without decrypting. This verify-then-decrypt ordering is critical — if decryption errors (including padding errors) are surfaced before signature verification, the padding oracle window remains open.</p>
+<p>NIP-44 messages are exempt from this requirement because NIP-44 uses ChaCha20 (no padding) with HMAC-SHA256 authentication built in.</p>
+<h2 id="5-content-encoding-glossia">5. Content Encoding (Glossia)<a class="headerlink" href="#5-content-encoding-glossia" title="Permanent link">&para;</a></h2>
+<p>Body content, signatures, and pubkeys may be encoded using the Glossia steganographic encoding system. Each field has an independent encoding setting:</p>
+<ul>
+<li><strong>Body/Subject</strong>: Glossia prose encoding (e.g., Latin, BIP39, or hex)</li>
+<li><strong>Signature</strong>: Independent encoding setting</li>
+<li><strong>Pubkey</strong>: Independent encoding setting</li>
+</ul>
+<p>Encoding is transparent to the protocol — decoders detect the encoding format automatically (base64 vs glossia word patterns) and decode accordingly.</p>
+<h3 id="51-nip-04-bitpacking">5.1 NIP-04 Bitpacking<a class="headerlink" href="#51-nip-04-bitpacking" title="Permanent link">&para;</a></h3>
+<p>NIP-04 ciphertext (<code>base64?iv=base64</code>) is bitpacked into a compact binary format before Glossia encoding, and unpacked after decoding. NIP-44 ciphertext (pure base64) passes through unchanged.</p>
+<h2 id="6-mime-structure">6. MIME Structure<a class="headerlink" href="#6-mime-structure" title="Permanent link">&para;</a></h2>
+<div class="codehilite"><pre><span></span><code>multipart/alternative
+  |-- text/plain   &lt;-- source of truth (armor blocks)
+  +-- text/html    &lt;-- rendering aid only
+</code></pre></div>
+
+<h3 id="61-mime-headers">6.1 MIME Headers<a class="headerlink" href="#61-mime-headers" title="Permanent link">&para;</a></h3>
+<p>The following custom MIME headers are included for backwards compatibility and fast IMAP filtering:</p>
+<table>
+<thead>
+<tr>
+<th>Header</th>
+<th>Value</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>X-Nostr-Pubkey</code></td>
+<td>hex or npub (bech32) pubkey</td>
+<td>Sender identification</td>
+</tr>
+<tr>
+<td><code>X-Nostr-Sig</code></td>
+<td>hex-encoded signature</td>
+<td>Message authentication</td>
+</tr>
+</tbody>
+</table>
+<p>Decoders MUST accept both hex-encoded and npub (bech32-encoded, <code>npub1...</code>) formats for <code>X-Nostr-Pubkey</code>. Encoders MAY produce either format.</p>
+<p><strong>Primary trust path</strong>: In-body SIGNATURE blocks (signed) or SEAL blocks (unsigned) (survive forwarding, quoting, and re-encoding).</p>
+<p><strong>Secondary trust path</strong>: X-Nostr-* MIME headers (for fast IMAP filtering and older client compatibility).</p>
+<h3 id="62-html-rendering">6.2 HTML Rendering<a class="headerlink" href="#62-html-rendering" title="Permanent link">&para;</a></h3>
+<p>The <code>text/html</code> part is a rendering aid for human readability. It mirrors the structure of the armor blocks in <code>text/plain</code> but presents decoded, readable content. Clients that understand Nostr-Mail SHOULD generate the HTML part according to the following rules.</p>
+<h4 id="621-general-structure">6.2.1 General Structure<a class="headerlink" href="#621-general-structure" title="Permanent link">&para;</a></h4>
+<p>Each armor block maps to a <code>&lt;div&gt;</code> in the HTML. Nested armor blocks (from replies) map to nested <code>&lt;blockquote&gt;</code> elements. Signature blocks are rendered as labeled sections below their associated body.</p>
+<div class="codehilite"><pre><span></span><code><span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>{body content}<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">blockquote</span><span class="p">&gt;</span>
+    {nested message HTML, recursively structured}
+  <span class="p">&lt;/</span><span class="nt">blockquote</span><span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">hr</span><span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">h4</span><span class="p">&gt;</span>{signature author}<span class="p">&lt;/</span><span class="nt">h4</span><span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>{encoded signature + pubkey}<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+</code></pre></div>
+
+<h4 id="622-body-content">6.2.2 Body Content<a class="headerlink" href="#622-body-content" title="Permanent link">&para;</a></h4>
+<ul>
+<li><strong>Signed plaintext</strong>: The body <code>&lt;div&gt;</code> contains the decoded glossia plaintext (human-readable text), so that non-Nostr-Mail clients can display the message content directly.</li>
+<li><strong>Encrypted</strong>: The body <code>&lt;div&gt;</code> contains the glossia-encoded ciphertext (since the plaintext is not available without decryption).</li>
+</ul>
+<h4 id="623-reply-threading">6.2.3 Reply Threading<a class="headerlink" href="#623-reply-threading" title="Permanent link">&para;</a></h4>
+<p>For replies, the outermost body <code>&lt;div&gt;</code> MUST contain only the new reply content — not the quoted text from previous messages. Previous messages appear as nested <code>&lt;blockquote&gt;</code> elements, each containing their own decoded body content and signature sections. This ensures the first visible content is the new reply, with conversation history indented below.</p>
+<div class="codehilite"><pre><span></span><code><span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>
+  <span class="cm">&lt;!-- Outermost: only the new reply text --&gt;</span>
+  <span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>{L3 new reply plaintext}<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">blockquote</span><span class="p">&gt;</span>
+    <span class="cm">&lt;!-- L2 previous reply --&gt;</span>
+    <span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>{L2 decoded plaintext}<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+    <span class="p">&lt;</span><span class="nt">blockquote</span><span class="p">&gt;</span>
+      <span class="cm">&lt;!-- L1 original message --&gt;</span>
+      <span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>{L1 decoded plaintext}<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+      <span class="p">&lt;</span><span class="nt">hr</span><span class="p">&gt;</span>
+      <span class="p">&lt;</span><span class="nt">h4</span><span class="p">&gt;</span>{L1 author}<span class="p">&lt;/</span><span class="nt">h4</span><span class="p">&gt;</span>
+      <span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>{L1 encoded signature + pubkey}<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+    <span class="p">&lt;/</span><span class="nt">blockquote</span><span class="p">&gt;</span>
+    <span class="p">&lt;</span><span class="nt">hr</span><span class="p">&gt;</span>
+    <span class="p">&lt;</span><span class="nt">h4</span><span class="p">&gt;</span>{L2 author}<span class="p">&lt;/</span><span class="nt">h4</span><span class="p">&gt;</span>
+    <span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>{L2 encoded signature + pubkey}<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+  <span class="p">&lt;/</span><span class="nt">blockquote</span><span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">hr</span><span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">h4</span><span class="p">&gt;</span>{L3 author}<span class="p">&lt;/</span><span class="nt">h4</span><span class="p">&gt;</span>
+  <span class="p">&lt;</span><span class="nt">div</span><span class="p">&gt;</span>{L3 encoded signature + pubkey}<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+<span class="p">&lt;/</span><span class="nt">div</span><span class="p">&gt;</span>
+</code></pre></div>
+
+<h4 id="624-signature-display">6.2.4 Signature Display<a class="headerlink" href="#624-signature-display" title="Permanent link">&para;</a></h4>
+<p>Each signature section consists of:
+1. A horizontal rule (<code>&lt;hr&gt;</code>) separator
+2. A heading (<code>&lt;h4&gt;</code>) with the author's profile name (from the <code>@ProfileName</code> line in the SIGNATURE block)
+3. A <code>&lt;div&gt;</code> containing the glossia-encoded signature and pubkey bytes (preserving the encoded form, not decoded)</p>
+<p>Seal blocks (for unsigned messages) are rendered similarly, with the display name and encoded pubkey.</p>
+<h4 id="625-inline-styles">6.2.5 Inline Styles<a class="headerlink" href="#625-inline-styles" title="Permanent link">&para;</a></h4>
+<p>Since email clients strip <code>&lt;style&gt;</code> tags and external stylesheets, all styling MUST use inline <code>style</code> attributes. Recommended styles:</p>
+<ul>
+<li><strong>Blockquote</strong>: <code>border-left: 2px solid #ccc; margin: 1em 0; padding: 0 1em;</code></li>
+<li><strong>Signature div</strong>: <code>border-left: 2px solid #ccc; padding-left: 1em; color: #888; font-style: italic; overflow-wrap: break-word;</code></li>
+<li><strong>Signature heading</strong>: <code>margin: 0 0 0.5em; color: #666; font-size: 0.9em;</code></li>
+<li><strong>HR separator</strong>: <code>border: none; border-top: 1px solid #ccc; margin: 1.5em 0;</code></li>
+</ul>
+<h2 id="7-identity-model">7. Identity Model<a class="headerlink" href="#7-identity-model" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Source</th>
+<th>Trust Level</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transport sender</td>
+<td>Email <code>From:</code> header</td>
+<td>None (spoofable)</td>
+</tr>
+<tr>
+<td>Cryptographic author</td>
+<td>SIGNATURE block (pubkey) or SEAL block (npub)</td>
+<td>Verified via signature (if signed)</td>
+</tr>
+<tr>
+<td>Client attribution</td>
+<td><code>X-Mailer</code> header</td>
+<td>Informational only</td>
+</tr>
+</tbody>
+</table>
+<h2 id="8-decoder-algorithm">8. Decoder Algorithm<a class="headerlink" href="#8-decoder-algorithm" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Scan</strong> the <code>text/plain</code> body for armor block delimiters (<code>-{3,}\s*BEGIN NOSTR</code>)</li>
+<li><strong>Normalize</strong> whitespace and line endings (<code>\r\n</code> -&gt; <code>\n</code>)</li>
+<li><strong>Parse</strong> the BEGIN tag to determine encryption type (NIP-04, NIP-44, or signed plaintext)</li>
+<li><strong>Detect</strong> content encoding: base64 (no spaces) vs Glossia (word patterns)</li>
+<li><strong>Decode</strong> content: base64 decode or Glossia transcode -&gt; bytes</li>
+<li><strong>Unpack</strong> NIP-04 if applicable (bitpacked binary -&gt; <code>base64?iv=base64</code>)</li>
+<li><strong>Verify</strong> signatures against <code>SHA-256(decoded_body_bytes)</code> using the pubkey from the SIGNATURE block</li>
+<li>For NIP-04: signature MUST be present and MUST verify. If the signature is missing or invalid, the decoder MUST reject the message <strong>without proceeding to step 8</strong> (see Section 4.1)</li>
+<li>For NIP-44: signature verification is recommended but not required (NIP-44 provides its own authentication via HMAC)</li>
+<li><strong>Decrypt</strong> if encrypted, using recipient's private key and sender's pubkey</li>
+</ol>
+<h2 id="9-versioning">9. Versioning<a class="headerlink" href="#9-versioning" title="Permanent link">&para;</a></h2>
+<p>This specification may be extended with additional block types in future versions. Decoders SHOULD ignore unrecognized block types rather than failing.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": [], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+      
+    
+  </body>
+</html>

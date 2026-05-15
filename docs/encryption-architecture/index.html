@@ -1,0 +1,2088 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+        <link rel="canonical" href="https://nostr-mail.com/docs/encryption-architecture/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Nostr-Mail Encryption & Encoding Architecture - nostr-mail</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#nostr-mail-encryption-encoding-architecture" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="nostr-mail" class="md-header__button md-logo" aria-label="nostr-mail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nostr-mail
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Nostr-Mail Encryption &amp; Encoding Architecture
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/asherp/nostr-mail" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    nostr-mail
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="nostr-mail" class="md-nav__button md-logo" aria-label="nostr-mail" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nostr-mail
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/asherp/nostr-mail" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    nostr-mail
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quick-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../nostr-clients/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Nostr Clients
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guides
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/inbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Inbox Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/sent/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Sent Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/drafts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Drafts Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/direct-messages/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Direct Messages
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/contacts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contacts Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/profile/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Profile Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pages/settings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings Page
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Technical Documentation
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Technical Documentation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../nip44/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    NIP-44 Encryption
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Legacy Documentation
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Legacy Documentation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../legacy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Legacy Docker Setup
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Additional Documentation
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Additional Documentation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../NIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    NIP
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Techstack/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Techstack
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../related_work/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Related Work
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../WorkLog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    WorkLog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#current-state" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Current State
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-key-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Key Management
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1. Key Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#current-browser-side-storage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Current: Browser-Side Storage
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#problem" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Problem
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-nip-encryption-subject-body" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. NIP Encryption (Subject &amp; Body)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. NIP Encryption (Subject &amp; Body)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#libraries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Libraries
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#encrypt-flow-email-servicejsencryptemailfields" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encrypt Flow (email-service.js:encryptEmailFields)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#decrypt-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decrypt Flow
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-glossia-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Glossia Encoding
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Glossia Encoding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-it-is" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What It Is
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#encode-flow-email-servicejsencodeemailfields" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encode Flow (email-service.js:encodeEmailFields)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#decode-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decode Flow
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#backend-glossia-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Backend Glossia Usage
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-signing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Signing
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Signing">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#flow-appjs-sign-handler" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Flow (app.js sign handler)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#verification" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Verification
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-dm-encryption" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. DM Encryption
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. DM Encryption">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#send-flow-tauri-servicejssenddirectmessage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Send Flow (tauri-service.js:sendDirectMessage)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-where-crypto-happens-today" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Where Crypto Happens Today
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-migration-path-backend-encryption-system-keychain" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Migration Path: Backend Encryption + System Keychain
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="7. Migration Path: Backend Encryption + System Keychain">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#goals" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Goals
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-changes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What Changes
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="What Changes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#key-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key Management
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#nip-encryption" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        NIP Encryption
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#glossia-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Glossia Encoding
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#signing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Signing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dm-sending" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DM Sending
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-stays-in-frontend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What Stays in Frontend
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rust-crates-needed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rust Crates Needed
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-capn-proto-as-the-internal-representation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Cap'n Proto as the Internal Representation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8. Cap&#39;n Proto as the Internal Representation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#problem-duplicated-parsing-ad-hoc-data-shapes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Problem: Duplicated Parsing, Ad-Hoc Data Shapes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#solution-capnp-structs-as-the-parsing-contract" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Solution: Capnp Structs as the Parsing Contract
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-it-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How It Works
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="How It Works">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#reading-emails-incoming" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reading emails (incoming)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#writing-emails-outgoing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Writing emails (outgoing)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#manifest-binary-transport" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Manifest (binary transport)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-this-replaces-in-js" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What This Replaces in JS
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-stays-the-same" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What Stays the Same
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="nostr-mail-encryption-encoding-architecture">Nostr-Mail Encryption &amp; Encoding Architecture<a class="headerlink" href="#nostr-mail-encryption-encoding-architecture" title="Permanent link">&para;</a></h1>
+<h2 id="current-state">Current State<a class="headerlink" href="#current-state" title="Permanent link">&para;</a></h2>
+<p>This document describes how encryption, decryption, and glossia encoding currently work in nostr-mail, with a view toward migrating encryption to the Rust backend and adopting system keychain storage.</p>
+<hr />
+<h2 id="1-key-management">1. Key Management<a class="headerlink" href="#1-key-management" title="Permanent link">&para;</a></h2>
+<h3 id="current-browser-side-storage">Current: Browser-Side Storage<a class="headerlink" href="#current-browser-side-storage" title="Permanent link">&para;</a></h3>
+<p>Private keys live in the browser's <code>localStorage</code> as a JSON object <code>{ private_key: "nsec1...", public_key: "npub1..." }</code>.</p>
+<p><strong>Load order</strong> (<code>app.js:455-492</code>):
+1. Try <code>TauriService.getDefaultPrivateKeyFromConfig()</code> (reads from a config file on disk)
+2. Fall back to <code>localStorage.getItem('nostr_keypair')</code>
+3. If neither exists, user must generate/import via Settings UI</p>
+<p><strong>Runtime access</strong>: <code>appState.getKeypair()</code> returns <code>{ private_key, public_key }</code> in bech32 (nsec/npub). Every crypto call passes the raw nsec string from JS to either:
+- <code>CryptoService</code> (JS/nostr-tools, in-browser), or
+- <code>TauriService</code> → Tauri IPC → Rust backend</p>
+<p><strong>Multi-account</strong>: <code>ProfileManager</code> stores multiple <code>{ private_key, public_key }</code> objects in <code>localStorage</code>. Switching calls <code>appState.setKeypair(keypair)</code> and re-initializes.</p>
+<p><strong>Settings encryption</strong>: Sensitive settings (IMAP/SMTP passwords) are encrypted with AES-256-GCM using a key derived from <code>SHA-256("nostr-mail-settings-encryption-v1:" + secret_key_bytes)</code>. This happens in both the frontend (<code>CryptoService.encryptSettingValue</code>) and backend (<code>crypto::encrypt_setting_value</code>).</p>
+<h3 id="problem">Problem<a class="headerlink" href="#problem" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Private keys stored in plaintext in localStorage (accessible to any JS in the page)</li>
+<li>Keys are passed over Tauri IPC as strings on every encrypt/decrypt call</li>
+<li>No OS-level protection (no keychain, no hardware-backed storage)</li>
+</ul>
+<hr />
+<h2 id="2-nip-encryption-subject-body">2. NIP Encryption (Subject &amp; Body)<a class="headerlink" href="#2-nip-encryption-subject-body" title="Permanent link">&para;</a></h2>
+<h3 id="libraries">Libraries<a class="headerlink" href="#libraries" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Library</th>
+<th>Format</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Frontend</td>
+<td><code>nostr-tools/nip44</code> (JS, via import map)</td>
+<td>NIP-44 v2: <code>version(1) + nonce(32) + padded_plaintext + MAC(32)</code> → base64</td>
+</tr>
+<tr>
+<td>Frontend</td>
+<td><code>nostr-tools/nip04</code> (JS, via import map)</td>
+<td>NIP-04: AES-256-CBC → <code>base64?iv=base64</code></td>
+</tr>
+<tr>
+<td>Backend</td>
+<td><code>nostr_sdk::nip44</code> / <code>nostr_sdk::nip04</code> (Rust)</td>
+<td>Same wire formats</td>
+</tr>
+</tbody>
+</table>
+<h3 id="encrypt-flow-email-servicejsencryptemailfields">Encrypt Flow (<code>email-service.js:encryptEmailFields</code>)<a class="headerlink" href="#encrypt-flow-email-servicejsencryptemailfields" title="Permanent link">&para;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="k">User</span><span class="w"> </span><span class="n">clicks</span><span class="w"> </span><span class="n">Encrypt</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="n">encryptEmailFields</span><span class="p">()</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="nl">subject</span><span class="p">:</span><span class="w"> </span><span class="n">TauriService</span><span class="p">.</span><span class="n">encryptMessageWithAlgorithm</span><span class="p">(</span><span class="n">privkey</span><span class="p">,</span><span class="w"> </span><span class="n">pubkey</span><span class="p">,</span><span class="w"> </span><span class="n">subject</span><span class="p">,</span><span class="w"> </span><span class="n">algo</span><span class="p">)</span>
+<span class="w">       </span><span class="err">│</span><span class="w">             </span><span class="err">→</span><span class="w"> </span><span class="n">CryptoService</span><span class="p">.</span><span class="n">encryptMessageWithAlgorithm</span><span class="p">()</span><span class="w"> </span><span class="o">[</span><span class="n">JS, nostr-tools</span><span class="o">]</span>
+<span class="w">       </span><span class="err">│</span><span class="w">             </span><span class="err">→</span><span class="w"> </span><span class="n">base64</span><span class="w"> </span><span class="n">NIP</span><span class="w"> </span><span class="n">ciphertext</span>
+<span class="w">       </span><span class="err">│</span><span class="w">             </span><span class="err">→</span><span class="w"> </span><span class="n">stored</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">this</span><span class="p">.</span><span class="n">_subjectCiphertext</span><span class="w"> </span><span class="p">(</span><span class="k">for</span><span class="w"> </span><span class="n">DM</span><span class="w"> </span><span class="n">matching</span><span class="p">)</span>
+<span class="w">       </span><span class="err">│</span><span class="w">             </span><span class="err">→</span><span class="w"> </span><span class="n">written</span><span class="w"> </span><span class="k">to</span><span class="w"> </span><span class="n">DOM</span><span class="w"> </span><span class="n">subject</span><span class="w"> </span><span class="n">field</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="n">body</span><span class="w"> </span><span class="p">(</span><span class="n">simplified</span><span class="p">,</span><span class="w"> </span><span class="o">&lt;</span><span class="mi">64</span><span class="n">KB</span><span class="p">,</span><span class="w"> </span><span class="k">no</span><span class="w"> </span><span class="n">attachments</span><span class="p">)</span><span class="err">:</span>
+<span class="w">       </span><span class="err">│</span><span class="w">     </span><span class="n">TauriService</span><span class="p">.</span><span class="n">encryptMessageWithAlgorithm</span><span class="p">(</span><span class="n">privkey</span><span class="p">,</span><span class="w"> </span><span class="n">pubkey</span><span class="p">,</span><span class="w"> </span><span class="n">body</span><span class="p">,</span><span class="w"> </span><span class="n">algo</span><span class="p">)</span>
+<span class="w">       </span><span class="err">│</span><span class="w">     </span><span class="err">→</span><span class="w"> </span><span class="n">base64</span><span class="w"> </span><span class="n">NIP</span><span class="w"> </span><span class="n">ciphertext</span>
+<span class="w">       </span><span class="err">│</span><span class="w">     </span><span class="err">→</span><span class="w"> </span><span class="n">wrapped</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="nf">ASCII</span><span class="w"> </span><span class="nl">armor</span><span class="p">:</span><span class="w"> </span><span class="c1">--- BEGIN NOSTR NIP-44 ENCRYPTED BODY ---</span>
+<span class="w">       </span><span class="err">│</span><span class="w">     </span><span class="err">→</span><span class="w"> </span><span class="n">written</span><span class="w"> </span><span class="k">to</span><span class="w"> </span><span class="n">DOM</span><span class="w"> </span><span class="n">body</span><span class="w"> </span><span class="n">field</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">└──</span><span class="w"> </span><span class="n">body</span><span class="w"> </span><span class="p">(</span><span class="n">manifest</span><span class="p">,</span><span class="w"> </span><span class="err">≥</span><span class="mi">64</span><span class="n">KB</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="n">has</span><span class="w"> </span><span class="n">attachments</span><span class="p">)</span><span class="err">:</span>
+<span class="w">             </span><span class="mf">1.</span><span class="w"> </span><span class="n">generateSymmetricKey</span><span class="p">()</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">AES</span><span class="o">-</span><span class="mi">256</span><span class="o">-</span><span class="n">GCM</span><span class="w"> </span><span class="k">key</span><span class="w"> </span><span class="o">[</span><span class="n">WebCrypto</span><span class="o">]</span>
+<span class="w">             </span><span class="mf">2.</span><span class="w"> </span><span class="n">encryptWithAES</span><span class="p">(</span><span class="n">body</span><span class="p">,</span><span class="w"> </span><span class="n">aesKey</span><span class="p">)</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">AES</span><span class="w"> </span><span class="n">ciphertext</span>
+<span class="w">             </span><span class="mf">3.</span><span class="w"> </span><span class="n">Build</span><span class="w"> </span><span class="n">manifest</span><span class="w"> </span><span class="n">JSON</span><span class="w"> </span><span class="err">{</span><span class="w"> </span><span class="nl">body</span><span class="p">:</span><span class="w"> </span><span class="err">{</span><span class="w"> </span><span class="n">ciphertext</span><span class="p">,</span><span class="w"> </span><span class="n">key_wrap</span><span class="p">,</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="err">}</span><span class="p">,</span><span class="w"> </span><span class="nl">attachments</span><span class="p">:</span><span class="w"> </span><span class="o">[</span><span class="n">...</span><span class="o">]</span><span class="w"> </span><span class="err">}</span>
+<span class="w">             </span><span class="mf">4.</span><span class="w"> </span><span class="n">TauriService</span><span class="p">.</span><span class="n">encryptMessageWithAlgorithm</span><span class="p">(</span><span class="n">privkey</span><span class="p">,</span><span class="w"> </span><span class="n">pubkey</span><span class="p">,</span><span class="w"> </span><span class="n">manifestJSON</span><span class="p">,</span><span class="w"> </span><span class="n">algo</span><span class="p">)</span>
+<span class="w">             </span><span class="mf">5.</span><span class="w"> </span><span class="n">Wrap</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="nf">ASCII</span><span class="w"> </span><span class="n">armor</span>
+</code></pre></div>
+
+<p><strong>Key detail</strong>: <code>TauriService.encryptMessageWithAlgorithm</code> checks if <code>CryptoService.isReady()</code>. If yes, it runs entirely in JS (nostr-tools). If no, it falls back to Tauri IPC → Rust <code>encrypt_message_with_algorithm</code>.</p>
+<h3 id="decrypt-flow">Decrypt Flow<a class="headerlink" href="#decrypt-flow" title="Permanent link">&para;</a></h3>
+<p>Decryption mirrors encryption:
+1. Subject: glossia-decode (if needed) → <code>TauriService.decryptDmContent(privkey, pubkey, ciphertext)</code>
+2. Body: strip ASCII armor → glossia-decode (if needed) → NIP decrypt → if manifest, AES-decrypt body/attachments</p>
+<hr />
+<h2 id="3-glossia-encoding">3. Glossia Encoding<a class="headerlink" href="#3-glossia-encoding" title="Permanent link">&para;</a></h2>
+<h3 id="what-it-is">What It Is<a class="headerlink" href="#what-it-is" title="Permanent link">&para;</a></h3>
+<p>Glossia converts binary data (NIP ciphertext) into natural-looking prose. It's a <strong>Rust library</strong> compiled to both:
+- <strong>WASM</strong> (<code>glossia/web/glossia.js</code> + <code>glossia_bg.wasm</code>) → loaded by frontend <code>GlossiaService</code>
+- <strong>Native Rust</strong> → linked directly into the Tauri backend (<code>glossia = { path = "../../glossia" }</code>)</p>
+<h3 id="encode-flow-email-servicejsencodeemailfields">Encode Flow (<code>email-service.js:encodeEmailFields</code>)<a class="headerlink" href="#encode-flow-email-servicejsencodeemailfields" title="Permanent link">&para;</a></h3>
+<p>Called automatically after <code>encryptEmailFields()</code> if a glossia encoding is selected.</p>
+<div class="codehilite"><pre><span></span><code><span class="n">NIP</span><span class="w"> </span><span class="n">ciphertext</span><span class="w"> </span><span class="p">(</span><span class="n">base64</span><span class="p">)</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="n">_packNip04</span><span class="p">(</span><span class="n">ciphertext</span><span class="p">)</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">NIP</span><span class="o">-</span><span class="mi">04</span><span class="w"> </span><span class="s2">&quot;base64?iv=base64&quot;</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">binary</span><span class="w"> </span><span class="n">pack</span><span class="w"> </span><span class="p">[</span><span class="n">len</span><span class="p">(</span><span class="mi">2</span><span class="p">),</span><span class="w"> </span><span class="n">payload</span><span class="p">,</span><span class="w"> </span><span class="n">iv</span><span class="p">(</span><span class="mi">16</span><span class="p">)]</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">base64</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">NIP</span><span class="o">-</span><span class="mi">44</span><span class="w"> </span><span class="n">pure</span><span class="w"> </span><span class="n">base64</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="k">pass</span><span class="w"> </span><span class="n">through</span><span class="w"> </span><span class="n">unchanged</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="n">GlossiaService</span><span class="o">.</span><span class="n">transcode</span><span class="p">(</span><span class="n">packed</span><span class="p">,</span><span class="w"> </span><span class="n">instruction</span><span class="p">)</span>
+<span class="w">  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">├──</span><span class="w"> </span><span class="n">Subject</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;encode into ${meta} raw&quot;</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="err">→</span><span class="w"> </span><span class="n">bare</span><span class="w"> </span><span class="n">payload</span><span class="w"> </span><span class="n">words</span><span class="p">,</span><span class="w"> </span><span class="n">no</span><span class="w"> </span><span class="n">grammar</span><span class="o">/</span><span class="n">cover</span><span class="w"> </span><span class="n">words</span><span class="w"> </span><span class="p">(</span><span class="n">compact</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">subject</span><span class="w"> </span><span class="n">line</span><span class="p">)</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">e</span><span class="o">.</span><span class="n">g</span><span class="o">.</span><span class="w"> </span><span class="s2">&quot;abandon rifle federal goat canoe fossil&quot;</span>
+<span class="w">  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">└──</span><span class="w"> </span><span class="n">Body</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;encode into ${meta}&quot;</span>
+<span class="w">      </span><span class="err">→</span><span class="w"> </span><span class="n">full</span><span class="w"> </span><span class="n">prose</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="n">grammar</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="n">cover</span><span class="w"> </span><span class="n">words</span>
+<span class="w">      </span><span class="n">e</span><span class="o">.</span><span class="n">g</span><span class="o">.</span><span class="w"> </span><span class="s2">&quot;Abandon is bad across rifle to the federal lie to cap.&quot;</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="n">Written</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">DOM</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">email</span><span class="w"> </span><span class="n">fields</span>
+</code></pre></div>
+
+<p><strong>Per-field settings</strong> control encoding dialect:
+- <code>glossia_encoding_body</code> → body &amp; subject ciphertext (default: <code>latin</code>)
+- <code>glossia_encoding_signature</code> → signature block
+- <code>glossia_encoding_pubkey</code> → pubkey/seal block
+- Empty string = no encoding (raw base64/hex)</p>
+<h3 id="decode-flow">Decode Flow<a class="headerlink" href="#decode-flow" title="Permanent link">&para;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="n">Glossia</span><span class="w"> </span><span class="n">words</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="n">GlossiaService</span><span class="o">.</span><span class="n">detectDialect</span><span class="p">(</span><span class="n">content</span><span class="p">)</span>
+<span class="w">  </span><span class="err">→</span><span class="w"> </span><span class="n">auto</span><span class="o">-</span><span class="n">detect</span><span class="p">:</span><span class="w"> </span><span class="n">returns</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">language</span><span class="p">,</span><span class="w"> </span><span class="n">wordlist</span><span class="p">,</span><span class="w"> </span><span class="n">confidence</span><span class="w"> </span><span class="p">},</span><span class="w"> </span><span class="o">...</span><span class="p">]</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="n">GlossiaService</span><span class="o">.</span><span class="n">transcode</span><span class="p">(</span><span class="n">content</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;decode from ${dialect}&quot;</span><span class="p">)</span>
+<span class="w">  </span><span class="err">→</span><span class="w"> </span><span class="n">hex</span><span class="w"> </span><span class="n">string</span><span class="w"> </span><span class="p">(</span><span class="ow">or</span><span class="w"> </span><span class="n">base64</span><span class="w"> </span><span class="n">depending</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">dialect</span><span class="p">)</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="n">_isHex</span><span class="p">(</span><span class="n">output</span><span class="p">)</span><span class="w"> </span><span class="err">?</span><span class="w"> </span><span class="n">_hexToBase64</span><span class="p">(</span><span class="n">output</span><span class="p">)</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="n">output</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="n">_autoUnpack</span><span class="p">(</span><span class="n">decoded</span><span class="p">)</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">If</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="k">match</span><span class="w"> </span><span class="p">[</span><span class="n">len</span><span class="p">(</span><span class="mi">2</span><span class="p">),</span><span class="w"> </span><span class="n">payload</span><span class="p">,</span><span class="w"> </span><span class="n">iv</span><span class="p">(</span><span class="mi">16</span><span class="p">)]:</span><span class="w"> </span><span class="n">reconstruct</span><span class="w"> </span><span class="s2">&quot;base64?iv=base64&quot;</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">Otherwise</span><span class="p">:</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="k">as</span><span class="o">-</span><span class="k">is</span><span class="w"> </span><span class="p">(</span><span class="n">NIP</span><span class="o">-</span><span class="mi">44</span><span class="p">)</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="n">NIP</span><span class="w"> </span><span class="n">ciphertext</span><span class="w"> </span><span class="n">ready</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">decryption</span>
+</code></pre></div>
+
+<h3 id="backend-glossia-usage">Backend Glossia Usage<a class="headerlink" href="#backend-glossia-usage" title="Permanent link">&para;</a></h3>
+<p>The Rust backend <strong>already uses glossia natively</strong> for:
+- <code>detect_dialect_best()</code> — dialect auto-detection for incoming emails (<code>email.rs:2328</code>)
+- <code>decode_from_language()</code> — decoding glossia words to hex (<code>email.rs:2336</code>)
+- <code>encode_into_language()</code> — encoding for transport auth verification (<code>email.rs:3275</code>)
+- <code>encode_bip39</code> / <code>decode_bip39</code> Tauri commands (<code>lib.rs:3628+</code>) — direct encoding/decoding</p>
+<hr />
+<h2 id="4-signing">4. Signing<a class="headerlink" href="#4-signing" title="Permanent link">&para;</a></h2>
+<h3 id="flow-appjs-sign-handler">Flow (<code>app.js</code> sign handler)<a class="headerlink" href="#flow-appjs-sign-handler" title="Permanent link">&para;</a></h3>
+<ol>
+<li>Extract ciphertext from the body (armor or glossia-decode)</li>
+<li><code>CryptoService.ciphertextToBytes(ciphertext)</code> → canonical binary</li>
+<li><code>CryptoService.signData(privateKey, bytes)</code> → Schnorr sign SHA-256 hash</li>
+<li>Signature (64-byte hex) + pubkey (32-byte hex) encoded as glossia words</li>
+<li>Appended to email body as <code>--- BEGIN NOSTR SIGNATURE ---</code> or <code>--- BEGIN NOSTR SEAL ---</code> blocks</li>
+</ol>
+<h3 id="verification">Verification<a class="headerlink" href="#verification" title="Permanent link">&para;</a></h3>
+<ol>
+<li>Extract signature and pubkey from armor blocks</li>
+<li>Glossia-decode each to hex</li>
+<li>Extract and canonicalize the signed ciphertext</li>
+<li><code>CryptoService.verifySignature(pubkey, signature, bytes)</code> → Schnorr verify</li>
+</ol>
+<hr />
+<h2 id="5-dm-encryption">5. DM Encryption<a class="headerlink" href="#5-dm-encryption" title="Permanent link">&para;</a></h2>
+<h3 id="send-flow-tauri-servicejssenddirectmessage">Send Flow (<code>tauri-service.js:sendDirectMessage</code>)<a class="headerlink" href="#send-flow-tauri-servicejssenddirectmessage" title="Permanent link">&para;</a></h3>
+<div class="codehilite"><pre><span></span><code>sendDirectMessage(privateKey, recipientPubkey, message, relays)
+       │
+       ▼
+Utils.isLikelyEncryptedContent(message)?
+  ├── true  → { Encrypted: message }   ← already NIP ciphertext, pass through
+  └── false → { Plaintext: message }   ← backend will NIP-encrypt
+       │
+       ▼
+Backend send_direct_message (lib.rs:418)
+  ├── Plaintext → nip44::encrypt(sk, recipient, text) or nip04::encrypt
+  └── Encrypted → use content as-is in Kind 4 event
+       │
+       ▼
+EventBuilder::new(Kind::EncryptedDirectMessage, content)
+  → sign → publish to relays
+</code></pre></div>
+
+<p><strong>Email-linked DMs</strong>: When sending an encrypted email, the subject's NIP ciphertext (<code>_subjectCiphertext</code>) is sent as the DM content via <code>sendEncryptedDirectMessage</code> (sends as <code>{ Encrypted: ciphertext }</code>). This lets other Nostr clients decrypt the DM, and enables DM↔email hash matching.</p>
+<hr />
+<h2 id="6-where-crypto-happens-today">6. Where Crypto Happens Today<a class="headerlink" href="#6-where-crypto-happens-today" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th style="text-align: center;">Frontend (JS)</th>
+<th style="text-align: center;">Backend (Rust)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NIP-44/04 encrypt</td>
+<td style="text-align: center;"><strong>primary</strong> (nostr-tools)</td>
+<td style="text-align: center;">fallback</td>
+</tr>
+<tr>
+<td>NIP-44/04 decrypt</td>
+<td style="text-align: center;"><strong>primary</strong> (nostr-tools)</td>
+<td style="text-align: center;">fallback + DM fetch</td>
+</tr>
+<tr>
+<td>Schnorr sign/verify</td>
+<td style="text-align: center;"><strong>primary</strong> (@noble/curves)</td>
+<td style="text-align: center;">—</td>
+</tr>
+<tr>
+<td>AES-256-GCM (manifest)</td>
+<td style="text-align: center;"><strong>primary</strong> (WebCrypto)</td>
+<td style="text-align: center;">—</td>
+</tr>
+<tr>
+<td>Settings AES-GCM encrypt</td>
+<td style="text-align: center;"><strong>primary</strong> (WebCrypto)</td>
+<td style="text-align: center;">also (for batch save)</td>
+</tr>
+<tr>
+<td>Glossia encode/decode</td>
+<td style="text-align: center;"><strong>primary</strong> (WASM)</td>
+<td style="text-align: center;">also (detect, encode, decode)</td>
+</tr>
+<tr>
+<td>Key generation</td>
+<td style="text-align: center;"><strong>primary</strong> (nostr-tools)</td>
+<td style="text-align: center;">fallback</td>
+</tr>
+<tr>
+<td>Key storage</td>
+<td style="text-align: center;">localStorage</td>
+<td style="text-align: center;">config file (default key)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="7-migration-path-backend-encryption-system-keychain">7. Migration Path: Backend Encryption + System Keychain<a class="headerlink" href="#7-migration-path-backend-encryption-system-keychain" title="Permanent link">&para;</a></h2>
+<h3 id="goals">Goals<a class="headerlink" href="#goals" title="Permanent link">&para;</a></h3>
+<ol>
+<li><strong>Private keys never leave the backend</strong> — no nsec strings over IPC or in localStorage</li>
+<li><strong>System keychain</strong> (macOS Keychain, Windows Credential Locker, Linux Secret Service) for key storage</li>
+<li><strong>Glossia in Rust</strong> — eliminate WASM build; the backend already links glossia natively</li>
+</ol>
+<h3 id="what-changes">What Changes<a class="headerlink" href="#what-changes" title="Permanent link">&para;</a></h3>
+<h4 id="key-management">Key Management<a class="headerlink" href="#key-management" title="Permanent link">&para;</a></h4>
+<ul>
+<li>Store nsec in system keychain via <code>keyring</code> or <code>tauri-plugin-stronghold</code></li>
+<li>Frontend identifies accounts by npub only</li>
+<li>Backend holds nsec in memory for the active session; clears on lock/logout</li>
+<li>IPC calls no longer pass <code>private_key</code>; backend looks up the active key internally</li>
+</ul>
+<h4 id="nip-encryption">NIP Encryption<a class="headerlink" href="#nip-encryption" title="Permanent link">&para;</a></h4>
+<ul>
+<li>New Tauri commands: <code>encrypt_email_fields(pubkey, subject, body, algo)</code> → returns <code>{ encrypted_subject, encrypted_body, subject_ciphertext }</code></li>
+<li>Frontend sends plaintext, receives ciphertext — never touches keys</li>
+<li>Manifest AES encryption also moves to backend (Rust <code>aes-gcm</code> crate)</li>
+</ul>
+<h4 id="glossia-encoding">Glossia Encoding<a class="headerlink" href="#glossia-encoding" title="Permanent link">&para;</a></h4>
+<ul>
+<li>Already available in Rust; backend can encode/decode inline after encryption</li>
+<li>Single command: <code>encrypt_and_encode_email(pubkey, subject, body, algo, glossia_settings)</code> → returns fully encoded fields</li>
+<li>Eliminates the WASM build step and <code>glossia-service.js</code> entirely</li>
+</ul>
+<h4 id="signing">Signing<a class="headerlink" href="#signing" title="Permanent link">&para;</a></h4>
+<ul>
+<li><code>sign_ciphertext(ciphertext_bytes)</code> → backend signs with active key</li>
+<li><code>verify_signature(pubkey, sig, data)</code> → can stay frontend or move to backend</li>
+</ul>
+<h4 id="dm-sending">DM Sending<a class="headerlink" href="#dm-sending" title="Permanent link">&para;</a></h4>
+<ul>
+<li>Backend already handles NIP encryption for <code>Plaintext</code> DMs</li>
+<li><code>send_email_with_dm(email_params, dm_recipient)</code> → backend encrypts subject, encodes body, sends email, sends DM with ciphertext — all in one atomic operation</li>
+</ul>
+<h3 id="what-stays-in-frontend">What Stays in Frontend<a class="headerlink" href="#what-stays-in-frontend" title="Permanent link">&para;</a></h3>
+<ul>
+<li>UI rendering and user interaction</li>
+<li>Glossia dialect selection (settings)</li>
+<li>Calling backend commands with plaintext + npub</li>
+<li>Displaying decrypted content</li>
+</ul>
+<h3 id="rust-crates-needed">Rust Crates Needed<a class="headerlink" href="#rust-crates-needed" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>keyring</code> or <code>tauri-plugin-stronghold</code> — system keychain</li>
+<li><code>aes-gcm</code> — manifest body/attachment encryption (replace WebCrypto)</li>
+<li><code>sha2</code> — already used</li>
+<li><code>glossia</code> — already linked</li>
+<li><code>nostr-sdk</code> — already used for NIP-44/04</li>
+<li><code>capnp</code> — already linked (Cap'n Proto runtime for structured IPC)</li>
+</ul>
+<hr />
+<h2 id="8-capn-proto-as-the-internal-representation">8. Cap'n Proto as the Internal Representation<a class="headerlink" href="#8-capn-proto-as-the-internal-representation" title="Permanent link">&para;</a></h2>
+<h3 id="problem-duplicated-parsing-ad-hoc-data-shapes">Problem: Duplicated Parsing, Ad-Hoc Data Shapes<a class="headerlink" href="#problem-duplicated-parsing-ad-hoc-data-shapes" title="Permanent link">&para;</a></h3>
+<p>Armor parsing is currently implemented twice — once in JS (<code>parseArmorComponents</code>, ~100 lines) and once in Rust (<code>parse_armor_depth</code>, ~75 lines). Both use regex-based depth-counting state machines and return different ad-hoc shapes:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>JS</th>
+<th>Rust</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Return type</td>
+<td><code>{ bodyText, sigContent, sealContent, quotedArmor, profileName, displayName, rawSigPubkey, prefixText, isEncryptedBody }</code></td>
+<td><code>(String, Option&lt;String&gt;)</code> (body + nested only)</td>
+</tr>
+<tr>
+<td>Type detection</td>
+<td>Regex on raw text at every call site: <code>plainBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-(?:04\|44) ENCRYPTED)/)</code></td>
+<td><code>body.contains("BEGIN NOSTR NIP-04 ENCRYPTED")</code></td>
+</tr>
+<tr>
+<td>Sig/pubkey decode</td>
+<td>Deferred — each of 45+ call sites glossia-decodes independently</td>
+<td>Partial — only for signing verification</td>
+</tr>
+<tr>
+<td>Nesting</td>
+<td>Returns <code>quotedArmor</code> as raw text; callers re-parse recursively</td>
+<td>Returns nested text; callers re-parse</td>
+</tr>
+</tbody>
+</table>
+<h3 id="solution-capnp-structs-as-the-parsing-contract">Solution: Capnp Structs as the Parsing Contract<a class="headerlink" href="#solution-capnp-structs-as-the-parsing-contract" title="Permanent link">&para;</a></h3>
+<p>The Cap'n Proto schema (<code>schema/nostr_mail.capnp</code>) already defines typed structs that mirror this structure exactly:</p>
+<div class="codehilite"><pre><span></span><code>ArmorMessage { body: Body, signature: SignatureBlock, seal: SealBlock }
+Body { union { encrypted { nip, ciphertext }, signed { plaintext }, plain { text } }, quoted: ArmorMessage }
+SignatureBlock { profileName, signature (64 bytes), pubkey (32 bytes) }
+SealBlock { displayName, pubkey (32 bytes) }
+</code></pre></div>
+
+<p>A single Rust parser produces a capnp <code>ArmorMessage</code>, and the frontend reads typed fields. This eliminates:</p>
+<ol>
+<li>
+<p><strong>The JS parser entirely</strong> — <code>parseArmorComponents()</code> and its 45+ ad-hoc field accesses are replaced by a Tauri command that returns capnp bytes.</p>
+</li>
+<li>
+<p><strong>Per-site type detection</strong> — the <code>Body</code> union is a proper tagged discriminant (<code>body.which()</code> → <code>encrypted | signed | plain</code>), replacing regex checks scattered across call sites.</p>
+</li>
+<li>
+<p><strong>Per-site glossia decoding</strong> — the Rust parser decodes signatures and pubkeys before populating the capnp struct. <code>SignatureBlock.signature</code> arrives as 64 raw bytes; <code>SignatureBlock.pubkey</code> as 32 raw bytes. No caller-side decode needed.</p>
+</li>
+<li>
+<p><strong>Recursive re-parsing</strong> — <code>Body.quoted</code> is a nested <code>ArmorMessage</code>, so walking a reply chain is a pointer traversal, not a re-parse of raw text at each level.</p>
+</li>
+</ol>
+<h3 id="how-it-works">How It Works<a class="headerlink" href="#how-it-works" title="Permanent link">&para;</a></h3>
+<h4 id="reading-emails-incoming">Reading emails (incoming)<a class="headerlink" href="#reading-emails-incoming" title="Permanent link">&para;</a></h4>
+<div class="codehilite"><pre><span></span><code><span class="nx">text</span><span class="o">/</span><span class="nx">plain</span><span class="w"> </span><span class="nx">body</span><span class="w"> </span><span class="p">(</span><span class="nx">ASCII</span><span class="w"> </span><span class="nx">armor</span><span class="p">)</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="nx">Backend</span><span class="p">:</span><span class="w"> </span><span class="nx">parse_armor</span><span class="p">(</span><span class="nx">text</span><span class="p">)</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">capnp</span><span class="w"> </span><span class="nx">ArmorMessage</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="nx">Body</span><span class="p">.</span><span class="nx">encrypted</span><span class="p">.</span><span class="nx">ciphertext</span><span class="w"> </span><span class="p">(</span><span class="nx">raw</span><span class="w"> </span><span class="nx">bytes</span><span class="p">,</span><span class="w"> </span><span class="nx">glossia</span><span class="o">-</span><span class="nx">decoded</span><span class="p">)</span>
+<span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="nx">Body</span><span class="p">.</span><span class="nx">encrypted</span><span class="p">.</span><span class="nx">nip</span><span class="w"> </span><span class="p">(</span><span class="nx">NIP</span><span class="o">-</span><span class="mi">04</span><span class="w"> </span><span class="k">or</span><span class="w"> </span><span class="nx">NIP</span><span class="o">-</span><span class="mi">44</span><span class="w"> </span><span class="nx">tag</span><span class="p">)</span>
+<span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="nx">Body</span><span class="p">.</span><span class="nx">quoted</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">nested</span><span class="w"> </span><span class="nx">ArmorMessage</span><span class="w"> </span><span class="p">(</span><span class="nx">already</span><span class="w"> </span><span class="nx">parsed</span><span class="p">)</span>
+<span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="nx">SignatureBlock</span><span class="p">.</span><span class="nx">signature</span><span class="w"> </span><span class="p">(</span><span class="mi">64</span><span class="w"> </span><span class="nx">bytes</span><span class="p">,</span><span class="w"> </span><span class="nx">glossia</span><span class="o">-</span><span class="nx">decoded</span><span class="p">)</span>
+<span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="nx">SignatureBlock</span><span class="p">.</span><span class="nx">pubkey</span><span class="w"> </span><span class="p">(</span><span class="mi">32</span><span class="w"> </span><span class="nx">bytes</span><span class="p">,</span><span class="w"> </span><span class="nx">glossia</span><span class="o">-</span><span class="nx">decoded</span><span class="p">)</span>
+<span class="w">       </span><span class="err">└──</span><span class="w"> </span><span class="nx">SignatureBlock</span><span class="p">.</span><span class="nx">profileName</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">▼</span>
+<span class="nx">Frontend</span><span class="p">:</span><span class="w"> </span><span class="nx">reads</span><span class="w"> </span><span class="nx">typed</span><span class="w"> </span><span class="nx">fields</span><span class="w"> </span><span class="nx">from</span><span class="w"> </span><span class="nx">capnp</span><span class="w"> </span><span class="nx">message</span>
+<span class="w">       </span><span class="err">│</span>
+<span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="nx">Render</span><span class="w"> </span><span class="nx">body</span><span class="w"> </span><span class="p">(</span><span class="nx">request</span><span class="w"> </span><span class="nx">decryption</span><span class="w"> </span><span class="nx">via</span><span class="w"> </span><span class="nx">backend</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nx">encrypted</span><span class="p">)</span>
+<span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="nx">Display</span><span class="w"> </span><span class="nx">signature</span><span class="w"> </span><span class="nx">status</span><span class="w"> </span><span class="p">(</span><span class="nx">verify</span><span class="w"> </span><span class="nx">via</span><span class="w"> </span><span class="nx">backend</span><span class="p">)</span>
+<span class="w">       </span><span class="err">└──</span><span class="w"> </span><span class="nx">Recurse</span><span class="w"> </span><span class="nx">into</span><span class="w"> </span><span class="p">.</span><span class="nx">quoted</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="nx">reply</span><span class="w"> </span><span class="nx">threading</span>
+</code></pre></div>
+
+<h4 id="writing-emails-outgoing">Writing emails (outgoing)<a class="headerlink" href="#writing-emails-outgoing" title="Permanent link">&para;</a></h4>
+<div class="codehilite"><pre><span></span><code>Frontend: user composes message
+       │
+       ▼
+Backend: build_armor(ArmorMessage) → text/plain
+       │
+       ├── Encrypt body → populate Body.encrypted
+       ├── Glossia-encode all fields
+       ├── Sign → populate SignatureBlock (concatenate all nested body bytes)
+       ├── Nest quoted original into Body.quoted
+       └── Serialize to ASCII armor text
+       │
+       ▼
+text/plain body ready for SMTP
+</code></pre></div>
+
+<h4 id="manifest-binary-transport">Manifest (binary transport)<a class="headerlink" href="#manifest-binary-transport" title="Permanent link">&para;</a></h4>
+<p>The <code>Manifest</code> struct is the one place where capnp is also the <strong>wire format</strong>, not just the internal representation. After NIP decryption, the manifest payload is either JSON (legacy, first byte <code>0x7B</code>) or capnp binary (first byte <code>0x00</code>). See the schema comments for detection logic.</p>
+<h3 id="what-this-replaces-in-js">What This Replaces in JS<a class="headerlink" href="#what-this-replaces-in-js" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Current JS code</th>
+<th>Replaced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>parseArmorComponents()</code> (100 lines)</td>
+<td><code>parse_armor</code> Tauri command</td>
+</tr>
+<tr>
+<td><code>_extractAllBodyBytes()</code> (recursive re-parse)</td>
+<td>Walk <code>Body.quoted</code> chain on capnp struct</td>
+</tr>
+<tr>
+<td><code>_decodeArmorBodyToBytes()</code></td>
+<td>Already decoded in capnp fields</td>
+</tr>
+<tr>
+<td><code>_splitSigPubkey()</code> (glossia decode sig+pubkey)</td>
+<td>Already decoded in <code>SignatureBlock</code></td>
+</tr>
+<tr>
+<td><code>verifyInlineSignature()</code> regex type detection</td>
+<td><code>body.which()</code> union discriminant</td>
+</tr>
+<tr>
+<td><code>decodeGlossiaSignedMessage()</code></td>
+<td><code>Body.signed.plaintext</code> field</td>
+</tr>
+<tr>
+<td><code>buildPlainBody()</code> (10 positional params)</td>
+<td><code>build_armor(ArmorMessage)</code> Tauri command</td>
+</tr>
+</tbody>
+</table>
+<h3 id="what-stays-the-same">What Stays the Same<a class="headerlink" href="#what-stays-the-same" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>The wire format is still ASCII armor.</strong> Capnp is the internal representation between backend and frontend, not the email transport encoding. Emails remain human-readable for non-nostr-mail clients.</li>
+<li><strong>The capnp schema is documentation as much as code.</strong> Even before full migration, the schema defines the canonical structure that both layers agree on.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": [], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.0/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+      
+    
+  </body>
+</html>

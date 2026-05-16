@@ -215,7 +215,7 @@ const TauriService = {
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
     },
-    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null) {
+    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -234,10 +234,16 @@ const TauriService = {
         }
         if (references) {
             args.references = references;
+        }
+        if (includePubkeyHeader !== null && includePubkeyHeader !== undefined) {
+            args.includePubkeyHeader = includePubkeyHeader;
+        }
+        if (includeSigHeader !== null && includeSigHeader !== undefined) {
+            args.includeSigHeader = includeSigHeader;
         }
         return await this.invoke('send_email', args);
     },
-    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null) {
+    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -256,6 +262,12 @@ const TauriService = {
         }
         if (references) {
             args.references = references;
+        }
+        if (includePubkeyHeader !== null && includePubkeyHeader !== undefined) {
+            args.includePubkeyHeader = includePubkeyHeader;
+        }
+        if (includeSigHeader !== null && includeSigHeader !== undefined) {
+            args.includeSigHeader = includeSigHeader;
         }
         return await this.invoke('construct_email_headers', args);
     },

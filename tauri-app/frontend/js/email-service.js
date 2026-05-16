@@ -2020,13 +2020,15 @@ class EmailService {
             } else {
                 // Send regular email
                 console.log('[JS] Sending regular email');
-                
+
                 // Send email with attachments
                 const attachmentData = this.prepareAttachmentsForEmail();
                 console.log('[JS] Sending email with attachments:', attachmentData);
-                
+
                 const plainBody = this._plainBody || body;
-                await TauriService.sendEmail(emailConfig, toAddress, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences);
+                const includePubkeyHeader = settings && settings.include_pubkey_header !== false;
+                const includeSigHeader = settings && settings.include_sig_header !== false;
+                await TauriService.sendEmail(emailConfig, toAddress, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences, includePubkeyHeader, includeSigHeader);
             }
 
             console.log('[JS] Email sent successfully');
@@ -2165,7 +2167,9 @@ class EmailService {
             };
 
             // Construct headers (sender's pubkey will be derived from keychain in backend)
-            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId, null, this._htmlBody, this._replyToMessageId, this._replyReferences);
+            const includePubkeyHeaderPreview = settings && settings.include_pubkey_header !== false;
+            const includeSigHeaderPreview = settings && settings.include_sig_header !== false;
+            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId, null, this._htmlBody, this._replyToMessageId, this._replyReferences, includePubkeyHeaderPreview, includeSigHeaderPreview);
             
             // Debug: Log what headers we actually received
             console.log('[JS] Headers received from backend:');
@@ -2458,7 +2462,9 @@ class EmailService {
             if (!recipientEmail) {
                 throw new Error('No email address available for this contact. Please enter one in the To field.');
             }
-            await TauriService.sendEmail(emailConfig, recipientEmail, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences);
+            const includePubkeyHeader = settings && settings.include_pubkey_header !== false;
+            const includeSigHeader = settings && settings.include_sig_header !== false;
+            await TauriService.sendEmail(emailConfig, recipientEmail, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences, includePubkeyHeader, includeSigHeader);
             console.log('[JS] Encrypted email sent successfully');
 
             // Persist a minimal record of this sent email to the local DB immediately,

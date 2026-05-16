@@ -149,6 +149,8 @@ pub fn construct_email_headers(
     html_body: Option<&str>,
     in_reply_to: Option<&str>,
     references: Option<&str>,
+    include_pubkey_header: bool,
+    include_sig_header: bool,
 ) -> Result<String> {
     println!("[RUST] construct_email_headers: Constructing email headers");
     println!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
@@ -185,28 +187,42 @@ pub fn construct_email_headers(
     }
 
     // Add the sender's public key to the headers (not the receiver's)
-    // This allows the receiver to derive the shared secret using their private key
+    // This allows the receiver to derive the shared secret using their private key.
+    // Both X-Nostr-Pubkey and X-Nostr-Sig are gated on per-user toggles in
+    // Advanced settings (default-on). X-Nostr-Sig also requires X-Nostr-Pubkey
+    // since the recipient needs the pubkey to verify the signature.
     if let Some(private_key) = &config.private_key {
-        // Extract public key from private key
-        match crypto::get_public_key_from_private(private_key) {
-            Ok(sender_pubkey) => {
-                println!("[RUST] construct_email_headers: Adding sender pubkey to headers: {}", sender_pubkey);
-                builder = builder.header(XNostrPubkey(sender_pubkey));
-                
-                // Sign the binary ciphertext extracted from the body
-                let binary = extract_ciphertext_binary(body);
-                match crypto::sign_data_bytes(private_key, &binary) {
-                    Ok(signature) => {
-                        println!("[RUST] construct_email_headers: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
-                        builder = builder.header(XNostrSig(signature));
+        if include_pubkey_header || include_sig_header {
+            match crypto::get_public_key_from_private(private_key) {
+                Ok(sender_pubkey) => {
+                    if include_pubkey_header {
+                        println!("[RUST] construct_email_headers: Adding sender pubkey to headers: {}", sender_pubkey);
+                        builder = builder.header(XNostrPubkey(sender_pubkey));
+                    } else {
+                        println!("[RUST] construct_email_headers: Skipping X-Nostr-Pubkey (disabled by user)");
                     }
-                    Err(e) => {
-                        println!("[RUST] construct_email_headers: Failed to sign email body: {}", e);
+
+                    if include_sig_header && include_pubkey_header {
+                        // Sign the binary ciphertext extracted from the body
+                        let binary = extract_ciphertext_binary(body);
+                        match crypto::sign_data_bytes(private_key, &binary) {
+                            Ok(signature) => {
+                                println!("[RUST] construct_email_headers: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
+                                builder = builder.header(XNostrSig(signature));
+                            }
+                            Err(e) => {
+                                println!("[RUST] construct_email_headers: Failed to sign email body: {}", e);
+                            }
+                        }
+                    } else if include_sig_header && !include_pubkey_header {
+                        println!("[RUST] construct_email_headers: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
+                    } else {
+                        println!("[RUST] construct_email_headers: Skipping X-Nostr-Sig (disabled by user)");
                     }
                 }
-            }
-            Err(e) => {
-                println!("[RUST] construct_email_headers: Failed to get public key from private key: {}", e);
+                Err(e) => {
+                    println!("[RUST] construct_email_headers: Failed to get public key from private key: {}", e);
+                }
             }
         }
     }
@@ -326,6 +342,8 @@ pub async fn send_email(
     html_body: Option<&str>,
     in_reply_to: Option<&str>,
     references: Option<&str>,
+    include_pubkey_header: bool,
+    include_sig_header: bool,
 ) -> Result<String> {
     println!("[RUST] send_email: Starting email send process");
     println!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
@@ -356,37 +374,49 @@ pub async fn send_email(
         builder = builder.references(refs.to_string());
     }
 
-    // Add the sender's public key to the headers (not the receiver's)
-    // This allows the receiver to derive the shared secret using their private key
+    // Add the sender's public key to the headers (not the receiver's).
+    // X-Nostr-Pubkey and X-Nostr-Sig are gated on per-user toggles in Advanced
+    // settings (default-on). X-Nostr-Sig requires X-Nostr-Pubkey since the
+    // recipient needs the pubkey to verify the signature.
     if let Some(private_key) = &config.private_key {
-        // Extract public key from private key
-        match crypto::get_public_key_from_private(private_key) {
-            Ok(sender_pubkey) => {
-                println!("[RUST] send_email: Adding sender pubkey to headers: {}", sender_pubkey);
-                builder = builder.header(XNostrPubkey(sender_pubkey));
-                
-                // Sign the binary ciphertext extracted from the body
-                println!("[RUST] send_email: body passed to extract_ciphertext_binary ({} chars):\n{}", body.len(), &body[..body.len().min(500)]);
-                let binary = extract_ciphertext_binary(body);
-                let binary_hash = {
-                    use sha2::{Sha256, Digest};
-                    let mut h = Sha256::new();
-                    h.update(&binary);
-                    hex::encode(&h.finalize()[..8])
-                };
-                println!("[RUST] send_email: extracted binary {} bytes, sha256_prefix: {}", binary.len(), binary_hash);
-                match crypto::sign_data_bytes(private_key, &binary) {
-                    Ok(signature) => {
-                        println!("[RUST] send_email: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
-                        builder = builder.header(XNostrSig(signature));
+        if include_pubkey_header || include_sig_header {
+            match crypto::get_public_key_from_private(private_key) {
+                Ok(sender_pubkey) => {
+                    if include_pubkey_header {
+                        println!("[RUST] send_email: Adding sender pubkey to headers: {}", sender_pubkey);
+                        builder = builder.header(XNostrPubkey(sender_pubkey));
+                    } else {
+                        println!("[RUST] send_email: Skipping X-Nostr-Pubkey (disabled by user)");
                     }
-                    Err(e) => {
-                        println!("[RUST] send_email: Failed to sign email body: {}", e);
+
+                    if include_sig_header && include_pubkey_header {
+                        println!("[RUST] send_email: body passed to extract_ciphertext_binary ({} chars):\n{}", body.len(), &body[..body.len().min(500)]);
+                        let binary = extract_ciphertext_binary(body);
+                        let binary_hash = {
+                            use sha2::{Sha256, Digest};
+                            let mut h = Sha256::new();
+                            h.update(&binary);
+                            hex::encode(&h.finalize()[..8])
+                        };
+                        println!("[RUST] send_email: extracted binary {} bytes, sha256_prefix: {}", binary.len(), binary_hash);
+                        match crypto::sign_data_bytes(private_key, &binary) {
+                            Ok(signature) => {
+                                println!("[RUST] send_email: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
+                                builder = builder.header(XNostrSig(signature));
+                            }
+                            Err(e) => {
+                                println!("[RUST] send_email: Failed to sign email body: {}", e);
+                            }
+                        }
+                    } else if include_sig_header && !include_pubkey_header {
+                        println!("[RUST] send_email: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
+                    } else {
+                        println!("[RUST] send_email: Skipping X-Nostr-Sig (disabled by user)");
                     }
                 }
-            }
-            Err(e) => {
-                println!("[RUST] send_email: Failed to get public key from private key: {}", e);
+                Err(e) => {
+                    println!("[RUST] send_email: Failed to get public key from private key: {}", e);
+                }
             }
         }
     }
@@ -4553,6 +4583,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            true,
         );
 
         assert!(result.is_ok());
@@ -4577,6 +4609,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            true,
         );
 
         assert!(result.is_ok());
@@ -4605,6 +4639,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            true,
         );
 
         assert!(result.is_ok());
@@ -4629,6 +4665,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            true,
         );
 
         assert!(result.is_ok());
@@ -4662,6 +4700,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            true,
         );
 
         assert!(result.is_ok());

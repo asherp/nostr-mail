@@ -662,6 +662,11 @@ body.dark-mode .toggle-settings-item:hover {
     margin-bottom: 0;
 }
 
+.toggle-settings-item.disabled {
+    opacity: 0.55;
+    pointer-events: none;
+}
+
 /* Selected recipient pubkey display */
 .selected-pubkey-display {
     margin-top: 8px;

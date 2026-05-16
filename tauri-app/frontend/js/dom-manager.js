@@ -109,6 +109,8 @@ class DOMManager {
             'automatically-encrypt-preference': this.getElement('automatically-encrypt-preference'),
             'automatically-sign-preference': this.getElement('automatically-sign-preference'),
             'hide-unsigned-messages-preference': this.getElement('hide-unsigned-messages-preference'),
+            'include-pubkey-header-preference': this.getElement('include-pubkey-header-preference'),
+            'include-sig-header-preference': this.getElement('include-sig-header-preference'),
             syncCutoffDays: this.getElement('sync-cutoff-days'),
             emailsPerPage: this.getElement('emails-per-page'),
             testEmailConnectionBtn: this.getElement('test-email-connection-btn'),

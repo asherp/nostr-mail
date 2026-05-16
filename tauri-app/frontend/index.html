@@ -709,6 +709,26 @@
                                     </div>
                                     <small class="form-text text-muted">Hide messages with missing or unverified signatures.</small>
                                 </li>
+
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="include-pubkey-header-preference">Include X-Nostr-Pubkey</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="include-pubkey-header-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Attach an X-Nostr-Pubkey header to outgoing emails so recipients can derive the shared secret without scanning the body.</small>
+                                </li>
+
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="include-sig-header-preference">Include X-Nostr-Sig</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="include-sig-header-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Attach an X-Nostr-Sig header signing the email body. Requires X-Nostr-Pubkey to be enabled.</small>
+                                </li>
                             </ul>
                         </div>
                         

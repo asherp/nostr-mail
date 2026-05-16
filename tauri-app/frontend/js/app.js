@@ -226,7 +226,9 @@ NostrMailApp.prototype.loadSettings = async function() {
                         hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                         automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                         automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
-                        hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false' // Default to true if not set
+                        hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false', // Default to true if not set
+                        include_pubkey_header: dbSettings.include_pubkey_header !== 'false', // Default to true if not set
+                        include_sig_header: dbSettings.include_sig_header !== 'false' // Default to true if not set
                     };
                     appState.setSettings(settings);
                     this.populateSettingsForm();
@@ -329,6 +331,8 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         automatically_encrypt: true,
         automatically_sign: true,
         hide_unsigned_messages: true,
+        include_pubkey_header: true,
+        include_sig_header: true,
         glossia_encoding_body: 'latin',
         glossia_encoding_signature: 'latin',
         glossia_encoding_pubkey: 'latin'
@@ -387,6 +391,8 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                 automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
                 hide_unsigned_messages: dbSettings.hide_unsigned_messages !== 'false', // Default to true if not set
+                include_pubkey_header: dbSettings.include_pubkey_header !== 'false', // Default to true if not set
+                include_sig_header: dbSettings.include_sig_header !== 'false', // Default to true if not set
                 glossia_encoding_body: dbSettings.glossia_encoding_body ?? dbSettings.glossia_encoding ?? 'latin',
                 glossia_encoding_signature: dbSettings.glossia_encoding_signature ?? dbSettings.glossia_encoding ?? 'latin',
                 glossia_encoding_pubkey: dbSettings.glossia_encoding_pubkey ?? dbSettings.glossia_encoding ?? 'latin'
@@ -3170,6 +3176,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 automatically_encrypt: (loadedSettings && loadedSettings.automatically_encrypt !== undefined) ? loadedSettings.automatically_encrypt : (domManager.get('automatically-encrypt-preference')?.checked !== false),
                 automatically_sign: (loadedSettings && loadedSettings.automatically_sign !== undefined) ? loadedSettings.automatically_sign : (domManager.get('automatically-sign-preference')?.checked !== false),
                 hide_unsigned_messages: (loadedSettings && loadedSettings.hide_unsigned_messages !== undefined) ? loadedSettings.hide_unsigned_messages : (domManager.get('hide-unsigned-messages-preference')?.checked !== false),
+                include_pubkey_header: (loadedSettings && loadedSettings.include_pubkey_header !== undefined) ? loadedSettings.include_pubkey_header : (domManager.get('include-pubkey-header-preference')?.checked !== false),
+                include_sig_header: (loadedSettings && loadedSettings.include_sig_header !== undefined) ? loadedSettings.include_sig_header : (domManager.get('include-sig-header-preference')?.checked !== false),
                 glossia_encoding_body: (loadedSettings && loadedSettings.glossia_encoding_body != null) ? loadedSettings.glossia_encoding_body : (domManager.getValue('glossiaEncodingBody') ?? 'latin'),
                 glossia_encoding_signature: (loadedSettings && loadedSettings.glossia_encoding_signature != null) ? loadedSettings.glossia_encoding_signature : (domManager.getValue('glossiaEncodingSignature') ?? 'latin'),
                 glossia_encoding_pubkey: (loadedSettings && loadedSettings.glossia_encoding_pubkey != null) ? loadedSettings.glossia_encoding_pubkey : (domManager.getValue('glossiaEncodingPubkey') ?? 'latin')
@@ -3205,6 +3213,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 automatically_encrypt: autoEncryptEnabled,
                 automatically_sign: autoSignPref?.checked !== false, // Default to true (will be true if auto-encrypt is enabled)
                 hide_unsigned_messages: domManager.get('hide-unsigned-messages-preference')?.checked !== false, // Default to true
+                include_pubkey_header: domManager.get('include-pubkey-header-preference')?.checked !== false, // Default to true
+                include_sig_header: domManager.get('include-sig-header-preference')?.checked !== false, // Default to true
                 glossia_encoding_body: domManager.getValue('glossiaEncodingBody') ?? 'latin',
                 glossia_encoding_signature: domManager.getValue('glossiaEncodingSignature') ?? 'latin',
                 glossia_encoding_pubkey: domManager.getValue('glossiaEncodingPubkey') ?? 'latin'
@@ -3246,6 +3256,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('automatically_encrypt', (settings.automatically_encrypt !== undefined ? settings.automatically_encrypt : true).toString());
             settingsMap.set('automatically_sign', (settings.automatically_sign !== undefined ? settings.automatically_sign : true).toString());
             settingsMap.set('hide_unsigned_messages', (settings.hide_unsigned_messages !== undefined ? settings.hide_unsigned_messages : true).toString());
+            settingsMap.set('include_pubkey_header', (settings.include_pubkey_header !== undefined ? settings.include_pubkey_header : true).toString());
+            settingsMap.set('include_sig_header', (settings.include_sig_header !== undefined ? settings.include_sig_header : true).toString());
             settingsMap.set('glossia_encoding_body', settings.glossia_encoding_body ?? 'latin');
             settingsMap.set('glossia_encoding_signature', settings.glossia_encoding_signature ?? 'latin');
             settingsMap.set('glossia_encoding_pubkey', settings.glossia_encoding_pubkey ?? 'latin');
@@ -3340,6 +3352,8 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'automatically-encrypt-preference',
         'automatically-sign-preference',
         'hide-unsigned-messages-preference',
+        'include-pubkey-header-preference',
+        'include-sig-header-preference',
         'syncCutoffDays',
         'emailsPerPage',
         'glossiaEncodingBody',
@@ -3377,7 +3391,33 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
             // User can still have auto-sign enabled independently
         });
     }
-    
+
+    // X-Nostr-Sig requires X-Nostr-Pubkey: a signature without the pubkey is
+    // unverifiable, so when the pubkey toggle is off we force-disable sig.
+    const includePubkeyPref = domManager.get('include-pubkey-header-preference');
+    const includeSigPref = domManager.get('include-sig-header-preference');
+
+    const applySigGate = () => {
+        if (!includePubkeyPref || !includeSigPref) return;
+        const pubkeyOn = includePubkeyPref.checked;
+        includeSigPref.disabled = !pubkeyOn;
+        const sigContainer = includeSigPref.closest('.toggle-settings-item');
+        if (sigContainer) sigContainer.classList.toggle('disabled', !pubkeyOn);
+        if (!pubkeyOn && includeSigPref.checked) {
+            includeSigPref.checked = false;
+        }
+    };
+
+    if (includePubkeyPref && includeSigPref) {
+        includePubkeyPref.addEventListener('change', () => {
+            applySigGate();
+            debouncedSave();
+        });
+        // Initial state in case form was populated before listeners attached
+        applySigGate();
+        this._applySigHeaderGate = applySigGate;
+    }
+
     // Also listen for email provider changes (which may auto-fill other fields)
     const emailProvider = domManager.get('emailProvider');
     if (emailProvider) {
@@ -3553,7 +3593,24 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         if (hideUnsignedMessagesPref) {
             hideUnsignedMessagesPref.checked = settings.hide_unsigned_messages !== false;
         }
-        
+
+        // Set include X-Nostr-Pubkey header preference (default to true if not set)
+        const includePubkeyHeaderPref = domManager.get('include-pubkey-header-preference');
+        if (includePubkeyHeaderPref) {
+            includePubkeyHeaderPref.checked = settings.include_pubkey_header !== false;
+        }
+
+        // Set include X-Nostr-Sig header preference (default to true if not set)
+        const includeSigHeaderPref = domManager.get('include-sig-header-preference');
+        if (includeSigHeaderPref) {
+            includeSigHeaderPref.checked = settings.include_sig_header !== false;
+        }
+
+        // Re-apply the sig-requires-pubkey gate after both checkboxes are set
+        if (typeof this._applySigHeaderGate === 'function') {
+            this._applySigHeaderGate();
+        }
+
         // Update compose buttons based on settings
         this.updateComposeButtons();
         

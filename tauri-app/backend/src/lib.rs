@@ -1191,13 +1191,19 @@ fn extract_signable_bytes(
 ) -> Result<Vec<u8>, String> {
     println!("[RUST] extract_signable_bytes called, body_len={}, is_armored={}", body.len(), is_armored);
     let mut bytes = if is_armored {
-        // Body content is already stripped of armor delimiters (bodyText from parseArmorComponents).
-        // Use decode_armor_section which handles glossia/base64 decode directly.
-        // If the body still has delimiters (full armor text), fall back to extract_ciphertext_binary.
-        if let Some(decoded) = email::decode_armor_section(&body) {
+        // If the body still has armor delimiters, route through extract_ciphertext_binary —
+        // that's the exact function the signing path uses, so the bytes match by
+        // construction (vs. decode_armor_section's glossia detector mis-handling the
+        // BEGIN/END lines and producing slightly different bytes).
+        // Otherwise the body is already the stripped inner content (bodyText from
+        // parseArmorComponents) and decode_armor_section is correct.
+        let has_delimiters = body.contains("BEGIN NOSTR") && body.contains("END NOSTR");
+        if has_delimiters {
+            email::extract_ciphertext_binary(&body)
+        } else if let Some(decoded) = email::decode_armor_section(&body) {
             decoded
         } else {
-            // Fallback: try as full armor text with delimiters
+            // Last-resort fallback
             email::extract_ciphertext_binary(&body)
         }
     } else {
@@ -1931,13 +1937,22 @@ async fn publish_nostr_event(private_key: Option<String>, content: String, kind:
 }
 
 #[tauri::command]
-async fn send_email(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>, _state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn send_email(mut email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>, include_pubkey_header: Option<bool>, include_sig_header: Option<bool>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] send_email called with {} attachments, html_body: {}", attachments.as_ref().map(|a| a.len()).unwrap_or(0), html_body.is_some());
+
+    // Resolve private key from state if not supplied — keychain migration moved
+    // keys out of the frontend, so X-Nostr-Pubkey / X-Nostr-Sig only get added
+    // when we look them up here.
+    email_config.private_key = resolve_private_key(email_config.private_key, &state).ok();
+
+    // Default both header toggles to true so existing callers preserve behavior.
+    let include_pubkey = include_pubkey_header.unwrap_or(true);
+    let include_sig = include_sig_header.unwrap_or(true);
 
     // Send the email via SMTP
     // Note: We don't save to database here - sent emails will be fetched from the server's sent folder via IMAP sync
     // This avoids duplicate entries and ensures we have the server's version with proper headers
-    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref())
+    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref(), include_pubkey, include_sig)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1947,9 +1962,12 @@ async fn send_email(email_config: EmailConfig, to_address: String, subject: Stri
 }
 
 #[tauri::command]
-async fn construct_email_headers(email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>) -> Result<String, String> {
+async fn construct_email_headers(mut email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>, include_pubkey_header: Option<bool>, include_sig_header: Option<bool>, state: tauri::State<'_, AppState>) -> Result<String, String> {
     println!("[RUST] construct_email_headers called with {} attachments, html_body: {}", attachments.as_ref().map(|a| a.len()).unwrap_or(0), html_body.is_some());
-    email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref())
+    email_config.private_key = resolve_private_key(email_config.private_key, &state).ok();
+    let include_pubkey = include_pubkey_header.unwrap_or(true);
+    let include_sig = include_sig_header.unwrap_or(true);
+    email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref(), include_pubkey, include_sig)
         .map_err(|e| e.to_string())
 }
 

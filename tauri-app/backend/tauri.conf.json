@@ -31,6 +31,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    },
     "macOS": {
       "signingIdentity": "Developer ID Application: Asher Pembroke (Z3Z2X4AWPH)"
     }

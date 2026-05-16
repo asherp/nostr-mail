@@ -151,24 +151,16 @@ impl KeychainManager {
 /// the application context; MainActivity.onCreate calls `VaultStorage.init`
 /// before any Rust command can reach this code.
 ///
-/// IMPORTANT: Tauri command handlers run on threads attached to the JVM via
-/// JNI, where `Thread.contextClassLoader` is the system bootstrap loader and
-/// `JNIEnv::find_class` cannot resolve app classes. We therefore load the
-/// `VaultStorage` class via the Activity's own classloader (acquired from
-/// `ndk_context`), which works from any thread.
+/// We dispatch onto Tauri's main Android thread via `tauri::wry::prelude::dispatch`,
+/// which provides a JNIEnv plus the activity reference — and use `find_class`
+/// (which calls the Activity's `getAppClass`) to resolve `VaultStorage` through
+/// the app classloader. (Tauri 2.10+ dropped the `ndk_context` populated by tao
+/// 0.34; this is the new path.)
 #[cfg(target_os = "android")]
 mod android {
     use jni::objects::{JClass, JObject, JString, JValue};
-    use jni::{AttachGuard, JNIEnv, JavaVM};
-
-    fn attach() -> Result<JavaVM, String> {
-        let ctx = ndk_context::android_context();
-        if ctx.vm().is_null() {
-            return Err("ndk_context VM is null (Tauri Android runtime not initialized)".into());
-        }
-        unsafe { JavaVM::from_raw(ctx.vm().cast()) }
-            .map_err(|e| format!("Failed to acquire JavaVM: {}", e))
-    }
+    use jni::JNIEnv;
+    use std::sync::mpsc;
 
     /// If a Java exception is pending on `env`, dump its stack trace to logcat
     /// and clear it so subsequent JNI calls don't immediately fail.
@@ -179,45 +171,31 @@ mod android {
         }
     }
 
-    /// Load `com.nostr.mail.VaultStorage` via the Activity's classloader.
-    fn load_vault_class<'a>(env: &mut JNIEnv<'a>) -> Result<JClass<'a>, String> {
-        let ctx = ndk_context::android_context();
-        if ctx.context().is_null() {
-            return Err("ndk_context Activity is null (init not run yet?)".into());
-        }
-        let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-        let classloader = env
-            .call_method(&activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-            .map_err(|e| { drain_exception(env); format!("Activity.getClassLoader failed: {}", e) })?
-            .l()
-            .map_err(|e| format!("getClassLoader returned non-object: {}", e))?;
-        let class_name = env
-            .new_string("com.nostr.mail.VaultStorage")
-            .map_err(|e| format!("new_string failed: {}", e))?;
-        let class_obj = env
-            .call_method(
-                &classloader,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[(&class_name).into()],
-            )
-            .map_err(|e| { drain_exception(env); format!("ClassLoader.loadClass(VaultStorage) failed: {}", e) })?
-            .l()
-            .map_err(|e| format!("loadClass returned non-object: {}", e))?;
-        Ok(JClass::from(class_obj))
-    }
-
-    fn with_env<F, R>(label: &str, f: F) -> Result<R, String>
+    /// Hop onto Tauri's main Android thread, look up `VaultStorage`, run `f`,
+    /// and ferry the result back via a channel so the caller stays sync.
+    fn with_env<F, R>(label: &'static str, f: F) -> Result<R, String>
     where
-        F: for<'a> FnOnce(&mut AttachGuard<'a>, JClass<'a>) -> Result<R, String>,
+        F: for<'a> FnOnce(&mut JNIEnv<'a>, JClass<'a>) -> Result<R, String> + Send + 'static,
+        R: Send + 'static,
     {
-        let vm = attach()?;
-        let mut guard = vm
-            .attach_current_thread()
-            .map_err(|e| format!("[{}] JNI attach failed: {}", label, e))?;
-        let class = load_vault_class(&mut guard)
-            .map_err(|e| format!("[{}] {}", label, e))?;
-        f(&mut guard, class)
+        let (tx, rx) = mpsc::channel::<Result<R, String>>();
+        tauri::wry::prelude::dispatch(move |env, activity, _webview| {
+            let result = (|| -> Result<R, String> {
+                let class = tauri::wry::prelude::find_class(
+                    env,
+                    activity,
+                    "com.nostr.mail.VaultStorage".to_string(),
+                )
+                .map_err(|e| {
+                    drain_exception(env);
+                    format!("[{}] find_class(VaultStorage) failed: {}", label, e)
+                })?;
+                f(env, class)
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .map_err(|e| format!("[{}] dispatch channel closed: {}", label, e))?
     }
 
     pub fn vault_read() -> Result<Option<String>, String> {
@@ -245,9 +223,10 @@ mod android {
 
     pub fn vault_write(json: &str) -> Result<(), String> {
         println!("[RUST] VaultStorage.write JNI call ({} bytes)", json.len());
-        with_env("vault_write", |env, class| {
+        let owned = json.to_owned();
+        with_env("vault_write", move |env, class| {
             let arg = env
-                .new_string(json)
+                .new_string(&owned)
                 .map_err(|e| format!("Failed to allocate JString: {}", e))?;
             env.call_static_method(
                 class,

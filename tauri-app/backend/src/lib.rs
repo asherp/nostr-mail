@@ -2672,12 +2672,18 @@ fn get_app_data_dir() -> Result<std::path::PathBuf, String> {
     
     #[cfg(target_os = "android")]
     {
-        // On Android, apps can write to their internal files directory
-        // Path: /data/data/<package_name>/files/
-        // Package name: com.nostr.mail
-        // Android apps have write access to this directory by default
-        
-        let app_files_dir = std::path::PathBuf::from("/data/data/com.nostr.mail/files");
+        // Derive the package name from /proc/self/cmdline so debug builds
+        // (applicationId com.nostr.mail.debug) read/write their own sandbox,
+        // not the release app's at /data/data/com.nostr.mail/files.
+        let pkg = std::fs::read_to_string("/proc/self/cmdline")
+            .ok()
+            .and_then(|s| {
+                let first = s.split('\0').next()?.split(':').next()?;
+                if first.is_empty() { None } else { Some(first.to_string()) }
+            })
+            .unwrap_or_else(|| "com.nostr.mail".to_string());
+
+        let app_files_dir = std::path::PathBuf::from(format!("/data/data/{}/files", pkg));
         let app_data_dir = app_files_dir.join("nostr-mail");
         
         // The files directory should exist, but create it if it doesn't

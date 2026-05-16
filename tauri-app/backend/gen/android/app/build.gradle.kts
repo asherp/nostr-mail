@@ -46,9 +46,11 @@ android {
     }
     buildTypes {
         getByName("debug") {
-            // Note: Removed applicationIdSuffix to allow Tauri CLI to launch the app correctly
-            // Debug and release builds use different signing keys, so they're still distinguishable
-            // Use different app name for dev builds so it's distinguishable
+            // Debug builds get a separate package id so they coexist with the release-signed
+            // APK from zapstore. Must match `bundle.android.debugApplicationIdSuffix` in
+            // tauri.conf.json so the Tauri CLI's `am start` launch targets the right package
+            // (requires tauri-cli >= 2.11.0; see tauri-apps/tauri#14886).
+            applicationIdSuffix = ".debug"
             resValue("string", "app_name", "NostrMail Dev")
             resValue("string", "main_activity_title", "NostrMail Dev")
             manifestPlaceholders["usesCleartextTraffic"] = "true"

@@ -165,7 +165,14 @@ NostrMailApp.prototype.init = async function() {
         // Ensure default nostr-mail contact is added for this user
         console.log('📇 Ensuring default nostr-mail contact...');
         await this.ensureDefaultContact();
-        
+
+        // Kick off a kind-3 follow-list sync from relays in the background.
+        // loadContacts() above only reads the local DB, so on a fresh install
+        // the contacts table stays empty until this completes.
+        contactsService.refreshContacts().catch(err => {
+            console.warn('[APP] Background contacts refresh failed:', err);
+        });
+
         // NOTE: We do NOT load emails here. Emails are only loaded when the inbox tab is clicked.
         // await emailService.loadEmails(); // <-- Remove or comment out this line so emails are not loaded on startup
         // await dmService.loadDmContacts(); // TODO: add this back in once we have stored DMs in the DB
@@ -220,7 +227,7 @@ NostrMailApp.prototype.loadSettings = async function() {
                         use_tls: dbSettings.use_tls === 'true',
                         email_filter: dbSettings.email_filter || 'nostr',
                         send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                        sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 365, // Default to 1 year
+                        sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 30, // Default to 30 days
                         emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                         require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
                         hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
@@ -276,7 +283,7 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
         use_tls: true,
         email_filter: 'nostr',
         send_matching_dm: true,
-        sync_cutoff_days: 365,
+        sync_cutoff_days: 30,
         emails_per_page: 50,
         require_signature: true,
         glossia_encoding_body: 'latin',
@@ -324,7 +331,7 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         use_tls: true,
         email_filter: 'nostr',
         send_matching_dm: true,
-        sync_cutoff_days: 1825, // Default to 5 years (matching loadSettingsForPubkey)
+        sync_cutoff_days: 30, // Default to 30 days (matching loadSettingsForPubkey)
         emails_per_page: 50,
         require_signature: true,
         hide_undecryptable_emails: true,
@@ -384,7 +391,7 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 use_tls: dbSettings.use_tls === 'true',
                 email_filter: dbSettings.email_filter || 'nostr',
                 send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 1825, // Default to 5 years
+                sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 30, // Default to 30 days
                 emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                 require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
                 hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
@@ -815,6 +822,13 @@ NostrMailApp.prototype.switchToProfile = async function(publicKeyOrKeypair) {
     await this.reloadActivePage();
     await this.ensureDefaultContact();
 
+    // Pull the new account's kind-3 follow list from relays in the background.
+    if (window.contactsService) {
+        window.contactsService.refreshContacts().catch(err => {
+            console.warn('[APP] Background contacts refresh failed after profile switch:', err);
+        });
+    }
+
     // Update the sidebar switcher display
     await this.updateProfileSwitcher();
 
@@ -1150,20 +1164,18 @@ NostrMailApp.prototype.setupEventListeners = function() {
                         if (messageBodyInput) messageBodyInput.disabled = true;
                         // Update DM checkbox visibility
                         if (window.emailService) window.emailService.updateDmCheckboxVisibility();
-                        // Clear signature when encrypting (body state changed)
-                        // Preserve _plainBody and _htmlBody since encryptEmailFields() just rebuilt them
-                        const savedPlainBody = window.emailService._plainBody;
-                        const savedHtmlBody = window.emailService._htmlBody;
-                        window.emailService.clearSignature();
-                        window.emailService._plainBody = savedPlainBody;
-                        window.emailService._htmlBody = savedHtmlBody;
 
-                        // Auto-sign after encrypt: click the sign button to transform
-                        // the SEAL block into a SIGNATURE block. Clicking Signed again
-                        // restores the SEAL-only version (originalBody snapshot).
+                        // Auto-sign after encrypt: call signComposedBody() directly.
+                        // encryptEmailFields() already cleared and rebuilt _plainBody/_htmlBody,
+                        // so no save/restore dance is needed here.
                         const signBtnAuto = domManager.get('signBtn');
                         if (signBtnAuto && signBtnAuto.dataset.signed !== 'true') {
-                            signBtnAuto.click();
+                            try {
+                                await window.emailService.signComposedBody();
+                            } catch (e) {
+                                console.error('[JS] Auto-sign after manual encrypt failed:', e);
+                                notificationService.showError('Sign failed: ' + (e && e.message ? e.message : e));
+                            }
                         }
                     }
                 } else {
@@ -1237,195 +1249,20 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 const labelSpan = signBtn.querySelector('.sign-btn-label');
                 const isSigned = signBtn.dataset.signed === 'true';
 
-                const keypair = appState.getKeypair();
-                if (!keypair) {
-                    notificationService.showError('No keypair available for signing.');
-                    return;
-                }
-
-                const gs = window.GlossiaService;
-                const metaSig = window.emailService?.getGlossiaEncodingSignature();
-                const metaPubkey = window.emailService?.getGlossiaEncodingPubkey();
-
                 if (!isSigned) {
-                    // Sign: sign the canonical ciphertext (decoded binary) if encrypted,
-                    // otherwise sign the plaintext body as-is
+                    // Sign branch delegates to emailService.signComposedBody() so the
+                    // logic is shared with the auto-sign path in sendEncryptedEmail.
                     console.log('[JS] Sign button clicked');
-                    const rawBodyValue = domManager.getValue('messageBody') || '';
-                    if (!rawBodyValue) {
-                        notificationService.showError('Message body must be filled to sign.');
+                    if (!window.emailService) {
+                        notificationService.showError('Email service not ready.');
                         return;
                     }
-
-                    // Parse armor structure from the full body.
-                    // parseArmorComponents handles depth-counting to properly extract
-                    // the outermost body, nested quoted armor, sig, and seal.
-                    const armorParts = window.emailService ? await window.emailService.parseArmorComponents(rawBodyValue) : null;
-                    // isArmored = the body starts with armor (user's own encrypted/signed body).
-                    // If prefixText exists, armor is a quoted original (plaintext reply case).
-                    const isArmored = !!(armorParts && armorParts.bodyText && !armorParts.prefixText);
-                    let bodyValue;
-                    let quotedPlaintext = null;
-
-                    if (isArmored) {
-                        // Armored content: extract body and quoted armor from parsed structure
-                        bodyValue = armorParts.bodyText;
-                        if (window.emailService) {
-                            window.emailService._quotedOriginalArmor = armorParts.quotedArmor || null;
-                        }
-                    } else {
-                        // Not armored: use splitReplyAndQuoted for plaintext reply detection
-                        const splitResult = window.emailService ? window.emailService.splitReplyAndQuoted(rawBodyValue) : { replyText: rawBodyValue, quotedOriginal: '' };
-                        bodyValue = splitResult.quotedOriginal ? splitResult.replyText : rawBodyValue;
-                        if (splitResult.quotedOriginal && window.emailService) {
-                            const qParts = await window.emailService.parseArmorComponents(splitResult.quotedOriginal);
-                            if (qParts && qParts.prefixText) {
-                                quotedPlaintext = qParts.prefixText;
-                                const armorStart = splitResult.quotedOriginal.indexOf('-----');
-                                window.emailService._quotedOriginalArmor = armorStart >= 0
-                                    ? splitResult.quotedOriginal.substring(armorStart).trim()
-                                    : splitResult.quotedOriginal;
-                            } else {
-                                window.emailService._quotedOriginalArmor = splitResult.quotedOriginal;
-                            }
-                        }
-                    }
-
                     try {
-                        // Extract signable bytes via backend (handles glossia round-trip + nested concatenation)
-                        const quotedArmorForSig = window.emailService?._quotedOriginalArmor || null;
-                        const glossiaEncoding = !isArmored ? (window.emailService?.getGlossiaEncoding() || null) : null;
-                        const dataBytes = new Uint8Array(await TauriService.extractSignableBytes(
-                            bodyValue, isArmored, quotedArmorForSig, glossiaEncoding
-                        ));
-                        console.log('[JS] Signing data (binary length:', dataBytes.length, ')');
-
-                        // Sign + verify in one backend round-trip
-                        const [signature, isValid] = await TauriService.signAndVerifyBytes(dataBytes);
-                        if (!isValid) {
-                            notificationService.showError('Signature verification failed. Body restored.');
-                            return;
-                        }
-                        const pubkeyHex = window.CryptoService._npubToHex(keypair.public_key);
-                        let encodedSig, encodedPubkey, encodedSigPubkey = null;
-
-                        if (gs) {
-                            // Glossia available: encode sig and pubkey separately
-                            const result = await gs.encodeSigPubkey(signature, pubkeyHex, metaSig, metaPubkey);
-                            encodedSig = result.encodedSig;
-                            encodedPubkey = result.encodedPubkey;
-                        } else {
-                            // Glossia not loaded: append raw hex
-                            encodedSig = signature;
-                            encodedPubkey = pubkeyHex;
-                        }
-
-                        // Look up sender name and display name from profile cache or contacts
-                        let profileName = null;
-                        let displayName = null;
-                        try {
-                            const cached = localStorage.getItem('nostr_mail_profiles');
-                            if (cached) {
-                                const profile = JSON.parse(cached)[keypair.public_key];
-                                profileName = profile?.fields?.name || null;
-                                displayName = profile?.fields?.display_name || null;
-                            }
-                        } catch (_) {}
-                        if (!profileName && !displayName) {
-                            const contacts = appState.getContacts() || [];
-                            const selfContact = contacts.find(c => c.pubkey === pubkeyHex);
-                            profileName = selfContact?.name || null;
-                        }
-
-                        // Build armored body via buildPlainBody (handles both encrypted and plaintext per spec)
-                        let newBody;
-                        if (isArmored && window.emailService) {
-                            const encBtn = domManager.get('encryptBtn');
-                            const encAlgo = (encBtn && encBtn.dataset.encrypted === 'true')
-                                ? (appState.getSettings()?.encryption_algorithm || 'nip44')
-                                : null;
-                            newBody = window.emailService.buildPlainBody(
-                                bodyValue, encodedSig, encodedPubkey,
-                                profileName, displayName, true, encAlgo, null, encodedSigPubkey,
-                                window.emailService._quotedOriginalArmor
-                            );
-                        } else if (window.emailService) {
-                            // Plaintext: glossia-encode body and build SIGNED BODY armor per spec 3.2
-                            // originalPlaintext includes quoted text with > prefixes for display above armor
-                            const origPlain = quotedPlaintext
-                                ? bodyValue + '\n\n' + quotedPlaintext
-                                : bodyValue;
-                            let plainBodyText = bodyValue;
-                            if (gs) {
-                                const metaBody = window.emailService?.getGlossiaEncoding();
-                                if (metaBody) {
-                                    try {
-                                        const encoded = await gs.transcode(bodyValue, `encode into ${metaBody}`);
-                                        plainBodyText = encoded.output;
-                                    } catch (e) {
-                                        console.warn('[JS] Sign: glossia-encode plaintext body failed:', e);
-                                    }
-                                }
-                            }
-                            newBody = window.emailService.buildPlainBody(
-                                plainBodyText, encodedSig, encodedPubkey,
-                                profileName, displayName, false, null, origPlain, encodedSigPubkey,
-                                window.emailService._quotedOriginalArmor
-                            );
-                        }
-                        domManager.setValue('messageBody', newBody);
-
-                        signBtn.dataset.signed = 'true';
-                        signBtn.dataset.signature = signature;
-                        signBtn.dataset.originalBody = rawBodyValue;
-                        if (iconSpan) iconSpan.className = 'fas fa-check-circle';
-                        if (labelSpan) labelSpan.textContent = 'Signed';
-                        signBtn.classList.add('signed');
-
-                        // Build HTML alternative body for multipart email
-                        if (window.emailService) {
-                            // Build quoted HTML recursively for all nesting levels
-                            const quotedHtmlContent = await window.emailService.buildRecursiveQuotedHtml(
-                                window.emailService._quotedOriginalArmor, quotedPlaintext
-                            );
-                            // bodyValue is already the body content from parseArmorComponents (no armor tags)
-                            const encBtn = domManager.get('encryptBtn');
-                            const isEncrypted = encBtn && encBtn.dataset.encrypted === 'true';
-                            window.emailService._htmlBody = window.emailService.buildHtmlAlt(bodyValue, encodedSig, encodedPubkey, profileName, displayName, metaSig, metaPubkey, encodedSigPubkey, quotedHtmlContent);
-                            const encAlgo = isEncrypted ? (appState.getSettings()?.encryption_algorithm || 'nip44') : null;
-                            // For plaintext signed emails, glossia-encode the full body (reply + quoted);
-                            // for encrypted, use the body content from inside the armor
-                            const origPlainForMime = (!isEncrypted && quotedPlaintext)
-                                ? bodyValue + '\n\n' + quotedPlaintext
-                                : (isEncrypted ? null : bodyValue);
-                            let plainBodyText = bodyValue;
-                            if (!isEncrypted && gs) {
-                                const metaBody = window.emailService?.getGlossiaEncoding();
-                                if (metaBody) {
-                                    try {
-                                        const encoded = await gs.transcode(bodyValue, `encode into ${metaBody}`);
-                                        plainBodyText = encoded.output;
-                                    } catch (e) {
-                                        console.warn('[JS] Failed to glossia-encode plaintext body:', e);
-                                    }
-                                }
-                            }
-                            window.emailService._plainBody = window.emailService.buildPlainBody(
-                                plainBodyText, encodedSig, encodedPubkey, profileName, displayName,
-                                isEncrypted, encAlgo, origPlainForMime, encodedSigPubkey,
-                                window.emailService._quotedOriginalArmor
-                            );
-                            // Show armored format in textarea
-                            if (window.emailService._plainBody) {
-                                domManager.setValue('messageBody', window.emailService._plainBody);
-                            }
-                        }
-
-                        console.log('[JS] Signature verified successfully');
+                        await window.emailService.signComposedBody();
                         notificationService.showSuccess('Signed and verified.');
                     } catch (error) {
                         console.error('[JS] Failed to sign:', error);
-                        notificationService.showError('Failed to sign: ' + error);
+                        notificationService.showError('Failed to sign: ' + (error && error.message ? error.message : error));
                     }
                 } else {
                     // Block unsigning NIP-04 messages that arrived pre-signed
@@ -1857,7 +1694,16 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 this.updateProfile();
             });
         }
-        
+
+        const editProfileBtn = document.getElementById('edit-profile-btn');
+        if (editProfileBtn) {
+            editProfileBtn.addEventListener('click', () => this.enterProfileEditMode());
+        }
+        const cancelProfileEditBtn = document.getElementById('cancel-profile-edit-btn');
+        if (cancelProfileEditBtn) {
+            cancelProfileEditBtn.addEventListener('click', () => this.exitProfileEditMode());
+        }
+
         const addProfileFieldBtn = document.getElementById('add-profile-field-btn');
         if (addProfileFieldBtn) {
             addProfileFieldBtn.addEventListener('click', () => this.addProfileField());
@@ -2008,82 +1854,48 @@ NostrMailApp.prototype.setupLiveEventListeners = async function() {
     }
 };
 
+// Trailing-edge debounce for full-contacts refresh. A burst of incoming DMs
+// (typical on fresh-DB startup) would otherwise trigger one O(contacts) reload
+// per event; coalesce them into a single reload.
+NostrMailApp.prototype._scheduleDmContactsRefresh = function() {
+    if (!window.dmService) return;
+    if (this._dmContactsRefreshTimer) {
+        clearTimeout(this._dmContactsRefreshTimer);
+    }
+    this._dmContactsRefreshTimer = setTimeout(() => {
+        this._dmContactsRefreshTimer = null;
+        window.dmService.loadDmContacts().catch(error => {
+            console.error('[LiveEvents] Failed to refresh DM conversations:', error);
+        });
+    }, 300);
+};
+
 NostrMailApp.prototype.handleLiveDM = function(dmData) {
     try {
-        
-        // Dispatch custom DOM event for confirmation waiting (includes event_id)
-        
-        // Start performance timing
-        const startTime = performance.now();
-        
-        // Run refreshes in parallel for better performance
-        const refreshPromises = [];
-        
         // Check if we're viewing a conversation with this sender/recipient
         const isInConversationView = document.querySelector('.tab-content#dm.active');
         const currentContact = window.appState.getSelectedDmContact();
-        const isViewingThisConversation = currentContact && 
+        const isViewingThisConversation = currentContact &&
             (currentContact.pubkey === dmData.sender_pubkey || currentContact.pubkey === dmData.recipient_pubkey);
-        
-        // CRITICAL FIX: If viewing this conversation, refresh messages FIRST, then contacts.
-        // This ensures messages appear immediately and aren't overwritten by loadDmContacts.
-        // If NOT viewing this conversation, refresh contacts list only (messages will load when user opens conversation).
-        if (isInConversationView && isViewingThisConversation) {
-            
-            
-            // Refresh messages FIRST (this will render immediately)
-            // Force fresh load from database to ensure newly sent message is included
-            let messagesPromise = null;
-            if (window.dmService) {
-                messagesPromise = window.dmService.loadDmMessages(currentContact.pubkey, true) // forceRefresh = true
-                    .then(() => {
-                    })
-                    .catch(error => {
-                        console.error('[LiveEvents] Failed to refresh conversation messages:', error);
-                    });
-                refreshPromises.push(messagesPromise);
-            }
-            
-            // Then refresh contacts list AFTER messages are loaded (to update last message preview)
-            // Wait for messages to complete first to prevent race condition
-            if (window.dmService && messagesPromise) {
-                const contactsPromise = messagesPromise.then(() => {
-                    return window.dmService.loadDmContacts();
-                }).catch(error => {
-                    console.error('[LiveEvents] Failed to refresh DM conversations:', error);
+
+        // If viewing this conversation, refresh its messages immediately so the new
+        // message appears right away. The contacts-list refresh is debounced below.
+        if (isInConversationView && isViewingThisConversation && window.dmService) {
+            window.dmService.loadDmMessages(currentContact.pubkey, true)
+                .catch(error => {
+                    console.error('[LiveEvents] Failed to refresh conversation messages:', error);
                 });
-                refreshPromises.push(contactsPromise);
-            }
-        } else {
-            // Not viewing this conversation - just refresh contacts list
-            
-            if (window.dmService) {
-                const contactsPromise = window.dmService.loadDmContacts().catch(error => {
-                    console.error('[LiveEvents] Failed to refresh DM conversations:', error);
-                });
-                refreshPromises.push(contactsPromise);
-            }
         }
-        
-        // Wait for all refreshes to complete and log timing
-        Promise.all(refreshPromises).then(() => {
-            const endTime = performance.now();
-        }).catch(error => {
-            const endTime = performance.now();
-            console.error(`[LiveEvents] UI refresh failed after ${(endTime - startTime).toFixed(2)}ms:`, error);
-        });
-        
+
+        // Coalesce full contacts-list refreshes across bursts of DMs.
+        this._scheduleDmContactsRefresh();
+
         // Show notification for new message immediately (don't wait for UI refresh)
         const senderShort = dmData.sender_pubkey.slice(0, 8) + '...';
         notificationService.showInfo(`New message from ${senderShort}`);
-        
+
         // Try to add message to UI immediately if possible (experimental)
         this.tryDirectMessageInsertion(dmData);
-        
-        // Update unread count or other UI indicators
-        // TODO: Implement unread count system
-        
-        
     } catch (error) {
         console.error('[LiveEvents] Error handling live DM:', error);
     }
@@ -3169,7 +2981,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 use_tls: (loadedSettings && loadedSettings.use_tls !== undefined) ? loadedSettings.use_tls : (domManager.get('use-tls')?.checked || false),
                 email_filter: (loadedSettings && loadedSettings.email_filter) ? loadedSettings.email_filter : (domManager.getValue('emailFilterPreference') || 'nostr'),
                 send_matching_dm: (loadedSettings && loadedSettings.send_matching_dm !== undefined) ? loadedSettings.send_matching_dm : (domManager.get('send-matching-dm-preference')?.checked !== false),
-                sync_cutoff_days: (loadedSettings && loadedSettings.sync_cutoff_days) ? loadedSettings.sync_cutoff_days : (parseInt(domManager.getValue('syncCutoffDays')) || 365),
+                sync_cutoff_days: (loadedSettings && loadedSettings.sync_cutoff_days) ? loadedSettings.sync_cutoff_days : (parseInt(domManager.getValue('syncCutoffDays')) || 30),
                 emails_per_page: (loadedSettings && loadedSettings.emails_per_page) ? loadedSettings.emails_per_page : (parseInt(domManager.getValue('emailsPerPage')) || 50),
                 require_signature: (loadedSettings && loadedSettings.require_signature !== undefined) ? loadedSettings.require_signature : (domManager.get('require-signature-preference')?.checked !== false),
                 hide_undecryptable_emails: (loadedSettings && loadedSettings.hide_undecryptable_emails !== undefined) ? loadedSettings.hide_undecryptable_emails : (domManager.get('hide-undecryptable-emails-preference')?.checked !== false),
@@ -3206,7 +3018,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 use_tls: domManager.get('use-tls')?.checked || false,
                 email_filter: domManager.getValue('emailFilterPreference') || 'nostr',
                 send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false, // Default to true
-                sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 365, // Default to 1 year
+                sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 30, // Default to 30 days
                 emails_per_page: parseInt(domManager.getValue('emailsPerPage')) || 50, // Default to 50
                 require_signature: domManager.get('require-signature-preference')?.checked !== false, // Default to true
                 hide_undecryptable_emails: domManager.get('hide-undecryptable-emails-preference')?.checked !== false, // Default to true
@@ -3546,7 +3358,7 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.setValue('imapPort', settings.imap_port || '');
         domManager.get('use-tls').checked = settings.use_tls || false;
         domManager.setValue('emailFilterPreference', settings.email_filter || 'nostr');
-        domManager.setValue('syncCutoffDays', settings.sync_cutoff_days || 365);
+        domManager.setValue('syncCutoffDays', settings.sync_cutoff_days || 30);
         domManager.setValue('emailsPerPage', settings.emails_per_page || 50);
         
         // Set send matching DM preference (default to true if not set)
@@ -4366,6 +4178,8 @@ NostrMailApp.prototype.loadProfile = async function(pubkey = null) {
     // Store viewing mode
     this.isViewingOwnProfile = isViewingOwnProfile;
     this.viewingProfilePubkey = targetPubkey;
+    // Always start in view mode; user must click Edit to modify
+    this.isEditingOwnProfile = false;
     console.log('[Profile] loadProfile - Set isViewingOwnProfile:', isViewingOwnProfile, 'for pubkey:', targetPubkey);
     
     // If viewing own profile, clear viewing pubkey from appState
@@ -4726,31 +4540,34 @@ NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) 
     });
     
     const updateBtn = document.getElementById('update-profile-btn');
+    const editBtn = document.getElementById('edit-profile-btn');
+    const cancelBtn = document.getElementById('cancel-profile-edit-btn');
     const profileForm = document.getElementById('profile-fields-form');
     const profileHeader = document.querySelector('#profile .tab-header h2');
     const profileActions = document.querySelector('#profile .profile-actions');
-    
-    // Show/hide and enable/disable update button
+    const isEditing = isViewingOwnProfile && this.isEditingOwnProfile === true;
+
+    // Edit button: visible only when viewing own profile in view mode
+    if (editBtn) {
+        editBtn.style.display = (isViewingOwnProfile && !isEditing) ? '' : 'none';
+    }
+    // Cancel button: visible only while editing own profile
+    if (cancelBtn) {
+        cancelBtn.style.display = isEditing ? '' : 'none';
+    }
+    // Update button: visible only while editing own profile
     if (updateBtn) {
-        updateBtn.style.display = isViewingOwnProfile ? 'block' : 'none';
-        console.log('[Profile] updateProfileUI - Button display set to:', updateBtn.style.display);
-        
-        // Check form changes to determine button state (will disable if no changes)
-        if (isViewingOwnProfile) {
-            console.log('[Profile] updateProfileUI - Checking form changes for button state');
+        updateBtn.style.display = isEditing ? 'block' : 'none';
+        if (isEditing) {
             this.checkProfileFormChanges();
         } else {
-            // Not viewing own profile - disable button
             updateBtn.disabled = true;
-            console.log('[Profile] updateProfileUI - Button disabled (not viewing own profile)');
         }
-    } else {
-        console.log('[Profile] updateProfileUI - Update button not found in DOM');
     }
-    
-    // Disable form submission when viewing other users
+
+    // Disable form submission outside edit mode
     if (profileForm) {
-        if (isViewingOwnProfile) {
+        if (isEditing) {
             profileForm.onsubmit = (e) => {
                 e.preventDefault();
                 this.updateProfile();
@@ -4881,6 +4698,36 @@ NostrMailApp.prototype.updateProfileUI = function(isViewingOwnProfile, profile) 
 NostrMailApp.prototype.editableProfileFields = {};
 // Store the original form state to detect changes
 NostrMailApp.prototype.originalProfileFields = {};
+// Whether the own-profile page is currently in edit mode (vs read-only view)
+NostrMailApp.prototype.isEditingOwnProfile = false;
+
+NostrMailApp.prototype.enterProfileEditMode = function() {
+    if (this.isViewingOwnProfile === false) return;
+    this.isEditingOwnProfile = true;
+    // Ensure all standard fields exist so empty inputs are rendered
+    PROFILE_FIELD_ORDER.forEach(key => {
+        if (!(key in this.editableProfileFields)) {
+            this.editableProfileFields[key] = '';
+        }
+    });
+    this.originalProfileFields = JSON.parse(JSON.stringify(this.editableProfileFields));
+    this.renderProfileFieldsList(this.editableProfileFields, true, true);
+    // Re-show standalone profile picture for live-preview in edit mode
+    const standalonePic = document.getElementById('profile-picture');
+    if (standalonePic) standalonePic.style.display = '';
+    this.renderProfileEmailWarning();
+    this.updateProfileUI(true, null);
+};
+
+NostrMailApp.prototype.exitProfileEditMode = function() {
+    // Revert any in-progress edits
+    this.editableProfileFields = JSON.parse(JSON.stringify(this.originalProfileFields || {}));
+    this.isEditingOwnProfile = false;
+    this.renderProfileFieldsList(this.editableProfileFields, true, false);
+    const warningDiv = document.getElementById('profile-email-warning');
+    if (warningDiv) warningDiv.innerHTML = '';
+    this.updateProfileUI(true, null);
+};
 
 NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPictureDataUrl, isViewingOwnProfile = true) {
     // Build editable fields from profile.fields, always include email
@@ -4899,59 +4746,50 @@ NostrMailApp.prototype.renderProfileFromObject = function(profile, cachedPicture
     // Capture original state for change detection (deep copy)
     this.originalProfileFields = JSON.parse(JSON.stringify(this.editableProfileFields));
     console.log('[Profile] Captured original profile fields:', JSON.stringify(this.originalProfileFields, null, 2));
-    
-    this.renderProfileFieldsList(this.editableProfileFields, isViewingOwnProfile);
-    // Show warning if profile email and settings email differ (only for own profile)
-    if (isViewingOwnProfile) {
+
+    const isEditable = isViewingOwnProfile && this.isEditingOwnProfile === true;
+    // Stash picture for view-mode renderer; falls back to fields.picture if null
+    this._currentProfilePictureSrc = cachedPictureDataUrl || null;
+    this.renderProfileFieldsList(this.editableProfileFields, isViewingOwnProfile, isEditable);
+    // Show warning if profile email and settings email differ (only when editing own profile)
+    if (isEditable) {
         this.renderProfileEmailWarning();
         // Ensure button is disabled after form is loaded (no changes yet)
         console.log('[Profile] renderProfileFromObject - Form loaded, checking for changes');
         this.checkProfileFormChanges();
+    } else {
+        // Hide stale warning when entering view mode
+        const warningDiv = document.getElementById('profile-email-warning');
+        if (warningDiv) warningDiv.innerHTML = '';
     }
+    // Keep header / Edit / Save / Cancel button visibility consistent with render state
+    this.updateProfileUI(isViewingOwnProfile, profile);
 
-    // Show profile picture if present, otherwise show a placeholder
+    // Show profile picture if present, otherwise show a placeholder.
+    // Only shown in edit mode — view mode embeds avatar inside the rendered block.
     const profilePicture = document.getElementById('profile-picture');
     if (profilePicture) {
         // Helper: placeholder SVG
         const placeholderSVG = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
 
-        // Set image source with fallback logic and log what is used
+        // Set image source with fallback logic
         let src = '';
         if (cachedPictureDataUrl && typeof cachedPictureDataUrl === 'string' && cachedPictureDataUrl.startsWith('data:image')) {
             src = cachedPictureDataUrl;
-            console.log('[Profile] Using cached profile picture data URL');
         } else if (this.editableProfileFields.picture && typeof this.editableProfileFields.picture === 'string' && this.editableProfileFields.picture.trim() !== '') {
             src = this.editableProfileFields.picture.trim();
-            console.log('[Profile] Using profile.fields.picture URL:', src);
         } else {
             src = placeholderSVG;
-            console.log('[Profile] Using placeholder profile picture');
         }
         profilePicture.src = src;
-        profilePicture.style.display = '';
+        profilePicture.style.display = isEditable ? '' : 'none';
 
-        // Always set an error handler to fallback to placeholder and log error
         profilePicture.onerror = function() {
             console.warn('[Profile] Failed to load profile picture, falling back to placeholder. Tried src:', src);
             profilePicture.src = placeholderSVG;
-            profilePicture.style.display = '';
         };
     }
 
-    // Live preview: update profile picture as user types/pastes a new URL
-    const pictureInput = document.getElementById('profile-field-picture');
-    if (pictureInput && profilePicture) {
-        pictureInput.addEventListener('input', function() {
-            const url = pictureInput.value.trim();
-            if (url) {
-                profilePicture.src = url;
-                profilePicture.style.display = '';
-            } else {
-                profilePicture.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
-                profilePicture.style.display = '';
-            }
-        });
-    }
 }
 
 // Top-level constant for profile field order
@@ -4969,65 +4807,83 @@ const PROFILE_FIELD_ORDER = [
     'nip05',
 ];
 
-NostrMailApp.prototype.renderProfileFieldsList = function(fields, isViewingOwnProfile = true) {
+NostrMailApp.prototype.renderProfileFieldsList = function(fields, isViewingOwnProfile = true, isEditable) {
+    if (typeof isEditable === 'undefined') isEditable = isViewingOwnProfile;
     const listDiv = document.getElementById('profile-fields-list');
     if (!listDiv) return;
-    
+
     listDiv.innerHTML = '';
-    
+
     if (!fields || Object.keys(fields).length === 0) {
+        if (!isEditable) {
+            // Even with no fields, render the header so pubkey + copy/QR are visible
+            this._renderProfileViewMode(fields || {}, this.viewingProfilePubkey, this._currentProfilePictureSrc);
+            return;
+        }
         listDiv.innerHTML = '<div class="text-muted">No fields found.</div>';
         return;
     }
 
-    // Use the top-level constant for field order
-    // When viewing own profile, always show all standard fields (even if empty)
-    // When viewing others, only show fields that have values
+    if (!isEditable) {
+        // View mode: contact-detail-style header + Profile Information section
+        this._renderProfileViewMode(fields, this.viewingProfilePubkey, this._currentProfilePictureSrc);
+        return;
+    }
+
+    const hasValue = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+
+    // Edit mode: render all standard fields (empty inputs OK).
     for (const key of PROFILE_FIELD_ORDER) {
-        if (isViewingOwnProfile || fields.hasOwnProperty(key)) {
-            // For own profile, always render (will show empty inputs)
-            // For others, only render if field exists
-            this._renderProfileFieldItem(listDiv, key, fields[key] || '', isViewingOwnProfile);
+        if (isEditable || hasValue(fields[key])) {
+            this._renderProfileFieldItem(listDiv, key, fields[key] || '', isEditable);
         }
     }
 
-    // Render custom fields (not in PROFILE_FIELD_ORDER), sorted alphabetically
+    // Render custom fields (not in PROFILE_FIELD_ORDER), sorted alphabetically.
     const customKeys = Object.keys(fields)
         .filter(key => !PROFILE_FIELD_ORDER.includes(key))
+        .filter(key => isEditable || hasValue(fields[key]))
         .sort();
     for (const key of customKeys) {
-        this._renderProfileFieldItem(listDiv, key, fields[key], isViewingOwnProfile);
+        this._renderProfileFieldItem(listDiv, key, fields[key], isEditable);
     }
 
-    // Add real-time warning update for email field (only for own profile)
-    if (isViewingOwnProfile) {
-        const emailInput = document.getElementById('profile-field-email');
-        if (emailInput) {
-            emailInput.addEventListener('input', () => {
-                this.editableProfileFields.email = emailInput.value;
-                // Validate email field
-                this.validateProfileField('email', emailInput);
-                this.renderProfileEmailWarning();
-                // Check if form has changed and update button state
-                this.checkProfileFormChanges();
-            });
-            // Validate on blur
-            emailInput.addEventListener('blur', () => {
-                this.validateProfileField('email', emailInput);
-            });
-        }
-    }
-    
-    // Validate all fields on initial render (only for own profile)
-    if (isViewingOwnProfile) {
-        const fieldsToValidate = ['email', 'picture', 'banner', 'website', 'lud16', 'nip05'];
-        fieldsToValidate.forEach(key => {
-            const input = document.getElementById(`profile-field-${key}`);
-            if (input) {
-                this.validateProfileField(key, input);
-            }
+    if (!isEditable) return;
+
+    // Add real-time warning update for email field
+    const emailInput = document.getElementById('profile-field-email');
+    if (emailInput) {
+        emailInput.addEventListener('input', () => {
+            this.editableProfileFields.email = emailInput.value;
+            this.validateProfileField('email', emailInput);
+            this.renderProfileEmailWarning();
+            this.checkProfileFormChanges();
+        });
+        emailInput.addEventListener('blur', () => {
+            this.validateProfileField('email', emailInput);
         });
     }
+
+    // Live preview: update standalone profile picture as user types/pastes a new URL
+    const pictureInput = document.getElementById('profile-field-picture');
+    const profilePicture = document.getElementById('profile-picture');
+    if (pictureInput && profilePicture) {
+        const placeholderSVG = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><circle cx="60" cy="60" r="60" fill="%23e0e0e0"/><circle cx="60" cy="50" r="28" fill="%23bdbdbd"/><ellipse cx="60" cy="100" rx="38" ry="20" fill="%23bdbdbd"/></svg>';
+        pictureInput.addEventListener('input', function() {
+            const url = pictureInput.value.trim();
+            profilePicture.src = url || placeholderSVG;
+            profilePicture.style.display = '';
+        });
+    }
+
+    // Validate all fields on initial render
+    const fieldsToValidate = ['email', 'picture', 'banner', 'website', 'lud16', 'nip05'];
+    fieldsToValidate.forEach(key => {
+        const input = document.getElementById(`profile-field-${key}`);
+        if (input) {
+            this.validateProfileField(key, input);
+        }
+    });
 }
 
 // Check if profile form has changed from original state
@@ -5088,15 +4944,113 @@ NostrMailApp.prototype.hasProfileFormChanges = function() {
     return false;
 }
 
+// View-mode renderer: contact-detail-style block with pubkey + copy/QR buttons.
+// Used when displaying own profile in read-only mode, or any contact's profile.
+NostrMailApp.prototype._renderProfileViewMode = function(fields, pubkey, pictureDataUrl) {
+    const listDiv = document.getElementById('profile-fields-list');
+    if (!listDiv) return;
+
+    const esc = (v) => Utils.escapeHtml(v == null ? '' : String(v));
+    const escAttr = (v) => esc(v).replace(/"/g, '&quot;');
+    const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+
+    // Pick an avatar source: cached data URL > fields.picture > default
+    let avatarSrc = defaultAvatar;
+    if (pictureDataUrl && typeof pictureDataUrl === 'string' && pictureDataUrl.startsWith('data:image')) {
+        avatarSrc = pictureDataUrl;
+    } else if (fields.picture && String(fields.picture).trim() !== '') {
+        avatarSrc = String(fields.picture).trim();
+    }
+
+    const displayName = (fields.display_name && fields.display_name.trim()) ||
+                        (fields.name && fields.name.trim()) ||
+                        '(No name set)';
+    const email = fields.email && fields.email.trim();
+
+    // Build the Profile Information field list (matches contacts-service.renderContactDetail)
+    const profileFields = [];
+    if (displayName && displayName !== '(No name set)') {
+        profileFields.push({ key: 'Display Name', value: displayName });
+    }
+    if (email) {
+        profileFields.push({ key: 'Email Address', value: email, isEmail: true });
+    }
+    if (pubkey) {
+        profileFields.push({ key: 'Public Key', value: pubkey, isPubkey: true });
+    }
+    // Add remaining fields (anything not already shown in header / standard rows)
+    const handledKeys = new Set(['name', 'display_name', 'email', 'picture']);
+    Object.entries(fields).forEach(([k, v]) => {
+        if (handledKeys.has(k)) return;
+        if (typeof v !== 'string' || v.trim() === '') return;
+        const formattedKey = k.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        profileFields.push({ key: formattedKey, value: v });
+    });
+
+    const fieldsHTML = profileFields.map(field => {
+        let valueHTML;
+        if (field.isEmail) {
+            valueHTML = `<a href="mailto:${escAttr(field.value)}" class="contact-detail-email">${esc(field.value)}</a>`;
+        } else if (field.isPubkey) {
+            valueHTML = `<code class="contact-detail-pubkey">${esc(field.value)}</code>`;
+        } else if (typeof field.value === 'string' && /^https?:\/\//i.test(field.value)) {
+            valueHTML = `<a href="${escAttr(field.value)}" target="_blank" rel="noopener noreferrer">${esc(field.value)}</a>`;
+        } else {
+            valueHTML = esc(field.value);
+        }
+        return `
+            <div class="contact-detail-field">
+                <label>${esc(field.key)}</label>
+                <div class="value">${valueHTML}</div>
+            </div>
+        `;
+    }).join('');
+
+    const pubkeyBlock = pubkey ? `
+        <div class="contact-detail-pubkey-with-buttons">
+            <code class="contact-detail-pubkey-code">${esc(pubkey)}</code>
+            <div class="contact-detail-pubkey-buttons">
+                <button type="button" class="btn btn-secondary" title="Copy public key" onclick="window.contactsService.copyContactPubkey('${escAttr(pubkey)}')">
+                    <i class="fas fa-copy"></i>
+                </button>
+                <button type="button" class="btn btn-secondary" title="Show QR code" onclick="window.contactsService.showContactQrCode('${escAttr(pubkey)}')">
+                    <i class="fas fa-qrcode"></i>
+                </button>
+            </div>
+        </div>
+    ` : '';
+
+    listDiv.innerHTML = `
+        <div class="contact-detail-content">
+            <div class="contact-detail-header">
+                <img class="profile-picture" src="${escAttr(avatarSrc)}" alt="${escAttr(displayName)} avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';" style="width:120px;height:120px;object-fit:cover;border-radius:50%;margin-right:20px;">
+                <div class="contact-detail-info">
+                    <h3>${esc(displayName)}</h3>
+                    ${pubkeyBlock}
+                    ${email ? `<div class="contact-detail-email">${esc(email)}</div>` : ''}
+                </div>
+            </div>
+            <div class="contact-detail-section">
+                <h4>Profile Information</h4>
+                ${fieldsHTML || '<div class="text-muted">No profile information set yet. Click Edit to add details.</div>'}
+            </div>
+        </div>
+    `;
+
+    // Hide the standalone profile picture element — the view-mode block embeds its own avatar
+    const standalonePic = document.getElementById('profile-picture');
+    if (standalonePic) standalonePic.style.display = 'none';
+};
+
 // Helper to render a single field item
-NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value, isViewingOwnProfile = true) {
+NostrMailApp.prototype._renderProfileFieldItem = function(listDiv, key, value, isEditable = true) {
     const fieldDiv = document.createElement('div');
     fieldDiv.className = 'form-group profile-field-item';
     const label = document.createElement('label');
     label.textContent = key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, ' ') + ':';
     label.setAttribute('for', `profile-field-${key}`);
-    
-    if (isViewingOwnProfile) {
+
+    if (isEditable) {
         // Editable mode - create input/textarea
         let input;
         if (key === 'about') {
@@ -5401,10 +5355,14 @@ NostrMailApp.prototype.updateProfile = async function() {
         this.editableProfileFields = { ...cleanedFields };
         // Reset original state to current state (no changes after successful update)
         this.originalProfileFields = JSON.parse(JSON.stringify(this.editableProfileFields));
-        this.renderProfileFieldsList(this.editableProfileFields);
-        
-        // Disable button after successful update (no changes)
-        this.checkProfileFormChanges();
+        // Exit edit mode and return to read-only view.
+        // Invalidate cached avatar so the view-mode block uses the (possibly new) picture URL.
+        this.isEditingOwnProfile = false;
+        this._currentProfilePictureSrc = null;
+        this.renderProfileFieldsList(this.editableProfileFields, true, false);
+        const warningDiv = document.getElementById('profile-email-warning');
+        if (warningDiv) warningDiv.innerHTML = '';
+        this.updateProfileUI(true, null);
 
         notificationService.showSuccess('Profile updated successfully');
 

@@ -373,12 +373,6 @@ const TauriService = {
     generateQrCode: async function(data) {
         return await this.invoke('generate_qr_code', { data });
     },
-    fetchNostrEmailsLast24h: async function(emailConfig) {
-        return await this.invoke('fetch_nostr_emails_last_24h', { emailConfig });
-    },
-    fetchNostrEmailsSmart: async function(emailConfig) {
-        return await this.invoke('fetch_nostr_emails_smart', { emailConfig });
-    },
     initDatabase: async function() {
         return await this.invoke('init_database');
     },
@@ -477,8 +471,8 @@ const TauriService = {
     getDbSentEmailThreads: async function(limit = 50, offset = 0, userEmail = null, userPubkey = null) {
         return await this.invoke('db_get_sent_email_threads', { limit, offset, userEmail, userPubkey });
     },
-    getThreadEmails: async function(threadId) {
-        return await this.invoke('db_get_thread_emails', { threadId });
+    getThreadEmails: async function(threadId, userEmail = null) {
+        return await this.invoke('db_get_thread_emails', { threadId, userEmail });
     },
     getDbEmail: async function(messageId) {
         return await this.invoke('db_get_email', { messageId: messageId });

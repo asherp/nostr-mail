@@ -361,6 +361,40 @@ body.dark-mode .nostr-mail-logo-dark {
     flex-wrap: wrap;
 }
 
+/* Mobile: collapse Edit/Refresh to icon-only square buttons,
+   matching .contacts-actions behavior (contacts.css:805). */
+@media (max-width: 768px) {
+    .profile-actions {
+        width: auto;
+        gap: var(--spacing-sm);
+        justify-content: flex-end;
+        flex-wrap: nowrap;
+    }
+
+    .profile-actions .btn {
+        flex: 0 0 auto;
+        min-width: 44px;
+        width: 44px;
+        height: 44px;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: var(--radius-md);
+        gap: 0;
+    }
+
+    .profile-actions .btn .btn-text {
+        display: none;
+    }
+
+    .profile-actions .btn i {
+        margin-right: 0;
+        font-size: 1.2rem;
+        flex-shrink: 0;
+    }
+}
+
 /* Dark mode navigation styles */
 body.dark-mode .sidebar {
     background: linear-gradient(135deg, #232946 0%, #121629 100%);

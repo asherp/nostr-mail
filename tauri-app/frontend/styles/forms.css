@@ -115,6 +115,14 @@
     }
 }
 
+/* Match the contact-detail dark background so the profile page doesn't sit on
+   the lighter #232946 main-content color (contacts.css sets .contacts-detail
+   to #181a20 in dark mode). */
+body.dark-mode .profile-form {
+    background-color: #181a20;
+    color: #e0e0e0;
+}
+
 /* Dark mode styles for settings sections */
 body.dark-mode .settings-form .settings-section {
     background: #232946;
@@ -295,6 +303,29 @@ body.dark-mode .profile-field-input.invalid {
 
 body.dark-mode .profile-field-error {
     color: #ff6b6b;
+}
+
+/* Profile read-only view (rendered, not editable) */
+.profile-field-value {
+    padding: 6px 0;
+    color: #232946;
+    word-break: break-word;
+    white-space: pre-wrap;
+    line-height: 1.5;
+    min-height: 1.5em;
+}
+.profile-field-value a {
+    color: #667eea;
+    text-decoration: none;
+}
+.profile-field-value a:hover {
+    text-decoration: underline;
+}
+body.dark-mode .profile-field-value {
+    color: #e8e8e8;
+}
+body.dark-mode .profile-field-value a {
+    color: #8ca0ff;
 }
 
 body.dark-mode .form-group input:focus,

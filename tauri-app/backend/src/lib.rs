@@ -44,6 +44,44 @@ fn resolve_private_key(explicit: Option<String>, state: &AppState) -> Result<Str
     state.get_active_private_key()
 }
 
+/// The active user's pubkey in bech32 (npub) form, if any. Used as the
+/// direction anchor for DM↔email pubkey backfill.
+fn active_user_npub(state: &AppState) -> Option<String> {
+    state.get_current_keys()
+        .and_then(|k| k.public_key().to_bech32().ok())
+}
+
+/// Best-effort: after saving a DM, fill in any matching email row's NULL
+/// pubkey fields using the DM's counterparty. Failures are logged, not
+/// surfaced — backfill is a recovery hint, not a critical write.
+fn try_backfill_email_from_dm(
+    db: &crate::database::Database,
+    dm: &crate::database::DirectMessage,
+    state: &AppState,
+) {
+    let user_npub = active_user_npub(state);
+    match db.backfill_email_pubkeys_from_dm(dm, user_npub.as_deref()) {
+        Ok(true) => println!("[RUST] backfill: anchored email pubkeys from DM {}", dm.event_id),
+        Ok(false) => {}
+        Err(e) => println!("[RUST] backfill: DM→email failed for {}: {}", dm.event_id, e),
+    }
+}
+
+/// Best-effort: after saving an email, fill in any of its NULL pubkey fields
+/// from a previously-stored matching DM.
+fn try_backfill_email_from_stored_dm(
+    db: &crate::database::Database,
+    email_id: i64,
+    state: &AppState,
+) {
+    let user_npub = active_user_npub(state);
+    match db.backfill_email_pubkeys_from_existing_dm(email_id, user_npub.as_deref()) {
+        Ok(true) => println!("[RUST] backfill: anchored email {} pubkeys from existing DM", email_id),
+        Ok(false) => {}
+        Err(e) => println!("[RUST] backfill: email→DM failed for {}: {}", email_id, e),
+    }
+}
+
 /// Helper function to sync relay states - auto-disables relays that failed or aren't connected
 async fn sync_relay_states_internal(state: &AppState) -> Vec<String> {
     let client_option = {
@@ -2812,7 +2850,12 @@ fn db_find_pubkeys_by_email(email: String, state: tauri::State<AppState>) -> Res
 #[tauri::command]
 fn db_find_pubkeys_by_email_including_dms(email: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     let db = state.get_database()?;
-    db.find_pubkeys_by_email_including_dms(&email).map_err(|e| e.to_string())
+    // user_pubkey scopes the result to *counterparties*: the DM↔email join
+    // returns the side that isn't us, which keeps self-wraps from poisoning
+    // the decrypt-time pubkey lookup with our own key.
+    let user_pubkey = active_user_npub(&state).unwrap_or_default();
+    db.find_pubkeys_by_email_including_dms(&email, &user_pubkey)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2832,7 +2875,9 @@ fn db_filter_new_contacts(user_pubkey: String, pubkeys: Vec<String>, state: taur
 fn db_save_email(email: DbEmail, state: tauri::State<AppState>) -> Result<i64, String> {
     println!("[RUST] db_save_email called");
     let db = state.get_database()?;
-    db.save_email(&email).map_err(|e| e.to_string())
+    let id = db.save_email(&email).map_err(|e| e.to_string())?;
+    try_backfill_email_from_stored_dm(&db, id, &state);
+    Ok(id)
 }
 
 #[tauri::command]
@@ -3174,9 +3219,9 @@ fn db_get_sent_email_threads(limit: Option<i64>, offset: Option<i64>, user_email
 }
 
 #[tauri::command]
-fn db_get_thread_emails(thread_id: String, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
+fn db_get_thread_emails(thread_id: String, user_email: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
     let db = state.get_database()?;
-    let emails = db.get_thread_emails(&thread_id).map_err(|e| e.to_string())?;
+    let emails = db.get_thread_emails(&thread_id, user_email.as_deref()).map_err(|e| e.to_string())?;
     let mapped: Vec<EmailMessage> = emails.iter().map(map_db_email_to_email_message).collect();
     Ok(mapped)
 }
@@ -3196,7 +3241,12 @@ async fn db_search_sent_emails(
     println!("[RUST] db_search_sent_emails called with query: '{}', limit: {}, offset: {}", search_query, page_size, skip_count);
     let private_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
-    
+
+    // Used by find_pubkeys_by_email_including_dms to return the counterparty,
+    // not ourselves. Empty string falls through harmlessly (no DM has an
+    // empty pubkey, so the CASE just picks the actual side).
+    let user_npub_for_lookup = active_user_npub(&state).unwrap_or_default();
+
     // Emit search started event
     if let Err(e) = app_handle.emit("sent-search-started", &serde_json::json!({})) {
         println!("[RUST] Failed to emit sent-search-started event: {}", e);
@@ -3264,7 +3314,7 @@ async fn db_search_sent_emails(
             
             // Try to find recipient pubkeys (including DMs)
             println!("[RUST] Searching for recipient pubkeys for email: {}", recipient_email);
-            if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email_including_dms(recipient_email) {
+            if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email_including_dms(recipient_email, &user_npub_for_lookup) {
                 println!("[RUST] Found {} recipient pubkey(s) for {} (including DMs)", recipient_pubkeys.len(), recipient_email);
                 // Also try normalized Gmail address
                 let normalized_email = if recipient_email.contains("@gmail.com") {
@@ -3282,7 +3332,7 @@ async fn db_search_sent_emails(
                 let mut all_pubkeys = recipient_pubkeys;
                 if normalized_email != recipient_email.to_lowercase() {
                     println!("[RUST] Also searching for normalized email: {}", normalized_email);
-                    if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email_including_dms(&normalized_email) {
+                    if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email_including_dms(&normalized_email, &user_npub_for_lookup) {
                         println!("[RUST] Found {} pubkey(s) for normalized email (including DMs)", normalized_pubkeys.len());
                         all_pubkeys.extend(normalized_pubkeys);
                     }
@@ -3427,7 +3477,7 @@ async fn db_search_sent_emails(
                     let mut subject_decrypted = false;
                     
                     // Try recipient pubkeys first (same as body, including DMs)
-                    if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email_including_dms(recipient_email) {
+                    if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email_including_dms(recipient_email, &user_npub_for_lookup) {
                         let normalized_email = if recipient_email.contains("@gmail.com") {
                             let parts: Vec<&str> = recipient_email.split('@').collect();
                             if parts.len() == 2 {
@@ -3442,7 +3492,7 @@ async fn db_search_sent_emails(
                         
                         let mut all_pubkeys = recipient_pubkeys;
                         if normalized_email != recipient_email.to_lowercase() {
-                            if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email_including_dms(&normalized_email) {
+                            if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email_including_dms(&normalized_email, &user_npub_for_lookup) {
                                 all_pubkeys.extend(normalized_pubkeys);
                             }
                         }
@@ -3642,7 +3692,9 @@ async fn db_search_sent_emails(
 fn db_save_dm(dm: DbDirectMessage, state: tauri::State<AppState>) -> Result<i64, String> {
     println!("[RUST] db_save_dm called");
     let db = state.get_database()?;
-    db.save_dm(&dm).map_err(|e| e.to_string())
+    let id = db.save_dm(&dm).map_err(|e| e.to_string())?;
+    try_backfill_email_from_dm(&db, &dm, &state);
+    Ok(id)
 }
 
 #[tauri::command]
@@ -3955,7 +4007,9 @@ async fn save_attachments_as_zip(zip_filename: String, attachments: Vec<Attachme
 fn db_save_email_with_attachments(email: crate::database::Email, attachments: Vec<crate::types::EmailAttachment>, state: tauri::State<AppState>) -> Result<i64, String> {
     println!("[RUST] db_save_email_with_attachments called with {} attachments", attachments.len());
     let db = state.get_database()?;
-    db.save_email_with_attachments(&email, &attachments).map_err(|e| e.to_string())
+    let id = db.save_email_with_attachments(&email, &attachments).map_err(|e| e.to_string())?;
+    try_backfill_email_from_stored_dm(&db, id, &state);
+    Ok(id)
 }
 
 // Database commands for settings
@@ -4920,24 +4974,24 @@ fn glossia_get_default_wordlist(language: String) -> String {
 }
 
 #[tauri::command]
-async fn fetch_nostr_emails_last_24h(email_config: EmailConfig) -> Result<Vec<EmailMessage>, String> {
-    email::fetch_nostr_emails_last_24h(&email_config)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn fetch_nostr_emails_smart(email_config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<Vec<EmailMessage>, String> {
-    let db = state.get_database().map_err(|e| e.to_string())?;
-    email::fetch_nostr_emails_smart(&email_config, &db)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 async fn sync_nostr_emails(config: EmailConfig, folder: Option<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     email::sync_nostr_emails_to_db(&config, folder.as_deref(), &db).await.map_err(|e| e.to_string())
+}
+
+/// Clear the UID-based sync watermark for one folder so the next sync
+/// re-bootstraps from `sync_cutoff_days`. Useful for recovering older messages
+/// that were skipped (e.g. by Gmail IMAP search-index lag) and as a manual
+/// "force resync" hook for debugging.
+#[tauri::command]
+async fn reset_folder_sync_state(
+    email_address: String,
+    folder_name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    db.clear_folder_sync_state(&email_address, &folder_name)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -4969,6 +5023,7 @@ async fn sync_direct_messages_with_network(private_key: Option<String>, relays: 
     println!("[RUST] sync_direct_messages_with_network called");
     let pk = resolve_private_key(private_key, &state)?;
     let db = state.get_database().map_err(|e| e.to_string())?;
+    let user_npub = active_user_npub(&state);
 
     // Get the persistent client (clone it before await to avoid Send issues)
     let client_option = {
@@ -4986,7 +5041,7 @@ async fn sync_direct_messages_with_network(private_key: Option<String>, relays: 
             let events = crate::nostr::fetch_direct_messages(&pk, &relays, since)
                 .await
                 .map_err(|e| e.to_string())?;
-            return sync_dms_from_events(events, db);
+            return sync_dms_from_events(events, db, user_npub.as_deref());
         }
     };
 
@@ -5019,7 +5074,7 @@ async fn sync_direct_messages_with_network(private_key: Option<String>, relays: 
         let events = crate::nostr::fetch_direct_messages(&pk, &relays, since)
             .await
             .map_err(|e| e.to_string())?;
-        return sync_dms_from_events(events, db);
+        return sync_dms_from_events(events, db, user_npub.as_deref());
     } else {
         println!("[RUST] Connected to {} relay(s) for DM sync:", connected_relays.len());
         for (url, _) in connected_relays.iter() {
@@ -5039,11 +5094,16 @@ async fn sync_direct_messages_with_network(private_key: Option<String>, relays: 
         .await
         .map_err(|e| e.to_string())?;
     
-    sync_dms_from_events(events, db)
+    sync_dms_from_events(events, db, user_npub.as_deref())
 }
 
-// Helper function to convert events to DMs and save them
-fn sync_dms_from_events(events: Vec<NostrEvent>, db: crate::database::Database) -> Result<usize, String> {
+// Helper function to convert events to DMs and save them.
+// `user_npub` is used to anchor DM↔email pubkey backfill (best-effort).
+fn sync_dms_from_events(
+    events: Vec<NostrEvent>,
+    db: crate::database::Database,
+    user_npub: Option<&str>,
+) -> Result<usize, String> {
     // Convert NostrEvent to DirectMessage
     let dms: Vec<DbDirectMessage> = events.iter().map(|event| {
         // Convert sender_pubkey to npub format
@@ -5093,6 +5153,13 @@ fn sync_dms_from_events(events: Vec<NostrEvent>, db: crate::database::Database) 
     // Save new DMs
     let inserted = db.save_dm_batch(&dms).map_err(|e| e.to_string())?;
     println!("[RUST] Saved {} new DM(s) to database", inserted);
+    // Best-effort: each DM that just landed may resolve an email row's
+    // recipient_pubkey on a fresh install with no contacts table yet.
+    for dm in &dms {
+        if let Err(e) = db.backfill_email_pubkeys_from_dm(dm, user_npub) {
+            println!("[RUST] backfill: DM→email failed for {}: {}", dm.event_id, e);
+        }
+    }
     // Return number of new messages
     Ok(inserted)
 }
@@ -5278,7 +5345,12 @@ fn sync_conversation_events(
         };
 
         match db.save_dm(&dm) {
-            Ok(_) => saved_count += 1,
+            Ok(_) => {
+                saved_count += 1;
+                if let Err(e) = db.backfill_email_pubkeys_from_dm(&dm, Some(user_pubkey)) {
+                    println!("[RUST] backfill: DM→email failed for {}: {}", dm.event_id, e);
+                }
+            }
             Err(e) => {
                 if !e.to_string().contains("UNIQUE constraint failed") {
                     println!("[RUST] Failed to save DM: {}", e);
@@ -5286,7 +5358,7 @@ fn sync_conversation_events(
             }
         }
     }
-    
+
     // Update conversation metadata
     let _ = db.update_conversation_from_messages(user_pubkey, contact_pubkey);
     let _ = db.update_conversation_from_messages(contact_pubkey, user_pubkey);
@@ -6115,6 +6187,8 @@ async fn handle_live_direct_message(
             let _save_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             println!("[RUST] Saved live DM to database");
 
+            try_backfill_email_from_dm(&db, &dm, &state);
+
             // Emit event to frontend
             let _emit_start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
             let dm_payload = serde_json::json!({
@@ -6234,6 +6308,7 @@ async fn handle_live_gift_wrap(
     let db = state.get_database().map_err(|e| e.to_string())?;
     match db.save_dm(&dm) {
         Ok(_) => {
+            try_backfill_email_from_dm(&db, &dm, &state);
             let dm_payload = serde_json::json!({
                 "event_id": dm.event_id,
                 "sender_pubkey": dm.sender_pubkey,
@@ -6530,6 +6605,8 @@ fn db_save_sent_email_stub(
 ) -> Result<i64, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now();
+    let signature_valid = crate::email::verify_email_signature_inline(&body);
+    let signature_source = signature_valid.map(|_| "body".to_string());
     let email = crate::database::Email {
         id: None,
         message_id,
@@ -6548,15 +6625,48 @@ fn db_save_sent_email_stub(
         is_read: true,
         updated_at: Some(now),
         created_at: now,
-        signature_valid: None,
-        signature_source: None,
+        signature_valid,
+        signature_source,
         transport_auth_verified: None,
         subject_hash,
         in_reply_to,
         references,
         thread_id: None,
     };
-    db.save_email(&email).map_err(|e| e.to_string())
+    let id = db.save_email(&email).map_err(|e| e.to_string())?;
+    try_backfill_email_from_stored_dm(&db, id, &state);
+    Ok(id)
+}
+
+/// Bulk pass: scan every encrypted email with a NULL sender_pubkey or
+/// recipient_pubkey and try to anchor it via a matching DM. Intended for
+/// post-login (after DMs and IMAP have both synced) so fresh-install
+/// users can decrypt sent emails that lack a contacts-table anchor.
+///
+/// Returns the number of email rows updated.
+#[tauri::command]
+fn db_backfill_email_pubkeys(state: tauri::State<AppState>) -> Result<usize, String> {
+    let db = state.get_database()?;
+    let user_npub = active_user_npub(&state)
+        .ok_or_else(|| "No active account".to_string())?;
+    db.backfill_email_pubkeys_pass(&user_npub).map_err(|e| e.to_string())
+}
+
+/// One-shot retrofit: recompute `subject_hash` on every encrypted email using
+/// the current (NIP-aware) hash logic and then run the DM↔email pubkey
+/// backfill. Use after upgrading past the hash representation fix to repair
+/// rows whose NIP-04 subject_hash was stored over the wrong byte form.
+///
+/// Returns `(rows_with_updated_hash, rows_with_backfilled_pubkeys)`.
+#[tauri::command]
+fn db_retrofit_subject_hashes(state: tauri::State<AppState>) -> Result<(usize, usize), String> {
+    let db = state.get_database()?;
+    let updated = db.retrofit_subject_hashes().map_err(|e| e.to_string())?;
+    let backfilled = match active_user_npub(&state) {
+        Some(npub) => db.backfill_email_pubkeys_pass(&npub).map_err(|e| e.to_string())?,
+        None => 0,
+    };
+    Ok((updated, backfilled))
 }
 
 #[allow(dead_code)]
@@ -6696,42 +6806,58 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: Option<String>, 
         email.sender_pubkey, email.recipient_pubkey, _user_pubkey);
     println!("[RUST] User sent email: {}, User received email: {}", user_sent_email, user_received_email);
     
-    // Determine which pubkey to use for decryption
-    let pubkeys_to_try: Vec<String> = if user_sent_email {
-        // User sent the email: decrypt with user's private key × recipient's public key
+    // Determine which pubkey to use for decryption.
+    // The DM's counterparty (_contact_pubkey) is the strongest hint: we got here
+    // because this DM's content hash matched this email's subject, so the email
+    // is from/to the same person we're DM'ing with. Try that first in every
+    // branch, then fall back to email row metadata. Only consult the per-email
+    // pubkey-by-address index if we still have nothing — never the all-DMs
+    // brute force, which produces an O(N) decrypt loop across every pubkey
+    // the user has ever exchanged DMs with.
+    let mut pubkeys_to_try: Vec<String> = Vec::new();
+    if !_contact_pubkey.is_empty() {
+        pubkeys_to_try.push(_contact_pubkey.clone());
+    }
+    let push_unique = |list: &mut Vec<String>, pk: String| {
+        if !pk.is_empty() && !list.contains(&pk) {
+            list.push(pk);
+        }
+    };
+    if user_sent_email {
         if let Some(ref recipient_pubkey) = email.recipient_pubkey {
-            vec![recipient_pubkey.clone()]
-        } else {
-            // Fallback: find recipient pubkey by email address
+            push_unique(&mut pubkeys_to_try, recipient_pubkey.clone());
+        }
+        if pubkeys_to_try.is_empty() {
             println!("[RUST] Recipient pubkey not set, looking up by email: {}", email.to_address);
-            db.find_pubkeys_by_email(&email.to_address).map_err(|e| e.to_string())?
+            for pk in db.find_pubkeys_by_email(&email.to_address).map_err(|e| e.to_string())? {
+                push_unique(&mut pubkeys_to_try, pk);
+            }
         }
     } else if user_received_email {
-        // User received the email: decrypt with user's private key × sender's public key
         if let Some(ref sender_pubkey) = email.sender_pubkey {
-            vec![sender_pubkey.clone()]
-        } else {
-            // Fallback: find sender pubkey by email address
+            push_unique(&mut pubkeys_to_try, sender_pubkey.clone());
+        }
+        if pubkeys_to_try.len() <= 1 {
+            // Only the contact_pubkey hint was added; try email-address lookup too.
             println!("[RUST] Sender pubkey not set, looking up by email: {}", email.from_address);
-            db.find_pubkeys_by_email(&email.from_address).map_err(|e| e.to_string())?
+            for pk in db.find_pubkeys_by_email(&email.from_address).map_err(|e| e.to_string())? {
+                push_unique(&mut pubkeys_to_try, pk);
+            }
         }
     } else {
-        // Unknown direction: try both sender and recipient pubkeys
-        println!("[RUST] Cannot determine email direction, trying both sender and recipient pubkeys");
-        let mut pubkeys = Vec::new();
+        // Unknown direction (email row has no sender/recipient pubkey). The
+        // contact_pubkey hint above is the right answer in practice — the DM
+        // and email share a counterparty. Add the email row's own fields if
+        // present, but skip find_pubkeys_by_email_including_dms (returns every
+        // DM pubkey ever seen, which triggers a runaway brute-force decrypt).
+        println!("[RUST] Cannot determine email direction; relying on DM counterparty hint");
         if let Some(ref sender_pubkey) = email.sender_pubkey {
-            pubkeys.push(sender_pubkey.clone());
+            push_unique(&mut pubkeys_to_try, sender_pubkey.clone());
         }
         if let Some(ref recipient_pubkey) = email.recipient_pubkey {
-            pubkeys.push(recipient_pubkey.clone());
+            push_unique(&mut pubkeys_to_try, recipient_pubkey.clone());
         }
-        // Also try looking up by email addresses (including DMs for recipient, contacts only for sender)
-        let sender_pubkeys = db.find_pubkeys_by_email(&email.from_address).map_err(|e| e.to_string())?;
-        let recipient_pubkeys = db.find_pubkeys_by_email_including_dms(&email.to_address).map_err(|e| e.to_string())?;
-        pubkeys.extend(sender_pubkeys);
-        pubkeys.extend(recipient_pubkeys);
-        pubkeys
-    };
+    }
     
     if pubkeys_to_try.is_empty() {
         println!("[RUST] No pubkeys found for decryption");
@@ -6867,8 +6993,6 @@ pub fn run() {
         send_email,
         construct_email_headers,
         fetch_emails,
-        fetch_nostr_emails_last_24h,
-        fetch_nostr_emails_smart,
         fetch_image,
         fetch_multiple_images,
         fetch_profiles,
@@ -6978,6 +7102,7 @@ pub fn run() {
         db_get_all_relays,
         db_delete_relay,
         sync_nostr_emails,
+        reset_folder_sync_state,
         sync_sent_emails,
         sync_all_emails,
         sync_direct_messages_with_network,
@@ -7003,6 +7128,8 @@ pub fn run() {
         db_get_matching_email_body,
         db_update_email_subject_hash,
         db_save_sent_email_stub,
+        db_backfill_email_pubkeys,
+        db_retrofit_subject_hashes,
     ]);
     println!("[RUST] Invoke handler registered successfully");
     

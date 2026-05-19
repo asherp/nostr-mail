@@ -143,6 +143,17 @@ pub struct Attachment {
     pub created_at: DateTime<Utc>,
 }
 
+/// Per-folder UID-based sync watermark. Scoped by (account_key, folder_name)
+/// where account_key is the lowercase-trimmed email address used to log into
+/// IMAP. `uid_validity` is the IMAP UIDVALIDITY from the SELECT response and
+/// guards against the server renumbering messages.
+#[derive(Debug, Clone)]
+pub struct FolderSyncState {
+    pub uid_validity: u32,
+    pub last_seen_uid: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -483,6 +494,9 @@ impl Database {
         // Migrate: Remove duplicate settings entries
         Self::migrate_remove_duplicate_settings(&conn)?;
 
+        // Migrate: Add folder_sync_state table for UID-based incremental IMAP sync.
+        Self::migrate_add_folder_sync_state_table(&conn)?;
+
         // Create indexes for better performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_pubkey ON contacts(pubkey)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_contacts_user_pubkey ON user_contacts(user_pubkey)", [])?;
@@ -535,25 +549,11 @@ impl Database {
                 "ALTER TABLE emails ADD COLUMN subject_hash TEXT",
                 [],
             )?;
-            
-            // Backfill hash for existing encrypted emails
-            println!("[DB] Backfilling subject_hash for existing encrypted emails");
-            let mut stmt = conn.prepare("SELECT id, subject FROM emails WHERE is_nostr_encrypted = 1 AND (subject_hash IS NULL OR subject_hash = '')")?;
-            let rows: Result<Vec<(i64, String)>, _> = stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?.collect();
-            
-            if let Ok(rows) = rows {
-                let count = rows.len();
-                for (id, subject) in rows {
-                    let hash = Self::compute_content_hash(&subject);
-                    conn.execute(
-                        "UPDATE emails SET subject_hash = ? WHERE id = ?",
-                        params![hash, id],
-                    )?;
-                }
-                println!("[DB] Backfilled {} email hashes", count);
-            }
+            // No backfill — hashing the stored subject would produce
+            // SHA256(glossia_prose), which structurally never matches a DM's
+            // content_hash. Existing rows stay NULL; the decrypt-time
+            // retrofit (frontend) will populate them with the correct hash
+            // of the NIP ciphertext the next time each email is opened.
         }
 
         // Check if content_hash column exists in direct_messages table
@@ -941,6 +941,39 @@ impl Database {
     }
 
     /// Migration: Add user_contacts junction table if it doesn't exist
+    /// Migration: Add folder_sync_state table.
+    /// Stores per-folder UID watermarks for incremental IMAP sync.
+    fn migrate_add_folder_sync_state_table(conn: &Connection) -> Result<()> {
+        let table_exists = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='folder_sync_state'"
+            )?;
+            let mut rows = stmt.query([])?;
+            rows.next()?.is_some()
+        };
+
+        if !table_exists {
+            println!("[DB] Creating folder_sync_state table");
+            conn.execute(
+                "CREATE TABLE folder_sync_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pubkey TEXT NOT NULL,
+                    folder_name TEXT NOT NULL,
+                    uid_validity INTEGER NOT NULL,
+                    last_seen_uid INTEGER NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    UNIQUE(pubkey, folder_name)
+                )",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_folder_sync_state_pubkey ON folder_sync_state(pubkey)",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     fn migrate_add_user_contacts_table(conn: &Connection) -> Result<()> {
         // Check if user_contacts table exists
         let table_exists = {
@@ -1335,17 +1368,17 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
 
-        // INSERT fallback: when no explicit subject_hash is provided for a new encrypted
-        // email, hash the subject as stored. UPDATE preserves the existing value via
-        // COALESCE so a retroactive hash correction (set by the frontend post-send) is
-        // not clobbered by a later IMAP-sync resave that passes subject_hash: None.
-        let insert_subject_hash = email.subject_hash.clone().or_else(|| {
-            if email.is_nostr_encrypted {
-                Some(Self::compute_content_hash(&email.subject))
-            } else {
-                None
-            }
-        });
+        // subject_hash must always be hash of the NIP ciphertext (matches the
+        // companion DM's content_hash). Callers compute it explicitly:
+        //   - send path: db_save_sent_email_stub passes the precomputed hash
+        //   - IMAP sync: email.rs uses compute_subject_ciphertext_hash()
+        //   - frontend retrofit: db_update_email_subject_hash patches it later
+        //
+        // We never derive it from the stored `subject` because on IMAP-synced
+        // rows that's glossia prose, not ciphertext — hashing it would
+        // structurally never match any DM. UPDATE uses COALESCE so a later
+        // resave with None doesn't clobber an already-correct value.
+        let insert_subject_hash = email.subject_hash.clone();
         let update_subject_hash = email.subject_hash.clone();
 
         let (in_reply_to, references, thread_id) = Self::resolve_threading(email);
@@ -1357,7 +1390,10 @@ impl Database {
                     message_id = ?, from_address = ?, to_address = ?, subject = ?,
                     body = ?, body_plain = ?, body_html = ?, received_at = ?,
                     is_nostr_encrypted = ?, sender_pubkey = ?, recipient_pubkey = ?, raw_headers = ?, is_draft = ?, is_read = ?, updated_at = ?,
-                    subject_hash = COALESCE(?, subject_hash), signature_valid = ?, signature_source = ?, transport_auth_verified = ?,
+                    subject_hash = COALESCE(?, subject_hash),
+                    signature_valid = COALESCE(?, signature_valid),
+                    signature_source = COALESCE(?, signature_source),
+                    transport_auth_verified = ?,
                     in_reply_to = ?, references_ = ?, thread_id = ?
                 WHERE id = ?",
                 params![
@@ -1436,13 +1472,11 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         
-        let subject_hash = email.subject_hash.clone().or_else(|| {
-            if email.is_nostr_encrypted {
-                Some(Self::compute_content_hash(&email.subject))
-            } else {
-                None
-            }
-        });
+        // See save_email: subject_hash must come from a caller that knows the
+        // ciphertext (send path / IMAP-sync helper / decrypt-time retrofit).
+        // Hashing the stored subject would store the wrong bytes on
+        // glossia-encoded rows.
+        let subject_hash = email.subject_hash.clone();
 
         let (in_reply_to, references, thread_id) = Self::resolve_threading(email);
 
@@ -1794,6 +1828,19 @@ impl Database {
         // Two-phase query:
         // 1) view_threads: find thread_ids that have at least one email matching inbox filters
         // 2) ranked: rank ALL non-draft emails in those threads (includes sent replies)
+        //
+        // When the active user's IMAP address is known, prefer non-sent emails
+        // as the per-thread representative. That way the inbox row preview
+        // reflects the latest *received* message instead of the user's own
+        // reply (which is confusing in an inbox view — replies are still
+        // visible in the expanded thread). We also order the final result
+        // by the picked email's received_at so threads where the latest
+        // activity is the user's own reply still float to the top.
+        let sent_rank_expr = if user_email.is_some() {
+            "CASE WHEN LOWER(TRIM(e.from_address)) = LOWER(TRIM(?)) THEN 1 ELSE 0 END,"
+        } else {
+            ""
+        };
         let query = format!(
             "WITH view_threads AS (
                 SELECT DISTINCT COALESCE(thread_id, message_id) AS tid
@@ -1802,7 +1849,11 @@ impl Database {
             ),
             ranked AS (
                 SELECT e.*,
-                    ROW_NUMBER() OVER (PARTITION BY COALESCE(e.thread_id, e.message_id) ORDER BY e.received_at DESC, e.id DESC) AS rn,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(e.thread_id, e.message_id)
+                        ORDER BY {} e.received_at DESC, e.id DESC
+                    ) AS rn,
+                    MAX(e.received_at) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS thread_last_activity,
                     COUNT(*) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS message_count,
                     SUM(CASE WHEN e.is_read = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS unread_count
                 FROM emails e
@@ -1815,10 +1866,18 @@ impl Database {
                    transport_auth_verified, in_reply_to, references_, thread_id,
                    message_count, unread_count
             FROM ranked WHERE rn = 1
-            ORDER BY received_at DESC
+            ORDER BY thread_last_activity DESC
             LIMIT ? OFFSET ?",
-            filter_sql
+            filter_sql,
+            sent_rank_expr
         );
+        // Param order must match placeholder order in the SQL string:
+        //   1) view_threads filter (nostr_only pubkeys + user_email)  — already pushed above
+        //   2) ranked CTE prefer-received CASE (only when user_email is set) — pushed here
+        //   3) LIMIT + OFFSET                                          — pushed below
+        if let Some(email) = user_email {
+            params.push(Box::new(email.to_string()));
+        }
         params.push(Box::new(limit));
         params.push(Box::new(offset));
 
@@ -1970,19 +2029,74 @@ impl Database {
     }
 
     /// Get all emails in a given thread, ordered by date ascending.
-    pub fn get_thread_emails(&self, thread_id: &str) -> Result<Vec<Email>> {
+    pub fn get_thread_emails(&self, thread_id: &str, user_email: Option<&str>) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
         let normalized = Self::normalize_message_id(thread_id);
-        let mut stmt = conn.prepare(
+
+        let mut query = String::from(
             "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html,
                     received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
                     is_draft, is_read, updated_at, created_at, signature_valid, signature_source,
                     transport_auth_verified, in_reply_to, references_, thread_id
              FROM emails
-             WHERE COALESCE(thread_id, message_id) = ? AND is_draft = 0
-             ORDER BY received_at ASC"
-        )?;
-        let rows = stmt.query_map(params![normalized], |row| {
+             WHERE COALESCE(thread_id, message_id) = ? AND is_draft = 0"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        params.push(Box::new(normalized));
+
+        // Scope to active account: a row belongs to the account if either side of the
+        // conversation matches the active user_email. Mirrors the normalization used by
+        // get_sent_emails (from_address) and get_emails (to_address), so a thread is
+        // restricted to rows the inbox or sent folders of this account would surface.
+        if let Some(email) = user_email {
+            let user_email_lower = email.trim().to_lowercase();
+            if email.contains("@gmail.com") {
+                let normalized_user_email = Self::normalize_gmail_address(email);
+                let user_email_no_plus = match (user_email_lower.find('+'), user_email_lower.find('@')) {
+                    (Some(plus_pos), Some(at_pos)) => format!(
+                        "{}@{}",
+                        &user_email_lower[..plus_pos],
+                        &user_email_lower[at_pos + 1..]
+                    ),
+                    _ => user_email_lower.clone(),
+                };
+                let normalized_user_email_no_plus = Self::normalize_gmail_address(&user_email_no_plus);
+
+                // Build the Gmail-normalized match clause for a given column name. Templates the
+                // same SQL pattern used in get_sent_emails so dot/+ aliases match either side.
+                let gmail_match = |col: &str| -> String {
+                    format!(
+                        "(LOWER(TRIM({col})) = LOWER(TRIM(?)) OR \
+                         (REPLACE(SUBSTR(LOWER(TRIM({col})), 1, CASE WHEN INSTR(LOWER(TRIM({col})), '+') > 0 THEN INSTR(LOWER(TRIM({col})), '+') - 1 ELSE INSTR(LOWER(TRIM({col})), '@') - 1 END), '.', '') || '@gmail.com') = ? OR \
+                         (REPLACE(SUBSTR(LOWER(TRIM({col})), 1, CASE WHEN INSTR(LOWER(TRIM({col})), '+') > 0 THEN INSTR(LOWER(TRIM({col})), '+') - 1 ELSE INSTR(LOWER(TRIM({col})), '@') - 1 END), '.', '') || '@gmail.com') = ?)",
+                        col = col
+                    )
+                };
+                query.push_str(&format!(
+                    " AND ({} OR {})",
+                    gmail_match("from_address"),
+                    gmail_match("to_address")
+                ));
+                // Params for from_address clause
+                params.push(Box::new(user_email_lower.clone()));
+                params.push(Box::new(normalized_user_email.clone()));
+                params.push(Box::new(normalized_user_email_no_plus.clone()));
+                // Params for to_address clause
+                params.push(Box::new(user_email_lower.clone()));
+                params.push(Box::new(normalized_user_email));
+                params.push(Box::new(normalized_user_email_no_plus));
+            } else {
+                query.push_str(
+                    " AND (LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR LOWER(TRIM(to_address)) = LOWER(TRIM(?)))"
+                );
+                params.push(Box::new(user_email_lower.clone()));
+                params.push(Box::new(user_email_lower));
+            }
+        }
+        query.push_str(" ORDER BY received_at ASC");
+
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok(Email {
                 id: Some(row.get(0)?),
                 message_id: row.get(1)?,
@@ -2109,6 +2223,66 @@ impl Database {
             &key,
             &timestamp.to_rfc3339(),
         )
+    }
+
+    /// Read the UID-based sync watermark for one (account, folder).
+    pub fn get_folder_sync_state(&self, pubkey: &str, folder: &str) -> Result<Option<FolderSyncState>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT uid_validity, last_seen_uid, updated_at
+             FROM folder_sync_state
+             WHERE pubkey = ? AND folder_name = ?",
+        )?;
+        let mut rows = stmt.query(params![pubkey.trim().to_lowercase(), folder])?;
+        if let Some(row) = rows.next()? {
+            let uid_validity: i64 = row.get(0)?;
+            let last_seen_uid: i64 = row.get(1)?;
+            Ok(Some(FolderSyncState {
+                uid_validity: uid_validity as u32,
+                last_seen_uid: last_seen_uid as u32,
+                updated_at: row.get(2)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Upsert the UID-based sync watermark for one (account, folder).
+    pub fn set_folder_sync_state(
+        &self,
+        pubkey: &str,
+        folder: &str,
+        uid_validity: u32,
+        last_seen_uid: u32,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO folder_sync_state (pubkey, folder_name, uid_validity, last_seen_uid, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(pubkey, folder_name) DO UPDATE SET
+                 uid_validity = excluded.uid_validity,
+                 last_seen_uid = excluded.last_seen_uid,
+                 updated_at = excluded.updated_at",
+            params![
+                pubkey.trim().to_lowercase(),
+                folder,
+                uid_validity as i64,
+                last_seen_uid as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the watermark for one (account, folder) so the next sync re-bootstraps.
+    pub fn clear_folder_sync_state(&self, pubkey: &str, folder: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM folder_sync_state WHERE pubkey = ? AND folder_name = ?",
+            params![pubkey.trim().to_lowercase(), folder],
+        )?;
+        Ok(())
     }
 
     // Direct message operations
@@ -2358,13 +2532,19 @@ impl Database {
     }
 
     /// Find email by RFC-822 Message-ID (used for NIP-17 message-id rumor tag matching).
+    /// Both sides are normalized (trim + strip surrounding `<>`) so that an
+    /// IMAP-stored `<uuid@host>` matches a DM rumor-tag `uuid@host`.
     pub fn find_email_by_message_id(&self, message_id: &str) -> Result<Option<Email>> {
         let conn = self.conn.lock().unwrap();
+        let normalized = Self::normalize_message_id(message_id);
         let mut stmt = conn.prepare(
             "SELECT id, message_id, from_address, to_address, subject, body, body_plain, body_html, received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers, is_draft, is_read, updated_at, created_at, signature_valid, signature_source, transport_auth_verified, in_reply_to, references_, thread_id
-             FROM emails WHERE message_id = ? AND is_nostr_encrypted = 1 LIMIT 1"
+             FROM emails
+             WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?
+               AND is_nostr_encrypted = 1
+             LIMIT 1"
         )?;
-        let mut rows = stmt.query_map(params![message_id], |row| {
+        let mut rows = stmt.query_map(params![normalized], |row| {
             Ok(Email {
                 id: Some(row.get(0)?),
                 message_id: row.get(1)?,
@@ -3059,52 +3239,95 @@ impl Database {
         Ok(pubkeys)
     }
     
-    /// Find pubkeys by email, including all DM participants
-    /// This searches both contacts table by email and includes all unique pubkeys from DMs
-    pub fn find_pubkeys_by_email_including_dms(&self, email: &str) -> Result<Vec<String>> {
+    /// Find pubkeys associated with `email`, joining DM history through the
+    /// emails table when a contact entry is absent.
+    ///
+    /// Two anchor mechanisms link a DM to an email row, both populated at
+    /// insert time and so available even when the counterparty has no contact:
+    /// - `dm.email_message_id == email.message_id` (NIP-17 message-id tag), and
+    /// - `dm.content_hash == email.subject_hash` (the subject ciphertext bytes
+    ///   hash identically on both sides — once the NIP-aware hash fix is in).
+    ///
+    /// Whichever side of the DM is *not* `user_pubkey` is the counterparty we
+    /// want; this excludes self-wrapped DMs from poisoning the result with the
+    /// caller's own key. The prior implementation's step 2 dumped every DM
+    /// pubkey ever seen with no email filter at all.
+    pub fn find_pubkeys_by_email_including_dms(
+        &self,
+        email: &str,
+        user_pubkey: &str,
+    ) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let email_trimmed = email.trim().to_lowercase();
-        println!("[RUST] Searching for pubkeys with email (including all DMs): {}", email_trimmed);
-        
-        let mut pubkeys = std::collections::HashSet::new();
-        
-        // 1. Search contacts table by email
-        let mut stmt = conn.prepare(
-            "SELECT pubkey FROM contacts WHERE LOWER(TRIM(email)) = ?1"
-        )?;
-        let rows = stmt.query_map(params![email_trimmed], |row| {
-            let pubkey: String = row.get(0)?;
-            Ok(pubkey)
-        })?;
-        for row in rows {
-            if let Ok(pubkey) = row {
-                pubkeys.insert(pubkey);
+        println!(
+            "[RUST] Searching for pubkeys with email (including DMs): {}",
+            email_trimmed
+        );
+
+        let mut pubkeys: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let push = |pk: String, sink: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+            if pk.is_empty() || pk == user_pubkey {
+                return;
+            }
+            if seen.insert(pk.clone()) {
+                sink.push(pk);
+            }
+        };
+
+        // 1) Contacts indexed by email — the cheapest and most direct hit.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT pubkey FROM contacts WHERE LOWER(TRIM(email)) = ?1",
+            )?;
+            let rows = stmt.query_map(params![email_trimmed], |row| {
+                let pubkey: String = row.get(0)?;
+                Ok(pubkey)
+            })?;
+            for row in rows.flatten() {
+                push(row, &mut pubkeys, &mut seen);
             }
         }
-        
-        // 2. Get ALL unique pubkeys from DMs (regardless of email address setting)
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT dm_pubkey
-             FROM (
-               SELECT sender_pubkey as dm_pubkey FROM direct_messages
-               UNION
-               SELECT recipient_pubkey as dm_pubkey FROM direct_messages
-             ) dm_pubkeys
-             WHERE dm_pubkey != ''"
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let pubkey: String = row.get(0)?;
-            Ok(pubkey)
-        })?;
-        for row in rows {
-            if let Ok(pubkey) = row {
-                pubkeys.insert(pubkey);
+
+        // 2) DMs anchored to an email row whose from/to matches `email`.
+        //    Two equally valid anchors: NIP-17 message-id tag, or
+        //    subject_hash ↔ content_hash equality.
+        //
+        //    Message-id is stored with brackets on the email side (`<uuid@host>`)
+        //    and without on the DM side — normalize the email side to match.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT CASE
+                          WHEN dm.sender_pubkey = ?2 THEN dm.recipient_pubkey
+                          ELSE dm.sender_pubkey
+                        END AS counterparty
+                   FROM direct_messages dm
+                   JOIN emails e ON (
+                        (dm.email_message_id IS NOT NULL
+                         AND dm.email_message_id != ''
+                         AND TRIM(REPLACE(REPLACE(e.message_id, '<', ''), '>', '')) = dm.email_message_id)
+                        OR (dm.content_hash IS NOT NULL
+                            AND dm.content_hash != ''
+                            AND e.subject_hash IS NOT NULL
+                            AND e.subject_hash = dm.content_hash)
+                   )
+                  WHERE LOWER(TRIM(e.from_address)) = ?1
+                     OR LOWER(TRIM(e.to_address))   = ?1",
+            )?;
+            let rows = stmt.query_map(params![email_trimmed, user_pubkey], |row| {
+                let pubkey: String = row.get(0)?;
+                Ok(pubkey)
+            })?;
+            for row in rows.flatten() {
+                push(row, &mut pubkeys, &mut seen);
             }
         }
-        
-        let result: Vec<String> = pubkeys.into_iter().collect();
-        println!("[RUST] Found pubkeys for email '{}' (including all DMs): {:?}", email_trimmed, result);
-        Ok(result)
+
+        println!(
+            "[RUST] Found pubkeys for email '{}' (including DMs): {:?}",
+            email_trimmed, pubkeys
+        );
+        Ok(pubkeys)
     }
 
     pub fn update_email_sender_pubkey(&self, message_id: &str, sender_pubkey: &str) -> Result<()> {
@@ -3145,6 +3368,272 @@ impl Database {
             params![recipient_pubkey, id],
         )?;
         Ok(())
+    }
+
+    pub fn update_email_subject_hash_by_id(&self, id: i64, subject_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE emails SET subject_hash = ? WHERE id = ?",
+            params![subject_hash, id],
+        )?;
+        Ok(())
+    }
+
+    /// Recompute `subject_hash` for every encrypted email row using the current
+    /// hash logic, updating rows whose stored value differs (or is NULL).
+    ///
+    /// Existed rows from before the NIP-aware fix have NIP-04 subjects hashed
+    /// over the wrong representation (plain base64 instead of `base64?iv=base64`),
+    /// so they can never link to their companion DM. This sweeps that mismatch
+    /// out. Plain (non-encrypted) subjects produce `None` and are left untouched.
+    pub fn retrofit_subject_hashes(&self) -> Result<usize> {
+        let rows_to_check = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, subject, body, subject_hash
+                   FROM emails
+                  WHERE is_nostr_encrypted = 1",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let subject: String = row.get(1)?;
+                let body: String = row.get(2)?;
+                let existing: Option<String> = row.get(3)?;
+                Ok((id, subject, body, existing))
+            })?;
+            rows.collect::<Result<Vec<_>>>()?
+        };
+
+        let mut updates: Vec<(i64, String)> = Vec::new();
+        for (id, subject, body, existing) in rows_to_check {
+            if let Some(new_hash) = crate::email::compute_subject_ciphertext_hash(&subject, &body) {
+                if existing.as_deref() != Some(new_hash.as_str()) {
+                    updates.push((id, new_hash));
+                }
+            }
+        }
+
+        let conn = self.conn.lock().unwrap();
+        for (id, hash) in &updates {
+            conn.execute(
+                "UPDATE emails SET subject_hash = ? WHERE id = ?",
+                params![hash, id],
+            )?;
+        }
+        println!("[RUST] retrofit_subject_hashes: updated {} row(s)", updates.len());
+        Ok(updates.len())
+    }
+
+    /// Given an email row and a candidate DM that matches it (via message_id
+    /// or subject_hash↔content_hash), write NULL pubkey fields on the email
+    /// using the DM's counterparty pubkey.
+    ///
+    /// Direction is resolved by, in order:
+    ///   1. An existing pubkey anchor on the email matching one of the DM parties.
+    ///   2. `user_pubkey` — whichever DM party equals the active user is the user;
+    ///      the other is the counterparty.
+    ///
+    /// Returns `true` if any field was written.
+    fn apply_dm_to_email_pubkeys(
+        &self,
+        email: &Email,
+        dm_sender: &str,
+        dm_recipient: &str,
+        user_pubkey: Option<&str>,
+    ) -> Result<bool> {
+        let email_id = match email.id {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+
+        let sender_filled = email.sender_pubkey.is_some();
+        let recipient_filled = email.recipient_pubkey.is_some();
+        if sender_filled && recipient_filled {
+            return Ok(false);
+        }
+
+        // Resolve (email_sender, email_recipient) target values.
+        let (target_sender, target_recipient): (Option<&str>, Option<&str>) =
+            if let Some(existing) = email.sender_pubkey.as_deref() {
+                if existing == dm_sender {
+                    (None, Some(dm_recipient))
+                } else if existing == dm_recipient {
+                    (None, Some(dm_sender))
+                } else {
+                    return Ok(false);
+                }
+            } else if let Some(existing) = email.recipient_pubkey.as_deref() {
+                if existing == dm_sender {
+                    (Some(dm_recipient), None)
+                } else if existing == dm_recipient {
+                    (Some(dm_sender), None)
+                } else {
+                    return Ok(false);
+                }
+            } else if let Some(user) = user_pubkey {
+                if user == dm_sender {
+                    (Some(user), Some(dm_recipient))
+                } else if user == dm_recipient {
+                    (Some(dm_sender), Some(user))
+                } else {
+                    return Ok(false);
+                }
+            } else {
+                return Ok(false);
+            };
+
+        let mut written = false;
+        if !sender_filled {
+            if let Some(s) = target_sender {
+                self.update_email_sender_pubkey_by_id(email_id, s)?;
+                written = true;
+            }
+        }
+        if !recipient_filled {
+            if let Some(r) = target_recipient {
+                self.update_email_recipient_pubkey_by_id(email_id, r)?;
+                written = true;
+            }
+        }
+        Ok(written)
+    }
+
+    /// After saving a DM, find any matching email and backfill its NULL pubkey
+    /// fields from the DM's counterparty pubkey.
+    pub fn backfill_email_pubkeys_from_dm(
+        &self,
+        dm: &DirectMessage,
+        user_pubkey: Option<&str>,
+    ) -> Result<bool> {
+        // Prefer NIP-17 message-id linkage; fall back to content_hash↔subject_hash.
+        let email = if let Some(mid) = dm.email_message_id.as_deref() {
+            match self.find_email_by_message_id(mid)? {
+                Some(e) => Some(e),
+                None => {
+                    let hash = Self::compute_content_hash(&dm.content);
+                    self.find_email_by_subject_hash(&hash)?
+                }
+            }
+        } else {
+            let hash = Self::compute_content_hash(&dm.content);
+            self.find_email_by_subject_hash(&hash)?
+        };
+
+        let email = match email {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+
+        self.apply_dm_to_email_pubkeys(&email, &dm.sender_pubkey, &dm.recipient_pubkey, user_pubkey)
+    }
+
+    /// After saving an email, look up any previously-stored matching DM and
+    /// backfill the email's NULL pubkey fields. Match priority is message_id,
+    /// then content_hash ↔ subject_hash.
+    pub fn backfill_email_pubkeys_from_existing_dm(
+        &self,
+        email_id: i64,
+        user_pubkey: Option<&str>,
+    ) -> Result<bool> {
+        let email = match self.get_email_by_id(email_id)? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+
+        if email.sender_pubkey.is_some() && email.recipient_pubkey.is_some() {
+            return Ok(false);
+        }
+
+        // 1. Match via NIP-17 message-id.
+        if let Some(dm) = self.find_dm_for_email(&email)? {
+            return self.apply_dm_to_email_pubkeys(
+                &email,
+                &dm.0,
+                &dm.1,
+                user_pubkey,
+            );
+        }
+
+        Ok(false)
+    }
+
+    /// Lookup the DM (sender_pubkey, recipient_pubkey) that matches an email,
+    /// trying message_id linkage first, then content_hash ↔ subject_hash.
+    /// Returned tuple is (dm_sender_pubkey, dm_recipient_pubkey).
+    fn find_dm_for_email(&self, email: &Email) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Preferred: NIP-17 message-id rumor tag. Normalize both sides — the
+        // email's stored message_id usually carries `<...>` from IMAP, while
+        // DM rumor tags are typically stored without brackets.
+        {
+            let normalized = Self::normalize_message_id(&email.message_id);
+            let mut stmt = conn.prepare(
+                "SELECT sender_pubkey, recipient_pubkey FROM direct_messages
+                 WHERE TRIM(REPLACE(REPLACE(email_message_id, '<', ''), '>', '')) = ?
+                 LIMIT 1"
+            )?;
+            let mut rows = stmt.query(params![normalized])?;
+            if let Some(row) = rows.next()? {
+                return Ok(Some((row.get(0)?, row.get(1)?)));
+            }
+        }
+
+        // Fallback: the email's stored subject_hash matches a DM's content_hash.
+        // The struct's `subject_hash` field is set by some callers but not
+        // populated by get_email_by_id, so read it directly.
+        let stored_hash: Option<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT subject_hash FROM emails WHERE message_id = ? LIMIT 1"
+            )?;
+            let mut rows = stmt.query(params![email.message_id])?;
+            match rows.next()? {
+                Some(row) => row.get(0)?,
+                None => None,
+            }
+        };
+
+        if let Some(hash) = stored_hash {
+            if !hash.is_empty() {
+                let mut stmt = conn.prepare(
+                    "SELECT sender_pubkey, recipient_pubkey FROM direct_messages
+                     WHERE content_hash = ? LIMIT 1"
+                )?;
+                let mut rows = stmt.query(params![hash])?;
+                if let Some(row) = rows.next()? {
+                    return Ok(Some((row.get(0)?, row.get(1)?)));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Bulk pass: for every email row missing sender_pubkey or recipient_pubkey,
+    /// try to backfill from any matching DM. Intended to be invoked after a
+    /// fresh-install DM sync and after IMAP Sent-folder sync, so existing
+    /// rows get retroactively anchored.
+    ///
+    /// Returns the number of email rows updated.
+    pub fn backfill_email_pubkeys_pass(&self, user_pubkey: &str) -> Result<usize> {
+        let ids: Vec<i64> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM emails
+                 WHERE is_nostr_encrypted = 1
+                   AND (sender_pubkey IS NULL OR recipient_pubkey IS NULL)"
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let mut updated = 0;
+        for id in ids {
+            if self.backfill_email_pubkeys_from_existing_dm(id, Some(user_pubkey))? {
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 
     pub fn find_emails_by_message_id(&self, message_id: &str) -> Result<Vec<Email>> {
@@ -4795,5 +5284,305 @@ mod tests {
         let retrieved = db.get_email("msg-pubkey-update@example.com").unwrap().unwrap();
         assert_eq!(retrieved.sender_pubkey, Some("id_sender_pk".to_string()));
         assert_eq!(retrieved.recipient_pubkey, Some("id_recipient_pk".to_string()));
+    }
+
+    // =====================
+    // folder_sync_state
+    // =====================
+
+    #[test]
+    fn test_folder_sync_state_missing_row_returns_none() {
+        let (db, _dir) = create_test_db();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn test_folder_sync_state_roundtrip() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 12345, 678).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.uid_validity, 12345);
+        assert_eq!(got.last_seen_uid, 678);
+    }
+
+    #[test]
+    fn test_folder_sync_state_upserts() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 200).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.uid_validity, 1);
+        assert_eq!(got.last_seen_uid, 200);
+
+        // UIDVALIDITY change overwrites cleanly.
+        db.set_folder_sync_state("alice@example.com", "INBOX", 2, 5).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.uid_validity, 2);
+        assert_eq!(got.last_seen_uid, 5);
+    }
+
+    #[test]
+    fn test_folder_sync_state_normalizes_account_key() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("  Alice@Example.com  ", "INBOX", 99, 7).unwrap();
+        // Reading with a differently-cased/padded form should hit the same row.
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.uid_validity, 99);
+        assert_eq!(got.last_seen_uid, 7);
+    }
+
+    #[test]
+    fn test_folder_sync_state_scoped_per_folder() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 10).unwrap();
+        db.set_folder_sync_state("alice@example.com", "nostr-mail", 1, 20).unwrap();
+
+        let inbox = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        let nm = db.get_folder_sync_state("alice@example.com", "nostr-mail").unwrap().unwrap();
+        assert_eq!(inbox.last_seen_uid, 10);
+        assert_eq!(nm.last_seen_uid, 20);
+    }
+
+    #[test]
+    fn test_folder_sync_state_clear() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 10).unwrap();
+        db.clear_folder_sync_state("alice@example.com", "INBOX").unwrap();
+        assert!(db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().is_none());
+
+        // Clearing a non-existent row is a no-op.
+        db.clear_folder_sync_state("alice@example.com", "INBOX").unwrap();
+    }
+
+    // =====================
+    // DM↔email pubkey backfill
+    // =====================
+
+    fn make_encrypted_email(message_id: &str, ciphertext_subject: &str) -> Email {
+        let mut e = make_email(message_id);
+        e.is_nostr_encrypted = true;
+        e.subject = ciphertext_subject.to_string();
+        // sender/recipient pubkeys NULL — fresh-install case
+        e.sender_pubkey = None;
+        e.recipient_pubkey = None;
+        // Frontend would set subject_hash explicitly; mimic that.
+        e.subject_hash = Some(Database::compute_content_hash(ciphertext_subject));
+        e
+    }
+
+    #[test]
+    fn test_backfill_dm_to_email_via_message_id_user_sent() {
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let other = "npub_other";
+
+        // Email exists first (e.g., IMAP-synced) with NULL pubkeys.
+        let email = make_encrypted_email("<msg1@example.com>", "ciphertext-payload-1");
+        let email_id = db.save_email(&email).unwrap();
+
+        // Now a self-wrap DM arrives carrying the email's message-id tag.
+        let mut dm = make_dm("dm-event-1", user, other);
+        dm.email_message_id = Some("<msg1@example.com>".to_string());
+        dm.content = "different-content".to_string(); // hash won't match — must use msg-id path
+
+        db.save_dm(&dm).unwrap();
+        let wrote = db
+            .backfill_email_pubkeys_from_dm(&dm, Some(user))
+            .unwrap();
+        assert!(wrote);
+
+        let got = db.get_email_by_id(email_id).unwrap().unwrap();
+        assert_eq!(got.sender_pubkey.as_deref(), Some(user));
+        assert_eq!(got.recipient_pubkey.as_deref(), Some(other));
+    }
+
+    #[test]
+    fn test_backfill_dm_to_email_via_message_id_user_received() {
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let other = "npub_other";
+
+        let email = make_encrypted_email("<msg2@example.com>", "ciphertext-payload-2");
+        let email_id = db.save_email(&email).unwrap();
+
+        // DM where user is recipient — incoming gift wrap.
+        let mut dm = make_dm("dm-event-2", other, user);
+        dm.email_message_id = Some("<msg2@example.com>".to_string());
+        dm.content = "other-content".to_string();
+
+        db.save_dm(&dm).unwrap();
+        let wrote = db
+            .backfill_email_pubkeys_from_dm(&dm, Some(user))
+            .unwrap();
+        assert!(wrote);
+
+        let got = db.get_email_by_id(email_id).unwrap().unwrap();
+        assert_eq!(got.sender_pubkey.as_deref(), Some(other));
+        assert_eq!(got.recipient_pubkey.as_deref(), Some(user));
+    }
+
+    #[test]
+    fn test_backfill_dm_to_email_via_subject_hash_fallback() {
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let other = "npub_other";
+
+        let ciphertext = "ciphertext-subject-3";
+        let email = make_encrypted_email("<msg3@example.com>", ciphertext);
+        let email_id = db.save_email(&email).unwrap();
+
+        // No email_message_id tag — match must succeed via content_hash↔subject_hash.
+        let mut dm = make_dm("dm-event-3", user, other);
+        dm.email_message_id = None;
+        dm.content = ciphertext.to_string();
+
+        db.save_dm(&dm).unwrap();
+        let wrote = db
+            .backfill_email_pubkeys_from_dm(&dm, Some(user))
+            .unwrap();
+        assert!(wrote);
+
+        let got = db.get_email_by_id(email_id).unwrap().unwrap();
+        assert_eq!(got.sender_pubkey.as_deref(), Some(user));
+        assert_eq!(got.recipient_pubkey.as_deref(), Some(other));
+    }
+
+    #[test]
+    fn test_backfill_email_to_existing_dm() {
+        // Reverse direction: DM is stored first, then the email arrives via IMAP.
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let other = "npub_other";
+
+        let mut dm = make_dm("dm-event-4", user, other);
+        dm.email_message_id = Some("<msg4@example.com>".to_string());
+        dm.content = "ciphertext-4".to_string();
+        db.save_dm(&dm).unwrap();
+
+        let email = make_encrypted_email("<msg4@example.com>", "ciphertext-4");
+        let email_id = db.save_email(&email).unwrap();
+
+        let wrote = db
+            .backfill_email_pubkeys_from_existing_dm(email_id, Some(user))
+            .unwrap();
+        assert!(wrote);
+
+        let got = db.get_email_by_id(email_id).unwrap().unwrap();
+        assert_eq!(got.sender_pubkey.as_deref(), Some(user));
+        assert_eq!(got.recipient_pubkey.as_deref(), Some(other));
+    }
+
+    #[test]
+    fn test_backfill_skips_when_anchor_mismatches() {
+        // Email already has sender_pubkey set to something unrelated to the DM —
+        // backfill must not silently overwrite or guess a recipient_pubkey.
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let other = "npub_other";
+        let unrelated = "npub_unrelated";
+
+        let mut email = make_encrypted_email("<msg5@example.com>", "ct-5");
+        email.sender_pubkey = Some(unrelated.to_string());
+        let email_id = db.save_email(&email).unwrap();
+
+        let mut dm = make_dm("dm-event-5", user, other);
+        dm.email_message_id = Some("<msg5@example.com>".to_string());
+        db.save_dm(&dm).unwrap();
+
+        let wrote = db
+            .backfill_email_pubkeys_from_dm(&dm, Some(user))
+            .unwrap();
+        assert!(!wrote);
+
+        let got = db.get_email_by_id(email_id).unwrap().unwrap();
+        assert!(got.recipient_pubkey.is_none());
+        assert_eq!(got.sender_pubkey.as_deref(), Some(unrelated));
+    }
+
+    #[test]
+    fn test_backfill_message_id_bracket_normalization() {
+        // Email rows arrive from IMAP with `<...>` around message_id, while
+        // DM rumor tags are typically stored bare. Backfill must still link.
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let other = "npub_other";
+
+        let bare_id = "abc-uuid@nostr-mail";
+        let bracketed = format!("<{}>", bare_id);
+
+        let email = make_encrypted_email(&bracketed, "ct-brackets");
+        let email_id = db.save_email(&email).unwrap();
+
+        let mut dm = make_dm("dm-brackets", user, other);
+        dm.email_message_id = Some(bare_id.to_string()); // no brackets
+        dm.content = "irrelevant".to_string(); // hash won't match — message-id path must succeed
+        db.save_dm(&dm).unwrap();
+
+        let wrote = db
+            .backfill_email_pubkeys_from_dm(&dm, Some(user))
+            .unwrap();
+        assert!(wrote, "backfill should link despite bracket asymmetry");
+
+        let got = db.get_email_by_id(email_id).unwrap().unwrap();
+        assert_eq!(got.sender_pubkey.as_deref(), Some(user));
+        assert_eq!(got.recipient_pubkey.as_deref(), Some(other));
+
+        // And the reverse direction (email-side trigger).
+        let mut email2 = make_encrypted_email(&format!("<{}>", "uuid2@nostr-mail"), "ct-brackets-2");
+        email2.sender_pubkey = None;
+        email2.recipient_pubkey = None;
+        let id2 = db.save_email(&email2).unwrap();
+
+        let mut dm2 = make_dm("dm-brackets-2", other, user);
+        dm2.email_message_id = Some("uuid2@nostr-mail".to_string());
+        db.save_dm(&dm2).unwrap();
+
+        let wrote2 = db
+            .backfill_email_pubkeys_from_existing_dm(id2, Some(user))
+            .unwrap();
+        assert!(wrote2);
+        let got2 = db.get_email_by_id(id2).unwrap().unwrap();
+        assert_eq!(got2.sender_pubkey.as_deref(), Some(other));
+        assert_eq!(got2.recipient_pubkey.as_deref(), Some(user));
+    }
+
+    #[test]
+    fn test_backfill_bulk_pass() {
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let other = "npub_other";
+
+        // Two emails missing pubkeys, one DM matches each.
+        let email1 = make_encrypted_email("<bulk1@example.com>", "ct-bulk-1");
+        let email2 = make_encrypted_email("<bulk2@example.com>", "ct-bulk-2");
+        // Third email — already has recipient set, shouldn't be touched.
+        let mut email3 = make_encrypted_email("<bulk3@example.com>", "ct-bulk-3");
+        email3.recipient_pubkey = Some(other.to_string());
+        email3.sender_pubkey = Some(user.to_string());
+
+        let id1 = db.save_email(&email1).unwrap();
+        let id2 = db.save_email(&email2).unwrap();
+        let _id3 = db.save_email(&email3).unwrap();
+
+        let mut dm1 = make_dm("bulk-dm-1", user, other);
+        dm1.email_message_id = Some("<bulk1@example.com>".to_string());
+        dm1.content = "ct-bulk-1".to_string();
+        db.save_dm(&dm1).unwrap();
+
+        let mut dm2 = make_dm("bulk-dm-2", other, user);
+        dm2.content = "ct-bulk-2".to_string(); // matches email2 via subject_hash
+        db.save_dm(&dm2).unwrap();
+
+        let updated = db.backfill_email_pubkeys_pass(user).unwrap();
+        assert_eq!(updated, 2);
+
+        let got1 = db.get_email_by_id(id1).unwrap().unwrap();
+        assert_eq!(got1.sender_pubkey.as_deref(), Some(user));
+        assert_eq!(got1.recipient_pubkey.as_deref(), Some(other));
+
+        let got2 = db.get_email_by_id(id2).unwrap().unwrap();
+        assert_eq!(got2.sender_pubkey.as_deref(), Some(other));
+        assert_eq!(got2.recipient_pubkey.as_deref(), Some(user));
     }
 }

@@ -8,6 +8,41 @@
     flex-wrap: wrap;
 }
 
+/* Mobile: collapse Search/Refresh to icon-only square buttons,
+   matching .contacts-actions / .profile-actions behavior. */
+@media (max-width: 768px) {
+    .dm-actions {
+        width: auto;
+        gap: var(--spacing-sm);
+        margin-bottom: 0;
+        justify-content: flex-end;
+        flex-wrap: nowrap;
+    }
+
+    .dm-actions .btn {
+        flex: 0 0 auto;
+        min-width: 44px;
+        width: 44px;
+        height: 44px;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: var(--radius-md);
+        gap: 0;
+    }
+
+    .dm-actions .btn .btn-text {
+        display: none;
+    }
+
+    .dm-actions .btn i {
+        margin-right: 0;
+        font-size: 1.2rem;
+        flex-shrink: 0;
+    }
+}
+
 /* DM Search Styles */
 .dm-search-container {
     position: relative;

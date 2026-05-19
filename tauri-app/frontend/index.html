@@ -250,7 +250,7 @@
                             <i class="fas fa-search email-search-icon"></i>
                         </div>
                         <button id="refresh-sent" class="btn btn-secondary">
-                            <i class="fas fa-sync"></i> Refresh
+                            <i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>
                         </button>
                     </div>
                 </div>
@@ -296,7 +296,7 @@
                     </div>
                     <div class="inbox-actions" id="drafts-actions">
                         <button id="refresh-drafts" class="btn btn-secondary">
-                            <i class="fas fa-sync"></i> Refresh
+                            <i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>
                         </button>
                     </div>
                 </div>
@@ -326,10 +326,10 @@
                     </div>
                     <div class="dm-actions">
                         <button id="dm-search-toggle" class="btn btn-secondary">
-                            <i class="fas fa-search"></i> Search
+                            <i class="fas fa-search"></i> <span class="btn-text">Search</span>
                         </button>
                         <button id="refresh-dm" class="btn btn-secondary">
-                            <i class="fas fa-sync"></i> Refresh
+                            <i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>
                         </button>
                     </div>
                 </div>
@@ -417,8 +417,11 @@
                         <h2>Profile</h2>
                     </div>
                     <div class="profile-actions">
+                        <button id="edit-profile-btn" class="btn btn-primary" type="button" style="display: none;">
+                            <i class="fas fa-edit"></i> <span class="btn-text">Edit</span>
+                        </button>
                         <button id="refresh-profile" class="btn btn-secondary">
-                            <i class="fas fa-sync"></i> Refresh
+                            <i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>
                         </button>
                     </div>
                 </div>
@@ -431,7 +434,9 @@
                     <form id="profile-fields-form">
                         <div id="profile-fields-list" class="profile-fields-list"></div>
                         <div class="form-actions">
-                            
+                            <button id="cancel-profile-edit-btn" class="btn btn-secondary" type="button" style="display: none;">
+                                <i class="fas fa-times"></i> Cancel
+                            </button>
                             <button id="update-profile-btn" class="btn btn-primary" type="submit" disabled>
                                 <i class="fas fa-save"></i> Update Profile
                             </button>
@@ -632,7 +637,7 @@
                                     <select id="glossia-encoding-pubkey">
                                         <option value="latin">Latin</option>
                                         <option value="english bip39">English - BIP39</option>
-                                        <option value="">Bech32</option>
+                                        <option value="">npub</option>
                                     </select>
                                 </div>
                             </div>
@@ -734,8 +739,8 @@
                         
                         <div class="form-group">
                             <label for="sync-cutoff-days">Sync Cutoff (Days):</label>
-                            <input type="number" id="sync-cutoff-days" placeholder="365" min="1" max="36500" value="365">
-                            <small class="form-text text-muted">How far back in time to sync emails when setting up on a new device. Default: 365 days (1 year). Set to 0 to sync all emails.</small>
+                            <input type="number" id="sync-cutoff-days" placeholder="30" min="1" max="36500" value="30">
+                            <small class="form-text text-muted">How far back in time to sync emails when setting up on a new device. Default: 30 days. Set to 0 to sync all emails.</small>
                         </div>
                         
                         <div class="form-group">

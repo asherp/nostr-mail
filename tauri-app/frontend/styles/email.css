@@ -784,6 +784,37 @@ body.dark-mode .email-attachment-icon {
     gap: 15px;
 }
 
+/* Mobile: collapse Refresh button on Sent/Drafts to icon-only square,
+   matching .contacts-actions / .profile-actions / .dm-actions behavior.
+   Scoped to #sent and #drafts so inbox layout (folder select etc.) is untouched. */
+@media (max-width: 768px) {
+    #sent .inbox-actions .btn,
+    #drafts .inbox-actions .btn {
+        flex: 0 0 auto;
+        min-width: 44px;
+        width: 44px;
+        height: 44px;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: var(--radius-md);
+        gap: 0;
+    }
+
+    #sent .inbox-actions .btn .btn-text,
+    #drafts .inbox-actions .btn .btn-text {
+        display: none;
+    }
+
+    #sent .inbox-actions .btn i,
+    #drafts .inbox-actions .btn i {
+        margin-right: 0;
+        font-size: 1.2rem;
+        flex-shrink: 0;
+    }
+}
+
 .email-search-container {
     position: relative;
     min-width: 250px;

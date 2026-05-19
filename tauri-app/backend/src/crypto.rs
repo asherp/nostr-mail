@@ -66,7 +66,10 @@ pub fn decrypt_message(private_key: &str, public_key: &str, encrypted_message: &
     // Parse the keys from bech32 format
     let secret_key = SecretKey::from_bech32(private_key)?;
     let public_key = PublicKey::from_bech32(public_key)?;
-    
+
+    let nip44_err: Option<String>;
+    let nip04_err: Option<String>;
+
     // Try NIP-44 first (newer standard)
     match nip44::decrypt(&secret_key, &public_key, encrypted_message) {
         Ok(decrypted) => {
@@ -74,10 +77,12 @@ pub fn decrypt_message(private_key: &str, public_key: &str, encrypted_message: &
             return Ok(decrypted);
         }
         Err(e) => {
-            println!("[CRYPTO] NIP-44 decryption failed: {:?}, trying NIP-04", e);
+            let msg = format!("{:?}", e);
+            println!("[CRYPTO] NIP-44 decryption failed: {}, trying NIP-04", msg);
+            nip44_err = Some(msg);
         }
     }
-    
+
     // Try NIP-04 format: base64(encrypted_content)?iv=base64(iv)
     match nip04::decrypt(&secret_key, &public_key, encrypted_message) {
         Ok(decrypted) => {
@@ -85,13 +90,19 @@ pub fn decrypt_message(private_key: &str, public_key: &str, encrypted_message: &
             return Ok(decrypted);
         }
         Err(e) => {
-            println!("[CRYPTO] NIP-04 decryption also failed: {:?}", e);
+            let msg = format!("{:?}", e);
+            println!("[CRYPTO] NIP-04 decryption also failed: {}", msg);
+            nip04_err = Some(msg);
         }
     }
-    
-    Err(anyhow::anyhow!("Failed to decrypt with both NIP-04 and NIP-44. Content length: {}, Has '?iv=': {}", 
-        encrypted_message.len(), 
-        encrypted_message.contains("?iv=")))
+
+    Err(anyhow::anyhow!(
+        "Failed to decrypt (content_len={}, has_iv={}). NIP-44: {} | NIP-04: {}",
+        encrypted_message.len(),
+        encrypted_message.contains("?iv="),
+        nip44_err.as_deref().unwrap_or("not attempted"),
+        nip04_err.as_deref().unwrap_or("not attempted"),
+    ))
 }
 
 /// Detect encryption format from encrypted content

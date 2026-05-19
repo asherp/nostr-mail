@@ -93,12 +93,34 @@ class EmailService {
         return 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
     }
 
+    // Resolve recipient contact for sent-email rendering. STRICT pubkey-only,
+    // mirroring _resolveSender's anti-spoofing rule for incoming mail.
+    //
+    // Why no email-based fallback: an attacker who knows a contact's email
+    // address could borrow that contact's avatar simply by being the To: on a
+    // sent email — even if they have nothing to do with that contact's Nostr
+    // identity. The avatar is an identity claim; we only make it when we can
+    // back it with a cryptographic anchor (matching recipient_pubkey).
+    //
+    // Returns null when no recipient_pubkey is set or no contact matches that
+    // pubkey. Callers render the default avatar in that case.
+    _resolveRecipientContact(email) {
+        if (!this._contactsByPubkey) this._buildContactIndex();
+        const recipientPubkey = email && (email.recipient_pubkey || null);
+        if (!recipientPubkey) return null;
+        return this._contactsByPubkey.get(recipientPubkey) || null;
+    }
+
     // Resolve sender identity for incoming email rendering.
-    // SECURITY: when a Nostr pubkey is attached to the email, contacts are matched
-    // ONLY by pubkey. Falling back to From: address would let an attacker spoof the
-    // SMTP header to borrow a known contact's avatar/name while signing with their
-    // own key — combined with the green Signature Verified badge that would look
-    // like the contact signed it.
+    // SECURITY: contacts are matched ONLY by pubkey, ever. Falling back to
+    // From: address (whether the email is signed or not) would let an
+    // attacker spoof the SMTP header to borrow a known contact's avatar/name
+    // — for signed mail it combines with the green Signature Verified badge
+    // to look like the contact signed it; for unsigned mail it lets any
+    // sender claim a contact's identity just by setting From:. The From:
+    // address still surfaces as the identity *label* via fromAddress below,
+    // but the avatar/name comes from the contact only when the pubkey
+    // anchors it. See feedback_avatar_anti_spoofing.
     _resolveSender(email) {
         if (!this._contactsByPubkey) this._buildContactIndex();
 
@@ -113,9 +135,9 @@ class EmailService {
         if (senderPubkey) {
             contact = this._contactsByPubkey.get(senderPubkey) || null;
             if (!contact) isUnknownSigner = true;
-        } else {
-            contact = this._findContact(null, fromAddress);
         }
+        // When senderPubkey is null we deliberately leave contact = null and
+        // render the default avatar. The From: address still labels the row.
 
         let avatarSrc = defaultAvatar;
         let avatarClass = 'contact-avatar';
@@ -1026,6 +1048,51 @@ class EmailService {
         const data = encoder.encode(str);
         const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
         return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // Self-healing retrofit: when the backend returns the glossia-decoded
+    // subject ciphertext (even on full-decrypt failure), hash it and write
+    // it back as subject_hash, then re-run the DM↔email backfill so a
+    // previously-unanchored sent email picks up its recipient_pubkey from a
+    // matching DM. After the backfill runs, refresh the in-memory email's
+    // pubkey fields from DB and report whether anything changed so list
+    // renderers can re-attempt decrypt in place. Failures are logged.
+    //
+    // Returns `true` when the row's recipient_pubkey or sender_pubkey was
+    // populated as a result of this call (caller should retry decrypt), and
+    // `false` otherwise.
+    async _retrofitSubjectHashAndBackfill(email, subjectCiphertext) {
+        if (!subjectCiphertext || !email || !email.message_id) return false;
+        try {
+            const hash = await this.hashStringSHA256(subjectCiphertext);
+            await window.__TAURI__.core.invoke('db_update_email_subject_hash', {
+                messageId: email.message_id,
+                subjectHash: hash,
+            });
+            // Hash now matches the DM's content_hash for this conversation.
+            // Backfill pass writes recipient_pubkey on the affected row.
+            const updated = await window.__TAURI__.core.invoke('db_backfill_email_pubkeys');
+            if (!updated || updated <= 0 || !email.id) return false;
+            // The in-memory email object is stale relative to what the
+            // backfill wrote. Refetch this one row and patch the fields the
+            // list/thread renderers care about, then signal the caller.
+            const id = typeof email.id === 'number' ? email.id : parseInt(email.id, 10);
+            const fresh = await window.__TAURI__.core.invoke('db_get_email_by_id', { emailId: id });
+            if (!fresh) return false;
+            let changed = false;
+            if (fresh.recipient_pubkey && !email.recipient_pubkey) {
+                email.recipient_pubkey = fresh.recipient_pubkey;
+                changed = true;
+            }
+            if (fresh.sender_pubkey && !email.sender_pubkey) {
+                email.sender_pubkey = fresh.sender_pubkey;
+                changed = true;
+            }
+            return changed;
+        } catch (e) {
+            console.warn('[JS] subject_hash retrofit/backfill failed:', e);
+            return false;
+        }
     }
 
     // Clear current draft state (for new compose)
@@ -2747,7 +2814,7 @@ class EmailService {
         } finally {
             if (!append) {
                 domManager.enable('refreshSent');
-                domManager.setHTML('refreshSent', '<i class="fas fa-sync"></i> Refresh');
+                domManager.setHTML('refreshSent', '<i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>');
             } else {
                 const loadMoreBtn = document.getElementById('load-more-sent-emails');
                 if (loadMoreBtn) {
@@ -2798,6 +2865,19 @@ class EmailService {
         try {
             const newCount = await TauriService.syncSentEmails();
             console.log(`[JS] Synced ${newCount} new sent emails from network`);
+            // Best-effort: backfill sender/recipient pubkeys on rows that came
+            // in with NULL anchors (legacy sends, or fresh installs whose IMAP
+            // Sent folder predates the local contacts table). The DM-side
+            // ingest path also runs this incrementally; the bulk pass catches
+            // the IMAP-sync paths that bypass db_save_email.
+            try {
+                const updated = await window.__TAURI__.core.invoke('db_backfill_email_pubkeys');
+                if (updated > 0) {
+                    console.log(`[JS] Backfilled pubkeys on ${updated} email(s) via matching DMs`);
+                }
+            } catch (e) {
+                console.warn('[JS] db_backfill_email_pubkeys after sent sync failed:', e);
+            }
             return newCount;
         } catch (error) {
             console.error('[JS] Error in syncSentEmails:', error);
@@ -3066,19 +3146,56 @@ class EmailService {
 
             if (uncachedEncrypted.length > 0 && appState.getKeypair()) {
                 try {
-                    const batchInput = uncachedEncrypted.map(email => ({
-                        id: String(email.id),
-                        armorText: email.body,
-                        subject: email.subject,
-                        senderPubkey: email.sender_pubkey || email.nostr_pubkey || null,
-                        recipientPubkey: null,
-                    }));
+                    // The inbox list also surfaces threads whose latest message
+                    // is one the user *sent* (replies inside an inbound thread).
+                    // For those rows the sender pubkey is the user, so we must
+                    // pass recipientPubkey and leave senderPubkey null, otherwise
+                    // determine_decrypt_pubkey hits self-DH and fails. Direction
+                    // detection mirrors showThreadDetail (line 4429-4430).
+                    const settings = appState.getSettings();
+                    const userEmail = (settings?.email_address || '').trim().toLowerCase();
+                    const userPubkey = appState.getKeypair()?.public_key || null;
+                    const batchInput = uncachedEncrypted.map(email => {
+                        const fromAddr = (email.from || '').trim().toLowerCase();
+                        const isSent = (userEmail && fromAddr === userEmail) ||
+                            (userPubkey && email.sender_pubkey === userPubkey);
+                        if (isSent) {
+                            let recipientPubkey = email.recipient_pubkey || null;
+                            if (!recipientPubkey) {
+                                const recipientEmail = email.to || email.to_address;
+                                const contact = recipientEmail ? this._findContact(null, recipientEmail) : null;
+                                if (contact && contact.pubkey) {
+                                    recipientPubkey = contact.pubkey;
+                                    email.recipient_pubkey = recipientPubkey;
+                                }
+                            }
+                            return {
+                                id: String(email.id),
+                                armorText: email.body,
+                                subject: email.subject,
+                                senderPubkey: null,
+                                recipientPubkey,
+                            };
+                        }
+                        return {
+                            id: String(email.id),
+                            armorText: email.body,
+                            subject: email.subject,
+                            senderPubkey: email.sender_pubkey || email.nostr_pubkey || null,
+                            recipientPubkey: null,
+                        };
+                    });
                     console.log(`[JS] Batch decrypting ${batchInput.length} inbox emails in one IPC call`);
                     const batchResults = await TauriService.decryptEmailBodiesBatch(batchInput);
 
                     // Build a lookup from email ID to email object for side effects
                     const emailById = new Map(uncachedEncrypted.map(e => [String(e.id), e]));
 
+                    // Track rows that failed initial decrypt — if the retrofit
+                    // anchors recipient_pubkey for any of them, we retry once
+                    // in-place so the first list render shows the content
+                    // (instead of "Could not decrypt" until the user clicks).
+                    const pendingRetries = [];
                     for (const item of batchResults) {
                         const email = emailById.get(item.id);
                         if (item.result && item.result.success) {
@@ -3089,22 +3206,6 @@ class EmailService {
                                 previewSubject: item.result.subject,
                                 showSubject: true,
                             });
-                            // Fire-and-forget side effects: subject hash + pubkey backfill
-                            if (item.result.subjectCiphertext && email && email.message_id) {
-                                this.hashStringSHA256(item.result.subjectCiphertext).then(hash => {
-                                    window.__TAURI__.core.invoke('db_update_email_subject_hash', {
-                                        messageId: email.message_id,
-                                        subjectHash: hash,
-                                    }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
-                                });
-                            }
-                            if (item.result.senderPubkey && email && !email.sender_pubkey && email.id) {
-                                email.sender_pubkey = item.result.senderPubkey;
-                                window.__TAURI__.core.invoke('db_update_email_sender_pubkey_by_id', {
-                                    id: typeof email.id === 'number' ? email.id : parseInt(email.id, 10),
-                                    senderPubkey: item.result.senderPubkey,
-                                }).catch(e => console.warn('[JS] Failed to backfill sender_pubkey:', e));
-                            }
                         } else {
                             // Cache the failure too so we don't re-attempt
                             this._previewCache.set(`inbox-${item.id}`, {
@@ -3113,6 +3214,55 @@ class EmailService {
                                 showSubject: false,
                             });
                         }
+                        // Side effects fire regardless of full-decrypt success:
+                        // subject_ciphertext is produced as long as glossia decode
+                        // worked, which is enough to self-heal recipient_pubkey for
+                        // sent emails (the catch-22 case).
+                        if (item.result && email) {
+                            const retrofitPromise = this._retrofitSubjectHashAndBackfill(email, item.result.subjectCiphertext);
+                            if (!item.result.success) {
+                                pendingRetries.push({ item, email, retrofitPromise });
+                            }
+                            if (item.result.senderPubkey && !email.sender_pubkey && email.id) {
+                                email.sender_pubkey = item.result.senderPubkey;
+                                window.__TAURI__.core.invoke('db_update_email_sender_pubkey_by_id', {
+                                    id: typeof email.id === 'number' ? email.id : parseInt(email.id, 10),
+                                    senderPubkey: item.result.senderPubkey,
+                                }).catch(e => console.warn('[JS] Failed to backfill sender_pubkey:', e));
+                            }
+                        }
+                    }
+
+                    // Re-decrypt any rows whose retrofit produced fresh pubkey
+                    // anchors. The retrofit helper has already patched
+                    // `email.recipient_pubkey` / `email.sender_pubkey` in place
+                    // by the time it resolves.
+                    if (pendingRetries.length > 0) {
+                        await Promise.all(pendingRetries.map(async ({ item, email, retrofitPromise }) => {
+                            try {
+                                const changed = await retrofitPromise;
+                                if (!changed) return;
+                                const fromAddr = (email.from || '').trim().toLowerCase();
+                                const isSent = (userEmail && fromAddr === userEmail) ||
+                                    (userPubkey && email.sender_pubkey === userPubkey);
+                                const senderPubkey = isSent ? null : (email.sender_pubkey || email.nostr_pubkey || null);
+                                const recipientPubkey = isSent ? (email.recipient_pubkey || null) : null;
+                                const retry = await TauriService.decryptEmailBody(
+                                    email.body, email.subject, senderPubkey, recipientPubkey
+                                );
+                                if (retry && retry.success) {
+                                    let previewText = Utils.escapeHtml(retry.body.substring(0, 100));
+                                    if (retry.body.length > 100) previewText += '...';
+                                    this._previewCache.set(`inbox-${item.id}`, {
+                                        previewText,
+                                        previewSubject: retry.subject,
+                                        showSubject: true,
+                                    });
+                                }
+                            } catch (e) {
+                                console.warn('[JS] Inbox retry decrypt failed:', e);
+                            }
+                        }));
                     }
                 } catch (e) {
                     console.error('[JS] Batch decryption failed, falling back to per-email:', e);
@@ -3225,10 +3375,31 @@ class EmailService {
                     previewText = 'Unable to decrypt: no keypair';
                 } else {
                     try {
-                        const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
+                        // An inbox row can be a sent reply within an inbound
+                        // thread. Pick decrypt direction the same way
+                        // showThreadDetail does so previews don't fail with
+                        // self-DH when the user authored the latest message.
+                        const settings = appState.getSettings();
+                        const userEmail = (settings?.email_address || '').trim().toLowerCase();
+                        const userPubkey = keypair.public_key || null;
+                        const fromAddr = (email.from || '').trim().toLowerCase();
+                        const isSent = (userEmail && fromAddr === userEmail) ||
+                            (userPubkey && email.sender_pubkey === userPubkey);
+                        let senderPubkey = null;
+                        let recipientPubkey = null;
+                        if (isSent) {
+                            recipientPubkey = email.recipient_pubkey || null;
+                            if (!recipientPubkey) {
+                                const recipientEmail = email.to || email.to_address;
+                                const contact = recipientEmail ? this._findContact(null, recipientEmail) : null;
+                                if (contact && contact.pubkey) recipientPubkey = contact.pubkey;
+                            }
+                        } else {
+                            senderPubkey = email.sender_pubkey || email.nostr_pubkey || null;
+                        }
                         const result = await TauriService.decryptEmailBody(
                             email.body, email.subject,
-                            senderPubkey, null
+                            senderPubkey, recipientPubkey
                         );
                         if (result.success) {
                             previewSubject = result.subject;
@@ -3238,15 +3409,10 @@ class EmailService {
                         } else {
                             previewText = 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.';
                         }
-                        // Update subject_hash for DM↔email matching
-                        if (result.subjectCiphertext && email.message_id) {
-                            this.hashStringSHA256(result.subjectCiphertext).then(hash => {
-                                window.__TAURI__.core.invoke('db_update_email_subject_hash', {
-                                    messageId: email.message_id,
-                                    subjectHash: hash,
-                                }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
-                            });
-                        }
+                        // Fire retrofit even on full-decrypt failure (subject_ciphertext
+                        // only needs glossia-decode to have succeeded). This is what
+                        // unsticks sent emails whose recipient_pubkey is NULL.
+                        this._retrofitSubjectHashAndBackfill(email, result.subjectCiphertext);
                         // Backfill sender_pubkey from armor signature if header was missing
                         if (result.senderPubkey && !email.sender_pubkey && email.id) {
                             console.log('[JS] Backfilling sender_pubkey from armor:', result.senderPubkey.substring(0, 20) + '...');
@@ -4382,19 +4548,20 @@ ${attachmentsHtml}
                 threadContent.innerHTML = '<div class="thread-loading"><i class="fas fa-spinner fa-spin"></i> Loading conversation...</div>';
             }
 
-            // Fetch all emails in thread
-            const threadEmails = await TauriService.getThreadEmails(threadId);
+            // Resolve active account email up front so we can scope the thread query to it
+            // (prevents cross-account contamination when multiple accounts share this DB).
+            const settings = appState.getSettings();
+            const userEmail = (settings?.email_address || '').trim().toLowerCase();
+            const userPubkey = appState.getKeypair()?.public_key;
+
+            // Fetch all emails in thread, scoped to the active account
+            const threadEmails = await TauriService.getThreadEmails(threadId, userEmail || null);
             if (!threadEmails || threadEmails.length === 0) {
                 if (threadContent) threadContent.innerHTML = '<div class="thread-loading">No messages found.</div>';
                 return;
             }
 
             appState.setCurrentThread(threadId, threadEmails);
-
-            // Classify each email as sent or received
-            const settings = appState.getSettings();
-            const userEmail = (settings?.email_address || '').trim().toLowerCase();
-            const userPubkey = appState.getKeypair()?.public_key;
 
             for (const email of threadEmails) {
                 const fromAddr = (email.from || '').trim().toLowerCase();
@@ -4526,12 +4693,6 @@ ${attachmentsHtml}
                             isUnknownSigner: isUnknownSigner,
                         })
                         : '';
-                    // Suppress green inline sig icon for unknown signers; the
-                    // expanded security panel still shows the full row.
-                    if (isUnknownSigner) {
-                        const sigIsValid = (outerSigResult && outerSigResult.isValid === true) || email.signature_valid === true;
-                        if (sigIsValid) signatureIcon = '';
-                    }
                     const timeAgo = Utils.formatTimeAgo(new Date(email.date));
 
                     // Signature indicator — icon only in header, full text in details panel
@@ -4550,6 +4711,13 @@ ${attachmentsHtml}
                     } else if (email.signature_valid === false) {
                         signatureIcon = `<span class="signature-indicator invalid" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
                         securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
+                    }
+
+                    // Suppress green inline sig icon for unknown signers; the
+                    // expanded security panel still shows the full row.
+                    if (isUnknownSigner) {
+                        const sigIsValid = (outerSigResult && outerSigResult.isValid === true) || email.signature_valid === true;
+                        if (sigIsValid) signatureIcon = '';
                     }
 
                     // Transport auth indicator
@@ -6401,6 +6569,10 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                     const batchResults = await TauriService.decryptEmailBodiesBatch(batchInput);
 
                     const emailById = new Map(uncachedEncrypted.map(e => [String(e.id), e]));
+                    // Failed rows that just kicked off a retrofit — once the
+                    // backfill anchors recipient_pubkey we retry once in place
+                    // so the first sent-list render shows decrypted content.
+                    const pendingRetries = [];
 
                     for (const item of batchResults) {
                         const email = emailById.get(item.id);
@@ -6412,15 +6584,6 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 previewSubject: item.result.subject,
                                 showSubject: true,
                             });
-                            // Fire-and-forget side effects
-                            if (item.result.subjectCiphertext && email && email.message_id) {
-                                this.hashStringSHA256(item.result.subjectCiphertext).then(hash => {
-                                    window.__TAURI__.core.invoke('db_update_email_subject_hash', {
-                                        messageId: email.message_id,
-                                        subjectHash: hash,
-                                    }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
-                                });
-                            }
                             // Backfill recipient_pubkey to DB if resolved from contact index
                             if (email && email.recipient_pubkey && email.id) {
                                 this._saveRecipientPubkeyToDb(email, email.recipient_pubkey)
@@ -6433,6 +6596,39 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 showSubject: true,
                             });
                         }
+                        // Retrofit subject_hash whenever the backend produced a
+                        // glossia-decoded ciphertext — even on full-decrypt failure.
+                        // This breaks the catch-22 where missing recipient_pubkey
+                        // blocks decrypt which would have populated the hash.
+                        if (item.result && email) {
+                            const retrofitPromise = this._retrofitSubjectHashAndBackfill(email, item.result.subjectCiphertext);
+                            if (!item.result.success) {
+                                pendingRetries.push({ item, email, retrofitPromise });
+                            }
+                        }
+                    }
+
+                    if (pendingRetries.length > 0) {
+                        await Promise.all(pendingRetries.map(async ({ item, email, retrofitPromise }) => {
+                            try {
+                                const changed = await retrofitPromise;
+                                if (!changed || !email.recipient_pubkey) return;
+                                const retry = await TauriService.decryptEmailBody(
+                                    email.body, email.subject, null, email.recipient_pubkey
+                                );
+                                if (retry && retry.success) {
+                                    let previewText = Utils.escapeHtml(retry.body.substring(0, 100));
+                                    if (retry.body.length > 100) previewText += '...';
+                                    this._previewCache.set(`sent-${item.id}`, {
+                                        previewText,
+                                        previewSubject: retry.subject,
+                                        showSubject: true,
+                                    });
+                                }
+                            } catch (e) {
+                                console.warn('[JS] Sent retry decrypt failed:', e);
+                            }
+                        }));
                     }
                 } catch (e) {
                     console.error('[JS] Batch decryption failed for sent emails, falling back to per-email:', e);
@@ -6577,15 +6773,9 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                             this._saveRecipientPubkeyToDb(email, recipientPubkey)
                                 .catch(e => console.warn('[JS] Failed to backfill recipient_pubkey:', e));
                         }
-                        // Update subject_hash for DM↔email matching
-                        if (result.subjectCiphertext && email.message_id) {
-                            this.hashStringSHA256(result.subjectCiphertext).then(hash => {
-                                window.__TAURI__.core.invoke('db_update_email_subject_hash', {
-                                    messageId: email.message_id,
-                                    subjectHash: hash,
-                                }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
-                            });
-                        }
+                        // Fire retrofit + backfill even on decrypt failure — this
+                        // is the self-heal path for sent emails missing recipient_pubkey.
+                        this._retrofitSubjectHashAndBackfill(email, result.subjectCiphertext);
                     } catch (e) {
                         console.error('[JS] Backend decrypt failed for sent preview:', e);
                         previewText = 'Could not decrypt';
@@ -6645,8 +6835,9 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             transportAuthIndicator = `<span class="transport-auth-indicator invalid" title="Email transport authentication failed"><i class="fas fa-envelope"></i> Email Unverified</span>`;
         }
 
-        // Get recipient contact for avatar (O(1) lookup via pre-built index)
-        const recipientContact = this._findContact(null, email.to);
+        // Strict pubkey-bound lookup when recipient_pubkey is set, otherwise
+        // email fallback. See _resolveRecipientContact for the rationale.
+        const recipientContact = this._resolveRecipientContact(email);
 
         // Avatar fallback logic (same as inbox)
         const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
@@ -6761,8 +6952,9 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         const attachmentIndicator = attachmentCount > 0 ? 
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
-        // Get recipient contact for avatar (O(1) lookup via pre-built index)
-        const recipientContact = this._findContact(null, email.to);
+        // Strict pubkey-bound lookup when recipient_pubkey is set, otherwise
+        // email fallback. See _resolveRecipientContact for the rationale.
+        const recipientContact = this._resolveRecipientContact(email);
 
         // Avatar fallback logic (same as inbox)
         const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
@@ -7747,19 +7939,14 @@ ${attachmentsHtml}
                 null, recipientPubkey
             );
 
+            // Retrofit happens whether or not the body decrypted — the subject
+            // ciphertext is enough to anchor a matching DM, which then enables
+            // a fresh decrypt attempt to succeed.
+            this._retrofitSubjectHashAndBackfill(email, result.subjectCiphertext);
+
             if (result.success) {
                 await this._saveRecipientPubkeyToDb(email, recipientPubkey);
                 window.notificationService.showSuccess('Decryption successful! Pubkey saved.');
-
-                // Update subject_hash for DM↔email matching
-                if (result.subjectCiphertext && email.message_id) {
-                    this.hashStringSHA256(result.subjectCiphertext).then(hash => {
-                        window.__TAURI__.core.invoke('db_update_email_subject_hash', {
-                            messageId: email.message_id,
-                            subjectHash: hash,
-                        }).catch(e => console.warn('[JS] Failed to update subject_hash:', e));
-                    });
-                }
                 return true;
             }
 
@@ -8435,7 +8622,7 @@ ${attachmentsHtml}
         } finally {
             if (!append) {
                 domManager.enable('refreshDrafts');
-                domManager.setHTML('refreshDrafts', '<i class="fas fa-sync"></i> Refresh');
+                domManager.setHTML('refreshDrafts', '<i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>');
             } else {
                 const loadMoreBtn = document.getElementById('load-more-drafts');
                 if (loadMoreBtn) {

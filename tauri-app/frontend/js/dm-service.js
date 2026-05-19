@@ -931,8 +931,13 @@ class DMService {
                 const existingHeader = dmMessages.querySelector('.conversation-header');
                 const existingEmptyState = dmMessages.querySelector('.text-center.text-muted');
                 const existingContainer = dmMessages.querySelector('.messages-container');
-                // Only skip if we already have a fully rendered conversation view (header + either empty state or messages)
-                if (existingHeader && (existingEmptyState || existingContainer)) {
+                // Only preserve the existing view if it belongs to the SAME contact.
+                // Without this check, opening a new (empty) conversation while another
+                // is on screen would short-circuit and leave the old conversation visible.
+                const existingPubkey = existingHeader
+                    ?.querySelector('.contact-avatar[data-pubkey]')
+                    ?.getAttribute('data-pubkey');
+                if (existingHeader && (existingEmptyState || existingContainer) && existingPubkey === contactPubkey) {
                     console.warn('[RENDER] No messages to render, preserving existing empty conversation view');
                     return; // Don't clear the existing conversation view if we have none to render
                 }
@@ -1708,6 +1713,18 @@ class DMService {
             await window.__TAURI__.core.invoke('sync_direct_messages_with_network', {
                 relays
             });
+            // Best-effort: any sent-email rows still missing recipient_pubkey
+            // (legacy or fresh-install) may now be anchorable via the DMs we
+            // just pulled. Per-save backfill already ran on each individual DM
+            // store; this is a no-op when there's nothing left to recover.
+            try {
+                const updated = await window.__TAURI__.core.invoke('db_backfill_email_pubkeys');
+                if (updated > 0) {
+                    console.log(`[JS] Backfilled pubkeys on ${updated} email(s) after DM sync`);
+                }
+            } catch (e) {
+                console.warn('[JS] db_backfill_email_pubkeys after DM sync failed:', e);
+            }
             window.notificationService.showSuccess('DMs synced from network');
         } catch (error) {
             console.error('Failed to sync DMs from network:', error);

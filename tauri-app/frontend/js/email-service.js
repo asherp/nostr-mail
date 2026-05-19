@@ -4731,7 +4731,13 @@ ${attachmentsHtml}
                     const snippetPlain = (displayBody || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
                     const snippet = Utils.escapeHtml(snippetPlain.substring(0, 120));
 
-                    const bodyId = `thread-body-${email.id}`;
+                    // Prefix by source so the same thread rendered into both
+                    // #inbox-thread-detail-content and #sent-thread-detail-content
+                    // doesn't collide on element IDs. getElementById returns the
+                    // first match in document order, which would otherwise route
+                    // iframe rendering (renderHtmlBodyInIframe) into the wrong
+                    // card and leave the sent-side body empty.
+                    const bodyId = `${prefix}-thread-body-${email.id}`;
                     const cardDiv = document.createElement('div');
                     cardDiv.className = 'email-detail-card';
                     cardDiv.innerHTML = `

@@ -113,6 +113,7 @@ src-tauri/target/
 backend/gen/android/**/build/
 backend/gen/android/.gradle/
 backend/gen/android/app/build/
+backend/gen/android/app/src/main/assets/
 backend/gen/android/buildSrc/build/
 backend/gen/android/*.apk
 backend/gen/android/*.aab

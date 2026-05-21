@@ -271,9 +271,6 @@ const TauriService = {
         }
         return await this.invoke('construct_email_headers', args);
     },
-    fetchEmails: async function(emailConfig, limit, searchQuery, onlyNostr = true, requireSignature = null) {
-        return await this.invoke('fetch_emails', { emailConfig, limit, searchQuery, onlyNostr, requireSignature });
-    },
     testImapConnection: async function(emailConfig) {
         return await this.invoke('test_imap_connection', { emailConfig });
     },

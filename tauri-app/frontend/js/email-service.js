@@ -2426,10 +2426,22 @@ class EmailService {
             const shouldSendDm = settings && settings.send_matching_dm !== false; // Default to true
             const autoEncrypt = settings && settings.automatically_encrypt !== false; // Default to true
             
-            // Check if email is actually encrypted by examining the content
-            // Subject should be encrypted (base64-like) or body should have NIP encryption markers
+            // Check if email is actually encrypted by examining the content.
+            // Body check uses the capnp-validated parser on the reply portion only
+            // (above any quoted armor). A raw substring scan for "BEGIN NOSTR" would
+            // false-positive on replies that quote an encrypted original, causing
+            // auto-encrypt to be skipped while auto-sign still fires.
             let isSubjectEncrypted = window.Utils && window.Utils.isLikelyEncryptedContent(subject);
-            let isBodyEncrypted = body.includes('BEGIN NOSTR') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
+            let isBodyEncrypted = false;
+            try {
+                const { replyText } = this.splitReplyAndQuoted(body);
+                const replyForCheck = replyText || body;
+                const armorParts = await this.parseArmorComponentsRust(replyForCheck);
+                isBodyEncrypted = !!(armorParts && armorParts.isEncryptedBody);
+            } catch (e) {
+                console.warn('[JS] sendEncryptedEmail: armor parse failed, falling back to substring check:', e);
+                isBodyEncrypted = body.includes('BEGIN NOSTR') || (window.Utils && window.Utils.isLikelyEncryptedContent(body));
+            }
             let isEmailEncrypted = isSubjectEncrypted || isBodyEncrypted;
             
             // Auto-encrypt if enabled and email is not already encrypted
@@ -2850,7 +2862,7 @@ class EmailService {
             // Get selected folder from dropdown
             const folderSelect = document.getElementById('imap-folder-select');
             const selectedFolder = folderSelect && folderSelect.value ? folderSelect.value : null;
-            console.log(`[JS] Syncing inbox emails from folder: ${selectedFolder || 'All Folders'}`);
+            console.log(`[JS] Syncing inbox emails from folder: ${selectedFolder || 'Default (INBOX + nostr-mail)'}`);
             
             const newCount = await TauriService.syncNostrEmails(selectedFolder);
             console.log(`[JS] Synced ${newCount} new inbox emails from network`);
@@ -3501,11 +3513,6 @@ class EmailService {
                 ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
                 <div class="email-preview">${previewText}</div>
             </div>
-            <div class="email-actions">
-                <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteInboxEmailFromList('${Utils.escapeHtml(email.message_id || email.id)}')">
-                    <i class="fas fa-trash"></i>
-                </button>
-            </div>
         `;
 
         this._wireViewProfileButtons(emailElement);
@@ -3605,11 +3612,6 @@ class EmailService {
                 </div>
                 <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
                 <div class="email-preview">Loading...</div>
-            </div>
-            <div class="email-actions">
-                <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteInboxEmailFromList('${Utils.escapeHtml(email.message_id || email.id)}')">
-                    <i class="fas fa-trash"></i>
-                </button>
             </div>
         `;
 
@@ -3842,6 +3844,9 @@ class EmailService {
             if (emailDetailView) emailDetailView.style.display = 'flex';
             if (inboxActions) inboxActions.style.display = 'none';
             if (inboxTitle) inboxTitle.style.display = 'none';
+            // Detail view has its own back-to-inbox button; hide the tab's back-to-nav-btn
+            // to avoid stacking two back buttons on mobile portrait.
+            document.querySelectorAll('#inbox .back-to-nav-btn').forEach(b => b.style.display = 'none');
             const emailDetailContent = document.getElementById('email-detail-content');
             if (emailDetailContent) {
                 // Use email.body directly instead of cleanedBody to preserve encrypted message format
@@ -4190,6 +4195,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+<button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
 </div>
@@ -4274,7 +4280,18 @@ ${attachmentsHtml}
                             }
                         });
                     }
-                    
+
+                    const inboxDeleteBtn = emailDetailContent.querySelector('.thread-delete-action');
+                    if (inboxDeleteBtn) {
+                        inboxDeleteBtn.addEventListener('click', async () => {
+                            inboxMoreDropdown.classList.remove('open');
+                            const ok = await this._deleteEmailFromDetail(email.message_id || email.id, 'inbox');
+                            if (!ok) return;
+                            this.showEmailList();
+                            await this.loadEmails();
+                        });
+                    }
+
                     // Add event listeners for invalid signature indicator in sender header
                     if (email.signature_valid === false) {
                         const sigIndicator = emailDetailContent.querySelector('.email-sender-header .signature-indicator.invalid');
@@ -4517,6 +4534,12 @@ ${attachmentsHtml}
                 inboxTitle.textContent = 'Inbox';
                 inboxTitle.style.display = '';
             }
+            // Re-show the tab's back-to-nav-btn on mobile portrait — it was hidden
+            // while the detail view was open to avoid stacking two back buttons.
+            if (window.app?.isMobilePortrait()) {
+                const backToNavBtn = document.querySelector('#inbox .back-to-nav-btn');
+                if (backToNavBtn) backToNavBtn.style.display = 'flex';
+            }
             appState.clearCurrentThread();
 
         } catch (error) {
@@ -4542,6 +4565,7 @@ ${attachmentsHtml}
             if (actions) actions.style.display = 'none';
             if (title) title.style.display = 'none';
             if (threadDetailView) threadDetailView.style.display = 'flex';
+            document.querySelectorAll(`#${prefix} .back-to-nav-btn`).forEach(b => b.style.display = 'none');
 
             // Show loading state
             if (threadContent) {
@@ -4771,6 +4795,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+<button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
 </div>
@@ -4841,6 +4866,26 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 if (rawBody) rawBody.style.display = 'block';
                                 if (bodyDiv) bodyDiv.style.display = 'none';
                                 rawToggle.textContent = 'Hide Raw';
+                            }
+                        });
+                    }
+                    const deleteCardBtn = cardDiv.querySelector('.thread-delete-action');
+                    if (deleteCardBtn) {
+                        deleteCardBtn.addEventListener('click', async () => {
+                            moreDropdown.classList.remove('open');
+                            const messageId = email.message_id || email.id;
+                            const ok = await this._deleteEmailFromDetail(messageId, source);
+                            if (!ok) return;
+                            cardDiv.remove();
+                            const remaining = threadContent.querySelectorAll('.email-detail-card').length;
+                            if (remaining === 0) {
+                                if (source === 'inbox') {
+                                    this.showEmailList();
+                                    await this.loadEmails();
+                                } else {
+                                    this.showSentList();
+                                    await this.loadSentEmails();
+                                }
                             }
                         });
                     }
@@ -5038,43 +5083,31 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         }
     }
 
-    // Delete sent email from the sent list
-    async deleteSentEmailFromList(messageId) {
+    // Confirm + delete a single email from inside a detail/thread view.
+    // Returns true if the delete succeeded so the caller can clean up the
+    // surrounding DOM (remove card, navigate back to list, etc.).
+    async _deleteEmailFromDetail(messageId, source) {
+        const isInbox = source === 'inbox';
+        const choice = await notificationService.showDeleteOptions(
+            isInbox ? 'Delete Email' : 'Delete Sent Email',
+            'Delete locally (will re-fetch on next sync) or delete everywhere (removes from email server too)?'
+        );
+        if (!choice) return false;
+        const deleteFromServer = choice === 'everywhere';
         try {
-            const choice = await notificationService.showDeleteOptions(
-                'Delete Sent Email',
-                'Delete locally (will re-fetch on next sync) or delete everywhere (removes from email server too)?'
-            );
-            if (!choice) return; // cancelled
-
-            const deleteFromServer = choice === 'everywhere';
-            await this.deleteSentEmail(messageId, deleteFromServer);
+            if (isInbox) {
+                const settings = appState.getSettings();
+                const userEmail = settings?.email_address || null;
+                await TauriService.deleteInboxEmail(messageId, deleteFromServer, userEmail);
+            } else {
+                await this.deleteSentEmail(messageId, deleteFromServer);
+            }
             notificationService.showSuccess(deleteFromServer ? 'Email deleted from server and local database.' : 'Email deleted locally.');
-            await this.loadSentEmails();
+            return true;
         } catch (error) {
-            console.error('Error deleting sent email:', error);
-            notificationService.showError('Failed to delete sent email: ' + error);
-        }
-    }
-
-    async deleteInboxEmailFromList(messageId) {
-        try {
-            const choice = await notificationService.showDeleteOptions(
-                'Delete Email',
-                'Delete locally (will re-fetch on next sync) or delete everywhere (removes from email server too)?'
-            );
-            if (!choice) return; // cancelled
-
-            const settings = appState.getSettings();
-            const userEmail = settings?.email_address || null;
-            const deleteFromServer = choice === 'everywhere';
-
-            await TauriService.deleteInboxEmail(messageId, deleteFromServer, userEmail);
-            notificationService.showSuccess(deleteFromServer ? 'Email deleted from server and local database.' : 'Email deleted locally.');
-            await this.loadEmails();
-        } catch (error) {
-            console.error('Error deleting inbox email:', error);
+            console.error(`[JS] Error deleting ${source} email:`, error);
             notificationService.showError('Failed to delete email: ' + error);
+            return false;
         }
     }
 
@@ -5269,10 +5302,10 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             if (selectElement) {
                 selectElement.innerHTML = '';
                 if (folders && folders.length > 0) {
-                    // Add a default "All Folders" option
+                    // Add the default option (scans INBOX + nostr-mail)
                     const allOption = document.createElement('option');
                     allOption.value = '';
-                    allOption.textContent = 'All Folders';
+                    allOption.textContent = 'Default';
                     selectElement.appendChild(allOption);
                     
                     // Filter out "Sent" folder (case-insensitive)
@@ -6870,13 +6903,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 ${showSubject ? `<div class="email-subject email-list-strong">${Utils.escapeHtml(previewSubject)}</div>` : ''}
                 <div class="email-preview">${previewText}</div>
             </div>
-            <div class="email-actions">
-                <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteSentEmailFromList('${email.message_id}')">
-                    <i class="fas fa-trash"></i>
-                </button>
-            </div>
         `;
-        
+
         // Add hover and click handlers for invalid signature indicator
         if (email.signature_valid === false) {
             const sigIndicator = emailElement.querySelector('.signature-indicator.invalid');
@@ -6987,11 +7015,6 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
                 <div class="email-preview">${Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '')}</div>
             </div>
-            <div class="email-actions">
-                <button class="btn btn-danger btn-small" onclick="event.stopPropagation(); emailService.deleteSentEmailFromList('${email.message_id}')">
-                    <i class="fas fa-trash"></i>
-                </button>
-            </div>
         `;
         emailElement.addEventListener('click', () => {
             if (email.message_count > 1) {
@@ -7016,6 +7039,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             if (sentDetailView) sentDetailView.style.display = 'flex';
             if (sentActions) sentActions.style.display = 'none';
             if (sentTitle) sentTitle.style.display = 'none';
+            document.querySelectorAll('#sent .back-to-nav-btn').forEach(b => b.style.display = 'none');
             const sentDetailContent = domManager.get('sentDetailContent');
             
             // Show loading state immediately to prevent freeze
@@ -7231,6 +7255,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+<button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
 </div>
@@ -7327,6 +7352,16 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                             bodyInfo.style.display = '';
                             sentErrRawToggle.textContent = 'Show Raw';
                         }
+                    });
+                }
+                const sentErrDeleteBtn = sentDetailContent.querySelector('.thread-delete-action');
+                if (sentErrDeleteBtn) {
+                    sentErrDeleteBtn.addEventListener('click', async () => {
+                        sentErrMoreDropdown.classList.remove('open');
+                        const ok = await this._deleteEmailFromDetail(email.message_id || email.id, 'sent');
+                        if (!ok) return;
+                        this.showSentList();
+                        await this.loadSentEmails();
                     });
                 }
                 return;
@@ -7678,6 +7713,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+<button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
 </div>
@@ -7776,6 +7812,16 @@ ${attachmentsHtml}
                         bodyInfo.style.display = '';
                         sentRawToggle.textContent = 'Show Raw';
                     }
+                });
+            }
+            const sentDeleteBtn = sentDetailContent.querySelector('.thread-delete-action');
+            if (sentDeleteBtn) {
+                sentDeleteBtn.addEventListener('click', async () => {
+                    sentMoreDropdown.classList.remove('open');
+                    const ok = await this._deleteEmailFromDetail(email.message_id || email.id, 'sent');
+                    if (!ok) return;
+                    this.showSentList();
+                    await this.loadSentEmails();
                 });
             }
         }; // End of updateDetail function
@@ -8537,6 +8583,10 @@ ${attachmentsHtml}
             if (sentTitle) {
                 sentTitle.textContent = 'Sent';
                 sentTitle.style.display = '';
+            }
+            if (window.app?.isMobilePortrait()) {
+                const backToNavBtn = document.querySelector('#sent .back-to-nav-btn');
+                if (backToNavBtn) backToNavBtn.style.display = 'flex';
             }
             appState.clearCurrentThread();
         } catch (error) {

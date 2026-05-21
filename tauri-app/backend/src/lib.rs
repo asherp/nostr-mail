@@ -2010,77 +2010,6 @@ async fn construct_email_headers(mut email_config: EmailConfig, to_address: Stri
 }
 
 #[tauri::command]
-async fn fetch_emails(email_config: EmailConfig, limit: usize, search_query: Option<String>, only_nostr: bool, require_signature: Option<bool>, state: tauri::State<'_, AppState>) -> Result<Vec<EmailMessage>, String> {
-    println!("[RUST] fetch_emails called with search: {:?}, only_nostr: {}, require_signature: {:?}", search_query, only_nostr, require_signature);
-    
-    // Get latest email date from database
-    let db = state.get_database().map_err(|e| e.to_string())?;
-    let latest = db.get_latest_email_received_at().map_err(|e: rusqlite::Error| e.to_string())?;
-    println!("[RUST] fetch_emails: Latest email date from DB: {:?}", latest);
-    
-    // Get sync_cutoff_days setting (similar to sync_nostr_emails_to_db)
-    let sync_cutoff_days = match db.find_pubkeys_by_email_setting(&email_config.email_address) {
-        Ok(pubkeys) => {
-            // Try to get sync_cutoff_days from the first matching pubkey
-            let mut cutoff = 365i64; // Default
-            for pubkey in pubkeys {
-                if let Ok(Some(value)) = db.get_setting(&pubkey, "sync_cutoff_days") {
-                    if let Ok(parsed) = value.parse::<i64>() {
-                        cutoff = parsed;
-                        break; // Use first found setting
-                    }
-                }
-            }
-            Some(cutoff)
-        }
-        Err(_) => Some(365i64), // Default if we can't find pubkey
-    };
-    
-    // Get require_signature setting if not provided (default: true)
-    let require_signature = if let Some(req) = require_signature {
-        req
-    } else {
-        // Try to get from user settings (default: true)
-        match db.find_pubkeys_by_email_setting(&email_config.email_address) {
-            Ok(pubkeys) => {
-                let mut req_sig = true; // Default to true
-                for pubkey in pubkeys {
-                    if let Ok(Some(value)) = db.get_setting(&pubkey, "require_signature") {
-                        req_sig = value == "true";
-                        break; // Use first found setting
-                    }
-                }
-                req_sig
-            }
-            Err(_) => true, // Default if we can't find pubkey
-        }
-    };
-    
-    let mut emails = email::fetch_emails(&email_config, limit, search_query, only_nostr, latest, sync_cutoff_days).await.map_err(|e| e.to_string())?;
-    
-    // Filter emails based on signature requirement
-    if require_signature {
-        emails.retain(|email| {
-            // If email has X-Nostr-Pubkey header, it must have a valid signature
-            if email.sender_pubkey.is_some() {
-                // Email has pubkey, check signature
-                if let Some(valid) = email.signature_valid {
-                    valid // Only keep if signature is valid
-                } else {
-                    false // Reject emails without signature when require_signature is true
-                }
-            } else {
-                // No pubkey header, allow (not a nostr email)
-                true
-            }
-        });
-    }
-    // If require_signature is false, accept all emails regardless of signature
-    
-    Ok(emails)
-}
-
-#[tauri::command]
 async fn fetch_image(url: String) -> Result<String, String> {
     nostr::fetch_image_as_data_url(&url).await.map_err(|e| e.to_string())
 }
@@ -4976,7 +4905,9 @@ fn glossia_get_default_wordlist(language: String) -> String {
 #[tauri::command]
 async fn sync_nostr_emails(config: EmailConfig, folder: Option<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
-    email::sync_nostr_emails_to_db(&config, folder.as_deref(), &db).await.map_err(|e| e.to_string())
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::sync_nostr_emails_to_db(&config, folder.as_deref(), &active_pubkey, &db).await.map_err(|e| e.to_string())
 }
 
 /// Clear the UID-based sync watermark for one folder so the next sync
@@ -4998,7 +4929,9 @@ async fn reset_folder_sync_state(
 async fn sync_sent_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     println!("[RUST] sync_sent_emails command called");
     let db = state.get_database().map_err(|e| e.to_string())?;
-    let result = email::sync_sent_emails_to_db(&config, &db).await.map_err(|e| e.to_string());
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    let result = email::sync_sent_emails_to_db(&config, &active_pubkey, &db).await.map_err(|e| e.to_string());
     println!("[RUST] sync_sent_emails command completed with result: {:?}", result);
     result
 }
@@ -5006,11 +4939,12 @@ async fn sync_sent_emails(config: EmailConfig, state: tauri::State<'_, AppState>
 #[tauri::command]
 async fn sync_all_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<(usize, usize), String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
-    
-    // Sync both inbox and sent emails
-    let inbox_result = email::sync_nostr_emails_to_db(&config, None, &db).await;
-    let sent_result = email::sync_sent_emails_to_db(&config, &db).await;
-    
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+
+    let inbox_result = email::sync_nostr_emails_to_db(&config, None, &active_pubkey, &db).await;
+    let sent_result = email::sync_sent_emails_to_db(&config, &active_pubkey, &db).await;
+
     match (inbox_result, sent_result) {
         (Ok(inbox_count), Ok(sent_count)) => Ok((inbox_count, sent_count)),
         (Err(e), _) => Err(format!("Inbox sync failed: {}", e)),
@@ -6430,12 +6364,13 @@ async fn db_delete_sent_email(message_id: String, delete_from_server: Option<boo
 
     let db = state.get_database()?;
 
-    // Try to delete from email server using current user's IMAP settings
+    // Try to delete from email server using the active pubkey's IMAP settings.
+    // Scoping to the active pubkey avoids the find_pubkeys_by_email_setting
+    // pitfall where a stale identity sharing the same email would win the
+    // credential lookup and silently fail the server-side delete.
     if delete_from_server.unwrap_or(true) {
-    if let Some(ref user_email_param) = user_email {
-        let pubkeys_vec = db.find_pubkeys_by_email_setting(user_email_param).unwrap_or_default();
-        for pubkey in pubkeys_vec {
-            if let Ok(all_settings) = db.get_all_settings(&pubkey) {
+        if let Some(active_pubkey) = active_user_npub(&state) {
+            if let Ok(all_settings) = db.get_all_settings(&active_pubkey) {
                 let email_address = all_settings.get("email_address").cloned();
                 let password = all_settings.get("password").cloned();
                 let imap_host = all_settings.get("imap_host").cloned();
@@ -6469,11 +6404,9 @@ async fn db_delete_sent_email(message_id: String, delete_from_server: Option<boo
                             println!("[RUST] db_delete_sent_email: Server deletion timed out after 30 seconds, continuing with local deletion");
                         }
                     }
-                    break;
                 }
             }
         }
-    }
     }
 
     // Always delete locally, even if server deletion failed
@@ -6481,49 +6414,46 @@ async fn db_delete_sent_email(message_id: String, delete_from_server: Option<boo
 }
 
 #[tauri::command]
-async fn db_delete_inbox_email(message_id: String, delete_from_server: Option<bool>, user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn db_delete_inbox_email(message_id: String, delete_from_server: Option<bool>, _user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] db_delete_inbox_email called for message_id: {}, delete_from_server: {:?}", message_id, delete_from_server);
 
+    // Same active-pubkey scoping rationale as db_delete_sent_email above.
     if delete_from_server.unwrap_or(false) {
-        if let Some(ref user_email_param) = user_email {
+        if let Some(active_pubkey) = active_user_npub(&state) {
             let db = state.get_database()?;
-            let pubkeys_vec = db.find_pubkeys_by_email_setting(user_email_param).unwrap_or_default();
-            for pubkey in pubkeys_vec {
-                if let Ok(all_settings) = db.get_all_settings(&pubkey) {
-                    let email_address = all_settings.get("email_address").cloned();
-                    let password = all_settings.get("password").cloned();
-                    let imap_host = all_settings.get("imap_host").cloned();
-                    let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
-                    let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+            if let Ok(all_settings) = db.get_all_settings(&active_pubkey) {
+                let email_address = all_settings.get("email_address").cloned();
+                let password = all_settings.get("password").cloned();
+                let imap_host = all_settings.get("imap_host").cloned();
+                let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+                let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
 
-                    if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
-                        let email_config = crate::types::EmailConfig {
-                            email_address: email_addr,
-                            password: pwd,
-                            smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
-                            smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
-                            imap_host: host,
-                            imap_port: port,
-                            use_tls,
-                            private_key: all_settings.get("nostr_private_key").cloned(),
-                        };
+                if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+                    let email_config = crate::types::EmailConfig {
+                        email_address: email_addr,
+                        password: pwd,
+                        smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+                        smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+                        imap_host: host,
+                        imap_port: port,
+                        use_tls,
+                        private_key: all_settings.get("nostr_private_key").cloned(),
+                    };
 
-                        println!("[RUST] db_delete_inbox_email: Attempting to delete from email server");
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            crate::email::delete_inbox_email_from_server(&email_config, &message_id)
-                        ).await {
-                            Ok(Ok(_)) => {
-                                println!("[RUST] db_delete_inbox_email: Successfully deleted from email server");
-                            }
-                            Ok(Err(e)) => {
-                                println!("[RUST] db_delete_inbox_email: Failed to delete from email server: {}, continuing with local deletion", e);
-                            }
-                            Err(_) => {
-                                println!("[RUST] db_delete_inbox_email: Server deletion timed out after 30 seconds, continuing with local deletion");
-                            }
+                    println!("[RUST] db_delete_inbox_email: Attempting to delete from email server");
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        crate::email::delete_inbox_email_from_server(&email_config, &message_id)
+                    ).await {
+                        Ok(Ok(_)) => {
+                            println!("[RUST] db_delete_inbox_email: Successfully deleted from email server");
                         }
-                        break;
+                        Ok(Err(e)) => {
+                            println!("[RUST] db_delete_inbox_email: Failed to delete from email server: {}, continuing with local deletion", e);
+                        }
+                        Err(_) => {
+                            println!("[RUST] db_delete_inbox_email: Server deletion timed out after 30 seconds, continuing with local deletion");
+                        }
                     }
                 }
             }
@@ -6992,7 +6922,6 @@ pub fn run() {
         publish_nostr_event,
         send_email,
         construct_email_headers,
-        fetch_emails,
         fetch_image,
         fetch_multiple_images,
         fetch_profiles,
@@ -7397,7 +7326,9 @@ pub async fn http_start_live_event_subscription(_app_state: std::sync::Arc<AppSt
 pub async fn http_sync_sent_emails(app_state: std::sync::Arc<AppState>, email_config: EmailConfig) -> Result<usize, String> {
     println!("[HTTP] sync_sent_emails called");
     let db = app_state.get_database().map_err(|e| e.to_string())?;
-    email::sync_sent_emails_to_db(&email_config, &db).await.map_err(|e| e.to_string())
+    let active_pubkey = active_user_npub(&app_state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::sync_sent_emails_to_db(&email_config, &active_pubkey, &db).await.map_err(|e| e.to_string())
 }
 
 pub async fn http_db_get_all_settings(

@@ -147,10 +147,39 @@
         border-top: none;
         box-shadow: none;
     }
-    
+
     body.dark-mode .app-container.navbar-mode .nav-item.active {
         background-color: rgba(255, 255, 255, 0.1);
         border-left: 4px solid #e0e0e0;
+    }
+
+    /* Back-to-nav button: icon-only square (matches landscape treatment).
+       Without this, portrait initially shows "<- Back" until a landscape
+       round-trip applies the icon-only styling. */
+    .back-to-nav-btn {
+        flex: 0 0 auto !important;
+        min-width: 36px !important;
+        width: 36px !important;
+        height: 36px !important;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 0 !important;
+        font-size: 0 !important;
+        line-height: 0 !important;
+        color: transparent !important;
+    }
+
+    .back-to-nav-btn i {
+        font-size: 1rem !important;
+        margin: 0 !important;
+        display: inline-block !important;
+        color: #333 !important;
+    }
+
+    body.dark-mode .back-to-nav-btn i {
+        color: #e0e0e0 !important;
     }
 }
 

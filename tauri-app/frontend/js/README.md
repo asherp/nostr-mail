@@ -159,9 +159,6 @@ await TauriService.sendDirectMessage(
     message,
     relays
 );
-
-// Fetch emails
-const emails = await TauriService.fetchEmails(emailConfig, 10, searchQuery);
 ```
 
 ### Using the Notification Service

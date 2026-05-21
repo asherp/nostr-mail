@@ -784,34 +784,98 @@ body.dark-mode .email-attachment-icon {
     gap: 15px;
 }
 
-/* Mobile: collapse Refresh button on Sent/Drafts to icon-only square,
+/* Mobile: collapse Refresh button on Inbox/Sent/Drafts to icon-only square,
    matching .contacts-actions / .profile-actions / .dm-actions behavior.
-   Scoped to #sent and #drafts so inbox layout (folder select etc.) is untouched. */
+   Inbox keeps its folder select and search box at full size — only the
+   Refresh button collapses. */
 @media (max-width: 768px) {
+    #inbox .inbox-actions .btn,
     #sent .inbox-actions .btn,
     #drafts .inbox-actions .btn {
-        flex: 0 0 auto;
-        min-width: 44px;
-        width: 44px;
-        height: 44px;
-        padding: 0;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        border-radius: var(--radius-md);
-        gap: 0;
+        flex: 0 0 auto !important;
+        min-width: 44px !important;
+        width: 44px !important;
+        height: 44px !important;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        border-radius: var(--radius-md) !important;
+        gap: 0 !important;
+        /* Belt-and-suspenders: collapse text whether wrapped in .btn-text or bare. */
+        font-size: 0 !important;
+        line-height: 0 !important;
+        color: transparent !important;
+        overflow: hidden !important;
     }
 
+    #inbox .inbox-actions .btn .btn-text,
     #sent .inbox-actions .btn .btn-text,
     #drafts .inbox-actions .btn .btn-text {
-        display: none;
+        display: none !important;
     }
 
+    #inbox .inbox-actions .btn i,
     #sent .inbox-actions .btn i,
     #drafts .inbox-actions .btn i {
-        margin-right: 0;
-        font-size: 1.2rem;
-        flex-shrink: 0;
+        margin: 0 !important;
+        font-size: 1.2rem !important;
+        line-height: 1 !important;
+        flex-shrink: 0 !important;
+        color: inherit;
+    }
+
+    /* Restore icon color (parent's transparent shouldn't bleed through). */
+    #inbox .inbox-actions .btn-secondary i,
+    #sent .inbox-actions .btn-secondary i,
+    #drafts .inbox-actions .btn-secondary i {
+        color: #6c757d !important;
+    }
+
+    body.dark-mode #inbox .inbox-actions .btn-secondary i,
+    body.dark-mode #sent .inbox-actions .btn-secondary i,
+    body.dark-mode #drafts .inbox-actions .btn-secondary i {
+        color: #e0e0e0 !important;
+    }
+}
+
+/* Mobile portrait: keep back + title + folder select + refresh on one row,
+   drop the search box to a full-width row below. Uses display:contents on
+   .inbox-actions so its children join the .tab-header flex layout directly,
+   then flex-wrap + order place the search on its own line.
+   Scoped to #inbox — sent/drafts use the icon-collapse above. */
+@media (max-width: 480px) {
+    #inbox .tab-header {
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: flex-start;
+        gap: var(--spacing-sm);
+    }
+
+    #inbox .inbox-actions {
+        display: contents;
+    }
+
+    #inbox .tab-header > div:first-child {
+        flex: 1 1 auto;
+        min-width: 0;
+    }
+
+    #inbox .email-search-container {
+        flex: 1 1 100%;
+        min-width: 0;
+        order: 2;
+    }
+
+    #inbox #imap-folder-select {
+        margin-right: 0 !important;
+        flex: 0 1 auto;
+        min-width: 100px;
+        order: 1;
+    }
+
+    #inbox #refresh-inbox {
+        order: 1;
     }
 }
 
@@ -1112,6 +1176,22 @@ body.dark-mode .thread-menu-item {
 
 body.dark-mode .thread-menu-item:hover {
     background-color: #374151;
+}
+
+.thread-menu-item.thread-delete-action {
+    color: #b91c1c;
+}
+
+.thread-menu-item.thread-delete-action:hover {
+    background-color: #fef2f2;
+}
+
+body.dark-mode .thread-menu-item.thread-delete-action {
+    color: #fca5a5;
+}
+
+body.dark-mode .thread-menu-item.thread-delete-action:hover {
+    background-color: #3f1212;
 }
 
 .thread-detail-content {

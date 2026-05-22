@@ -739,6 +739,16 @@
                                     </div>
                                     <small class="form-text text-muted">Attach an X-Nostr-Sig header signing the email body. Requires X-Nostr-Pubkey to be enabled.</small>
                                 </li>
+
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="include-recipient-header-preference">Include X-Nostr-Recipient</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="include-recipient-header-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">Attach an X-Nostr-Recipient header naming the pubkey the body was encrypted to. Lets you (and the recipient) decrypt without needing a matching Nostr DM — useful when not using relays.</small>
+                                </li>
                             </ul>
                         </div>
                         

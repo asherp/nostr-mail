@@ -215,7 +215,7 @@ const TauriService = {
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
     },
-    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null) {
+    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, recipientPubkey = null, includeRecipientHeader = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -240,10 +240,16 @@ const TauriService = {
         }
         if (includeSigHeader !== null && includeSigHeader !== undefined) {
             args.includeSigHeader = includeSigHeader;
+        }
+        if (recipientPubkey !== null && recipientPubkey !== undefined) {
+            args.recipientPubkey = recipientPubkey;
+        }
+        if (includeRecipientHeader !== null && includeRecipientHeader !== undefined) {
+            args.includeRecipientHeader = includeRecipientHeader;
         }
         return await this.invoke('send_email', args);
     },
-    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null) {
+    constructEmailHeaders: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, recipientPubkey = null, includeRecipientHeader = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -268,6 +274,12 @@ const TauriService = {
         }
         if (includeSigHeader !== null && includeSigHeader !== undefined) {
             args.includeSigHeader = includeSigHeader;
+        }
+        if (recipientPubkey !== null && recipientPubkey !== undefined) {
+            args.recipientPubkey = recipientPubkey;
+        }
+        if (includeRecipientHeader !== null && includeRecipientHeader !== undefined) {
+            args.includeRecipientHeader = includeRecipientHeader;
         }
         return await this.invoke('construct_email_headers', args);
     },

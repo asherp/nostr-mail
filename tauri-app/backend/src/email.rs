@@ -136,6 +136,21 @@ impl Header for XNostrSig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct XNostrRecipient(String);
+
+impl Header for XNostrRecipient {
+    fn name() -> HeaderName {
+        HeaderName::new_from_ascii_str("X-Nostr-Recipient")
+    }
+    fn parse(s: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Ok(XNostrRecipient(s.to_string()))
+    }
+    fn display(&self) -> HeaderValue {
+        HeaderValue::new(Self::name(), self.0.clone())
+    }
+}
+
 /// Construct email headers without sending the email
 pub fn construct_email_headers(
     config: &EmailConfig,
@@ -150,6 +165,8 @@ pub fn construct_email_headers(
     references: Option<&str>,
     include_pubkey_header: bool,
     include_sig_header: bool,
+    recipient_pubkey: Option<&str>,
+    include_recipient_header: bool,
 ) -> Result<String> {
     println!("[RUST] construct_email_headers: Constructing email headers");
     println!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
@@ -225,7 +242,19 @@ pub fn construct_email_headers(
             }
         }
     }
-    
+
+    // X-Nostr-Recipient lets the receiver (and the sender's own Sent-folder
+    // reader) anchor decryption to a specific pubkey without depending on a
+    // Nostr relay or DM cross-reference. Independent of pubkey/sig toggles.
+    if include_recipient_header {
+        if let Some(rp) = recipient_pubkey {
+            if !rp.is_empty() {
+                println!("[RUST] construct_email_headers: Adding recipient pubkey to headers: {}", rp);
+                builder = builder.header(XNostrRecipient(rp.to_string()));
+            }
+        }
+    }
+
     // Build the text (and optional HTML) body part
     let text_part = SinglePart::builder()
         .header(ContentType::TEXT_PLAIN)
@@ -330,6 +359,7 @@ pub fn construct_email_headers(
     Ok(final_headers)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_email(
     config: &EmailConfig,
     to_address: &str,
@@ -343,6 +373,8 @@ pub async fn send_email(
     references: Option<&str>,
     include_pubkey_header: bool,
     include_sig_header: bool,
+    recipient_pubkey: Option<&str>,
+    include_recipient_header: bool,
 ) -> Result<String> {
     println!("[RUST] send_email: Starting email send process");
     println!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
@@ -419,7 +451,19 @@ pub async fn send_email(
             }
         }
     }
-    
+
+    // X-Nostr-Recipient lets the receiver (and the sender's own Sent-folder
+    // reader) anchor decryption to a specific pubkey without depending on a
+    // Nostr relay or DM cross-reference. Independent of pubkey/sig toggles.
+    if include_recipient_header {
+        if let Some(rp) = recipient_pubkey {
+            if !rp.is_empty() {
+                println!("[RUST] send_email: Adding recipient pubkey to headers: {}", rp);
+                builder = builder.header(XNostrRecipient(rp.to_string()));
+            }
+        }
+    }
+
     // Build the text (and optional HTML) body part
     let text_part = SinglePart::builder()
         .header(ContentType::TEXT_PLAIN)
@@ -1192,6 +1236,19 @@ pub fn extract_sender_pubkey_with_armor_fallback(raw_headers: &str, body_text: &
 pub fn extract_nostr_sig_from_headers(raw_headers: &str) -> Option<String> {
     for line in raw_headers.lines() {
         if line.to_lowercase().starts_with("x-nostr-sig:") {
+            return Some(line.split_once(':').unwrap_or(("", "")).1.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract the X-Nostr-Recipient header value if present. This is an
+/// unauthenticated assertion by the sender that the body was encrypted to this
+/// recipient pubkey — callers must still verify (decryption will fail if the
+/// claim is false). Lets clients anchor decryption without a Nostr relay.
+pub fn extract_nostr_recipient_from_headers(raw_headers: &str) -> Option<String> {
+    for line in raw_headers.lines() {
+        if line.to_lowercase().starts_with("x-nostr-recipient:") {
             return Some(line.split_once(':').unwrap_or(("", "")).1.trim().to_string());
         }
     }
@@ -3563,6 +3620,8 @@ mod tests {
             None,
             true,
             true,
+            None,
+            true,
         );
 
         assert!(result.is_ok());
@@ -3588,6 +3647,8 @@ mod tests {
             None,
             None,
             true,
+            true,
+            None,
             true,
         );
 
@@ -3619,6 +3680,8 @@ mod tests {
             None,
             true,
             true,
+            None,
+            true,
         );
 
         assert!(result.is_ok());
@@ -3644,6 +3707,8 @@ mod tests {
             None,
             None,
             true,
+            true,
+            None,
             true,
         );
 
@@ -3680,11 +3745,94 @@ mod tests {
             None,
             true,
             true,
+            None,
+            true,
         );
 
         assert!(result.is_ok());
         let headers = result.unwrap();
         assert!(headers.contains("Content-Type:"));
+    }
+
+    #[test]
+    fn test_construct_email_headers_with_recipient() {
+        let config = make_config();
+        let recipient_npub = "npub1v3j6xqw0000000000000000000000000000000000000000000000000000";
+
+        let result = construct_email_headers(
+            &config,
+            "recipient@example.com",
+            "Subject",
+            "Body",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            Some(recipient_npub),
+            true,
+        );
+
+        assert!(result.is_ok());
+        let headers = result.unwrap();
+        assert!(headers.contains("X-Nostr-Recipient:"), "Missing X-Nostr-Recipient header");
+        assert!(headers.contains(recipient_npub), "Header missing recipient pubkey value");
+    }
+
+    #[test]
+    fn test_construct_email_headers_recipient_disabled() {
+        let config = make_config();
+        let recipient_npub = "npub1v3j6xqw0000000000000000000000000000000000000000000000000000";
+
+        let result = construct_email_headers(
+            &config,
+            "recipient@example.com",
+            "Subject",
+            "Body",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            Some(recipient_npub),
+            false,
+        );
+
+        assert!(result.is_ok());
+        let headers = result.unwrap();
+        assert!(!headers.contains("X-Nostr-Recipient:"), "Header should be absent when disabled");
+    }
+
+    #[test]
+    fn test_construct_email_headers_recipient_none() {
+        let config = make_config();
+
+        let result = construct_email_headers(
+            &config,
+            "recipient@example.com",
+            "Subject",
+            "Body",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            None,
+            true,
+        );
+
+        assert!(result.is_ok());
+        let headers = result.unwrap();
+        assert!(!headers.contains("X-Nostr-Recipient:"), "Header should be absent when pubkey is None");
     }
 
     // =====================
@@ -4779,6 +4927,7 @@ fn parse_nostr_email_from_imap_body_inner(
 
     let extracted_attachments = extract_attachments_from_parsed_email(&email, &body_text);
     let sender_pubkey = extract_sender_pubkey_with_armor_fallback(&raw_headers, &body_text);
+    let recipient_pubkey = extract_nostr_recipient_from_headers(&raw_headers);
     let (signature_valid, signature_source) = verify_email_signature_full(&body_text, &raw_headers);
     let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
 
@@ -4807,7 +4956,7 @@ fn parse_nostr_email_from_imap_body_inner(
         html_body: extract_html_body(&email),
         date,
         sender_pubkey,
-        recipient_pubkey: None,
+        recipient_pubkey,
         raw_headers,
         attachments: extracted_attachments,
         signature_valid,

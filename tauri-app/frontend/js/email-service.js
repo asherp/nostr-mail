@@ -2095,7 +2095,9 @@ class EmailService {
                 const plainBody = this._plainBody || body;
                 const includePubkeyHeader = settings && settings.include_pubkey_header !== false;
                 const includeSigHeader = settings && settings.include_sig_header !== false;
-                await TauriService.sendEmail(emailConfig, toAddress, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences, includePubkeyHeader, includeSigHeader);
+                const includeRecipientHeader = settings && settings.include_recipient_header !== false;
+                // Plaintext send: no recipient pubkey, nothing to anchor.
+                await TauriService.sendEmail(emailConfig, toAddress, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences, includePubkeyHeader, includeSigHeader, null, includeRecipientHeader);
             }
 
             console.log('[JS] Email sent successfully');
@@ -2236,7 +2238,9 @@ class EmailService {
             // Construct headers (sender's pubkey will be derived from keychain in backend)
             const includePubkeyHeaderPreview = settings && settings.include_pubkey_header !== false;
             const includeSigHeaderPreview = settings && settings.include_sig_header !== false;
-            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId, null, this._htmlBody, this._replyToMessageId, this._replyReferences, includePubkeyHeaderPreview, includeSigHeaderPreview);
+            const includeRecipientHeaderPreview = settings && settings.include_recipient_header !== false;
+            const previewRecipientPubkey = (this.selectedNostrContact && this.selectedNostrContact.pubkey) ? this.selectedNostrContact.pubkey : null;
+            const headers = await TauriService.constructEmailHeaders(emailConfig, toAddress, previewSubject, previewBody, nostrNpub, messageId, null, this._htmlBody, this._replyToMessageId, this._replyReferences, includePubkeyHeaderPreview, includeSigHeaderPreview, previewRecipientPubkey, includeRecipientHeaderPreview);
             
             // Debug: Log what headers we actually received
             console.log('[JS] Headers received from backend:');
@@ -2543,7 +2547,11 @@ class EmailService {
             }
             const includePubkeyHeader = settings && settings.include_pubkey_header !== false;
             const includeSigHeader = settings && settings.include_sig_header !== false;
-            await TauriService.sendEmail(emailConfig, recipientEmail, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences, includePubkeyHeader, includeSigHeader);
+            const includeRecipientHeader = settings && settings.include_recipient_header !== false;
+            // contact.pubkey is the npub the body was encrypted to — emit it as
+            // X-Nostr-Recipient so the recipient (and our own Sent-folder reader)
+            // can anchor decryption without a Nostr relay or DM cross-reference.
+            await TauriService.sendEmail(emailConfig, recipientEmail, subject, plainBody, null, messageId, attachmentData, this._htmlBody, this._replyToMessageId, this._replyReferences, includePubkeyHeader, includeSigHeader, contact && contact.pubkey ? contact.pubkey : null, includeRecipientHeader);
             console.log('[JS] Encrypted email sent successfully');
 
             // Persist a minimal record of this sent email to the local DB immediately,

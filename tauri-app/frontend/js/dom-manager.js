@@ -111,6 +111,7 @@ class DOMManager {
             'hide-unsigned-messages-preference': this.getElement('hide-unsigned-messages-preference'),
             'include-pubkey-header-preference': this.getElement('include-pubkey-header-preference'),
             'include-sig-header-preference': this.getElement('include-sig-header-preference'),
+            'include-recipient-header-preference': this.getElement('include-recipient-header-preference'),
             syncCutoffDays: this.getElement('sync-cutoff-days'),
             emailsPerPage: this.getElement('emails-per-page'),
             inboxFolderPreference: this.getElement('inbox-folder-preference'),

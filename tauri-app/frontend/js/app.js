@@ -229,6 +229,7 @@ NostrMailApp.prototype.loadSettings = async function() {
                         send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
                         sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 30, // Default to 30 days
                         emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
+                        inbox_folder: dbSettings.inbox_folder || '',
                         require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
                         hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                         automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
@@ -285,6 +286,7 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
         send_matching_dm: true,
         sync_cutoff_days: 30,
         emails_per_page: 50,
+        inbox_folder: '',
         require_signature: true,
         glossia_encoding_body: 'latin',
         glossia_encoding_signature: 'latin',
@@ -333,6 +335,7 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         send_matching_dm: true,
         sync_cutoff_days: 30, // Default to 30 days (matching loadSettingsForPubkey)
         emails_per_page: 50,
+        inbox_folder: '',
         require_signature: true,
         hide_undecryptable_emails: true,
         automatically_encrypt: true,
@@ -393,6 +396,7 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
                 sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 30, // Default to 30 days
                 emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
+                inbox_folder: dbSettings.inbox_folder || '',
                 require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
                 hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                 automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
@@ -1456,15 +1460,18 @@ NostrMailApp.prototype.setupEventListeners = function() {
             testEmailConnectionBtn.addEventListener('click', () => window.emailService?.testEmailConnection());
         }
         
-        // Add event listener for folder dropdown change
-        const folderSelect = document.getElementById('imap-folder-select');
+        // Folder preference now lives in Settings > Advanced. Reload the inbox
+        // when the user picks a different folder there. The setting itself is
+        // persisted by the autosave path (settingsFields below).
+        const folderSelect = document.getElementById('inbox-folder-preference');
         if (folderSelect) {
             folderSelect.addEventListener('change', async () => {
                 const selectedFolder = folderSelect.value;
-                console.log('[APP] Folder changed to:', selectedFolder);
-                // Reload emails when folder changes
+                console.log('[APP] Inbox folder preference changed to:', selectedFolder);
+                const settings = appState.getSettings() || {};
+                settings.inbox_folder = selectedFolder;
+                appState.setSettings(settings);
                 if (window.emailService) {
-                    // Reset offset and reload emails
                     window.emailService.inboxOffset = 0;
                     await window.emailService.loadEmails();
                 }
@@ -2726,6 +2733,13 @@ NostrMailApp.prototype.switchTab = async function(tabName) {
     if (tabName === 'settings') {
         this.loadRelaysFromDatabase();
         this.initializeSettingsAccordion();
+        // Refresh the per-account Inbox Folder list silently in case
+        // IMAP credentials changed since populateSettingsForm last ran.
+        if (window.emailService) {
+            window.emailService.listImapFolders({ silent: true }).catch(err => {
+                console.warn('[APP] Background folder refresh failed:', err);
+            });
+        }
     }
     if (tabName === 'contacts') {
         // Always reload contacts when switching to contacts tab to ensure they match the current user
@@ -2779,11 +2793,8 @@ NostrMailApp.prototype.switchTab = async function(tabName) {
     }
     if (tabName === 'inbox') {
         if (window.emailService) {
-            // Load folders when inbox tab is opened
-            window.emailService.listImapFolders().catch(err => {
-                console.error('[APP] Error loading folders:', err);
-            });
-            // Load emails based on selected folder
+            // Folder list is loaded when the Settings tab is opened. Here we
+            // just load emails using the persisted inbox_folder preference.
             window.emailService.loadEmails();
         }
     }
@@ -2983,6 +2994,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 send_matching_dm: (loadedSettings && loadedSettings.send_matching_dm !== undefined) ? loadedSettings.send_matching_dm : (domManager.get('send-matching-dm-preference')?.checked !== false),
                 sync_cutoff_days: (loadedSettings && loadedSettings.sync_cutoff_days) ? loadedSettings.sync_cutoff_days : (parseInt(domManager.getValue('syncCutoffDays')) || 30),
                 emails_per_page: (loadedSettings && loadedSettings.emails_per_page) ? loadedSettings.emails_per_page : (parseInt(domManager.getValue('emailsPerPage')) || 50),
+                inbox_folder: (loadedSettings && loadedSettings.inbox_folder !== undefined) ? loadedSettings.inbox_folder : (domManager.getValue('inboxFolderPreference') || ''),
                 require_signature: (loadedSettings && loadedSettings.require_signature !== undefined) ? loadedSettings.require_signature : (domManager.get('require-signature-preference')?.checked !== false),
                 hide_undecryptable_emails: (loadedSettings && loadedSettings.hide_undecryptable_emails !== undefined) ? loadedSettings.hide_undecryptable_emails : (domManager.get('hide-undecryptable-emails-preference')?.checked !== false),
                 automatically_encrypt: (loadedSettings && loadedSettings.automatically_encrypt !== undefined) ? loadedSettings.automatically_encrypt : (domManager.get('automatically-encrypt-preference')?.checked !== false),
@@ -3020,6 +3032,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false, // Default to true
                 sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 30, // Default to 30 days
                 emails_per_page: parseInt(domManager.getValue('emailsPerPage')) || 50, // Default to 50
+                inbox_folder: domManager.getValue('inboxFolderPreference') || '',
                 require_signature: domManager.get('require-signature-preference')?.checked !== false, // Default to true
                 hide_undecryptable_emails: domManager.get('hide-undecryptable-emails-preference')?.checked !== false, // Default to true
                 automatically_encrypt: autoEncryptEnabled,
@@ -3063,6 +3076,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('send_matching_dm', settings.send_matching_dm.toString());
             settingsMap.set('sync_cutoff_days', settings.sync_cutoff_days.toString());
             settingsMap.set('emails_per_page', settings.emails_per_page.toString());
+            settingsMap.set('inbox_folder', settings.inbox_folder || '');
             settingsMap.set('require_signature', settings.require_signature.toString());
             settingsMap.set('hide_undecryptable_emails', (settings.hide_undecryptable_emails || false).toString());
             settingsMap.set('automatically_encrypt', (settings.automatically_encrypt !== undefined ? settings.automatically_encrypt : true).toString());
@@ -3168,6 +3182,7 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'include-sig-header-preference',
         'syncCutoffDays',
         'emailsPerPage',
+        'inboxFolderPreference',
         'glossiaEncodingBody',
         'glossiaEncodingSignature',
         'glossiaEncodingPubkey'
@@ -3360,6 +3375,32 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.setValue('emailFilterPreference', settings.email_filter || 'nostr');
         domManager.setValue('syncCutoffDays', settings.sync_cutoff_days || 30);
         domManager.setValue('emailsPerPage', settings.emails_per_page || 50);
+        // Inbox folder: the dropdown's <option> list is per-account (driven by
+        // the active user's IMAP server). Reset it to just Default + persisted
+        // name so the value can be applied immediately, then trigger a silent
+        // background refresh to pull the live folder list for this account.
+        const inboxFolderSelect = domManager.get('inboxFolderPreference');
+        if (inboxFolderSelect) {
+            const persistedFolder = settings.inbox_folder || '';
+            inboxFolderSelect.innerHTML = '';
+            const defaultOpt = document.createElement('option');
+            defaultOpt.value = '';
+            defaultOpt.textContent = 'Default';
+            inboxFolderSelect.appendChild(defaultOpt);
+            if (persistedFolder) {
+                const opt = document.createElement('option');
+                opt.value = persistedFolder;
+                opt.textContent = persistedFolder;
+                inboxFolderSelect.appendChild(opt);
+            }
+            inboxFolderSelect.value = persistedFolder;
+            inboxFolderSelect.disabled = false;
+            if (window.emailService) {
+                window.emailService.listImapFolders({ silent: true }).catch(err => {
+                    console.warn('[APP] Background folder refresh failed:', err);
+                });
+            }
+        }
         
         // Set send matching DM preference (default to true if not set)
         const sendMatchingDmPref = domManager.get('send-matching-dm-preference');

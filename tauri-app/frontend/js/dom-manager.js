@@ -113,6 +113,7 @@ class DOMManager {
             'include-sig-header-preference': this.getElement('include-sig-header-preference'),
             syncCutoffDays: this.getElement('sync-cutoff-days'),
             emailsPerPage: this.getElement('emails-per-page'),
+            inboxFolderPreference: this.getElement('inbox-folder-preference'),
             testEmailConnectionBtn: this.getElement('test-email-connection-btn'),
             copyNprivBtn: this.getElement('copy-npriv-btn'),
             copyEmailPasswordBtn: this.getElement('copy-email-password-btn'),

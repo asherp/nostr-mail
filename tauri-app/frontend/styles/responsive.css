@@ -181,6 +181,15 @@
     body.dark-mode .back-to-nav-btn i {
         color: #e0e0e0 !important;
     }
+
+    /* When viewing an email/thread detail in inbox/sent, hide the tab's
+       nav-back button so the detail view's own back button isn't stacked on
+       top of it. Overrides the display:flex !important above (which would
+       otherwise beat the JS inline display:none). */
+    #inbox.detail-open .back-to-nav-btn,
+    #sent.detail-open .back-to-nav-btn {
+        display: none !important;
+    }
 }
 
 /* Mobile Landscape Mode - Keep bottom navigation */
@@ -520,7 +529,14 @@
     body.dark-mode .back-to-nav-btn i {
         color: #e0e0e0 !important;
     }
-    
+
+    /* Hide tab nav-back button when viewing an inbox/sent email/thread detail
+       — parallels the portrait rule above. */
+    #inbox.detail-open .back-to-nav-btn,
+    #sent.detail-open .back-to-nav-btn {
+        display: none !important;
+    }
+
     /* Safe area support for mobile - prevent header from being obscured */
     /* Note: Safe area padding is already applied above with !important, this is a fallback */
     @supports (padding: max(0px)) {

@@ -2859,11 +2859,10 @@ class EmailService {
 
     async syncInboxEmails() {
         try {
-            // Get selected folder from dropdown
-            const folderSelect = document.getElementById('imap-folder-select');
-            const selectedFolder = folderSelect && folderSelect.value ? folderSelect.value : null;
+            const settings = appState.getSettings() || {};
+            const selectedFolder = settings.inbox_folder ? settings.inbox_folder : null;
             console.log(`[JS] Syncing inbox emails from folder: ${selectedFolder || 'Default (INBOX + nostr-mail)'}`);
-            
+
             const newCount = await TauriService.syncNostrEmails(selectedFolder);
             console.log(`[JS] Synced ${newCount} new inbox emails from network`);
             return newCount;
@@ -3844,6 +3843,7 @@ class EmailService {
             if (emailDetailView) emailDetailView.style.display = 'flex';
             if (inboxActions) inboxActions.style.display = 'none';
             if (inboxTitle) inboxTitle.style.display = 'none';
+            document.getElementById('inbox')?.classList.add('detail-open');
             // Detail view has its own back-to-inbox button; hide the tab's back-to-nav-btn
             // to avoid stacking two back buttons on mobile portrait.
             document.querySelectorAll('#inbox .back-to-nav-btn').forEach(b => b.style.display = 'none');
@@ -4155,6 +4155,7 @@ class EmailService {
                                 if (emailList) emailList.style.display = 'block';
                                 if (emailDetailView) emailDetailView.style.display = 'none';
                                 if (inboxActions) inboxActions.style.display = 'flex';
+                                document.getElementById('inbox')?.classList.remove('detail-open');
                                 if (inboxTitle) {
                                     inboxTitle.textContent = 'Inbox';
                                     inboxTitle.style.display = '';
@@ -4527,6 +4528,7 @@ ${attachmentsHtml}
             if (emailDetailView) emailDetailView.style.display = 'none';
             if (inboxThreadDetailView) inboxThreadDetailView.style.display = 'none';
             if (inboxActions) inboxActions.style.display = 'flex';
+            document.getElementById('inbox')?.classList.remove('detail-open');
 
             // Re-render emails to update unread indicators
             this.renderEmails();
@@ -4565,6 +4567,7 @@ ${attachmentsHtml}
             if (actions) actions.style.display = 'none';
             if (title) title.style.display = 'none';
             if (threadDetailView) threadDetailView.style.display = 'flex';
+            document.getElementById(isInbox ? 'inbox' : 'sent')?.classList.add('detail-open');
             document.querySelectorAll(`#${prefix} .back-to-nav-btn`).forEach(b => b.style.display = 'none');
 
             // Show loading state
@@ -5238,48 +5241,57 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         }
     }
 
-    // List IMAP folders
-    async listImapFolders() {
-        console.log('[EMAIL-SERVICE] listImapFolders called');
+    // List IMAP folders. Pass { silent: true } to suppress error toasts when
+    // called as a background refresh (e.g. after a pubkey switch where IMAP
+    // credentials may not be filled in yet).
+    async listImapFolders({ silent = false } = {}) {
+        console.log('[EMAIL-SERVICE] listImapFolders called', { silent });
         if (!appState.hasSettings()) {
-            notificationService.showError('Please save your settings first');
+            if (!silent) notificationService.showError('Please save your settings first');
             return;
         }
-        
+
         // Validate that required settings are present
         const settings = appState.getSettings();
-        console.log('[EMAIL-SERVICE] Settings:', { 
-            hasEmail: !!settings.email_address, 
-            hasPassword: !!settings.password, 
-            hasImapHost: !!settings.imap_host 
+        console.log('[EMAIL-SERVICE] Settings:', {
+            hasEmail: !!settings.email_address,
+            hasPassword: !!settings.password,
+            hasImapHost: !!settings.imap_host
         });
-        
+
         if (!settings.email_address || !settings.email_address.trim()) {
-            notificationService.showError('Email address is required.');
+            if (!silent) notificationService.showError('Email address is required.');
             return;
         }
-        
+
         if (!settings.password || !settings.password.trim()) {
-            notificationService.showError('Password is required.');
+            if (!silent) notificationService.showError('Password is required.');
             return;
         }
-        
+
         if (!settings.imap_host || !settings.imap_host.trim()) {
-            notificationService.showError('IMAP host is required.');
+            if (!silent) notificationService.showError('IMAP host is required.');
             return;
         }
         
         try {
-            const selectElement = document.getElementById('imap-folder-select');
-            console.log('[EMAIL-SERVICE] Elements found:', { 
+            const selectElement = document.getElementById('inbox-folder-preference');
+            console.log('[EMAIL-SERVICE] Elements found:', {
                 selectElement: !!selectElement
             });
-            
+
+            // Preserve the currently-saved selection so we can re-apply it after
+            // repopulating the <option>s. Prefer the persisted setting over the
+            // current DOM value (DOM may be empty if this fires before
+            // populateSettingsForm runs).
+            const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
+            const previousValue = selectElement ? (selectElement.value || persistedFolder) : persistedFolder;
+
             if (selectElement) {
                 selectElement.disabled = true;
                 selectElement.innerHTML = '<option disabled>Loading folders...</option>';
             }
-            
+
             const emailConfig = {
                 email_address: settings.email_address,
                 password: settings.password,
@@ -5289,30 +5301,28 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 imap_port: settings.imap_port || 993,
                 use_tls: settings.use_tls !== false,
             };
-            
+
             console.log('[JS] Listing IMAP folders with config:', {
                 imap_host: emailConfig.imap_host,
                 imap_port: emailConfig.imap_port,
                 use_tls: emailConfig.use_tls,
                 email: emailConfig.email_address
             });
-            
+
             const folders = await TauriService.listImapFolders(emailConfig);
-            
+
             if (selectElement) {
                 selectElement.innerHTML = '';
                 if (folders && folders.length > 0) {
-                    // Add the default option (scans INBOX + nostr-mail)
                     const allOption = document.createElement('option');
                     allOption.value = '';
                     allOption.textContent = 'Default';
                     selectElement.appendChild(allOption);
-                    
-                    // Filter out "Sent" folder (case-insensitive)
-                    const filteredFolders = folders.filter(folder => 
+
+                    const filteredFolders = folders.filter(folder =>
                         folder.toLowerCase() !== 'sent'
                     );
-                    
+
                     filteredFolders.forEach(folder => {
                         const option = document.createElement('option');
                         option.value = folder;
@@ -5320,6 +5330,10 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         selectElement.appendChild(option);
                     });
                     selectElement.disabled = false;
+
+                    if (previousValue && Array.from(selectElement.options).some(o => o.value === previousValue)) {
+                        selectElement.value = previousValue;
+                    }
                 } else {
                     const option = document.createElement('option');
                     option.disabled = true;
@@ -5327,26 +5341,43 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                     selectElement.appendChild(option);
                 }
             }
-            
+
             console.log(`[EMAIL-SERVICE] Loaded ${folders?.length || 0} folders`);
-            
+
         } catch (error) {
             console.error('Failed to list IMAP folders:', error);
-            notificationService.showError('Failed to list IMAP folders: ' + error);
-            
-            const selectElement = document.getElementById('imap-folder-select');
+            if (!silent) notificationService.showError('Failed to list IMAP folders: ' + error);
+
+            const selectElement = document.getElementById('inbox-folder-preference');
             if (selectElement) {
-                selectElement.disabled = true;
-                selectElement.innerHTML = '<option disabled>Failed to load folders</option>';
+                if (silent) {
+                    // Background refresh failed (network down, wrong creds, account
+                    // mid-switch). Leave the dropdown in a usable state with just
+                    // "Default" + the persisted folder name so the user isn't blocked.
+                    const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
+                    selectElement.innerHTML = '';
+                    selectElement.disabled = false;
+                    const defaultOpt = document.createElement('option');
+                    defaultOpt.value = '';
+                    defaultOpt.textContent = 'Default';
+                    selectElement.appendChild(defaultOpt);
+                    if (persistedFolder) {
+                        const opt = document.createElement('option');
+                        opt.value = persistedFolder;
+                        opt.textContent = persistedFolder;
+                        selectElement.appendChild(opt);
+                        selectElement.value = persistedFolder;
+                    }
+                } else {
+                    selectElement.disabled = true;
+                    selectElement.innerHTML = '<option disabled>Failed to load folders</option>';
+                }
             }
         }
     }
 
     getSelectedFolder() {
-        const selectElement = document.getElementById('imap-folder-select');
-        if (!selectElement) return null;
-        
-        return selectElement.value || null;
+        return (appState.getSettings() || {}).inbox_folder || null;
     }
 
     // Handle email provider selection
@@ -7018,6 +7049,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             if (sentDetailView) sentDetailView.style.display = 'flex';
             if (sentActions) sentActions.style.display = 'none';
             if (sentTitle) sentTitle.style.display = 'none';
+            document.getElementById('sent')?.classList.add('detail-open');
             document.querySelectorAll('#sent .back-to-nav-btn').forEach(b => b.style.display = 'none');
             const sentDetailContent = domManager.get('sentDetailContent');
             
@@ -7170,6 +7202,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                             if (sentList) sentList.style.display = 'block';
                             if (sentDetailView) sentDetailView.style.display = 'none';
                             if (sentActions) sentActions.style.display = 'flex';
+                            document.getElementById('sent')?.classList.remove('detail-open');
                             if (sentTitle) {
                                 sentTitle.textContent = 'Sent';
                                 sentTitle.style.display = '';
@@ -8531,6 +8564,7 @@ ${attachmentsHtml}
             if (sentDetailView) sentDetailView.style.display = 'none';
             if (sentThreadDetailView) sentThreadDetailView.style.display = 'none';
             if (sentActions) sentActions.style.display = 'flex';
+            document.getElementById('sent')?.classList.remove('detail-open');
             if (sentTitle) {
                 sentTitle.textContent = 'Sent';
                 sentTitle.style.display = '';

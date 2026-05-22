@@ -419,6 +419,7 @@ body.dark-mode .email-detail-body {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    min-height: 0;
 }
 
 .email-detail-header {
@@ -517,6 +518,7 @@ body.dark-mode .email-sender-time {
     flex: 1;
     padding: 16px;
     overflow-y: auto;
+    min-height: 0;
 }
 
 .email-detail-content .email-detail-header {
@@ -839,43 +841,143 @@ body.dark-mode .email-attachment-icon {
     }
 }
 
-/* Mobile portrait: keep back + title + folder select + refresh on one row,
-   drop the search box to a full-width row below. Uses display:contents on
-   .inbox-actions so its children join the .tab-header flex layout directly,
-   then flex-wrap + order place the search on its own line.
-   Scoped to #inbox — sent/drafts use the icon-collapse above. */
+/* Mobile portrait: collapse the back/reply buttons in the email detail header
+   to icon-only squares, matching the .inbox-actions treatment above. Without
+   this, "← Inbox" and "← Reply" stay verbose and chew up the narrow viewport. */
 @media (max-width: 480px) {
-    #inbox .tab-header {
-        flex-wrap: wrap;
-        align-items: center;
-        justify-content: flex-start;
+    .email-detail-header .btn,
+    .email-detail-header .btn-primary,
+    .email-detail-header .btn-secondary {
+        flex: 0 0 auto !important;
+        min-width: 44px !important;
+        width: 44px !important;
+        height: 44px !important;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        border-radius: var(--radius-md) !important;
+        gap: 0 !important;
+        margin: 0 !important;
+        font-size: 0 !important;
+        line-height: 0 !important;
+        color: transparent !important;
+        overflow: hidden !important;
+    }
+
+    .email-detail-header .btn .btn-text,
+    .email-detail-header .btn-primary .btn-text,
+    .email-detail-header .btn-secondary .btn-text {
+        display: none !important;
+    }
+
+    .email-detail-header .btn i,
+    .email-detail-header .btn-primary i,
+    .email-detail-header .btn-secondary i {
+        margin: 0 !important;
+        font-size: 1.2rem !important;
+        line-height: 1 !important;
+        flex-shrink: 0 !important;
+        color: inherit;
+    }
+
+    .email-detail-header .btn-secondary i {
+        color: #6c757d !important;
+    }
+
+    .email-detail-header .btn-primary i {
+        color: #fff !important;
+    }
+
+    body.dark-mode .email-detail-header .btn-secondary i {
+        color: #e0e0e0 !important;
+    }
+
+    /* Reply button uses inline margin-left: auto to push itself to the far
+       right; the header gap only affects siblings without auto margins. */
+    .email-detail-header {
         gap: var(--spacing-sm);
+        padding: 12px 16px !important;
     }
 
-    #inbox .inbox-actions {
-        display: contents;
+    /* Re-assert margin-left: auto on the reply button — the icon-only rule
+       above sets margin: 0 !important on every header button, which would
+       otherwise pin Reply right next to Back. */
+    #reply-to-inbox-thread,
+    #reply-to-sent-thread {
+        margin-left: auto !important;
+    }
+}
+
+/* Desktop only: when an email or thread is open, hide the now-empty
+   tab-header (title + actions are JS-hidden, leaving a ~50px empty band).
+   Scoped to min-width: 1025px so mobile and tablet keep their
+   env(safe-area-inset-top) padding for the system status bar / notch. */
+@media (min-width: 1025px) {
+    #inbox.detail-open > .tab-header,
+    #sent.detail-open > .tab-header {
+        display: none !important;
+    }
+}
+
+/* Mobile portrait: keep back + title + refresh on one row, drop the search
+   box to a full-width row below. Uses display:contents on .inbox-actions so
+   its children join the .tab-header flex layout directly, then flex-wrap +
+   order place the search on its own line.
+   Applied to #inbox and #sent (parallel layouts); drafts uses icon-collapse.
+   !important is used liberally to win against contacts.css and responsive.css
+   which both touch .tab-header at overlapping breakpoints. */
+@media (max-width: 480px) {
+    #inbox .tab-header,
+    #sent .tab-header {
+        display: flex !important;
+        flex-direction: row !important;
+        flex-wrap: wrap !important;
+        align-items: center !important;
+        justify-content: flex-start !important;
+        gap: var(--spacing-sm) !important;
+        row-gap: var(--spacing-sm) !important;
     }
 
-    #inbox .tab-header > div:first-child {
-        flex: 1 1 auto;
-        min-width: 0;
+    /* Flatten .inbox-actions so its children become flex items of .tab-header.
+       Scoped to :not(.detail-open) so that opening an email or thread hides the
+       search + refresh row — otherwise display:contents !important would beat
+       the JS inline display:none and leave them visible above the detail view. */
+    #inbox:not(.detail-open) .inbox-actions,
+    #sent:not(.detail-open) .inbox-actions {
+        display: contents !important;
+    }
+    #inbox.detail-open .inbox-actions,
+    #sent.detail-open .inbox-actions {
+        display: none !important;
     }
 
-    #inbox .email-search-container {
-        flex: 1 1 100%;
-        min-width: 0;
-        order: 2;
+    /* Left cluster (back + title) sits at its natural width; actions follow it
+       on the same row. */
+    #inbox .tab-header > div:first-child,
+    #sent .tab-header > div:first-child {
+        flex: 0 1 auto !important;
+        min-width: 0 !important;
+        order: 0 !important;
     }
 
-    #inbox #imap-folder-select {
-        margin-right: 0 !important;
-        flex: 0 1 auto;
-        min-width: 100px;
-        order: 1;
+    #inbox #refresh-inbox,
+    #sent #refresh-sent {
+        order: 2 !important;
+        margin-left: auto !important;
     }
 
-    #inbox #refresh-inbox {
-        order: 1;
+    /* Search forced to its own full-width row below.
+       flex: 0 0 100% pins the basis at 100% so wrap is unavoidable;
+       width: 100% is a belt-and-suspenders backup in case a child rule
+       overrides flex-basis. */
+    #inbox .email-search-container,
+    #sent .email-search-container {
+        order: 99 !important;
+        flex: 0 0 100% !important;
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
     }
 }
 
@@ -1201,6 +1303,7 @@ body.dark-mode .thread-menu-item.thread-delete-action:hover {
     display: flex;
     flex-direction: column;
     gap: 0;
+    min-height: 0;
 }
 
 .thread-detail-content .email-detail-card {
@@ -1208,6 +1311,7 @@ body.dark-mode .thread-menu-item.thread-delete-action:hover {
     box-shadow: none;
     border: none;
     border-bottom: 1px solid #e5e7eb;
+    flex-shrink: 0;
 }
 
 .thread-detail-content .email-detail-card:first-child {

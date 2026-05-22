@@ -181,7 +181,7 @@
             <!-- Inbox Tab -->
             <div class="tab-content" id="inbox">
                 <div class="tab-header">
-                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md);">
                         <button class="btn btn-secondary back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
                             <i class="fas fa-arrow-left"></i> Back
                         </button>
@@ -192,9 +192,6 @@
                             <input type="text" id="email-search" placeholder="Search by sender email..." class="email-search-input">
                             <i class="fas fa-search email-search-icon"></i>
                         </div>
-                        <select id="imap-folder-select" class="btn-select" style="margin-right: 10px;">
-                            <option disabled>Loading folders...</option>
-                        </select>
                         <button id="refresh-inbox" class="btn btn-secondary">
                             <i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>
                         </button>
@@ -210,7 +207,7 @@
                 <div class="email-detail-view" id="email-detail-view" style="display: none;">
                     <div class="email-detail-header">
                         <button id="back-to-inbox" class="btn btn-secondary">
-                            <i class="fas fa-arrow-left"></i> Inbox
+                            <i class="fas fa-arrow-left"></i> <span class="btn-text">Inbox</span>
                         </button>
                     </div>
                     <div class="email-detail-content" id="email-detail-content">
@@ -222,10 +219,10 @@
                 <div class="email-detail-view" id="inbox-thread-detail-view" style="display: none;">
                     <div class="email-detail-header">
                         <button id="back-to-inbox-from-thread" class="btn btn-secondary">
-                            <i class="fas fa-arrow-left"></i> Inbox
+                            <i class="fas fa-arrow-left"></i> <span class="btn-text">Inbox</span>
                         </button>
-                        <button id="reply-to-inbox-thread" class="btn btn-primary" style="margin-left: 10px;">
-                            <i class="fas fa-reply"></i> Reply
+                        <button id="reply-to-inbox-thread" class="btn btn-primary" style="margin-left: auto;">
+                            <i class="fas fa-reply"></i> <span class="btn-text">Reply</span>
                         </button>
                     </div>
                     <div class="thread-subject-header" id="inbox-thread-subject"></div>
@@ -238,7 +235,7 @@
             <!-- Sent Tab -->
             <div class="tab-content" id="sent">
                 <div class="tab-header">
-                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md);">
                         <button class="btn btn-secondary back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
                             <i class="fas fa-arrow-left"></i> Back
                         </button>
@@ -260,7 +257,7 @@
                 <div class="email-detail-view" id="sent-detail-view" style="display: none;">
                     <div class="email-detail-header">
                         <button id="back-to-sent" class="btn btn-secondary">
-                            <i class="fas fa-arrow-left"></i> Sent
+                            <i class="fas fa-arrow-left"></i> <span class="btn-text">Sent</span>
                         </button>
                     </div>
                     <div class="email-detail-content" id="sent-detail-content">
@@ -272,10 +269,10 @@
                 <div class="email-detail-view" id="sent-thread-detail-view" style="display: none;">
                     <div class="email-detail-header">
                         <button id="back-to-sent-from-thread" class="btn btn-secondary">
-                            <i class="fas fa-arrow-left"></i> Sent
+                            <i class="fas fa-arrow-left"></i> <span class="btn-text">Sent</span>
                         </button>
-                        <button id="reply-to-sent-thread" class="btn btn-primary" style="margin-left: 10px;">
-                            <i class="fas fa-reply"></i> Reply
+                        <button id="reply-to-sent-thread" class="btn btn-primary" style="margin-left: auto;">
+                            <i class="fas fa-reply"></i> <span class="btn-text">Reply</span>
                         </button>
                     </div>
                     <div class="thread-subject-header" id="sent-thread-subject"></div>
@@ -306,7 +303,7 @@
                 <div class="email-detail-view" id="drafts-detail-view" style="display: none;">
                     <div class="email-detail-header">
                         <button id="back-to-drafts" class="btn btn-secondary">
-                            <i class="fas fa-arrow-left"></i> Back to Drafts
+                            <i class="fas fa-arrow-left"></i> <span class="btn-text">Back to Drafts</span>
                         </button>
                     </div>
                     <div class="email-detail-content" id="drafts-detail-content">
@@ -650,6 +647,14 @@
                                 <option value="all">All Emails</option>
                             </select>
                             <small class="form-text text-muted">Nostr Emails Only shows encrypted emails, signed emails, and emails from your Nostr contacts. All Emails shows everything.</small>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="inbox-folder-preference">Inbox Folder:</label>
+                            <select id="inbox-folder-preference">
+                                <option value="">Default</option>
+                            </select>
+                            <small class="form-text text-muted">Which IMAP folder to scan for new mail. Default scans INBOX + nostr-mail. Folder list loads from your IMAP server.</small>
                         </div>
                         
                         <div class="form-group">

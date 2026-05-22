@@ -6775,49 +6775,28 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 if (!keypair) {
                     previewText = 'Unable to decrypt: no keypair';
                 } else {
-                    try {
-                        let recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
-                        // If no recipient pubkey, try DB lookup by email address (same as detail view)
-                        if (!recipientPubkey) {
-                            const recipientEmail = email.to || email.to_address;
-                            if (recipientEmail) {
-                                try {
-                                    let pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email_including_dms', { email: recipientEmail });
-                                    if (!pubkeys || pubkeys.length === 0) {
-                                        pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
-                                    }
-                                    if (pubkeys && pubkeys.length > 0) {
-                                        recipientPubkey = pubkeys[0];
-                                    }
-                                } catch (e) {
-                                    console.warn('[JS] Sent preview: pubkey lookup failed for', recipientEmail, e);
-                                }
+                    const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
+                    if (!recipientPubkey) {
+                        previewText = 'Could not decrypt';
+                    } else {
+                        try {
+                            const result = await TauriService.decryptEmailBody(
+                                email.body, email.subject,
+                                null, recipientPubkey
+                            );
+                            if (result.success) {
+                                previewSubject = result.subject;
+                                previewText = Utils.escapeHtml(result.body.substring(0, 100));
+                                if (result.body.length > 100) previewText += '...';
+                                showSubject = true;
+                            } else {
+                                previewText = 'Could not decrypt';
                             }
-                        }
-                        const result = await TauriService.decryptEmailBody(
-                            email.body, email.subject,
-                            null, recipientPubkey
-                        );
-                        if (result.success) {
-                            previewSubject = result.subject;
-                            previewText = Utils.escapeHtml(result.body.substring(0, 100));
-                            if (result.body.length > 100) previewText += '...';
-                            showSubject = true;
-                        } else {
+                            this._retrofitSubjectHashAndBackfill(email, result.subjectCiphertext);
+                        } catch (e) {
+                            console.error('[JS] Backend decrypt failed for sent preview:', e);
                             previewText = 'Could not decrypt';
                         }
-                        // Backfill recipient_pubkey to DB if discovered via lookup
-                        if (result.success && recipientPubkey && !email.recipient_pubkey && email.id) {
-                            email.recipient_pubkey = recipientPubkey;
-                            this._saveRecipientPubkeyToDb(email, recipientPubkey)
-                                .catch(e => console.warn('[JS] Failed to backfill recipient_pubkey:', e));
-                        }
-                        // Fire retrofit + backfill even on decrypt failure — this
-                        // is the self-heal path for sent emails missing recipient_pubkey.
-                        this._retrofitSubjectHashAndBackfill(email, result.subjectCiphertext);
-                    } catch (e) {
-                        console.error('[JS] Backend decrypt failed for sent preview:', e);
-                        previewText = 'Could not decrypt';
                     }
                 }
             } else {
@@ -7082,37 +7061,9 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         // If encrypted but no recipient_pubkey, try to find it via email address lookup first
         // (faster than brute-force contact search, and the normal rendering path handles decryption failures gracefully)
         if (isEncrypted && !hasRecipientPubkey && appState.getKeypair()) {
-            console.log(`[JS] _loadSentEmailDetail: No recipient_pubkey for email ${email.id}, trying email-based lookup`);
-            // Try quick email-based lookup (same as decryptSentManifestMessage uses internally)
-            const recipientEmail = email.to || email.to_address;
-            if (recipientEmail) {
-                try {
-                    let pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email_including_dms', { email: recipientEmail });
-                    if (!pubkeys || pubkeys.length === 0) {
-                        pubkeys = await window.__TAURI__.core.invoke('db_find_pubkeys_by_email', { email: recipientEmail });
-                    }
-                    if (pubkeys && pubkeys.length > 0) {
-                        console.log(`[JS] _loadSentEmailDetail: Found ${pubkeys.length} pubkey(s) for ${recipientEmail}, trying decryption`);
-                        for (const pubkey of pubkeys) {
-                            const success = await this._tryDecryptWithRecipientPubkey(email, pubkey);
-                            if (success) {
-                                const updatedEmail = appState.getSentEmails().find(e => e.id === email.id || e.message_id === email.message_id);
-                                if (updatedEmail) Object.assign(email, updatedEmail);
-                                await this._loadSentEmailDetail(email, sentDetailContent);
-                                return;
-                            }
-                        }
-                        console.log(`[JS] _loadSentEmailDetail: Decryption failed with all ${pubkeys.length} pubkey(s) for ${recipientEmail}`);
-                    } else {
-                        console.log(`[JS] _loadSentEmailDetail: No pubkeys found for ${recipientEmail}, falling back to contact search`);
-                    }
-                } catch (e) {
-                    console.warn(`[JS] _loadSentEmailDetail: Email-based lookup failed:`, e);
-                }
-            }
-
-            // Fallback: brute-force search through all contacts
-            console.log(`[JS] _loadSentEmailDetail: Starting contact search for email ${email.id}`);
+            // Brute-force search through all contacts (pubkey-anchored). Address-based
+            // lookup is intentionally absent — see feedback_no_email_address_pubkey_resolution.
+            console.log(`[JS] _loadSentEmailDetail: No recipient_pubkey for email ${email.id}, starting contact search`);
             const foundPubkey = await this._searchContactsForRecipientPubkey(email);
             if (foundPubkey) {
                 console.log(`[JS] _loadSentEmailDetail: Found pubkey for email ${email.id}, reloading detail`);

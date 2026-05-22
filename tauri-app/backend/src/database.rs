@@ -3199,137 +3199,6 @@ impl Database {
         Ok(())
     }
 
-    /// Returns a list of pubkeys whose contact email matches the given email address (case-insensitive, trimmed)
-    pub fn find_pubkeys_by_email(&self, email: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let email_trimmed = email.trim().to_lowercase();
-        println!("[RUST] Searching for pubkeys with email: {}", email_trimmed);
-        let mut stmt = conn.prepare(
-            "SELECT pubkey FROM contacts WHERE LOWER(TRIM(email)) = ?1"
-        )?;
-        let rows = stmt.query_map(params![email_trimmed], |row| {
-            let pubkey: String = row.get(0)?;
-            Ok(pubkey)
-        })?;
-        let mut pubkeys = Vec::new();
-        for row in rows {
-            pubkeys.push(row?);
-        }
-        println!("[RUST] Found pubkeys for email '{}': {:?}", email_trimmed, pubkeys);
-        Ok(pubkeys)
-    }
-    
-    /// Returns a list of pubkeys whose email_address setting matches the given email address (case-insensitive, trimmed)
-    pub fn find_pubkeys_by_email_setting(&self, email: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let email_trimmed = email.trim().to_lowercase();
-        println!("[RUST] Searching for pubkeys with email_address setting: {}", email_trimmed);
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT pubkey FROM user_settings WHERE key = 'email_address' AND LOWER(TRIM(value)) = ?1"
-        )?;
-        let rows = stmt.query_map(params![email_trimmed], |row| {
-            let pubkey: String = row.get(0)?;
-            Ok(pubkey)
-        })?;
-        let mut pubkeys = Vec::new();
-        for row in rows {
-            pubkeys.push(row?);
-        }
-        println!("[RUST] Found pubkeys for email_address setting '{}': {:?}", email_trimmed, pubkeys);
-        Ok(pubkeys)
-    }
-    
-    /// Find pubkeys associated with `email`, joining DM history through the
-    /// emails table when a contact entry is absent.
-    ///
-    /// Two anchor mechanisms link a DM to an email row, both populated at
-    /// insert time and so available even when the counterparty has no contact:
-    /// - `dm.email_message_id == email.message_id` (NIP-17 message-id tag), and
-    /// - `dm.content_hash == email.subject_hash` (the subject ciphertext bytes
-    ///   hash identically on both sides — once the NIP-aware hash fix is in).
-    ///
-    /// Whichever side of the DM is *not* `user_pubkey` is the counterparty we
-    /// want; this excludes self-wrapped DMs from poisoning the result with the
-    /// caller's own key. The prior implementation's step 2 dumped every DM
-    /// pubkey ever seen with no email filter at all.
-    pub fn find_pubkeys_by_email_including_dms(
-        &self,
-        email: &str,
-        user_pubkey: &str,
-    ) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let email_trimmed = email.trim().to_lowercase();
-        println!(
-            "[RUST] Searching for pubkeys with email (including DMs): {}",
-            email_trimmed
-        );
-
-        let mut pubkeys: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let push = |pk: String, sink: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
-            if pk.is_empty() || pk == user_pubkey {
-                return;
-            }
-            if seen.insert(pk.clone()) {
-                sink.push(pk);
-            }
-        };
-
-        // 1) Contacts indexed by email — the cheapest and most direct hit.
-        {
-            let mut stmt = conn.prepare(
-                "SELECT pubkey FROM contacts WHERE LOWER(TRIM(email)) = ?1",
-            )?;
-            let rows = stmt.query_map(params![email_trimmed], |row| {
-                let pubkey: String = row.get(0)?;
-                Ok(pubkey)
-            })?;
-            for row in rows.flatten() {
-                push(row, &mut pubkeys, &mut seen);
-            }
-        }
-
-        // 2) DMs anchored to an email row whose from/to matches `email`.
-        //    Two equally valid anchors: NIP-17 message-id tag, or
-        //    subject_hash ↔ content_hash equality.
-        //
-        //    Message-id is stored with brackets on the email side (`<uuid@host>`)
-        //    and without on the DM side — normalize the email side to match.
-        {
-            let mut stmt = conn.prepare(
-                "SELECT CASE
-                          WHEN dm.sender_pubkey = ?2 THEN dm.recipient_pubkey
-                          ELSE dm.sender_pubkey
-                        END AS counterparty
-                   FROM direct_messages dm
-                   JOIN emails e ON (
-                        (dm.email_message_id IS NOT NULL
-                         AND dm.email_message_id != ''
-                         AND TRIM(REPLACE(REPLACE(e.message_id, '<', ''), '>', '')) = dm.email_message_id)
-                        OR (dm.content_hash IS NOT NULL
-                            AND dm.content_hash != ''
-                            AND e.subject_hash IS NOT NULL
-                            AND e.subject_hash = dm.content_hash)
-                   )
-                  WHERE LOWER(TRIM(e.from_address)) = ?1
-                     OR LOWER(TRIM(e.to_address))   = ?1",
-            )?;
-            let rows = stmt.query_map(params![email_trimmed, user_pubkey], |row| {
-                let pubkey: String = row.get(0)?;
-                Ok(pubkey)
-            })?;
-            for row in rows.flatten() {
-                push(row, &mut pubkeys, &mut seen);
-            }
-        }
-
-        println!(
-            "[RUST] Found pubkeys for email '{}' (including DMs): {:?}",
-            email_trimmed, pubkeys
-        );
-        Ok(pubkeys)
-    }
-
     pub fn update_email_sender_pubkey(&self, message_id: &str, sender_pubkey: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         println!("[RUST] Updating sender_pubkey for message_id {} to {}", message_id, sender_pubkey);
@@ -3633,7 +3502,94 @@ impl Database {
                 updated += 1;
             }
         }
+        updated += self.correct_sent_recipient_pubkey_from_dms(user_pubkey)?;
         Ok(updated)
+    }
+
+    /// For sent rows where `recipient_pubkey` is already set, replace it with
+    /// the matched DM's counterparty when ALL matched DMs (via message_id or
+    /// subject_hash↔content_hash) unanimously disagree with the stored value.
+    /// Skips when matched DMs disagree among themselves or when they agree
+    /// with the stored value. Pubkey-anchored only — never address-based.
+    /// See feedback_no_email_address_pubkey_resolution.
+    pub fn correct_sent_recipient_pubkey_from_dms(&self, user_pubkey: &str) -> Result<usize> {
+        let candidates: Vec<(i64, String, String, Option<String>)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, message_id, recipient_pubkey, subject_hash
+                   FROM emails
+                  WHERE is_nostr_encrypted = 1
+                    AND sender_pubkey = ?1
+                    AND recipient_pubkey IS NOT NULL"
+            )?;
+            let rows = stmt.query_map(params![user_pubkey], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let mut updates: Vec<(i64, String)> = Vec::new();
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT
+                   CASE WHEN sender_pubkey = ?1 THEN recipient_pubkey ELSE sender_pubkey END
+                 FROM direct_messages
+                 WHERE
+                   (email_message_id IS NOT NULL AND email_message_id != ''
+                    AND TRIM(REPLACE(REPLACE(email_message_id,'<',''),'>','')) = ?2)
+                   OR (?3 != '' AND content_hash IS NOT NULL
+                       AND content_hash != '' AND content_hash = ?3)"
+            )?;
+            for (id, message_id, stored_rcpt, subject_hash) in candidates {
+                let normalized_mid = Self::normalize_message_id(&message_id);
+                let hash = subject_hash.unwrap_or_default();
+                if normalized_mid.is_empty() && hash.is_empty() {
+                    continue;
+                }
+                let rows = stmt.query_map(
+                    params![user_pubkey, normalized_mid, hash],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let counterparties: Vec<String> = rows
+                    .filter_map(|r| r.ok())
+                    .filter(|p| !p.is_empty() && p != user_pubkey)
+                    .collect();
+                if counterparties.is_empty() {
+                    continue;
+                }
+                let first = &counterparties[0];
+                if !counterparties.iter().all(|p| p == first) {
+                    continue; // ambiguous — skip
+                }
+                if first == &stored_rcpt {
+                    continue; // already correct
+                }
+                updates.push((id, first.clone()));
+            }
+        }
+
+        {
+            let conn = self.conn.lock().unwrap();
+            for (id, pk) in &updates {
+                conn.execute(
+                    "UPDATE emails SET recipient_pubkey = ?1 WHERE id = ?2",
+                    params![pk, id],
+                )?;
+            }
+        }
+        if !updates.is_empty() {
+            println!(
+                "[RUST] correct_sent_recipient_pubkey_from_dms: corrected {} row(s)",
+                updates.len()
+            );
+        }
+        Ok(updates.len())
     }
 
     pub fn find_emails_by_message_id(&self, message_id: &str) -> Result<Vec<Email>> {
@@ -5146,31 +5102,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_pubkeys_by_email() {
-        let (db, _dir) = create_test_db();
-        let mut contact = make_contact("pk_email_search");
-        contact.email = Some("findme@example.com".to_string());
-        db.save_contact(&contact).unwrap();
-
-        let pubkeys = db.find_pubkeys_by_email("findme@example.com").unwrap();
-        assert_eq!(pubkeys.len(), 1);
-        assert_eq!(pubkeys[0], "pk_email_search");
-
-        let empty = db.find_pubkeys_by_email("nope@example.com").unwrap();
-        assert!(empty.is_empty());
-    }
-
-    #[test]
-    fn test_find_pubkeys_by_email_setting() {
-        let (db, _dir) = create_test_db();
-        db.save_setting("pk_setting_search", "email_address", "mysetting@example.com").unwrap();
-
-        let pubkeys = db.find_pubkeys_by_email_setting("mysetting@example.com").unwrap();
-        assert_eq!(pubkeys.len(), 1);
-        assert_eq!(pubkeys[0], "pk_setting_search");
-    }
-
-    #[test]
     fn test_get_database_size() {
         let (db, _dir) = create_test_db();
         let size = db.get_database_size().unwrap();
@@ -5471,6 +5402,76 @@ mod tests {
         let got = db.get_email_by_id(email_id).unwrap().unwrap();
         assert_eq!(got.sender_pubkey.as_deref(), Some(user));
         assert_eq!(got.recipient_pubkey.as_deref(), Some(other));
+    }
+
+    #[test]
+    fn test_correct_sent_recipient_pubkey_overwrites_wrong_value() {
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let wrong = "npub_wrong";
+        let correct = "npub_correct";
+
+        // Sent email stored with the WRONG recipient_pubkey.
+        let mut email = make_encrypted_email("<corr1@example.com>", "ct-corr-1");
+        email.sender_pubkey = Some(user.to_string());
+        email.recipient_pubkey = Some(wrong.to_string());
+        let email_id = db.save_email(&email).unwrap();
+
+        // A matching DM (by message-id) records the correct counterparty.
+        let mut dm = make_dm("dm-corr-1", user, correct);
+        dm.email_message_id = Some("corr1@example.com".to_string());
+        db.save_dm(&dm).unwrap();
+
+        let n = db.correct_sent_recipient_pubkey_from_dms(user).unwrap();
+        assert_eq!(n, 1);
+        let got = db.get_email_by_id(email_id).unwrap().unwrap();
+        assert_eq!(got.recipient_pubkey.as_deref(), Some(correct));
+    }
+
+    #[test]
+    fn test_correct_sent_recipient_pubkey_skips_when_dms_disagree() {
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let stored = "npub_stored";
+        let alt_a = "npub_alt_a";
+        let alt_b = "npub_alt_b";
+
+        let mut email = make_encrypted_email("<corr2@example.com>", "ct-corr-2");
+        email.sender_pubkey = Some(user.to_string());
+        email.recipient_pubkey = Some(stored.to_string());
+        let email_id = db.save_email(&email).unwrap();
+
+        // Two DMs match the email by message-id but disagree on counterparty.
+        let mut dm_a = make_dm("dm-corr-2a", user, alt_a);
+        dm_a.email_message_id = Some("corr2@example.com".to_string());
+        db.save_dm(&dm_a).unwrap();
+        let mut dm_b = make_dm("dm-corr-2b", user, alt_b);
+        dm_b.email_message_id = Some("corr2@example.com".to_string());
+        db.save_dm(&dm_b).unwrap();
+
+        let n = db.correct_sent_recipient_pubkey_from_dms(user).unwrap();
+        assert_eq!(n, 0);
+        let got = db.get_email_by_id(email_id).unwrap().unwrap();
+        assert_eq!(got.recipient_pubkey.as_deref(), Some(stored));
+    }
+
+    #[test]
+    fn test_correct_sent_recipient_pubkey_noop_when_dm_agrees() {
+        let (db, _dir) = create_test_db();
+        let user = "npub_user";
+        let correct = "npub_correct";
+
+        let mut email = make_encrypted_email("<corr3@example.com>", "ct-corr-3");
+        email.sender_pubkey = Some(user.to_string());
+        email.recipient_pubkey = Some(correct.to_string());
+        db.save_email(&email).unwrap();
+
+        let mut dm = make_dm("dm-corr-3", user, correct);
+        dm.email_message_id = Some("corr3@example.com".to_string());
+        db.save_dm(&dm).unwrap();
+
+        let n = db.correct_sent_recipient_pubkey_from_dms(user).unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

@@ -4599,9 +4599,6 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
         } else {
             // New email - save raw email to DB directly without checking again
             println!("[RUST] Email is new, inserting directly to DB (skipping redundant get_email check)");
-            // For sent emails, try to find recipient_pubkey from contacts
-            let recipient_pubkey = db.find_pubkeys_by_email(&email.to).ok()
-                .and_then(|pubkeys| pubkeys.first().cloned());
             let db_email = DbEmail {
                 id: None,
                 message_id: email.message_id.clone(),
@@ -4614,7 +4611,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                 received_at: email.date,
                 is_nostr_encrypted: true,
                 sender_pubkey: email.sender_pubkey.clone(),
-                recipient_pubkey: recipient_pubkey.or(email.recipient_pubkey.clone()),
+                recipient_pubkey: email.recipient_pubkey.clone(),
                 raw_headers: Some(email.raw_headers.clone()),
                 is_draft: false,
                 is_read: false,

@@ -2771,23 +2771,6 @@ fn db_batch_save_contacts(user_pubkey: String, contacts: Vec<DbContact>, is_publ
 }
 
 #[tauri::command]
-fn db_find_pubkeys_by_email(email: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
-    let db = state.get_database()?;
-    db.find_pubkeys_by_email(&email).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn db_find_pubkeys_by_email_including_dms(email: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
-    let db = state.get_database()?;
-    // user_pubkey scopes the result to *counterparties*: the DM↔email join
-    // returns the side that isn't us, which keeps self-wraps from poisoning
-    // the decrypt-time pubkey lookup with our own key.
-    let user_pubkey = active_user_npub(&state).unwrap_or_default();
-    db.find_pubkeys_by_email_including_dms(&email, &user_pubkey)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 fn db_filter_new_contacts(user_pubkey: String, pubkeys: Vec<String>, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     let db = state.get_database()?;
     let existing: std::collections::HashSet<String> = db.get_all_contacts(&user_pubkey)
@@ -3171,11 +3154,6 @@ async fn db_search_sent_emails(
     let private_key = resolve_private_key(private_key, &state).ok();
     let db = state.get_database()?;
 
-    // Used by find_pubkeys_by_email_including_dms to return the counterparty,
-    // not ourselves. Empty string falls through harmlessly (no DM has an
-    // empty pubkey, so the CASE just picks the actual side).
-    let user_npub_for_lookup = active_user_npub(&state).unwrap_or_default();
-
     // Emit search started event
     if let Err(e) = app_handle.emit("sent-search-started", &serde_json::json!({})) {
         println!("[RUST] Failed to emit sent-search-started event: {}", e);
@@ -3230,240 +3208,65 @@ async fn db_search_sent_emails(
                 break;
             }
             
-            // For sent emails, decrypt using recipient's pubkey
-            // Shared secret derivation: user's private key × recipient's public key
         let _raw_headers = email.raw_headers.as_deref().unwrap_or("");
         let (decrypted_subject, decrypted_body) = if email.is_nostr_encrypted && email_config.private_key.is_some() {
-            // For sent emails, shared secret = user's private key × recipient's public key
-            // So we need the recipient's pubkey to decrypt (not sender's pubkey)
-            // Try to find recipient pubkey from contacts
-            let recipient_email = &email.to_address;
-            let mut decrypted_body_result = None;
+            // Pubkey-anchored decryption only: use email.recipient_pubkey if set,
+            // then self-sent fallback (sender_pubkey == user_pubkey).
+            // No address-based pubkey lookups — see feedback_no_email_address_pubkey_resolution.
+            let private_key = email_config.private_key.as_ref().unwrap();
+            let mut decrypted_body_result: Option<String> = None;
             let mut decrypted_subject_result = email.subject.clone();
-            
-            // Try to find recipient pubkeys (including DMs)
-            println!("[RUST] Searching for recipient pubkeys for email: {}", recipient_email);
-            if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email_including_dms(recipient_email, &user_npub_for_lookup) {
-                println!("[RUST] Found {} recipient pubkey(s) for {} (including DMs)", recipient_pubkeys.len(), recipient_email);
-                // Also try normalized Gmail address
-                let normalized_email = if recipient_email.contains("@gmail.com") {
-                    let parts: Vec<&str> = recipient_email.split('@').collect();
-                    if parts.len() == 2 {
-                        let local = parts[0].split('+').next().unwrap_or(parts[0]);
-                        format!("{}@{}", local, parts[1]).to_lowercase()
-                    } else {
-                        recipient_email.to_lowercase()
+            let mut body_decrypt_pubkey: Option<String> = None;
+
+            let encrypted_body_content = extract_encrypted_content_from_armor(&email.body)
+                .unwrap_or_else(|| email.body.clone());
+
+            if let Some(recipient_pubkey) = email.recipient_pubkey.as_ref() {
+                match nostr::decrypt_dm_content(private_key, recipient_pubkey, &encrypted_body_content) {
+                    Ok(decrypted) => {
+                        decrypted_body_result = Some(decrypted);
+                        body_decrypt_pubkey = Some(recipient_pubkey.clone());
                     }
-                } else {
-                    recipient_email.to_lowercase()
-                };
-                
-                let mut all_pubkeys = recipient_pubkeys;
-                if normalized_email != recipient_email.to_lowercase() {
-                    println!("[RUST] Also searching for normalized email: {}", normalized_email);
-                    if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email_including_dms(&normalized_email, &user_npub_for_lookup) {
-                        println!("[RUST] Found {} pubkey(s) for normalized email (including DMs)", normalized_pubkeys.len());
-                        all_pubkeys.extend(normalized_pubkeys);
+                    Err(e) => {
+                        println!("[RUST] Failed to decrypt sent email body with stored recipient_pubkey: {}", e);
                     }
                 }
-                all_pubkeys.dedup();
-                println!("[RUST] Total unique recipient pubkeys to try: {}", all_pubkeys.len());
-                
-                // Extract encrypted content from body (remove ASCII armor if present)
-                let encrypted_content = match extract_encrypted_content_from_armor(&email.body) {
-                    Some(content) => {
-                        println!("[RUST] Extracted encrypted content from ASCII armor, length: {}", content.len());
-                        content
-                    },
-                    None => {
-                        println!("[RUST] No ASCII armor found, using raw body");
-                        email.body.clone()
-                    }
-                };
-                
-                // Try decrypting with each recipient pubkey
-                // Shared secret = user's private key × recipient's public key
-                for recipient_pubkey in &all_pubkeys {
-                    println!("[RUST] Trying to decrypt sent email body with recipient pubkey (shared secret: user_privkey × recipient_pubkey): {}", recipient_pubkey);
-                    match nostr::decrypt_dm_content(
-                        email_config.private_key.as_ref().unwrap(),
-                        recipient_pubkey, // Using recipient's pubkey for shared secret derivation
-                        &encrypted_content
-                    ) {
-                        Ok(decrypted) => {
-                            println!("[RUST] Successfully decrypted sent email body with recipient pubkey, length: {}", decrypted.len());
-                            // Save the recipient pubkey to database for future use
-                            if !email.message_id.is_empty() {
-                                if let Err(e) = db.update_email_recipient_pubkey(&email.message_id, recipient_pubkey) {
-                                    println!("[RUST] Warning: Failed to save recipient pubkey to database: {}", e);
-                                } else {
-                                    println!("[RUST] Saved recipient pubkey {} to database for email {}", recipient_pubkey, email.message_id);
-                                }
-                            } else if let Some(email_id) = email.id {
-                                if let Err(e) = db.update_email_recipient_pubkey_by_id(email_id, recipient_pubkey) {
-                                    println!("[RUST] Warning: Failed to save recipient pubkey to database: {}", e);
-                                } else {
-                                    println!("[RUST] Saved recipient pubkey {} to database for email id {}", recipient_pubkey, email_id);
-                                }
-                            }
-                            decrypted_body_result = Some(decrypted);
-                            break;
-                        }
-                        Err(e) => {
-                            println!("[RUST] Failed to decrypt with recipient pubkey {}: {}", recipient_pubkey, e);
-                        }
-                    }
-                }
-            } else {
-                println!("[RUST] No recipient pubkeys found for email: {}", recipient_email);
             }
-            
-            // Fallback: Only for self-sent emails where recipient_pubkey lookup failed AND sender_pubkey == user's pubkey
-            // For self-sent emails with same keypair: sender_pubkey == recipient_pubkey == user's pubkey
-            // Shared secret = user's private key × sender_pubkey (which equals recipient_pubkey for self-sent)
+
+            // Self-sent fallback: sender_pubkey == user_pubkey ⇒ same shared secret either way.
             if decrypted_body_result.is_none() {
-                println!("[RUST] No recipient pubkey decryption succeeded, checking if this is a self-sent email {}", email.id.unwrap_or(0));
-                
-                // Get user's public key from private key to verify if this is truly self-sent
-                if let Ok(user_pubkey) = crypto::get_public_key_from_private(email_config.private_key.as_ref().unwrap()) {
-                    // Only try sender_pubkey if it matches user's pubkey (truly self-sent with same keypair)
+                if let Ok(user_pubkey) = crypto::get_public_key_from_private(private_key) {
                     if let Some(sender_pubkey) = email.sender_pubkey.as_ref() {
                         if sender_pubkey == &user_pubkey {
-                        println!("[RUST] Confirmed self-sent email (sender_pubkey == user_pubkey), trying sender_pubkey as recipient: {}", sender_pubkey);
-                        
-                        // Extract encrypted content from body (remove ASCII armor if present)
-                        let encrypted_body_content = match extract_encrypted_content_from_armor(&email.body) {
-                            Some(content) => {
-                                println!("[RUST] Extracted encrypted content from ASCII armor for fallback, length: {}", content.len());
-                                content
-                            },
-                            None => {
-                                println!("[RUST] No ASCII armor found in body for fallback, using raw body");
-                                email.body.clone()
-                            }
-                        };
-                        
-                        // Try decrypting body with sender_pubkey (only works for self-sent emails with same keypair)
-                        // Shared secret = user's private key × sender_pubkey (same as recipient_pubkey for self-sent)
-                        match nostr::decrypt_dm_content(
-                            email_config.private_key.as_ref().unwrap(),
-                            sender_pubkey, // For self-sent: sender_pubkey == recipient_pubkey == user_pubkey
-                            &encrypted_body_content
-                        ) {
-                            Ok(decrypted) => {
-                                println!("[RUST] Successfully decrypted sent email body with sender_pubkey (self-sent email with same keypair), length: {}", decrypted.len());
+                            if let Ok(decrypted) = nostr::decrypt_dm_content(private_key, sender_pubkey, &encrypted_body_content) {
                                 decrypted_body_result = Some(decrypted);
-                                
-                                // Also try to decrypt subject with sender_pubkey (same shared secret derivation)
-                                if email::is_likely_encrypted_content(&email.subject) {
-                                    let encrypted_subject_content = match extract_encrypted_content_from_armor(&email.subject) {
-                                        Some(content) => content,
-                                        None => email.subject.clone()
-                                    };
-                                    
-                                    match nostr::decrypt_dm_content(
-                                        email_config.private_key.as_ref().unwrap(),
-                                        sender_pubkey, // Same shared secret: user_privkey × sender_pubkey
-                                        &encrypted_subject_content
-                                    ) {
-                                        Ok(decrypted_subj) => {
-                                            println!("[RUST] Successfully decrypted subject with sender_pubkey");
-                                            decrypted_subject_result = decrypted_subj;
-                                        }
-                                        Err(_) => {
-                                            println!("[RUST] Failed to decrypt subject with sender_pubkey, keeping original");
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("[RUST] Failed to decrypt with sender_pubkey fallback: {}", e);
-                                println!("[RUST] Using encrypted body for search (search may not find decrypted content)");
-                                decrypted_body_result = Some(email.body.clone());
-                            }
-                        }
-                        } else {
-                            println!("[RUST] sender_pubkey ({}) != user_pubkey ({}), this is NOT a self-sent email with same keypair", sender_pubkey, user_pubkey);
-                            println!("[RUST] Cannot decrypt without recipient_pubkey. Recipient's pubkey must be in contacts for this email address: {}", recipient_email);
-                            println!("[RUST] Using encrypted body for search (search may not find decrypted content)");
-                            decrypted_body_result = Some(email.body.clone());
-                        }
-                    } else {
-                        println!("[RUST] No sender_pubkey available for fallback, using encrypted body");
-                        decrypted_body_result = Some(email.body.clone());
-                    }
-                } else {
-                    println!("[RUST] Failed to get user's pubkey from private key, cannot verify self-sent email");
-                    println!("[RUST] Cannot decrypt without recipient_pubkey. Recipient's pubkey must be in contacts for this email address: {}", recipient_email);
-                    println!("[RUST] Using encrypted body for search (search may not find decrypted content)");
-                    decrypted_body_result = Some(email.body.clone());
-                }
-            } else {
-                println!("[RUST] Successfully decrypted sent email {} body with recipient pubkey", email.id.unwrap_or(0));
-                
-                // Subject decryption - try with recipient pubkeys first, then fallback to sender pubkey
-                if email::is_likely_encrypted_content(&email.subject) {
-                    let mut subject_decrypted = false;
-                    
-                    // Try recipient pubkeys first (same as body, including DMs)
-                    if let Ok(recipient_pubkeys) = db.find_pubkeys_by_email_including_dms(recipient_email, &user_npub_for_lookup) {
-                        let normalized_email = if recipient_email.contains("@gmail.com") {
-                            let parts: Vec<&str> = recipient_email.split('@').collect();
-                            if parts.len() == 2 {
-                                let local = parts[0].split('+').next().unwrap_or(parts[0]);
-                                format!("{}@{}", local, parts[1]).to_lowercase()
-                            } else {
-                                recipient_email.to_lowercase()
-                            }
-                        } else {
-                            recipient_email.to_lowercase()
-                        };
-                        
-                        let mut all_pubkeys = recipient_pubkeys;
-                        if normalized_email != recipient_email.to_lowercase() {
-                            if let Ok(normalized_pubkeys) = db.find_pubkeys_by_email_including_dms(&normalized_email, &user_npub_for_lookup) {
-                                all_pubkeys.extend(normalized_pubkeys);
-                            }
-                        }
-                        all_pubkeys.dedup();
-                        
-                        // Extract encrypted content from subject
-                        let encrypted_subject_content = match extract_encrypted_content_from_armor(&email.subject) {
-                            Some(content) => content,
-                            None => email.subject.clone()
-                        };
-                        
-                        for recipient_pubkey in &all_pubkeys {
-                            match nostr::decrypt_dm_content(
-                                email_config.private_key.as_ref().unwrap(),
-                                recipient_pubkey,
-                                &encrypted_subject_content
-                            ) {
-                                Ok(decrypted) => {
-                                    decrypted_subject_result = decrypted;
-                                    subject_decrypted = true;
-                                    break;
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                    }
-                    
-                    // Fallback to sender pubkey if recipient pubkey decryption failed
-                    if !subject_decrypted {
-                        if let Some(sender_pubkey) = email.sender_pubkey.as_ref() {
-                            if let Ok(decrypted) = crypto::decrypt_message(
-                                email_config.private_key.as_ref().unwrap(),
-                                sender_pubkey,
-                                &email.subject
-                            ) {
-                                decrypted_subject_result = decrypted;
+                                body_decrypt_pubkey = Some(sender_pubkey.clone());
                             }
                         }
                     }
                 }
             }
-            
+
+            // Subject: try the pubkey that decrypted the body first, then sender_pubkey as last resort.
+            if decrypted_body_result.is_some() && email::is_likely_encrypted_content(&email.subject) {
+                let encrypted_subject_content = extract_encrypted_content_from_armor(&email.subject)
+                    .unwrap_or_else(|| email.subject.clone());
+                let mut subject_decrypted = false;
+                if let Some(ref pk) = body_decrypt_pubkey {
+                    if let Ok(decrypted_subj) = nostr::decrypt_dm_content(private_key, pk, &encrypted_subject_content) {
+                        decrypted_subject_result = decrypted_subj;
+                        subject_decrypted = true;
+                    }
+                }
+                if !subject_decrypted {
+                    if let Some(sender_pubkey) = email.sender_pubkey.as_ref() {
+                        if let Ok(decrypted) = crypto::decrypt_message(private_key, sender_pubkey, &email.subject) {
+                            decrypted_subject_result = decrypted;
+                        }
+                    }
+                }
+            }
+
             (decrypted_subject_result, decrypted_body_result.unwrap_or_else(|| email.body.clone()))
         } else {
             (email.subject.clone(), email.body.clone())
@@ -6365,9 +6168,8 @@ async fn db_delete_sent_email(message_id: String, delete_from_server: Option<boo
     let db = state.get_database()?;
 
     // Try to delete from email server using the active pubkey's IMAP settings.
-    // Scoping to the active pubkey avoids the find_pubkeys_by_email_setting
-    // pitfall where a stale identity sharing the same email would win the
-    // credential lookup and silently fail the server-side delete.
+    // Scoping to the active pubkey ensures a stale identity sharing the same
+    // email can't win the credential lookup and silently fail the server-side delete.
     if delete_from_server.unwrap_or(true) {
         if let Some(active_pubkey) = active_user_npub(&state) {
             if let Ok(all_settings) = db.get_all_settings(&active_pubkey) {
@@ -6736,51 +6538,29 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: Option<String>, 
         email.sender_pubkey, email.recipient_pubkey, _user_pubkey);
     println!("[RUST] User sent email: {}, User received email: {}", user_sent_email, user_received_email);
     
-    // Determine which pubkey to use for decryption.
-    // The DM's counterparty (_contact_pubkey) is the strongest hint: we got here
-    // because this DM's content hash matched this email's subject, so the email
-    // is from/to the same person we're DM'ing with. Try that first in every
-    // branch, then fall back to email row metadata. Only consult the per-email
-    // pubkey-by-address index if we still have nothing — never the all-DMs
-    // brute force, which produces an O(N) decrypt loop across every pubkey
-    // the user has ever exchanged DMs with.
+    // Determine which pubkey to use for decryption. Pubkey-anchored only —
+    // the DM's counterparty (_contact_pubkey) is the strongest hint since this
+    // DM matched this email's subject_hash/message-id, then the email row's
+    // own sender/recipient pubkey. Never address-based lookups.
     let mut pubkeys_to_try: Vec<String> = Vec::new();
-    if !_contact_pubkey.is_empty() {
-        pubkeys_to_try.push(_contact_pubkey.clone());
-    }
     let push_unique = |list: &mut Vec<String>, pk: String| {
         if !pk.is_empty() && !list.contains(&pk) {
             list.push(pk);
         }
     };
+    if !_contact_pubkey.is_empty() {
+        push_unique(&mut pubkeys_to_try, _contact_pubkey.clone());
+    }
     if user_sent_email {
         if let Some(ref recipient_pubkey) = email.recipient_pubkey {
             push_unique(&mut pubkeys_to_try, recipient_pubkey.clone());
-        }
-        if pubkeys_to_try.is_empty() {
-            println!("[RUST] Recipient pubkey not set, looking up by email: {}", email.to_address);
-            for pk in db.find_pubkeys_by_email(&email.to_address).map_err(|e| e.to_string())? {
-                push_unique(&mut pubkeys_to_try, pk);
-            }
         }
     } else if user_received_email {
         if let Some(ref sender_pubkey) = email.sender_pubkey {
             push_unique(&mut pubkeys_to_try, sender_pubkey.clone());
         }
-        if pubkeys_to_try.len() <= 1 {
-            // Only the contact_pubkey hint was added; try email-address lookup too.
-            println!("[RUST] Sender pubkey not set, looking up by email: {}", email.from_address);
-            for pk in db.find_pubkeys_by_email(&email.from_address).map_err(|e| e.to_string())? {
-                push_unique(&mut pubkeys_to_try, pk);
-            }
-        }
     } else {
-        // Unknown direction (email row has no sender/recipient pubkey). The
-        // contact_pubkey hint above is the right answer in practice — the DM
-        // and email share a counterparty. Add the email row's own fields if
-        // present, but skip find_pubkeys_by_email_including_dms (returns every
-        // DM pubkey ever seen, which triggers a runaway brute-force decrypt).
-        println!("[RUST] Cannot determine email direction; relying on DM counterparty hint");
+        // Unknown direction (email row has no sender/recipient pubkey set to user).
         if let Some(ref sender_pubkey) = email.sender_pubkey {
             push_unique(&mut pubkeys_to_try, sender_pubkey.clone());
         }
@@ -6966,8 +6746,6 @@ pub fn run() {
         db_update_user_contact_public_status,
         db_batch_update_user_contact_public_status,
         db_batch_save_contacts,
-        db_find_pubkeys_by_email,
-        db_find_pubkeys_by_email_including_dms,
         db_filter_new_contacts,
         db_save_email,
         db_get_email,

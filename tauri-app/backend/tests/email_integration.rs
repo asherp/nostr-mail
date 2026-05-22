@@ -90,7 +90,7 @@ async fn defaults_header_sig_roundtrip() {
     );
 
     // 3. send_email signs over extract_ciphertext_binary(body) and adds
-    // X-Nostr-Pubkey + X-Nostr-Sig headers automatically.
+    // X-Nostr-Pubkey + X-Nostr-Sig + X-Nostr-Recipient headers automatically.
     email::send_email(
         &alice_config,
         "bob@test.local",
@@ -102,8 +102,10 @@ async fn defaults_header_sig_roundtrip() {
         None,
         None,
         None,
-        true, // include_pubkey_header
-        true, // include_sig_header
+        true,            // include_pubkey_header
+        true,            // include_sig_header
+        Some(&bob_npub), // recipient_pubkey (default-on anchor for decryption)
+        true,            // include_recipient_header
     )
     .await
     .expect("send_email");
@@ -150,6 +152,11 @@ async fn defaults_header_sig_roundtrip() {
     let header_pubkey = email::extract_nostr_pubkey_from_headers(&raw_headers)
         .expect("X-Nostr-Pubkey header present");
     assert_eq!(header_pubkey, alice_npub, "header pubkey mismatch");
+
+    // 8b. Confirm the X-Nostr-Recipient header is bob's npub.
+    let header_recipient = email::extract_nostr_recipient_from_headers(&raw_headers)
+        .expect("X-Nostr-Recipient header present");
+    assert_eq!(header_recipient, bob_npub, "recipient header mismatch");
 
     // 9. Decrypt and assert plaintext recovery.
     // `extract_ciphertext_binary` returns base64-decoded raw bytes; NIP-44
@@ -222,6 +229,8 @@ async fn glossia_body_latin_roundtrip() {
         None,
         true,
         true,
+        Some(&bob_npub),
+        true,
     )
     .await
     .expect("send_email");
@@ -248,6 +257,13 @@ async fn glossia_body_latin_roundtrip() {
         sig_source,
         raw_headers,
         delivered.body
+    );
+
+    // X-Nostr-Recipient anchors decryption to bob's npub.
+    assert_eq!(
+        email::extract_nostr_recipient_from_headers(&raw_headers).as_deref(),
+        Some(bob_npub.as_str()),
+        "recipient header mismatch"
     );
 
     // extract_ciphertext_binary glossia-decodes the latin words and then
@@ -367,6 +383,8 @@ async fn defaults_full_roundtrip_with_inline_sig() {
         None,
         true,
         true,
+        Some(&bob_npub),
+        true,
     )
     .await
     .expect("send_email");
@@ -404,6 +422,13 @@ async fn defaults_full_roundtrip_with_inline_sig() {
     assert_eq!(
         recovered_sig_pubkey_hex, alice_pubkey_hex,
         "in-body pubkey did not match alice"
+    );
+
+    // 9b. X-Nostr-Recipient anchors decryption to bob's npub.
+    assert_eq!(
+        email::extract_nostr_recipient_from_headers(&raw_headers).as_deref(),
+        Some(bob_npub.as_str()),
+        "recipient header mismatch"
     );
 
     // 10. Decrypt and confirm plaintext recovery.
@@ -461,6 +486,8 @@ async fn nip04_legacy_decrypt() {
         None,
         true,
         true,
+        Some(&bob_npub),
+        true,
     )
     .await
     .expect("send_email");
@@ -472,6 +499,11 @@ async fn nip04_legacy_decrypt() {
     let raw_headers = raw_headers_from_store(delivered);
     let (sig_valid, _) = email::verify_email_signature_full(&delivered.body, &raw_headers);
     assert_eq!(sig_valid, Some(true), "nip04 header sig should verify");
+    assert_eq!(
+        email::extract_nostr_recipient_from_headers(&raw_headers).as_deref(),
+        Some(bob_npub.as_str()),
+        "recipient header mismatch"
+    );
 
     // decode_armor_section handles the `base64?iv=base64` form by returning
     // payload_bytes || iv_bytes concatenated. To round-trip through decrypt
@@ -536,6 +568,8 @@ async fn multipart_html_and_text() {
         None,
         true,
         true,
+        Some(&bob_npub),
+        true,
     )
     .await
     .expect("send_email");
@@ -557,6 +591,14 @@ async fn multipart_html_and_text() {
         recv_html.contains("<b>Bob</b>"),
         "html part lost in transit: html_body={:?}",
         delivered.html_body
+    );
+
+    // X-Nostr-Recipient travels alongside the MIME body.
+    let raw_headers = raw_headers_from_store(delivered);
+    assert_eq!(
+        email::extract_nostr_recipient_from_headers(&raw_headers).as_deref(),
+        Some(bob_npub.as_str()),
+        "recipient header mismatch"
     );
 }
 
@@ -590,6 +632,8 @@ async fn non_ascii_subject_roundtrip() {
         None,
         false,
         false,
+        None,  // no recipient pubkey — this test isn't about encryption
+        true,  // default-on, but the None pubkey above makes it a no-op
     )
     .await
     .expect("send_email");

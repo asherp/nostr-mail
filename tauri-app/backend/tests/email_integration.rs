@@ -658,14 +658,20 @@ async fn non_ascii_subject_roundtrip() {
 // once the mock either stores raw bytes or decodes charset properly.
 
 /// Sent-folder decryption with the X-Nostr-Recipient header as the only
-/// anchor — no Nostr DM, no relay cross-reference.
+/// anchor — exercising the fresh-install / no-local-DB / no-contacts path.
 ///
-/// Scenario: alice sends bob an encrypted email, never publishes a matching
-/// Kind 14 DM. Later she opens her own Sent folder. Because she's the sender,
-/// her X-Nostr-Pubkey header points at *herself*, so the decryption routine
-/// would refuse self-DH if that were the only signal. The X-Nostr-Recipient
-/// header bob-pubkey rescues this: the pipeline picks it up as the ECDH
-/// counterparty and decrypts cleanly.
+/// Scenario: alice sends bob an encrypted email and never publishes a
+/// matching Kind 14 DM. On her usual device, her local DB stores bob's
+/// pubkey against this message_id, so reopening the Sent folder Just
+/// Works. But on a fresh install — or after the relays drop her DMs and
+/// bob isn't in her contacts — that local lookup misses. The
+/// X-Nostr-Recipient header is what rescues those cases: the decrypt
+/// pipeline picks it up as the ECDH counterparty without needing any
+/// device-local or relay state.
+///
+/// This test simulates that "no other anchor available" path by calling
+/// the pipeline with `sender_pubkey=None, recipient_pubkey=Some(header)`
+/// — no DB hint passed in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sent_mail_decrypts_via_recipient_header_without_dm() {
     let mock = spawn_mock_email().await;
@@ -746,15 +752,22 @@ async fn sent_mail_decrypts_via_recipient_header_without_dm() {
     );
 }
 
-/// Negative companion: without the X-Nostr-Recipient header, alice can't
-/// decrypt her own sent mail — there's no signal pointing at bob, and the
-/// in-armor sig pubkey is alice's own (self-DH is refused upstream).
+/// Negative companion at the pipeline level: with no counterparty hint
+/// (no header in the email, and no local-DB or contacts lookup feeding a
+/// hint in), the decrypt pipeline can't recover the plaintext.
 ///
-/// This is what the recipient header rescues. If this test ever starts
-/// passing, either the header became optional (regression) or some other
-/// channel started leaking the counterparty pubkey into the email.
+/// Caveat for readers: this is NOT the same as "alice can't read her own
+/// sent mail without the header" in real life. On the sending device the
+/// local DB stores recipient_pubkey against this message_id, so the UI
+/// passes that in as the hint and decryption succeeds without any header.
+/// What this test pins down is the worst-case path — fresh install, DM
+/// not in relay history, recipient not in contacts — where the
+/// X-Nostr-Recipient header is the only thing that can rescue Sent-folder
+/// decryption. If this test ever flips to passing, the pipeline grew a
+/// new way to recover the counterparty pubkey on its own and the
+/// fresh-install fallback story should be revisited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sent_mail_undecryptable_without_recipient_header_or_dm() {
+async fn sent_mail_undecryptable_without_any_counterparty_hint() {
     let mock = spawn_mock_email().await;
     let (alice_nsec, alice_npub, _) = test_keypair(1);
     let (_bob_nsec, bob_npub, _) = test_keypair(2);

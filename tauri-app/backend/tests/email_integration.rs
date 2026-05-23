@@ -656,3 +656,170 @@ async fn non_ascii_subject_roundtrip() {
 // in our send/receive pipeline — production paths re-parse raw RFC822
 // bytes with mailparse and handle charset correctly. Restore this test
 // once the mock either stores raw bytes or decodes charset properly.
+
+/// Sent-folder decryption with the X-Nostr-Recipient header as the only
+/// anchor — no Nostr DM, no relay cross-reference.
+///
+/// Scenario: alice sends bob an encrypted email, never publishes a matching
+/// Kind 14 DM. Later she opens her own Sent folder. Because she's the sender,
+/// her X-Nostr-Pubkey header points at *herself*, so the decryption routine
+/// would refuse self-DH if that were the only signal. The X-Nostr-Recipient
+/// header bob-pubkey rescues this: the pipeline picks it up as the ECDH
+/// counterparty and decrypts cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sent_mail_decrypts_via_recipient_header_without_dm() {
+    let mock = spawn_mock_email().await;
+    let (alice_nsec, alice_npub, _) = test_keypair(1);
+    let (_bob_nsec, bob_npub, _) = test_keypair(2);
+
+    let alice_config = email_config(
+        "alice@test.local",
+        "password-alice",
+        &alice_nsec,
+        mock.smtp_addr,
+        mock.imap_addr,
+    );
+
+    let plaintext = "Sent-folder anchor: bob can read this, and so can I.";
+    let subject = "sent-folder anchor test";
+
+    let ciphertext = nip44_encrypt(&alice_nsec, &bob_npub, plaintext);
+    let armored_body = format!(
+        "-----BEGIN NOSTR NIP-44 ENCRYPTED BODY-----\n{}\n-----END NOSTR MESSAGE-----",
+        ciphertext
+    );
+
+    // Default-on path: include_recipient_header=true + recipient_pubkey supplied.
+    email::send_email(
+        &alice_config,
+        "bob@test.local",
+        subject,
+        &armored_body,
+        Some(&alice_npub),
+        None,
+        None,
+        None,
+        None,
+        None,
+        true,
+        true,
+        Some(&bob_npub),
+        true,
+    )
+    .await
+    .expect("send_email");
+
+    let inbox = mock.store.get_mailbox_emails("INBOX").await;
+    assert_eq!(inbox.len(), 1);
+    let delivered = &inbox[0];
+    let raw_headers = raw_headers_from_store(delivered);
+
+    // The whole point of the header: it's there, and it points at bob.
+    let recipient_from_header = email::extract_nostr_recipient_from_headers(&raw_headers)
+        .expect("X-Nostr-Recipient header present");
+    assert_eq!(
+        recipient_from_header, bob_npub,
+        "recipient header should pin bob as decryption counterparty"
+    );
+
+    // Alice opens her Sent folder. She's the sender, so sender_pubkey is None
+    // (the X-Nostr-Pubkey header would point at herself → self-DH refusal).
+    // The pipeline picks up recipient_pubkey from the X-Nostr-Recipient header
+    // and uses it as the ECDH counterparty.
+    let result = email::decrypt_email_body_pipeline(
+        &alice_nsec,
+        &delivered.body,
+        &delivered.subject,
+        None,
+        Some(&recipient_from_header),
+    )
+    .expect("decrypt_email_body_pipeline");
+
+    assert!(
+        result.success,
+        "sent-mail decrypt should succeed via recipient header; error={:?}",
+        result.error
+    );
+    assert_eq!(
+        result.body, plaintext,
+        "sent-mail plaintext mismatch after recipient-header decrypt"
+    );
+}
+
+/// Negative companion: without the X-Nostr-Recipient header, alice can't
+/// decrypt her own sent mail — there's no signal pointing at bob, and the
+/// in-armor sig pubkey is alice's own (self-DH is refused upstream).
+///
+/// This is what the recipient header rescues. If this test ever starts
+/// passing, either the header became optional (regression) or some other
+/// channel started leaking the counterparty pubkey into the email.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sent_mail_undecryptable_without_recipient_header_or_dm() {
+    let mock = spawn_mock_email().await;
+    let (alice_nsec, alice_npub, _) = test_keypair(1);
+    let (_bob_nsec, bob_npub, _) = test_keypair(2);
+
+    let alice_config = email_config(
+        "alice@test.local",
+        "password-alice",
+        &alice_nsec,
+        mock.smtp_addr,
+        mock.imap_addr,
+    );
+
+    let plaintext = "no header, no DM, no decrypt for the sender";
+    let subject = "sent-folder anchor missing";
+
+    let ciphertext = nip44_encrypt(&alice_nsec, &bob_npub, plaintext);
+    let armored_body = format!(
+        "-----BEGIN NOSTR NIP-44 ENCRYPTED BODY-----\n{}\n-----END NOSTR MESSAGE-----",
+        ciphertext
+    );
+
+    // include_recipient_header=false AND recipient_pubkey=None → no anchor.
+    email::send_email(
+        &alice_config,
+        "bob@test.local",
+        subject,
+        &armored_body,
+        Some(&alice_npub),
+        None,
+        None,
+        None,
+        None,
+        None,
+        true,
+        true,
+        None,
+        false,
+    )
+    .await
+    .expect("send_email");
+
+    let inbox = mock.store.get_mailbox_emails("INBOX").await;
+    assert_eq!(inbox.len(), 1);
+    let delivered = &inbox[0];
+    let raw_headers = raw_headers_from_store(delivered);
+
+    // Header must really be absent — this is the precondition for the test.
+    assert!(
+        email::extract_nostr_recipient_from_headers(&raw_headers).is_none(),
+        "X-Nostr-Recipient should be absent; sent-folder undecryptability test is moot otherwise"
+    );
+
+    // Alice's Sent-folder decrypt attempt with no counterparty hint fails.
+    let result = email::decrypt_email_body_pipeline(
+        &alice_nsec,
+        &delivered.body,
+        &delivered.subject,
+        None,
+        None,
+    )
+    .expect("decrypt_email_body_pipeline returns Ok even when content can't be decrypted");
+
+    assert!(
+        !result.success,
+        "sent-mail decrypt should NOT succeed without a counterparty anchor; got body={:?}",
+        result.body
+    );
+}

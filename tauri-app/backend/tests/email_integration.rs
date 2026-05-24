@@ -836,3 +836,746 @@ async fn sent_mail_undecryptable_without_any_counterparty_hint() {
         result.body
     );
 }
+
+/// Reply to a *signed plaintext* email: alice's full armor (SIGNED BODY +
+/// SIGNATURE) is quoted with `> ` prefixes and nested *inside* bob's own
+/// SIGNED BODY region. After SMTP roundtrip, both signatures must verify
+/// recursively — bob's at depth 0 over `bob_prose ++ alice_prose`, and
+/// alice's at depth 1 over alice's prose alone.
+///
+/// Three properties this pins:
+///   1. `parse_armor_depth` finds the nested region via unanchored marker
+///      match — the `> ` prefix is transparent.
+///   2. Glossia decode ignores `> `, dashes, and whitespace, so alice's
+///      `> `-prefixed payload words decode to the same bytes as the
+///      unquoted original.
+///   3. `verify_all_signatures_inline` walks every depth and re-verifies
+///      each level independently.
+///
+/// If any of those drift (regex anchored to `^`, decoder loses BIP-39-style
+/// punctuation-stripping, recursion stops at depth 0), this test fails
+/// before the reply chain breaks silently in production.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_plaintext_reply_preserves_nested_signature() {
+    let mock = spawn_mock_email().await;
+    let (alice_nsec, alice_npub, _) = test_keypair(1);
+    let (bob_nsec, bob_npub, _) = test_keypair(2);
+
+    let alice_config = email_config(
+        "alice@test.local",
+        "password-alice",
+        &alice_nsec,
+        mock.smtp_addr,
+        mock.imap_addr,
+    );
+    let bob_config = email_config(
+        "bob@test.local",
+        "password-bob",
+        &bob_nsec,
+        mock.smtp_addr,
+        mock.imap_addr,
+    );
+
+    // Shared: load latin wordlist once for bitpack_fixed SIGNATURE encoding.
+    let words = glossia::load_payload_words_for_wordlist("latin", "default")
+        .expect("load latin wordlist");
+    let tree = glossia::WordlistTree::new(words);
+
+    // Build a SIGNED BODY + SIGNATURE armor block for `plaintext` signed by
+    // `nsec`/`npub`. Mirrors `clearsigned_plaintext_verifies_via_header`'s
+    // inline construction — partial first, sign over
+    // `extract_ciphertext_binary(&partial)`, then assemble the full block.
+    let build_signed_armor = |nsec: &str, npub: &str, plaintext: &str| -> String {
+        let encoded = glossia_encode_latin_body(plaintext);
+        let partial = format!(
+            "----- BEGIN NOSTR SIGNED BODY -----\n{}\n----- END NOSTR MESSAGE -----",
+            encoded
+        );
+        let to_sign = email::extract_ciphertext_binary(&partial);
+        let sig_hex = crypto::sign_data_bytes(nsec, &to_sign).expect("sign_data_bytes");
+        let pubkey_hex = npub_to_hex(npub);
+
+        let mut combined = Vec::with_capacity(96);
+        combined.extend_from_slice(&hex_decode(&sig_hex));
+        combined.extend_from_slice(&hex_decode(&pubkey_hex));
+        let sig_words = glossia::codec::encode_base_n(&combined, &tree, "bitpack_fixed")
+            .expect("bitpack_fixed encode");
+        let sig_block = sig_words.join(" ");
+
+        format!(
+            "----- BEGIN NOSTR SIGNED BODY -----\n\
+             {encoded}\n\
+             ----- BEGIN NOSTR SIGNATURE -----\n\
+             {sig_block}\n\
+             ----- END NOSTR MESSAGE -----"
+        )
+    };
+
+    // ─── Hop 1: alice → bob (signed plaintext, not encrypted) ──────────────
+    let alice_plaintext = "Public announcement: meeting moved to 4pm.";
+    let alice_msgid = "alice-signed-root-001@test.local";
+    let alice_armor = build_signed_armor(&alice_nsec, &alice_npub, alice_plaintext);
+    // Plaintext shown above the armor mirrors what the frontend produces for
+    // non-nostr-mail clients (see `clearsigned_plaintext_verifies_via_header`).
+    let alice_body = format!("{alice_plaintext}\n\n{alice_armor}");
+
+    email::send_email(
+        &alice_config,
+        "bob@test.local",
+        "announcement",
+        &alice_body,
+        Some(&alice_npub),
+        Some(alice_msgid),
+        None,
+        None,
+        None,
+        None,
+        true,  // include_pubkey_header
+        true,  // include_sig_header
+        None,  // no recipient (clearsigned, no encryption context)
+        false, // skip recipient header
+    )
+    .await
+    .expect("alice send_email");
+
+    // ─── Hop 2: bob → alice (reply, nesting alice's armor inside bob's) ───
+    //
+    // Quote alice's entire armor verbatim, including markers, SIGNATURE,
+    // and the END marker. The `> ` prefix is per-line; `parse_armor_depth`
+    // sees the nested markers via unanchored `contains()`, and the glossia
+    // decoder strips `>` as non-alphanumeric punctuation when matching
+    // payload words.
+    let alice_quoted: String = alice_armor
+        .lines()
+        .map(|l| format!("> {}", l))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let bob_plaintext = "Acknowledged — see you at 4.";
+    let bob_encoded = glossia_encode_latin_body(bob_plaintext);
+
+    // Partial bob: alice's quoted armor lives *inside* bob's SIGNED BODY
+    // region (between bob's BEGIN and bob's END), so bob's canonical bytes
+    // are `bob_prose_decoded ++ alice_prose_decoded` per
+    // extract_ciphertext_binary's recursion (src/email.rs:2931-2948).
+    let bob_partial = format!(
+        "----- BEGIN NOSTR SIGNED BODY -----\n\
+         {bob_encoded}\n\
+         {alice_quoted}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+    let bob_to_sign = email::extract_ciphertext_binary(&bob_partial);
+    let bob_sig_hex = crypto::sign_data_bytes(&bob_nsec, &bob_to_sign).expect("bob sign");
+    let bob_pubkey_hex = npub_to_hex(&bob_npub);
+
+    let mut bob_combined = Vec::with_capacity(96);
+    bob_combined.extend_from_slice(&hex_decode(&bob_sig_hex));
+    bob_combined.extend_from_slice(&hex_decode(&bob_pubkey_hex));
+    let bob_sig_words = glossia::codec::encode_base_n(&bob_combined, &tree, "bitpack_fixed")
+        .expect("bob bitpack_fixed encode");
+    let bob_sig_block = bob_sig_words.join(" ");
+
+    // Final bob body: plaintext preamble + outer SIGNED BODY containing
+    // (bob's prose, alice's quoted nested armor) + bob's SIGNATURE + END.
+    // Inserting bob's SIGNATURE after the quoted region doesn't change the
+    // canonical bytes — parse_armor_depth's body-collection loop breaks at
+    // `BEGIN NOSTR SIGNATURE` at depth 1, same as without it.
+    let bob_reply_body = format!(
+        "{bob_plaintext}\n\n\
+         ----- BEGIN NOSTR SIGNED BODY -----\n\
+         {bob_encoded}\n\
+         {alice_quoted}\n\
+         ----- BEGIN NOSTR SIGNATURE -----\n\
+         {bob_sig_block}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+
+    let bob_msgid = "bob-signed-reply-001@test.local";
+    email::send_email(
+        &bob_config,
+        "alice@test.local",
+        "Re: announcement",
+        &bob_reply_body,
+        Some(&bob_npub),
+        Some(bob_msgid),
+        None,
+        None,
+        Some(alice_msgid),
+        Some(alice_msgid),
+        true,
+        true,
+        None,
+        false,
+    )
+    .await
+    .expect("bob send_email reply");
+
+    // ─── Pull both messages out of the mock store ──────────────────────────
+    let inbox = mock.store.get_mailbox_emails("INBOX").await;
+    assert_eq!(inbox.len(), 2, "expected one root + one reply in INBOX");
+    let root = inbox
+        .iter()
+        .find(|e| e.from.to_string() == "alice@test.local")
+        .expect("alice's root is in INBOX");
+    let reply = inbox
+        .iter()
+        .find(|e| e.from.to_string() == "bob@test.local")
+        .expect("bob's reply is in INBOX");
+
+    let lookup = |email: &mock_email::Email, name: &str| -> Option<String> {
+        email
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let normalize = |s: &str| {
+        s.trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string()
+    };
+
+    // (1) Both root and reply have correct Message-ID propagation
+    assert_eq!(
+        normalize(&lookup(root, "Message-ID").expect("root Message-ID")),
+        alice_msgid
+    );
+    assert_eq!(
+        normalize(&lookup(reply, "Message-ID").expect("reply Message-ID")),
+        bob_msgid
+    );
+
+    // (2) Threading headers
+    let in_reply_to = lookup(reply, "In-Reply-To").expect("reply In-Reply-To");
+    assert_eq!(normalize(&in_reply_to), alice_msgid, "In-Reply-To");
+    let references = lookup(reply, "References").expect("reply References");
+    let refs_normalized: Vec<String> =
+        references.split_whitespace().map(|s| normalize(s)).collect();
+    assert_eq!(
+        refs_normalized,
+        vec![alice_msgid.to_string()],
+        "References on first reply"
+    );
+
+    // (3) Re: subject prefix survived
+    assert!(
+        reply.subject.starts_with("Re: "),
+        "reply subject must start with 'Re: '; got {:?}",
+        reply.subject
+    );
+
+    // (4) The quoted armor markers survive verbatim in the wire body —
+    //     per-line `> ` prefix on every alice line.
+    assert!(
+        reply.body.contains("> ----- BEGIN NOSTR SIGNED BODY -----"),
+        "quoted alice BEGIN marker missing"
+    );
+    assert!(
+        reply.body.contains("> ----- BEGIN NOSTR SIGNATURE -----"),
+        "quoted alice SIGNATURE marker missing"
+    );
+    assert!(
+        reply.body.contains("> ----- END NOSTR MESSAGE -----"),
+        "quoted alice END marker missing"
+    );
+
+    // (5) ⭐ Both signatures verify recursively. This is the assertion the
+    //     rest of the test exists to enable.
+    let results = email::verify_all_signatures_inline(&reply.body);
+    assert_eq!(
+        results.len(),
+        2,
+        "expected outer (bob) + nested (alice) signature; got {:?}",
+        results
+    );
+
+    // Results are ordered innermost-first by verify_all_signatures_recursive:
+    // alice (depth 1) lands at index 0, bob (depth 0) at index 1.
+    let alice_result = results.iter().find(|r| r.depth == 1).expect("alice depth 1");
+    let bob_result = results.iter().find(|r| r.depth == 0).expect("bob depth 0");
+
+    assert!(
+        bob_result.is_valid,
+        "bob's outer signature must verify; got {:?}",
+        bob_result
+    );
+    assert!(
+        alice_result.is_valid,
+        "alice's nested signature must verify through `> ` quoting; got {:?}",
+        alice_result
+    );
+    assert_eq!(
+        bob_result.pubkey_hex.as_deref(),
+        Some(npub_to_hex(&bob_npub).as_str()),
+        "bob signed at depth 0"
+    );
+    assert_eq!(
+        alice_result.pubkey_hex.as_deref(),
+        Some(npub_to_hex(&alice_npub).as_str()),
+        "alice signed at depth 1"
+    );
+
+    // (6) No plaintext leak: alice's original plaintext appears nowhere in
+    //     the wire body. The frontend never quotes plaintext for a signed
+    //     reply — only the encoded armor — so a regression that "helpfully"
+    //     decoded for display before send would trip this.
+    assert!(
+        !reply.body.contains(alice_plaintext),
+        "PLAINTEXT LEAK: alice's plaintext appears in bob's reply body"
+    );
+
+    // (7) Replicate database::compute_thread_id's rule locally and confirm
+    //     both messages group under alice's normalized id.
+    let thread_id_of = |msg_id: &str, refs: Option<&str>, irt: Option<&str>| -> String {
+        if let Some(r) = refs {
+            if let Some(first) = r.split_whitespace().next() {
+                return normalize(first);
+            }
+        }
+        if let Some(p) = irt {
+            if let Some(first) = p.split_whitespace().next() {
+                return normalize(first);
+            }
+        }
+        normalize(msg_id)
+    };
+    let root_thread = thread_id_of(alice_msgid, None, None);
+    let reply_thread = thread_id_of(bob_msgid, Some(&references), Some(&in_reply_to));
+    assert_eq!(
+        root_thread, reply_thread,
+        "root and reply must compute to the same thread_id"
+    );
+    assert_eq!(reply_thread, alice_msgid, "thread root is alice's Message-ID");
+}
+
+/// Encrypted reply: alice NIP-44-encrypts to bob with an inline SIGNATURE
+/// block; bob NIP-44-encrypts a reply with alice's *entire* armor (BODY +
+/// SIGNATURE) nested directly inside bob's ENCRYPTED BODY region — with NO
+/// `> ` quote prefix (per the production encrypted-reply structure; the
+/// `> ` prefix is only used for signed plaintext, where it gives a UX
+/// affordance to non-nostr-mail clients).
+///
+/// After SMTP roundtrip the test asserts:
+///   - Bob's outer signature verifies at depth 0 over `bob_ct ++ alice_ct`.
+///   - Alice's nested signature verifies at depth 1 over her own ciphertext.
+///   - `decrypt_email_body_pipeline` as alice returns two `block_results`
+///     (innermost-first), each successfully decrypted to the original
+///     plaintext at that level.
+///
+/// X25519 ECDH is symmetric, so alice can decrypt her own outbound ct1
+/// (she's one of the two participants) — that's what makes the nested
+/// re-decrypt possible on the recipient side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip44_reply_preserves_nested_encrypted_armor() {
+    let mock = spawn_mock_email().await;
+    let (alice_nsec, alice_npub, _) = test_keypair(1);
+    let (bob_nsec, bob_npub, _) = test_keypair(2);
+
+    let alice_config = email_config(
+        "alice@test.local",
+        "password-alice",
+        &alice_nsec,
+        mock.smtp_addr,
+        mock.imap_addr,
+    );
+    let bob_config = email_config(
+        "bob@test.local",
+        "password-bob",
+        &bob_nsec,
+        mock.smtp_addr,
+        mock.imap_addr,
+    );
+
+    let words = glossia::load_payload_words_for_wordlist("latin", "default")
+        .expect("load latin wordlist");
+    let tree = glossia::WordlistTree::new(words);
+
+    // Inline helper: build a NIP-44 encrypted armor block with inline
+    // SIGNATURE over the glossia-decoded base64 ciphertext bytes (matches
+    // production: `extract_ciphertext_binary` returns the base64 string
+    // bytes regardless of whether they were stored raw or glossia-encoded).
+    let build_signed_nip44 = |nsec: &str, npub: &str, ct_b64: &str| -> String {
+        let ct_glossia = glossia_encode_latin_body(ct_b64);
+        let partial = format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n{ct_glossia}\n----- END NOSTR MESSAGE -----"
+        );
+        let to_sign = email::extract_ciphertext_binary(&partial);
+        let sig_hex = crypto::sign_data_bytes(nsec, &to_sign).expect("sign_data_bytes");
+        let pubkey_hex = npub_to_hex(npub);
+
+        let mut combined = Vec::with_capacity(96);
+        combined.extend_from_slice(&hex_decode(&sig_hex));
+        combined.extend_from_slice(&hex_decode(&pubkey_hex));
+        let sig_words = glossia::codec::encode_base_n(&combined, &tree, "bitpack_fixed")
+            .expect("bitpack_fixed encode");
+        let sig_block = sig_words.join(" ");
+
+        format!(
+            "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+             {ct_glossia}\n\
+             ----- BEGIN NOSTR SIGNATURE -----\n\
+             {sig_block}\n\
+             ----- END NOSTR MESSAGE -----"
+        )
+    };
+
+    // ─── Hop 1: alice → bob (NIP-44 encrypted, signed) ─────────────────────
+    let alice_plaintext = "Hello bob, want coffee Thursday?";
+    let alice_ct = nip44_encrypt(&alice_nsec, &bob_npub, alice_plaintext);
+    let alice_armor = build_signed_nip44(&alice_nsec, &alice_npub, &alice_ct);
+    let alice_msgid = "alice-enc-root-001@test.local";
+
+    email::send_email(
+        &alice_config,
+        "bob@test.local",
+        "coffee thursday?",
+        &alice_armor,
+        Some(&alice_npub),
+        Some(alice_msgid),
+        None,
+        None,
+        None,
+        None,
+        true,
+        true,
+        Some(&bob_npub),
+        true,
+    )
+    .await
+    .expect("alice send_email");
+
+    // ─── Hop 2: bob → alice (NIP-44 encrypted reply, alice nested inside) ─
+    let bob_plaintext = "Sure, 3pm at the usual place?";
+    let bob_ct = nip44_encrypt(&bob_nsec, &alice_npub, bob_plaintext);
+    let bob_ct_glossia = glossia_encode_latin_body(&bob_ct);
+
+    // Nest alice's full armor inside bob's encrypted body — NO `> ` prefix.
+    // parse_armor_depth finds the inner BEGIN/END pair via depth counting.
+    let bob_partial = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+         {bob_ct_glossia}\n\
+         {alice_armor}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+    let bob_to_sign = email::extract_ciphertext_binary(&bob_partial);
+    let bob_sig_hex = crypto::sign_data_bytes(&bob_nsec, &bob_to_sign).expect("bob sign");
+    let bob_pubkey_hex = npub_to_hex(&bob_npub);
+
+    let mut bob_combined = Vec::with_capacity(96);
+    bob_combined.extend_from_slice(&hex_decode(&bob_sig_hex));
+    bob_combined.extend_from_slice(&hex_decode(&bob_pubkey_hex));
+    let bob_sig_words = glossia::codec::encode_base_n(&bob_combined, &tree, "bitpack_fixed")
+        .expect("bob bitpack_fixed encode");
+    let bob_sig_block = bob_sig_words.join(" ");
+
+    let bob_reply_body = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+         {bob_ct_glossia}\n\
+         {alice_armor}\n\
+         ----- BEGIN NOSTR SIGNATURE -----\n\
+         {bob_sig_block}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+
+    let bob_msgid = "bob-enc-reply-001@test.local";
+    email::send_email(
+        &bob_config,
+        "alice@test.local",
+        "Re: coffee thursday?",
+        &bob_reply_body,
+        Some(&bob_npub),
+        Some(bob_msgid),
+        None,
+        None,
+        Some(alice_msgid),
+        Some(alice_msgid),
+        true,
+        true,
+        Some(&alice_npub),
+        true,
+    )
+    .await
+    .expect("bob send_email reply");
+
+    let inbox = mock.store.get_mailbox_emails("INBOX").await;
+    assert_eq!(inbox.len(), 2, "expected one root + one reply in INBOX");
+    let reply = inbox
+        .iter()
+        .find(|e| e.from.to_string() == "bob@test.local")
+        .expect("bob's reply is in INBOX");
+
+    // (1) ⭐ Both signatures verify recursively.
+    let results = email::verify_all_signatures_inline(&reply.body);
+    assert_eq!(
+        results.len(),
+        2,
+        "expected outer (bob) + nested (alice) signature; got {:?}",
+        results
+    );
+    let alice_result = results.iter().find(|r| r.depth == 1).expect("alice depth 1");
+    let bob_result = results.iter().find(|r| r.depth == 0).expect("bob depth 0");
+    assert!(bob_result.is_valid, "bob's outer sig must verify: {:?}", bob_result);
+    assert!(
+        alice_result.is_valid,
+        "alice's nested sig must verify (no `> ` prefix in encrypted nesting): {:?}",
+        alice_result
+    );
+    assert_eq!(bob_result.body_type, "encrypted");
+    assert_eq!(alice_result.body_type, "encrypted");
+
+    // (2) ⭐ Recursive decrypt as alice yields two layers, each decrypts
+    //     to its respective plaintext. block_results are innermost-first.
+    let decrypt = email::decrypt_email_body_pipeline(
+        &alice_nsec,
+        &reply.body,
+        &reply.subject,
+        Some(&bob_npub),
+        Some(&alice_npub),
+    )
+    .expect("decrypt_email_body_pipeline");
+    assert!(decrypt.success, "decrypt must succeed: {:?}", decrypt.error);
+    assert_eq!(
+        decrypt.block_results.len(),
+        2,
+        "expected 2 decrypted blocks (alice innermost, bob outermost); got {:?}",
+        decrypt.block_results
+    );
+    let inner = &decrypt.block_results[0];
+    let outer = &decrypt.block_results[1];
+    assert!(inner.was_encrypted);
+    assert!(outer.was_encrypted);
+    assert_eq!(
+        inner.decrypted_text.as_deref(),
+        Some(alice_plaintext),
+        "alice's nested ciphertext must decrypt to her original plaintext; error={:?}",
+        inner.error
+    );
+    assert_eq!(
+        outer.decrypted_text.as_deref(),
+        Some(bob_plaintext),
+        "bob's outer ciphertext must decrypt to his reply plaintext; error={:?}",
+        outer.error
+    );
+
+    // (3) No plaintext leak: neither plaintext appears anywhere in the wire body.
+    assert!(
+        !reply.body.contains(alice_plaintext),
+        "alice's plaintext leaked into wire body"
+    );
+    assert!(
+        !reply.body.contains(bob_plaintext),
+        "bob's plaintext leaked into wire body"
+    );
+
+    // (4) Threading sanity: In-Reply-To points at alice's root, Re: prefix kept.
+    let in_reply_to = reply
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("In-Reply-To"))
+        .map(|(_, v)| v.clone())
+        .expect("In-Reply-To header");
+    let normalize = |s: &str| {
+        s.trim().trim_start_matches('<').trim_end_matches('>').to_string()
+    };
+    assert_eq!(normalize(&in_reply_to), alice_msgid);
+    assert!(reply.subject.starts_with("Re: "));
+}
+
+/// Three-level encrypted reply chain (matches the production example
+/// pattern exactly): alice→bob, then bob→alice nests alice's armor, then
+/// alice→bob nests bob's full reply armor. The final wire body has three
+/// `BEGIN NOSTR NIP-44 ENCRYPTED BODY` markers followed by three
+/// `SIGNATURE`/`END NOSTR MESSAGE` pairs unwinding innermost-first.
+///
+/// We construct all three layers locally and only SMTP-send hop 3 (the
+/// recursive structure is the unit under test, not the threading chain
+/// — that's covered separately by the 2-level test).
+///
+/// Asserts: three signatures verify at depths 0/1/2, and a recipient-side
+/// recursive decrypt yields three plaintext layers in the correct order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip44_three_level_reply_chain() {
+    let mock = spawn_mock_email().await;
+    let (alice_nsec, alice_npub, _) = test_keypair(1);
+    let (bob_nsec, bob_npub, _) = test_keypair(2);
+
+    let alice_config = email_config(
+        "alice@test.local",
+        "password-alice",
+        &alice_nsec,
+        mock.smtp_addr,
+        mock.imap_addr,
+    );
+
+    let words = glossia::load_payload_words_for_wordlist("latin", "default")
+        .expect("load latin wordlist");
+    let tree = glossia::WordlistTree::new(words);
+
+    // Inline helper: sign+encode a 96-byte (sig||pubkey) blob as a
+    // bitpack_fixed SIGNATURE block body (just the words, no markers).
+    let sig_block = |nsec: &str, npub: &str, canonical: &[u8]| -> String {
+        let sig_hex = crypto::sign_data_bytes(nsec, canonical).expect("sign");
+        let pubkey_hex = npub_to_hex(npub);
+        let mut combined = Vec::with_capacity(96);
+        combined.extend_from_slice(&hex_decode(&sig_hex));
+        combined.extend_from_slice(&hex_decode(&pubkey_hex));
+        glossia::codec::encode_base_n(&combined, &tree, "bitpack_fixed")
+            .expect("bitpack_fixed encode")
+            .join(" ")
+    };
+
+    // ─── Layer 1: alice → bob (innermost, will end up at depth 2) ─────────
+    let pt_1 = "Hello bob, want coffee?";
+    let ct_1 = nip44_encrypt(&alice_nsec, &bob_npub, pt_1);
+    let ct_1_glossia = glossia_encode_latin_body(&ct_1);
+    let partial_1 = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n{ct_1_glossia}\n----- END NOSTR MESSAGE -----"
+    );
+    let canonical_1 = email::extract_ciphertext_binary(&partial_1);
+    let sig_1 = sig_block(&alice_nsec, &alice_npub, &canonical_1);
+    let armor_1 = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+         {ct_1_glossia}\n\
+         ----- BEGIN NOSTR SIGNATURE -----\n\
+         {sig_1}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+
+    // ─── Layer 2: bob → alice reply (will end up at depth 1) ──────────────
+    let pt_2 = "Sure, 3pm at the usual place?";
+    let ct_2 = nip44_encrypt(&bob_nsec, &alice_npub, pt_2);
+    let ct_2_glossia = glossia_encode_latin_body(&ct_2);
+    let partial_2 = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+         {ct_2_glossia}\n\
+         {armor_1}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+    let canonical_2 = email::extract_ciphertext_binary(&partial_2);
+    let sig_2 = sig_block(&bob_nsec, &bob_npub, &canonical_2);
+    let armor_2 = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+         {ct_2_glossia}\n\
+         {armor_1}\n\
+         ----- BEGIN NOSTR SIGNATURE -----\n\
+         {sig_2}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+
+    // ─── Layer 3: alice → bob reply-to-reply (outermost, depth 0) ─────────
+    let pt_3 = "Great, see you then.";
+    let ct_3 = nip44_encrypt(&alice_nsec, &bob_npub, pt_3);
+    let ct_3_glossia = glossia_encode_latin_body(&ct_3);
+    let partial_3 = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+         {ct_3_glossia}\n\
+         {armor_2}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+    let canonical_3 = email::extract_ciphertext_binary(&partial_3);
+    let sig_3 = sig_block(&alice_nsec, &alice_npub, &canonical_3);
+    let armor_3 = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+         {ct_3_glossia}\n\
+         {armor_2}\n\
+         ----- BEGIN NOSTR SIGNATURE -----\n\
+         {sig_3}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+
+    // Sanity: the assembled body has exactly 3 BEGIN-BODY markers and
+    // 3 END-MESSAGE markers (one per layer). Pins our construction before
+    // we hand it to the wire.
+    assert_eq!(armor_3.matches("BEGIN NOSTR NIP-44 ENCRYPTED BODY").count(), 3);
+    assert_eq!(armor_3.matches("END NOSTR MESSAGE").count(), 3);
+
+    // ─── Send hop 3 via SMTP ──────────────────────────────────────────────
+    let msgid = "alice-enc-reply2-001@test.local";
+    email::send_email(
+        &alice_config,
+        "bob@test.local",
+        "Re: Re: coffee thursday?",
+        &armor_3,
+        Some(&alice_npub),
+        Some(msgid),
+        None,
+        None,
+        None,
+        None,
+        true,
+        true,
+        Some(&bob_npub),
+        true,
+    )
+    .await
+    .expect("send hop 3");
+
+    let inbox = mock.store.get_mailbox_emails("INBOX").await;
+    assert_eq!(inbox.len(), 1, "single-message test");
+    let delivered = &inbox[0];
+
+    // (1) ⭐ Three signatures verify at the right depths.
+    let results = email::verify_all_signatures_inline(&delivered.body);
+    assert_eq!(
+        results.len(),
+        3,
+        "expected 3 signatures across the nested chain; got {:?}",
+        results
+    );
+    for r in &results {
+        assert!(
+            r.is_valid,
+            "signature at depth {} must verify; result={:?}",
+            r.depth, r
+        );
+        assert_eq!(r.body_type, "encrypted");
+    }
+    let pk_at = |d: usize| -> String {
+        results
+            .iter()
+            .find(|r| r.depth == d)
+            .and_then(|r| r.pubkey_hex.clone())
+            .expect("signature at this depth")
+    };
+    assert_eq!(pk_at(0), npub_to_hex(&alice_npub), "depth 0 = alice (hop 3)");
+    assert_eq!(pk_at(1), npub_to_hex(&bob_npub),   "depth 1 = bob (hop 2)");
+    assert_eq!(pk_at(2), npub_to_hex(&alice_npub), "depth 2 = alice (hop 1)");
+
+    // (2) ⭐ Recursive decrypt as bob yields three plaintexts in
+    //     innermost-first order: [pt_1, pt_2, pt_3].
+    let decrypt = email::decrypt_email_body_pipeline(
+        &bob_nsec,
+        &delivered.body,
+        &delivered.subject,
+        Some(&alice_npub),
+        Some(&bob_npub),
+    )
+    .expect("decrypt pipeline");
+    assert!(decrypt.success, "decrypt failed: {:?}", decrypt.error);
+    assert_eq!(
+        decrypt.block_results.len(),
+        3,
+        "expected 3 decrypted layers; got {:?}",
+        decrypt.block_results
+    );
+    let texts: Vec<&str> = decrypt
+        .block_results
+        .iter()
+        .map(|b| b.decrypted_text.as_deref().unwrap_or("<none>"))
+        .collect();
+    assert_eq!(
+        texts,
+        vec![pt_1, pt_2, pt_3],
+        "innermost-first plaintext order must match the construction chain"
+    );
+
+    // (3) No plaintext leak at any layer.
+    for pt in &[pt_1, pt_2, pt_3] {
+        assert!(
+            !delivered.body.contains(pt),
+            "plaintext {:?} leaked into wire body",
+            pt
+        );
+    }
+}

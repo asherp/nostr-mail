@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - main
+      - android
     tags:
       - "v*"
   workflow_dispatch:
@@ -226,7 +227,7 @@ jobs:
         working-directory: tauri-app/backend
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
-        run: cargo tauri android build --apk=true --target aarch64
+        run: cargo tauri android build --apk --target aarch64
 
       - name: Rename APK with version
         run: |

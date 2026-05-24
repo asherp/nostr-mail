@@ -1308,6 +1308,61 @@ fn extract_armor_body_content(body: &str) -> Option<&str> {
     }
 }
 
+/// Decode a fixed-width payload produced by `encode_base_n("bitpack_fixed")`
+/// — the same codec that `glossia_encode_raw_base_n` (lib.rs) uses for
+/// signature and pubkey blocks. Mirrors that encoder exactly: no header
+/// word, byte length known up front.
+///
+/// Tries each (language, wordlist) candidate ranked by `detect_dialect`
+/// and returns the first decode that produces exactly `expected_bytes`.
+/// This is the correct decoder for SIGNATURE/SEAL block content. The
+/// `decode_from_language` path used by `try_glossia_decode_to_bytes`
+/// assumes a leading bitpack header word and is wrong for raw fixed
+/// payloads (it round-trips by luck for high-entropy inputs).
+fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<u8>> {
+    use std::collections::HashSet;
+
+    let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.is_empty() {
+        return None;
+    }
+
+    let candidates = glossia::detect_dialect(&words);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    for cand in candidates {
+        let payload_words = match glossia::load_payload_words_for_wordlist(&cand.language, &cand.wordlist) {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
+        let payload_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
+
+        let extracted: Vec<String> = text
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|w| payload_set.contains(w.as_str()))
+            .collect();
+
+        if extracted.is_empty() {
+            continue;
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            glossia::codec::decode_base_n_fixed(&extracted, &payload_tree, "bitpack_fixed", expected_bytes)
+        }));
+
+        if let Ok(Ok(bytes)) = result {
+            if bytes.len() == expected_bytes {
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
 /// Try to decode glossia-encoded text (BIP39/Latin words) back to binary bytes.
 /// Returns None if the text doesn't appear to be glossia-encoded or decode fails.
 /// Uses catch_unwind because glossia's codec can panic on malformed input
@@ -1497,7 +1552,13 @@ fn try_decode_as_pubkey(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() { return None; }
 
-    // Glossia decode → 32 bytes
+    // Raw bitpack_fixed decode (matches glossia_encode_raw_base_n on the encode side)
+    if let Some(bytes) = try_decode_raw_base_n_fixed(trimmed, 32) {
+        return Some(hex::encode(bytes));
+    }
+
+    // Legacy: decode_from_language path (body-dialect with header word).
+    // Kept as a fallback for older messages encoded via the body pipeline.
     if let Some(bytes) = try_glossia_decode_to_bytes(trimmed) {
         if bytes.len() == 32 {
             return Some(hex::encode(bytes));
@@ -1527,7 +1588,12 @@ fn try_decode_as_signature(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() { return None; }
 
-    // Glossia decode → 64 bytes
+    // Raw bitpack_fixed decode (matches glossia_encode_raw_base_n on the encode side)
+    if let Some(bytes) = try_decode_raw_base_n_fixed(trimmed, 64) {
+        return Some(hex::encode(bytes));
+    }
+
+    // Legacy: decode_from_language path (body-dialect with header word).
     if let Some(bytes) = try_glossia_decode_to_bytes(trimmed) {
         if bytes.len() == 64 {
             return Some(hex::encode(bytes));
@@ -1549,7 +1615,15 @@ fn try_decode_as_signature(text: &str) -> Option<String> {
 ///   2. Blank-line split (new format): sig and pubkey separated by empty line
 ///   3. Last-line heuristic: last line is npub/hex pubkey, rest is sig
 fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
-    // Phase 1: Combined 96-byte (masked mode — glossia encodes sig||pubkey as one payload)
+    // Phase 1a: Combined 96-byte (raw bitpack_fixed — matches frontend's
+    // glossia_encode_raw_base_n on the encode side).
+    if let Some(bytes) = try_decode_raw_base_n_fixed(content, 96) {
+        let sig_hex = hex::encode(&bytes[..64]);
+        let pubkey_hex = hex::encode(&bytes[64..]);
+        return Some((sig_hex, pubkey_hex));
+    }
+
+    // Phase 1b: Legacy combined 96-byte via decode_from_language (body-dialect).
     if let Some(bytes) = try_glossia_decode_to_bytes(content) {
         if bytes.len() == 96 {
             let sig_hex = hex::encode(&bytes[..64]);

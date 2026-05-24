@@ -192,6 +192,58 @@
     }
 }
 
+/* Narrow viewports: relay row's actions overflow when kept inline with the
+   URL. Stack info above actions, and let the actions wrap if even one row
+   isn't enough. */
+@media (max-width: 600px) {
+    .relay-item {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .relay-item-info {
+        margin-right: 0;
+        margin-bottom: 8px;
+    }
+
+    .relay-item-actions {
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        gap: 12px;
+    }
+
+    /* Reclaim horizontal space: settings cards eat ~30px of outer padding on
+       each side at desktop sizes; trim it on narrow screens. */
+    .settings-form {
+        padding: var(--spacing-md) var(--spacing-sm);
+    }
+
+    .settings-section-content {
+        padding: var(--spacing-md);
+    }
+
+    /* Email list: drop the side padding so each card spans the full width.
+       Internal .email-item padding keeps text off the edge. */
+    .email-list {
+        padding-left: 0;
+        padding-right: 0;
+    }
+
+    /* Same treatment for the conversation/thread + single-email detail
+       containers. Cards have their own internal padding. */
+    .thread-detail-content,
+    .email-detail-content {
+        padding-left: 0;
+        padding-right: 0;
+    }
+
+    .email-detail-header,
+    .thread-subject-header {
+        padding-left: var(--spacing-md);
+        padding-right: var(--spacing-md);
+    }
+}
+
 /* Mobile Landscape Mode - Keep bottom navigation */
 @media (max-width: 1024px) and (orientation: landscape) {
     .app-container {

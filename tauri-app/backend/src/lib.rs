@@ -5,9 +5,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 pub mod crypto;
-mod email;
+pub mod email;
 mod nostr;
-mod types;
+pub mod types;
 pub mod state;
 mod storage;
 mod database;

@@ -4630,6 +4630,12 @@ ${attachmentsHtml}
                     return skel;
                 });
 
+                // Default the thread title to the first message's stored subject
+                // so the user has a meaningful header from the moment the view
+                // appears. Per-message tasks below may overwrite this as soon as
+                // any decrypted subject differs from the stored one.
+                if (threadSubject) threadSubject.textContent = threadSubjectText;
+
                 // Yield so the skeletons commit to a paint before we start
                 // the decrypt work below (which can otherwise complete in a
                 // single JS turn on warm caches and skip the skeleton frame).
@@ -4637,11 +4643,18 @@ ${attachmentsHtml}
                     requestAnimationFrame(() => requestAnimationFrame(resolve))
                 );
 
-                // Decrypt + verify all messages in parallel. Each Tauri call is an
-                // independent IPC round-trip into Rust, so running them concurrently
-                // turns a sum-of-latencies into a max-of-latencies. DOM mounting still
-                // happens sequentially below to preserve thread order.
-                const preparedMessages = await Promise.all(threadEmails.map(async (email) => {
+                // Stream cards into place as each message's decrypt finishes,
+                // instead of waiting for the whole batch. Each per-message task
+                // decrypts, builds its card, and replaces its own skeleton.
+                // Shared state (thread subject, last-decrypted reply target) is
+                // updated under index-ordering rules so out-of-order completion
+                // doesn't produce inconsistent results: lower-index decrypts
+                // win the thread subject, only the final message updates the
+                // reply-target snapshot.
+                let earliestDecryptedSubjectIdx = Infinity;
+                const lastIdx = threadEmails.length - 1;
+
+                await Promise.allSettled(threadEmails.map(async (email, idx) => {
                     const isSent = email._isSentByUser;
                     const emailBody = email.body || '';
                     const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
@@ -4711,20 +4724,22 @@ ${attachmentsHtml}
                         }
                     }
 
-                    return { email, isSent, displayBody, displaySubject, sigResults, blockDecryptResults };
-                }));
-
-                // Track thread subject from the first message whose decrypted subject differs
-                // from the stored one. Done in order so the choice matches pre-parallel behavior.
-                for (const { email, displaySubject } of preparedMessages) {
-                    if (displaySubject && displaySubject !== email.subject && threadSubjectText === threadEmails[0].subject) {
+                    // Update thread subject — first message in order whose
+                    // decrypted subject differs from the stored one wins.
+                    if (displaySubject && displaySubject !== email.subject && idx < earliestDecryptedSubjectIdx) {
+                        earliestDecryptedSubjectIdx = idx;
                         threadSubjectText = displaySubject;
-                        break;
+                        if (threadSubject) threadSubject.textContent = threadSubjectText;
                     }
-                }
 
-                for (let idx = 0; idx < preparedMessages.length; idx++) {
-                    const { email, isSent, displayBody, displaySubject, sigResults, blockDecryptResults } = preparedMessages[idx];
+                    // Track reply target — only meaningful for the most recent
+                    // message; other tasks shouldn't overwrite it.
+                    if (idx === lastIdx) {
+                        lastDecryptedSubject = displaySubject;
+                        lastDecryptedBody = displayBody;
+                    }
+
+                    // ===== Build and mount the full card =====
                     // Resolve contact for avatar. For received messages we use
                     // strict pubkey-only matching via _resolveSender (anti-spoofing).
                     // For sent messages the "sender" is the local user, so email-fallback is fine.
@@ -4956,11 +4971,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         Utils.decorateArmorBlocks(bodyId);
                         this.verifyAndAnnotateSignatureBlocks(displayBody, bodyId);
                     }
-
-                    // Track last email's decrypted content for reply button
-                    lastDecryptedSubject = displaySubject;
-                    lastDecryptedBody = displayBody;
-                }
+                }));
 
                 // Close menus on outside click
                 document.addEventListener('click', () => {
@@ -4969,10 +4980,6 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 
                 // Scroll to bottom (most recent message)
                 threadContent.scrollTop = threadContent.scrollHeight;
-            }
-
-            if (threadSubject) {
-                threadSubject.textContent = threadSubjectText;
             }
 
             // Mark unread emails as read (fire-and-forget)

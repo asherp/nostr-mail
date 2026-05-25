@@ -4660,9 +4660,12 @@ ${attachmentsHtml}
                 let earliestDecryptedSubjectIdx = Infinity;
                 const lastIdx = threadEmails.length - 1;
 
+                const taskStartAll = performance.now();
                 await Promise.allSettled(threadEmails.map(async (email, idx) => {
+                    const taskStart = performance.now();
                     const isSent = email._isSentByUser;
                     const emailBody = email.body || '';
+                    const bodyBytes = emailBody.length;
                     const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
 
                     let displayBody = emailBody;
@@ -4729,6 +4732,8 @@ ${attachmentsHtml}
                             console.error(`[JS] Thread email ${email.id} sig/glossia error:`, err);
                         }
                     }
+
+                    const tDecryptDone = performance.now();
 
                     // Update thread subject — first message in order whose
                     // decrypted subject differs from the stored one wins.
@@ -4977,7 +4982,18 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         Utils.decorateArmorBlocks(bodyId);
                         this.verifyAndAnnotateSignatureBlocks(displayBody, bodyId);
                     }
+
+                    const tEnd = performance.now();
+                    console.log(
+                        `[THREAD-PERF] msg ${idx + 1}/${threadEmails.length} ` +
+                        `(body=${bodyBytes}b, encrypted=${!!encryptedMatch}): ` +
+                        `decrypt+verify=${(tDecryptDone - taskStart).toFixed(1)}ms, ` +
+                        `mount+post=${(tEnd - tDecryptDone).toFixed(1)}ms, ` +
+                        `total=${(tEnd - taskStart).toFixed(1)}ms ` +
+                        `(landed at ${(tEnd - taskStartAll).toFixed(1)}ms)`
+                    );
                 }));
+                console.log(`[THREAD-PERF] all ${threadEmails.length} messages settled in ${(performance.now() - taskStartAll).toFixed(1)}ms`);
 
                 // If we showed the "Decrypting…" placeholder but no per-message
                 // task ever produced a decrypted subject (e.g. all decrypts

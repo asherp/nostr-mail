@@ -3088,7 +3088,12 @@ class EmailService {
             // Without this, a warm preview cache lets the full replacement run to
             // completion in the same JS turn as the appendChild loop, and the
             // browser never paints the intermediate "skeleton-only" state.
-            await new Promise(resolve => requestAnimationFrame(resolve));
+            // Double-rAF is the standard idiom: the first rAF callback runs
+            // *before* the next paint, the second runs after it, so by the time
+            // the second resolves the skeleton paint has definitely committed.
+            await new Promise(resolve =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve))
+            );
 
             // Batch-decrypt uncached encrypted emails in a single IPC call
             const uncachedEncrypted = filteredEmails.filter(email => {
@@ -6604,7 +6609,12 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             // Without this, a warm preview cache lets the full replacement run to
             // completion in the same JS turn as the appendChild loop, and the
             // browser never paints the intermediate "skeleton-only" state.
-            await new Promise(resolve => requestAnimationFrame(resolve));
+            // Double-rAF is the standard idiom: the first rAF callback runs
+            // *before* the next paint, the second runs after it, so by the time
+            // the second resolves the skeleton paint has definitely committed.
+            await new Promise(resolve =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve))
+            );
 
             // Batch-decrypt uncached encrypted sent emails, resolving pubkeys from contact index
             const uncachedEncrypted = filteredEmails.filter(email => {

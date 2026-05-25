@@ -3564,6 +3564,14 @@ class EmailService {
         const senderInfo = this._resolveSender(email);
         const senderLine = this._renderSenderLine(senderInfo, '');
 
+        // For encrypted emails the stored subject is either ciphertext or a
+        // placeholder string; either way it isn't meaningful to display while
+        // we wait for decryption. Substitute a clear "Decrypting…" hint for
+        // both the subject and the body preview until the full render lands.
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
+        const previewText = isEncrypted ? 'Decrypting…' : 'Loading...';
+
         emailElement.innerHTML = `
             <img class="${senderInfo.avatarClass}" src="${senderInfo.avatarSrc}" alt="${Utils.escapeHtml(senderInfo.identityName)}'s avatar" onerror="this.onerror=null;this.src='${senderInfo.defaultAvatar}';this.className='contact-avatar';">
             <div class="email-content">
@@ -3571,8 +3579,8 @@ class EmailService {
                     <div class="email-sender email-list-strong">${senderLine} ${attachmentIndicator}</div>
                     <div class="email-date">${dateDisplay}</div>
                 </div>
-                <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
-                <div class="email-preview">Loading...</div>
+                <div class="email-subject email-list-strong">${subjectText}</div>
+                <div class="email-preview">${previewText}</div>
             </div>
         `;
 
@@ -7040,6 +7048,15 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             avatarSrc = recipientContact.picture;
         }
 
+        // For encrypted sent emails the stored subject is ciphertext / a
+        // placeholder and the body is armor — show "Decrypting…" for both
+        // until the full render replaces this skeleton.
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
+        const previewText = isEncrypted
+            ? 'Decrypting…'
+            : Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
+
         emailElement.innerHTML = `
             <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.to)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
             <div class="email-content">
@@ -7047,8 +7064,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                     <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator}</div>
                     <div class="email-date">${dateDisplay}</div>
                 </div>
-                <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
-                <div class="email-preview">${Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '')}</div>
+                <div class="email-subject email-list-strong">${subjectText}</div>
+                <div class="email-preview">${previewText}</div>
             </div>
         `;
         emailElement.addEventListener('click', () => {

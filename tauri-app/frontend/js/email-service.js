@@ -4553,7 +4553,12 @@ ${attachmentsHtml}
 
             if (threadContent) {
                 threadContent.innerHTML = '';
-                for (const email of threadEmails) {
+
+                // Decrypt + verify all messages in parallel. Each Tauri call is an
+                // independent IPC round-trip into Rust, so running them concurrently
+                // turns a sum-of-latencies into a max-of-latencies. DOM mounting still
+                // happens sequentially below to preserve thread order.
+                const preparedMessages = await Promise.all(threadEmails.map(async (email) => {
                     const isSent = email._isSentByUser;
                     const emailBody = email.body || '';
                     const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
@@ -4623,11 +4628,19 @@ ${attachmentsHtml}
                         }
                     }
 
-                    // Track thread subject from first successful decrypt
+                    return { email, isSent, displayBody, displaySubject, sigResults, blockDecryptResults };
+                }));
+
+                // Track thread subject from the first message whose decrypted subject differs
+                // from the stored one. Done in order so the choice matches pre-parallel behavior.
+                for (const { email, displaySubject } of preparedMessages) {
                     if (displaySubject && displaySubject !== email.subject && threadSubjectText === threadEmails[0].subject) {
                         threadSubjectText = displaySubject;
+                        break;
                     }
+                }
 
+                for (const { email, isSent, displayBody, displaySubject, sigResults, blockDecryptResults } of preparedMessages) {
                     // Resolve contact for avatar. For received messages we use
                     // strict pubkey-only matching via _resolveSender (anti-spoofing).
                     // For sent messages the "sender" is the local user, so email-fallback is fine.

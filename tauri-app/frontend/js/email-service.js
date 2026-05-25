@@ -4559,6 +4559,14 @@ ${attachmentsHtml}
                 threadContent.innerHTML = '<div class="thread-loading"><i class="fas fa-spinner fa-spin"></i> Loading conversation...</div>';
             }
 
+            // Force the browser to paint the view switch + loading spinner before
+            // we kick off the SQL fetch. Without this, the click handler chains
+            // straight into the await below and the user sees the email list
+            // until the whole thread has been fetched and rendered.
+            await new Promise(resolve =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve))
+            );
+
             // Resolve active account email up front so we can scope the thread query to it
             // (prevents cross-account contamination when multiple accounts share this DB).
             const settings = appState.getSettings();
@@ -4592,6 +4600,42 @@ ${attachmentsHtml}
 
             if (threadContent) {
                 threadContent.innerHTML = '';
+
+                // Paint a skeleton card per message so the user sees the
+                // structure of the conversation immediately (sender + date,
+                // with a "Decrypting…" snippet). Each skeleton is replaced
+                // in place once the parallel decrypt + render below produces
+                // the full card for it.
+                const skeletons = threadEmails.map((email, idx) => {
+                    const skel = document.createElement('div');
+                    const isLast = idx === threadEmails.length - 1;
+                    skel.className = `email-detail-card thread-skeleton${isLast ? '' : ' collapsed'}`;
+                    const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+                    const fromLabel = Utils.escapeHtml(email.from || email.from_address || '');
+                    skel.innerHTML = `
+<div class="email-sender-header">
+<div class="email-sender-row">
+<img class="email-sender-avatar" src="${defaultAvatar}" alt="">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${fromLabel}</div>
+<span class="email-body-snippet">Decrypting…</span>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
+</div>
+</div>
+                    `;
+                    threadContent.appendChild(skel);
+                    return skel;
+                });
+
+                // Yield so the skeletons commit to a paint before we start
+                // the decrypt work below (which can otherwise complete in a
+                // single JS turn on warm caches and skip the skeleton frame).
+                await new Promise(resolve =>
+                    requestAnimationFrame(() => requestAnimationFrame(resolve))
+                );
 
                 // Decrypt + verify all messages in parallel. Each Tauri call is an
                 // independent IPC round-trip into Rust, so running them concurrently
@@ -4679,7 +4723,8 @@ ${attachmentsHtml}
                     }
                 }
 
-                for (const { email, isSent, displayBody, displaySubject, sigResults, blockDecryptResults } of preparedMessages) {
+                for (let idx = 0; idx < preparedMessages.length; idx++) {
+                    const { email, isSent, displayBody, displaySubject, sigResults, blockDecryptResults } = preparedMessages[idx];
                     // Resolve contact for avatar. For received messages we use
                     // strict pubkey-only matching via _resolveSender (anti-spoofing).
                     // For sent messages the "sender" is the local user, so email-fallback is fine.
@@ -4805,7 +4850,14 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <div class="email-detail-body" id="${bodyId}">${email.html_body ? '' : Utils.escapeHtml(displayBody).replace(/\n/g, '<br>')}</div>
 <pre class="email-raw-content email-raw-body" style="display:none">${Utils.escapeHtml(email.raw_body || '')}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
                     `;
-                    threadContent.appendChild(cardDiv);
+                    // Swap the skeleton placeholder for the fully rendered card.
+                    // If the skeleton was already removed (defensive), fall back to append.
+                    const skeleton = skeletons[idx];
+                    if (skeleton && skeleton.parentNode === threadContent) {
+                        threadContent.replaceChild(cardDiv, skeleton);
+                    } else {
+                        threadContent.appendChild(cardDiv);
+                    }
 
                     // Collapse all cards except the last (most recent)
                     const isLastEmail = (email === threadEmails[threadEmails.length - 1]);

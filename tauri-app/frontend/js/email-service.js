@@ -3073,6 +3073,17 @@ class EmailService {
                 return true;
             });
 
+            // Paint skeleton placeholders synchronously so users see structure
+            // (sender, subject, date, attachment badge) the moment the SQL fetch
+            // returns, instead of staring at a blank list until batch decryption
+            // and per-row rendering finish. Each placeholder is replaced in-place
+            // when its full render resolves, so order matches server order.
+            const placeholders = filteredEmails.map(email => {
+                const ph = this.renderInboxEmailItemBasic(email);
+                emailList.appendChild(ph);
+                return ph;
+            });
+
             // Batch-decrypt uncached encrypted emails in a single IPC call
             const uncachedEncrypted = filteredEmails.filter(email => {
                 if (this._previewCache.has(`inbox-${email.id}`)) return false;
@@ -3206,34 +3217,40 @@ class EmailService {
                 }
             }
 
-            // Process emails in parallel (decryption will hit cache from batch above)
-            const emailPromises = filteredEmails
-                .map(async (email) => {
-                    try {
-                        // Add timeout to prevent hanging on decryption
-                        const timeoutPromise = new Promise((_, reject) =>
-                            setTimeout(() => reject(new Error('Decryption timeout')), 5000)
-                        );
-                        const renderPromise = this.renderInboxEmailItem(email);
-                        return await Promise.race([renderPromise, timeoutPromise]);
-                    } catch (error) {
-                        console.error(`[JS] Error rendering inbox email ${email.id}:`, error);
-                        // Return a basic email item even if rendering fails
-                        return this.renderInboxEmailItemBasic(email);
+            // Replace each placeholder with its full render as soon as that render
+            // resolves. Decryption will mostly hit the cache populated by the batch
+            // above, so this is fast; rows that need extra work upgrade in place
+            // without blocking the rest of the list.
+            const replacementResults = await Promise.allSettled(filteredEmails.map(async (email, idx) => {
+                const placeholder = placeholders[idx];
+                try {
+                    const timeoutPromise = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Decryption timeout')), 5000)
+                    );
+                    const fullElement = await Promise.race([
+                        this.renderInboxEmailItem(email),
+                        timeoutPromise
+                    ]);
+                    if (!placeholder || placeholder.parentNode !== emailList) return false;
+                    if (fullElement) {
+                        emailList.replaceChild(fullElement, placeholder);
+                        return true;
                     }
-                });
-
-            // Wait for all emails to be rendered (with timeout protection)
-            const renderedItems = await Promise.allSettled(emailPromises);
-
-            // Add all successfully rendered items to the list (filter out null results)
-            let renderedCount = 0;
-            for (const result of renderedItems) {
-                if (result.status === 'fulfilled' && result.value) {
-                    emailList.appendChild(result.value);
-                    renderedCount++;
+                    // renderInboxEmailItem returns null when hide_undecryptable is on
+                    // and the row failed to decrypt — drop the placeholder entirely.
+                    emailList.removeChild(placeholder);
+                    return false;
+                } catch (error) {
+                    console.error(`[JS] Error rendering inbox email ${email.id}:`, error);
+                    // Leave the skeleton placeholder visible so the user still sees the row.
+                    return !!(placeholder && placeholder.parentNode === emailList);
                 }
-            }
+            }));
+
+            const renderedCount = replacementResults.reduce(
+                (n, r) => n + (r.status === 'fulfilled' && r.value ? 1 : 0),
+                0
+            );
 
             // Show message if no emails were rendered (only on full render, not append)
             if (renderedCount === 0 && appendFrom <= 0) {

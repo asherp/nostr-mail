@@ -4594,7 +4594,13 @@ ${attachmentsHtml}
             // Render messages using same per-email decrypt as single email views
             const keypair = appState.getKeypair();
             const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
-            let threadSubjectText = threadEmails[0].subject;
+            // For encrypted threads the stored subject of the first message is
+            // ciphertext / a placeholder, so start with "Decrypting…" until a
+            // per-message task lands a real decrypted subject. Cleartext threads
+            // just keep their stored subject as the default.
+            const firstHasArmor = !!(threadEmails[0].body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(threadEmails[0].body));
+            const decryptingPlaceholder = 'Decrypting…';
+            let threadSubjectText = firstHasArmor ? decryptingPlaceholder : threadEmails[0].subject;
             let lastDecryptedSubject = null;
             let lastDecryptedBody = null;
 
@@ -4972,6 +4978,15 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         this.verifyAndAnnotateSignatureBlocks(displayBody, bodyId);
                     }
                 }));
+
+                // If we showed the "Decrypting…" placeholder but no per-message
+                // task ever produced a decrypted subject (e.g. all decrypts
+                // failed), fall back to the stored subject so the title doesn't
+                // stay stuck on the placeholder.
+                if (earliestDecryptedSubjectIdx === Infinity && threadSubjectText === decryptingPlaceholder) {
+                    threadSubjectText = threadEmails[0].subject;
+                    if (threadSubject) threadSubject.textContent = threadSubjectText;
+                }
 
                 // Close menus on outside click
                 document.addEventListener('click', () => {

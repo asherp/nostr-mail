@@ -75,6 +75,7 @@ pub struct EmailThreadSummary {
     pub thread_id: String,
     pub message_count: i64,
     pub unread_count: i64,
+    pub attachment_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

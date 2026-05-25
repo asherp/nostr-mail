@@ -440,7 +440,7 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
     }
 }
 
-fn map_email_thread_to_summary(email: &DbEmail, message_count: i64, unread_count: i64) -> EmailThreadSummary {
+fn map_email_thread_to_summary(email: &DbEmail, message_count: i64, unread_count: i64, attachment_count: i64) -> EmailThreadSummary {
     let raw_headers = email.raw_headers.clone().unwrap_or_default();
     EmailThreadSummary {
         id: email.id.map(|id| id.to_string()).unwrap_or_else(|| email.message_id.clone()),
@@ -462,6 +462,7 @@ fn map_email_thread_to_summary(email: &DbEmail, message_count: i64, unread_count
         thread_id: email.thread_id.clone().unwrap_or_else(|| email.message_id.clone()),
         message_count,
         unread_count,
+        attachment_count,
     }
 }
 
@@ -3105,8 +3106,8 @@ fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Optio
 fn db_get_email_threads(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailThreadSummary>, String> {
     let db = state.get_database()?;
     let threads = db.get_email_threads(limit, offset, nostr_only, user_email.as_deref(), user_pubkey.as_deref()).map_err(|e| e.to_string())?;
-    let mapped: Vec<EmailThreadSummary> = threads.iter().map(|(email, count, unread)| {
-        map_email_thread_to_summary(email, *count, *unread)
+    let mapped: Vec<EmailThreadSummary> = threads.iter().map(|(email, count, unread, attachments)| {
+        map_email_thread_to_summary(email, *count, *unread, *attachments)
     }).collect();
     Ok(mapped)
 }
@@ -3117,7 +3118,7 @@ fn db_get_sent_email_threads(limit: Option<i64>, offset: Option<i64>, user_email
     let threads = db.get_sent_email_threads(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
     // Filter by sender_pubkey if user_pubkey is provided (same as db_get_sent_emails)
     let filtered: Vec<_> = if let Some(ref upk) = user_pubkey {
-        threads.into_iter().filter(|(e, _, _)| {
+        threads.into_iter().filter(|(e, _, _, _)| {
             match &e.sender_pubkey {
                 Some(spk) => spk == upk,
                 None => true,
@@ -3126,8 +3127,8 @@ fn db_get_sent_email_threads(limit: Option<i64>, offset: Option<i64>, user_email
     } else {
         threads
     };
-    let mapped: Vec<EmailThreadSummary> = filtered.iter().map(|(email, count, unread)| {
-        map_email_thread_to_summary(email, *count, *unread)
+    let mapped: Vec<EmailThreadSummary> = filtered.iter().map(|(email, count, unread, attachments)| {
+        map_email_thread_to_summary(email, *count, *unread, *attachments)
     }).collect();
     Ok(mapped)
 }

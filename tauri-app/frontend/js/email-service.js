@@ -2636,52 +2636,10 @@ class EmailService {
             console.log('[JS] Email filter preference:', emailFilter, 'nostrOnly:', nostrOnly);
             console.log('[JS] Loading emails with offset:', this.inboxOffset, 'pageSize:', pageSize);
             const emails = await TauriService.getDbEmailThreads(pageSize, this.inboxOffset, nostrOnly, userEmail, userPubkey);
-            
-            // Load attachments for each email in parallel with timeout
-            console.log(`[JS] Loading attachments for ${emails.length} inbox emails`);
-            const attachmentPromises = emails.map(async (email) => {
-                try {
-                    // Convert email.id to integer - it might be a string
-                    const emailIdInt = parseInt(email.id);
-                    if (isNaN(emailIdInt)) {
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
-                        // Try to get email by message_id to get the real database ID
-                        if (email.message_id) {
-                            try {
-                                const emailData = await TauriService.getDbEmail(email.message_id);
-                                if (emailData && emailData.id) {
-                                    const realId = parseInt(emailData.id);
-                                    if (!isNaN(realId)) {
-                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
-                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
-                                        return;
-                                    }
-                                }
-                            } catch (e) {
-                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
-                            }
-                        }
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
-                        email.attachments = [];
-                        return;
-                    }
-                    
-                    const timeoutPromise = new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
-                    );
-                    email.attachments = await Promise.race([
-                        TauriService.getAttachmentsForEmail(emailIdInt),
-                        timeoutPromise
-                    ]);
-                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
-                } catch (error) {
-                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
-                    email.attachments = [];
-                }
-            });
-            
-            await Promise.all(attachmentPromises);
-            
+
+            // Attachments are no longer prefetched per-email here. The thread query already
+            // returns `attachment_count` (cheap COUNT(*) subquery) which the list badge uses;
+            // full attachment metadata is lazy-loaded by showEmailDetail when the user clicks in.
             let appendFrom = 0;
             if (append) {
                 // Append new emails to existing ones
@@ -2767,51 +2725,10 @@ class EmailService {
             // Fetch sent emails (where user is sender)
             const userPubkey = keypair ? keypair.public_key : null;
             let emails = await TauriService.getDbSentEmailThreads(pageSize, this.sentOffset, userEmail, userPubkey);
-            
-            // Load attachments for each email in parallel with timeout
-            console.log(`[JS] Loading attachments for ${emails.length} sent emails`);
-            const attachmentPromises = emails.map(async (email) => {
-                try {
-                    // Convert email.id to integer - it might be a string
-                    const emailIdInt = parseInt(email.id);
-                    if (isNaN(emailIdInt)) {
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
-                        // Try to get email by message_id to get the real database ID
-                        if (email.message_id) {
-                            try {
-                                const emailData = await TauriService.getDbEmail(email.message_id);
-                                if (emailData && emailData.id) {
-                                    const realId = parseInt(emailData.id);
-                                    if (!isNaN(realId)) {
-                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
-                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
-                                        return;
-                                    }
-                                }
-                            } catch (e) {
-                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
-                            }
-                        }
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
-                        email.attachments = [];
-                        return;
-                    }
-                    
-                    const timeoutPromise = new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
-                    );
-                    email.attachments = await Promise.race([
-                        TauriService.getAttachmentsForEmail(emailIdInt),
-                        timeoutPromise
-                    ]);
-                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
-                } catch (error) {
-                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
-                    email.attachments = [];
-                }
-            });
-            await Promise.allSettled(attachmentPromises);
-            
+
+            // Attachments are no longer prefetched per-email here. The thread query already
+            // returns `attachment_count` (cheap COUNT(*) subquery) which the list badge uses;
+            // full attachment metadata is lazy-loaded by the sent detail view when the user clicks in.
             let appendFrom = 0;
             if (append) {
                 // Append new emails to existing ones
@@ -3477,8 +3394,12 @@ class EmailService {
             return null;
         }
 
-        // Add attachment indicator (same style as sent emails)
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        // Add attachment indicator (same style as sent emails).
+        // Prefer attachment_count from the thread query (cheap COUNT(*) subquery).
+        // Fall back to email.attachments.length when an older code path has already populated it.
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
         const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
@@ -3602,7 +3523,9 @@ class EmailService {
             dateDisplay = emailDate.toLocaleDateString();
         }
 
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
         const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
@@ -3955,14 +3878,28 @@ class EmailService {
                     })();
                 }
                 const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {
-                    // Render attachments - decrypt metadata for display
-                    console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
-                    
-                    // Ensure attachments array exists
-                    if (!email.attachments || !Array.isArray(email.attachments)) {
-                        console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
-                        email.attachments = [];
+                    // Render attachments - decrypt metadata for display.
+                    // Attachments are no longer prefetched during list load; lazy-load them here
+                    // when the detail view actually needs them. attachment_count from the thread
+                    // query gives a fast path to skip the IPC call entirely when there are none.
+                    if (!Array.isArray(email.attachments)) {
+                        if (email.attachment_count === 0) {
+                            email.attachments = [];
+                        } else {
+                            const emailIdInt = parseInt(email.id);
+                            if (!isNaN(emailIdInt)) {
+                                try {
+                                    email.attachments = await TauriService.getAttachmentsForEmail(emailIdInt);
+                                } catch (err) {
+                                    console.error(`[JS] Failed to lazy-load attachments for email ${email.id}:`, err);
+                                    email.attachments = [];
+                                }
+                            } else {
+                                email.attachments = [];
+                            }
+                        }
                     }
+                    console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
                     
                     let attachmentsHtml = '';
                     if (email.attachments && email.attachments.length > 0) {
@@ -7362,17 +7299,29 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         
         // Define updateDetail function first (before it's called)
         const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {
-            // Render attachments - decrypt metadata for display
-            console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
-            console.log(`[JS] Email object:`, email);
-            console.log(`[JS] email.html_body present:`, !!email.html_body, `length:`, email.html_body ? email.html_body.length : 0);
-            console.log(`[JS] Email.attachments type:`, typeof email.attachments, Array.isArray(email.attachments));
-            
-            // Ensure attachments array exists
-            if (!email.attachments || !Array.isArray(email.attachments)) {
-                console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
-                email.attachments = [];
+            // Render attachments - decrypt metadata for display.
+            // Attachments are no longer prefetched during list load; lazy-load them here
+            // when the detail view actually needs them. attachment_count from the thread
+            // query gives a fast path to skip the IPC call entirely when there are none.
+            if (!Array.isArray(email.attachments)) {
+                if (email.attachment_count === 0) {
+                    email.attachments = [];
+                } else {
+                    const emailIdInt = parseInt(email.id);
+                    if (!isNaN(emailIdInt)) {
+                        try {
+                            email.attachments = await TauriService.getAttachmentsForEmail(emailIdInt);
+                        } catch (err) {
+                            console.error(`[JS] Failed to lazy-load attachments for sent email ${email.id}:`, err);
+                            email.attachments = [];
+                        }
+                    } else {
+                        email.attachments = [];
+                    }
+                }
             }
+            console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
+            console.log(`[JS] email.html_body present:`, !!email.html_body, `length:`, email.html_body ? email.html_body.length : 0);
             
             // Log attachment details for debugging
             if (email.attachments && email.attachments.length > 0) {

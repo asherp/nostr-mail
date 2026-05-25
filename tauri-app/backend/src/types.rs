@@ -363,6 +363,9 @@ pub struct BatchDecryptInput {
     pub subject: String,
     pub sender_pubkey: Option<String>,
     pub recipient_pubkey: Option<String>,
+    /// Message-Id of the email row in the local DB, used to look up
+    /// raw_headers for header-based signature verification fallback (NIP-04).
+    pub message_id: Option<String>,
 }
 
 /// Per-item result from batch email decryption (wraps success or error).

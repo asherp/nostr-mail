@@ -2201,7 +2201,8 @@ class DMService {
                 const recipientPubkey = email.recipient_pubkey;
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    senderPubkey, recipientPubkey
+                    senderPubkey, recipientPubkey,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {

@@ -629,16 +629,17 @@ const TauriService = {
         return await this.invoke('parse_armor_message', { armorText });
     },
 
-    decryptEmailBody: async function(armorText, subject, senderPubkey, recipientPubkey) {
+    decryptEmailBody: async function(armorText, subject, senderPubkey, recipientPubkey, messageId) {
         return await this.invoke('decrypt_email_body', {
             armorText, subject,
             senderPubkey: senderPubkey || null,
             recipientPubkey: recipientPubkey || null,
+            messageId: messageId || null,
         });
     },
 
     // Batch decrypt multiple email bodies in a single IPC call.
-    // `emails` is an array of { id, armorText, subject, senderPubkey, recipientPubkey }.
+    // `emails` is an array of { id, armorText, subject, senderPubkey, recipientPubkey, messageId? }.
     // Returns an array of { id, result, error } in the same order.
     decryptEmailBodiesBatch: async function(emails) {
         return await this.invoke('decrypt_email_bodies_batch', { emails });

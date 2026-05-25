@@ -2558,6 +2558,7 @@ fn decrypt_armor_tree(
     private_key: &str,
     user_pubkey_hex: &str,
     fallback_pubkey: &str,
+    raw_headers: Option<&str>,
 ) -> (Vec<crate::types::DecryptedBlock>, Option<JsonManifest>) {
     let mut results = Vec::new();
     let mut outer_manifest = None;
@@ -2573,7 +2574,11 @@ fn decrypt_armor_tree(
         } else {
             fallback_pubkey
         };
-        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback);
+        // raw_headers (X-Nostr-Sig) signs the outermost canonical body bytes, which
+        // includes nested quoted bytes by concatenation. Inner subtrees only see a
+        // slice of that signed data, so the header sig would never verify against
+        // them — pass None so inner levels rely solely on their inline signatures.
+        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback, None);
         results.extend(inner_results);
     }
 
@@ -2582,75 +2587,110 @@ fn decrypt_armor_tree(
     // serves as the MAC. Verification MUST happen before decryption to prevent
     // padding oracle attacks.
     if parsed.encryption_nip.as_deref() == Some("nip04") {
-        match (&parsed.signature_hex, &parsed.sig_pubkey_hex) {
-            (Some(sig_hex), Some(pubkey_hex)) => {
-                // Collect body bytes for verification — use raw decoded bytes (no NIP-04
-                // unpacking) to match extract_ciphertext_binary, which the inline
-                // signature verification uses successfully.
-                let verify_bytes = if let Some(ref b64) = parsed.body_bytes_b64 {
-                    general_purpose::STANDARD.decode(b64).unwrap_or_else(|_| parsed.body_text.as_bytes().to_vec())
-                } else {
-                    extract_ciphertext_binary(&parsed.body_text)
-                };
-                let mut all_bytes = verify_bytes;
+        // Compute the canonical signed bytes once: this level's raw decoded body
+        // concatenated with all nested quoted body bytes. Both the inline
+        // SIGNATURE block and the X-Nostr-Sig header sign these same bytes.
+        let verify_bytes = if let Some(ref b64) = parsed.body_bytes_b64 {
+            general_purpose::STANDARD.decode(b64).unwrap_or_else(|_| parsed.body_text.as_bytes().to_vec())
+        } else {
+            extract_ciphertext_binary(&parsed.body_text)
+        };
+        let mut all_bytes = verify_bytes;
 
-                // Concatenate nested quoted body bytes
-                fn collect_quoted_bytes(
-                    quoted: &Option<Box<crate::types::ParsedArmorMessage>>,
-                    buf: &mut Vec<u8>,
-                ) {
-                    if let Some(ref q) = quoted {
-                        if let Some(ref b64) = q.body_bytes_b64 {
-                            if let Ok(bytes) = general_purpose::STANDARD.decode(b64) {
-                                buf.extend_from_slice(&bytes);
-                            }
-                        }
-                        collect_quoted_bytes(&q.quoted, buf);
+        fn collect_quoted_bytes(
+            quoted: &Option<Box<crate::types::ParsedArmorMessage>>,
+            buf: &mut Vec<u8>,
+        ) {
+            if let Some(ref q) = quoted {
+                if let Some(ref b64) = q.body_bytes_b64 {
+                    if let Ok(bytes) = general_purpose::STANDARD.decode(b64) {
+                        buf.extend_from_slice(&bytes);
                     }
                 }
-                collect_quoted_bytes(&parsed.quoted, &mut all_bytes);
+                collect_quoted_bytes(&q.quoted, buf);
+            }
+        }
+        collect_quoted_bytes(&parsed.quoted, &mut all_bytes);
 
-                // Step 7: Verify signature against unpacked canonical bytes
-                let verified = matches!(
+        // Primary trust path: inline SIGNATURE block inside the armor.
+        let inline_verified = match (&parsed.signature_hex, &parsed.sig_pubkey_hex) {
+            (Some(sig_hex), Some(pubkey_hex)) => {
+                let ok = matches!(
                     crate::crypto::verify_signature_bytes(pubkey_hex, sig_hex, &all_bytes),
                     Ok(true)
                 );
-
-                if verified {
-                    println!("[RUST] NIP-04 signature verified ({} bytes), proceeding to decrypt", all_bytes.len());
+                if ok {
+                    println!("[RUST] NIP-04 inline signature verified ({} bytes)", all_bytes.len());
                 } else {
-                    println!("[RUST] NIP-04 signature INVALID — rejecting without decryption");
-                    results.push(crate::types::DecryptedBlock {
-                        decrypted_text: None,
-                        error: Some(
-                            "NIP-04 signature verification failed. The message was rejected \
-                             without decrypting to prevent potential ciphertext manipulation. \
-                             The message may have been tampered with in transit.".to_string()
-                        ),
-                        was_encrypted: true,
-                        profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
-                        body_type: "encrypted".to_string(),
-                    });
-                    return (results, outer_manifest);
+                    println!("[RUST] NIP-04 inline signature INVALID");
                 }
+                Some(ok)
             }
-            _ => {
-                // No signature on NIP-04 message — reject
-                println!("[RUST] NIP-04 message has no signature — rejecting without decryption");
-                results.push(crate::types::DecryptedBlock {
-                    decrypted_text: None,
-                    error: Some(
-                        "This NIP-04 encrypted message has no signature. NIP-04 requires a \
-                         signature for authentication because it lacks built-in message \
-                         integrity (MAC). The message cannot be safely decrypted. The sender \
-                         may be using an older client that doesn't sign NIP-04 messages.".to_string()
-                    ),
-                    was_encrypted: true,
-                    profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
-                    body_type: "encrypted".to_string(),
-                });
-                return (results, outer_manifest);
-            }
+            _ => None,
+        };
+
+        // Fallback trust path: X-Nostr-Sig + X-Nostr-Pubkey transport headers.
+        // Only consulted at the outermost armor level (raw_headers is None for
+        // recursive calls into nested quoted blocks), because the header sig
+        // signs the full canonical body, not inner subtrees.
+        let header_verified = if inline_verified != Some(true) {
+            raw_headers.and_then(|rh| {
+                let pk = extract_nostr_pubkey_from_headers(rh)?;
+                let sig = extract_nostr_sig_from_headers(rh)?;
+                let ok = matches!(
+                    crate::crypto::verify_signature_bytes(&pk, &sig, &all_bytes),
+                    Ok(true)
+                );
+                if ok {
+                    println!("[RUST] NIP-04 X-Nostr-Sig header verified ({} bytes)", all_bytes.len());
+                } else {
+                    println!("[RUST] NIP-04 X-Nostr-Sig header INVALID");
+                }
+                Some(ok)
+            })
+        } else {
+            None
+        };
+
+        let verified = inline_verified == Some(true) || header_verified == Some(true);
+        if !verified {
+            let (msg, log) = match (inline_verified, header_verified) {
+                (Some(false), Some(false)) => (
+                    "NIP-04 signature verification failed (both inline SIGNATURE block and \
+                     X-Nostr-Sig header). The message was rejected without decrypting to \
+                     prevent potential ciphertext manipulation.".to_string(),
+                    "NIP-04 both inline + header sigs INVALID — rejecting"
+                ),
+                (Some(false), None) => (
+                    "NIP-04 signature verification failed. The message was rejected without \
+                     decrypting to prevent potential ciphertext manipulation. The message may \
+                     have been tampered with in transit.".to_string(),
+                    "NIP-04 inline signature INVALID, no header sig — rejecting"
+                ),
+                (None, Some(false)) => (
+                    "NIP-04 X-Nostr-Sig header verification failed. No inline SIGNATURE block \
+                     was present, and the transport-header signature did not verify. The \
+                     message was rejected without decrypting.".to_string(),
+                    "NIP-04 header sig INVALID, no inline sig — rejecting"
+                ),
+                _ => (
+                    "This NIP-04 encrypted message has no signature (neither an inline \
+                     SIGNATURE block nor an X-Nostr-Sig header). NIP-04 requires a signature \
+                     for authentication because it lacks built-in message integrity (MAC). \
+                     To opt into decrypting unsigned messages anyway, disable \"Require \
+                     Signatures\" in Settings → Advanced.".to_string(),
+                    "NIP-04 message has no signature (inline or header) — rejecting"
+                ),
+            };
+            println!("[RUST] {}", log);
+            results.push(crate::types::DecryptedBlock {
+                decrypted_text: None,
+                error: Some(msg),
+                was_encrypted: true,
+                profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
+                body_type: "encrypted".to_string(),
+            });
+            return (results, outer_manifest);
         }
     }
 
@@ -2682,6 +2722,7 @@ pub fn decrypt_email_body_pipeline(
     subject: &str,
     sender_pubkey: Option<&str>,
     recipient_pubkey: Option<&str>,
+    raw_headers: Option<&str>,
 ) -> Result<crate::types::DecryptEmailResult, String> {
     println!("[RUST] decrypt_email_body: armor_len={} subject_len={}", armor_text.len(), subject.len());
 
@@ -2721,7 +2762,7 @@ pub fn decrypt_email_body_pipeline(
         .unwrap_or("");
 
     // Walk the armor tree, decrypt each level
-    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback);
+    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback, raw_headers);
 
     // Extract outermost decrypted body (last element in innermost-first array)
     let outer_block = block_results.last();

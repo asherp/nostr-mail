@@ -6581,6 +6581,16 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             // apply here. Always show your own sent mail.
             const filteredEmails = emails;
 
+            // Paint skeleton placeholders synchronously so users see structure
+            // (recipient, subject, date, attachment badge) the moment the SQL fetch
+            // returns. Each placeholder is replaced in-place when its full render
+            // resolves, preserving server order.
+            const placeholders = filteredEmails.map(email => {
+                const ph = this.renderSentEmailItemBasic(email);
+                sentList.appendChild(ph);
+                return ph;
+            });
+
             // Batch-decrypt uncached encrypted sent emails, resolving pubkeys from contact index
             const uncachedEncrypted = filteredEmails.filter(email => {
                 if (this._previewCache.has(`sent-${email.id}`)) return false;
@@ -6680,34 +6690,40 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 }
             }
 
-            // Process emails in parallel (decryption will hit cache from batch above)
-            const emailPromises = filteredEmails
-                .map(async (email) => {
+            // Replace each placeholder with its full render as soon as that render
+            // resolves. Decryption will mostly hit the cache populated by the batch
+            // above, so this is fast; rows that need extra work upgrade in place
+            // without blocking the rest of the list.
+            const replacementResults = await Promise.allSettled(filteredEmails.map(async (email, idx) => {
+                const placeholder = placeholders[idx];
                 try {
-                    // Add timeout to prevent hanging on decryption
                     const timeoutPromise = new Promise((_, reject) =>
                         setTimeout(() => reject(new Error('Decryption timeout')), 5000)
                     );
-                    const renderPromise = this.renderSentEmailItem(email);
-                    return await Promise.race([renderPromise, timeoutPromise]);
+                    const fullElement = await Promise.race([
+                        this.renderSentEmailItem(email),
+                        timeoutPromise
+                    ]);
+                    if (!placeholder || placeholder.parentNode !== sentList) return false;
+                    if (fullElement) {
+                        sentList.replaceChild(fullElement, placeholder);
+                        return true;
+                    }
+                    // renderSentEmailItem returns null when hide_undecryptable is on
+                    // and the row failed to decrypt — drop the placeholder entirely.
+                    sentList.removeChild(placeholder);
+                    return false;
                 } catch (error) {
                     console.error(`[JS] Error rendering email ${email.id}:`, error);
-                    // Return a basic email item even if rendering fails
-                    return this.renderSentEmailItemBasic(email);
+                    // Leave the skeleton placeholder visible so the user still sees the row.
+                    return !!(placeholder && placeholder.parentNode === sentList);
                 }
-            });
-            
-            // Wait for all emails to be rendered (with timeout protection)
-            const renderedItems = await Promise.allSettled(emailPromises);
-            
-            // Add all successfully rendered items to the list (filter out null results)
-            let renderedCount = 0;
-            for (const result of renderedItems) {
-                if (result.status === 'fulfilled' && result.value) {
-                    sentList.appendChild(result.value);
-                    renderedCount++;
-                }
-            }
+            }));
+
+            const renderedCount = replacementResults.reduce(
+                (n, r) => n + (r.status === 'fulfilled' && r.value ? 1 : 0),
+                0
+            );
             
             // Show message if no emails were rendered (only on full render, not append)
             if (renderedCount === 0 && appendFrom <= 0) {
@@ -6835,10 +6851,15 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         if (hideUndecryptable && !isDecryptable) {
             return null;
         }
-        
-        // Add attachment indicator
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
-        const attachmentIndicator = attachmentCount > 0 ? 
+
+        // Add attachment indicator — prefer attachment_count from the thread query
+        // (cheap COUNT(*) subquery) since the sent list no longer prefetches full
+        // attachment metadata. Fall back to email.attachments.length for any code
+        // path that has already populated the array.
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
+        const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
         // Add signature verification indicator
@@ -6967,8 +6988,10 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             dateDisplay = emailDate.toLocaleDateString();
         }
         
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
-        const attachmentIndicator = attachmentCount > 0 ? 
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
+        const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
         // Strict pubkey-bound lookup when recipient_pubkey is set, otherwise

@@ -525,6 +525,114 @@ async fn nip04_legacy_decrypt() {
     assert_eq!(decrypted, plaintext);
 }
 
+/// Unsigned NIP-04 armor (no inline SIGNATURE block) sent with an X-Nostr-Sig
+/// transport header. decrypt_email_body_pipeline MUST reject when raw_headers
+/// is None (per NIP-04 MAC requirement) and MUST decrypt when raw_headers are
+/// supplied, by treating X-Nostr-Sig as the authentication MAC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip04_header_sig_fallback_unlocks_decrypt() {
+    let mock = spawn_mock_email().await;
+    let (alice_nsec, alice_npub, _) = test_keypair(1);
+    let (bob_nsec, bob_npub, _) = test_keypair(2);
+
+    let alice_config = email_config(
+        "alice@test.local",
+        "password-alice",
+        &alice_nsec,
+        mock.smtp_addr,
+        mock.imap_addr,
+    );
+
+    let plaintext = "Header-sig fallback should let me through.";
+    let ciphertext = crypto::encrypt_message(&alice_nsec, &bob_npub, plaintext, Some("nip04"))
+        .expect("nip04 encrypt");
+
+    // No inline SIGNATURE block — only the encrypted body armor.
+    let armored_body = format!(
+        "-----BEGIN NOSTR NIP-04 ENCRYPTED BODY-----\n{}\n-----END NOSTR MESSAGE-----",
+        ciphertext
+    );
+
+    email::send_email(
+        &alice_config,
+        "bob@test.local",
+        "nip04 header sig fallback",
+        &armored_body,
+        Some(&alice_npub),
+        None,
+        None,
+        None,
+        None,
+        None,
+        true, // include X-Nostr-Pubkey
+        true, // include X-Nostr-Sig
+        Some(&bob_npub),
+        true,
+    )
+    .await
+    .expect("send_email");
+
+    let inbox = mock.store.get_mailbox_emails("INBOX").await;
+    let delivered = &inbox[0];
+    let raw_headers = raw_headers_from_store(delivered);
+
+    // Sanity: the message we're testing really has X-Nostr-Sig but no inline sig.
+    assert!(
+        email::extract_nostr_sig_from_headers(&raw_headers).is_some(),
+        "precondition: X-Nostr-Sig must be present"
+    );
+    assert!(
+        !delivered.body.contains("BEGIN NOSTR SIGNATURE"),
+        "precondition: armor must NOT contain inline SIGNATURE block"
+    );
+
+    // Without raw_headers: pipeline rejects with the unsigned-message error.
+    let without_headers = email::decrypt_email_body_pipeline(
+        &bob_nsec,
+        &delivered.body,
+        &delivered.subject,
+        Some(&alice_npub),
+        Some(&bob_npub),
+        None,
+    )
+    .expect("pipeline returns Ok even on signature rejection");
+    assert!(
+        !without_headers.success,
+        "must reject unsigned NIP-04 when no header sig is available"
+    );
+    let err = without_headers
+        .block_results
+        .last()
+        .and_then(|b| b.error.clone())
+        .unwrap_or_default();
+    assert!(
+        err.contains("no signature") || err.contains("Require Signatures"),
+        "rejection error should explain the cause, got: {}",
+        err
+    );
+
+    // With raw_headers: header sig verifies, body decrypts to plaintext.
+    let with_headers = email::decrypt_email_body_pipeline(
+        &bob_nsec,
+        &delivered.body,
+        &delivered.subject,
+        Some(&alice_npub),
+        Some(&bob_npub),
+        Some(&raw_headers),
+    )
+    .expect("pipeline returns Ok when header sig verifies");
+    assert!(
+        with_headers.success,
+        "header sig fallback must unlock decrypt, error={:?}",
+        with_headers.error
+    );
+    assert_eq!(
+        with_headers.body.trim(),
+        plaintext,
+        "decrypted plaintext must round-trip"
+    );
+}
+
 /// Multipart text+html lettre → mailparse round-trip. The encrypted ENCRYPTED
 /// BODY armor lives in the text/plain part; the html part is a separate MIME
 /// section. Confirms both reach the receive side intact.
@@ -835,6 +943,7 @@ async fn sent_mail_decrypts_via_recipient_header_without_dm() {
         &delivered.subject,
         None,
         Some(&recipient_from_header),
+        None,
     )
     .expect("decrypt_email_body_pipeline");
 
@@ -922,6 +1031,7 @@ async fn sent_mail_undecryptable_without_any_counterparty_hint() {
         &alice_nsec,
         &delivered.body,
         &delivered.subject,
+        None,
         None,
         None,
     )
@@ -2114,6 +2224,7 @@ async fn nip44_reply_preserves_nested_encrypted_armor() {
         &reply.subject,
         Some(&bob_npub),
         Some(&alice_npub),
+        None,
     )
     .expect("decrypt_email_body_pipeline");
     assert!(decrypt.success, "decrypt must succeed: {:?}", decrypt.error);
@@ -2332,6 +2443,7 @@ async fn nip44_three_level_reply_chain() {
         &delivered.subject,
         Some(&alice_npub),
         Some(&bob_npub),
+        None,
     )
     .expect("decrypt pipeline");
     assert!(decrypt.success, "decrypt failed: {:?}", decrypt.error);

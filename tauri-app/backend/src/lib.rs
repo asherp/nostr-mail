@@ -4154,15 +4154,25 @@ fn decrypt_email_body(
     subject: String,
     sender_pubkey: Option<String>,
     recipient_pubkey: Option<String>,
+    message_id: Option<String>,
     state: tauri::State<AppState>,
 ) -> Result<types::DecryptEmailResult, String> {
     let pk = resolve_private_key(private_key, &state)?;
+    // Look up raw_headers from DB by message_id so the pipeline can fall back to
+    // the X-Nostr-Sig header for NIP-04 signature verification when the inline
+    // SIGNATURE block is missing.
+    let raw_headers = message_id.as_deref().and_then(|mid| {
+        state.get_database().ok()
+            .and_then(|db| db.get_email(mid).ok().flatten())
+            .and_then(|e| e.raw_headers)
+    });
     email::decrypt_email_body_pipeline(
         &pk,
         &armor_text,
         &subject,
         sender_pubkey.as_deref(),
         recipient_pubkey.as_deref(),
+        raw_headers.as_deref(),
     )
 }
 
@@ -4173,16 +4183,25 @@ fn decrypt_email_bodies_batch(
     state: tauri::State<AppState>,
 ) -> Result<Vec<types::BatchDecryptResultItem>, String> {
     let pk = resolve_private_key(private_key, &state)?;
+    // Open DB once for the whole batch so each item can look up its raw_headers
+    // by message_id for NIP-04 header-sig fallback verification.
+    let db_opt = state.get_database().ok();
     let results = emails
         .into_iter()
         .map(|e| {
             let id = e.id.clone();
+            let raw_headers = e.message_id.as_deref().and_then(|mid| {
+                db_opt.as_ref()
+                    .and_then(|db| db.get_email(mid).ok().flatten())
+                    .and_then(|row| row.raw_headers)
+            });
             match email::decrypt_email_body_pipeline(
                 &pk,
                 &e.armor_text,
                 &e.subject,
                 e.sender_pubkey.as_deref(),
                 e.recipient_pubkey.as_deref(),
+                raw_headers.as_deref(),
             ) {
                 Ok(result) => types::BatchDecryptResultItem {
                     id,
@@ -6582,7 +6601,7 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: Option<String>, 
     for pubkey in &pubkeys_to_try {
         let sender_pk = if user_received_email { Some(pubkey.as_str()) } else { None };
         let recipient_pk = if user_sent_email { Some(pubkey.as_str()) } else { Some(pubkey.as_str()) };
-        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk) {
+        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk, email.raw_headers.as_deref()) {
             Ok(result) if result.success => {
                 println!("[RUST] decrypt_email_body_pipeline succeeded with pubkey: {}", pubkey);
                 return Ok(Some(types::MatchingEmailBodyResult {

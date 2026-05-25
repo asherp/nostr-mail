@@ -3111,6 +3111,7 @@ class EmailService {
                                 subject: email.subject,
                                 senderPubkey: null,
                                 recipientPubkey,
+                                messageId: email.message_id || null,
                             };
                         }
                         return {
@@ -3119,6 +3120,7 @@ class EmailService {
                             subject: email.subject,
                             senderPubkey: email.sender_pubkey || email.nostr_pubkey || null,
                             recipientPubkey: null,
+                            messageId: email.message_id || null,
                         };
                     });
                     console.log(`[JS] Batch decrypting ${batchInput.length} inbox emails in one IPC call`);
@@ -3184,7 +3186,7 @@ class EmailService {
                                 const senderPubkey = isSent ? null : (email.sender_pubkey || email.nostr_pubkey || null);
                                 const recipientPubkey = isSent ? (email.recipient_pubkey || null) : null;
                                 const retry = await TauriService.decryptEmailBody(
-                                    email.body, email.subject, senderPubkey, recipientPubkey
+                                    email.body, email.subject, senderPubkey, recipientPubkey, email.message_id || null
                                 );
                                 if (retry && retry.success) {
                                     let previewText = Utils.escapeHtml(retry.body.substring(0, 100));
@@ -3335,7 +3337,8 @@ class EmailService {
                         }
                         const result = await TauriService.decryptEmailBody(
                             email.body, email.subject,
-                            senderPubkey, recipientPubkey
+                            senderPubkey, recipientPubkey,
+                            email.message_id || null
                         );
                         if (result.success) {
                             previewSubject = result.subject;
@@ -3797,7 +3800,7 @@ class EmailService {
                             // Run decryption and signature verification in parallel (they're independent)
                             console.log('[JS] Calling backend decrypt_email_body + verifyAllSignatures in parallel...');
                             const [result, allSigs] = await Promise.all([
-                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, null),
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, null, email.message_id || null),
                                 TauriService.verifyAllSignatures(emailBody).catch(e => {
                                     console.warn('[JS] Signature verification error:', e);
                                     return [];
@@ -3924,7 +3927,7 @@ class EmailService {
                                         const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                                         const decryptResult = await TauriService.decryptEmailBody(
                                             email.body, email.subject || '',
-                                            senderPubkey, null
+                                            senderPubkey, null, email.message_id || null
                                         );
                                         if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
                                             manifestResult = {
@@ -4583,7 +4586,7 @@ ${attachmentsHtml}
 
                         try {
                             const [result, allSigs] = await Promise.all([
-                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey),
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey, email.message_id || null),
                                 TauriService.verifyAllSignatures(emailBody).catch(e => {
                                     console.warn('[JS] Thread sig verify error:', e);
                                     return [];
@@ -6591,6 +6594,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                             subject: email.subject,
                             senderPubkey: null,
                             recipientPubkey,
+                            messageId: email.message_id || null,
                         };
                     });
                     console.log(`[JS] Batch decrypting ${batchInput.length} sent emails in one IPC call`);
@@ -6642,7 +6646,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 const changed = await retrofitPromise;
                                 if (!changed || !email.recipient_pubkey) return;
                                 const retry = await TauriService.decryptEmailBody(
-                                    email.body, email.subject, null, email.recipient_pubkey
+                                    email.body, email.subject, null, email.recipient_pubkey, email.message_id || null
                                 );
                                 if (retry && retry.success) {
                                     let previewText = Utils.escapeHtml(retry.body.substring(0, 100));
@@ -6771,7 +6775,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         try {
                             const result = await TauriService.decryptEmailBody(
                                 email.body, email.subject,
-                                null, recipientPubkey
+                                null, recipientPubkey,
+                                email.message_id || null
                             );
                             if (result.success) {
                                 previewSubject = result.subject;
@@ -7387,7 +7392,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                                 const decryptResult = await TauriService.decryptEmailBody(
                                     email.body, email.subject || '',
-                                    null, recipientPubkey
+                                    null, recipientPubkey,
+                                    email.message_id || null
                                 );
                                 if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
                                     manifestResult = {
@@ -7796,7 +7802,7 @@ ${attachmentsHtml}
                         // Run decryption and signature verification in parallel (they're independent)
                         console.log('[JS] Calling backend decrypt_email_body + verifyAllSignatures for sent email in parallel...');
                         const [result, allSigs] = await Promise.all([
-                            TauriService.decryptEmailBody(email.body, email.subject, null, recipientPubkey),
+                            TauriService.decryptEmailBody(email.body, email.subject, null, recipientPubkey, email.message_id || null),
                             TauriService.verifyAllSignatures(email.body).catch(e => {
                                 console.warn('[JS] Signature verification error:', e);
                                 return [];
@@ -7942,7 +7948,8 @@ ${attachmentsHtml}
 
             const result = await TauriService.decryptEmailBody(
                 email.body, email.subject || '',
-                null, recipientPubkey
+                null, recipientPubkey,
+                email.message_id || null
             );
 
             // Retrofit happens whether or not the body decrypted — the subject
@@ -8075,7 +8082,8 @@ ${attachmentsHtml}
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for sent attachment...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    null, recipientPubkey
+                    null, recipientPubkey,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8171,7 +8179,8 @@ ${attachmentsHtml}
                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    null, recipientPubkey
+                    null, recipientPubkey,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8317,7 +8326,8 @@ ${attachmentsHtml}
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for attachment...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    senderPubkey, null
+                    senderPubkey, null,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8416,7 +8426,8 @@ ${attachmentsHtml}
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for ZIP...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    senderPubkey, null
+                    senderPubkey, null,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8771,7 +8782,8 @@ ${attachmentsHtml}
                     const recipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey || draft.sender_pubkey;
                     const result = await TauriService.decryptEmailBody(
                         draft.body, draft.subject || '',
-                        recipientPubkey, null
+                        recipientPubkey, null,
+                        draft.message_id || null
                     );
                     if (result.success) {
                         previewSubject = result.subject || draft.subject;
@@ -9196,7 +9208,8 @@ ${attachmentsHtml}
                             const recipientPubkey = draftRecipientPubkey;
                             const result = await TauriService.decryptEmailBody(
                                 draft.body, draft.subject || '',
-                                recipientPubkey, null
+                                recipientPubkey, null,
+                                draft.message_id || null
                             );
                             if (result.success) {
                                 decryptedSubject = result.subject || draft.subject;

@@ -2661,7 +2661,7 @@ class ContactsService {
                 }
                 
                 // Update contact detail if this contact is currently selected
-                const selectedContact = this.getSelectedContact();
+                const selectedContact = window.appState.getSelectedContact();
                 if (selectedContact && selectedContact.pubkey === pubkey) {
                     this.renderContactDetail(contact);
                 }

@@ -3280,7 +3280,7 @@ class EmailService {
                 emailList.appendChild(loadMoreBtn);
             }
 
-            console.log(`[JS] renderEmails: Successfully rendered ${renderedItems.filter(r => r.status === 'fulfilled').length} emails`);
+            console.log(`[JS] renderEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
             console.error('Error rendering emails:', error);
         }
@@ -6752,7 +6752,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 sentList.appendChild(loadMoreBtn);
             }
             
-            console.log(`[JS] renderSentEmails: Successfully rendered ${renderedItems.filter(r => r.status === 'fulfilled').length} emails`);
+            console.log(`[JS] renderSentEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
             console.error('[JS] Error in renderSentEmails:', error);
             sentList.innerHTML = '<div class="text-center text-muted">Error loading sent emails</div>';

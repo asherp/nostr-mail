@@ -3084,6 +3084,12 @@ class EmailService {
                 return ph;
             });
 
+            // Yield to the browser so it paints the skeletons before we move on.
+            // Without this, a warm preview cache lets the full replacement run to
+            // completion in the same JS turn as the appendChild loop, and the
+            // browser never paints the intermediate "skeleton-only" state.
+            await new Promise(resolve => requestAnimationFrame(resolve));
+
             // Batch-decrypt uncached encrypted emails in a single IPC call
             const uncachedEncrypted = filteredEmails.filter(email => {
                 if (this._previewCache.has(`inbox-${email.id}`)) return false;
@@ -6593,6 +6599,12 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 sentList.appendChild(ph);
                 return ph;
             });
+
+            // Yield to the browser so it paints the skeletons before we move on.
+            // Without this, a warm preview cache lets the full replacement run to
+            // completion in the same JS turn as the appendChild loop, and the
+            // browser never paints the intermediate "skeleton-only" state.
+            await new Promise(resolve => requestAnimationFrame(resolve));
 
             // Batch-decrypt uncached encrypted sent emails, resolving pubkeys from contact index
             const uncachedEncrypted = filteredEmails.filter(email => {

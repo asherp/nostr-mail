@@ -3567,10 +3567,10 @@ class EmailService {
         // For encrypted emails the stored subject is either ciphertext or a
         // placeholder string; either way it isn't meaningful to display while
         // we wait for decryption. Substitute a clear "Decrypting…" hint for
-        // both the subject and the body preview until the full render lands.
+        // the subject and blank the preview until the full render lands.
         const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
         const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
-        const previewText = isEncrypted ? 'Decrypting…' : 'Loading...';
+        const previewText = isEncrypted ? '' : 'Loading...';
 
         emailElement.innerHTML = `
             <img class="${senderInfo.avatarClass}" src="${senderInfo.avatarSrc}" alt="${Utils.escapeHtml(senderInfo.identityName)}'s avatar" onerror="this.onerror=null;this.src='${senderInfo.defaultAvatar}';this.className='contact-avatar';">
@@ -7049,12 +7049,13 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         }
 
         // For encrypted sent emails the stored subject is ciphertext / a
-        // placeholder and the body is armor — show "Decrypting…" for both
-        // until the full render replaces this skeleton.
+        // placeholder and the body is armor — show "Decrypting…" on the
+        // subject and blank the preview until the full render replaces
+        // this skeleton. Cleartext sent emails keep their body snippet.
         const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
         const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
         const previewText = isEncrypted
-            ? 'Decrypting…'
+            ? ''
             : Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
 
         emailElement.innerHTML = `

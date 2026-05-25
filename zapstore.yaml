@@ -2,18 +2,25 @@ name: NostrMail
 repository: https://github.com/asherp/nostr-mail
 pubkey: npub1agg7melcvmue7vwj2wqdh2666454xv5vsdu7n2tmkv73fl0a0tsq7asr9j
 description: |
-  ⚠️ **Pre-release Notice:** This is a pre-release build and may have bugs. We recommend generating a new keypair rather than using an existing one.
-  
-  NostrMail encrypts email content using  NIP-44/NIP-04.
-  
-  This application can use any email server for delivery while leveraging Nostr's decentralized social key registry for key discovery and management.
-  
+ 
+  NostrMail is an Email client that adds nostr encryption and signatures to vanilla email.
+  This app is compatible with any email service (GMail, yahoo, etc) for delivery, and leverages
+  the Nostr network for key discovery and management.
+
   Features:
-  - SMTP Email Sending and IMAP Email Fetching
   - End-to-end encryption using NIP-44 (default) and NIP-04
+  - Inline signatures
+  - Private contacts
+  - SMTP Email Sending and IMAP Email Fetching
+  - Latin and Bip39 (english) ciphertext encoding via Glossia
   - Nostr direct messages and contact management
-  - Profile management with Nostr social key registry
+  - Profile management
   - Cross-platform support (Windows, macOS, Linux, Android)
+
+  ⚠️ **Notice:** We recommend generating a new keypair in the app rather than using an existing one.
+  You may also want to create a fresh email account for this purpose. Any provider will do - just set up an app password and you're good to go.
+  
+
 summary: An email client providing encryption and signatures within standard email, comaptible all imap/smtp servers (gmail, yahoo, business). 
 website: https://nostr-mail.com
 icon: tauri-app/backend/icons/icon.png

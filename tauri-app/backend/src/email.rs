@@ -2442,6 +2442,7 @@ fn decrypt_single_block(
     let nip = encryption_nip.unwrap_or("nip44");
 
     // Step 1: Glossia-decode body text → ciphertext string
+    let perf_glossia = std::time::Instant::now();
     let ciphertext = match glossia_decode_to_ciphertext(body_text, nip) {
         Ok(ct) => {
             println!("[RUST] decrypt_single_block: glossia decoded, ciphertext len={}", ct.len());
@@ -2453,6 +2454,8 @@ fn decrypt_single_block(
             return (block, None);
         }
     };
+    let glossia_ms = perf_glossia.elapsed().as_millis();
+    let ciphertext_len = ciphertext.len();
 
     // Step 2: Determine which pubkey to decrypt with
     let decrypt_pubkey_hex = match determine_decrypt_pubkey(sig_pubkey_hex, seal_pubkey_hex, user_pubkey_hex, fallback_pubkey) {
@@ -2479,6 +2482,7 @@ fn decrypt_single_block(
         }
     };
 
+    let perf_nip = std::time::Instant::now();
     let decrypted = match crate::nostr::decrypt_dm_content(private_key, &decrypt_npub, &ciphertext) {
         Ok(d) => {
             println!("[RUST] decrypt_single_block: NIP decrypt SUCCESS, len={} preview={:?}", d.len(), &d[..d.len().min(40)]);
@@ -2490,6 +2494,9 @@ fn decrypt_single_block(
             return (block, None);
         }
     };
+    let nip_decrypt_ms = perf_nip.elapsed().as_millis();
+    println!("[RUST-PERF] decrypt_single_block: nip={} glossia={}ms (ct={}b) nip_decrypt={}ms (out={}b)",
+        nip, glossia_ms, ciphertext_len, nip_decrypt_ms, decrypted.len());
 
     // Step 4: Detect manifest vs legacy
     let trimmed = decrypted.trim();
@@ -2559,13 +2566,16 @@ fn decrypt_armor_tree(
     user_pubkey_hex: &str,
     fallback_pubkey: &str,
     raw_headers: Option<&str>,
+    depth: usize,
 ) -> (Vec<crate::types::DecryptedBlock>, Option<JsonManifest>) {
+    let perf_level = std::time::Instant::now();
     let mut results = Vec::new();
     let mut outer_manifest = None;
 
     // Recurse into quoted first (innermost-first ordering)
     // Propagate current level's sig/seal pubkey as fallback for inner blocks,
     // so nested blocks can identify the other party when their own sig matches the user.
+    let mut inner_ms = 0u128;
     if let Some(ref quoted) = parsed.quoted {
         let inner_fallback = if fallback_pubkey.is_empty() {
             parsed.sig_pubkey_hex.as_deref()
@@ -2578,7 +2588,9 @@ fn decrypt_armor_tree(
         // includes nested quoted bytes by concatenation. Inner subtrees only see a
         // slice of that signed data, so the header sig would never verify against
         // them — pass None so inner levels rely solely on their inline signatures.
-        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback, None);
+        let perf_inner = std::time::Instant::now();
+        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback, None, depth + 1);
+        inner_ms = perf_inner.elapsed().as_millis();
         results.extend(inner_results);
     }
 
@@ -2586,7 +2598,11 @@ fn decrypt_armor_tree(
     // NIP-04 (AES-256-CBC) lacks authenticated encryption; the Schnorr signature
     // serves as the MAC. Verification MUST happen before decryption to prevent
     // padding oracle attacks.
+    let perf_sig = std::time::Instant::now();
+    let mut sig_verify_ran = false;
+    let mut sig_verify_bytes_len: usize = 0;
     if parsed.encryption_nip.as_deref() == Some("nip04") {
+        sig_verify_ran = true;
         // Compute the canonical signed bytes once: this level's raw decoded body
         // concatenated with all nested quoted body bytes. Both the inline
         // SIGNATURE block and the X-Nostr-Sig header sign these same bytes.
@@ -2611,6 +2627,7 @@ fn decrypt_armor_tree(
             }
         }
         collect_quoted_bytes(&parsed.quoted, &mut all_bytes);
+        sig_verify_bytes_len = all_bytes.len();
 
         // Primary trust path: inline SIGNATURE block inside the armor.
         let inline_verified = match (&parsed.signature_hex, &parsed.sig_pubkey_hex) {
@@ -2690,11 +2707,18 @@ fn decrypt_armor_tree(
                 profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
                 body_type: "encrypted".to_string(),
             });
+            let sig_ms_reject = perf_sig.elapsed().as_millis();
+            println!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block=SKIPPED(sig fail) total={}ms",
+                depth, parsed.body_text.len(), parsed.encryption_nip.as_deref(),
+                inner_ms, sig_ms_reject, sig_verify_bytes_len,
+                perf_level.elapsed().as_millis());
             return (results, outer_manifest);
         }
     }
+    let sig_verify_ms = if sig_verify_ran { perf_sig.elapsed().as_millis() } else { 0 };
 
     // Decrypt this level
+    let perf_block = std::time::Instant::now();
     let (block, manifest) = decrypt_single_block(
         &parsed.body_text,
         &parsed.body_type,
@@ -2706,10 +2730,16 @@ fn decrypt_armor_tree(
         user_pubkey_hex,
         fallback_pubkey,
     );
+    let block_ms = perf_block.elapsed().as_millis();
     if manifest.is_some() {
         outer_manifest = manifest;
     }
     results.push(block);
+
+    println!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block={}ms total={}ms",
+        depth, parsed.body_text.len(), parsed.encryption_nip.as_deref(),
+        inner_ms, sig_verify_ms, sig_verify_bytes_len, block_ms,
+        perf_level.elapsed().as_millis());
 
     (results, outer_manifest)
 }
@@ -2724,12 +2754,14 @@ pub fn decrypt_email_body_pipeline(
     recipient_pubkey: Option<&str>,
     raw_headers: Option<&str>,
 ) -> Result<crate::types::DecryptEmailResult, String> {
+    let perf_total = std::time::Instant::now();
     println!("[RUST] decrypt_email_body: armor_len={} subject_len={}", armor_text.len(), subject.len());
 
     // Normalize line endings (spec section 8 step 2)
     let normalized = armor_text.replace("\r\n", "\n");
 
     // Parse armor into capnp ArmorMessage → serde struct
+    let perf_parse = std::time::Instant::now();
     let parsed = match parse_armor_components(&normalized) {
         Some(p) => p,
         None => {
@@ -2747,14 +2779,17 @@ pub fn decrypt_email_body_pipeline(
             });
         }
     };
+    let parse_ms = perf_parse.elapsed().as_millis();
 
     // Derive user's pubkey hex from private key
+    let perf_derive = std::time::Instant::now();
     let user_pubkey_hex = {
         let sk = nostr_sdk::prelude::SecretKey::parse(private_key)
             .map_err(|e| format!("Invalid private key: {:?}", e))?;
         let keys = nostr_sdk::prelude::Keys::new(sk);
         keys.public_key().to_hex()
     };
+    let derive_pk_ms = perf_derive.elapsed().as_millis();
 
     // Determine fallback pubkey (the other party's pubkey for decryption)
     let fallback = sender_pubkey
@@ -2762,7 +2797,9 @@ pub fn decrypt_email_body_pipeline(
         .unwrap_or("");
 
     // Walk the armor tree, decrypt each level
-    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback, raw_headers);
+    let perf_tree = std::time::Instant::now();
+    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback, raw_headers, 0);
+    let tree_ms = perf_tree.elapsed().as_millis();
 
     // Extract outermost decrypted body (last element in innermost-first array)
     let outer_block = block_results.last();
@@ -2800,6 +2837,7 @@ pub fn decrypt_email_body_pipeline(
     };
 
     // Decrypt subject — use armor's embedded pubkey as fallback when sender_pubkey wasn't provided
+    let perf_subject = std::time::Instant::now();
     let (decrypted_subject, subject_ciphertext) = if parsed.body_type == "encrypted" {
         let nip_hint = parsed.encryption_nip.as_deref().unwrap_or("nip44");
         let subject_fallback = if fallback.is_empty() {
@@ -2814,8 +2852,10 @@ pub fn decrypt_email_body_pipeline(
     } else {
         (subject.to_string(), None)
     };
+    let subject_ms = perf_subject.elapsed().as_millis();
 
     // Extract sender pubkey from outermost armor signature (for avatar fallback)
+    let perf_sender = std::time::Instant::now();
     let armor_sender_pubkey = if sender_pubkey.is_none() {
         // No header-provided pubkey — try to derive from verified armor signature
         parsed.sig_pubkey_hex.as_deref().and_then(|pk_hex| {
@@ -2833,10 +2873,14 @@ pub fn decrypt_email_body_pipeline(
     } else {
         None
     };
+    let sender_extract_ms = perf_sender.elapsed().as_millis();
 
     println!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={} armor_sender_pubkey={:?}",
         success, is_manifest, block_results.len(), attachments.len(),
         armor_sender_pubkey.as_deref().map(|s: &str| &s[..std::cmp::min(s.len(), 20)]));
+    println!("[RUST-PERF] decrypt_email_body_pipeline: total={}ms parse={}ms derive_pk={}ms tree={}ms subject={}ms sender_extract={}ms (armor_len={}b, levels={})",
+        perf_total.elapsed().as_millis(), parse_ms, derive_pk_ms, tree_ms, subject_ms, sender_extract_ms,
+        armor_text.len(), block_results.len());
 
     Ok(crate::types::DecryptEmailResult {
         subject: decrypted_subject,

@@ -1823,8 +1823,16 @@ fn populate_armor_from_text(
             nostr_mail_capnp::NipVersion::Nip44
         };
         enc.set_nip(nip_version);
-        if let Some(bytes) = decode_armor_section(&body_text) {
-            enc.set_ciphertext(&bytes);
+        // Only NIP-04 actually consumes the pre-decoded ciphertext bytes (used as
+        // the MAC payload during signature verification, see decrypt_armor_tree).
+        // NIP-44 re-runs glossia decode in decrypt_single_block on the encoded
+        // body_text and never reads enc.ciphertext, so doing the decode here
+        // wastes a full glossia detect+decode round trip per nesting level — the
+        // single biggest cost in parse_armor_components according to profiling.
+        if matches!(nip_version, nostr_mail_capnp::NipVersion::Nip04) {
+            if let Some(bytes) = decode_armor_section(&body_text) {
+                enc.set_ciphertext(&bytes);
+            }
         }
     } else if is_signed_body {
         let mut sgn = body_builder.reborrow().init_signed();
@@ -2112,9 +2120,11 @@ fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result
         return Err("Glossia decode failed: empty input".to_string());
     }
     let detect_words = words.clone();
+    let perf_detect = std::time::Instant::now();
     let detect_result = std::panic::catch_unwind(move || {
         glossia::detect_dialect_best(&detect_words)
     });
+    let detect_ms = perf_detect.elapsed().as_millis();
     let best = match detect_result {
         Ok(Some(m)) => m,
         Ok(None) => {
@@ -2139,9 +2149,11 @@ fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result
     let text = encoded_content.to_string();
     let language = best.language.clone();
     let wordlist = best.wordlist.clone();
+    let perf_decode = std::time::Instant::now();
     let decode_result = std::panic::catch_unwind(move || {
         glossia::decode_from_language(&text, &language, &wordlist, false)
     });
+    let decode_ms = perf_decode.elapsed().as_millis();
     let decoded = match decode_result {
         Ok(Ok(d)) => d,
         Ok(Err(e)) => {
@@ -2158,6 +2170,8 @@ fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result
         }
     };
     println!("[RUST] glossia_decode_to_ciphertext: decoded len={}", decoded.len());
+    println!("[RUST-PERF] glossia_decode_to_ciphertext: detect={}ms (words={}) decode_from_language={}ms (in={}b, out={}b)",
+        detect_ms, words.len(), decode_ms, encoded_content.len(), decoded.len());
 
     glossia_postprocess(&decoded, nip_hint)
 }

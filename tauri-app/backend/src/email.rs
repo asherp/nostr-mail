@@ -1368,36 +1368,12 @@ fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<
 /// Uses catch_unwind because glossia's codec can panic on malformed input
 /// (e.g. partial wordlist matches with bad padding).
 fn try_glossia_decode_to_bytes(text: &str) -> Option<Vec<u8>> {
-    let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
-    if words.is_empty() {
-        return None;
-    }
-    let best = glossia::detect_dialect_best(&words)?;
-    if best.hit_rate < 0.3 {
-        return None;
-    }
-    let text_owned = text.to_string();
-    let language = best.language.clone();
-    let wordlist = best.wordlist.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        glossia::decode_from_language(&text_owned, &language, &wordlist, false)
-    }));
-    let decoded = match result {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => {
-            println!("[RUST] try_glossia_decode_to_bytes: decode error: {:?}", e);
-            return None;
-        }
-        Err(_) => {
-            println!("[RUST] try_glossia_decode_to_bytes: glossia panicked during decode, skipping");
-            return None;
-        }
-    };
+    let cached = glossia_detect_and_decode_cached(text)?;
     // decode_from_language returns hex when bytes aren't valid UTF-8 (i.e. binary ciphertext)
-    if let Some(bytes) = glossia::hex_decode(&decoded) {
+    if let Some(bytes) = glossia::hex_decode(&cached.decoded) {
         Some(bytes)
     } else {
-        Some(decoded.into_bytes())
+        Some(cached.decoded.clone().into_bytes())
     }
 }
 
@@ -2107,6 +2083,81 @@ fn is_base64_content(content: &str) -> bool {
 /// prose was encoded with, then decodes once with that pair. Mirrors the
 /// subject path (`glossia_decode_subject`) and `try_glossia_decode_to_bytes`.
 /// The `nip_hint` is "nip04" or "nip44" from the armor BEGIN tag.
+/// Result of glossia detect + decode for a piece of armored body text.
+/// Cached process-wide by hash of the input so repeated decodes of the
+/// same text (across nesting levels, sender_extract, sig verification,
+/// thread reopen, etc.) skip both `detect_dialect_best` and
+/// `decode_from_language`.
+#[derive(Clone, Debug)]
+struct GlossiaDecodeCached {
+    language: String,
+    wordlist: String,
+    /// Output of `glossia::decode_from_language` — either UTF-8 text or
+    /// hex of the underlying bytes when the bytes weren't valid UTF-8.
+    decoded: String,
+    hit_rate: f64,
+}
+
+static GLOSSIA_DECODE_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, GlossiaDecodeCached>>>
+    = std::sync::OnceLock::new();
+
+fn hash_glossia_input(text: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Cached `detect_dialect_best` + `decode_from_language`. Pure function of the
+/// input text — the same prose always produces the same dialect + decoded
+/// output, so a process-wide cache is safe. Returns None for plaintext or
+/// non-glossia input (low hit rate / detection failure).
+fn glossia_detect_and_decode_cached(text: &str) -> Option<GlossiaDecodeCached> {
+    let key = hash_glossia_input(text);
+    let cache = GLOSSIA_DECODE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    if let Some(entry) = cache.lock().unwrap().get(&key) {
+        println!("[RUST-PERF] glossia cache HIT key={:x} (in={}b, dialect={}/{}, out={}b)",
+            key, text.len(), entry.language, entry.wordlist, entry.decoded.len());
+        return Some(entry.clone());
+    }
+
+    let perf = std::time::Instant::now();
+    let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.is_empty() {
+        return None;
+    }
+    let detect_words = words.clone();
+    let best = match std::panic::catch_unwind(move || glossia::detect_dialect_best(&detect_words)) {
+        Ok(Some(b)) => b,
+        _ => return None,
+    };
+    if best.hit_rate < 0.3 {
+        return None;
+    }
+    let language = best.language.clone();
+    let wordlist = best.wordlist.clone();
+    let text_owned = text.to_string();
+    let decoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        glossia::decode_from_language(&text_owned, &language, &wordlist, false)
+    })) {
+        Ok(Ok(d)) => d,
+        _ => return None,
+    };
+    let entry = GlossiaDecodeCached {
+        language,
+        wordlist,
+        decoded,
+        hit_rate: best.hit_rate,
+    };
+    println!("[RUST-PERF] glossia cache MISS key={:x} compute={}ms (in={}b, words={}, dialect={}/{}, out={}b, hit_rate={:.3})",
+        key, perf.elapsed().as_millis(), text.len(), words.len(),
+        entry.language, entry.wordlist, entry.decoded.len(), entry.hit_rate);
+    cache.lock().unwrap().insert(key, entry.clone());
+    Some(entry)
+}
+
 fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result<String, String> {
     // If already base64 or base64?iv=base64, return as-is
     if is_base64_content(encoded_content) {
@@ -2114,66 +2165,13 @@ fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result
         return Ok(stripped);
     }
 
-    // Detect dialect (language + wordlist) from the prose itself.
-    let words: Vec<String> = encoded_content.split_whitespace().map(|w| w.to_lowercase()).collect();
-    if words.is_empty() {
-        return Err("Glossia decode failed: empty input".to_string());
-    }
-    let detect_words = words.clone();
-    let perf_detect = std::time::Instant::now();
-    let detect_result = std::panic::catch_unwind(move || {
-        glossia::detect_dialect_best(&detect_words)
-    });
-    let detect_ms = perf_detect.elapsed().as_millis();
-    let best = match detect_result {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            return Err("Glossia decode failed: no dialect detected".to_string());
-        }
-        Err(panic_info) => {
-            let msg = panic_info.downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            return Err(format!("Glossia decode failed: detect panicked: {}", msg));
-        }
-    };
+    let cached = glossia_detect_and_decode_cached(encoded_content)
+        .ok_or_else(|| "Glossia decode failed: no dialect detected or hit_rate too low".to_string())?;
     println!("[RUST] glossia_decode_to_ciphertext: detected dialect={:?} wordlist={:?} hit_rate={}",
-        best.language, best.wordlist, best.hit_rate);
-    if best.hit_rate < 0.3 {
-        return Err(format!(
-            "Glossia decode failed: hit_rate {} too low (<0.3)", best.hit_rate
-        ));
-    }
+        cached.language, cached.wordlist, cached.hit_rate);
+    println!("[RUST] glossia_decode_to_ciphertext: decoded len={}", cached.decoded.len());
 
-    let text = encoded_content.to_string();
-    let language = best.language.clone();
-    let wordlist = best.wordlist.clone();
-    let perf_decode = std::time::Instant::now();
-    let decode_result = std::panic::catch_unwind(move || {
-        glossia::decode_from_language(&text, &language, &wordlist, false)
-    });
-    let decode_ms = perf_decode.elapsed().as_millis();
-    let decoded = match decode_result {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => {
-            return Err(format!("Glossia decode failed for {}/{}: {:?}",
-                best.language, best.wordlist, e));
-        }
-        Err(panic_info) => {
-            let msg = panic_info.downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            return Err(format!("Glossia decode failed for {}/{}: panic: {}",
-                best.language, best.wordlist, msg));
-        }
-    };
-    println!("[RUST] glossia_decode_to_ciphertext: decoded len={}", decoded.len());
-    println!("[RUST-PERF] glossia_decode_to_ciphertext: detect={}ms (words={}) decode_from_language={}ms (in={}b, out={}b)",
-        detect_ms, words.len(), decode_ms, encoded_content.len(), decoded.len());
-
-    glossia_postprocess(&decoded, nip_hint)
+    glossia_postprocess(&cached.decoded, nip_hint)
 }
 
 /// Glossia-decode subject (payload_only mode, hit_rate >= 0.8).

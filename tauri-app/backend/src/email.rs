@@ -13,6 +13,42 @@ use tokio::time::timeout;
 use std::time::Duration;
 use crate::types::{TransportAuthVerdict, TransportAuthMethod};
 use std::net::TcpStream;
+
+// Verbose [RUST] logs in the decrypt hot path are silent by default — set the
+// NOSTR_MAIL_DEBUG environment variable to any value to re-enable them for
+// diagnostics. [RUST-PERF] lines (regular println!) remain on so profiling
+// info is always available.
+fn debug_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NOSTR_MAIL_DEBUG").is_ok())
+}
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if debug_log_enabled() {
+            println!($($arg)*);
+        }
+    };
+}
+
+// Soft cap on cache size. When a cache grows beyond this, ~25% of entries are
+// dropped (HashMap iteration order is unspecified, so this is effectively a
+// random eviction). Realistic inboxes have a few thousand unique armor bodies
+// at most; this guard exists for the pathological "100k+ encrypted messages"
+// case.
+const CACHE_MAX: usize = 10_000;
+
+fn maybe_evict<K: Clone + Eq + std::hash::Hash, V>(
+    map: &mut std::collections::HashMap<K, V>,
+) {
+    if map.len() > CACHE_MAX {
+        let drop_count = map.len() / 4;
+        let keys: Vec<K> = map.keys().take(drop_count).cloned().collect();
+        for k in keys {
+            map.remove(&k);
+        }
+    }
+}
 #[cfg(not(target_os = "android"))]
 use native_tls::TlsConnector;
 #[cfg(target_os = "android")]
@@ -168,8 +204,8 @@ pub fn construct_email_headers(
     recipient_pubkey: Option<&str>,
     include_recipient_header: bool,
 ) -> Result<String> {
-    println!("[RUST] construct_email_headers: Constructing email headers");
-    println!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
+    debug_log!("[RUST] construct_email_headers: Constructing email headers");
+    debug_log!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
     
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
@@ -179,7 +215,7 @@ pub fn construct_email_headers(
 
     // Add custom message ID if provided
     if let Some(msg_id) = message_id {
-        println!("[RUST] construct_email_headers: Setting message ID: {}", msg_id);
+        debug_log!("[RUST] construct_email_headers: Setting message ID: {}", msg_id);
         // Try using the builder's message_id method
         builder = builder.message_id(Some(msg_id.to_string()));
         
@@ -187,18 +223,18 @@ pub fn construct_email_headers(
         // Note: This might not work with lettre's builder pattern, but worth trying
         // builder = builder.header(("Message-ID", msg_id));
     } else {
-        println!("[RUST] construct_email_headers: No message ID provided");
+        debug_log!("[RUST] construct_email_headers: No message ID provided");
     }
 
     // Add In-Reply-To header if provided (for email threading)
     if let Some(reply_id) = in_reply_to {
-        println!("[RUST] construct_email_headers: Setting In-Reply-To: {}", reply_id);
+        debug_log!("[RUST] construct_email_headers: Setting In-Reply-To: {}", reply_id);
         builder = builder.in_reply_to(reply_id.to_string());
     }
 
     // Add References header if provided (for email threading)
     if let Some(refs) = references {
-        println!("[RUST] construct_email_headers: Setting References: {}", refs);
+        debug_log!("[RUST] construct_email_headers: Setting References: {}", refs);
         builder = builder.references(refs.to_string());
     }
 
@@ -212,10 +248,10 @@ pub fn construct_email_headers(
             match crypto::get_public_key_from_private(private_key) {
                 Ok(sender_pubkey) => {
                     if include_pubkey_header {
-                        println!("[RUST] construct_email_headers: Adding sender pubkey to headers: {}", sender_pubkey);
+                        debug_log!("[RUST] construct_email_headers: Adding sender pubkey to headers: {}", sender_pubkey);
                         builder = builder.header(XNostrPubkey(sender_pubkey));
                     } else {
-                        println!("[RUST] construct_email_headers: Skipping X-Nostr-Pubkey (disabled by user)");
+                        debug_log!("[RUST] construct_email_headers: Skipping X-Nostr-Pubkey (disabled by user)");
                     }
 
                     if include_sig_header && include_pubkey_header {
@@ -223,21 +259,21 @@ pub fn construct_email_headers(
                         let binary = extract_ciphertext_binary(body);
                         match crypto::sign_data_bytes(private_key, &binary) {
                             Ok(signature) => {
-                                println!("[RUST] construct_email_headers: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
+                                debug_log!("[RUST] construct_email_headers: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
                                 builder = builder.header(XNostrSig(signature));
                             }
                             Err(e) => {
-                                println!("[RUST] construct_email_headers: Failed to sign email body: {}", e);
+                                debug_log!("[RUST] construct_email_headers: Failed to sign email body: {}", e);
                             }
                         }
                     } else if include_sig_header && !include_pubkey_header {
-                        println!("[RUST] construct_email_headers: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
+                        debug_log!("[RUST] construct_email_headers: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
                     } else {
-                        println!("[RUST] construct_email_headers: Skipping X-Nostr-Sig (disabled by user)");
+                        debug_log!("[RUST] construct_email_headers: Skipping X-Nostr-Sig (disabled by user)");
                     }
                 }
                 Err(e) => {
-                    println!("[RUST] construct_email_headers: Failed to get public key from private key: {}", e);
+                    debug_log!("[RUST] construct_email_headers: Failed to get public key from private key: {}", e);
                 }
             }
         }
@@ -249,7 +285,7 @@ pub fn construct_email_headers(
     if include_recipient_header {
         if let Some(rp) = recipient_pubkey {
             if !rp.is_empty() {
-                println!("[RUST] construct_email_headers: Adding recipient pubkey to headers: {}", rp);
+                debug_log!("[RUST] construct_email_headers: Adding recipient pubkey to headers: {}", rp);
                 builder = builder.header(XNostrRecipient(rp.to_string()));
             }
         }
@@ -261,7 +297,7 @@ pub fn construct_email_headers(
         .body(body.to_string());
 
     let body_part: Option<MultiPart> = if let Some(html) = html_body {
-        println!("[RUST] construct_email_headers: Building multipart/alternative with HTML body");
+        debug_log!("[RUST] construct_email_headers: Building multipart/alternative with HTML body");
         let html_part = SinglePart::builder()
             .header(ContentType::TEXT_HTML)
             .body(html.to_string());
@@ -281,7 +317,7 @@ pub fn construct_email_headers(
                 builder.body(body.to_string())?
             }
         } else {
-            println!("[RUST] construct_email_headers: Building multipart email with {} attachments", attachments.len());
+            debug_log!("[RUST] construct_email_headers: Building multipart email with {} attachments", attachments.len());
 
             // Create multipart/mixed; nest alternative or plain text inside
             let mut multipart = if let Some(alt) = body_part {
@@ -294,7 +330,7 @@ pub fn construct_email_headers(
 
             // Add each attachment (for header construction, we don't need the actual data)
             for attachment in attachments {
-                println!("[RUST] construct_email_headers: Adding attachment header: {}", attachment.filename);
+                debug_log!("[RUST] construct_email_headers: Adding attachment header: {}", attachment.filename);
 
                 // Parse content type
                 let content_type = attachment.content_type.parse::<ContentType>()
@@ -321,7 +357,7 @@ pub fn construct_email_headers(
     let email_bytes = email.formatted();
     let email_string = String::from_utf8(email_bytes)?;
     
-    println!("[RUST] construct_email_headers: Full email string length: {}", email_string.len());
+    debug_log!("[RUST] construct_email_headers: Full email string length: {}", email_string.len());
     
     // Extract headers from the email string
     let lines: Vec<&str> = email_string.lines().collect();
@@ -338,19 +374,19 @@ pub fn construct_email_headers(
     }
     
     let final_headers = headers.join("\n");
-    println!("[RUST] construct_email_headers: Final headers:");
+    debug_log!("[RUST] construct_email_headers: Final headers:");
     println!("{}", final_headers);
     
     // Check if Message-ID is present in the headers
     if final_headers.to_lowercase().contains("message-id:") {
-        println!("[RUST] construct_email_headers: Message-ID found in headers");
+        debug_log!("[RUST] construct_email_headers: Message-ID found in headers");
     } else {
-        println!("[RUST] construct_email_headers: Message-ID NOT found in headers");
+        debug_log!("[RUST] construct_email_headers: Message-ID NOT found in headers");
         // If Message-ID is not present, manually add it
         if let Some(msg_id) = message_id {
-            println!("[RUST] construct_email_headers: Manually adding Message-ID: {}", msg_id);
+            debug_log!("[RUST] construct_email_headers: Manually adding Message-ID: {}", msg_id);
             let headers_with_message_id = format!("Message-ID: {}\n{}", msg_id, final_headers);
-            println!("[RUST] construct_email_headers: Headers with manually added Message-ID:");
+            debug_log!("[RUST] construct_email_headers: Headers with manually added Message-ID:");
             println!("{}", headers_with_message_id);
             return Ok(headers_with_message_id);
         }
@@ -376,10 +412,10 @@ pub async fn send_email(
     recipient_pubkey: Option<&str>,
     include_recipient_header: bool,
 ) -> Result<String> {
-    println!("[RUST] send_email: Starting email send process");
-    println!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
-    println!("[RUST] send_email: From: {}, To: {}", config.email_address, to_address);
-    println!("[RUST] send_email: Use TLS: {}", config.use_tls);
+    debug_log!("[RUST] send_email: Starting email send process");
+    debug_log!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
+    debug_log!("[RUST] send_email: From: {}, To: {}", config.email_address, to_address);
+    debug_log!("[RUST] send_email: Use TLS: {}", config.use_tls);
     
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
@@ -395,13 +431,13 @@ pub async fn send_email(
 
     // Add In-Reply-To header if provided (for email threading)
     if let Some(reply_id) = in_reply_to {
-        println!("[RUST] send_email: Setting In-Reply-To: {}", reply_id);
+        debug_log!("[RUST] send_email: Setting In-Reply-To: {}", reply_id);
         builder = builder.in_reply_to(reply_id.to_string());
     }
 
     // Add References header if provided (for email threading)
     if let Some(refs) = references {
-        println!("[RUST] send_email: Setting References: {}", refs);
+        debug_log!("[RUST] send_email: Setting References: {}", refs);
         builder = builder.references(refs.to_string());
     }
 
@@ -414,14 +450,14 @@ pub async fn send_email(
             match crypto::get_public_key_from_private(private_key) {
                 Ok(sender_pubkey) => {
                     if include_pubkey_header {
-                        println!("[RUST] send_email: Adding sender pubkey to headers: {}", sender_pubkey);
+                        debug_log!("[RUST] send_email: Adding sender pubkey to headers: {}", sender_pubkey);
                         builder = builder.header(XNostrPubkey(sender_pubkey));
                     } else {
-                        println!("[RUST] send_email: Skipping X-Nostr-Pubkey (disabled by user)");
+                        debug_log!("[RUST] send_email: Skipping X-Nostr-Pubkey (disabled by user)");
                     }
 
                     if include_sig_header && include_pubkey_header {
-                        println!("[RUST] send_email: body passed to extract_ciphertext_binary ({} chars):\n{}", body.len(), &body[..body.len().min(500)]);
+                        debug_log!("[RUST] send_email: body passed to extract_ciphertext_binary ({} chars):\n{}", body.len(), &body[..body.len().min(500)]);
                         let binary = extract_ciphertext_binary(body);
                         let binary_hash = {
                             use sha2::{Sha256, Digest};
@@ -429,24 +465,24 @@ pub async fn send_email(
                             h.update(&binary);
                             hex::encode(&h.finalize()[..8])
                         };
-                        println!("[RUST] send_email: extracted binary {} bytes, sha256_prefix: {}", binary.len(), binary_hash);
+                        debug_log!("[RUST] send_email: extracted binary {} bytes, sha256_prefix: {}", binary.len(), binary_hash);
                         match crypto::sign_data_bytes(private_key, &binary) {
                             Ok(signature) => {
-                                println!("[RUST] send_email: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
+                                debug_log!("[RUST] send_email: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
                                 builder = builder.header(XNostrSig(signature));
                             }
                             Err(e) => {
-                                println!("[RUST] send_email: Failed to sign email body: {}", e);
+                                debug_log!("[RUST] send_email: Failed to sign email body: {}", e);
                             }
                         }
                     } else if include_sig_header && !include_pubkey_header {
-                        println!("[RUST] send_email: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
+                        debug_log!("[RUST] send_email: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
                     } else {
-                        println!("[RUST] send_email: Skipping X-Nostr-Sig (disabled by user)");
+                        debug_log!("[RUST] send_email: Skipping X-Nostr-Sig (disabled by user)");
                     }
                 }
                 Err(e) => {
-                    println!("[RUST] send_email: Failed to get public key from private key: {}", e);
+                    debug_log!("[RUST] send_email: Failed to get public key from private key: {}", e);
                 }
             }
         }
@@ -458,7 +494,7 @@ pub async fn send_email(
     if include_recipient_header {
         if let Some(rp) = recipient_pubkey {
             if !rp.is_empty() {
-                println!("[RUST] send_email: Adding recipient pubkey to headers: {}", rp);
+                debug_log!("[RUST] send_email: Adding recipient pubkey to headers: {}", rp);
                 builder = builder.header(XNostrRecipient(rp.to_string()));
             }
         }
@@ -470,7 +506,7 @@ pub async fn send_email(
         .body(body.to_string());
 
     let body_part: Option<MultiPart> = if let Some(html) = html_body {
-        println!("[RUST] send_email: Building multipart/alternative with HTML body");
+        debug_log!("[RUST] send_email: Building multipart/alternative with HTML body");
         let html_part = SinglePart::builder()
             .header(ContentType::TEXT_HTML)
             .body(html.to_string());
@@ -490,7 +526,7 @@ pub async fn send_email(
                 builder.body(body.to_string())?
             }
         } else {
-            println!("[RUST] send_email: Building multipart email with {} attachments", attachments.len());
+            debug_log!("[RUST] send_email: Building multipart email with {} attachments", attachments.len());
 
             // Create multipart/mixed; nest alternative or plain text inside
             let mut multipart = if let Some(alt) = body_part {
@@ -503,13 +539,13 @@ pub async fn send_email(
 
             // Add each attachment
             for attachment in attachments {
-                println!("[RUST] send_email: Adding attachment: {} ({})", attachment.filename, attachment.size);
+                debug_log!("[RUST] send_email: Adding attachment: {} ({})", attachment.filename, attachment.size);
 
                 // Decode base64 data
                 let attachment_data = match general_purpose::STANDARD.decode(&attachment.data) {
                     Ok(data) => data,
                     Err(e) => {
-                        println!("[RUST] send_email: Failed to decode base64 attachment data for {}: {}", attachment.filename, e);
+                        debug_log!("[RUST] send_email: Failed to decode base64 attachment data for {}: {}", attachment.filename, e);
                         continue;
                     }
                 };
@@ -554,14 +590,14 @@ pub async fn send_email(
 
     let mailer = mailer_builder.build();
 
-    println!("[RUST] send_email: Mailer built, attempting to send...");
+    debug_log!("[RUST] send_email: Mailer built, attempting to send...");
     
     // Run the blocking SMTP send operation in a separate thread with a 60-second timeout
     let mailer_clone = mailer.clone();
     let email_clone = email.clone();
     
     let send_future = task::spawn_blocking(move || {
-        println!("[RUST] send_email: Executing SMTP send in blocking thread");
+        debug_log!("[RUST] send_email: Executing SMTP send in blocking thread");
         mailer_clone.send(&email_clone)
     });
     
@@ -569,11 +605,11 @@ pub async fn send_email(
         Ok(join_res) => match join_res {
             Ok(send_res) => match send_res {
                 Ok(_) => {
-                    println!("[RUST] send_email: Email sent successfully");
+                    debug_log!("[RUST] send_email: Email sent successfully");
                     Ok(format!("Email sent successfully to {}", to_address))
                 }
                 Err(e) => {
-                    println!("[RUST] send_email: Failed to send email: {}", e);
+                    debug_log!("[RUST] send_email: Failed to send email: {}", e);
                     let error_msg = if e.to_string().to_lowercase().contains("authentication") {
                         "Authentication failed. For Gmail, make sure you're using an App Password, not your regular password.".to_string()
                     } else if e.to_string().to_lowercase().contains("connection") || e.to_string().to_lowercase().contains("host") {
@@ -589,12 +625,12 @@ pub async fn send_email(
                 }
             },
             Err(e) => {
-                println!("[RUST] send_email: Task join error: {}", e);
+                debug_log!("[RUST] send_email: Task join error: {}", e);
                 Err(anyhow::anyhow!("Task join error: {}", e))
             }
         },
         Err(_) => {
-            println!("[RUST] send_email: SMTP send operation timed out after 60 seconds");
+            debug_log!("[RUST] send_email: SMTP send operation timed out after 60 seconds");
             Err(anyhow::anyhow!("SMTP send operation timed out after 60 seconds. Check your internet connection and SMTP settings."))
         }
     }
@@ -611,7 +647,7 @@ pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &st
     let use_tls = config.use_tls;
     let message_id = message_id.to_string();
 
-    println!("[RUST] delete_sent_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
+    debug_log!("[RUST] delete_sent_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
 
     // Run all blocking IMAP I/O on a dedicated thread to avoid blocking the Tokio runtime
     tokio::task::spawn_blocking(move || {
@@ -624,7 +660,7 @@ pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &st
             let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
             let result = delete_sent_email_from_session_sync(&mut session, is_gmail, &message_id);
             let _ = session.logout();
-            println!("[RUST] delete_sent_email_from_server: Session closed");
+            debug_log!("[RUST] delete_sent_email_from_server: Session closed");
             result
         } else {
             let tcp_stream = TcpStream::connect(&addr)?;
@@ -632,7 +668,7 @@ pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &st
             let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
             let result = delete_sent_email_from_session_sync(&mut session, is_gmail, &message_id);
             let _ = session.logout();
-            println!("[RUST] delete_sent_email_from_server: Session closed");
+            debug_log!("[RUST] delete_sent_email_from_server: Session closed");
             result
         };
         result
@@ -664,13 +700,13 @@ fn extract_text_body(email: &mailparse::ParsedMail) -> Option<String> {
 /// Extract the text/html body from a parsed email (multipart/alternative).
 /// Returns None if no HTML part is found.
 fn extract_html_body(email: &mailparse::ParsedMail) -> Option<String> {
-    println!("[RUST] extract_html_body: top-level mimetype={}, subparts={}", email.ctype.mimetype, email.subparts.len());
+    debug_log!("[RUST] extract_html_body: top-level mimetype={}, subparts={}", email.ctype.mimetype, email.subparts.len());
     for (i, subpart) in email.subparts.iter().enumerate() {
         let ctype = &subpart.ctype;
-        println!("[RUST] extract_html_body: subpart[{}] mimetype={}", i, ctype.mimetype);
+        debug_log!("[RUST] extract_html_body: subpart[{}] mimetype={}", i, ctype.mimetype);
         if ctype.mimetype == "text/html" {
             let body = subpart.get_body().ok();
-            println!("[RUST] extract_html_body: found text/html, body length={}", body.as_ref().map(|b| b.len()).unwrap_or(0));
+            debug_log!("[RUST] extract_html_body: found text/html, body length={}", body.as_ref().map(|b| b.len()).unwrap_or(0));
             return body;
         }
         // Recurse into nested multipart
@@ -680,7 +716,7 @@ fn extract_html_body(email: &mailparse::ParsedMail) -> Option<String> {
             }
         }
     }
-    println!("[RUST] extract_html_body: no text/html found");
+    debug_log!("[RUST] extract_html_body: no text/html found");
     None
 }
 
@@ -698,7 +734,7 @@ fn delete_sent_email_from_session_sync(
         "Sent"
     };
     
-    println!("[RUST] delete_sent_email_from_session: Selecting sent folder: {}", sent_folder);
+    debug_log!("[RUST] delete_sent_email_from_session: Selecting sent folder: {}", sent_folder);
     
     // Try to select the sent folder, fallback to common variations
     let folder_selected = session.select(sent_folder).is_ok() || 
@@ -707,7 +743,7 @@ fn delete_sent_email_from_session_sync(
                          session.select("Sent").is_ok();
     
     if !folder_selected {
-        println!("[RUST] delete_sent_email_from_session: Could not select sent folder, aborting server deletion");
+        debug_log!("[RUST] delete_sent_email_from_session: Could not select sent folder, aborting server deletion");
         return Err(anyhow::anyhow!("Could not select sent folder"));
     }
     
@@ -733,28 +769,28 @@ fn delete_sent_email_from_session_sync(
     
     let mut matching_messages = std::collections::HashSet::new();
     for search_query in &search_queries {
-        println!("[RUST] delete_sent_email_from_session: Searching for email with query: {}", search_query);
+        debug_log!("[RUST] delete_sent_email_from_session: Searching for email with query: {}", search_query);
         match session.search(search_query) {
             Ok(results) => {
                 let result_count = results.len();
                 if !results.is_empty() {
                     matching_messages.extend(results);
-                    println!("[RUST] delete_sent_email_from_session: Found {} matching message(s) with query: {}", result_count, search_query);
+                    debug_log!("[RUST] delete_sent_email_from_session: Found {} matching message(s) with query: {}", result_count, search_query);
                     break; // Found results, no need to try other formats
                 }
             }
             Err(e) => {
-                println!("[RUST] delete_sent_email_from_session: Search query failed: {} - {}", search_query, e);
+                debug_log!("[RUST] delete_sent_email_from_session: Search query failed: {} - {}", search_query, e);
             }
         }
     }
     
     if matching_messages.is_empty() {
-        println!("[RUST] delete_sent_email_from_session: No email found with Message-ID (tried: {}, {}, {})", full_msg_id, normalized_msg_id, message_id.trim());
+        debug_log!("[RUST] delete_sent_email_from_session: No email found with Message-ID (tried: {}, {}, {})", full_msg_id, normalized_msg_id, message_id.trim());
         return Err(anyhow::anyhow!("Email not found on server"));
     }
     
-    println!("[RUST] delete_sent_email_from_session: Found {} matching message(s)", matching_messages.len());
+    debug_log!("[RUST] delete_sent_email_from_session: Found {} matching message(s)", matching_messages.len());
     
     // Get the message sequence number (should be just one)
     // Convert HashSet to Vec to get the first element
@@ -768,18 +804,18 @@ fn delete_sent_email_from_session_sync(
         "Trash"
     };
     
-    println!("[RUST] delete_sent_email_from_session: Moving message {} to trash folder: {}", message_seq, trash_folder);
+    debug_log!("[RUST] delete_sent_email_from_session: Moving message {} to trash folder: {}", message_seq, trash_folder);
     
     // Use MOVE command (mv method) to move the message to trash
     // This is supported by Gmail and other modern IMAP servers
     let message_seq_str = format!("{}", message_seq);
     match session.mv(&message_seq_str, trash_folder) {
         Ok(_) => {
-            println!("[RUST] delete_sent_email_from_session: Successfully moved email to trash using MOVE command");
+            debug_log!("[RUST] delete_sent_email_from_session: Successfully moved email to trash using MOVE command");
             return Ok(());
         }
         Err(e) => {
-            println!("[RUST] delete_sent_email_from_session: MOVE command failed: {}, trying COPY + DELETE", e);
+            debug_log!("[RUST] delete_sent_email_from_session: MOVE command failed: {}, trying COPY + DELETE", e);
         }
     }
     
@@ -788,12 +824,12 @@ fn delete_sent_email_from_session_sync(
     let copy_result = session.copy(&message_seq_str, trash_folder);
     match copy_result {
         Ok(_) => {
-            println!("[RUST] delete_sent_email_from_session: Successfully copied email to trash");
+            debug_log!("[RUST] delete_sent_email_from_session: Successfully copied email to trash");
             // Mark original as deleted
             session.store(&message_seq_str, "+FLAGS (\\Deleted)")?;
             // Expunge to actually delete
             session.expunge()?;
-            println!("[RUST] delete_sent_email_from_session: Successfully deleted email from sent folder");
+            debug_log!("[RUST] delete_sent_email_from_session: Successfully deleted email from sent folder");
             Ok(())
         }
         Err(e) => {
@@ -805,11 +841,11 @@ fn delete_sent_email_from_session_sync(
             };
             
             for alt_trash in alternative_trash_folders {
-                println!("[RUST] delete_sent_email_from_session: Trying alternative trash folder: {}", alt_trash);
+                debug_log!("[RUST] delete_sent_email_from_session: Trying alternative trash folder: {}", alt_trash);
                 if session.copy(&message_seq_str, alt_trash).is_ok() {
                     session.store(&message_seq_str, "+FLAGS (\\Deleted)")?;
                     session.expunge()?;
-                    println!("[RUST] delete_sent_email_from_session: Successfully moved email to {} using COPY", alt_trash);
+                    debug_log!("[RUST] delete_sent_email_from_session: Successfully moved email to {} using COPY", alt_trash);
                     return Ok(());
                 }
             }
@@ -828,7 +864,7 @@ pub async fn delete_inbox_email_from_server(config: &EmailConfig, message_id: &s
     let use_tls = config.use_tls;
     let message_id = message_id.to_string();
 
-    println!("[RUST] delete_inbox_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
+    debug_log!("[RUST] delete_inbox_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
 
     tokio::task::spawn_blocking(move || {
         use std::net::TcpStream;
@@ -863,7 +899,7 @@ fn delete_email_from_folder_sync(
     // Try each source folder until we find and delete the email
     let mut folder_selected = false;
     for folder in source_folders {
-        println!("[RUST] delete_email_from_folder_sync: Trying folder: {}", folder);
+        debug_log!("[RUST] delete_email_from_folder_sync: Trying folder: {}", folder);
         if session.select(folder).is_ok() {
             folder_selected = true;
 
@@ -886,7 +922,7 @@ fn delete_email_from_folder_sync(
                 if let Ok(results) = session.search(search_query) {
                     if !results.is_empty() {
                         matching_messages.extend(results);
-                        println!("[RUST] delete_email_from_folder_sync: Found {} match(es) in {} with query: {}", matching_messages.len(), folder, search_query);
+                        debug_log!("[RUST] delete_email_from_folder_sync: Found {} match(es) in {} with query: {}", matching_messages.len(), folder, search_query);
                         break;
                     }
                 }
@@ -914,11 +950,11 @@ fn move_to_trash(
     let trash_folder = if is_gmail { "[Gmail]/Trash" } else { "Trash" };
     let seq_str = format!("{}", message_seq);
 
-    println!("[RUST] move_to_trash: Moving message {} to {}", message_seq, trash_folder);
+    debug_log!("[RUST] move_to_trash: Moving message {} to {}", message_seq, trash_folder);
 
     // Try MOVE first
     if session.mv(&seq_str, trash_folder).is_ok() {
-        println!("[RUST] move_to_trash: Successfully moved via MOVE command");
+        debug_log!("[RUST] move_to_trash: Successfully moved via MOVE command");
         return Ok(());
     }
 
@@ -933,7 +969,7 @@ fn move_to_trash(
         if session.copy(&seq_str, folder).is_ok() {
             session.store(&seq_str, "+FLAGS (\\Deleted)")?;
             session.expunge()?;
-            println!("[RUST] move_to_trash: Successfully moved to {} via COPY", folder);
+            debug_log!("[RUST] move_to_trash: Successfully moved to {} via COPY", folder);
             return Ok(());
         }
     }
@@ -950,7 +986,7 @@ pub async fn list_imap_folders(config: &EmailConfig) -> Result<Vec<String>> {
     let use_tls = config.use_tls;
     let addr = format!("{}:{}", host, port);
     
-    println!("[RUST] list_imap_folders: Connecting to IMAP server: {}", addr);
+    debug_log!("[RUST] list_imap_folders: Connecting to IMAP server: {}", addr);
     
     let mailboxes = if use_tls {
         let client = create_imap_tls_client!(host, &addr)?;
@@ -971,7 +1007,7 @@ pub async fn list_imap_folders(config: &EmailConfig) -> Result<Vec<String>> {
         .map(|mb| mb.name().to_string())
         .collect();
     
-    println!("[RUST] list_imap_folders: Found {} folders", folder_names.len());
+    debug_log!("[RUST] list_imap_folders: Found {} folders", folder_names.len());
     Ok(folder_names)
 }
 
@@ -985,8 +1021,8 @@ pub async fn test_imap_connection(config: &EmailConfig) -> Result<()> {
 
     let addr = format!("{}:{}", host, port);
     
-    println!("[RUST] Testing IMAP connection to: {}", addr);
-    println!("[RUST] Host: {}, Port: {}, Use TLS: {}", host, port, use_tls);
+    debug_log!("[RUST] Testing IMAP connection to: {}", addr);
+    debug_log!("[RUST] Host: {}, Port: {}, Use TLS: {}", host, port, use_tls);
 
     if use_tls {
         let client = create_imap_tls_client!(host, &addr)?;
@@ -998,15 +1034,15 @@ pub async fn test_imap_connection(config: &EmailConfig) -> Result<()> {
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         session.logout()?;
     }
-    println!("[RUST] IMAP connection test successful");
+    debug_log!("[RUST] IMAP connection test successful");
     Ok(())
 }
 
 /// Test SMTP connection with the given config. Returns Ok(()) if successful, Err otherwise.
 pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
-    println!("[RUST] test_smtp_connection: Starting SMTP connection test");
-    println!("[RUST] test_smtp_connection: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
-    println!("[RUST] test_smtp_connection: Email: {}, Use TLS: {}", config.email_address, config.use_tls);
+    debug_log!("[RUST] test_smtp_connection: Starting SMTP connection test");
+    debug_log!("[RUST] test_smtp_connection: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
+    debug_log!("[RUST] test_smtp_connection: Email: {}, Use TLS: {}", config.email_address, config.use_tls);
     
     let creds = Credentials::new(config.email_address.clone(), config.password.clone());
 
@@ -1026,12 +1062,12 @@ pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
 
     let mailer = mailer_builder.build();
 
-    println!("[RUST] test_smtp_connection: Mailer built, testing connection...");
+    debug_log!("[RUST] test_smtp_connection: Mailer built, testing connection...");
     
     // Test the connection with a timeout
     let mailer_clone = mailer.clone();
     let test_future = task::spawn_blocking(move || {
-        println!("[RUST] test_smtp_connection: Executing connection test in blocking thread");
+        debug_log!("[RUST] test_smtp_connection: Executing connection test in blocking thread");
         mailer_clone.test_connection()
     });
     
@@ -1039,11 +1075,11 @@ pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
         Ok(join_res) => match join_res {
             Ok(test_res) => match test_res {
                 Ok(_) => {
-                    println!("[RUST] test_smtp_connection: SMTP connection test successful");
+                    debug_log!("[RUST] test_smtp_connection: SMTP connection test successful");
                     Ok(())
                 }
                 Err(e) => {
-                    println!("[RUST] test_smtp_connection: SMTP connection test failed: {}", e);
+                    debug_log!("[RUST] test_smtp_connection: SMTP connection test failed: {}", e);
                     let error_msg = if e.to_string().to_lowercase().contains("authentication") {
                         "Authentication failed. For Gmail, make sure you're using an App Password, not your regular password.".to_string()
                     } else if e.to_string().to_lowercase().contains("connection") || e.to_string().to_lowercase().contains("host") {
@@ -1059,12 +1095,12 @@ pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
                 }
             },
             Err(e) => {
-                println!("[RUST] test_smtp_connection: Task join error: {}", e);
+                debug_log!("[RUST] test_smtp_connection: Task join error: {}", e);
                 Err(anyhow::anyhow!("SMTP connection join error: {}", e))
             }
         },
         Err(_) => {
-            println!("[RUST] test_smtp_connection: SMTP connection test timed out after 30 seconds");
+            debug_log!("[RUST] test_smtp_connection: SMTP connection test timed out after 30 seconds");
             Err(anyhow::anyhow!("SMTP connection test timed out after 30 seconds. Check your internet connection and SMTP settings."))
         }
     }
@@ -1153,7 +1189,7 @@ fn extract_attachments_recursive(
             };
             
             attachments.push(db_attachment);
-            println!("[RUST] Extracted attachment: {} ({} bytes)", filename, attachment_data.len());
+            debug_log!("[RUST] Extracted attachment: {} ({} bytes)", filename, attachment_data.len());
         }
     }
 }
@@ -1224,7 +1260,7 @@ pub fn extract_sender_pubkey_with_armor_fallback(raw_headers: &str, body_text: &
                 if let Ok(pk) = nostr_sdk::prelude::PublicKey::from_hex(pubkey_hex) {
                     // to_bech32 is infallible for PublicKey
                     let npub = nostr_sdk::prelude::ToBech32::to_bech32(&pk).expect("bech32 encode");
-                    println!("[RUST] extract_sender_pubkey_with_armor_fallback: using verified armor pubkey {} ({})", &npub[..std::cmp::min(npub.len(), 20)], &pubkey_hex[..std::cmp::min(pubkey_hex.len(), 16)]);
+                    debug_log!("[RUST] extract_sender_pubkey_with_armor_fallback: using verified armor pubkey {} ({})", &npub[..std::cmp::min(npub.len(), 20)], &pubkey_hex[..std::cmp::min(pubkey_hex.len(), 16)]);
                     return Some(npub);
                 }
             }
@@ -1399,7 +1435,7 @@ pub fn glossia_roundtrip_to_bytes(text: &str, encoding: &str) -> Option<Vec<u8>>
     let encoded = match result {
         Ok(Ok((encoded_text, _, _, _))) => encoded_text,
         _ => {
-            println!("[RUST] glossia_roundtrip_to_bytes: encode failed for encoding={}", encoding);
+            debug_log!("[RUST] glossia_roundtrip_to_bytes: encode failed for encoding={}", encoding);
             return None;
         }
     };
@@ -1692,7 +1728,7 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
     }
 
     let preview: String = armor_text.chars().take(120).collect();
-    println!("[RUST] parse_armor_components: input length={} preview={:?}", armor_text.len(), preview);
+    debug_log!("[RUST] parse_armor_components: input length={} preview={:?}", armor_text.len(), preview);
 
     let perf = std::time::Instant::now();
 
@@ -1714,7 +1750,7 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
         result.quoted_armor_text = raw_quoted_text;
     }
 
-    println!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
+    debug_log!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
         result.body_type, result.encryption_nip, result.signature_hex.is_some(),
         result.seal_pubkey_hex.is_some(), result.quoted.is_some());
     println!("[RUST-PERF] parse_armor cache MISS key={:x} compute={}ms (in={}b, has_quoted={})",
@@ -1724,6 +1760,7 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
     // verify_all_signatures' recursive parse calls hit cache as well.
     {
         let mut guard = cache_map.lock().unwrap();
+        maybe_evict(&mut guard);
         guard.insert(cache_key, result.clone());
         populate_parse_subtree_cache(&result, &mut guard);
     }
@@ -1758,7 +1795,7 @@ fn populate_armor_from_text(
     let armor_start = match armor_start {
         Some(idx) => idx,
         None => {
-            println!("[RUST] populate_armor_from_text: no armor delimiter found");
+            debug_log!("[RUST] populate_armor_from_text: no armor delimiter found");
             return None;
         }
     };
@@ -1837,7 +1874,7 @@ fn populate_armor_from_text(
     }
 
     if state == "before" {
-        println!("[RUST] populate_armor_from_text: state machine never left 'before'");
+        debug_log!("[RUST] populate_armor_from_text: state machine never left 'before'");
         return None;
     }
 
@@ -2215,7 +2252,11 @@ fn glossia_detect_and_decode_cached(text: &str) -> Option<GlossiaDecodeCached> {
     println!("[RUST-PERF] glossia cache MISS key={:x} compute={}ms (in={}b, words={}, dialect={}/{}, out={}b, hit_rate={:.3})",
         key, perf.elapsed().as_millis(), text.len(), words.len(),
         entry.language, entry.wordlist, entry.decoded.len(), entry.hit_rate);
-    cache.lock().unwrap().insert(key, entry.clone());
+    {
+        let mut guard = cache.lock().unwrap();
+        maybe_evict(&mut guard);
+        guard.insert(key, entry.clone());
+    }
     Some(entry)
 }
 
@@ -2228,9 +2269,9 @@ fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result
 
     let cached = glossia_detect_and_decode_cached(encoded_content)
         .ok_or_else(|| "Glossia decode failed: no dialect detected or hit_rate too low".to_string())?;
-    println!("[RUST] glossia_decode_to_ciphertext: detected dialect={:?} wordlist={:?} hit_rate={}",
+    debug_log!("[RUST] glossia_decode_to_ciphertext: detected dialect={:?} wordlist={:?} hit_rate={}",
         cached.language, cached.wordlist, cached.hit_rate);
-    println!("[RUST] glossia_decode_to_ciphertext: decoded len={}", cached.decoded.len());
+    debug_log!("[RUST] glossia_decode_to_ciphertext: decoded len={}", cached.decoded.len());
 
     glossia_postprocess(&cached.decoded, nip_hint)
 }
@@ -2343,15 +2384,15 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
     // Compute the result via an IIFE so every (early-) return path flows into
     // the cache insertion below without scattering insert calls everywhere.
     let result: Option<String> = (|| -> Option<String> {
-        println!("[RUST] glossia_decode_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
+        debug_log!("[RUST] glossia_decode_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
         if subject.is_empty() || is_likely_encrypted_content(subject) {
-            println!("[RUST] glossia_decode_subject: empty or already encrypted, returning None");
+            debug_log!("[RUST] glossia_decode_subject: empty or already encrypted, returning None");
             return None;
         }
 
         // Detect dialect with hit_rate filtering
         let words: Vec<String> = subject.split_whitespace().map(|w| w.to_lowercase()).collect();
-        println!("[RUST] glossia_decode_subject: word_count={} words={:?}", words.len(), &words[..words.len().min(6)]);
+        debug_log!("[RUST] glossia_decode_subject: word_count={} words={:?}", words.len(), &words[..words.len().min(6)]);
         if words.is_empty() {
             return None;
         }
@@ -2360,20 +2401,20 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
         });
         let dialect = match detect_result {
             Ok(Some(best)) => {
-                println!("[RUST] glossia_decode_subject: detected dialect={:?} hit_rate={}", best.language, best.hit_rate);
+                debug_log!("[RUST] glossia_decode_subject: detected dialect={:?} hit_rate={}", best.language, best.hit_rate);
                 if best.hit_rate >= 0.8 {
                     best.language.clone()
                 } else {
-                    println!("[RUST] glossia_decode_subject: hit_rate too low (<0.8), returning None");
+                    debug_log!("[RUST] glossia_decode_subject: hit_rate too low (<0.8), returning None");
                     return None;
                 }
             }
             Ok(None) => {
-                println!("[RUST] glossia_decode_subject: no dialect detected, returning None");
+                debug_log!("[RUST] glossia_decode_subject: no dialect detected, returning None");
                 return None;
             }
             Err(e) => {
-                println!("[RUST] glossia_decode_subject: detect_dialect_best panicked: {:?}", e.downcast_ref::<String>());
+                debug_log!("[RUST] glossia_decode_subject: detect_dialect_best panicked: {:?}", e.downcast_ref::<String>());
                 return None;
             }
         };
@@ -2390,17 +2431,17 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
             });
             match decode_result {
                 Ok(Ok(decoded)) => {
-                    println!("[RUST] glossia_decode_subject: wl={} decoded len={} preview={:?}", wl, decoded.len(), &decoded[..decoded.len().min(40)]);
+                    debug_log!("[RUST] glossia_decode_subject: wl={} decoded len={} preview={:?}", wl, decoded.len(), &decoded[..decoded.len().min(40)]);
                     match &best_decoded {
                         Some(prev) if prev.len() >= decoded.len() => {}
                         _ => { best_decoded = Some(decoded); }
                     }
                 }
                 Ok(Err(e)) => {
-                    println!("[RUST] glossia_decode_subject: wl={} decode error: {:?}", wl, e);
+                    debug_log!("[RUST] glossia_decode_subject: wl={} decode error: {:?}", wl, e);
                 }
                 Err(e) => {
-                    println!("[RUST] glossia_decode_subject: wl={} decode panicked: {:?}", wl, e.downcast_ref::<String>());
+                    debug_log!("[RUST] glossia_decode_subject: wl={} decode panicked: {:?}", wl, e.downcast_ref::<String>());
                 }
             }
         }
@@ -2408,17 +2449,21 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
         match best_decoded {
             Some(decoded) => {
                 let result = glossia_postprocess(&decoded, nip_hint);
-                println!("[RUST] glossia_decode_subject: postprocess result={:?}", result.as_ref().map(|s| &s[..s.len().min(40)]));
+                debug_log!("[RUST] glossia_decode_subject: postprocess result={:?}", result.as_ref().map(|s| &s[..s.len().min(40)]));
                 result.ok()
             }
             _ => {
-                println!("[RUST] glossia_decode_subject: no successful decode from any wordlist");
+                debug_log!("[RUST] glossia_decode_subject: no successful decode from any wordlist");
                 None
             }
         }
     })();
 
-    cache.lock().unwrap().insert(key, result.clone());
+    {
+        let mut guard = cache.lock().unwrap();
+        maybe_evict(&mut guard);
+        guard.insert(key, result.clone());
+    }
     result
 }
 
@@ -2516,7 +2561,7 @@ fn decrypt_single_block(
 ) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
     use base64::Engine;
 
-    println!("[RUST] decrypt_single_block: type={} nip={:?} sig_pk={:?} seal_pk={:?} fallback={:?} body_preview={:?}",
+    debug_log!("[RUST] decrypt_single_block: type={} nip={:?} sig_pk={:?} seal_pk={:?} fallback={:?} body_preview={:?}",
         body_type, encryption_nip, sig_pubkey_hex.map(|s| &s[..s.len().min(16)]),
         seal_pubkey_hex.map(|s| &s[..s.len().min(16)]),
         &fallback_pubkey[..fallback_pubkey.len().min(16)],
@@ -2536,7 +2581,7 @@ fn decrypt_single_block(
         let decoded = try_glossia_decode_to_bytes(body_text)
             .and_then(|bytes| String::from_utf8(bytes).ok());
         if let Some(ref text) = decoded {
-            println!("[RUST] decrypt_single_block: glossia decoded signed/plain body, len={} preview={:?}",
+            debug_log!("[RUST] decrypt_single_block: glossia decoded signed/plain body, len={} preview={:?}",
                 text.len(), &text[..text.len().min(60)]);
         }
         block.decrypted_text = Some(decoded.unwrap_or_else(|| body_text.to_string()));
@@ -2549,11 +2594,11 @@ fn decrypt_single_block(
     let perf_glossia = std::time::Instant::now();
     let ciphertext = match glossia_decode_to_ciphertext(body_text, nip) {
         Ok(ct) => {
-            println!("[RUST] decrypt_single_block: glossia decoded, ciphertext len={}", ct.len());
+            debug_log!("[RUST] decrypt_single_block: glossia decoded, ciphertext len={}", ct.len());
             ct
         }
         Err(e) => {
-            println!("[RUST] decrypt_single_block: glossia decode FAILED: {}", e);
+            debug_log!("[RUST] decrypt_single_block: glossia decode FAILED: {}", e);
             block.error = Some(format!("Glossia decode failed: {}", e));
             return (block, None);
         }
@@ -2564,11 +2609,11 @@ fn decrypt_single_block(
     // Step 2: Determine which pubkey to decrypt with
     let decrypt_pubkey_hex = match determine_decrypt_pubkey(sig_pubkey_hex, seal_pubkey_hex, user_pubkey_hex, fallback_pubkey) {
         Ok(pk) => {
-            println!("[RUST] decrypt_single_block: decrypt pubkey={}", &pk[..pk.len().min(16)]);
+            debug_log!("[RUST] decrypt_single_block: decrypt pubkey={}", &pk[..pk.len().min(16)]);
             pk
         }
         Err(e) => {
-            println!("[RUST] decrypt_single_block: determine_decrypt_pubkey FAILED: {}", e);
+            debug_log!("[RUST] decrypt_single_block: determine_decrypt_pubkey FAILED: {}", e);
             block.error = Some(e);
             return (block, None);
         }
@@ -2589,11 +2634,11 @@ fn decrypt_single_block(
     let perf_nip = std::time::Instant::now();
     let decrypted = match crate::nostr::decrypt_dm_content(private_key, &decrypt_npub, &ciphertext) {
         Ok(d) => {
-            println!("[RUST] decrypt_single_block: NIP decrypt SUCCESS, len={} preview={:?}", d.len(), &d[..d.len().min(40)]);
+            debug_log!("[RUST] decrypt_single_block: NIP decrypt SUCCESS, len={} preview={:?}", d.len(), &d[..d.len().min(40)]);
             d
         }
         Err(e) => {
-            println!("[RUST] decrypt_single_block: NIP decrypt FAILED: {}", e);
+            debug_log!("[RUST] decrypt_single_block: NIP decrypt FAILED: {}", e);
             block.error = Some(format!("NIP decrypt failed: {}", e));
             return (block, None);
         }
@@ -2741,9 +2786,9 @@ fn decrypt_armor_tree(
                     Ok(true)
                 );
                 if ok {
-                    println!("[RUST] NIP-04 inline signature verified ({} bytes)", all_bytes.len());
+                    debug_log!("[RUST] NIP-04 inline signature verified ({} bytes)", all_bytes.len());
                 } else {
-                    println!("[RUST] NIP-04 inline signature INVALID");
+                    debug_log!("[RUST] NIP-04 inline signature INVALID");
                 }
                 Some(ok)
             }
@@ -2763,9 +2808,9 @@ fn decrypt_armor_tree(
                     Ok(true)
                 );
                 if ok {
-                    println!("[RUST] NIP-04 X-Nostr-Sig header verified ({} bytes)", all_bytes.len());
+                    debug_log!("[RUST] NIP-04 X-Nostr-Sig header verified ({} bytes)", all_bytes.len());
                 } else {
-                    println!("[RUST] NIP-04 X-Nostr-Sig header INVALID");
+                    debug_log!("[RUST] NIP-04 X-Nostr-Sig header INVALID");
                 }
                 Some(ok)
             })
@@ -2803,7 +2848,7 @@ fn decrypt_armor_tree(
                     "NIP-04 message has no signature (inline or header) — rejecting"
                 ),
             };
-            println!("[RUST] {}", log);
+            debug_log!("[RUST] {}", log);
             results.push(crate::types::DecryptedBlock {
                 decrypted_text: None,
                 error: Some(msg),
@@ -2859,7 +2904,7 @@ pub fn decrypt_email_body_pipeline(
     raw_headers: Option<&str>,
 ) -> Result<crate::types::DecryptEmailResult, String> {
     let perf_total = std::time::Instant::now();
-    println!("[RUST] decrypt_email_body: armor_len={} subject_len={}", armor_text.len(), subject.len());
+    debug_log!("[RUST] decrypt_email_body: armor_len={} subject_len={}", armor_text.len(), subject.len());
 
     // Normalize line endings (spec section 8 step 2)
     let normalized = armor_text.replace("\r\n", "\n");
@@ -2869,7 +2914,7 @@ pub fn decrypt_email_body_pipeline(
     let parsed = match parse_armor_components(&normalized) {
         Some(p) => p,
         None => {
-            println!("[RUST] decrypt_email_body: no armor found");
+            debug_log!("[RUST] decrypt_email_body: no armor found");
             return Ok(crate::types::DecryptEmailResult {
                 subject: subject.to_string(),
                 body: armor_text.to_string(),
@@ -2979,7 +3024,7 @@ pub fn decrypt_email_body_pipeline(
     };
     let sender_extract_ms = perf_sender.elapsed().as_millis();
 
-    println!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={} armor_sender_pubkey={:?}",
+    debug_log!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={} armor_sender_pubkey={:?}",
         success, is_manifest, block_results.len(), attachments.len(),
         armor_sender_pubkey.as_deref().map(|s: &str| &s[..std::cmp::min(s.len(), 20)]));
     println!("[RUST-PERF] decrypt_email_body_pipeline: total={}ms parse={}ms derive_pk={}ms tree={}ms subject={}ms sender_extract={}ms (armor_len={}b, levels={})",
@@ -3011,23 +3056,23 @@ fn decrypt_subject(
     fallback_pubkey: &str,
     nip_hint: &str,
 ) -> (String, Option<String>) {
-    println!("[RUST] decrypt_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
+    debug_log!("[RUST] decrypt_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
     if subject.is_empty() {
-        println!("[RUST] decrypt_subject: empty subject, returning as-is");
+        debug_log!("[RUST] decrypt_subject: empty subject, returning as-is");
         return (subject.to_string(), None);
     }
 
     // Try to get ciphertext from subject
     let is_encrypted = is_likely_encrypted_content(subject);
-    println!("[RUST] decrypt_subject: is_likely_encrypted={}", is_encrypted);
+    debug_log!("[RUST] decrypt_subject: is_likely_encrypted={}", is_encrypted);
     let ciphertext = if is_encrypted {
-        println!("[RUST] decrypt_subject: using subject directly as ciphertext");
+        debug_log!("[RUST] decrypt_subject: using subject directly as ciphertext");
         subject.to_string()
     } else if let Some(decoded) = glossia_decode_subject(subject, nip_hint) {
-        println!("[RUST] decrypt_subject: glossia decoded to ciphertext len={} preview={:?}", decoded.len(), &decoded[..decoded.len().min(60)]);
+        debug_log!("[RUST] decrypt_subject: glossia decoded to ciphertext len={} preview={:?}", decoded.len(), &decoded[..decoded.len().min(60)]);
         decoded
     } else {
-        println!("[RUST] decrypt_subject: glossia decode failed, returning subject as-is");
+        debug_log!("[RUST] decrypt_subject: glossia decode failed, returning subject as-is");
         return (subject.to_string(), None);
     };
 
@@ -3035,7 +3080,7 @@ fn decrypt_subject(
 
     // Determine which pubkey to use — use fallback (other party's pubkey)
     let decrypt_pubkey = if fallback_pubkey.is_empty() {
-        println!("[RUST] decrypt_subject: no fallback pubkey, returning subject as-is");
+        debug_log!("[RUST] decrypt_subject: no fallback pubkey, returning subject as-is");
         return (subject.to_string(), subject_ciphertext);
     } else if fallback_pubkey.starts_with("npub1") {
         fallback_pubkey.to_string()
@@ -3044,20 +3089,20 @@ fn decrypt_subject(
         match nostr_sdk::prelude::PublicKey::parse(fallback_pubkey) {
             Ok(pk) => pk.to_bech32().unwrap_or_else(|_| fallback_pubkey.to_string()),
             Err(_) => {
-                println!("[RUST] decrypt_subject: failed to parse fallback pubkey {:?}", fallback_pubkey);
+                debug_log!("[RUST] decrypt_subject: failed to parse fallback pubkey {:?}", fallback_pubkey);
                 return (subject.to_string(), subject_ciphertext);
             }
         }
     };
 
-    println!("[RUST] decrypt_subject: attempting NIP decrypt with pubkey prefix={:?}", &decrypt_pubkey[..decrypt_pubkey.len().min(20)]);
+    debug_log!("[RUST] decrypt_subject: attempting NIP decrypt with pubkey prefix={:?}", &decrypt_pubkey[..decrypt_pubkey.len().min(20)]);
     match crate::nostr::decrypt_dm_content(private_key, &decrypt_pubkey, &ciphertext) {
         Ok(decrypted) => {
-            println!("[RUST] decrypt_subject: success! decrypted={:?}", &decrypted[..decrypted.len().min(60)]);
+            debug_log!("[RUST] decrypt_subject: success! decrypted={:?}", &decrypted[..decrypted.len().min(60)]);
             (decrypted, subject_ciphertext)
         }
         Err(e) => {
-            println!("[RUST] decrypt_subject: NIP decrypt failed: {:?}", e);
+            debug_log!("[RUST] decrypt_subject: NIP decrypt failed: {:?}", e);
             (subject.to_string(), subject_ciphertext)
         }
     }
@@ -3074,7 +3119,7 @@ pub fn decrypt_attachment_pipeline(
     use base64::Engine;
     use sha2::{Sha256, Digest};
 
-    println!("[RUST] decrypt_attachment: data_len={} filename={:?}", attachment_data_b64.len(), orig_filename);
+    debug_log!("[RUST] decrypt_attachment: data_len={} filename={:?}", attachment_data_b64.len(), orig_filename);
 
     let b64 = base64::engine::general_purpose::STANDARD;
 
@@ -3092,7 +3137,7 @@ pub fn decrypt_attachment_pipeline(
         hasher.update(&encrypted_data);
         let actual_hash = hex::encode(hasher.finalize());
         if actual_hash != expected_hash {
-            println!("[RUST] decrypt_attachment_pipeline: hash mismatch (expected {}, got {}) — continuing anyway", expected_hash, actual_hash);
+            debug_log!("[RUST] decrypt_attachment_pipeline: hash mismatch (expected {}, got {}) — continuing anyway", expected_hash, actual_hash);
         }
     }
 
@@ -3123,7 +3168,7 @@ pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
         if let Some(mut bytes) = decode_armor_section(&body_text) {
             if let Some(ref nested) = nested_armor {
                 let nested_bytes = extract_ciphertext_binary(nested);
-                println!("[RUST] extract_ciphertext_binary: concatenating {} outer + {} nested bytes",
+                debug_log!("[RUST] extract_ciphertext_binary: concatenating {} outer + {} nested bytes",
                     bytes.len(), nested_bytes.len());
                 bytes.extend_from_slice(&nested_bytes);
             }
@@ -3132,7 +3177,7 @@ pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
     }
 
     // Non-armored body: return UTF-8 bytes
-    println!("[RUST] extract_ciphertext_binary: plain text, {} bytes", body.len());
+    debug_log!("[RUST] extract_ciphertext_binary: plain text, {} bytes", body.len());
     body.as_bytes().to_vec()
 }
 
@@ -3143,11 +3188,11 @@ pub fn verify_email_signature(sender_pubkey: &str, signature: &str, body: &str) 
     let binary = extract_ciphertext_binary(body);
     match crypto::verify_signature_bytes(sender_pubkey, signature, &binary) {
         Ok(valid) => {
-            println!("[RUST] verify_email_signature: {} ({} bytes)", if valid { "valid" } else { "INVALID" }, binary.len());
+            debug_log!("[RUST] verify_email_signature: {} ({} bytes)", if valid { "valid" } else { "INVALID" }, binary.len());
             valid
         },
         Err(e) => {
-            println!("[RUST] verify_email_signature: error: {}", e);
+            debug_log!("[RUST] verify_email_signature: error: {}", e);
             false
         }
     }
@@ -3162,12 +3207,12 @@ pub fn verify_email_signature_inline(body: &str) -> Option<bool> {
     let binary = extract_ciphertext_binary(body);
     match crypto::verify_signature_bytes(pubkey_hex, sig_hex, &binary) {
         Ok(valid) => {
-            println!("[RUST] verify_email_signature_inline: {} ({} bytes, pubkey={}...)",
+            debug_log!("[RUST] verify_email_signature_inline: {} ({} bytes, pubkey={}...)",
                 if valid { "valid" } else { "INVALID" }, binary.len(), &pubkey_hex[..8.min(pubkey_hex.len())]);
             Some(valid)
         }
         Err(e) => {
-            println!("[RUST] verify_email_signature_inline: error: {}", e);
+            debug_log!("[RUST] verify_email_signature_inline: error: {}", e);
             Some(false)
         }
     }
@@ -3187,7 +3232,7 @@ pub fn verify_email_signature_full(body: &str, raw_headers: &str) -> (Option<boo
         }
     };
 
-    println!("[RUST] verify_email_signature_full: body={:?}, header={:?}", body_result, header_result);
+    debug_log!("[RUST] verify_email_signature_full: body={:?}, header={:?}", body_result, header_result);
 
     match (body_result, header_result) {
         (Some(true), Some(true)) => (Some(true), Some("both".to_string())),
@@ -3208,19 +3253,19 @@ pub fn verify_all_signatures_inline(body: &str) -> Vec<crate::types::SignatureVe
 fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types::SignatureVerificationResult> {
     let mut results = Vec::new();
 
-    println!("[RUST] verify_all_sigs_recursive: depth={}, body_len={}, preview={:?}",
+    debug_log!("[RUST] verify_all_sigs_recursive: depth={}, body_len={}, preview={:?}",
         depth, body.len(), &body[..80.min(body.len())]);
 
     // Parse armor at this level to get sig/pubkey and body type
     let parsed = match parse_armor_components(body) {
         Some(p) => p,
         None => {
-            println!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_components returned None", depth);
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_components returned None", depth);
             return results;
         }
     };
 
-    println!("[RUST] verify_all_sigs_recursive: depth={}, parsed: body_type={}, has_sig={}, has_pubkey={}, has_quoted={}",
+    debug_log!("[RUST] verify_all_sigs_recursive: depth={}, parsed: body_type={}, has_sig={}, has_pubkey={}, has_quoted={}",
         depth, parsed.body_type,
         parsed.signature_hex.is_some(), parsed.sig_pubkey_hex.is_some(),
         parsed.quoted.is_some());
@@ -3229,18 +3274,18 @@ fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types
     let depth_result = parse_armor_depth(body);
     match &depth_result {
         Some((_body_text, Some(ref nested_armor))) => {
-            println!("[RUST] verify_all_sigs_recursive: depth={}, found nested armor ({} bytes), recursing",
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, found nested armor ({} bytes), recursing",
                 depth, nested_armor.len());
             let inner_results = verify_all_signatures_recursive(nested_armor, depth + 1);
-            println!("[RUST] verify_all_sigs_recursive: depth={}, inner recursion returned {} results",
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, inner recursion returned {} results",
                 depth, inner_results.len());
             results.extend(inner_results);
         }
         Some((_body_text, None)) => {
-            println!("[RUST] verify_all_sigs_recursive: depth={}, no nested armor (leaf node)", depth);
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, no nested armor (leaf node)", depth);
         }
         None => {
-            println!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_depth returned None", depth);
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_depth returned None", depth);
         }
     }
 
@@ -3253,13 +3298,13 @@ fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types
         let binary = extract_ciphertext_binary(body);
         let is_valid = match crate::crypto::verify_signature_bytes(pk, sig, &binary) {
             Ok(valid) => {
-                println!("[RUST] verify_all_signatures: depth={}, {} ({} bytes, pubkey={}...)",
+                debug_log!("[RUST] verify_all_signatures: depth={}, {} ({} bytes, pubkey={}...)",
                     depth, if valid { "valid" } else { "INVALID" }, binary.len(),
                     &pk[..8.min(pk.len())]);
                 valid
             }
             Err(e) => {
-                println!("[RUST] verify_all_signatures: depth={}, error: {}", depth, e);
+                debug_log!("[RUST] verify_all_signatures: depth={}, error: {}", depth, e);
                 false
             }
         };
@@ -3273,11 +3318,11 @@ fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types
             profile_name: parsed.profile_name.clone(),
         });
     } else {
-        println!("[RUST] verify_all_sigs_recursive: depth={}, no sig/pubkey at this level (sig={}, pk={})",
+        debug_log!("[RUST] verify_all_sigs_recursive: depth={}, no sig/pubkey at this level (sig={}, pk={})",
             depth, sig_hex.is_some(), pubkey_hex.is_some());
     }
 
-    println!("[RUST] verify_all_sigs_recursive: depth={}, returning {} total results", depth, results.len());
+    debug_log!("[RUST] verify_all_sigs_recursive: depth={}, returning {} total results", depth, results.len());
     results
 }
 
@@ -3305,7 +3350,7 @@ pub fn extract_message_id_from_headers(raw_headers: &str) -> Option<String> {
                 .to_string();
             
             if !msg_id_clean.is_empty() {
-                println!("[RUST] extract_message_id_from_headers: Found Message-ID: {} (cleaned: {})", msg_id, msg_id_clean);
+                debug_log!("[RUST] extract_message_id_from_headers: Found Message-ID: {} (cleaned: {})", msg_id, msg_id_clean);
                 return Some(msg_id_clean);
             }
         }
@@ -3322,13 +3367,13 @@ pub fn extract_message_id_from_headers(raw_headers: &str) -> Option<String> {
                 .trim()
                 .to_string();
             if !msg_id_clean.is_empty() {
-                println!("[RUST] extract_message_id_from_headers: Found Message-ID via mailparse: {} (cleaned: {})", msg_id, msg_id_clean);
+                debug_log!("[RUST] extract_message_id_from_headers: Found Message-ID via mailparse: {} (cleaned: {})", msg_id, msg_id_clean);
                 return Some(msg_id_clean);
             }
         }
     }
     
-    println!("[RUST] extract_message_id_from_headers: No Message-ID header found in headers ({} chars). First 200 chars: {}", 
+    debug_log!("[RUST] extract_message_id_from_headers: No Message-ID header found in headers ({} chars). First 200 chars: {}", 
         raw_headers.len(), raw_headers.chars().take(200).collect::<String>());
     None
 }
@@ -3602,7 +3647,7 @@ pub fn decrypt_nostr_email_content(config: &EmailConfig, raw_headers: &str, subj
     let private_key = match &config.private_key {
         Some(key) => key,
         None => {
-            println!("[RUST] No private key available for decryption");
+            debug_log!("[RUST] No private key available for decryption");
             return Ok((subject.to_string(), body.to_string()));
         }
     };
@@ -3612,23 +3657,23 @@ pub fn decrypt_nostr_email_content(config: &EmailConfig, raw_headers: &str, subj
     let sender_pubkey = match extract_nostr_pubkey_from_headers(raw_headers) {
         Some(pubkey) => pubkey,
         None => {
-            println!("[RUST] No X-Nostr-Pubkey header found");
+            debug_log!("[RUST] No X-Nostr-Pubkey header found");
             return Ok((subject.to_string(), body.to_string()));
         }
     };
     
-    println!("[RUST] Attempting to decrypt inbox email using sender_pubkey (shared secret: user_privkey × sender_pubkey): {}", sender_pubkey);
+    debug_log!("[RUST] Attempting to decrypt inbox email using sender_pubkey (shared secret: user_privkey × sender_pubkey): {}", sender_pubkey);
     
     // Try to decrypt subject - encrypted subjects are typically just the raw encrypted content
     // without ASCII armor, and are usually base64 encoded
     let decrypted_subject = if is_likely_encrypted_content(subject) {
         match crypto::decrypt_message(private_key, &sender_pubkey, subject) {
             Ok(decrypted) => {
-                println!("[RUST] Successfully decrypted subject");
+                debug_log!("[RUST] Successfully decrypted subject");
                 decrypted
             }
             Err(e) => {
-                println!("[RUST] Failed to decrypt subject: {}", e);
+                debug_log!("[RUST] Failed to decrypt subject: {}", e);
                 subject.to_string()
             }
         }
@@ -3652,15 +3697,15 @@ pub fn decrypt_nostr_email_content(config: &EmailConfig, raw_headers: &str, subj
         
         // Detect format for logging
         let detected_format = crypto::detect_encryption_format(&clean_body);
-        println!("[RUST] Detected encryption format: {} for email body", detected_format);
+        debug_log!("[RUST] Detected encryption format: {} for email body", detected_format);
         
         match crypto::decrypt_message(private_key, &sender_pubkey, &clean_body) {
             Ok(decrypted) => {
-                println!("[RUST] Successfully decrypted body using format: {}", detected_format);
+                debug_log!("[RUST] Successfully decrypted body using format: {}", detected_format);
                 decrypted
             }
             Err(e) => {
-                println!("[RUST] Failed to decrypt body (detected format: {}): {}", detected_format, e);
+                debug_log!("[RUST] Failed to decrypt body (detected format: {}): {}", detected_format, e);
                 body.to_string()
             }
         }
@@ -4695,7 +4740,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                     }
                     raw_nostr_emails.extend(r.emails);
                 }
-                Err(e) => println!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
+                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
             }
         }
     } else {
@@ -4711,7 +4756,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                     }
                     raw_nostr_emails.extend(r.emails);
                 }
-                Err(e) => println!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
+                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
             }
         }
     }
@@ -4719,7 +4764,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
     // Filter emails based on transport authentication - always filter out unauthenticated emails
     raw_nostr_emails.retain(|email| {
         if let Some(false) = email.transport_auth_verified {
-            println!("[RUST] sync_nostr_emails_to_db: Filtering out email {} - transport authentication failed", email.message_id);
+            debug_log!("[RUST] sync_nostr_emails_to_db: Filtering out email {} - transport authentication failed", email.message_id);
             false
         } else {
             true
@@ -4752,14 +4797,14 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
             Ok(Some(existing)) => Some(existing),
             Ok(None) => None,
             Err(e) => {
-                println!("[RUST] ERROR: Failed to check if email exists: {}", e);
+                debug_log!("[RUST] ERROR: Failed to check if email exists: {}", e);
                 return Err(anyhow::anyhow!("Failed to check email {} in DB: {}", email.message_id, e));
             }
         };
         
         if let Some(existing_email) = existing_email {
             // Email already exists - update it with IMAP data (but preserve attachments)
-            println!("[RUST] Email with message_id {} already exists (id: {:?}), updating with IMAP data (preserving attachments)", 
+            debug_log!("[RUST] Email with message_id {} already exists (id: {:?}), updating with IMAP data (preserving attachments)", 
                 email.message_id, existing_email.id);
             let updated_email = DbEmail {
                 id: existing_email.id,
@@ -4788,7 +4833,7 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 thread_id: None,
             };
             db.save_email(&updated_email)?;
-            println!("[RUST] Updated existing email in DB: message_id={}", email.message_id);
+            debug_log!("[RUST] Updated existing email in DB: message_id={}", email.message_id);
         } else {
             // Save raw email to DB
             // For inbox emails, sender_pubkey comes from headers (already extracted)
@@ -4818,48 +4863,48 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 references: None,
                 thread_id: None,
             };
-            println!("[RUST] Saving email to DB: message_id={}", email.message_id);
+            debug_log!("[RUST] Saving email to DB: message_id={}", email.message_id);
             let email_id = db.save_email(&db_email)?;
-            println!("[RUST] Saved email to DB: message_id={}, id={}", email.message_id, email_id);
+            debug_log!("[RUST] Saved email to DB: message_id={}, id={}", email.message_id, email_id);
             
             // Save attachments for this email
-            println!("[RUST] sync_nostr_emails_to_db: Email {} has {} attachments in RawNostrEmail", email.message_id, email.attachments.len());
+            debug_log!("[RUST] sync_nostr_emails_to_db: Email {} has {} attachments in RawNostrEmail", email.message_id, email.attachments.len());
             if !email.attachments.is_empty() {
-                println!("[RUST] Saving {} attachments for email {} (id: {})", email.attachments.len(), email.message_id, email_id);
+                debug_log!("[RUST] Saving {} attachments for email {} (id: {})", email.attachments.len(), email.message_id, email_id);
                 for mut attachment in email.attachments.iter().cloned() {
                     attachment.email_id = email_id;
-                    println!("[RUST] Saving attachment: filename={}, size={}, encrypted={}, email_id={}",
+                    debug_log!("[RUST] Saving attachment: filename={}, size={}, encrypted={}, email_id={}",
                         attachment.filename, attachment.size, attachment.is_encrypted, email_id);
                     match db.save_attachment(&attachment) {
                         Ok(att_id) => {
-                            println!("[RUST] Successfully saved attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
+                            debug_log!("[RUST] Successfully saved attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
                         }
                         Err(e) => {
-                            println!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
+                            debug_log!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
                         }
                     }
                 }
             } else {
-                println!("[RUST] sync_nostr_emails_to_db: Email {} has no attachments in RawNostrEmail, trying to extract from body", email.message_id);
+                debug_log!("[RUST] sync_nostr_emails_to_db: Email {} has no attachments in RawNostrEmail, trying to extract from body", email.message_id);
                 // Try to extract attachments by parsing the raw RFC822 email body
                 if let Ok(parsed_email) = mailparse::parse_mail(email.body.as_bytes()) {
                     let extracted_attachments = extract_attachments_from_parsed_email(&parsed_email, &email.body);
                     if !extracted_attachments.is_empty() {
-                        println!("[RUST] Extracted {} attachments from email body for email {}", extracted_attachments.len(), email_id);
+                        debug_log!("[RUST] Extracted {} attachments from email body for email {}", extracted_attachments.len(), email_id);
                         for mut attachment in extracted_attachments {
                             attachment.email_id = email_id;
                             match db.save_attachment(&attachment) {
                                 Ok(att_id) => {
-                                    println!("[RUST] Saved extracted attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
+                                    debug_log!("[RUST] Saved extracted attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
                                 }
                                 Err(e) => {
-                                    println!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
+                                    debug_log!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
                                 }
                             }
                         }
                     }
                 } else {
-                    println!("[RUST] Could not parse email body to extract attachments for email {}", email_id);
+                    debug_log!("[RUST] Could not parse email body to extract attachments for email {}", email_id);
                 }
             }
             
@@ -4883,12 +4928,12 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
         }
     }
 
-    println!("[RUST] sync_nostr_emails_to_db: Completed sync, {} new emails saved", new_count);
+    debug_log!("[RUST] sync_nostr_emails_to_db: Completed sync, {} new emails saved", new_count);
     Ok(new_count)
 }
 
 pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
-    println!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
+    debug_log!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
 
@@ -4916,7 +4961,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                     }
                     raw_sent_emails.extend(r.emails);
                 }
-                Err(e) => println!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
+                Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
             }
         }
     } else {
@@ -4934,37 +4979,37 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                     }
                     raw_sent_emails.extend(r.emails);
                 }
-                Err(e) => println!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
+                Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
             }
         }
     }
 
-    println!("[RUST] sync_sent_emails_to_db: Fetched {} emails from IMAP", raw_sent_emails.len());
+    debug_log!("[RUST] sync_sent_emails_to_db: Fetched {} emails from IMAP", raw_sent_emails.len());
 
     let mut new_count = 0;
-    println!("[RUST] sync_sent_emails_to_db: Processing {} emails for saving", raw_sent_emails.len());
+    debug_log!("[RUST] sync_sent_emails_to_db: Processing {} emails for saving", raw_sent_emails.len());
     for (idx, email) in raw_sent_emails.iter().enumerate() {
-        println!("[RUST] sync_sent_emails_to_db: Processing email {} of {}: message_id={}, from={}, date={}", 
+        debug_log!("[RUST] sync_sent_emails_to_db: Processing email {} of {}: message_id={}, from={}, date={}", 
             idx + 1, raw_sent_emails.len(), email.message_id, email.from, email.date);
         // Skip emails that failed transport authentication
         if let Some(false) = email.transport_auth_verified {
-            println!("[RUST] sync_nostr_emails_to_db: Skipping email {} - transport authentication failed", email.message_id);
+            debug_log!("[RUST] sync_nostr_emails_to_db: Skipping email {} - transport authentication failed", email.message_id);
             continue;
         }
         
         // Check if already in DB by message_id (only check, don't save yet)
-        println!("[RUST] sync_sent_emails_to_db: Checking for existing email with message_id: {}", email.message_id);
+        debug_log!("[RUST] sync_sent_emails_to_db: Checking for existing email with message_id: {}", email.message_id);
         let existing_email = match db.get_email(&email.message_id) {
             Ok(Some(existing)) => {
-                println!("[RUST] sync_sent_emails_to_db: Found existing email in DB: id={:?}, message_id={}", existing.id, existing.message_id);
+                debug_log!("[RUST] sync_sent_emails_to_db: Found existing email in DB: id={:?}, message_id={}", existing.id, existing.message_id);
                 Some(existing)
             },
             Ok(None) => {
-                println!("[RUST] sync_sent_emails_to_db: No existing email found in DB for message_id: {}", email.message_id);
+                debug_log!("[RUST] sync_sent_emails_to_db: No existing email found in DB for message_id: {}", email.message_id);
                 None
             },
             Err(e) => {
-                println!("[RUST] ERROR: Failed to check if email exists: {}", e);
+                debug_log!("[RUST] ERROR: Failed to check if email exists: {}", e);
                 return Err(anyhow::anyhow!("Failed to check email {} in DB: {}", email.message_id, e));
             }
         };
@@ -4972,7 +5017,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
         if let Some(existing_email) = existing_email {
                 // Email already exists - update it with IMAP data (but preserve attachments)
                 // Only update fields that might have changed from IMAP, don't overwrite attachment data
-                println!("[RUST] Email with message_id {} already exists (id: {:?}), updating with IMAP data (preserving attachments)", 
+                debug_log!("[RUST] Email with message_id {} already exists (id: {:?}), updating with IMAP data (preserving attachments)", 
                     email.message_id, existing_email.id);
                 let updated_email = DbEmail {
                     id: existing_email.id,
@@ -5001,15 +5046,15 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                     thread_id: None,
                 };
                 match db.save_email(&updated_email) {
-                    Ok(id) => println!("[RUST] Updated existing email with IMAP data, id: {}", id),
+                    Ok(id) => debug_log!("[RUST] Updated existing email with IMAP data, id: {}", id),
                     Err(e) => {
-                        println!("[RUST] ERROR: Failed to update email {}: {}", email.message_id, e);
+                        debug_log!("[RUST] ERROR: Failed to update email {}: {}", email.message_id, e);
                         return Err(anyhow::anyhow!("Failed to update email {}: {}", email.message_id, e));
                     }
                 }
         } else {
             // New email - save raw email to DB directly without checking again
-            println!("[RUST] Email is new, inserting directly to DB (skipping redundant get_email check)");
+            debug_log!("[RUST] Email is new, inserting directly to DB (skipping redundant get_email check)");
             let db_email = DbEmail {
                 id: None,
                 message_id: email.message_id.clone(),
@@ -5036,42 +5081,42 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                 references: None,
                 thread_id: None,
             };
-            println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}",
+            debug_log!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}",
                 db_email.message_id, db_email.from_address, db_email.to_address, 
                 db_email.subject.len(), db_email.body.len());
             let email_id = match db.insert_email_direct(&db_email) {
                 Ok(id) => {
-                    println!("[RUST] Successfully inserted new sent email to DB with id: {}", id);
+                    debug_log!("[RUST] Successfully inserted new sent email to DB with id: {}", id);
                     new_count += 1;
                     id
                 }
                 Err(e) => {
-                    println!("[RUST] ERROR: Failed to insert email to DB: {}", e);
+                    debug_log!("[RUST] ERROR: Failed to insert email to DB: {}", e);
                     return Err(anyhow::anyhow!("Failed to insert email {} to DB: {}", email.message_id, e));
                 }
             };
             
             // Extract and save attachments from the email body
             // Parse the email body to extract attachments (they're in encrypted form)
-            println!("[RUST] sync_sent_emails_to_db: Email {} has {} attachments in RawNostrEmail", email.message_id, email.attachments.len());
+            debug_log!("[RUST] sync_sent_emails_to_db: Email {} has {} attachments in RawNostrEmail", email.message_id, email.attachments.len());
             if !email.attachments.is_empty() {
-                println!("[RUST] Saving {} attachments for email {} (id: {})", email.attachments.len(), email.message_id, email_id);
+                debug_log!("[RUST] Saving {} attachments for email {} (id: {})", email.attachments.len(), email.message_id, email_id);
                 for mut attachment in email.attachments.iter().cloned() {
                     attachment.email_id = email_id;
-                    println!("[RUST] Saving attachment: filename={}, size={}, encrypted={}, email_id={}", 
+                    debug_log!("[RUST] Saving attachment: filename={}, size={}, encrypted={}, email_id={}", 
                         attachment.filename, attachment.size, attachment.is_encrypted, attachment.email_id);
                     match db.save_attachment(&attachment) {
                         Ok(att_id) => {
-                            println!("[RUST] Successfully saved attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
+                            debug_log!("[RUST] Successfully saved attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
                         }
                         Err(e) => {
-                            println!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
+                            debug_log!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
                             // Don't fail the whole sync if attachment save fails
                         }
                     }
                 }
             } else {
-                println!("[RUST] sync_sent_emails_to_db: Email {} has no attachments in RawNostrEmail, trying to extract from body", email.message_id);
+                debug_log!("[RUST] sync_sent_emails_to_db: Email {} has no attachments in RawNostrEmail, trying to extract from body", email.message_id);
                 // Try to extract attachments by parsing the raw RFC822 email body
                 // The email.body might just be the text part, so we need to re-fetch the full email
                 // For now, try parsing the body - if it's multipart, we can extract attachments
@@ -5079,15 +5124,15 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                 if let Ok(parsed_email) = mailparse::parse_mail(email.body.as_bytes()) {
                     let extracted_attachments = extract_attachments_from_parsed_email(&parsed_email, &email.body);
                     if !extracted_attachments.is_empty() {
-                        println!("[RUST] Extracted {} attachments from email body for email {}", extracted_attachments.len(), email_id);
+                        debug_log!("[RUST] Extracted {} attachments from email body for email {}", extracted_attachments.len(), email_id);
                         for mut attachment in extracted_attachments {
                             attachment.email_id = email_id;
                             match db.save_attachment(&attachment) {
                                 Ok(att_id) => {
-                                    println!("[RUST] Saved extracted attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
+                                    debug_log!("[RUST] Saved extracted attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
                                 }
                                 Err(e) => {
-                                    println!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
+                                    debug_log!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
                                 }
                             }
                         }
@@ -5095,7 +5140,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                 } else {
                     // Body is not parseable as multipart - might need to re-fetch from IMAP
                     // For now, log and continue
-                    println!("[RUST] Could not parse email body to extract attachments for email {}", email_id);
+                    debug_log!("[RUST] Could not parse email body to extract attachments for email {}", email_id);
                 }
             }
         }
@@ -5115,7 +5160,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
         }
     }
 
-    println!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved", new_count);
+    debug_log!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved", new_count);
     Ok(new_count)
 }
 
@@ -5202,7 +5247,7 @@ fn parse_nostr_email_from_imap_body_inner(
                 reason: format!("Error verifying transport auth: {}", e),
             });
         if !verdict.transport_verified {
-            println!("[RUST] parse_nostr_email_from_imap_body: Email {} failed transport authentication: {}", message_id, verdict.reason);
+            debug_log!("[RUST] parse_nostr_email_from_imap_body: Email {} failed transport authentication: {}", message_id, verdict.reason);
             return None;
         }
         Some(true)
@@ -5302,7 +5347,7 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
         }
     };
 
-    println!("[RUST] uid_sync_folder: '{}' UID SEARCH {}", folder_name, query);
+    debug_log!("[RUST] uid_sync_folder: '{}' UID SEARCH {}", folder_name, query);
     let uid_set = session.uid_search(&query)?;
     if uid_set.is_empty() {
         return Ok(UidSyncResult {
@@ -5315,7 +5360,7 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
 
     let mut uids: Vec<u32> = uid_set.into_iter().collect();
     uids.sort_unstable();
-    println!("[RUST] uid_sync_folder: '{}' matched {} UIDs (min {}, max {})",
+    debug_log!("[RUST] uid_sync_folder: '{}' matched {} UIDs (min {}, max {})",
         folder_name, uids.len(), uids.first().copied().unwrap_or(0), uids.last().copied().unwrap_or(0));
 
     // Chunk into ~500-UID batches to stay well under Gmail's ~8KB IMAP line limit.
@@ -5379,7 +5424,7 @@ fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::i
     for mailbox in mailboxes.iter() {
         let mailbox_name = mailbox.name().to_lowercase();
         if mailbox_name == "[gmail]/sent mail" {
-            println!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
+            debug_log!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
             return Ok(Some(mailbox.name().to_string()));
         }
     }
@@ -5397,12 +5442,12 @@ fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::i
         // Check if this mailbox matches any sent pattern
         for pattern in &sent_patterns {
             if mailbox_name.contains(pattern) {
-                println!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
+                debug_log!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
                 return Ok(Some(mailbox.name().to_string()));
             }
         }
     }
     
-    println!("[RUST] discover_sent_mailbox: No sent mailbox found");
+    debug_log!("[RUST] discover_sent_mailbox: No sent mailbox found");
     Ok(None)
 }

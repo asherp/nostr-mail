@@ -1639,17 +1639,68 @@ fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
 ///
 /// Returns a serde-friendly ParsedArmorMessage for Tauri JSON IPC.
 /// All serde fields are derived from reading the capnp message — nothing bypasses the schema.
+/// Process-wide cache for parse_armor_components results. Keyed by hash of the
+/// line-ending-normalized armor text — both decrypt and verify Tauri commands
+/// call into this function with the same body, and on first parse we walk the
+/// returned tree to pre-populate sub-tree entries (one per nesting level), so
+/// verify_all_signatures' recursive parse calls hit cache too. Across thread
+/// reopens the entire parse becomes a HashMap lookup.
+static PARSE_ARMOR_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, crate::types::ParsedArmorMessage>>>
+    = std::sync::OnceLock::new();
+
+fn hash_armor_text(text: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Recursively insert each nested level of the parsed tree into the cache.
+/// Each level's cache key is hash(level.quoted_armor_text), matching what a
+/// top-level parse_armor_components(quoted_armor_text) would compute.
+fn populate_parse_subtree_cache(
+    node: &crate::types::ParsedArmorMessage,
+    cache: &mut std::collections::HashMap<u64, crate::types::ParsedArmorMessage>,
+) {
+    if let (Some(quoted_text), Some(quoted_box)) = (node.quoted_armor_text.as_ref(), node.quoted.as_ref()) {
+        let key = hash_armor_text(quoted_text);
+        cache.entry(key).or_insert_with(|| (**quoted_box).clone());
+        populate_parse_subtree_cache(quoted_box, cache);
+    }
+}
+
 pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedArmorMessage> {
     use crate::nostr_mail_capnp;
 
+    // Normalize line endings up front so the cache key doesn't fragment between
+    // callers (verify_all_signatures passes raw \r\n text from the DB, decrypt_email_body_pipeline
+    // passes its own pre-normalized copy). The downstream populate_armor_from_text
+    // also normalizes, but that's a cheap no-op on already-normalized input.
+    let normalized: std::borrow::Cow<str> = if armor_text.contains("\r\n") {
+        std::borrow::Cow::Owned(armor_text.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(armor_text)
+    };
+    let cache_key = hash_armor_text(&normalized);
+
+    let cache_map = PARSE_ARMOR_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(cached) = cache_map.lock().unwrap().get(&cache_key) {
+        println!("[RUST-PERF] parse_armor cache HIT key={:x} (in={}b, has_quoted={})",
+            cache_key, armor_text.len(), cached.quoted.is_some());
+        return Some(cached.clone());
+    }
+
     let preview: String = armor_text.chars().take(120).collect();
     println!("[RUST] parse_armor_components: input length={} preview={:?}", armor_text.len(), preview);
+
+    let perf = std::time::Instant::now();
 
     // Build the capnp ArmorMessage — this is the parsing target
     let mut capnp_msg = ::capnp::message::Builder::new_default();
     let (prefix_text, raw_quoted_text) = {
         let armor_builder = capnp_msg.init_root::<nostr_mail_capnp::armor_message::Builder>();
-        populate_armor_from_text(armor_builder, armor_text)?
+        populate_armor_from_text(armor_builder, &normalized)?
     };
 
     // Read the capnp message → serde struct (all fields derived from capnp)
@@ -1666,6 +1717,16 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
     println!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
         result.body_type, result.encryption_nip, result.signature_hex.is_some(),
         result.seal_pubkey_hex.is_some(), result.quoted.is_some());
+    println!("[RUST-PERF] parse_armor cache MISS key={:x} compute={}ms (in={}b, has_quoted={})",
+        cache_key, perf.elapsed().as_millis(), armor_text.len(), result.quoted.is_some());
+
+    // Insert outer + each nested level under its own hash key so
+    // verify_all_signatures' recursive parse calls hit cache as well.
+    {
+        let mut guard = cache_map.lock().unwrap();
+        guard.insert(cache_key, result.clone());
+        populate_parse_subtree_cache(&result, &mut guard);
+    }
 
     Some(result)
 }
@@ -2254,80 +2315,111 @@ pub fn compute_subject_ciphertext_hash(subject: &str, body: &str) -> Option<Stri
     Some(format!("{:x}", hasher.finalize()))
 }
 
+static GLOSSIA_SUBJECT_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Option<String>>>>
+    = std::sync::OnceLock::new();
+
+fn hash_subject(subject: &str, nip_hint: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    subject.hash(&mut h);
+    nip_hint.hash(&mut h);
+    h.finish()
+}
+
 fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
-    println!("[RUST] glossia_decode_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
-    if subject.is_empty() || is_likely_encrypted_content(subject) {
-        println!("[RUST] glossia_decode_subject: empty or already encrypted, returning None");
-        return None;
+    // Subject decode tries multiple wordlists and applies nip-specific
+    // postprocess, so we memoize the final Option<String> result keyed by
+    // (subject, nip_hint). Re-opens of the same email skip the entire
+    // detect + decode + postprocess flow.
+    let key = hash_subject(subject, nip_hint);
+    let cache = GLOSSIA_SUBJECT_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(cached) = cache.lock().unwrap().get(&key) {
+        println!("[RUST-PERF] glossia subject cache HIT key={:x} (in={}b, nip={})",
+            key, subject.len(), nip_hint);
+        return cached.clone();
     }
 
-    // Detect dialect with hit_rate filtering
-    let words: Vec<String> = subject.split_whitespace().map(|w| w.to_lowercase()).collect();
-    println!("[RUST] glossia_decode_subject: word_count={} words={:?}", words.len(), &words[..words.len().min(6)]);
-    if words.is_empty() {
-        return None;
-    }
-    let detect_result = std::panic::catch_unwind(move || {
-        glossia::detect_dialect_best(&words)
-    });
-    let dialect = match detect_result {
-        Ok(Some(best)) => {
-            println!("[RUST] glossia_decode_subject: detected dialect={:?} hit_rate={}", best.language, best.hit_rate);
-            if best.hit_rate >= 0.8 {
-                best.language.clone()
-            } else {
-                println!("[RUST] glossia_decode_subject: hit_rate too low (<0.8), returning None");
-                return None;
-            }
-        }
-        Ok(None) => {
-            println!("[RUST] glossia_decode_subject: no dialect detected, returning None");
+    // Compute the result via an IIFE so every (early-) return path flows into
+    // the cache insertion below without scattering insert calls everywhere.
+    let result: Option<String> = (|| -> Option<String> {
+        println!("[RUST] glossia_decode_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
+        if subject.is_empty() || is_likely_encrypted_content(subject) {
+            println!("[RUST] glossia_decode_subject: empty or already encrypted, returning None");
             return None;
         }
-        Err(e) => {
-            println!("[RUST] glossia_decode_subject: detect_dialect_best panicked: {:?}", e.downcast_ref::<String>());
-            return None;
-        }
-    };
 
-    // Try decoding with both "default" and "raw" wordlists, pick longest
-    let wordlists = ["default", "raw"];
-    let mut best_decoded: Option<String> = None;
-    for wl in &wordlists {
-        let text = subject.to_string();
-        let lang = dialect.clone();
-        let wl_str = wl.to_string();
-        let decode_result = std::panic::catch_unwind(move || {
-            glossia::decode_from_language(&text, &lang, &wl_str, false)
+        // Detect dialect with hit_rate filtering
+        let words: Vec<String> = subject.split_whitespace().map(|w| w.to_lowercase()).collect();
+        println!("[RUST] glossia_decode_subject: word_count={} words={:?}", words.len(), &words[..words.len().min(6)]);
+        if words.is_empty() {
+            return None;
+        }
+        let detect_result = std::panic::catch_unwind(move || {
+            glossia::detect_dialect_best(&words)
         });
-        match decode_result {
-            Ok(Ok(decoded)) => {
-                println!("[RUST] glossia_decode_subject: wl={} decoded len={} preview={:?}", wl, decoded.len(), &decoded[..decoded.len().min(40)]);
-                match &best_decoded {
-                    Some(prev) if prev.len() >= decoded.len() => {}
-                    _ => { best_decoded = Some(decoded); }
+        let dialect = match detect_result {
+            Ok(Some(best)) => {
+                println!("[RUST] glossia_decode_subject: detected dialect={:?} hit_rate={}", best.language, best.hit_rate);
+                if best.hit_rate >= 0.8 {
+                    best.language.clone()
+                } else {
+                    println!("[RUST] glossia_decode_subject: hit_rate too low (<0.8), returning None");
+                    return None;
                 }
             }
-            Ok(Err(e)) => {
-                println!("[RUST] glossia_decode_subject: wl={} decode error: {:?}", wl, e);
+            Ok(None) => {
+                println!("[RUST] glossia_decode_subject: no dialect detected, returning None");
+                return None;
             }
             Err(e) => {
-                println!("[RUST] glossia_decode_subject: wl={} decode panicked: {:?}", wl, e.downcast_ref::<String>());
+                println!("[RUST] glossia_decode_subject: detect_dialect_best panicked: {:?}", e.downcast_ref::<String>());
+                return None;
+            }
+        };
+
+        // Try decoding with both "default" and "raw" wordlists, pick longest
+        let wordlists = ["default", "raw"];
+        let mut best_decoded: Option<String> = None;
+        for wl in &wordlists {
+            let text = subject.to_string();
+            let lang = dialect.clone();
+            let wl_str = wl.to_string();
+            let decode_result = std::panic::catch_unwind(move || {
+                glossia::decode_from_language(&text, &lang, &wl_str, false)
+            });
+            match decode_result {
+                Ok(Ok(decoded)) => {
+                    println!("[RUST] glossia_decode_subject: wl={} decoded len={} preview={:?}", wl, decoded.len(), &decoded[..decoded.len().min(40)]);
+                    match &best_decoded {
+                        Some(prev) if prev.len() >= decoded.len() => {}
+                        _ => { best_decoded = Some(decoded); }
+                    }
+                }
+                Ok(Err(e)) => {
+                    println!("[RUST] glossia_decode_subject: wl={} decode error: {:?}", wl, e);
+                }
+                Err(e) => {
+                    println!("[RUST] glossia_decode_subject: wl={} decode panicked: {:?}", wl, e.downcast_ref::<String>());
+                }
             }
         }
-    }
 
-    match best_decoded {
-        Some(decoded) => {
-            let result = glossia_postprocess(&decoded, nip_hint);
-            println!("[RUST] glossia_decode_subject: postprocess result={:?}", result.as_ref().map(|s| &s[..s.len().min(40)]));
-            result.ok()
+        match best_decoded {
+            Some(decoded) => {
+                let result = glossia_postprocess(&decoded, nip_hint);
+                println!("[RUST] glossia_decode_subject: postprocess result={:?}", result.as_ref().map(|s| &s[..s.len().min(40)]));
+                result.ok()
+            }
+            _ => {
+                println!("[RUST] glossia_decode_subject: no successful decode from any wordlist");
+                None
+            }
         }
-        _ => {
-            println!("[RUST] glossia_decode_subject: no successful decode from any wordlist");
-            None
-        }
-    }
+    })();
+
+    cache.lock().unwrap().insert(key, result.clone());
+    result
 }
 
 // ── Decrypt pipeline ─────────────────────────────────────────────────

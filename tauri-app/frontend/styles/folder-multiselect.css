@@ -1,0 +1,67 @@
+/* Tom Select tweaks for the inbox-folder multiselect in Settings. */
+
+#inbox-folder-preference + .ts-wrapper {
+    min-height: 38px;
+    width: 100%;
+}
+
+#inbox-folder-preference + .ts-wrapper .ts-control {
+    padding: 6px 8px;
+    border-radius: 4px;
+    min-height: 38px;
+}
+
+#inbox-folder-preference + .ts-wrapper .ts-dropdown {
+    max-height: 320px;
+}
+
+#inbox-folder-preference + .ts-wrapper .ts-dropdown .optgroup-header {
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 0.05em;
+    color: #6b7280;
+    padding-top: 6px;
+}
+
+/* Selected-item pills — keep the spacing comfortable in the Settings form. */
+#inbox-folder-preference + .ts-wrapper .item {
+    margin: 2px 4px 2px 0;
+}
+
+/* Folder name that triggers a one-time confirm before full sync. */
+#inbox-folder-preference + .ts-wrapper .item[data-value="[Gmail]/All Mail"] {
+    background: #fef3c7;
+    border-color: #f59e0b;
+}
+
+/* Dark-mode adjustments. The default Tom Select theme is light; mirror the
+   app's dark palette so the control doesn't pop. */
+body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-control,
+body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-dropdown {
+    background-color: #232946;
+    color: #e0e0e0;
+    border-color: #3a3f55;
+}
+
+body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-dropdown .active {
+    background-color: #2d3450;
+    color: #fff;
+}
+
+body.dark-mode #inbox-folder-preference + .ts-wrapper .item {
+    background-color: #2d3450;
+    color: #e0e0e0;
+    border-color: #3a3f55;
+}
+
+body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-dropdown .optgroup-header {
+    color: #a0a4b8;
+    background-color: #181a20;
+}
+
+body.dark-mode #inbox-folder-preference + .ts-wrapper .item[data-value="[Gmail]/All Mail"] {
+    background: #78350f;
+    border-color: #f59e0b;
+    color: #fef3c7;
+}

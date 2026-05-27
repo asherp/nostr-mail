@@ -3398,22 +3398,17 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.setValue('syncCutoffDays', settings.sync_cutoff_days || 30);
         domManager.setValue('emailsPerPage', settings.emails_per_page || 50);
         // Inbox folders: the <option> list is per-account (driven by the
-        // active user's IMAP server). Seed it with the persisted selections
-        // (newline-separated) so the values can be applied immediately, then
-        // trigger a silent background refresh to pull the live folder list.
+        // active user's IMAP server). Seed Tom Select with the persisted
+        // selections (newline-separated) so the saved value is visible
+        // immediately, then trigger a silent background refresh to pull the
+        // live folder list.
         const inboxFolderSelect = domManager.get('inboxFolderPreference');
         if (inboxFolderSelect) {
             const persistedFolder = settings.inbox_folder || '';
             const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
-            inboxFolderSelect.innerHTML = '';
-            persistedList.forEach(name => {
-                const opt = document.createElement('option');
-                opt.value = name;
-                opt.textContent = name;
-                opt.selected = true;
-                inboxFolderSelect.appendChild(opt);
-            });
-            inboxFolderSelect.disabled = false;
+            if (window.FolderMultiselect) {
+                window.FolderMultiselect.setSelectionOnly(persistedList);
+            }
             if (window.emailService) {
                 window.emailService.listImapFolders({ silent: true }).catch(err => {
                     console.warn('[APP] Background folder refresh failed:', err);

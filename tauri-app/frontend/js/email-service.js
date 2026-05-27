@@ -5491,14 +5491,11 @@ ${attachmentsHtml}
             // before populateSettingsForm runs).
             const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
             const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
-            const domSelected = selectElement
-                ? Array.from(selectElement.selectedOptions).map(o => o.value).filter(Boolean)
-                : [];
-            const previousSelection = new Set(domSelected.length > 0 ? domSelected : persistedList);
+            const domSelected = window.FolderMultiselect ? window.FolderMultiselect.getSelection() : [];
+            const previousSelection = domSelected.length > 0 ? domSelected : persistedList;
 
-            if (selectElement) {
-                selectElement.disabled = true;
-                selectElement.innerHTML = '<option disabled>Loading folders...</option>';
+            if (window.FolderMultiselect) {
+                window.FolderMultiselect.setLoading();
             }
 
             const emailConfig = {
@@ -5520,29 +5517,14 @@ ${attachmentsHtml}
 
             const folders = await TauriService.listImapFolders(emailConfig);
 
-            if (selectElement) {
-                selectElement.innerHTML = '';
-                if (folders && folders.length > 0) {
-                    const filteredFolders = folders.filter(folder =>
-                        folder.toLowerCase() !== 'sent'
-                    );
-
-                    filteredFolders.forEach(folder => {
-                        const option = document.createElement('option');
-                        option.value = folder;
-                        option.textContent = folder;
-                        if (previousSelection.has(folder)) {
-                            option.selected = true;
-                        }
-                        selectElement.appendChild(option);
-                    });
-                    selectElement.disabled = false;
-                } else {
-                    const option = document.createElement('option');
-                    option.disabled = true;
-                    option.textContent = 'No folders found';
-                    selectElement.appendChild(option);
-                }
+            if (window.FolderMultiselect) {
+                const filteredFolders = (folders || []).filter(folder =>
+                    folder.toLowerCase() !== 'sent'
+                );
+                // Only keep prior selections that still exist on the server.
+                const filteredSet = new Set(filteredFolders);
+                const restoreSelection = previousSelection.filter(name => filteredSet.has(name));
+                window.FolderMultiselect.setOptions(filteredFolders, restoreSelection);
             }
 
             console.log(`[EMAIL-SERVICE] Loaded ${folders?.length || 0} folders`);
@@ -5551,26 +5533,16 @@ ${attachmentsHtml}
             console.error('Failed to list IMAP folders:', error);
             if (!silent) notificationService.showError('Failed to list IMAP folders: ' + error);
 
-            const selectElement = document.getElementById('inbox-folder-preference');
-            if (selectElement) {
+            if (window.FolderMultiselect) {
                 if (silent) {
                     // Background refresh failed (network down, wrong creds, account
                     // mid-switch). Leave the dropdown in a usable state with the
                     // persisted folder names so the user isn't blocked.
                     const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
                     const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
-                    selectElement.innerHTML = '';
-                    selectElement.disabled = false;
-                    persistedList.forEach(name => {
-                        const opt = document.createElement('option');
-                        opt.value = name;
-                        opt.textContent = name;
-                        opt.selected = true;
-                        selectElement.appendChild(opt);
-                    });
+                    window.FolderMultiselect.setSelectionOnly(persistedList);
                 } else {
-                    selectElement.disabled = true;
-                    selectElement.innerHTML = '<option disabled>Failed to load folders</option>';
+                    window.FolderMultiselect.setLoading();
                 }
             }
         }

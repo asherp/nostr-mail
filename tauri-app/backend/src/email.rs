@@ -1641,34 +1641,36 @@ fn try_decode_as_signature(text: &str) -> Option<String> {
     None
 }
 
-/// Decode signature block content into (sig_hex, pubkey_hex).
-/// Three-phase detection for backward compatibility:
-///   1. Combined 96-byte (old format): glossia→96 bytes or hex 192 chars
-///   2. Blank-line split (new format): sig and pubkey separated by empty line
-///   3. Last-line heuristic: last line is npub/hex pubkey, rest is sig
+/// Decode the content of a SIGNATURE block into (sig_hex, pubkey_hex).
+///
+/// The wire format priority follows the Cap'n Proto schema
+/// (`schema/nostr_mail.capnp` lines 188-197):
+///
+/// ```text
+/// CANONICAL (current emit format — JS encodeSigPubkey with default settings):
+///   <signature: glossia-encoded or hex — 64 bytes>
+///   <pubkey:    glossia-encoded, hex, or npub (bech32) — 32 bytes>
+///
+/// LEGACY (must-also-accept, never re-emitted by this codebase):
+///   <combined 96-byte glossia or hex of sig||pubkey on a single line>
+/// ```
+///
+/// We try the canonical two-line format FIRST. Doing the legacy
+/// combined-96 attempts first is what caused the
+/// "inline signature invalid" / "malformed public key" bug fixed in
+/// `0a8b3e2`: try_decode_raw_base_n_fixed would silently consume the
+/// canonical format (dropping the npub line as a non-payload token)
+/// and zero-pad the partial bit-stream up to 96 bytes, producing a
+/// garbage sig+pubkey pair instead of letting Phase 2 fire. With this
+/// ordering Phase 2 always wins for canonical inputs, and the legacy
+/// phases are a strict fallback for older messages.
+///
+/// Returns `Some((sig_hex, pubkey_hex))` for sig (128-char hex / 64 bytes)
+/// and pubkey (64-char hex / 32 bytes), or `None` if no format matched.
 fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
-    // Phase 1a: Combined 96-byte (raw bitpack_fixed — matches frontend's
-    // glossia_encode_raw_base_n on the encode side).
-    if let Some(bytes) = try_decode_raw_base_n_fixed(content, 96) {
-        let sig_hex = hex::encode(&bytes[..64]);
-        let pubkey_hex = hex::encode(&bytes[64..]);
-        return Some((sig_hex, pubkey_hex));
-    }
-
-    // Phase 1b: Legacy combined 96-byte via decode_from_language (body-dialect).
-    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
-        if bytes.len() == 96 {
-            let sig_hex = hex::encode(&bytes[..64]);
-            let pubkey_hex = hex::encode(&bytes[64..]);
-            return Some((sig_hex, pubkey_hex));
-        }
-    }
-    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
-    if stripped.len() == 192 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Some((stripped[..128].to_string(), stripped[128..].to_string()));
-    }
-
-    // Phase 2: Default mode — glossia sig + npub/hex pubkey on last line
+    // ── Canonical: two-line sig + pubkey ────────────────────────────────
+    // Last non-empty line is the pubkey (glossia, hex, or npub); preceding
+    // lines together form the signature payload (glossia or hex).
     let lines: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     if lines.len() >= 2 {
         let last = lines[lines.len() - 1];
@@ -1678,6 +1680,29 @@ fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
                 return Some((sig, pk));
             }
         }
+    }
+
+    // ── Legacy: combined 96-byte payload ────────────────────────────────
+    // Strict bitpack_fixed: try_decode_raw_base_n_fixed rejects mixed-token
+    // inputs (since 0a8b3e2), so this only fires for genuine combined
+    // payloads now — keeping it as a safety net for old archived mail.
+    if let Some(bytes) = try_decode_raw_base_n_fixed(content, 96) {
+        let sig_hex = hex::encode(&bytes[..64]);
+        let pubkey_hex = hex::encode(&bytes[64..]);
+        return Some((sig_hex, pubkey_hex));
+    }
+    // Legacy body-dialect glossia (decode_from_language) variant.
+    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
+        if bytes.len() == 96 {
+            let sig_hex = hex::encode(&bytes[..64]);
+            let pubkey_hex = hex::encode(&bytes[64..]);
+            return Some((sig_hex, pubkey_hex));
+        }
+    }
+    // Legacy raw 192-char hex (whitespace stripped).
+    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.len() == 192 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some((stripped[..128].to_string(), stripped[128..].to_string()));
     }
 
     None

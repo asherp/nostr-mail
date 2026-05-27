@@ -2815,10 +2815,14 @@ class EmailService {
     async syncInboxEmails() {
         try {
             const settings = appState.getSettings() || {};
-            const selectedFolder = settings.inbox_folder ? settings.inbox_folder : null;
-            console.log(`[JS] Syncing inbox emails from folder: ${selectedFolder || 'Default (INBOX + nostr-mail)'}`);
+            const folderList = (settings.inbox_folder || '')
+                .split('\n')
+                .map(f => f.trim())
+                .filter(Boolean);
+            const selectedFolders = folderList.length > 0 ? folderList : null;
+            console.log(`[JS] Syncing inbox emails from folders: ${selectedFolders ? selectedFolders.join(', ') : 'Default (INBOX + nostr-mail)'}`);
 
-            const newCount = await TauriService.syncNostrEmails(selectedFolder);
+            const newCount = await TauriService.syncNostrEmails(selectedFolders);
             console.log(`[JS] Synced ${newCount} new inbox emails from network`);
             return newCount;
         } catch (error) {
@@ -5398,11 +5402,15 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             });
 
             // Preserve the currently-saved selection so we can re-apply it after
-            // repopulating the <option>s. Prefer the persisted setting over the
-            // current DOM value (DOM may be empty if this fires before
-            // populateSettingsForm runs).
+            // repopulating the <option>s. Prefer current DOM selections; fall
+            // back to the persisted setting (DOM may be empty if this fires
+            // before populateSettingsForm runs).
             const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
-            const previousValue = selectElement ? (selectElement.value || persistedFolder) : persistedFolder;
+            const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
+            const domSelected = selectElement
+                ? Array.from(selectElement.selectedOptions).map(o => o.value).filter(Boolean)
+                : [];
+            const previousSelection = new Set(domSelected.length > 0 ? domSelected : persistedList);
 
             if (selectElement) {
                 selectElement.disabled = true;
@@ -5431,11 +5439,6 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             if (selectElement) {
                 selectElement.innerHTML = '';
                 if (folders && folders.length > 0) {
-                    const allOption = document.createElement('option');
-                    allOption.value = '';
-                    allOption.textContent = 'Default';
-                    selectElement.appendChild(allOption);
-
                     const filteredFolders = folders.filter(folder =>
                         folder.toLowerCase() !== 'sent'
                     );
@@ -5444,13 +5447,12 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         const option = document.createElement('option');
                         option.value = folder;
                         option.textContent = folder;
+                        if (previousSelection.has(folder)) {
+                            option.selected = true;
+                        }
                         selectElement.appendChild(option);
                     });
                     selectElement.disabled = false;
-
-                    if (previousValue && Array.from(selectElement.options).some(o => o.value === previousValue)) {
-                        selectElement.value = previousValue;
-                    }
                 } else {
                     const option = document.createElement('option');
                     option.disabled = true;
@@ -5469,22 +5471,19 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             if (selectElement) {
                 if (silent) {
                     // Background refresh failed (network down, wrong creds, account
-                    // mid-switch). Leave the dropdown in a usable state with just
-                    // "Default" + the persisted folder name so the user isn't blocked.
+                    // mid-switch). Leave the dropdown in a usable state with the
+                    // persisted folder names so the user isn't blocked.
                     const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
+                    const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
                     selectElement.innerHTML = '';
                     selectElement.disabled = false;
-                    const defaultOpt = document.createElement('option');
-                    defaultOpt.value = '';
-                    defaultOpt.textContent = 'Default';
-                    selectElement.appendChild(defaultOpt);
-                    if (persistedFolder) {
+                    persistedList.forEach(name => {
                         const opt = document.createElement('option');
-                        opt.value = persistedFolder;
-                        opt.textContent = persistedFolder;
+                        opt.value = name;
+                        opt.textContent = name;
+                        opt.selected = true;
                         selectElement.appendChild(opt);
-                        selectElement.value = persistedFolder;
-                    }
+                    });
                 } else {
                     selectElement.disabled = true;
                     selectElement.innerHTML = '<option disabled>Failed to load folders</option>';
@@ -5495,6 +5494,12 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 
     getSelectedFolder() {
         return (appState.getSettings() || {}).inbox_folder || null;
+    }
+
+    getSelectedFolders() {
+        const raw = (appState.getSettings() || {}).inbox_folder || '';
+        const list = raw.split('\n').map(f => f.trim()).filter(Boolean);
+        return list.length > 0 ? list : null;
     }
 
     // Handle email provider selection

@@ -650,11 +650,9 @@
                         </div>
 
                         <div class="form-group">
-                            <label for="inbox-folder-preference">Inbox Folder:</label>
-                            <select id="inbox-folder-preference">
-                                <option value="">Default</option>
-                            </select>
-                            <small class="form-text text-muted">Which IMAP folder to scan for new mail. Default scans INBOX + nostr-mail. Folder list loads from your IMAP server.</small>
+                            <label for="inbox-folder-preference">Inbox Folders:</label>
+                            <select id="inbox-folder-preference" multiple size="6"></select>
+                            <small class="form-text text-muted">Which IMAP folders to scan for new mail. Select one or more (Ctrl/Cmd-click to toggle). Leave all unselected to use the default (INBOX + nostr-mail). Folder list loads from your IMAP server.</small>
                         </div>
                         
                         <div class="form-group">

@@ -4702,15 +4702,32 @@ nitela\n\
 }
 
 
-pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
 
     // Folders to scan. Default (empty/None) = INBOX + nostr-mail label.
-    let folders: Vec<String> = match folder {
-        Some(f) if !f.is_empty() => vec![f.to_string()],
-        _ => vec!["INBOX".to_string(), "nostr-mail".to_string()],
+    // Multiple folders may be supplied to scan in a single pass; dedupe to
+    // avoid re-scanning the same folder twice if a caller passed duplicates.
+    let folders: Vec<String> = match folders_arg {
+        Some(list) => {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut out: Vec<String> = Vec::new();
+            for f in list {
+                let trimmed = f.trim();
+                if trimmed.is_empty() { continue; }
+                if seen.insert(trimmed.to_string()) {
+                    out.push(trimmed.to_string());
+                }
+            }
+            if out.is_empty() {
+                vec!["INBOX".to_string(), "nostr-mail".to_string()]
+            } else {
+                out
+            }
+        }
+        None => vec!["INBOX".to_string(), "nostr-mail".to_string()],
     };
 
     println!(

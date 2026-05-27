@@ -40,6 +40,18 @@ class EmailService {
         this.sentSearchOffset = 0; // Track pagination offset for sent search results
         this.searchHasMore = false; // Track if there are more search results
         this.sentSearchHasMore = false; // Track if there are more sent search results
+        // Infinite scroll state. `hasMoreInDb` is true when the last DB page was
+        // full (so another DB fetch is worth trying). `loadingMore` is a
+        // re-entrancy guard for the scroll handler. `serverFetchTried` flips
+        // true after we've hit the server once for the current exhaustion;
+        // it resets when the server returns new rows or on a fresh refresh.
+        this.inboxHasMoreInDb = true;
+        this.inboxLoadingMore = false;
+        this.inboxServerFetchTried = false;
+        this.sentHasMoreInDb = true;
+        this.sentLoadingMore = false;
+        this.sentServerFetchTried = false;
+        this._infiniteScrollInited = false;
         this._htmlBody = null; // HTML alternative body for multipart emails
         this._plainBody = null; // BIP39-armored plaintext body for text/plain MIME part
         this._quotedOriginalArmor = null; // Original message armor to append as quote in replies
@@ -2632,15 +2644,12 @@ class EmailService {
             if (!append) {
                 // Reset offset when loading fresh (not appending)
                 this.inboxOffset = 0;
+                this.inboxHasMoreInDb = true;
+                this.inboxServerFetchTried = false;
                 domManager.disable('refreshInbox');
                 domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
             } else {
-                // Show loading state on Load More button
-                const loadMoreBtn = document.getElementById('load-more-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = true;
-                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
-                }
+                this._setListStatus('email-list', 'Loading more...');
             }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
@@ -2683,9 +2692,9 @@ class EmailService {
 
             // Update offset for next load
             this.inboxOffset += emails.length;
+            this.inboxHasMoreInDb = emails.length === pageSize;
 
-            // Show Load More button if we got a full page of results
-            this.renderEmails(emails.length === pageSize, appendFrom);
+            this.renderEmails(this.inboxHasMoreInDb, appendFrom);
         } catch (error) {
             console.error('Failed to load emails:', error);
             notificationService.showError('Failed to load emails: ' + error);
@@ -2694,11 +2703,7 @@ class EmailService {
                 domManager.enable('refreshInbox');
                 domManager.setHTML('refreshInbox', '<i class="fas fa-sync"></i> Refresh');
             } else {
-                const loadMoreBtn = document.getElementById('load-more-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = false;
-                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                }
+                this._removeListStatus('email-list');
             }
         }
     }
@@ -2736,15 +2741,12 @@ class EmailService {
             if (!append) {
                 // Reset offset when loading fresh (not appending)
                 this.sentOffset = 0;
+                this.sentHasMoreInDb = true;
+                this.sentServerFetchTried = false;
                 domManager.disable('refreshSent');
                 domManager.setHTML('refreshSent', '<span class="loading"></span> Loading...');
             } else {
-                // Show loading state on Load More button
-                const loadMoreBtn = document.getElementById('load-more-sent-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = true;
-                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
-                }
+                this._setListStatus('sent-list', 'Loading more...');
             }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
@@ -2772,9 +2774,9 @@ class EmailService {
 
             // Update offset for next load
             this.sentOffset += emails.length;
+            this.sentHasMoreInDb = emails.length === pageSize;
 
-            // Show Load More button if we got a full page of results
-            this.renderSentEmails(emails.length === pageSize, appendFrom);
+            this.renderSentEmails(this.sentHasMoreInDb, appendFrom);
         } catch (error) {
             console.error('Failed to load sent emails:', error);
             notificationService.showError('Failed to load sent emails: ' + error);
@@ -2783,11 +2785,7 @@ class EmailService {
                 domManager.enable('refreshSent');
                 domManager.setHTML('refreshSent', '<i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>');
             } else {
-                const loadMoreBtn = document.getElementById('load-more-sent-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = false;
-                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                }
+                this._removeListStatus('sent-list');
             }
         }
     }
@@ -2795,6 +2793,141 @@ class EmailService {
     // Load more sent emails (pagination)
     async loadMoreSentEmails() {
         await this.loadSentEmails('', true);
+    }
+
+    // ── Infinite scroll ──────────────────────────────────────────────────
+    // Replaces the old "Load More" buttons. Loads the next DB page when the
+    // user scrolls within `_INFINITE_SCROLL_THRESHOLD_PX` of the bottom; when
+    // the DB is exhausted, falls through to a single server sync and tries
+    // the DB again.
+
+    _initInfiniteScroll() {
+        if (this._infiniteScrollInited) return;
+        const emailList = document.getElementById('email-list');
+        const sentList = document.getElementById('sent-list');
+        if (!emailList && !sentList) return;
+        this._infiniteScrollInited = true;
+        if (emailList) {
+            emailList.addEventListener('scroll', () => this._onListScroll('inbox'), { passive: true });
+        }
+        if (sentList) {
+            sentList.addEventListener('scroll', () => this._onListScroll('sent'), { passive: true });
+        }
+    }
+
+    _onListScroll(kind) {
+        const listEl = document.getElementById(kind === 'inbox' ? 'email-list' : 'sent-list');
+        if (!listEl) return;
+        const thresholdPx = 300;
+        const distanceFromBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
+        if (distanceFromBottom > thresholdPx) return;
+        this._tryLoadMore(kind);
+    }
+
+    // After a render, if the list isn't tall enough to scroll but more pages
+    // are available, pull the next page so the viewport always fills up.
+    // Guarded by `loadingMore` so it can't recurse infinitely.
+    _maybeFillViewport(kind) {
+        const listEl = document.getElementById(kind === 'inbox' ? 'email-list' : 'sent-list');
+        if (!listEl) return;
+        if (listEl.scrollHeight <= listEl.clientHeight + 8) {
+            this._tryLoadMore(kind);
+        }
+    }
+
+    _tryLoadMore(kind) {
+        if (kind === 'inbox') {
+            if (this.inboxLoadingMore) return;
+            const inSearch = (domManager.getValue('emailSearch')?.trim() || '') !== '';
+            if (this.inboxHasMoreInDb || (inSearch && this.searchHasMore)) {
+                this.inboxLoadingMore = true;
+                this.loadMoreEmails().finally(() => {
+                    this.inboxLoadingMore = false;
+                });
+            } else if (!inSearch && !this.inboxServerFetchTried) {
+                this.inboxServerFetchTried = true;
+                this.inboxLoadingMore = true;
+                this._fetchInboxFromServerAndAppend().finally(() => {
+                    this.inboxLoadingMore = false;
+                });
+            }
+        } else {
+            if (this.sentLoadingMore) return;
+            const inSearch = (domManager.getValue('sentSearch')?.trim() || '') !== '';
+            if (this.sentHasMoreInDb || (inSearch && this.sentSearchHasMore)) {
+                this.sentLoadingMore = true;
+                this.loadMoreSentEmails().finally(() => {
+                    this.sentLoadingMore = false;
+                });
+            } else if (!inSearch && !this.sentServerFetchTried) {
+                this.sentServerFetchTried = true;
+                this.sentLoadingMore = true;
+                this._fetchSentFromServerAndAppend().finally(() => {
+                    this.sentLoadingMore = false;
+                });
+            }
+        }
+    }
+
+    async _fetchInboxFromServerAndAppend() {
+        this._setListStatus('email-list', '<i class="fas fa-cloud-download-alt"></i> Fetching more from server...');
+        try {
+            const newCount = await this.syncInboxEmails();
+            console.log(`[JS] Infinite scroll: server sync returned ${newCount} new inbox emails`);
+            if (newCount > 0) {
+                // Server delivered new rows — there may be more DB pages
+                // again, and the user might exhaust them in this session
+                // and want another server poll.
+                this.inboxHasMoreInDb = true;
+                this.inboxServerFetchTried = false;
+                await this.loadEmails('', true);
+            } else {
+                this._setListStatus('email-list', 'No more emails');
+            }
+        } catch (e) {
+            console.error('[JS] Infinite scroll inbox server fetch failed:', e);
+            this._setListStatus('email-list', 'Failed to fetch from server');
+        }
+    }
+
+    async _fetchSentFromServerAndAppend() {
+        this._setListStatus('sent-list', '<i class="fas fa-cloud-download-alt"></i> Fetching more from server...');
+        try {
+            const newCount = await this.syncSentEmails();
+            console.log(`[JS] Infinite scroll: server sync returned ${newCount} new sent emails`);
+            if (newCount > 0) {
+                this.sentHasMoreInDb = true;
+                this.sentServerFetchTried = false;
+                await this.loadSentEmails('', true);
+            } else {
+                this._setListStatus('sent-list', 'No more emails');
+            }
+        } catch (e) {
+            console.error('[JS] Infinite scroll sent server fetch failed:', e);
+            this._setListStatus('sent-list', 'Failed to fetch from server');
+        }
+    }
+
+    _setListStatus(listId, htmlMessage) {
+        const list = document.getElementById(listId);
+        if (!list) return;
+        let status = list.querySelector('.infinite-scroll-status');
+        if (!status) {
+            status = document.createElement('div');
+            status.className = 'infinite-scroll-status text-center text-muted';
+            status.style.cssText = 'padding: 15px; font-size: 0.9em;';
+            list.appendChild(status);
+        } else {
+            list.appendChild(status); // ensure it stays at the bottom
+        }
+        status.innerHTML = htmlMessage;
+    }
+
+    _removeListStatus(listId) {
+        const list = document.getElementById(listId);
+        if (!list) return;
+        const status = list.querySelector('.infinite-scroll-status');
+        if (status) status.remove();
     }
 
     // Sync and reload emails
@@ -3063,12 +3196,16 @@ class EmailService {
     async renderEmails(showLoadMore = false, appendFrom = 0) {
         const emailList = domManager.get('emailList');
         if (!emailList) return;
+        this._initInfiniteScroll();
         try {
-            // Remove existing Load More button if it exists
+            // Remove any legacy Load More button (now replaced by infinite scroll)
             const existingLoadMoreBtn = document.getElementById('load-more-emails');
             if (existingLoadMoreBtn) {
                 existingLoadMoreBtn.remove();
             }
+            // Drop any inline status row before re-rendering; the scroll
+            // handler will re-add one when it next kicks off a load.
+            this._removeListStatus('email-list');
 
             // Get all emails from state
             const allEmails = appState.getEmails();
@@ -3310,15 +3447,11 @@ class EmailService {
                 return;
             }
 
-            // Add Load More button if there might be more emails
+            // If more DB pages exist but the rendered list is shorter than
+            // the viewport, auto-pull the next page so scroll has somewhere
+            // to go (avoids needing a scroll event to bootstrap).
             if (showLoadMore) {
-                const loadMoreBtn = document.createElement('button');
-                loadMoreBtn.id = 'load-more-emails';
-                loadMoreBtn.className = 'btn btn-secondary';
-                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
-                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                loadMoreBtn.addEventListener('click', () => this.loadMoreEmails());
-                emailList.appendChild(loadMoreBtn);
+                queueMicrotask(() => this._maybeFillViewport('inbox'));
             }
 
             console.log(`[JS] renderEmails: Successfully rendered ${renderedCount} emails`);
@@ -6690,12 +6823,14 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             console.error('[JS] renderSentEmails: sentList element not found');
             return;
         }
+        this._initInfiniteScroll();
         try {
-            // Remove existing Load More button if it exists
+            // Remove any legacy Load More button (now replaced by infinite scroll)
             const existingLoadMoreBtn = document.getElementById('load-more-sent-emails');
             if (existingLoadMoreBtn) {
                 existingLoadMoreBtn.remove();
             }
+            this._removeListStatus('sent-list');
 
             // Get all emails from state
             const allEmails = appState.getSentEmails();
@@ -6891,17 +7026,11 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 return;
             }
             
-            // Add Load More button if there might be more emails
+            // Pagination handled by infinite scroll (see _onListScroll).
             if (showLoadMore) {
-                const loadMoreBtn = document.createElement('button');
-                loadMoreBtn.id = 'load-more-sent-emails';
-                loadMoreBtn.className = 'btn btn-secondary';
-                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
-                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                loadMoreBtn.addEventListener('click', () => this.loadMoreSentEmails());
-                sentList.appendChild(loadMoreBtn);
+                queueMicrotask(() => this._maybeFillViewport('sent'));
             }
-            
+
             console.log(`[JS] renderSentEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
             console.error('[JS] Error in renderSentEmails:', error);

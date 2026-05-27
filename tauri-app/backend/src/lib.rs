@@ -4751,6 +4751,35 @@ async fn reset_folder_sync_state(
 }
 
 #[tauri::command]
+async fn fetch_older_inbox_emails(
+    config: EmailConfig,
+    folder: Option<String>,
+    page_size: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::fetch_older_inbox_emails_to_db(&config, folder.as_deref(), page_size, &active_pubkey, &db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_older_sent_emails(
+    config: EmailConfig,
+    page_size: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::fetch_older_sent_emails_to_db(&config, page_size, &active_pubkey, &db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn sync_sent_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     println!("[RUST] sync_sent_emails command called");
     let db = state.get_database().map_err(|e| e.to_string())?;
@@ -6833,6 +6862,8 @@ pub fn run() {
         sync_nostr_emails,
         reset_folder_sync_state,
         sync_sent_emails,
+        fetch_older_inbox_emails,
+        fetch_older_sent_emails,
         sync_all_emails,
         sync_direct_messages_with_network,
         sync_conversation_with_network,

@@ -151,6 +151,11 @@ pub struct Attachment {
 pub struct FolderSyncState {
     pub uid_validity: u32,
     pub last_seen_uid: u32,
+    // Lowest UID we've fetched for this folder. None on legacy rows that
+    // predate the backward-pagination feature; populated by the next
+    // forward sync (bootstrap fills it from the SINCE-cutoff range) or by
+    // the first fetch_older call.
+    pub min_seen_uid: Option<u32>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -496,6 +501,9 @@ impl Database {
 
         // Migrate: Add folder_sync_state table for UID-based incremental IMAP sync.
         Self::migrate_add_folder_sync_state_table(&conn)?;
+        // Migrate: Add min_seen_uid column to folder_sync_state for backward
+        // pagination ("fetch older from server").
+        Self::migrate_add_min_seen_uid_column(&conn)?;
 
         // Create indexes for better performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_pubkey ON contacts(pubkey)", [])?;
@@ -968,6 +976,30 @@ impl Database {
             )?;
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_folder_sync_state_pubkey ON folder_sync_state(pubkey)",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Migration: Add min_seen_uid column to folder_sync_state.
+    fn migrate_add_min_seen_uid_column(conn: &Connection) -> Result<()> {
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(folder_sync_state)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for r in rows {
+                if r? == "min_seen_uid" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_column {
+            println!("[DB] Adding min_seen_uid column to folder_sync_state");
+            conn.execute(
+                "ALTER TABLE folder_sync_state ADD COLUMN min_seen_uid INTEGER",
                 [],
             )?;
         }
@@ -2233,7 +2265,7 @@ impl Database {
     pub fn get_folder_sync_state(&self, pubkey: &str, folder: &str) -> Result<Option<FolderSyncState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT uid_validity, last_seen_uid, updated_at
+            "SELECT uid_validity, last_seen_uid, min_seen_uid, updated_at
              FROM folder_sync_state
              WHERE pubkey = ? AND folder_name = ?",
         )?;
@@ -2241,17 +2273,22 @@ impl Database {
         if let Some(row) = rows.next()? {
             let uid_validity: i64 = row.get(0)?;
             let last_seen_uid: i64 = row.get(1)?;
+            let min_seen_uid: Option<i64> = row.get(2)?;
             Ok(Some(FolderSyncState {
                 uid_validity: uid_validity as u32,
                 last_seen_uid: last_seen_uid as u32,
-                updated_at: row.get(2)?,
+                min_seen_uid: min_seen_uid.map(|v| v as u32),
+                updated_at: row.get(3)?,
             }))
         } else {
             Ok(None)
         }
     }
 
-    /// Upsert the UID-based sync watermark for one (account, folder).
+    /// Upsert the forward watermark (uid_validity, last_seen_uid) for one
+    /// (account, folder). Does NOT touch `min_seen_uid` — that's owned by
+    /// `set_folder_min_seen_uid`, since it only changes on bootstrap or
+    /// during a backward (fetch-older) pull.
     pub fn set_folder_sync_state(
         &self,
         pubkey: &str,
@@ -2274,6 +2311,34 @@ impl Database {
                 uid_validity as i64,
                 last_seen_uid as i64,
                 now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Lower `min_seen_uid` for one (account, folder). Only writes if the row
+    /// exists (a forward sync should have created it) and the new value is
+    /// strictly smaller than the current value — or the current value is NULL.
+    /// Backward-only: never raises the floor.
+    pub fn set_folder_min_seen_uid(
+        &self,
+        pubkey: &str,
+        folder: &str,
+        new_min: u32,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "UPDATE folder_sync_state
+             SET min_seen_uid = ?, updated_at = ?
+             WHERE pubkey = ? AND folder_name = ?
+               AND (min_seen_uid IS NULL OR min_seen_uid > ?)",
+            params![
+                new_min as i64,
+                now,
+                pubkey.trim().to_lowercase(),
+                folder,
+                new_min as i64,
             ],
         )?;
         Ok(())
@@ -5288,6 +5353,56 @@ mod tests {
 
         // Clearing a non-existent row is a no-op.
         db.clear_folder_sync_state("alice@example.com", "INBOX").unwrap();
+    }
+
+    #[test]
+    fn test_folder_min_seen_uid_starts_null() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, None);
+    }
+
+    #[test]
+    fn test_folder_min_seen_uid_only_lowers() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+
+        // Initial: NULL -> 50 succeeds.
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 50).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, Some(50));
+
+        // 30 < 50: lowers.
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 30).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, Some(30));
+
+        // 40 > 30: no-op (floor stays at 30).
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 40).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, Some(30));
+    }
+
+    #[test]
+    fn test_folder_min_seen_uid_requires_existing_row() {
+        let (db, _dir) = create_test_db();
+        // No row yet. set_folder_min_seen_uid is UPDATE-only — silent no-op.
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 50).unwrap();
+        assert!(db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_folder_sync_state_preserves_min_on_forward_update() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 25).unwrap();
+
+        // Forward sync advances last_seen_uid but should not touch min_seen_uid.
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 200).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.last_seen_uid, 200);
+        assert_eq!(got.min_seen_uid, Some(25));
     }
 
     // =====================

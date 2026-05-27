@@ -4702,117 +4702,44 @@ nitela\n\
 }
 
 
-pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
-    let account_key = config.email_address.trim().to_lowercase();
-    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
-    let require_signature = lookup_require_signature(db, active_pubkey);
-
-    // Folders to scan. Default (empty/None) = INBOX + nostr-mail label.
-    let folders: Vec<String> = match folder {
-        Some(f) if !f.is_empty() => vec![f.to_string()],
-        _ => vec!["INBOX".to_string(), "nostr-mail".to_string()],
-    };
-
-    println!(
-        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, sync_cutoff_days={} (bootstrap only)",
-        account_key, folders, sync_cutoff_days
-    );
-
-    // Per-folder watermark updates, applied AFTER all per-message DB saves succeed.
-    let mut pending_state: Vec<(String, u32, u32)> = Vec::new();
-    let mut raw_nostr_emails: Vec<RawNostrEmail> = Vec::new();
-
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let addr = format!("{}:{}", host, port);
-
-    if config.use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        for f in &folders {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        pending_state.push((f.clone(), r.uid_validity, r.max_uid));
-                    }
-                    raw_nostr_emails.extend(r.emails);
-                }
-                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
-            }
-        }
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        for f in &folders {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        pending_state.push((f.clone(), r.uid_validity, r.max_uid));
-                    }
-                    raw_nostr_emails.extend(r.emails);
-                }
-                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
-            }
-        }
-    }
-    
-    // Filter emails based on transport authentication - always filter out unauthenticated emails
-    raw_nostr_emails.retain(|email| {
-        if let Some(false) = email.transport_auth_verified {
-            debug_log!("[RUST] sync_nostr_emails_to_db: Filtering out email {} - transport authentication failed", email.message_id);
-            false
-        } else {
-            true
-        }
-    });
-    
-    // Filter emails based on signature requirement
+/// Apply the standard inbox filters (transport_auth, require_signature) and
+/// persist a batch of fetched messages, returning the count of newly-inserted
+/// rows. Shared between forward sync and fetch-older. Updates existing rows
+/// in place (preserving read state and attachments); new rows get fresh
+/// attachment extraction.
+fn persist_inbox_raw_emails(
+    raw_emails: Vec<RawNostrEmail>,
+    db: &Database,
+    require_signature: bool,
+) -> anyhow::Result<usize> {
+    let mut emails = raw_emails;
+    // Filter transport-unauthenticated.
+    emails.retain(|email| !matches!(email.transport_auth_verified, Some(false)));
+    // Enforce signature requirement.
     if require_signature {
-        raw_nostr_emails.retain(|email| {
-            // If email has sender_pubkey, it must have a valid signature
+        emails.retain(|email| {
             if email.sender_pubkey.is_some() {
-                // Email has pubkey, check signature
-                if let Some(valid) = email.signature_valid {
-                    valid // Only keep if signature is valid
-                } else {
-                    false // Reject emails without signature when require_signature is true
-                }
+                matches!(email.signature_valid, Some(true))
             } else {
-                // No pubkey header, allow (not a nostr email, but we're syncing nostr emails so this shouldn't happen)
                 true
             }
         });
     }
-    // If require_signature is false, accept all emails regardless of signature
 
     let mut new_count = 0;
-    for email in raw_nostr_emails {
-        // Check if already in DB by message_id
-        let existing_email = match db.get_email(&email.message_id) {
-            Ok(Some(existing)) => Some(existing),
-            Ok(None) => None,
-            Err(e) => {
-                debug_log!("[RUST] ERROR: Failed to check if email exists: {}", e);
-                return Err(anyhow::anyhow!("Failed to check email {} in DB: {}", email.message_id, e));
-            }
-        };
-        
+    for email in emails {
+        let existing_email = db
+            .get_email(&email.message_id)
+            .map_err(|e| anyhow::anyhow!("Failed to check email {} in DB: {}", email.message_id, e))?;
+
         if let Some(existing_email) = existing_email {
-            // Email already exists - update it with IMAP data (but preserve attachments)
-            debug_log!("[RUST] Email with message_id {} already exists (id: {:?}), updating with IMAP data (preserving attachments)", 
-                email.message_id, existing_email.id);
             let updated_email = DbEmail {
                 id: existing_email.id,
                 message_id: existing_email.message_id.clone(),
                 from_address: email.from.clone(),
                 to_address: email.to.clone(),
-                subject: email.subject.clone(), // still encrypted
-                body: email.body.clone(),       // still encrypted
+                subject: email.subject.clone(),
+                body: email.body.clone(),
                 body_plain: None,
                 body_html: email.html_body.clone(),
                 received_at: email.date,
@@ -4821,9 +4748,9 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 recipient_pubkey: email.recipient_pubkey.clone(),
                 raw_headers: Some(email.raw_headers.clone()),
                 is_draft: false,
-                is_read: existing_email.is_read, // Preserve read status
+                is_read: existing_email.is_read,
                 updated_at: Some(chrono::Utc::now()),
-                created_at: existing_email.created_at, // Preserve original creation date
+                created_at: existing_email.created_at,
                 signature_valid: email.signature_valid,
                 signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
@@ -4833,17 +4760,14 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 thread_id: None,
             };
             db.save_email(&updated_email)?;
-            debug_log!("[RUST] Updated existing email in DB: message_id={}", email.message_id);
         } else {
-            // Save raw email to DB
-            // For inbox emails, sender_pubkey comes from headers (already extracted)
             let db_email = DbEmail {
                 id: None,
                 message_id: email.message_id.clone(),
                 from_address: email.from.clone(),
                 to_address: email.to.clone(),
-                subject: email.subject.clone(), // still encrypted
-                body: email.body.clone(),       // still encrypted
+                subject: email.subject.clone(),
+                body: email.body.clone(),
                 body_plain: None,
                 body_html: email.html_body.clone(),
                 received_at: email.date,
@@ -4863,72 +4787,324 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 references: None,
                 thread_id: None,
             };
-            debug_log!("[RUST] Saving email to DB: message_id={}", email.message_id);
             let email_id = db.save_email(&db_email)?;
-            debug_log!("[RUST] Saved email to DB: message_id={}, id={}", email.message_id, email_id);
-            
-            // Save attachments for this email
-            debug_log!("[RUST] sync_nostr_emails_to_db: Email {} has {} attachments in RawNostrEmail", email.message_id, email.attachments.len());
-            if !email.attachments.is_empty() {
-                debug_log!("[RUST] Saving {} attachments for email {} (id: {})", email.attachments.len(), email.message_id, email_id);
-                for mut attachment in email.attachments.iter().cloned() {
-                    attachment.email_id = email_id;
-                    debug_log!("[RUST] Saving attachment: filename={}, size={}, encrypted={}, email_id={}",
-                        attachment.filename, attachment.size, attachment.is_encrypted, email_id);
-                    match db.save_attachment(&attachment) {
-                        Ok(att_id) => {
-                            debug_log!("[RUST] Successfully saved attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
-                        }
-                        Err(e) => {
-                            debug_log!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
-                        }
-                    }
-                }
-            } else {
-                debug_log!("[RUST] sync_nostr_emails_to_db: Email {} has no attachments in RawNostrEmail, trying to extract from body", email.message_id);
-                // Try to extract attachments by parsing the raw RFC822 email body
-                if let Ok(parsed_email) = mailparse::parse_mail(email.body.as_bytes()) {
-                    let extracted_attachments = extract_attachments_from_parsed_email(&parsed_email, &email.body);
-                    if !extracted_attachments.is_empty() {
-                        debug_log!("[RUST] Extracted {} attachments from email body for email {}", extracted_attachments.len(), email_id);
-                        for mut attachment in extracted_attachments {
-                            attachment.email_id = email_id;
-                            match db.save_attachment(&attachment) {
-                                Ok(att_id) => {
-                                    debug_log!("[RUST] Saved extracted attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
-                                }
-                                Err(e) => {
-                                    debug_log!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    debug_log!("[RUST] Could not parse email body to extract attachments for email {}", email_id);
-                }
-            }
-            
+            persist_attachments_for_email(db, &email, email_id);
             new_count += 1;
         }
     }
+    Ok(new_count)
+}
+
+/// Save attachments parsed from a RawNostrEmail. Falls back to re-parsing the
+/// RFC822 body when the RawNostrEmail came in with no attachments attached
+/// (e.g. older parse paths). Errors per-attachment are logged but never abort.
+fn persist_attachments_for_email(db: &Database, email: &RawNostrEmail, email_id: i64) {
+    if !email.attachments.is_empty() {
+        for mut attachment in email.attachments.iter().cloned() {
+            attachment.email_id = email_id;
+            if let Err(e) = db.save_attachment(&attachment) {
+                debug_log!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
+            }
+        }
+        return;
+    }
+    if let Ok(parsed_email) = mailparse::parse_mail(email.body.as_bytes()) {
+        let extracted_attachments = extract_attachments_from_parsed_email(&parsed_email, &email.body);
+        for mut attachment in extracted_attachments {
+            attachment.email_id = email_id;
+            if let Err(e) = db.save_attachment(&attachment) {
+                debug_log!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
+            }
+        }
+    }
+}
+
+pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+    let account_key = config.email_address.trim().to_lowercase();
+    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
+    let require_signature = lookup_require_signature(db, active_pubkey);
+
+    // Folders to scan. Default (empty/None) = INBOX + nostr-mail label.
+    let folders: Vec<String> = match folder {
+        Some(f) if !f.is_empty() => vec![f.to_string()],
+        _ => vec!["INBOX".to_string(), "nostr-mail".to_string()],
+    };
+
+    println!(
+        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, sync_cutoff_days={} (bootstrap only)",
+        account_key, folders, sync_cutoff_days
+    );
+
+    // Per-folder watermark updates, applied AFTER all per-message DB saves succeed.
+    // Tuple: (folder, uid_validity, last_seen_uid, bootstrap_min_uid).
+    // `bootstrap_min_uid` is Some only on the run that created or replaced the
+    // row — it seeds folder_sync_state.min_seen_uid so backward pagination has
+    // a defined floor. Incremental runs leave min_seen_uid alone.
+    let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
+    let mut raw_nostr_emails: Vec<RawNostrEmail> = Vec::new();
+
+    let host = &config.imap_host;
+    let port = config.imap_port;
+    let username = &config.email_address;
+    let password = &config.password;
+    let addr = format!("{}:{}", host, port);
+
+    if config.use_tls {
+        let client = create_imap_tls_client!(host, &addr)?;
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        for f in &folders {
+            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                                  parse_nostr_email_from_imap_body) {
+                Ok(r) => {
+                    if r.max_uid > 0 || !r.had_existing_state {
+                        let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
+                            Some(r.min_uid)
+                        } else {
+                            None
+                        };
+                        pending_state.push((f.clone(), r.uid_validity, r.max_uid, bootstrap_min));
+                    }
+                    raw_nostr_emails.extend(r.emails);
+                }
+                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
+            }
+        }
+    } else {
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let client = imap::Client::new(tcp_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        for f in &folders {
+            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                                  parse_nostr_email_from_imap_body) {
+                Ok(r) => {
+                    if r.max_uid > 0 || !r.had_existing_state {
+                        let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
+                            Some(r.min_uid)
+                        } else {
+                            None
+                        };
+                        pending_state.push((f.clone(), r.uid_validity, r.max_uid, bootstrap_min));
+                    }
+                    raw_nostr_emails.extend(r.emails);
+                }
+                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
+            }
+        }
+    }
+    
+    let new_count = persist_inbox_raw_emails(raw_nostr_emails, db, require_signature)?;
     // Commit per-folder UID watermarks now that the DB writes have all succeeded.
     // A partial-batch failure earlier returned Err and we never reach here, so
     // the watermark only advances when every fetched message was persisted.
-    for (folder_name, uid_validity, max_uid) in pending_state {
+    for (folder_name, uid_validity, max_uid, bootstrap_min) in pending_state {
         if let Err(e) = db.set_folder_sync_state(&account_key, &folder_name, uid_validity, max_uid) {
             println!(
                 "[RUST] sync_nostr_emails_to_db: failed to persist folder_sync_state for '{}': {}",
                 folder_name, e
             );
-        } else {
-            println!(
-                "[RUST] sync_nostr_emails_to_db: persisted folder_sync_state for '{}' (uid_validity={}, last_seen_uid={})",
-                folder_name, uid_validity, max_uid
-            );
+            continue;
+        }
+        println!(
+            "[RUST] sync_nostr_emails_to_db: persisted folder_sync_state for '{}' (uid_validity={}, last_seen_uid={})",
+            folder_name, uid_validity, max_uid
+        );
+        if let Some(min) = bootstrap_min {
+            if let Err(e) = db.set_folder_min_seen_uid(&account_key, &folder_name, min) {
+                println!(
+                    "[RUST] sync_nostr_emails_to_db: failed to seed min_seen_uid for '{}': {}",
+                    folder_name, e
+                );
+            } else {
+                println!(
+                    "[RUST] sync_nostr_emails_to_db: seeded min_seen_uid={} for '{}'",
+                    min, folder_name
+                );
+            }
         }
     }
 
     debug_log!("[RUST] sync_nostr_emails_to_db: Completed sync, {} new emails saved", new_count);
+    Ok(new_count)
+}
+
+/// Backward UID pagination for the inbox. Walks `page_size` UIDs back per
+/// folder past the stored `min_seen_uid` floor, persists matches, and lowers
+/// the floor. Returns the number of newly-inserted rows across all folders.
+pub async fn fetch_older_inbox_emails_to_db(
+    config: &EmailConfig,
+    folder: Option<&str>,
+    page_size: usize,
+    active_pubkey: &str,
+    db: &Database,
+) -> anyhow::Result<usize> {
+    let account_key = config.email_address.trim().to_lowercase();
+    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
+    let require_signature = lookup_require_signature(db, active_pubkey);
+
+    let folders: Vec<String> = match folder {
+        Some(f) if !f.is_empty() => vec![f.to_string()],
+        _ => vec!["INBOX".to_string(), "nostr-mail".to_string()],
+    };
+
+    println!(
+        "[RUST] fetch_older_inbox_emails_to_db: account={}, folders={:?}, page_size={}",
+        account_key, folders, page_size
+    );
+
+    // (folder, new_floor_uid) pairs to apply after a successful persist pass.
+    let mut pending_floors: Vec<(String, u32)> = Vec::new();
+    let mut raw_emails: Vec<RawNostrEmail> = Vec::new();
+
+    let host = &config.imap_host;
+    let port = config.imap_port;
+    let username = &config.email_address;
+    let password = &config.password;
+    let addr = format!("{}:{}", host, port);
+
+    if config.use_tls {
+        let client = create_imap_tls_client!(host, &addr)?;
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        for f in &folders {
+            match fetch_older_in_folder(&mut session, config, db, &account_key, f,
+                                         page_size, sync_cutoff_days,
+                                         parse_nostr_email_from_imap_body) {
+                Ok(r) => {
+                    if let Some(new_floor) = r.new_floor_uid {
+                        pending_floors.push((f.clone(), new_floor));
+                    }
+                    raw_emails.extend(r.emails);
+                }
+                Err(e) => debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e),
+            }
+        }
+    } else {
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let client = imap::Client::new(tcp_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        for f in &folders {
+            match fetch_older_in_folder(&mut session, config, db, &account_key, f,
+                                         page_size, sync_cutoff_days,
+                                         parse_nostr_email_from_imap_body) {
+                Ok(r) => {
+                    if let Some(new_floor) = r.new_floor_uid {
+                        pending_floors.push((f.clone(), new_floor));
+                    }
+                    raw_emails.extend(r.emails);
+                }
+                Err(e) => debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e),
+            }
+        }
+    }
+
+    let new_count = persist_inbox_raw_emails(raw_emails, db, require_signature)?;
+
+    // Lower the floor for each folder we touched. Persist AFTER save so a
+    // partial-failure earlier returned Err and we never lowered the floor
+    // past messages we didn't actually persist.
+    for (folder_name, new_floor) in pending_floors {
+        if let Err(e) = db.set_folder_min_seen_uid(&account_key, &folder_name, new_floor) {
+            println!(
+                "[RUST] fetch_older_inbox_emails_to_db: failed to lower min_seen_uid for '{}': {}",
+                folder_name, e
+            );
+        } else {
+            println!(
+                "[RUST] fetch_older_inbox_emails_to_db: lowered min_seen_uid to {} for '{}'",
+                new_floor, folder_name
+            );
+        }
+    }
+
+    println!(
+        "[RUST] fetch_older_inbox_emails_to_db: completed, {} new emails saved",
+        new_count
+    );
+    Ok(new_count)
+}
+
+/// Backward UID pagination for the sent folder. See `fetch_older_inbox_emails_to_db`.
+pub async fn fetch_older_sent_emails_to_db(
+    config: &EmailConfig,
+    page_size: usize,
+    active_pubkey: &str,
+    db: &Database,
+) -> anyhow::Result<usize> {
+    let account_key = config.email_address.trim().to_lowercase();
+    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
+
+    let host = &config.imap_host;
+    let port = config.imap_port;
+    let username = &config.email_address;
+    let password = &config.password;
+    let addr = format!("{}:{}", host, port);
+    let is_gmail = host.contains("gmail.com");
+
+    let mut pending_floors: Vec<(String, u32)> = Vec::new();
+    let mut raw_emails: Vec<RawNostrEmail> = Vec::new();
+
+    if config.use_tls {
+        let client = create_imap_tls_client!(host, &addr)?;
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        let sent_folder = discover_sent_mailbox(&mut session)?
+            .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
+        for f in [sent_folder.as_str(), "nostr-mail"] {
+            match fetch_older_in_folder(&mut session, config, db, &account_key, f,
+                                         page_size, sync_cutoff_days,
+                                         parse_nostr_sent_email_from_imap_body) {
+                Ok(r) => {
+                    if let Some(new_floor) = r.new_floor_uid {
+                        pending_floors.push((f.to_string(), new_floor));
+                    }
+                    raw_emails.extend(r.emails);
+                }
+                Err(e) => debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e),
+            }
+        }
+    } else {
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let client = imap::Client::new(tcp_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        let sent_folder = discover_sent_mailbox(&mut session)?
+            .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
+        for f in [sent_folder.as_str(), "nostr-mail"] {
+            match fetch_older_in_folder(&mut session, config, db, &account_key, f,
+                                         page_size, sync_cutoff_days,
+                                         parse_nostr_sent_email_from_imap_body) {
+                Ok(r) => {
+                    if let Some(new_floor) = r.new_floor_uid {
+                        pending_floors.push((f.to_string(), new_floor));
+                    }
+                    raw_emails.extend(r.emails);
+                }
+                Err(e) => debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e),
+            }
+        }
+    }
+
+    // Sent emails use the same persist contract but never apply the
+    // require_signature filter — own outgoing mail isn't expected to carry
+    // a verifiable transport signature, and the existing forward-sync path
+    // already skips that filter for sent.
+    let new_count = persist_inbox_raw_emails(raw_emails, db, /* require_signature */ false)?;
+
+    for (folder_name, new_floor) in pending_floors {
+        if let Err(e) = db.set_folder_min_seen_uid(&account_key, &folder_name, new_floor) {
+            println!(
+                "[RUST] fetch_older_sent_emails_to_db: failed to lower min_seen_uid for '{}': {}",
+                folder_name, e
+            );
+        } else {
+            println!(
+                "[RUST] fetch_older_sent_emails_to_db: lowered min_seen_uid to {} for '{}'",
+                new_floor, folder_name
+            );
+        }
+    }
+
+    println!(
+        "[RUST] fetch_older_sent_emails_to_db: completed, {} new emails saved",
+        new_count
+    );
     Ok(new_count)
 }
 
@@ -4937,7 +5113,8 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
 
-    let mut pending_state: Vec<(String, u32, u32)> = Vec::new();
+    // See sync_nostr_emails_to_db for the meaning of the 4-tuple.
+    let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
     let mut raw_sent_emails: Vec<RawNostrEmail> = Vec::new();
 
     let host = &config.imap_host;
@@ -4957,7 +5134,12 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                                   parse_nostr_sent_email_from_imap_body) {
                 Ok(r) => {
                     if r.max_uid > 0 || !r.had_existing_state {
-                        pending_state.push((f.to_string(), r.uid_validity, r.max_uid));
+                        let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
+                            Some(r.min_uid)
+                        } else {
+                            None
+                        };
+                        pending_state.push((f.to_string(), r.uid_validity, r.max_uid, bootstrap_min));
                     }
                     raw_sent_emails.extend(r.emails);
                 }
@@ -4975,7 +5157,12 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                                   parse_nostr_sent_email_from_imap_body) {
                 Ok(r) => {
                     if r.max_uid > 0 || !r.had_existing_state {
-                        pending_state.push((f.to_string(), r.uid_validity, r.max_uid));
+                        let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
+                            Some(r.min_uid)
+                        } else {
+                            None
+                        };
+                        pending_state.push((f.to_string(), r.uid_validity, r.max_uid, bootstrap_min));
                     }
                     raw_sent_emails.extend(r.emails);
                 }
@@ -5146,17 +5333,30 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
         }
     }
     // Commit per-folder UID watermarks after all per-message DB writes succeeded.
-    for (folder_name, uid_validity, max_uid) in pending_state {
+    for (folder_name, uid_validity, max_uid, bootstrap_min) in pending_state {
         if let Err(e) = db.set_folder_sync_state(&account_key, &folder_name, uid_validity, max_uid) {
             println!(
                 "[RUST] sync_sent_emails_to_db: failed to persist folder_sync_state for '{}': {}",
                 folder_name, e
             );
-        } else {
-            println!(
-                "[RUST] sync_sent_emails_to_db: persisted folder_sync_state for '{}' (uid_validity={}, last_seen_uid={})",
-                folder_name, uid_validity, max_uid
-            );
+            continue;
+        }
+        println!(
+            "[RUST] sync_sent_emails_to_db: persisted folder_sync_state for '{}' (uid_validity={}, last_seen_uid={})",
+            folder_name, uid_validity, max_uid
+        );
+        if let Some(min) = bootstrap_min {
+            if let Err(e) = db.set_folder_min_seen_uid(&account_key, &folder_name, min) {
+                println!(
+                    "[RUST] sync_sent_emails_to_db: failed to seed min_seen_uid for '{}': {}",
+                    folder_name, e
+                );
+            } else {
+                println!(
+                    "[RUST] sync_sent_emails_to_db: seeded min_seen_uid={} for '{}'",
+                    min, folder_name
+                );
+            }
         }
     }
 
@@ -5280,6 +5480,12 @@ struct UidSyncResult {
     emails: Vec<RawNostrEmail>,
     uid_validity: u32,
     max_uid: u32,
+    // Lowest UID actually returned by the IMAP server for this sync. 0 if no
+    // UIDs matched (caller should ignore in that case). On bootstrap this is
+    // the floor of "messages we've definitely fetched"; on incremental sync
+    // it's just the lowest new UID in the delta (caller should NOT use it to
+    // lower min_seen_uid past the existing bootstrap floor).
+    min_uid: u32,
     had_existing_state: bool,
 }
 
@@ -5354,14 +5560,16 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
             emails: vec![],
             uid_validity,
             max_uid: 0,
+            min_uid: 0,
             had_existing_state,
         });
     }
 
     let mut uids: Vec<u32> = uid_set.into_iter().collect();
     uids.sort_unstable();
+    let min_uid = uids.first().copied().unwrap_or(0);
     debug_log!("[RUST] uid_sync_folder: '{}' matched {} UIDs (min {}, max {})",
-        folder_name, uids.len(), uids.first().copied().unwrap_or(0), uids.last().copied().unwrap_or(0));
+        folder_name, uids.len(), min_uid, uids.last().copied().unwrap_or(0));
 
     // Chunk into ~500-UID batches to stay well under Gmail's ~8KB IMAP line limit.
     const FETCH_BATCH: usize = 500;
@@ -5388,7 +5596,123 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
         emails,
         uid_validity,
         max_uid,
+        min_uid,
         had_existing_state,
+    })
+}
+
+/// Result of a backward UID fetch ("load older from server"). `new_floor_uid`
+/// is the value to lower `folder_sync_state.min_seen_uid` to once the caller
+/// has persisted all parsed emails. None means "no further old messages on the
+/// server" — caller can record that we hit the bottom (we set the floor to 1).
+struct FetchOlderResult {
+    emails: Vec<RawNostrEmail>,
+    new_floor_uid: Option<u32>,
+}
+
+/// Pull `page_size` older messages from one folder, walking UIDs backward.
+///
+/// Requires a prior forward sync (folder_sync_state row must exist). Backfills
+/// `min_seen_uid` on the first call by replaying the bootstrap UID SEARCH —
+/// that gives us a deterministic floor instead of guessing.
+///
+/// Workflow:
+/// 1. SELECT folder, verify UIDVALIDITY matches stored.
+/// 2. Resolve the current floor (`min_seen_uid`, or backfilled).
+/// 3. `UID SEARCH UID 1:floor-1`.
+/// 4. Take the top `page_size` UIDs (newest among the older), UID FETCH them.
+/// 5. Return them + the new floor (= the lowest UID we just touched).
+fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    config: &EmailConfig,
+    db: &Database,
+    account_key: &str,
+    folder_name: &str,
+    page_size: usize,
+    sync_cutoff_days: i64,
+    parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
+) -> anyhow::Result<FetchOlderResult> {
+    let mb = session.select(folder_name)?;
+    let uid_validity = mb.uid_validity
+        .ok_or_else(|| anyhow::anyhow!("server did not advertise UIDVALIDITY for folder '{}'", folder_name))?;
+
+    let stored = match db.get_folder_sync_state(account_key, folder_name)? {
+        Some(s) => s,
+        None => {
+            // No forward sync has run for this folder yet. Bail rather than
+            // bootstrap from here — the regular sync path is responsible for
+            // initial population.
+            debug_log!("[RUST] fetch_older_in_folder: '{}' has no sync state, run forward sync first", folder_name);
+            return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None });
+        }
+    };
+
+    if stored.uid_validity != uid_validity {
+        debug_log!("[RUST] fetch_older_in_folder: '{}' UIDVALIDITY changed ({} -> {}), aborting backward fetch",
+            folder_name, stored.uid_validity, uid_validity);
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None });
+    }
+
+    // Resolve the floor. If we have no stored min, replay the bootstrap UID
+    // SEARCH (same query the initial forward sync used) and take its min UID
+    // as the floor. This is a metadata-only operation — no body fetch.
+    let floor_uid = match stored.min_seen_uid {
+        Some(v) => v,
+        None => {
+            let bootstrap_query = build_bootstrap_query(sync_cutoff_days);
+            debug_log!("[RUST] fetch_older_in_folder: '{}' has no min_seen_uid, backfilling via '{}'",
+                folder_name, bootstrap_query);
+            let set = session.uid_search(&bootstrap_query)?;
+            if set.is_empty() {
+                return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None });
+            }
+            let backfilled_min = set.into_iter().min().unwrap_or(0);
+            db.set_folder_min_seen_uid(account_key, folder_name, backfilled_min)?;
+            backfilled_min
+        }
+    };
+
+    if floor_uid <= 1 {
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None });
+    }
+
+    // Look for UIDs strictly below the current floor.
+    let query = format!("UID 1:{}", floor_uid - 1);
+    debug_log!("[RUST] fetch_older_in_folder: '{}' UID SEARCH {}", folder_name, query);
+    let uid_set = session.uid_search(&query)?;
+    if uid_set.is_empty() {
+        // Server has nothing below the floor — mark the bottom by setting
+        // floor to 1 so subsequent calls short-circuit.
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: Some(1) });
+    }
+
+    let mut uids: Vec<u32> = uid_set.into_iter().collect();
+    uids.sort_unstable();
+    // Top `page_size` are the newest of the older messages — typically what
+    // the user expects when scrolling past the bottom.
+    let take = uids.len().min(page_size.max(1));
+    let page: Vec<u32> = uids[uids.len() - take..].to_vec();
+    let new_floor_uid = *page.first().expect("non-empty by construction");
+    debug_log!("[RUST] fetch_older_in_folder: '{}' fetching {} older UIDs ({}..={}), new_floor will be {}",
+        folder_name, page.len(), new_floor_uid, page.last().copied().unwrap_or(0), new_floor_uid);
+
+    const FETCH_BATCH: usize = 500;
+    let mut emails: Vec<RawNostrEmail> = Vec::new();
+    for chunk in page.chunks(FETCH_BATCH) {
+        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let messages = session.uid_fetch(&uid_list, "(UID RFC822)")?;
+        for msg in messages.iter() {
+            if let Some(body) = msg.body() {
+                if let Some(parsed) = parse_fn(body, config) {
+                    emails.push(parsed);
+                }
+            }
+        }
+    }
+
+    Ok(FetchOlderResult {
+        emails,
+        new_floor_uid: Some(new_floor_uid),
     })
 }
 

@@ -2565,7 +2565,7 @@ class EmailService {
                     const hash = this._subjectCiphertext
                         ? await this.hashStringSHA256(this._subjectCiphertext)
                         : null;
-                    await window.__TAURI__.core.invoke('db_save_sent_email_stub', {
+                    const savedEmailId = await window.__TAURI__.core.invoke('db_save_sent_email_stub', {
                         messageId,
                         fromAddress: emailConfig.email_address,
                         toAddress: recipientEmail,
@@ -2578,7 +2578,37 @@ class EmailService {
                         inReplyTo: this._replyToMessageId || null,
                         references: this._replyReferences || null,
                     });
-                    console.log('[JS] Saved sent-email stub for message_id:', messageId);
+                    console.log('[JS] Saved sent-email stub for message_id:', messageId, 'id:', savedEmailId);
+
+                    // Persist attachment rows linked to the just-saved email so
+                    // the sent list's attachment_count subquery returns the right
+                    // number immediately (without waiting for an IMAP sync of the
+                    // Sent folder to bring the attachments back from the server).
+                    if (savedEmailId && Array.isArray(attachmentData) && attachmentData.length > 0) {
+                        const nowIso = new Date().toISOString();
+                        for (const att of attachmentData) {
+                            try {
+                                await TauriService.saveAttachment({
+                                    id: null,
+                                    email_id: savedEmailId,
+                                    filename: att.filename,
+                                    content_type: att.content_type,
+                                    data: att.data,
+                                    size: att.size,
+                                    is_encrypted: att.is_encrypted,
+                                    encryption_method: att.encryption_method,
+                                    algorithm: att.algorithm,
+                                    original_filename: att.original_filename,
+                                    original_type: att.original_type,
+                                    original_size: att.original_size,
+                                    created_at: nowIso,
+                                });
+                            } catch (attErr) {
+                                console.warn('[JS] Failed to save attachment row for sent email:', attErr);
+                            }
+                        }
+                        console.log(`[JS] Saved ${attachmentData.length} attachment row(s) for sent email id=${savedEmailId}`);
+                    }
                 } catch (e) {
                     console.warn('[JS] Failed to save sent-email stub:', e);
                 }

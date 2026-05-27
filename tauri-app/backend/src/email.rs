@@ -1376,13 +1376,33 @@ fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<
         let payload_tree = glossia::WordlistTree::new(payload_words.clone());
         let payload_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
 
-        let extracted: Vec<String> = text
+        // Normalize every input token the same way (lowercase, strip leading/trailing
+        // non-alphanumerics, drop empties), then split into kept-vs-dropped against
+        // the payload wordlist. We need the unfiltered set to enforce strictness below.
+        let all_tokens: Vec<String> = text
             .split_whitespace()
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let extracted: Vec<String> = all_tokens
+            .iter()
             .filter(|w| payload_set.contains(w.as_str()))
+            .cloned()
             .collect();
 
         if extracted.is_empty() {
+            continue;
+        }
+
+        // Strictness: this function is meant for pure bitpack_fixed-encoded blobs
+        // (all words from the same wordlist, no markers, no mixed content). If the
+        // payload-word filter dropped any tokens, the input isn't pure — e.g. it's
+        // a SIGNATURE block whose last line is an npub. Bail so decode_sig_and_pubkey
+        // falls through to Phase 2 (separate-line sig + pubkey) instead of padding
+        // the partial bit-stream up to expected_bytes with zeros and yielding
+        // garbage sig/pubkey bytes that crash verification with "malformed public
+        // key". See `manifest_attachment_default_jsformat_inline_sig_verifies` test.
+        if extracted.len() != all_tokens.len() {
             continue;
         }
 
@@ -1621,34 +1641,36 @@ fn try_decode_as_signature(text: &str) -> Option<String> {
     None
 }
 
-/// Decode signature block content into (sig_hex, pubkey_hex).
-/// Three-phase detection for backward compatibility:
-///   1. Combined 96-byte (old format): glossia→96 bytes or hex 192 chars
-///   2. Blank-line split (new format): sig and pubkey separated by empty line
-///   3. Last-line heuristic: last line is npub/hex pubkey, rest is sig
+/// Decode the content of a SIGNATURE block into (sig_hex, pubkey_hex).
+///
+/// The wire format priority follows the Cap'n Proto schema
+/// (`schema/nostr_mail.capnp` lines 188-197):
+///
+/// ```text
+/// CANONICAL (current emit format — JS encodeSigPubkey with default settings):
+///   <signature: glossia-encoded or hex — 64 bytes>
+///   <pubkey:    glossia-encoded, hex, or npub (bech32) — 32 bytes>
+///
+/// LEGACY (must-also-accept, never re-emitted by this codebase):
+///   <combined 96-byte glossia or hex of sig||pubkey on a single line>
+/// ```
+///
+/// We try the canonical two-line format FIRST. Doing the legacy
+/// combined-96 attempts first is what caused the
+/// "inline signature invalid" / "malformed public key" bug fixed in
+/// `0a8b3e2`: try_decode_raw_base_n_fixed would silently consume the
+/// canonical format (dropping the npub line as a non-payload token)
+/// and zero-pad the partial bit-stream up to 96 bytes, producing a
+/// garbage sig+pubkey pair instead of letting Phase 2 fire. With this
+/// ordering Phase 2 always wins for canonical inputs, and the legacy
+/// phases are a strict fallback for older messages.
+///
+/// Returns `Some((sig_hex, pubkey_hex))` for sig (128-char hex / 64 bytes)
+/// and pubkey (64-char hex / 32 bytes), or `None` if no format matched.
 fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
-    // Phase 1a: Combined 96-byte (raw bitpack_fixed — matches frontend's
-    // glossia_encode_raw_base_n on the encode side).
-    if let Some(bytes) = try_decode_raw_base_n_fixed(content, 96) {
-        let sig_hex = hex::encode(&bytes[..64]);
-        let pubkey_hex = hex::encode(&bytes[64..]);
-        return Some((sig_hex, pubkey_hex));
-    }
-
-    // Phase 1b: Legacy combined 96-byte via decode_from_language (body-dialect).
-    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
-        if bytes.len() == 96 {
-            let sig_hex = hex::encode(&bytes[..64]);
-            let pubkey_hex = hex::encode(&bytes[64..]);
-            return Some((sig_hex, pubkey_hex));
-        }
-    }
-    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
-    if stripped.len() == 192 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Some((stripped[..128].to_string(), stripped[128..].to_string()));
-    }
-
-    // Phase 2: Default mode — glossia sig + npub/hex pubkey on last line
+    // ── Canonical: two-line sig + pubkey ────────────────────────────────
+    // Last non-empty line is the pubkey (glossia, hex, or npub); preceding
+    // lines together form the signature payload (glossia or hex).
     let lines: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     if lines.len() >= 2 {
         let last = lines[lines.len() - 1];
@@ -1658,6 +1680,29 @@ fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
                 return Some((sig, pk));
             }
         }
+    }
+
+    // ── Legacy: combined 96-byte payload ────────────────────────────────
+    // Strict bitpack_fixed: try_decode_raw_base_n_fixed rejects mixed-token
+    // inputs (since 0a8b3e2), so this only fires for genuine combined
+    // payloads now — keeping it as a safety net for old archived mail.
+    if let Some(bytes) = try_decode_raw_base_n_fixed(content, 96) {
+        let sig_hex = hex::encode(&bytes[..64]);
+        let pubkey_hex = hex::encode(&bytes[64..]);
+        return Some((sig_hex, pubkey_hex));
+    }
+    // Legacy body-dialect glossia (decode_from_language) variant.
+    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
+        if bytes.len() == 96 {
+            let sig_hex = hex::encode(&bytes[..64]);
+            let pubkey_hex = hex::encode(&bytes[64..]);
+            return Some((sig_hex, pubkey_hex));
+        }
+    }
+    // Legacy raw 192-char hex (whitespace stripped).
+    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.len() == 192 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some((stripped[..128].to_string(), stripped[128..].to_string()));
     }
 
     None
@@ -4503,15 +4548,36 @@ nitela\n\
 
     #[test]
     fn test_parse_armor_components_body_bytes_base64() {
-        // Base64 body should decode to bytes and be returned as base64 in body_bytes_b64
-        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+        // After the NIP-44 eager-decode-skip optimization, parse_armor_components
+        // no longer populates body_bytes_b64 for NIP-44 — those pre-decoded bytes
+        // were only ever consumed by NIP-04 signature verification, and re-decoding
+        // them at parse time was the single biggest cost in the decrypt pipeline
+        // (see commit c9095f4). NIP-04 still populates the field; NIP-44 leaves it
+        // None and decrypt_single_block / extract_ciphertext_binary do the decode
+        // lazily.
+        let nip04 = "----- BEGIN NOSTR NIP-04 ENCRYPTED BODY -----\n\
             SGVsbG8gV29ybGQ=\n\
             ----- END NOSTR MESSAGE -----";
-        let result = parse_armor_components(body).expect("should parse");
-        assert!(result.body_bytes_b64.is_some());
-        // "SGVsbG8gV29ybGQ=" decodes to "Hello World"
-        let decoded = general_purpose::STANDARD.decode(result.body_bytes_b64.unwrap()).unwrap();
+        let nip04_parsed = parse_armor_components(nip04).expect("should parse nip04");
+        assert!(
+            nip04_parsed.body_bytes_b64.is_some(),
+            "NIP-04 must keep eager-decoded body_bytes_b64 (used as MAC input by sig verify)"
+        );
+        let decoded = general_purpose::STANDARD
+            .decode(nip04_parsed.body_bytes_b64.unwrap())
+            .unwrap();
         assert_eq!(std::str::from_utf8(&decoded).unwrap(), "Hello World");
+
+        let nip44 = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        let nip44_parsed = parse_armor_components(nip44).expect("should parse nip44");
+        assert!(
+            nip44_parsed.body_bytes_b64.is_none(),
+            "NIP-44 must skip the eager glossia decode at parse time — \
+             body_bytes_b64 stays None and decrypt_single_block re-decodes the \
+             body_text lazily"
+        );
     }
 
     #[test]
@@ -4564,9 +4630,15 @@ nitela\n\
 
     #[test]
     fn test_parse_armor_components_body_bytes_match_extract_ciphertext() {
-        // Critical test: verify that body_bytes_b64 decoded matches extract_ciphertext_binary
-        // for the same input (ensuring signature verification compatibility)
-        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+        // Critical contract for NIP-04 sig verification: the eager-decoded
+        // body_bytes_b64 must equal what extract_ciphertext_binary recovers
+        // lazily — otherwise the inline-sig MAC input on the parse side
+        // disagrees with what verify_email_signature_inline recomputes.
+        //
+        // For NIP-44 the eager decode is skipped (see
+        // test_parse_armor_components_body_bytes_base64), so this contract
+        // only applies to NIP-04.
+        let body = "----- BEGIN NOSTR NIP-04 ENCRYPTED BODY -----\n\
             SGVsbG8gV29ybGQ=\n\
             ----- END NOSTR MESSAGE -----";
         let parsed = parse_armor_components(body).expect("should parse");

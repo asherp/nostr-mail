@@ -250,6 +250,70 @@ class EmailService {
         return `<div class="email-header-row"><span class="email-header-label">Profile:</span> <span class="email-header-value email-profile-npub"><code>${npub}</code><button type="button" class="view-profile-chip view-profile-btn" data-pubkey="${pk}" title="View Nostr profile"><i class="fas fa-id-badge"></i> View Profile</button></span></div>`;
     }
 
+    // Build the per-card attachments HTML for a message inside the thread view.
+    // Returns an empty string when the message has no attachments. Resolves opaque
+    // .dat filenames back to their original names via the manifest metadata when
+    // available (passed in by the caller from the decrypt result). Uses the
+    // existing inbox/sent download routines based on `source`.
+    async _buildThreadCardAttachmentsHtml(email, manifestAttachments, source) {
+        const emailIdInt = parseInt(email.id);
+        if (isNaN(emailIdInt)) return '';
+        let attachments;
+        try {
+            attachments = await TauriService.getAttachmentsForEmail(emailIdInt);
+        } catch (e) {
+            console.warn(`[JS] Thread card attachment fetch failed for email ${email.id}:`, e);
+            return '';
+        }
+        if (!attachments || attachments.length === 0) return '';
+
+        const byOpaqueId = (manifestAttachments && manifestAttachments.length > 0)
+            ? new Map(manifestAttachments.map(a => [a.id || a.opaqueId, a]))
+            : null;
+
+        const items = attachments.map(att => {
+            const opaqueId = (att.filename || '').replace(/\.dat$/, '');
+            const manifest = byOpaqueId ? byOpaqueId.get(opaqueId) : null;
+            const displayName = (manifest && (manifest.origFilename || manifest.orig_filename)) || att.filename;
+            const displaySize = (manifest && (manifest.origSize || manifest.orig_size)) || att.size;
+            return { att, displayName, displaySize };
+        });
+
+        const isSent = source === 'sent';
+        const downloadAllFn = isSent ? 'downloadAllSentAttachments' : 'downloadAllInboxAttachments';
+        const itemsHtml = items.map(({ att, displayName, displaySize }) => {
+            const sizeFormatted = (displaySize / 1024).toFixed(2) + ' KB';
+            const escapedFilename = Utils.escapeHtml(att.filename || '');
+            const downloadCall = isSent
+                ? `window.emailService.downloadSentAttachment(${email.id}, ${att.id})`
+                : `window.emailService.downloadInboxAttachment(${email.id}, ${att.id}, '${escapedFilename}')`;
+            return `
+                <div class="attachment-item" style="display:flex;justify-content:space-between;align-items:center;padding:10px;border:1px solid #ddd;border-radius:4px;margin:5px 0;">
+                    <div class="attachment-info" style="display:flex;align-items:center;">
+                        <i class="fas fa-file" style="margin-right:10px;"></i>
+                        <div>
+                            <div class="attachment-name" style="font-weight:bold;">${Utils.escapeHtml(displayName)}</div>
+                            <div class="attachment-meta" style="font-size:0.9em;color:#666;">${sizeFormatted}</div>
+                        </div>
+                    </div>
+                    <button class="btn btn-sm btn-outline-primary" onclick="${downloadCall}">
+                        <i class="fas fa-download"></i> Download
+                    </button>
+                </div>`;
+        }).join('');
+
+        return `
+            <div class="email-attachments" style="margin:15px 0;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <h4 style="margin:0;">Attachments (${items.length})</h4>
+                    <button class="btn btn-sm btn-outline-success" onclick="window.emailService.${downloadAllFn}(${email.id})" title="Download all attachments as ZIP">
+                        <i class="fas fa-download"></i> Download All
+                    </button>
+                </div>
+                <div class="attachment-list">${itemsHtml}</div>
+            </div>`;
+    }
+
     // Open the Nostr profile (kind:0) for the given pubkey using the standard
     // contacts-page profile detail view — same UI as the contact-search /
     // Add-Contact flow, including the public/private follow toggle. Reuses
@@ -4836,6 +4900,10 @@ ${attachmentsHtml}
                     let displaySubject = email.subject;
                     let sigResults = null;
                     let blockDecryptResults = null;
+                    // Manifest attachment metadata captured from the decrypt result
+                    // so the per-card attachment renderer can resolve opaque .dat
+                    // filenames back to their original names + sizes.
+                    let manifestAttachmentsForCard = null;
 
                     if (encryptedMatch && keypair) {
                         // Determine correct pubkey: sender for received, recipient for sent
@@ -4869,6 +4937,10 @@ ${attachmentsHtml}
                                     if (b.error) return { error: b.error };
                                     return null;
                                 });
+                            }
+
+                            if (result.isManifest && Array.isArray(result.attachments) && result.attachments.length > 0) {
+                                manifestAttachmentsForCard = result.attachments;
                             }
 
                             // Backfill sender_pubkey from armor if missing
@@ -4997,6 +5069,17 @@ ${attachmentsHtml}
                     // iframe rendering (renderHtmlBodyInIframe) into the wrong
                     // card and leave the sent-side body empty.
                     const bodyId = `${prefix}-thread-body-${email.id}`;
+
+                    // Build the per-card attachments section. This is the only
+                    // path the thread view has for surfacing attachments — without
+                    // it, an earlier message with an attachment looks bare once
+                    // the conversation has more than one card (which is why the
+                    // user couldn't see attachments on the first email after
+                    // replying). Fetch in parallel with the other card work.
+                    const attachmentsHtml = await this._buildThreadCardAttachmentsHtml(
+                        email, manifestAttachmentsForCard, source
+                    );
+
                     const cardDiv = document.createElement('div');
                     cardDiv.className = 'email-detail-card';
                     cardDiv.innerHTML = `
@@ -5038,6 +5121,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 </div>
 <pre class="email-raw-content" style="display:none">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="${bodyId}">${email.html_body ? '' : Utils.escapeHtml(displayBody).replace(/\n/g, '<br>')}</div>
+${attachmentsHtml}
 <pre class="email-raw-content email-raw-body" style="display:none">${Utils.escapeHtml(email.raw_body || '')}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
                     `;
                     // Swap the skeleton placeholder for the fully rendered card.

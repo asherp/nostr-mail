@@ -2565,7 +2565,7 @@ class EmailService {
                     const hash = this._subjectCiphertext
                         ? await this.hashStringSHA256(this._subjectCiphertext)
                         : null;
-                    await window.__TAURI__.core.invoke('db_save_sent_email_stub', {
+                    const savedEmailId = await window.__TAURI__.core.invoke('db_save_sent_email_stub', {
                         messageId,
                         fromAddress: emailConfig.email_address,
                         toAddress: recipientEmail,
@@ -2578,7 +2578,37 @@ class EmailService {
                         inReplyTo: this._replyToMessageId || null,
                         references: this._replyReferences || null,
                     });
-                    console.log('[JS] Saved sent-email stub for message_id:', messageId);
+                    console.log('[JS] Saved sent-email stub for message_id:', messageId, 'id:', savedEmailId);
+
+                    // Persist attachment rows linked to the just-saved email so
+                    // the sent list's attachment_count subquery returns the right
+                    // number immediately (without waiting for an IMAP sync of the
+                    // Sent folder to bring the attachments back from the server).
+                    if (savedEmailId && Array.isArray(attachmentData) && attachmentData.length > 0) {
+                        const nowIso = new Date().toISOString();
+                        for (const att of attachmentData) {
+                            try {
+                                await TauriService.saveAttachment({
+                                    id: null,
+                                    email_id: savedEmailId,
+                                    filename: att.filename,
+                                    content_type: att.content_type,
+                                    data: att.data,
+                                    size: att.size,
+                                    is_encrypted: att.is_encrypted,
+                                    encryption_method: att.encryption_method,
+                                    algorithm: att.algorithm,
+                                    original_filename: att.original_filename,
+                                    original_type: att.original_type,
+                                    original_size: att.original_size,
+                                    created_at: nowIso,
+                                });
+                            } catch (attErr) {
+                                console.warn('[JS] Failed to save attachment row for sent email:', attErr);
+                            }
+                        }
+                        console.log(`[JS] Saved ${attachmentData.length} attachment row(s) for sent email id=${savedEmailId}`);
+                    }
                 } catch (e) {
                     console.warn('[JS] Failed to save sent-email stub:', e);
                 }
@@ -2636,52 +2666,10 @@ class EmailService {
             console.log('[JS] Email filter preference:', emailFilter, 'nostrOnly:', nostrOnly);
             console.log('[JS] Loading emails with offset:', this.inboxOffset, 'pageSize:', pageSize);
             const emails = await TauriService.getDbEmailThreads(pageSize, this.inboxOffset, nostrOnly, userEmail, userPubkey);
-            
-            // Load attachments for each email in parallel with timeout
-            console.log(`[JS] Loading attachments for ${emails.length} inbox emails`);
-            const attachmentPromises = emails.map(async (email) => {
-                try {
-                    // Convert email.id to integer - it might be a string
-                    const emailIdInt = parseInt(email.id);
-                    if (isNaN(emailIdInt)) {
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
-                        // Try to get email by message_id to get the real database ID
-                        if (email.message_id) {
-                            try {
-                                const emailData = await TauriService.getDbEmail(email.message_id);
-                                if (emailData && emailData.id) {
-                                    const realId = parseInt(emailData.id);
-                                    if (!isNaN(realId)) {
-                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
-                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
-                                        return;
-                                    }
-                                }
-                            } catch (e) {
-                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
-                            }
-                        }
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
-                        email.attachments = [];
-                        return;
-                    }
-                    
-                    const timeoutPromise = new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
-                    );
-                    email.attachments = await Promise.race([
-                        TauriService.getAttachmentsForEmail(emailIdInt),
-                        timeoutPromise
-                    ]);
-                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
-                } catch (error) {
-                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
-                    email.attachments = [];
-                }
-            });
-            
-            await Promise.all(attachmentPromises);
-            
+
+            // Attachments are no longer prefetched per-email here. The thread query already
+            // returns `attachment_count` (cheap COUNT(*) subquery) which the list badge uses;
+            // full attachment metadata is lazy-loaded by showEmailDetail when the user clicks in.
             let appendFrom = 0;
             if (append) {
                 // Append new emails to existing ones
@@ -2767,51 +2755,10 @@ class EmailService {
             // Fetch sent emails (where user is sender)
             const userPubkey = keypair ? keypair.public_key : null;
             let emails = await TauriService.getDbSentEmailThreads(pageSize, this.sentOffset, userEmail, userPubkey);
-            
-            // Load attachments for each email in parallel with timeout
-            console.log(`[JS] Loading attachments for ${emails.length} sent emails`);
-            const attachmentPromises = emails.map(async (email) => {
-                try {
-                    // Convert email.id to integer - it might be a string
-                    const emailIdInt = parseInt(email.id);
-                    if (isNaN(emailIdInt)) {
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
-                        // Try to get email by message_id to get the real database ID
-                        if (email.message_id) {
-                            try {
-                                const emailData = await TauriService.getDbEmail(email.message_id);
-                                if (emailData && emailData.id) {
-                                    const realId = parseInt(emailData.id);
-                                    if (!isNaN(realId)) {
-                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
-                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
-                                        return;
-                                    }
-                                }
-                            } catch (e) {
-                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
-                            }
-                        }
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
-                        email.attachments = [];
-                        return;
-                    }
-                    
-                    const timeoutPromise = new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
-                    );
-                    email.attachments = await Promise.race([
-                        TauriService.getAttachmentsForEmail(emailIdInt),
-                        timeoutPromise
-                    ]);
-                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
-                } catch (error) {
-                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
-                    email.attachments = [];
-                }
-            });
-            await Promise.allSettled(attachmentPromises);
-            
+
+            // Attachments are no longer prefetched per-email here. The thread query already
+            // returns `attachment_count` (cheap COUNT(*) subquery) which the list badge uses;
+            // full attachment metadata is lazy-loaded by the sent detail view when the user clicks in.
             let appendFrom = 0;
             if (append) {
                 // Append new emails to existing ones
@@ -3156,6 +3103,28 @@ class EmailService {
                 return true;
             });
 
+            // Paint skeleton placeholders synchronously so users see structure
+            // (sender, subject, date, attachment badge) the moment the SQL fetch
+            // returns, instead of staring at a blank list until batch decryption
+            // and per-row rendering finish. Each placeholder is replaced in-place
+            // when its full render resolves, so order matches server order.
+            const placeholders = filteredEmails.map(email => {
+                const ph = this.renderInboxEmailItemBasic(email);
+                emailList.appendChild(ph);
+                return ph;
+            });
+
+            // Yield to the browser so it paints the skeletons before we move on.
+            // Without this, a warm preview cache lets the full replacement run to
+            // completion in the same JS turn as the appendChild loop, and the
+            // browser never paints the intermediate "skeleton-only" state.
+            // Double-rAF is the standard idiom: the first rAF callback runs
+            // *before* the next paint, the second runs after it, so by the time
+            // the second resolves the skeleton paint has definitely committed.
+            await new Promise(resolve =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve))
+            );
+
             // Batch-decrypt uncached encrypted emails in a single IPC call
             const uncachedEncrypted = filteredEmails.filter(email => {
                 if (this._previewCache.has(`inbox-${email.id}`)) return false;
@@ -3194,6 +3163,7 @@ class EmailService {
                                 subject: email.subject,
                                 senderPubkey: null,
                                 recipientPubkey,
+                                messageId: email.message_id || null,
                             };
                         }
                         return {
@@ -3202,6 +3172,7 @@ class EmailService {
                             subject: email.subject,
                             senderPubkey: email.sender_pubkey || email.nostr_pubkey || null,
                             recipientPubkey: null,
+                            messageId: email.message_id || null,
                         };
                     });
                     console.log(`[JS] Batch decrypting ${batchInput.length} inbox emails in one IPC call`);
@@ -3267,7 +3238,7 @@ class EmailService {
                                 const senderPubkey = isSent ? null : (email.sender_pubkey || email.nostr_pubkey || null);
                                 const recipientPubkey = isSent ? (email.recipient_pubkey || null) : null;
                                 const retry = await TauriService.decryptEmailBody(
-                                    email.body, email.subject, senderPubkey, recipientPubkey
+                                    email.body, email.subject, senderPubkey, recipientPubkey, email.message_id || null
                                 );
                                 if (retry && retry.success) {
                                     let previewText = Utils.escapeHtml(retry.body.substring(0, 100));
@@ -3289,34 +3260,40 @@ class EmailService {
                 }
             }
 
-            // Process emails in parallel (decryption will hit cache from batch above)
-            const emailPromises = filteredEmails
-                .map(async (email) => {
-                    try {
-                        // Add timeout to prevent hanging on decryption
-                        const timeoutPromise = new Promise((_, reject) =>
-                            setTimeout(() => reject(new Error('Decryption timeout')), 5000)
-                        );
-                        const renderPromise = this.renderInboxEmailItem(email);
-                        return await Promise.race([renderPromise, timeoutPromise]);
-                    } catch (error) {
-                        console.error(`[JS] Error rendering inbox email ${email.id}:`, error);
-                        // Return a basic email item even if rendering fails
-                        return this.renderInboxEmailItemBasic(email);
+            // Replace each placeholder with its full render as soon as that render
+            // resolves. Decryption will mostly hit the cache populated by the batch
+            // above, so this is fast; rows that need extra work upgrade in place
+            // without blocking the rest of the list.
+            const replacementResults = await Promise.allSettled(filteredEmails.map(async (email, idx) => {
+                const placeholder = placeholders[idx];
+                try {
+                    const timeoutPromise = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Decryption timeout')), 5000)
+                    );
+                    const fullElement = await Promise.race([
+                        this.renderInboxEmailItem(email),
+                        timeoutPromise
+                    ]);
+                    if (!placeholder || placeholder.parentNode !== emailList) return false;
+                    if (fullElement) {
+                        emailList.replaceChild(fullElement, placeholder);
+                        return true;
                     }
-                });
-
-            // Wait for all emails to be rendered (with timeout protection)
-            const renderedItems = await Promise.allSettled(emailPromises);
-
-            // Add all successfully rendered items to the list (filter out null results)
-            let renderedCount = 0;
-            for (const result of renderedItems) {
-                if (result.status === 'fulfilled' && result.value) {
-                    emailList.appendChild(result.value);
-                    renderedCount++;
+                    // renderInboxEmailItem returns null when hide_undecryptable is on
+                    // and the row failed to decrypt — drop the placeholder entirely.
+                    emailList.removeChild(placeholder);
+                    return false;
+                } catch (error) {
+                    console.error(`[JS] Error rendering inbox email ${email.id}:`, error);
+                    // Leave the skeleton placeholder visible so the user still sees the row.
+                    return !!(placeholder && placeholder.parentNode === emailList);
                 }
-            }
+            }));
+
+            const renderedCount = replacementResults.reduce(
+                (n, r) => n + (r.status === 'fulfilled' && r.value ? 1 : 0),
+                0
+            );
 
             // Show message if no emails were rendered (only on full render, not append)
             if (renderedCount === 0 && appendFrom <= 0) {
@@ -3344,7 +3321,7 @@ class EmailService {
                 emailList.appendChild(loadMoreBtn);
             }
 
-            console.log(`[JS] renderEmails: Successfully rendered ${renderedItems.filter(r => r.status === 'fulfilled').length} emails`);
+            console.log(`[JS] renderEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
             console.error('Error rendering emails:', error);
         }
@@ -3418,7 +3395,8 @@ class EmailService {
                         }
                         const result = await TauriService.decryptEmailBody(
                             email.body, email.subject,
-                            senderPubkey, recipientPubkey
+                            senderPubkey, recipientPubkey,
+                            email.message_id || null
                         );
                         if (result.success) {
                             previewSubject = result.subject;
@@ -3477,8 +3455,12 @@ class EmailService {
             return null;
         }
 
-        // Add attachment indicator (same style as sent emails)
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        // Add attachment indicator (same style as sent emails).
+        // Prefer attachment_count from the thread query (cheap COUNT(*) subquery).
+        // Fall back to email.attachments.length when an older code path has already populated it.
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
         const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
@@ -3602,13 +3584,23 @@ class EmailService {
             dateDisplay = emailDate.toLocaleDateString();
         }
 
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
         const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
         // Resolve sender identity (strict pubkey match when signed — see _resolveSender)
         const senderInfo = this._resolveSender(email);
         const senderLine = this._renderSenderLine(senderInfo, '');
+
+        // For encrypted emails the stored subject is either ciphertext or a
+        // placeholder string; either way it isn't meaningful to display while
+        // we wait for decryption. Substitute a clear "Decrypting…" hint for
+        // the subject and blank the preview until the full render lands.
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
+        const previewText = isEncrypted ? '' : 'Loading...';
 
         emailElement.innerHTML = `
             <img class="${senderInfo.avatarClass}" src="${senderInfo.avatarSrc}" alt="${Utils.escapeHtml(senderInfo.identityName)}'s avatar" onerror="this.onerror=null;this.src='${senderInfo.defaultAvatar}';this.className='contact-avatar';">
@@ -3617,8 +3609,8 @@ class EmailService {
                     <div class="email-sender email-list-strong">${senderLine} ${attachmentIndicator}</div>
                     <div class="email-date">${dateDisplay}</div>
                 </div>
-                <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
-                <div class="email-preview">Loading...</div>
+                <div class="email-subject email-list-strong">${subjectText}</div>
+                <div class="email-preview">${previewText}</div>
             </div>
         `;
 
@@ -3874,7 +3866,7 @@ class EmailService {
                             // Run decryption and signature verification in parallel (they're independent)
                             console.log('[JS] Calling backend decrypt_email_body + verifyAllSignatures in parallel...');
                             const [result, allSigs] = await Promise.all([
-                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, null),
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, null, email.message_id || null),
                                 TauriService.verifyAllSignatures(emailBody).catch(e => {
                                     console.warn('[JS] Signature verification error:', e);
                                     return [];
@@ -3955,14 +3947,28 @@ class EmailService {
                     })();
                 }
                 const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {
-                    // Render attachments - decrypt metadata for display
-                    console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
-                    
-                    // Ensure attachments array exists
-                    if (!email.attachments || !Array.isArray(email.attachments)) {
-                        console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
-                        email.attachments = [];
+                    // Render attachments - decrypt metadata for display.
+                    // Attachments are no longer prefetched during list load; lazy-load them here
+                    // when the detail view actually needs them. attachment_count from the thread
+                    // query gives a fast path to skip the IPC call entirely when there are none.
+                    if (!Array.isArray(email.attachments)) {
+                        if (email.attachment_count === 0) {
+                            email.attachments = [];
+                        } else {
+                            const emailIdInt = parseInt(email.id);
+                            if (!isNaN(emailIdInt)) {
+                                try {
+                                    email.attachments = await TauriService.getAttachmentsForEmail(emailIdInt);
+                                } catch (err) {
+                                    console.error(`[JS] Failed to lazy-load attachments for email ${email.id}:`, err);
+                                    email.attachments = [];
+                                }
+                            } else {
+                                email.attachments = [];
+                            }
+                        }
                     }
+                    console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
                     
                     let attachmentsHtml = '';
                     if (email.attachments && email.attachments.length > 0) {
@@ -3987,7 +3993,7 @@ class EmailService {
                                         const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                                         const decryptResult = await TauriService.decryptEmailBody(
                                             email.body, email.subject || '',
-                                            senderPubkey, null
+                                            senderPubkey, null, email.message_id || null
                                         );
                                         if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
                                             manifestResult = {
@@ -4583,6 +4589,14 @@ ${attachmentsHtml}
                 threadContent.innerHTML = '<div class="thread-loading"><i class="fas fa-spinner fa-spin"></i> Loading conversation...</div>';
             }
 
+            // Force the browser to paint the view switch + loading spinner before
+            // we kick off the SQL fetch. Without this, the click handler chains
+            // straight into the await below and the user sees the email list
+            // until the whole thread has been fetched and rendered.
+            await new Promise(resolve =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve))
+            );
+
             // Resolve active account email up front so we can scope the thread query to it
             // (prevents cross-account contamination when multiple accounts share this DB).
             const settings = appState.getSettings();
@@ -4610,15 +4624,78 @@ ${attachmentsHtml}
             // Render messages using same per-email decrypt as single email views
             const keypair = appState.getKeypair();
             const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
-            let threadSubjectText = threadEmails[0].subject;
+            // For encrypted threads the stored subject of the first message is
+            // ciphertext / a placeholder, so start with "Decrypting…" until a
+            // per-message task lands a real decrypted subject. Cleartext threads
+            // just keep their stored subject as the default.
+            const firstHasArmor = !!(threadEmails[0].body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(threadEmails[0].body));
+            const decryptingPlaceholder = 'Decrypting…';
+            let threadSubjectText = firstHasArmor ? decryptingPlaceholder : threadEmails[0].subject;
             let lastDecryptedSubject = null;
             let lastDecryptedBody = null;
 
             if (threadContent) {
                 threadContent.innerHTML = '';
-                for (const email of threadEmails) {
+
+                // Paint a skeleton card per message so the user sees the
+                // structure of the conversation immediately (sender + date,
+                // with a "Decrypting…" snippet). Each skeleton is replaced
+                // in place once the parallel decrypt + render below produces
+                // the full card for it.
+                const skeletons = threadEmails.map((email, idx) => {
+                    const skel = document.createElement('div');
+                    const isLast = idx === threadEmails.length - 1;
+                    skel.className = `email-detail-card thread-skeleton${isLast ? '' : ' collapsed'}`;
+                    const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+                    const fromLabel = Utils.escapeHtml(email.from || email.from_address || '');
+                    skel.innerHTML = `
+<div class="email-sender-header">
+<div class="email-sender-row">
+<img class="email-sender-avatar" src="${defaultAvatar}" alt="">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${fromLabel}</div>
+<span class="email-body-snippet">Decrypting…</span>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
+</div>
+</div>
+                    `;
+                    threadContent.appendChild(skel);
+                    return skel;
+                });
+
+                // Default the thread title to the first message's stored subject
+                // so the user has a meaningful header from the moment the view
+                // appears. Per-message tasks below may overwrite this as soon as
+                // any decrypted subject differs from the stored one.
+                if (threadSubject) threadSubject.textContent = threadSubjectText;
+
+                // Yield so the skeletons commit to a paint before we start
+                // the decrypt work below (which can otherwise complete in a
+                // single JS turn on warm caches and skip the skeleton frame).
+                await new Promise(resolve =>
+                    requestAnimationFrame(() => requestAnimationFrame(resolve))
+                );
+
+                // Stream cards into place as each message's decrypt finishes,
+                // instead of waiting for the whole batch. Each per-message task
+                // decrypts, builds its card, and replaces its own skeleton.
+                // Shared state (thread subject, last-decrypted reply target) is
+                // updated under index-ordering rules so out-of-order completion
+                // doesn't produce inconsistent results: lower-index decrypts
+                // win the thread subject, only the final message updates the
+                // reply-target snapshot.
+                let earliestDecryptedSubjectIdx = Infinity;
+                const lastIdx = threadEmails.length - 1;
+
+                const taskStartAll = performance.now();
+                await Promise.allSettled(threadEmails.map(async (email, idx) => {
+                    const taskStart = performance.now();
                     const isSent = email._isSentByUser;
                     const emailBody = email.body || '';
+                    const bodyBytes = emailBody.length;
                     const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
 
                     let displayBody = emailBody;
@@ -4641,7 +4718,7 @@ ${attachmentsHtml}
 
                         try {
                             const [result, allSigs] = await Promise.all([
-                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey),
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey, email.message_id || null),
                                 TauriService.verifyAllSignatures(emailBody).catch(e => {
                                     console.warn('[JS] Thread sig verify error:', e);
                                     return [];
@@ -4686,11 +4763,24 @@ ${attachmentsHtml}
                         }
                     }
 
-                    // Track thread subject from first successful decrypt
-                    if (displaySubject && displaySubject !== email.subject && threadSubjectText === threadEmails[0].subject) {
+                    const tDecryptDone = performance.now();
+
+                    // Update thread subject — first message in order whose
+                    // decrypted subject differs from the stored one wins.
+                    if (displaySubject && displaySubject !== email.subject && idx < earliestDecryptedSubjectIdx) {
+                        earliestDecryptedSubjectIdx = idx;
                         threadSubjectText = displaySubject;
+                        if (threadSubject) threadSubject.textContent = threadSubjectText;
                     }
 
+                    // Track reply target — only meaningful for the most recent
+                    // message; other tasks shouldn't overwrite it.
+                    if (idx === lastIdx) {
+                        lastDecryptedSubject = displaySubject;
+                        lastDecryptedBody = displayBody;
+                    }
+
+                    // ===== Build and mount the full card =====
                     // Resolve contact for avatar. For received messages we use
                     // strict pubkey-only matching via _resolveSender (anti-spoofing).
                     // For sent messages the "sender" is the local user, so email-fallback is fine.
@@ -4816,7 +4906,14 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <div class="email-detail-body" id="${bodyId}">${email.html_body ? '' : Utils.escapeHtml(displayBody).replace(/\n/g, '<br>')}</div>
 <pre class="email-raw-content email-raw-body" style="display:none">${Utils.escapeHtml(email.raw_body || '')}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
                     `;
-                    threadContent.appendChild(cardDiv);
+                    // Swap the skeleton placeholder for the fully rendered card.
+                    // If the skeleton was already removed (defensive), fall back to append.
+                    const skeleton = skeletons[idx];
+                    if (skeleton && skeleton.parentNode === threadContent) {
+                        threadContent.replaceChild(cardDiv, skeleton);
+                    } else {
+                        threadContent.appendChild(cardDiv);
+                    }
 
                     // Collapse all cards except the last (most recent)
                     const isLastEmail = (email === threadEmails[threadEmails.length - 1]);
@@ -4916,9 +5013,25 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         this.verifyAndAnnotateSignatureBlocks(displayBody, bodyId);
                     }
 
-                    // Track last email's decrypted content for reply button
-                    lastDecryptedSubject = displaySubject;
-                    lastDecryptedBody = displayBody;
+                    const tEnd = performance.now();
+                    console.log(
+                        `[THREAD-PERF] msg ${idx + 1}/${threadEmails.length} ` +
+                        `(body=${bodyBytes}b, encrypted=${!!encryptedMatch}): ` +
+                        `decrypt+verify=${(tDecryptDone - taskStart).toFixed(1)}ms, ` +
+                        `mount+post=${(tEnd - tDecryptDone).toFixed(1)}ms, ` +
+                        `total=${(tEnd - taskStart).toFixed(1)}ms ` +
+                        `(landed at ${(tEnd - taskStartAll).toFixed(1)}ms)`
+                    );
+                }));
+                console.log(`[THREAD-PERF] all ${threadEmails.length} messages settled in ${(performance.now() - taskStartAll).toFixed(1)}ms`);
+
+                // If we showed the "Decrypting…" placeholder but no per-message
+                // task ever produced a decrypted subject (e.g. all decrypts
+                // failed), fall back to the stored subject so the title doesn't
+                // stay stuck on the placeholder.
+                if (earliestDecryptedSubjectIdx === Infinity && threadSubjectText === decryptingPlaceholder) {
+                    threadSubjectText = threadEmails[0].subject;
+                    if (threadSubject) threadSubject.textContent = threadSubjectText;
                 }
 
                 // Close menus on outside click
@@ -4928,10 +5041,6 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 
                 // Scroll to bottom (most recent message)
                 threadContent.scrollTop = threadContent.scrollHeight;
-            }
-
-            if (threadSubject) {
-                threadSubject.textContent = threadSubjectText;
             }
 
             // Mark unread emails as read (fire-and-forget)
@@ -6614,6 +6723,27 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             // apply here. Always show your own sent mail.
             const filteredEmails = emails;
 
+            // Paint skeleton placeholders synchronously so users see structure
+            // (recipient, subject, date, attachment badge) the moment the SQL fetch
+            // returns. Each placeholder is replaced in-place when its full render
+            // resolves, preserving server order.
+            const placeholders = filteredEmails.map(email => {
+                const ph = this.renderSentEmailItemBasic(email);
+                sentList.appendChild(ph);
+                return ph;
+            });
+
+            // Yield to the browser so it paints the skeletons before we move on.
+            // Without this, a warm preview cache lets the full replacement run to
+            // completion in the same JS turn as the appendChild loop, and the
+            // browser never paints the intermediate "skeleton-only" state.
+            // Double-rAF is the standard idiom: the first rAF callback runs
+            // *before* the next paint, the second runs after it, so by the time
+            // the second resolves the skeleton paint has definitely committed.
+            await new Promise(resolve =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve))
+            );
+
             // Batch-decrypt uncached encrypted sent emails, resolving pubkeys from contact index
             const uncachedEncrypted = filteredEmails.filter(email => {
                 if (this._previewCache.has(`sent-${email.id}`)) return false;
@@ -6641,6 +6771,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                             subject: email.subject,
                             senderPubkey: null,
                             recipientPubkey,
+                            messageId: email.message_id || null,
                         };
                     });
                     console.log(`[JS] Batch decrypting ${batchInput.length} sent emails in one IPC call`);
@@ -6692,7 +6823,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 const changed = await retrofitPromise;
                                 if (!changed || !email.recipient_pubkey) return;
                                 const retry = await TauriService.decryptEmailBody(
-                                    email.body, email.subject, null, email.recipient_pubkey
+                                    email.body, email.subject, null, email.recipient_pubkey, email.message_id || null
                                 );
                                 if (retry && retry.success) {
                                     let previewText = Utils.escapeHtml(retry.body.substring(0, 100));
@@ -6713,34 +6844,40 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 }
             }
 
-            // Process emails in parallel (decryption will hit cache from batch above)
-            const emailPromises = filteredEmails
-                .map(async (email) => {
+            // Replace each placeholder with its full render as soon as that render
+            // resolves. Decryption will mostly hit the cache populated by the batch
+            // above, so this is fast; rows that need extra work upgrade in place
+            // without blocking the rest of the list.
+            const replacementResults = await Promise.allSettled(filteredEmails.map(async (email, idx) => {
+                const placeholder = placeholders[idx];
                 try {
-                    // Add timeout to prevent hanging on decryption
                     const timeoutPromise = new Promise((_, reject) =>
                         setTimeout(() => reject(new Error('Decryption timeout')), 5000)
                     );
-                    const renderPromise = this.renderSentEmailItem(email);
-                    return await Promise.race([renderPromise, timeoutPromise]);
+                    const fullElement = await Promise.race([
+                        this.renderSentEmailItem(email),
+                        timeoutPromise
+                    ]);
+                    if (!placeholder || placeholder.parentNode !== sentList) return false;
+                    if (fullElement) {
+                        sentList.replaceChild(fullElement, placeholder);
+                        return true;
+                    }
+                    // renderSentEmailItem returns null when hide_undecryptable is on
+                    // and the row failed to decrypt — drop the placeholder entirely.
+                    sentList.removeChild(placeholder);
+                    return false;
                 } catch (error) {
                     console.error(`[JS] Error rendering email ${email.id}:`, error);
-                    // Return a basic email item even if rendering fails
-                    return this.renderSentEmailItemBasic(email);
+                    // Leave the skeleton placeholder visible so the user still sees the row.
+                    return !!(placeholder && placeholder.parentNode === sentList);
                 }
-            });
-            
-            // Wait for all emails to be rendered (with timeout protection)
-            const renderedItems = await Promise.allSettled(emailPromises);
-            
-            // Add all successfully rendered items to the list (filter out null results)
-            let renderedCount = 0;
-            for (const result of renderedItems) {
-                if (result.status === 'fulfilled' && result.value) {
-                    sentList.appendChild(result.value);
-                    renderedCount++;
-                }
-            }
+            }));
+
+            const renderedCount = replacementResults.reduce(
+                (n, r) => n + (r.status === 'fulfilled' && r.value ? 1 : 0),
+                0
+            );
             
             // Show message if no emails were rendered (only on full render, not append)
             if (renderedCount === 0 && appendFrom <= 0) {
@@ -6765,7 +6902,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 sentList.appendChild(loadMoreBtn);
             }
             
-            console.log(`[JS] renderSentEmails: Successfully rendered ${renderedItems.filter(r => r.status === 'fulfilled').length} emails`);
+            console.log(`[JS] renderSentEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
             console.error('[JS] Error in renderSentEmails:', error);
             sentList.innerHTML = '<div class="text-center text-muted">Error loading sent emails</div>';
@@ -6821,7 +6958,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         try {
                             const result = await TauriService.decryptEmailBody(
                                 email.body, email.subject,
-                                null, recipientPubkey
+                                null, recipientPubkey,
+                                email.message_id || null
                             );
                             if (result.success) {
                                 previewSubject = result.subject;
@@ -6868,10 +7006,15 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         if (hideUndecryptable && !isDecryptable) {
             return null;
         }
-        
-        // Add attachment indicator
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
-        const attachmentIndicator = attachmentCount > 0 ? 
+
+        // Add attachment indicator — prefer attachment_count from the thread query
+        // (cheap COUNT(*) subquery) since the sent list no longer prefetches full
+        // attachment metadata. Fall back to email.attachments.length for any code
+        // path that has already populated the array.
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
+        const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
         // Add signature verification indicator
@@ -7000,8 +7143,10 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             dateDisplay = emailDate.toLocaleDateString();
         }
         
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
-        const attachmentIndicator = attachmentCount > 0 ? 
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
+        const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
         // Strict pubkey-bound lookup when recipient_pubkey is set, otherwise
@@ -7023,6 +7168,16 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             avatarSrc = recipientContact.picture;
         }
 
+        // For encrypted sent emails the stored subject is ciphertext / a
+        // placeholder and the body is armor — show "Decrypting…" on the
+        // subject and blank the preview until the full render replaces
+        // this skeleton. Cleartext sent emails keep their body snippet.
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
+        const previewText = isEncrypted
+            ? ''
+            : Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
+
         emailElement.innerHTML = `
             <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.to)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
             <div class="email-content">
@@ -7030,8 +7185,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                     <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator}</div>
                     <div class="email-date">${dateDisplay}</div>
                 </div>
-                <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
-                <div class="email-preview">${Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '')}</div>
+                <div class="email-subject email-list-strong">${subjectText}</div>
+                <div class="email-preview">${previewText}</div>
             </div>
         `;
         emailElement.addEventListener('click', () => {
@@ -7362,17 +7517,29 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         
         // Define updateDetail function first (before it's called)
         const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {
-            // Render attachments - decrypt metadata for display
-            console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
-            console.log(`[JS] Email object:`, email);
-            console.log(`[JS] email.html_body present:`, !!email.html_body, `length:`, email.html_body ? email.html_body.length : 0);
-            console.log(`[JS] Email.attachments type:`, typeof email.attachments, Array.isArray(email.attachments));
-            
-            // Ensure attachments array exists
-            if (!email.attachments || !Array.isArray(email.attachments)) {
-                console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
-                email.attachments = [];
+            // Render attachments - decrypt metadata for display.
+            // Attachments are no longer prefetched during list load; lazy-load them here
+            // when the detail view actually needs them. attachment_count from the thread
+            // query gives a fast path to skip the IPC call entirely when there are none.
+            if (!Array.isArray(email.attachments)) {
+                if (email.attachment_count === 0) {
+                    email.attachments = [];
+                } else {
+                    const emailIdInt = parseInt(email.id);
+                    if (!isNaN(emailIdInt)) {
+                        try {
+                            email.attachments = await TauriService.getAttachmentsForEmail(emailIdInt);
+                        } catch (err) {
+                            console.error(`[JS] Failed to lazy-load attachments for sent email ${email.id}:`, err);
+                            email.attachments = [];
+                        }
+                    } else {
+                        email.attachments = [];
+                    }
+                }
             }
+            console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
+            console.log(`[JS] email.html_body present:`, !!email.html_body, `length:`, email.html_body ? email.html_body.length : 0);
             
             // Log attachment details for debugging
             if (email.attachments && email.attachments.length > 0) {
@@ -7425,7 +7592,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                                 const decryptResult = await TauriService.decryptEmailBody(
                                     email.body, email.subject || '',
-                                    null, recipientPubkey
+                                    null, recipientPubkey,
+                                    email.message_id || null
                                 );
                                 if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
                                     manifestResult = {
@@ -7834,7 +8002,7 @@ ${attachmentsHtml}
                         // Run decryption and signature verification in parallel (they're independent)
                         console.log('[JS] Calling backend decrypt_email_body + verifyAllSignatures for sent email in parallel...');
                         const [result, allSigs] = await Promise.all([
-                            TauriService.decryptEmailBody(email.body, email.subject, null, recipientPubkey),
+                            TauriService.decryptEmailBody(email.body, email.subject, null, recipientPubkey, email.message_id || null),
                             TauriService.verifyAllSignatures(email.body).catch(e => {
                                 console.warn('[JS] Signature verification error:', e);
                                 return [];
@@ -7980,7 +8148,8 @@ ${attachmentsHtml}
 
             const result = await TauriService.decryptEmailBody(
                 email.body, email.subject || '',
-                null, recipientPubkey
+                null, recipientPubkey,
+                email.message_id || null
             );
 
             // Retrofit happens whether or not the body decrypted — the subject
@@ -8113,7 +8282,8 @@ ${attachmentsHtml}
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for sent attachment...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    null, recipientPubkey
+                    null, recipientPubkey,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8209,7 +8379,8 @@ ${attachmentsHtml}
                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    null, recipientPubkey
+                    null, recipientPubkey,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8355,7 +8526,8 @@ ${attachmentsHtml}
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for attachment...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    senderPubkey, null
+                    senderPubkey, null,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8454,7 +8626,8 @@ ${attachmentsHtml}
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for ZIP...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    senderPubkey, null
+                    senderPubkey, null,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8809,7 +8982,8 @@ ${attachmentsHtml}
                     const recipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey || draft.sender_pubkey;
                     const result = await TauriService.decryptEmailBody(
                         draft.body, draft.subject || '',
-                        recipientPubkey, null
+                        recipientPubkey, null,
+                        draft.message_id || null
                     );
                     if (result.success) {
                         previewSubject = result.subject || draft.subject;
@@ -9234,7 +9408,8 @@ ${attachmentsHtml}
                             const recipientPubkey = draftRecipientPubkey;
                             const result = await TauriService.decryptEmailBody(
                                 draft.body, draft.subject || '',
-                                recipientPubkey, null
+                                recipientPubkey, null,
+                                draft.message_id || null
                             );
                             if (result.success) {
                                 decryptedSubject = result.subject || draft.subject;

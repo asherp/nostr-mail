@@ -1788,7 +1788,7 @@ impl Database {
     /// Get inbox emails grouped by thread. Returns one row per thread (the most recent email)
     /// plus message_count and unread_count for that thread.
     /// Counts ALL emails in a thread (including sent replies) so threads span inbox/sent.
-    pub fn get_email_threads(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>, user_pubkey: Option<&str>) -> Result<Vec<(Email, i64, i64)>> {
+    pub fn get_email_threads(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>, user_pubkey: Option<&str>) -> Result<Vec<(Email, i64, i64, i64)>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.unwrap_or(50);
         let offset = offset.unwrap_or(0);
@@ -1864,7 +1864,8 @@ impl Database {
                    received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
                    is_draft, is_read, updated_at, created_at, signature_valid, signature_source,
                    transport_auth_verified, in_reply_to, references_, thread_id,
-                   message_count, unread_count
+                   message_count, unread_count,
+                   (SELECT COUNT(*) FROM attachments WHERE email_id = ranked.id) AS attachment_count
             FROM ranked WHERE rn = 1
             ORDER BY thread_last_activity DESC
             LIMIT ? OFFSET ?",
@@ -1911,14 +1912,15 @@ impl Database {
             };
             let message_count: i64 = row.get(23)?;
             let unread_count: i64 = row.get(24)?;
-            Ok((email, message_count, unread_count))
+            let attachment_count: i64 = row.get(25)?;
+            Ok((email, message_count, unread_count, attachment_count))
         })?;
         rows.collect()
     }
 
     /// Get sent emails grouped by thread.
     /// Counts ALL emails in a thread (including received messages) so threads span inbox/sent.
-    pub fn get_sent_email_threads(&self, limit: Option<i64>, offset: Option<i64>, user_email: Option<&str>) -> Result<Vec<(Email, i64, i64)>> {
+    pub fn get_sent_email_threads(&self, limit: Option<i64>, offset: Option<i64>, user_email: Option<&str>) -> Result<Vec<(Email, i64, i64, i64)>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.unwrap_or(50);
         let offset = offset.unwrap_or(0);
@@ -1984,7 +1986,8 @@ impl Database {
                    received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
                    is_draft, is_read, updated_at, created_at, signature_valid, signature_source,
                    transport_auth_verified, in_reply_to, references_, thread_id,
-                   message_count, unread_count
+                   message_count, unread_count,
+                   (SELECT COUNT(*) FROM attachments WHERE email_id = ranked.id) AS attachment_count
             FROM ranked WHERE rn = 1
             ORDER BY received_at DESC
             LIMIT ? OFFSET ?",
@@ -2023,7 +2026,8 @@ impl Database {
             };
             let message_count: i64 = row.get(23)?;
             let unread_count: i64 = row.get(24)?;
-            Ok((email, message_count, unread_count))
+            let attachment_count: i64 = row.get(25)?;
+            Ok((email, message_count, unread_count, attachment_count))
         })?;
         rows.collect()
     }

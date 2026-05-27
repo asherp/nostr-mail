@@ -1376,13 +1376,33 @@ fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<
         let payload_tree = glossia::WordlistTree::new(payload_words.clone());
         let payload_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
 
-        let extracted: Vec<String> = text
+        // Normalize every input token the same way (lowercase, strip leading/trailing
+        // non-alphanumerics, drop empties), then split into kept-vs-dropped against
+        // the payload wordlist. We need the unfiltered set to enforce strictness below.
+        let all_tokens: Vec<String> = text
             .split_whitespace()
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let extracted: Vec<String> = all_tokens
+            .iter()
             .filter(|w| payload_set.contains(w.as_str()))
+            .cloned()
             .collect();
 
         if extracted.is_empty() {
+            continue;
+        }
+
+        // Strictness: this function is meant for pure bitpack_fixed-encoded blobs
+        // (all words from the same wordlist, no markers, no mixed content). If the
+        // payload-word filter dropped any tokens, the input isn't pure — e.g. it's
+        // a SIGNATURE block whose last line is an npub. Bail so decode_sig_and_pubkey
+        // falls through to Phase 2 (separate-line sig + pubkey) instead of padding
+        // the partial bit-stream up to expected_bytes with zeros and yielding
+        // garbage sig/pubkey bytes that crash verification with "malformed public
+        // key". See `manifest_attachment_default_jsformat_inline_sig_verifies` test.
+        if extracted.len() != all_tokens.len() {
             continue;
         }
 
@@ -4503,15 +4523,36 @@ nitela\n\
 
     #[test]
     fn test_parse_armor_components_body_bytes_base64() {
-        // Base64 body should decode to bytes and be returned as base64 in body_bytes_b64
-        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+        // After the NIP-44 eager-decode-skip optimization, parse_armor_components
+        // no longer populates body_bytes_b64 for NIP-44 — those pre-decoded bytes
+        // were only ever consumed by NIP-04 signature verification, and re-decoding
+        // them at parse time was the single biggest cost in the decrypt pipeline
+        // (see commit c9095f4). NIP-04 still populates the field; NIP-44 leaves it
+        // None and decrypt_single_block / extract_ciphertext_binary do the decode
+        // lazily.
+        let nip04 = "----- BEGIN NOSTR NIP-04 ENCRYPTED BODY -----\n\
             SGVsbG8gV29ybGQ=\n\
             ----- END NOSTR MESSAGE -----";
-        let result = parse_armor_components(body).expect("should parse");
-        assert!(result.body_bytes_b64.is_some());
-        // "SGVsbG8gV29ybGQ=" decodes to "Hello World"
-        let decoded = general_purpose::STANDARD.decode(result.body_bytes_b64.unwrap()).unwrap();
+        let nip04_parsed = parse_armor_components(nip04).expect("should parse nip04");
+        assert!(
+            nip04_parsed.body_bytes_b64.is_some(),
+            "NIP-04 must keep eager-decoded body_bytes_b64 (used as MAC input by sig verify)"
+        );
+        let decoded = general_purpose::STANDARD
+            .decode(nip04_parsed.body_bytes_b64.unwrap())
+            .unwrap();
         assert_eq!(std::str::from_utf8(&decoded).unwrap(), "Hello World");
+
+        let nip44 = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        let nip44_parsed = parse_armor_components(nip44).expect("should parse nip44");
+        assert!(
+            nip44_parsed.body_bytes_b64.is_none(),
+            "NIP-44 must skip the eager glossia decode at parse time — \
+             body_bytes_b64 stays None and decrypt_single_block re-decodes the \
+             body_text lazily"
+        );
     }
 
     #[test]
@@ -4564,9 +4605,15 @@ nitela\n\
 
     #[test]
     fn test_parse_armor_components_body_bytes_match_extract_ciphertext() {
-        // Critical test: verify that body_bytes_b64 decoded matches extract_ciphertext_binary
-        // for the same input (ensuring signature verification compatibility)
-        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+        // Critical contract for NIP-04 sig verification: the eager-decoded
+        // body_bytes_b64 must equal what extract_ciphertext_binary recovers
+        // lazily — otherwise the inline-sig MAC input on the parse side
+        // disagrees with what verify_email_signature_inline recomputes.
+        //
+        // For NIP-44 the eager decode is skipped (see
+        // test_parse_armor_components_body_bytes_base64), so this contract
+        // only applies to NIP-04.
+        let body = "----- BEGIN NOSTR NIP-04 ENCRYPTED BODY -----\n\
             SGVsbG8gV29ybGQ=\n\
             ----- END NOSTR MESSAGE -----";
         let parsed = parse_armor_components(body).expect("should parse");

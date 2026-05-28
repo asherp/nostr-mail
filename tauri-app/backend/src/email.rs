@@ -4778,16 +4778,18 @@ nitela\n\
 /// hasn't picked any folders explicitly. Folders that don't exist on the
 /// server are tolerated by `uid_sync_folder` (logged and skipped), so this can
 /// include best-guess names like `Archive` without breaking anything.
+///
+/// Spam/junk folders are NOT in this static list — they're appended at sync
+/// time by `extend_with_spam_folders` which finds the real folder names on
+/// the server (`[Gmail]/Spam`, `Junk Email`, `Junk`, etc.).
 pub fn default_inbox_folders(imap_host: &str) -> Vec<String> {
     let h = imap_host.to_lowercase();
     if h.contains("gmail.com") || h.contains("googlemail.com") {
-        // Gmail: INBOX is the Primary tab; Spam is included because
-        // Nostr-encrypted bodies look like base64 noise and routinely get
-        // mis-classified, so users would otherwise silently lose mail.
+        // Gmail: INBOX covers the Primary tab. No Archive — Gmail uses
+        // [Gmail]/All Mail for that, which would re-scan everything.
         vec![
             "INBOX".to_string(),
             "nostr-mail".to_string(),
-            "[Gmail]/Spam".to_string(),
         ]
     } else {
         // Generic IMAP: Archive is added because Outlook/Fastmail/etc users
@@ -5544,11 +5546,13 @@ fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
 
 /// Discover sent mailbox name using IMAP LIST command
 /// Returns the actual mailbox name found, or None if no sent mailbox exists
-/// Append any server mailbox whose name contains "spam" (case-insensitive) to
-/// `folders`, skipping names already present. Used to expand the default
-/// sync set so Nostr-encrypted mail that Gmail/etc. mis-classified as spam
-/// still gets picked up. Failures during LIST are non-fatal — the sync will
-/// just proceed with the pre-expansion folder set.
+/// Append any server mailbox whose name contains "spam" or "junk"
+/// (case-insensitive) to `folders`, skipping names already present. Used to
+/// expand the default sync set so Nostr-encrypted mail that providers
+/// mis-classified still gets picked up. Catches `[Gmail]/Spam`, Outlook's
+/// `Junk Email`, Yahoo's `Bulk Mail` (no, this won't catch Bulk — only spam
+/// and junk substrings), Fastmail's `Spam`, etc. Failures during LIST are
+/// non-fatal — the sync will just proceed with the pre-expansion folder set.
 fn extend_with_spam_folders(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     folders: &mut Vec<String>,
@@ -5562,7 +5566,8 @@ fn extend_with_spam_folders(
     };
     for mailbox in mailboxes.iter() {
         let name = mailbox.name();
-        if !name.to_lowercase().contains("spam") { continue; }
+        let lower = name.to_lowercase();
+        if !lower.contains("spam") && !lower.contains("junk") { continue; }
         if folders.iter().any(|f| f.eq_ignore_ascii_case(name)) { continue; }
         debug_log!("[RUST] extend_with_spam_folders: adding {}", name);
         folders.push(name.to_string());

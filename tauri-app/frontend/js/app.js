@@ -3416,7 +3416,7 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
                 TauriService.getDefaultInboxFolders(settings.imap_host).then(defaults => {
                     if (defaults && defaults.length > 0) {
                         window.FolderMultiselect.setPlaceholder(
-                            `Default (${defaults.join(', ')}, + any 'Spam' folders)`
+                            `Default (${defaults.join(', ')}, + spam/junk folders)`
                         );
                     }
                 }).catch(() => { /* placeholder stays at the initial value */ });

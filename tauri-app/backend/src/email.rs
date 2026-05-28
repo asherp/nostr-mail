@@ -5546,13 +5546,13 @@ fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
 
 /// Discover sent mailbox name using IMAP LIST command
 /// Returns the actual mailbox name found, or None if no sent mailbox exists
-/// Append any server mailbox whose name contains "spam" or "junk"
+/// Append any server mailbox whose name contains "spam", "junk", or "bulk"
 /// (case-insensitive) to `folders`, skipping names already present. Used to
 /// expand the default sync set so Nostr-encrypted mail that providers
 /// mis-classified still gets picked up. Catches `[Gmail]/Spam`, Outlook's
-/// `Junk Email`, Yahoo's `Bulk Mail` (no, this won't catch Bulk — only spam
-/// and junk substrings), Fastmail's `Spam`, etc. Failures during LIST are
-/// non-fatal — the sync will just proceed with the pre-expansion folder set.
+/// `Junk Email`, Fastmail's `Junk`, Yahoo's `Bulk Mail`, etc. Failures during
+/// LIST are non-fatal — the sync will just proceed with the pre-expansion
+/// folder set.
 fn extend_with_spam_folders(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     folders: &mut Vec<String>,
@@ -5567,7 +5567,7 @@ fn extend_with_spam_folders(
     for mailbox in mailboxes.iter() {
         let name = mailbox.name();
         let lower = name.to_lowercase();
-        if !lower.contains("spam") && !lower.contains("junk") { continue; }
+        if !lower.contains("spam") && !lower.contains("junk") && !lower.contains("bulk") { continue; }
         if folders.iter().any(|f| f.eq_ignore_ascii_case(name)) { continue; }
         debug_log!("[RUST] extend_with_spam_folders: adding {}", name);
         folders.push(name.to_string());

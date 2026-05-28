@@ -24,15 +24,13 @@
     padding-top: 6px;
 }
 
-/* Selected-item pills — keep the spacing comfortable in the Settings form. */
+/* Selected-item pills — match .btn-secondary so the control feels
+   consistent with the rest of the Settings form. */
 #inbox-folder-preference + .ts-wrapper .item {
     margin: 2px 4px 2px 0;
-}
-
-/* Folder name that triggers a one-time confirm before full sync. */
-#inbox-folder-preference + .ts-wrapper .item[data-value="[Gmail]/All Mail"] {
-    background: #fef3c7;
-    border-color: #f59e0b;
+    background-color: #f8f9fa;
+    color: #6c757d;
+    border: 1px solid #e9ecef;
 }
 
 /* Dark-mode adjustments. The default Tom Select theme is light; mirror the
@@ -50,18 +48,12 @@ body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-dropdown .active {
 }
 
 body.dark-mode #inbox-folder-preference + .ts-wrapper .item {
-    background-color: #2d3450;
+    background-color: #232946;
     color: #e0e0e0;
-    border-color: #3a3f55;
+    border-color: #232946;
 }
 
 body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-dropdown .optgroup-header {
     color: #a0a4b8;
     background-color: #181a20;
-}
-
-body.dark-mode #inbox-folder-preference + .ts-wrapper .item[data-value="[Gmail]/All Mail"] {
-    background: #78350f;
-    border-color: #f59e0b;
-    color: #fef3c7;
 }

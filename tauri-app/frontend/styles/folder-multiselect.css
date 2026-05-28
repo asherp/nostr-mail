@@ -1,21 +1,25 @@
-/* Tom Select tweaks for the inbox-folder multiselect in Settings. */
+/* Tom Select tweaks for the inbox-folder multiselect in Settings.
+ * Scoped via the wrapperClass `folder-multiselect` (set on the TS
+ * instance), since the wrapper contains the original <select> rather
+ * than being its sibling.
+ */
 
-#inbox-folder-preference + .ts-wrapper {
+.folder-multiselect {
     min-height: 38px;
     width: 100%;
 }
 
-#inbox-folder-preference + .ts-wrapper .ts-control {
+.folder-multiselect .ts-control {
     padding: 6px 8px;
     border-radius: 4px;
     min-height: 38px;
 }
 
-#inbox-folder-preference + .ts-wrapper .ts-dropdown {
+.folder-multiselect .ts-dropdown {
     max-height: 320px;
 }
 
-#inbox-folder-preference + .ts-wrapper .ts-dropdown .optgroup-header {
+.folder-multiselect .ts-dropdown .optgroup-header {
     font-weight: 600;
     text-transform: uppercase;
     font-size: 0.75rem;
@@ -25,35 +29,72 @@
 }
 
 /* Selected-item pills — match .btn-secondary so the control feels
-   consistent with the rest of the Settings form. */
-#inbox-folder-preference + .ts-wrapper .item {
-    margin: 2px 4px 2px 0;
-    background-color: #f8f9fa;
+ * consistent with the rest of the Settings form. The default theme
+ * paints these blue with a gradient + box-shadow + text-shadow; we
+ * have to flatten all of that to land on a clean neutral pill. */
+.folder-multiselect.multi .ts-control > div,
+.folder-multiselect.multi .ts-control > div[data-value] {
+    background: #f8f9fa;
+    background-image: none;
     color: #6c757d;
     border: 1px solid #e9ecef;
+    box-shadow: none;
+    text-shadow: none;
+    margin: 2px 4px 2px 0;
+    border-radius: 4px;
 }
 
-/* Dark-mode adjustments. The default Tom Select theme is light; mirror the
-   app's dark palette so the control doesn't pop. */
-body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-control,
-body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-dropdown {
+.folder-multiselect.multi.plugin-remove_button .item .remove {
+    border-left-color: #e9ecef;
+    color: #6c757d;
+}
+
+.folder-multiselect.multi.plugin-remove_button .item .remove:hover {
+    background: rgba(0, 0, 0, 0.05);
+    color: #495057;
+}
+
+/* Dark-mode adjustments. Mirror the app's dark palette so the control
+ * doesn't pop, and use the same colors as the dark .btn-secondary. */
+body.dark-mode .folder-multiselect .ts-control,
+body.dark-mode .folder-multiselect .ts-dropdown {
     background-color: #232946;
     color: #e0e0e0;
     border-color: #3a3f55;
 }
 
-body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-dropdown .active {
+body.dark-mode .folder-multiselect .ts-dropdown .active {
     background-color: #2d3450;
     color: #fff;
 }
 
-body.dark-mode #inbox-folder-preference + .ts-wrapper .item {
-    background-color: #232946;
+body.dark-mode .folder-multiselect.multi .ts-control > div,
+body.dark-mode .folder-multiselect.multi .ts-control > div[data-value] {
+    background: #2d3450;
+    background-image: none;
     color: #e0e0e0;
-    border-color: #232946;
+    border-color: #3a3f55;
+    box-shadow: none;
+    text-shadow: none;
 }
 
-body.dark-mode #inbox-folder-preference + .ts-wrapper .ts-dropdown .optgroup-header {
+body.dark-mode .folder-multiselect.multi.plugin-remove_button .item .remove {
+    border-left-color: #3a3f55;
+    color: #e0e0e0;
+}
+
+body.dark-mode .folder-multiselect.multi.plugin-remove_button .item .remove:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+}
+
+body.dark-mode .folder-multiselect .ts-dropdown .optgroup-header {
     color: #a0a4b8;
     background-color: #181a20;
+}
+
+/* Hide the placeholder text in the input once items are selected, so
+ * "Default (INBOX + nostr-mail)" stops showing alongside actual pills. */
+.folder-multiselect.has-items .ts-control > input::placeholder {
+    color: transparent;
 }

@@ -41,6 +41,7 @@
         if (!el || typeof window.TomSelect === 'undefined') return null;
 
         instance = new window.TomSelect(el, {
+            wrapperClass: 'ts-wrapper folder-multiselect',
             plugins: ['remove_button'],
             persist: false,
             create: false,

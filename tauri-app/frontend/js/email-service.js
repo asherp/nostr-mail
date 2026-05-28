@@ -5523,7 +5523,36 @@ ${attachmentsHtml}
                 );
                 // Only keep prior selections that still exist on the server.
                 const filteredSet = new Set(filteredFolders);
-                const restoreSelection = previousSelection.filter(name => filteredSet.has(name));
+                let restoreSelection = previousSelection.filter(name => filteredSet.has(name));
+
+                // No usable saved selection? Pre-select the provider-aware
+                // defaults so users SEE what will be synced as pills (rather
+                // than as ghosted placeholder text). Mirrors the backend's
+                // default logic: static defaults + any folder whose name
+                // contains spam/junk/bulk. setOptions calls setValue with
+                // silent=true so this doesn't trigger autosave — the user's
+                // persisted "" stays "" until they actively change something.
+                if (restoreSelection.length === 0) {
+                    const settings = appState.getSettings() || {};
+                    let staticDefaults = [];
+                    try {
+                        staticDefaults = await TauriService.getDefaultInboxFolders(settings.imap_host || '');
+                    } catch (e) {
+                        console.warn('[EMAIL-SERVICE] getDefaultInboxFolders failed:', e);
+                    }
+                    const effective = new Set();
+                    for (const name of (staticDefaults || [])) {
+                        if (filteredSet.has(name)) effective.add(name);
+                    }
+                    for (const name of filteredFolders) {
+                        const lower = name.toLowerCase();
+                        if (lower.includes('spam') || lower.includes('junk') || lower.includes('bulk')) {
+                            effective.add(name);
+                        }
+                    }
+                    restoreSelection = Array.from(effective);
+                }
+
                 window.FolderMultiselect.setOptions(filteredFolders, restoreSelection);
             }
 

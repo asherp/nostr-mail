@@ -3516,12 +3516,13 @@ class EmailService {
                 return;
             }
 
-            // If more DB pages exist but the rendered list is shorter than
-            // the viewport, auto-pull the next page so scroll has somewhere
-            // to go (avoids needing a scroll event to bootstrap).
-            if (showLoadMore) {
-                queueMicrotask(() => this._maybeFillViewport('inbox'));
-            }
+            // If the rendered list is shorter than the viewport, auto-pull
+            // the next page (DB or server, whichever applies) so the user
+            // doesn't have to manually trigger a scroll on a list that has
+            // nowhere to scroll. Called unconditionally — `_maybeFillViewport`
+            // no-ops when the list is already scrollable, and `_tryLoadMore`
+            // no-ops when there's nothing left to fetch.
+            queueMicrotask(() => this._maybeFillViewport('inbox'));
 
             console.log(`[JS] renderEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
@@ -7117,10 +7118,9 @@ ${attachmentsHtml}
                 return;
             }
             
-            // Pagination handled by infinite scroll (see _onListScroll).
-            if (showLoadMore) {
-                queueMicrotask(() => this._maybeFillViewport('sent'));
-            }
+            // See renderEmails — auto-fill the viewport when the rendered
+            // list is too short to scroll. Unconditional; guarded internally.
+            queueMicrotask(() => this._maybeFillViewport('sent'));
 
             console.log(`[JS] renderSentEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {

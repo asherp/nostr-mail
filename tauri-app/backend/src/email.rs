@@ -4774,16 +4774,66 @@ nitela\n\
 }
 
 
-pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+/// Provider-aware default folder list for inbox sync. Returned when the user
+/// hasn't picked any folders explicitly. Folders that don't exist on the
+/// server are tolerated by `uid_sync_folder` (logged and skipped), so this can
+/// include best-guess names like `Archive` without breaking anything.
+///
+/// Spam/junk folders are NOT in this static list — they're appended at sync
+/// time by `extend_with_spam_folders` which finds the real folder names on
+/// the server (`[Gmail]/Spam`, `Junk Email`, `Junk`, etc.).
+pub fn default_inbox_folders(imap_host: &str) -> Vec<String> {
+    let h = imap_host.to_lowercase();
+    if h.contains("gmail.com") || h.contains("googlemail.com") {
+        // Gmail: INBOX covers the Primary tab. No Archive — Gmail uses
+        // [Gmail]/All Mail for that, which would re-scan everything.
+        vec![
+            "INBOX".to_string(),
+            "nostr-mail".to_string(),
+        ]
+    } else {
+        // Generic IMAP: Archive is added because Outlook/Fastmail/etc users
+        // heavily route mail there. Missing on Yahoo etc; the sync loop logs
+        // the miss and continues.
+        vec![
+            "INBOX".to_string(),
+            "nostr-mail".to_string(),
+            "Archive".to_string(),
+        ]
+    }
+}
+
+pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
 
-    // Folders to scan. Default (empty/None) = INBOX + nostr-mail label.
-    let folders: Vec<String> = match folder {
-        Some(f) if !f.is_empty() => vec![f.to_string()],
-        _ => vec!["INBOX".to_string(), "nostr-mail".to_string()],
+    // Folders to scan. Default (empty/None) = provider-aware list from
+    // `default_inbox_folders`, with any *spam*-named server folder appended
+    // after login (Nostr-encrypted bodies routinely get mis-classified as
+    // spam). Multiple folders may be supplied to scan in a single pass;
+    // dedupe to avoid re-scanning the same folder twice if a caller passed
+    // duplicates.
+    let (folders, expand_spam): (Vec<String>, bool) = match folders_arg {
+        Some(list) => {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut out: Vec<String> = Vec::new();
+            for f in list {
+                let trimmed = f.trim();
+                if trimmed.is_empty() { continue; }
+                if seen.insert(trimmed.to_string()) {
+                    out.push(trimmed.to_string());
+                }
+            }
+            if out.is_empty() {
+                (default_inbox_folders(&config.imap_host), true)
+            } else {
+                (out, false)
+            }
+        }
+        None => (default_inbox_folders(&config.imap_host), true),
     };
+    let mut folders = folders;
 
     println!(
         "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, sync_cutoff_days={} (bootstrap only)",
@@ -4803,6 +4853,10 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
     if config.use_tls {
         let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        if expand_spam {
+            extend_with_spam_folders(&mut session, &mut folders);
+        }
+        println!("[RUST] sync_nostr_emails_to_db: folders after spam expansion: {:?}", folders);
         for f in &folders {
             match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
                                   parse_nostr_email_from_imap_body) {
@@ -4819,6 +4873,10 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
         let tcp_stream = TcpStream::connect(&addr)?;
         let client = imap::Client::new(tcp_stream);
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        if expand_spam {
+            extend_with_spam_folders(&mut session, &mut folders);
+        }
+        println!("[RUST] sync_nostr_emails_to_db: folders after spam expansion: {:?}", folders);
         for f in &folders {
             match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
                                   parse_nostr_email_from_imap_body) {
@@ -5488,6 +5546,34 @@ fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
 
 /// Discover sent mailbox name using IMAP LIST command
 /// Returns the actual mailbox name found, or None if no sent mailbox exists
+/// Append any server mailbox whose name contains "spam", "junk", or "bulk"
+/// (case-insensitive) to `folders`, skipping names already present. Used to
+/// expand the default sync set so Nostr-encrypted mail that providers
+/// mis-classified still gets picked up. Catches `[Gmail]/Spam`, Outlook's
+/// `Junk Email`, Fastmail's `Junk`, Yahoo's `Bulk Mail`, etc. Failures during
+/// LIST are non-fatal — the sync will just proceed with the pre-expansion
+/// folder set.
+fn extend_with_spam_folders(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    folders: &mut Vec<String>,
+) {
+    let mailboxes = match session.list(Some(""), Some("*")) {
+        Ok(m) => m,
+        Err(e) => {
+            debug_log!("[RUST] extend_with_spam_folders: LIST failed: {}", e);
+            return;
+        }
+    };
+    for mailbox in mailboxes.iter() {
+        let name = mailbox.name();
+        let lower = name.to_lowercase();
+        if !lower.contains("spam") && !lower.contains("junk") && !lower.contains("bulk") { continue; }
+        if folders.iter().any(|f| f.eq_ignore_ascii_case(name)) { continue; }
+        debug_log!("[RUST] extend_with_spam_folders: adding {}", name);
+        folders.push(name.to_string());
+    }
+}
+
 fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::io::Write>) -> anyhow::Result<Option<String>> {
     // Use LIST to get all mailboxes
     let mailboxes = session.list(Some(""), Some("*"))?;

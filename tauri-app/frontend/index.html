@@ -23,7 +23,10 @@
     <link rel="stylesheet" href="styles/avatars.css">
     <link rel="stylesheet" href="styles.css">
     <link href="vendor/fontawesome/css/all.min.css" rel="stylesheet">
+    <link href="vendor/tom-select/css/tom-select.default.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="styles/folder-multiselect.css">
     <script src="vendor/html5-qrcode/html5-qrcode.min.js"></script>
+    <script src="vendor/tom-select/js/tom-select.complete.min.js"></script>
     <script type="importmap">
     {
         "imports": {
@@ -48,6 +51,7 @@
     <script src="js/app-state.js"></script>
     <script src="js/profile-manager.js"></script>
     <script src="js/notification-service.js"></script>
+    <script src="js/folder-multiselect.js"></script>
     <script src="js/app.js"></script>
 </head>
 <body>
@@ -650,11 +654,9 @@
                         </div>
 
                         <div class="form-group">
-                            <label for="inbox-folder-preference">Inbox Folder:</label>
-                            <select id="inbox-folder-preference">
-                                <option value="">Default</option>
-                            </select>
-                            <small class="form-text text-muted">Which IMAP folder to scan for new mail. Default scans INBOX + nostr-mail. Folder list loads from your IMAP server.</small>
+                            <label for="inbox-folder-preference">Inbox Folders:</label>
+                            <select id="inbox-folder-preference" multiple size="6"></select>
+                            <small class="form-text text-muted">Which IMAP folders to scan for new mail. Select one or more, or leave empty to use provider-aware defaults — INBOX, <code>nostr-mail</code>, Archive (non-Gmail only), and any folder whose name contains "spam", "junk", or "bulk". Folder list loads from your IMAP server.</small>
                         </div>
                         
                         <div class="form-group">

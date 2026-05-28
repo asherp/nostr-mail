@@ -2879,10 +2879,14 @@ class EmailService {
     async syncInboxEmails() {
         try {
             const settings = appState.getSettings() || {};
-            const selectedFolder = settings.inbox_folder ? settings.inbox_folder : null;
-            console.log(`[JS] Syncing inbox emails from folder: ${selectedFolder || 'Default (INBOX + nostr-mail)'}`);
+            const folderList = (settings.inbox_folder || '')
+                .split('\n')
+                .map(f => f.trim())
+                .filter(Boolean);
+            const selectedFolders = folderList.length > 0 ? folderList : null;
+            console.log(`[JS] Syncing inbox emails from folders: ${selectedFolders ? selectedFolders.join(', ') : 'Default (INBOX + nostr-mail)'}`);
 
-            const newCount = await TauriService.syncNostrEmails(selectedFolder);
+            const newCount = await TauriService.syncNostrEmails(selectedFolders);
             console.log(`[JS] Synced ${newCount} new inbox emails from network`);
             return newCount;
         } catch (error) {
@@ -5482,15 +5486,16 @@ ${attachmentsHtml}
             });
 
             // Preserve the currently-saved selection so we can re-apply it after
-            // repopulating the <option>s. Prefer the persisted setting over the
-            // current DOM value (DOM may be empty if this fires before
-            // populateSettingsForm runs).
+            // repopulating the <option>s. Prefer current DOM selections; fall
+            // back to the persisted setting (DOM may be empty if this fires
+            // before populateSettingsForm runs).
             const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
-            const previousValue = selectElement ? (selectElement.value || persistedFolder) : persistedFolder;
+            const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
+            const domSelected = window.FolderMultiselect ? window.FolderMultiselect.getSelection() : [];
+            const previousSelection = domSelected.length > 0 ? domSelected : persistedList;
 
-            if (selectElement) {
-                selectElement.disabled = true;
-                selectElement.innerHTML = '<option disabled>Loading folders...</option>';
+            if (window.FolderMultiselect) {
+                window.FolderMultiselect.setLoading();
             }
 
             const emailConfig = {
@@ -5512,35 +5517,43 @@ ${attachmentsHtml}
 
             const folders = await TauriService.listImapFolders(emailConfig);
 
-            if (selectElement) {
-                selectElement.innerHTML = '';
-                if (folders && folders.length > 0) {
-                    const allOption = document.createElement('option');
-                    allOption.value = '';
-                    allOption.textContent = 'Default';
-                    selectElement.appendChild(allOption);
+            if (window.FolderMultiselect) {
+                const filteredFolders = (folders || []).filter(folder =>
+                    folder.toLowerCase() !== 'sent'
+                );
+                // Only keep prior selections that still exist on the server.
+                const filteredSet = new Set(filteredFolders);
+                let restoreSelection = previousSelection.filter(name => filteredSet.has(name));
 
-                    const filteredFolders = folders.filter(folder =>
-                        folder.toLowerCase() !== 'sent'
-                    );
-
-                    filteredFolders.forEach(folder => {
-                        const option = document.createElement('option');
-                        option.value = folder;
-                        option.textContent = folder;
-                        selectElement.appendChild(option);
-                    });
-                    selectElement.disabled = false;
-
-                    if (previousValue && Array.from(selectElement.options).some(o => o.value === previousValue)) {
-                        selectElement.value = previousValue;
+                // No usable saved selection? Pre-select the provider-aware
+                // defaults so users SEE what will be synced as pills (rather
+                // than as ghosted placeholder text). Mirrors the backend's
+                // default logic: static defaults + any folder whose name
+                // contains spam/junk/bulk. setOptions calls setValue with
+                // silent=true so this doesn't trigger autosave — the user's
+                // persisted "" stays "" until they actively change something.
+                if (restoreSelection.length === 0) {
+                    const settings = appState.getSettings() || {};
+                    let staticDefaults = [];
+                    try {
+                        staticDefaults = await TauriService.getDefaultInboxFolders(settings.imap_host || '');
+                    } catch (e) {
+                        console.warn('[EMAIL-SERVICE] getDefaultInboxFolders failed:', e);
                     }
-                } else {
-                    const option = document.createElement('option');
-                    option.disabled = true;
-                    option.textContent = 'No folders found';
-                    selectElement.appendChild(option);
+                    const effective = new Set();
+                    for (const name of (staticDefaults || [])) {
+                        if (filteredSet.has(name)) effective.add(name);
+                    }
+                    for (const name of filteredFolders) {
+                        const lower = name.toLowerCase();
+                        if (lower.includes('spam') || lower.includes('junk') || lower.includes('bulk')) {
+                            effective.add(name);
+                        }
+                    }
+                    restoreSelection = Array.from(effective);
                 }
+
+                window.FolderMultiselect.setOptions(filteredFolders, restoreSelection);
             }
 
             console.log(`[EMAIL-SERVICE] Loaded ${folders?.length || 0} folders`);
@@ -5549,29 +5562,16 @@ ${attachmentsHtml}
             console.error('Failed to list IMAP folders:', error);
             if (!silent) notificationService.showError('Failed to list IMAP folders: ' + error);
 
-            const selectElement = document.getElementById('inbox-folder-preference');
-            if (selectElement) {
+            if (window.FolderMultiselect) {
                 if (silent) {
                     // Background refresh failed (network down, wrong creds, account
-                    // mid-switch). Leave the dropdown in a usable state with just
-                    // "Default" + the persisted folder name so the user isn't blocked.
+                    // mid-switch). Leave the dropdown in a usable state with the
+                    // persisted folder names so the user isn't blocked.
                     const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
-                    selectElement.innerHTML = '';
-                    selectElement.disabled = false;
-                    const defaultOpt = document.createElement('option');
-                    defaultOpt.value = '';
-                    defaultOpt.textContent = 'Default';
-                    selectElement.appendChild(defaultOpt);
-                    if (persistedFolder) {
-                        const opt = document.createElement('option');
-                        opt.value = persistedFolder;
-                        opt.textContent = persistedFolder;
-                        selectElement.appendChild(opt);
-                        selectElement.value = persistedFolder;
-                    }
+                    const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
+                    window.FolderMultiselect.setSelectionOnly(persistedList);
                 } else {
-                    selectElement.disabled = true;
-                    selectElement.innerHTML = '<option disabled>Failed to load folders</option>';
+                    window.FolderMultiselect.setLoading();
                 }
             }
         }
@@ -5579,6 +5579,12 @@ ${attachmentsHtml}
 
     getSelectedFolder() {
         return (appState.getSettings() || {}).inbox_folder || null;
+    }
+
+    getSelectedFolders() {
+        const raw = (appState.getSettings() || {}).inbox_folder || '';
+        const list = raw.split('\n').map(f => f.trim()).filter(Boolean);
+        return list.length > 0 ? list : null;
     }
 
     // Handle email provider selection

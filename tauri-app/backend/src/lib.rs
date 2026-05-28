@@ -4728,11 +4728,20 @@ fn glossia_get_default_wordlist(language: String) -> String {
 }
 
 #[tauri::command]
-async fn sync_nostr_emails(config: EmailConfig, folder: Option<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+async fn sync_nostr_emails(config: EmailConfig, folders: Option<Vec<String>>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     let active_pubkey = active_user_npub(&state)
         .ok_or_else(|| "No active account. Please log in first.".to_string())?;
-    email::sync_nostr_emails_to_db(&config, folder.as_deref(), &active_pubkey, &db).await.map_err(|e| e.to_string())
+    email::sync_nostr_emails_to_db(&config, folders.as_deref(), &active_pubkey, &db).await.map_err(|e| e.to_string())
+}
+
+/// Return the provider-aware default folder list for the given IMAP host.
+/// The frontend uses this to render the multiselect placeholder so the user
+/// sees the same list that the backend will actually scan when nothing is
+/// selected.
+#[tauri::command]
+fn get_default_inbox_folders(imap_host: String) -> Vec<String> {
+    email::default_inbox_folders(&imap_host)
 }
 
 /// Clear the UID-based sync watermark for one folder so the next sync
@@ -6831,6 +6840,7 @@ pub fn run() {
         db_get_all_relays,
         db_delete_relay,
         sync_nostr_emails,
+        get_default_inbox_folders,
         reset_folder_sync_state,
         sync_sent_emails,
         sync_all_emails,

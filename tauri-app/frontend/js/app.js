@@ -3408,6 +3408,18 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
             const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
             if (window.FolderMultiselect) {
                 window.FolderMultiselect.setSelectionOnly(persistedList);
+                // Reflect the backend's provider-aware defaults in the
+                // placeholder so the user can see what "no selection" will
+                // sync. The backend also auto-adds any *spam*-named folder at
+                // sync time; signal that with an ellipsis + a note in the
+                // help text.
+                TauriService.getDefaultInboxFolders(settings.imap_host).then(defaults => {
+                    if (defaults && defaults.length > 0) {
+                        window.FolderMultiselect.setPlaceholder(
+                            `Default (${defaults.join(', ')}, + any 'Spam' folders)`
+                        );
+                    }
+                }).catch(() => { /* placeholder stays at the initial value */ });
             }
             if (window.emailService) {
                 window.emailService.listImapFolders({ silent: true }).catch(err => {

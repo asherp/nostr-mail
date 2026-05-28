@@ -424,6 +424,21 @@ const TauriService = {
         return await this.invoke('sync_nostr_emails', { config: emailConfig, folders: foldersArg });
     },
 
+    /* Provider-aware default folder list for the inbox-folder placeholder.
+       Mirrors the backend's `default_inbox_folders` — the source of truth for
+       what gets scanned when the user has nothing selected. The backend also
+       appends any server folder whose name contains "spam" at sync time;
+       that expansion isn't visible here since it needs a live connection. */
+    getDefaultInboxFolders: async function(imapHost) {
+        if (!imapHost) return [];
+        try {
+            return await this.invoke('get_default_inbox_folders', { imapHost });
+        } catch (err) {
+            console.warn('[TAURI] get_default_inbox_folders failed:', err);
+            return [];
+        }
+    },
+
     syncSentEmails: async function() {
         const settings = window.appState?.getSettings();
         const keypair = window.appState?.getKeypair();

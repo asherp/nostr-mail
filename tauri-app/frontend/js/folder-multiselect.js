@@ -151,6 +151,17 @@
         ts.enable();
     }
 
+    /* Update the empty-state placeholder shown when nothing is selected.
+       Called by the settings-load path after fetching provider-aware defaults
+       from the backend, so the text reflects what will actually be synced. */
+    function setPlaceholder(text) {
+        const ts = ensureInstance();
+        if (!ts) return;
+        ts.settings.placeholder = text;
+        const inputEl = ts.control_input;
+        if (inputEl) inputEl.setAttribute('placeholder', text);
+    }
+
     window.FolderMultiselect = {
         ensureInstance,
         setOptions,
@@ -158,6 +169,7 @@
         getSelection,
         setLoading,
         setReady,
+        setPlaceholder,
         ALL_MAIL_FOLDER,
     };
 })();

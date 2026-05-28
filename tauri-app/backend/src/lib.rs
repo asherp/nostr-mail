@@ -6330,6 +6330,16 @@ fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String
 }
 
 #[tauri::command]
+fn db_check_dms_match_email_encrypted_batch(
+    dm_event_ids: Vec<String>,
+    state: tauri::State<AppState>,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    db.check_dms_match_email_encrypted_batch(&dm_event_ids)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn db_update_email_subject_hash(message_id: String, subject_hash: String, state: tauri::State<AppState>) -> Result<(), String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     db.update_email_subject_hash(&message_id, &subject_hash).map_err(|e| e.to_string())
@@ -6853,6 +6863,7 @@ pub fn run() {
         db_delete_inbox_email,
         db_mark_as_read,
         db_check_dm_matches_email_encrypted,
+        db_check_dms_match_email_encrypted_batch,
         db_get_matching_email_id,
         db_get_matching_email_body,
         db_update_email_subject_hash,

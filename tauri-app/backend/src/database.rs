@@ -2584,6 +2584,164 @@ impl Database {
         }
     }
 
+    /// Batched version of the single-event DM↔email match check.
+    /// Returns a map from event_id -> has_match. Mirrors the semantics of
+    /// `db_check_dm_matches_email_encrypted`: prefer the NIP-17 message-id
+    /// rumor-tag exact link, fall back to subject_hash matching.
+    /// Holds the DB lock once and issues at most three SQL statements
+    /// regardless of how many event_ids are passed in.
+    pub fn check_dms_match_email_encrypted_batch(
+        &self,
+        event_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        use std::collections::HashMap;
+
+        let mut result: HashMap<String, bool> = HashMap::new();
+        if event_ids.is_empty() {
+            return Ok(result);
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // 1. Pull all (event_id, email_message_id, content_hash, content) rows for the
+        //    requested DMs in one query.
+        struct DmRow {
+            event_id: String,
+            email_message_id: Option<String>,
+            content_hash: Option<String>,
+            content: String,
+        }
+        let placeholders = event_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT event_id, email_message_id, content_hash, content
+             FROM direct_messages WHERE event_id IN ({})",
+            placeholders
+        );
+        let params: Vec<Box<dyn rusqlite::ToSql>> = event_ids
+            .iter()
+            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        let rows: Vec<DmRow> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let iter = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(DmRow {
+                    event_id: row.get(0)?,
+                    email_message_id: row.get(1)?,
+                    content_hash: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in iter {
+                out.push(r?);
+            }
+            out
+        };
+
+        // 2. Compute and persist any missing content_hashes so subject_hash matching
+        //    can run uniformly below (mirrors the lazy-fill in the single-event path).
+        let mut filled_hash: HashMap<String, String> = HashMap::new();
+        for row in &rows {
+            if row.content_hash.is_none() {
+                let hash = Self::compute_content_hash(&row.content);
+                conn.execute(
+                    "UPDATE direct_messages SET content_hash = ? WHERE event_id = ?",
+                    params![hash, row.event_id],
+                )?;
+                filled_hash.insert(row.event_id.clone(), hash);
+            }
+        }
+
+        for row in &rows {
+            result.entry(row.event_id.clone()).or_insert(false);
+        }
+        for ev in event_ids {
+            result.entry(ev.clone()).or_insert(false);
+        }
+
+        // 3. Pass 1 — NIP-17 message-id matches.
+        let mut mid_to_events: HashMap<String, Vec<String>> = HashMap::new();
+        for row in &rows {
+            if let Some(mid) = &row.email_message_id {
+                if !mid.is_empty() {
+                    let normalized = Self::normalize_message_id(mid);
+                    mid_to_events.entry(normalized).or_default().push(row.event_id.clone());
+                }
+            }
+        }
+        if !mid_to_events.is_empty() {
+            let mids: Vec<&String> = mid_to_events.keys().collect();
+            let placeholders = mids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) AS normalized_id
+                 FROM emails
+                 WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) IN ({})
+                   AND is_nostr_encrypted = 1",
+                placeholders
+            );
+            let mid_params: Vec<Box<dyn rusqlite::ToSql>> = mids
+                .iter()
+                .map(|s| Box::new((*s).clone()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let iter = stmt.query_map(rusqlite::params_from_iter(mid_params.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for r in iter {
+                if let Ok(mid) = r {
+                    if let Some(evs) = mid_to_events.get(&mid) {
+                        for ev in evs {
+                            result.insert(ev.clone(), true);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Pass 2 — subject_hash fallback for any DMs not yet matched.
+        let mut hash_to_events: HashMap<String, Vec<String>> = HashMap::new();
+        for row in &rows {
+            if result.get(&row.event_id).copied().unwrap_or(false) {
+                continue;
+            }
+            let hash = row
+                .content_hash
+                .clone()
+                .or_else(|| filled_hash.get(&row.event_id).cloned());
+            if let Some(hash) = hash {
+                hash_to_events.entry(hash).or_default().push(row.event_id.clone());
+            }
+        }
+        if !hash_to_events.is_empty() {
+            let hashes: Vec<&String> = hash_to_events.keys().collect();
+            let placeholders = hashes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT subject_hash FROM emails
+                 WHERE subject_hash IN ({}) AND is_nostr_encrypted = 1",
+                placeholders
+            );
+            let hash_params: Vec<Box<dyn rusqlite::ToSql>> = hashes
+                .iter()
+                .map(|s| Box::new((*s).clone()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let iter = stmt.query_map(rusqlite::params_from_iter(hash_params.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for r in iter {
+                if let Ok(h) = r {
+                    if let Some(evs) = hash_to_events.get(&h) {
+                        for ev in evs {
+                            result.insert(ev.clone(), true);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     pub fn get_email_by_id(&self, id: i64) -> Result<Option<Email>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

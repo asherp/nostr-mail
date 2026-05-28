@@ -196,6 +196,26 @@ class DMService {
         });
     }
 
+    // Batched check: returns a Map<event_id, bool> for the given event_ids.
+    // Empty input short-circuits to an empty Map (no IPC call).
+    async _fetchEmailMatchMap(eventIds) {
+        const map = new Map();
+        if (!eventIds || eventIds.length === 0) return map;
+        try {
+            const obj = await window.__TAURI__.core.invoke('db_check_dms_match_email_encrypted_batch', {
+                dmEventIds: eventIds
+            });
+            if (obj && typeof obj === 'object') {
+                for (const [k, v] of Object.entries(obj)) {
+                    map.set(k, !!v);
+                }
+            }
+        } catch (error) {
+            console.error('[JS] Batched email-match check failed:', error);
+        }
+        return map;
+    }
+
     async _decryptDmContent(encryptedContent, contactPubkey) {
         const keypair = window.appState.getKeypair();
         if (!keypair) return '[No keypair]';
@@ -220,12 +240,13 @@ class DMService {
 
         // Decrypt each message — use the other party's pubkey for the shared secret.
         // Preserve the original ciphertext on `raw_content` so the debug-info modal
-        // can show what's actually stored in the DB.
-        for (const msg of rawMessages) {
+        // can show what's actually stored in the DB. Decryption calls are independent,
+        // so run them in parallel to avoid serializing N IPC round trips.
+        await Promise.all(rawMessages.map(async (msg) => {
             const otherPubkey = (msg.sender_pubkey === myPubkey) ? msg.recipient_pubkey : msg.sender_pubkey;
             msg.raw_content = msg.content;
             msg.content = await this._decryptDmContent(msg.content, otherPubkey);
-        }
+        }));
 
         return rawMessages;
     }
@@ -822,29 +843,27 @@ class DMService {
         // Check if messages are already cached (skip cache if forceRefresh is true)
         const cachedMessages = window.appState.getDmMessages(contactPubkey);
         if (cachedMessages && cachedMessages.length > 0 && !forceRefresh) {
-            try {                // Even with cached messages, we need to check for email matches
-                const messagesWithEmailMatches = await Promise.all(cachedMessages.map(async (msg) => {
-                    // Check if this DM content matches an encrypted email subject (only if event_id exists)
-                    let hasEmailMatch = false;
-                    if (msg.event_id) {
-                        try {
-                            const contentPreview = msg.content ? msg.content.substring(0, 50) : '(no content)';                            hasEmailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
-                                dmEventId: msg.event_id,
-                                userPubkey: myPubkey,
-                                contactPubkey: contactPubkey
-                            });                        } catch (error) {
-                            console.error(`[JS] Error checking email match for cached message:`, error);
-                            hasEmailMatch = false;
-                        }
-                    }
-                    
+            try {
+                // Only re-query email matches for messages not already known as `true`.
+                // A confirmed match never becomes a non-match, so we trust cached `true`.
+                // `false`/undefined values are re-checked in case a matching email arrived
+                // since the last render. The whole set is queried in one Tauri call.
+                const toCheck = cachedMessages
+                    .filter((m) => m.event_id && m.hasEmailMatch !== true)
+                    .map((m) => m.event_id);
+                const matchMap = await this._fetchEmailMatchMap(toCheck);
+
+                const messagesWithEmailMatches = cachedMessages.map((msg) => {
+                    const hasEmailMatch = msg.event_id
+                        ? (msg.hasEmailMatch === true || matchMap.get(msg.event_id) === true)
+                        : false;
                     return {
                         ...msg,
                         event_id: msg.event_id || null,
-                        hasEmailMatch: hasEmailMatch
+                        hasEmailMatch
                     };
-                }));
-                
+                });
+
                 window.appState.setDmMessages(contactPubkey, messagesWithEmailMatches);
                 this.renderDmMessages(contactPubkey);
                 return;
@@ -853,52 +872,40 @@ class DMService {
                 // Fall through to fetch fresh messages
             }
         }
-        
+
         try {
             // Fetch and decrypt messages in the frontend (supports glossia-encoded DMs)
             const messages = await this._fetchAndDecryptDms(contactPubkey);
-            
+
             if (!messages || !Array.isArray(messages)) {
                 console.error('[JS] Invalid messages response:', messages);
                 window.notificationService.showError('Failed to load messages: invalid response');
                 return;
             }
-            
-            // Check for email matches for each message
-            const formattedMessages = await Promise.all(messages.map(async (msg) => {
-                // Check if this DM content matches an encrypted email subject (only if event_id exists)
-                let hasEmailMatch = false;
-                if (msg.event_id) {
-                    try {
-                        const contentPreview = msg.content ? msg.content.substring(0, 50) : '(no content)';                        hasEmailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
-                            dmEventId: msg.event_id,
-                            userPubkey: myPubkey,
-                            contactPubkey: contactPubkey
-                        });                    } catch (error) {
-                        console.error(`[JS] Error checking email match for message:`, error);
-                        hasEmailMatch = false;
-                    }
-                }
-                
-                return {
-                    id: msg.id,
-                    event_id: msg.event_id || null,
-                    content: msg.content || '',
-                    created_at: msg.created_at || msg.timestamp,
-                    sender_pubkey: msg.sender_pubkey,
-                    // Preserve the rest of the DirectMessage shape so the debug
-                    // modal can show the full record. These fields don't affect
-                    // rendering but are essential for diagnosing send/receive
-                    // issues from the in-app inspector.
-                    recipient_pubkey: msg.recipient_pubkey ?? null,
-                    received_at: msg.received_at ?? null,
-                    email_message_id: msg.email_message_id ?? null,
-                    received_from_relay: msg.received_from_relay ?? null,
-                    raw_content: msg.raw_content ?? null,
-                    is_sent: msg.sender_pubkey === myPubkey,
-                    confirmed: true, // All DB messages are confirmed
-                    hasEmailMatch: hasEmailMatch // New field to track email matches
-                };
+
+            // Check for email matches for all messages in a single batched call.
+            const matchMap = await this._fetchEmailMatchMap(
+                messages.filter((m) => m.event_id).map((m) => m.event_id)
+            );
+
+            const formattedMessages = messages.map((msg) => ({
+                id: msg.id,
+                event_id: msg.event_id || null,
+                content: msg.content || '',
+                created_at: msg.created_at || msg.timestamp,
+                sender_pubkey: msg.sender_pubkey,
+                // Preserve the rest of the DirectMessage shape so the debug
+                // modal can show the full record. These fields don't affect
+                // rendering but are essential for diagnosing send/receive
+                // issues from the in-app inspector.
+                recipient_pubkey: msg.recipient_pubkey ?? null,
+                received_at: msg.received_at ?? null,
+                email_message_id: msg.email_message_id ?? null,
+                received_from_relay: msg.received_from_relay ?? null,
+                raw_content: msg.raw_content ?? null,
+                is_sent: msg.sender_pubkey === myPubkey,
+                confirmed: true, // All DB messages are confirmed
+                hasEmailMatch: msg.event_id ? (matchMap.get(msg.event_id) === true) : false
             }));
             
             window.appState.setDmMessages(contactPubkey, formattedMessages);

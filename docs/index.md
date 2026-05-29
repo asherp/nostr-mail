@@ -26,15 +26,16 @@ Nostr-mail aims to improve privacy for the average person by bridging the gap be
 - **SMTP Email Sending**: Send emails through configured SMTP servers
 - **IMAP Email Fetching**: Fetch and display emails from IMAP servers
 - **Email Composition**: Rich email composition with subject, body, and recipient fields
+- **Threading**: Group related emails into conversation threads (In-Reply-To / References)
 - **Draft Saving**: Save email drafts locally for later completion
 - **Email Preview**: View email list with sender, subject, and preview text
 - **Email Details**: Full email viewing with formatted content
 - **Attachment Support**: Encrypt and send file attachments using hybrid encryption
 
 ### 🔐 Nostr Integration
-- **Key Management**: Generate and manage Nostr keypairs (nsec/npriv format)
+- **Multi-Account Key Management**: Generate and manage multiple Nostr keypairs, stored in the OS secure keychain, with an account switcher
 - **Profile Management**: Create and update Nostr profiles with metadata
-- **Direct Messages**: Send and receive encrypted direct messages via Nostr
+- **Direct Messages**: Send and receive encrypted direct messages via Nostr (NIP-17 gift wrap, with NIP-04 fallback)
 - **Relay Management**: Configure and manage Nostr relays with enable/disable controls
 - **Contact Discovery**: Automatically load contacts from your Nostr follow list
 - **Profile Caching**: Cache profile data and images for offline access
@@ -73,7 +74,10 @@ Nostr-mail aims to improve privacy for the average person by bridging the gap be
 ### Encryption
 - **NIP-44**: Default encryption standard (recommended)
 - **NIP-04**: Legacy encryption support for backward compatibility
+- **NIP-17**: Gift-wrapped direct messages that hide metadata from relays
+- **Glossia Encoding**: Render ciphertext as readable text so encrypted mail survives forwarding and reply quoting
 - **Hybrid Encryption**: AES-256 for large attachments, NIP-44 for keys
+- **Signing**: Sign and verify emails with your Nostr key, optionally via X-Nostr headers
 
 ## Getting Started
 
@@ -84,6 +88,7 @@ Ready to get started? Check out the [Installation Guide](installation.md) and [Q
 ### User Guides
 - [Installation](installation.md) - Set up nostr-mail on your system
 - [Quick Start](quick-start.md) - Get up and running quickly
+- [Accounts & Keys](pages/accounts.md) - Multi-account login and key storage
 - [Nostr Clients](nostr-clients.md) - Use nostr-mail with Amethyst, Damus, and other Nostr clients
 - [Compose Page](pages/compose.md) - Create and send encrypted emails
 - [Inbox Page](pages/inbox.md) - View and manage received emails
@@ -94,11 +99,22 @@ Ready to get started? Check out the [Installation Guide](installation.md) and [Q
 - [Profile Page](pages/profile.md) - Manage your Nostr profile
 - [Settings Page](pages/settings.md) - Configure all application settings
 
+### Encryption & Privacy
+- [Encryption & Signing](encryption.md) - How encryption, signing, NIP-17 DMs, and X-Nostr headers work
+- [Glossia Encoding](glossia.md) - Render ciphertext as readable text
+- [NIP-44 Encryption](nip44.md) - Encryption standard details
+
 ### Technical Documentation
 - [Architecture](architecture.md) - Project structure and data flow
+- [Encryption Architecture](encryption-architecture.md) - Internal encryption/encoding flow
 - [Development](development.md) - Building and development workflow
-- [NIP-44 Encryption](nip44.md) - Encryption standard details
+- [Tech Stack](Techstack.md) - Building blocks and dependencies
+
+### Protocol & Specification
+- [Nostr-Mail Protocol Specification](nostr-mail-spec.md) - Wire format for armor blocks and headers
+- [NIP Proposal](NIP.md) - Draft NIP for email alongside Nostr
 - [Glossia Design Philosophy](glossia-design.md) - Why glossia uses text/plain, not multipart/alternative
+- [Related Work](related_work.md) - Other approaches considered
 
 ### Legacy Documentation
 - [Legacy Docker Setup](legacy.md) - Old Docker/Python setup documentation

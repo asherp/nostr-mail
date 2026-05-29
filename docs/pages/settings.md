@@ -8,31 +8,31 @@ Configure email, Nostr, relays, and application preferences.
 
 ## Key Features
 
-- **Nostr Settings**: Keypair management, encryption algorithm selection
+- **Nostr Settings**: Account login (import or generate a key)
 - **Email Settings**: SMTP and IMAP configuration
-- **Relay Settings**: Add, remove, and manage Nostr relays
-- **Advanced Settings**: Email preferences, filtering, sync options
+- **Advanced Settings**: Encryption algorithm, Glossia encoding, inbox filtering, email preferences, sync options
+- **Relay Settings**: Add, remove, and manage Nostr relays; live-event status
 - **Appearance**: Dark mode toggle
+
+Settings are saved per account (keyed by your public key), so each identity keeps its own configuration.
 
 ## Usage Instructions
 
 ### Nostr Settings
 
-#### Private Key Management
+This is where you log in to your Nostr account. For multi-account management and how keys are stored, see [Accounts & Keys](accounts.md).
 
-- Enter your nsec/npriv key or generate a new one
-- Toggle visibility, copy, or show QR code
-- Public key (npub) is automatically derived
+#### Private Key (login)
 
-#### Encryption Algorithm
-
-- Select "NIP-44 (Recommended)" or "NIP-04 (Legacy)"
-- NIP-44 is the modern, secure standard
+- Enter your nsec/npriv key to log in, or generate a new one below
+- Toggle visibility, copy, show a QR code, or scan a QR code from another device
+- Public key (npub) is automatically derived and displayed
+- Keys are stored in the **OS secure keychain**, not in the browser
 
 #### Generate Keypair
 
-- Click "Generate New Keypair" to create a new keypair
-- **Important**: Save your private key securely!
+- Click "Generate New Keypair" to create a new account
+- **Important**: Save your private key securely — there is no recovery if it is lost!
 
 ### Email Settings
 
@@ -67,23 +67,47 @@ Configure email, Nostr, relays, and application preferences.
 
 ### Advanced Settings
 
+#### Encryption Algorithm
+
+- Select "NIP-44 (Recommended)" or "NIP-04 (Legacy)"
+- NIP-44 is the modern, secure standard. Incoming mail is decrypted with either scheme automatically. See [Encryption & Signing](../encryption.md).
+
+#### Glossia Encoding
+
+Choose how each email component is encoded so it survives forwarding and reply quoting. You can set the **Ciphertext**, **Signature**, and **Pubkey** independently to:
+
+- **Latin** — natural-language encoding (default, survives email chains)
+- **English – BIP39** — BIP39 word-list encoding (survives email chains)
+- **Base64 / npub** — no word encoding; compact but ⚠️ breaks on forward/reply
+
+See the [Glossia Encoding](../glossia.md) guide for details.
+
 #### Inbox Filter
 
-- Choose "Nostr Emails Only" or "All Emails"
+- Choose "Nostr Emails Only" (encrypted, signed, or from Nostr contacts) or "All Emails"
+
+#### Inbox Folder
+
+- Choose which IMAP folder to scan for new mail. "Default" scans INBOX + the `nostr-mail` folder. The folder list loads from your IMAP server.
 
 #### Email Preferences
 
-- **Send Matching DM**: Automatically send DM when emailing Nostr contacts
+- **Send Matching DM**: Automatically send a DM with the same subject when emailing Nostr contacts
 - **Require Signatures**: Only accept emails with valid signatures
-- **Hide Undecryptable Emails**: Hide emails that can't be decrypted
-- **Automatically Encrypt**: Encrypt all outgoing emails
-- **Automatically Sign**: Sign all outgoing emails
-- **Hide Unverified**: Hide messages without verified signatures
+- **Hide Undecryptable Emails**: Hide emails that can't be decrypted with your key
+- **Automatically Encrypt**: Encrypt outgoing emails when composing
+- **Automatically Sign**: Sign outgoing emails with your Nostr key
+- **Hide Unverified**: Hide messages with missing or invalid signatures
+- **Include X-Nostr-Pubkey**: Attach the sender's public key as a header so recipients can derive the shared secret without scanning the body
+- **Include X-Nostr-Sig**: Attach a signature header over the body (requires X-Nostr-Pubkey)
+- **Include X-Nostr-Recipient**: Attach the pubkey the body was encrypted to, allowing decryption without a matching Nostr DM (useful when not using relays)
+
+See [Encryption & Signing](../encryption.md#x-nostr-email-headers) for more on the X-Nostr headers.
 
 #### Sync Settings
 
-- **Sync Cutoff**: How far back to sync emails (default: 365 days)
-- **Emails Per Page**: Number of emails per page (default: 50)
+- **Sync Cutoff (Days)**: How far back to sync emails on a new device (default: 30 days; set to 0 to sync all)
+- **Emails Per Page**: Number of emails per page in the inbox (default: 50, range 10–500)
 
 ### Appearance
 

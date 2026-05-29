@@ -2,34 +2,26 @@
 
 ## Current State
 
-This document describes how encryption, decryption, and glossia encoding currently work in nostr-mail, with a view toward migrating encryption to the Rust backend and adopting system keychain storage.
+This document describes how encryption, decryption, and glossia encoding work in nostr-mail. Encryption runs in the Rust backend and private keys are stored in the OS keychain — the migration this document once anticipated is now complete.
 
 ---
 
 ## 1. Key Management
 
-### Current: Browser-Side Storage
+### OS Keychain Storage (`keychain.rs`)
 
-Private keys live in the browser's `localStorage` as a JSON object `{ private_key: "nsec1...", public_key: "npub1..." }`.
+Private keys are stored in the OS secure keychain, not in `localStorage`. All keys for all accounts are kept in a single encrypted vault entry (`pubkey → private_key`) managed by `KeychainManager`:
 
-**Load order** (`app.js:455-492`):
-1. Try `TauriService.getDefaultPrivateKeyFromConfig()` (reads from a config file on disk)
-2. Fall back to `localStorage.getItem('nostr_keypair')`
-3. If neither exists, user must generate/import via Settings UI
+- **Desktop** (macOS/Windows/Linux): the native keychain via the `keyring` crate (service `nostr-mail`, account `vault`).
+- **Android**: a Jetpack Security `EncryptedFile` whose master key lives in the Android Keystore, written through a JNI bridge to `com.nostr.mail.VaultStorage` (the `keyring` crate has no working Android backend).
 
-**Runtime access**: `appState.getKeypair()` returns `{ private_key, public_key }` in bech32 (nsec/npub). Every crypto call passes the raw nsec string from JS to either:
-- `CryptoService` (JS/nostr-tools, in-browser), or
-- `TauriService` → Tauri IPC → Rust backend
+The vault is cached in memory for the session, so the OS prompts for keychain access at most once per launch.
 
-**Multi-account**: `ProfileManager` stores multiple `{ private_key, public_key }` objects in `localStorage`. Switching calls `appState.setKeypair(keypair)` and re-initializes.
+**Multi-account** (`keychain_*` commands): accounts are added/generated/removed and switched via the keychain vault. The active account is tracked separately; per-account data (settings, contacts, emails, DMs) is keyed by public key in the database.
+
+**Migration**: older builds that kept keys in `localStorage` are migrated into the keychain on first launch (`keychain_migrate_from_frontend`), after which the plaintext `localStorage` copies are removed and a `nostr_mail_keychain_migrated` flag is set.
 
 **Settings encryption**: Sensitive settings (IMAP/SMTP passwords) are encrypted with AES-256-GCM using a key derived from `SHA-256("nostr-mail-settings-encryption-v1:" + secret_key_bytes)`. This happens in both the frontend (`CryptoService.encryptSettingValue`) and backend (`crypto::encrypt_setting_value`).
-
-### Problem
-
-- Private keys stored in plaintext in localStorage (accessible to any JS in the page)
-- Keys are passed over Tauri IPC as strings on every encrypt/decrypt call
-- No OS-level protection (no keychain, no hardware-backed storage)
 
 ---
 

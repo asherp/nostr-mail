@@ -109,9 +109,10 @@ Both workflows also support `workflow_dispatch` from the Actions tab, useful for
 
 ### Backend
 
-- **Command Handlers**: Tauri commands defined in `main.rs`
-- **Business Logic**: Feature-specific logic in separate modules (`email.rs`, `nostr.rs`, etc.)
+- **Command Handlers**: Tauri commands are defined in `lib.rs` and registered via `tauri::generate_handler!`. `main.rs` is a thin shim that calls `lib::run`.
+- **Business Logic**: Feature-specific logic in separate modules (`email.rs`, `nostr.rs`, `crypto.rs`, etc.)
 - **Database Layer**: SQLite operations in `database.rs`
+- **Key Storage**: OS-keychain vault in `keychain.rs`
 - **Type Safety**: Shared types in `types.rs`
 
 ## Debugging

@@ -4784,7 +4784,7 @@ async fn fetch_older_inbox_emails(
     folder: Option<String>,
     page_size: usize,
     state: tauri::State<'_, AppState>,
-) -> Result<usize, String> {
+) -> Result<email::FetchOlderSummary, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     let active_pubkey = active_user_npub(&state)
         .ok_or_else(|| "No active account. Please log in first.".to_string())?;
@@ -4798,7 +4798,7 @@ async fn fetch_older_sent_emails(
     config: EmailConfig,
     page_size: usize,
     state: tauri::State<'_, AppState>,
-) -> Result<usize, String> {
+) -> Result<email::FetchOlderSummary, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     let active_pubkey = active_user_npub(&state)
         .ok_or_else(|| "No active account. Please log in first.".to_string())?;

@@ -5084,16 +5084,28 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     Ok(new_count)
 }
 
-/// Backward UID pagination for the inbox. Walks `page_size` UIDs back per
-/// folder past the stored `min_seen_uid` floor, persists matches, and lowers
-/// the floor. Returns the number of newly-inserted rows across all folders.
+/// Summary of one `fetch_older_*_emails_to_db` call. `new_count` is the rows
+/// newly inserted into the DB across all scanned folders. `hit_bottom` is
+/// true only when every scanned folder walked all the way to UID 1 — i.e.
+/// there's nothing older on the server to find. When false, the per-call
+/// scan budget was exhausted before reaching bottom and another call may
+/// yield more.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FetchOlderSummary {
+    pub new_count: usize,
+    pub hit_bottom: bool,
+}
+
+/// Backward UID pagination for the inbox. Walks UIDs back per folder past
+/// the stored `min_seen_uid` floor, persists matches, and lowers the floor.
+/// Returns counts plus a `hit_bottom` aggregate over all folders.
 pub async fn fetch_older_inbox_emails_to_db(
     config: &EmailConfig,
     folder: Option<&str>,
     page_size: usize,
     active_pubkey: &str,
     db: &Database,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<FetchOlderSummary> {
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
@@ -5108,9 +5120,14 @@ pub async fn fetch_older_inbox_emails_to_db(
         account_key, folders, page_size
     );
 
-    // (folder, new_floor_uid) pairs to apply after a successful persist pass.
     let mut pending_floors: Vec<(String, u32)> = Vec::new();
     let mut raw_emails: Vec<RawNostrEmail> = Vec::new();
+    // Folder is "exhausted" iff fetch_older_in_folder reported hit_bottom
+    // for it. Overall hit_bottom = all scanned folders exhausted, AND at
+    // least one folder was scanned successfully. Folder errors are treated
+    // as "not exhausted" — the caller may want to retry.
+    let mut any_folder_scanned = false;
+    let mut all_folders_exhausted = true;
 
     let host = &config.imap_host;
     let port = config.imap_port;
@@ -5126,12 +5143,17 @@ pub async fn fetch_older_inbox_emails_to_db(
                                          page_size, sync_cutoff_days,
                                          parse_nostr_email_from_imap_body) {
                 Ok(r) => {
+                    any_folder_scanned = true;
+                    if !r.hit_bottom { all_folders_exhausted = false; }
                     if let Some(new_floor) = r.new_floor_uid {
                         pending_floors.push((f.clone(), new_floor));
                     }
                     raw_emails.extend(r.emails);
                 }
-                Err(e) => debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e),
+                Err(e) => {
+                    debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e);
+                    all_folders_exhausted = false;
+                }
             }
         }
     } else {
@@ -5143,21 +5165,23 @@ pub async fn fetch_older_inbox_emails_to_db(
                                          page_size, sync_cutoff_days,
                                          parse_nostr_email_from_imap_body) {
                 Ok(r) => {
+                    any_folder_scanned = true;
+                    if !r.hit_bottom { all_folders_exhausted = false; }
                     if let Some(new_floor) = r.new_floor_uid {
                         pending_floors.push((f.clone(), new_floor));
                     }
                     raw_emails.extend(r.emails);
                 }
-                Err(e) => debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e),
+                Err(e) => {
+                    debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e);
+                    all_folders_exhausted = false;
+                }
             }
         }
     }
 
     let new_count = persist_inbox_raw_emails(raw_emails, db, require_signature)?;
 
-    // Lower the floor for each folder we touched. Persist AFTER save so a
-    // partial-failure earlier returned Err and we never lowered the floor
-    // past messages we didn't actually persist.
     for (folder_name, new_floor) in pending_floors {
         if let Err(e) = db.set_folder_min_seen_uid(&account_key, &folder_name, new_floor) {
             println!(
@@ -5172,11 +5196,12 @@ pub async fn fetch_older_inbox_emails_to_db(
         }
     }
 
+    let hit_bottom = any_folder_scanned && all_folders_exhausted;
     println!(
-        "[RUST] fetch_older_inbox_emails_to_db: completed, {} new emails saved",
-        new_count
+        "[RUST] fetch_older_inbox_emails_to_db: completed, {} new emails saved, hit_bottom={}",
+        new_count, hit_bottom
     );
-    Ok(new_count)
+    Ok(FetchOlderSummary { new_count, hit_bottom })
 }
 
 /// Backward UID pagination for the sent folder. See `fetch_older_inbox_emails_to_db`.
@@ -5185,7 +5210,7 @@ pub async fn fetch_older_sent_emails_to_db(
     page_size: usize,
     active_pubkey: &str,
     db: &Database,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<FetchOlderSummary> {
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
 
@@ -5198,6 +5223,8 @@ pub async fn fetch_older_sent_emails_to_db(
 
     let mut pending_floors: Vec<(String, u32)> = Vec::new();
     let mut raw_emails: Vec<RawNostrEmail> = Vec::new();
+    let mut any_folder_scanned = false;
+    let mut all_folders_exhausted = true;
 
     if config.use_tls {
         let client = create_imap_tls_client!(host, &addr)?;
@@ -5209,12 +5236,17 @@ pub async fn fetch_older_sent_emails_to_db(
                                          page_size, sync_cutoff_days,
                                          parse_nostr_sent_email_from_imap_body) {
                 Ok(r) => {
+                    any_folder_scanned = true;
+                    if !r.hit_bottom { all_folders_exhausted = false; }
                     if let Some(new_floor) = r.new_floor_uid {
                         pending_floors.push((f.to_string(), new_floor));
                     }
                     raw_emails.extend(r.emails);
                 }
-                Err(e) => debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e),
+                Err(e) => {
+                    debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e);
+                    all_folders_exhausted = false;
+                }
             }
         }
     } else {
@@ -5228,20 +5260,23 @@ pub async fn fetch_older_sent_emails_to_db(
                                          page_size, sync_cutoff_days,
                                          parse_nostr_sent_email_from_imap_body) {
                 Ok(r) => {
+                    any_folder_scanned = true;
+                    if !r.hit_bottom { all_folders_exhausted = false; }
                     if let Some(new_floor) = r.new_floor_uid {
                         pending_floors.push((f.to_string(), new_floor));
                     }
                     raw_emails.extend(r.emails);
                 }
-                Err(e) => debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e),
+                Err(e) => {
+                    debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e);
+                    all_folders_exhausted = false;
+                }
             }
         }
     }
 
-    // Sent emails use the same persist contract but never apply the
-    // require_signature filter — own outgoing mail isn't expected to carry
-    // a verifiable transport signature, and the existing forward-sync path
-    // already skips that filter for sent.
+    // Sent emails skip the require_signature filter — see the forward sync
+    // path for the same exception.
     let new_count = persist_inbox_raw_emails(raw_emails, db, /* require_signature */ false)?;
 
     for (folder_name, new_floor) in pending_floors {
@@ -5258,11 +5293,12 @@ pub async fn fetch_older_sent_emails_to_db(
         }
     }
 
+    let hit_bottom = any_folder_scanned && all_folders_exhausted;
     println!(
-        "[RUST] fetch_older_sent_emails_to_db: completed, {} new emails saved",
-        new_count
+        "[RUST] fetch_older_sent_emails_to_db: completed, {} new emails saved, hit_bottom={}",
+        new_count, hit_bottom
     );
-    Ok(new_count)
+    Ok(FetchOlderSummary { new_count, hit_bottom })
 }
 
 pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
@@ -5789,20 +5825,28 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
 struct FetchOlderResult {
     emails: Vec<RawNostrEmail>,
     new_floor_uid: Option<u32>,
+    // True iff we walked through every candidate UID strictly below the
+    // current floor without finding more (or there were none). Distinguishes
+    // "real bottom of the folder" from "we exhausted this call's scan budget
+    // and there might still be more older nostr mail further down".
+    hit_bottom: bool,
 }
 
-/// Pull `page_size` older messages from one folder, walking UIDs backward.
+/// Pull older messages from one folder, walking UIDs backward.
 ///
 /// Requires a prior forward sync (folder_sync_state row must exist). Backfills
 /// `min_seen_uid` on the first call by replaying the bootstrap UID SEARCH —
 /// that gives us a deterministic floor instead of guessing.
 ///
-/// Workflow:
-/// 1. SELECT folder, verify UIDVALIDITY matches stored.
-/// 2. Resolve the current floor (`min_seen_uid`, or backfilled).
-/// 3. `UID SEARCH UID 1:floor-1`.
-/// 4. Take the top `page_size` UIDs (newest among the older), UID FETCH them.
-/// 5. Return them + the new floor (= the lowest UID we just touched).
+/// Walks newest-to-oldest from `min_seen_uid - 1`, fetching full bodies and
+/// running `parse_fn`. Stops when either:
+///   * `page_size` nostr matches have accumulated, OR
+///   * `max(page_size, MIN_SCAN_PER_CALL)` UIDs have been scanned, OR
+///   * the candidate set is exhausted (`hit_bottom = true`).
+///
+/// Scanning more than `page_size` matters when the folder is mostly non-nostr
+/// mail — common for Sent. Without it, one batch of non-matches looks like
+/// "bottom hit" and the UI gives up prematurely.
 fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     config: &EmailConfig,
@@ -5820,23 +5864,17 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
     let stored = match db.get_folder_sync_state(account_key, folder_name)? {
         Some(s) => s,
         None => {
-            // No forward sync has run for this folder yet. Bail rather than
-            // bootstrap from here — the regular sync path is responsible for
-            // initial population.
             debug_log!("[RUST] fetch_older_in_folder: '{}' has no sync state, run forward sync first", folder_name);
-            return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None });
+            return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false });
         }
     };
 
     if stored.uid_validity != uid_validity {
         debug_log!("[RUST] fetch_older_in_folder: '{}' UIDVALIDITY changed ({} -> {}), aborting backward fetch",
             folder_name, stored.uid_validity, uid_validity);
-        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None });
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false });
     }
 
-    // Resolve the floor. If we have no stored min, replay the bootstrap UID
-    // SEARCH (same query the initial forward sync used) and take its min UID
-    // as the floor. This is a metadata-only operation — no body fetch.
     let floor_uid = match stored.min_seen_uid {
         Some(v) => v,
         None => {
@@ -5845,7 +5883,7 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
                 folder_name, bootstrap_query);
             let set = session.uid_search(&bootstrap_query)?;
             if set.is_empty() {
-                return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None });
+                return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false });
             }
             let backfilled_min = set.into_iter().min().unwrap_or(0);
             db.set_folder_min_seen_uid(account_key, folder_name, backfilled_min)?;
@@ -5854,46 +5892,76 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
     };
 
     if floor_uid <= 1 {
-        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None });
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: true });
     }
 
-    // Look for UIDs strictly below the current floor.
     let query = format!("UID 1:{}", floor_uid - 1);
     debug_log!("[RUST] fetch_older_in_folder: '{}' UID SEARCH {}", folder_name, query);
     let uid_set = session.uid_search(&query)?;
     if uid_set.is_empty() {
-        // Server has nothing below the floor — mark the bottom by setting
-        // floor to 1 so subsequent calls short-circuit.
-        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: Some(1) });
+        // Server has nothing below the floor — mark bottom so subsequent
+        // calls short-circuit (floor moves to 1, hit_bottom signals UI).
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: Some(1), hit_bottom: true });
     }
 
     let mut uids: Vec<u32> = uid_set.into_iter().collect();
     uids.sort_unstable();
-    // Top `page_size` are the newest of the older messages — typically what
-    // the user expects when scrolling past the bottom.
-    let take = uids.len().min(page_size.max(1));
-    let page: Vec<u32> = uids[uids.len() - take..].to_vec();
-    let new_floor_uid = *page.first().expect("non-empty by construction");
-    debug_log!("[RUST] fetch_older_in_folder: '{}' fetching {} older UIDs ({}..={}), new_floor will be {}",
-        folder_name, page.len(), new_floor_uid, page.last().copied().unwrap_or(0), new_floor_uid);
 
-    const FETCH_BATCH: usize = 500;
+    // Per-call scan budget. `page_size` of 5 with a folder dominated by
+    // non-nostr mail would otherwise terminate at the first batch of misses.
+    // Keep this generous enough to walk through the common pattern of a few
+    // non-nostr in between nostr matches, but small enough that one scroll
+    // trigger doesn't pull megabytes of unrelated bodies. 50 hits a
+    // reasonable middle.
+    const MIN_SCAN_PER_CALL: usize = 50;
+    let target_count = page_size.max(1);
+    let max_scan = target_count.max(MIN_SCAN_PER_CALL);
+
     let mut emails: Vec<RawNostrEmail> = Vec::new();
-    for chunk in page.chunks(FETCH_BATCH) {
-        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        let messages = session.uid_fetch(&uid_list, "(UID RFC822)")?;
-        for msg in messages.iter() {
+    let mut scanned: usize = 0;
+    // Initialize to floor_uid so we never raise the floor on a no-op call.
+    let mut lowest_scanned: u32 = floor_uid;
+
+    // Walk newest-to-oldest, fetching up to `page_size` bodies per IMAP
+    // batch, stopping when we have enough matches or hit the per-call cap.
+    while scanned < uids.len() && emails.len() < target_count && scanned < max_scan {
+        let remaining_target = target_count.saturating_sub(emails.len());
+        let remaining_budget = max_scan.saturating_sub(scanned);
+        let remaining_candidates = uids.len() - scanned;
+        let take = remaining_target.max(1).min(remaining_budget).min(remaining_candidates);
+        let end = uids.len() - scanned;
+        let start = end - take;
+        let batch = &uids[start..end];
+
+        let uid_list = batch.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let msgs = session.uid_fetch(&uid_list, "(UID RFC822)")?;
+        for msg in msgs.iter() {
+            if let Some(uid) = msg.uid {
+                if uid < lowest_scanned { lowest_scanned = uid; }
+            }
             if let Some(body) = msg.body() {
                 if let Some(parsed) = parse_fn(body, config) {
                     emails.push(parsed);
                 }
             }
         }
+        scanned += take;
     }
+
+    let hit_bottom = scanned >= uids.len();
+    // When we've truly hit bottom, set floor to 1 so the next call
+    // short-circuits. Otherwise lower it to the lowest UID we touched.
+    let returned_floor = if hit_bottom { 1 } else { lowest_scanned };
+
+    debug_log!(
+        "[RUST] fetch_older_in_folder: '{}' scanned {}/{} UIDs, found {} nostr match(es), hit_bottom={}, new_floor={}",
+        folder_name, scanned, uids.len(), emails.len(), hit_bottom, returned_floor
+    );
 
     Ok(FetchOlderResult {
         emails,
-        new_floor_uid: Some(new_floor_uid),
+        new_floor_uid: Some(returned_floor),
+        hit_bottom,
     })
 }
 

@@ -2944,16 +2944,24 @@ class EmailService {
         this._setListStatus('email-list', '<i class="fas fa-cloud-download-alt"></i> Fetching older emails from server...');
         try {
             const pageSize = (appState.getSettings()?.emails_per_page) || 50;
-            const newCount = await TauriService.fetchOlderInboxEmails(pageSize);
-            console.log(`[JS] Infinite scroll: fetch_older_inbox_emails returned ${newCount} new inbox emails`);
+            const result = await TauriService.fetchOlderInboxEmails(pageSize);
+            // Backend returns { new_count, hit_bottom }. `hit_bottom = false`
+            // means the per-call scan budget was exhausted before reaching
+            // the bottom of the folder — typically because non-nostr mail
+            // dominated the scanned range. Tell the user to scroll again
+            // rather than declaring the server empty.
+            const newCount = result?.new_count ?? 0;
+            const hitBottom = result?.hit_bottom === true;
+            console.log(`[JS] Infinite scroll: fetch_older_inbox_emails newCount=${newCount}, hitBottom=${hitBottom}`);
             if (newCount > 0) {
-                // Server delivered rows the DB didn't have. Re-enable DB pagination
-                // and allow another server pull when the user scrolls past again.
                 this.inboxHasMoreInDb = true;
                 this.inboxServerFetchTried = false;
                 await this.loadEmails('', true);
-            } else {
+            } else if (hitBottom) {
                 this._setListStatus('email-list', 'No older emails on server');
+            } else {
+                this._setListStatus('email-list', 'No nostr matches in this batch — scroll for more');
+                this.inboxServerFetchTried = false;
             }
         } catch (e) {
             console.error('[JS] Infinite scroll inbox server fetch failed:', e);
@@ -2965,14 +2973,19 @@ class EmailService {
         this._setListStatus('sent-list', '<i class="fas fa-cloud-download-alt"></i> Fetching older emails from server...');
         try {
             const pageSize = (appState.getSettings()?.emails_per_page) || 50;
-            const newCount = await TauriService.fetchOlderSentEmails(pageSize);
-            console.log(`[JS] Infinite scroll: fetch_older_sent_emails returned ${newCount} new sent emails`);
+            const result = await TauriService.fetchOlderSentEmails(pageSize);
+            const newCount = result?.new_count ?? 0;
+            const hitBottom = result?.hit_bottom === true;
+            console.log(`[JS] Infinite scroll: fetch_older_sent_emails newCount=${newCount}, hitBottom=${hitBottom}`);
             if (newCount > 0) {
                 this.sentHasMoreInDb = true;
                 this.sentServerFetchTried = false;
                 await this.loadSentEmails('', true);
-            } else {
+            } else if (hitBottom) {
                 this._setListStatus('sent-list', 'No older emails on server');
+            } else {
+                this._setListStatus('sent-list', 'No nostr matches in this batch — scroll for more');
+                this.sentServerFetchTried = false;
             }
         } catch (e) {
             console.error('[JS] Infinite scroll sent server fetch failed:', e);

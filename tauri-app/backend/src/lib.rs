@@ -3114,20 +3114,17 @@ fn db_get_email_threads(limit: Option<i64>, offset: Option<i64>, nostr_only: Opt
 
 #[tauri::command]
 fn db_get_sent_email_threads(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailThreadSummary>, String> {
+    // user_pubkey is intentionally ignored. The previous post-filter on
+    // sender_pubkey ran AFTER the SQL LIMIT, so any thread whose rep didn't
+    // match the active pubkey shortened the returned page — which the
+    // frontend interprets via `emails.length === pageSize` as "DB exhausted"
+    // and stops paginating. get_sent_email_threads now selects the rep to
+    // be the user's own sent message (Gmail-normalized from_address match),
+    // making this filter both redundant and broken.
+    let _ = user_pubkey;
     let db = state.get_database()?;
     let threads = db.get_sent_email_threads(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
-    // Filter by sender_pubkey if user_pubkey is provided (same as db_get_sent_emails)
-    let filtered: Vec<_> = if let Some(ref upk) = user_pubkey {
-        threads.into_iter().filter(|(e, _, _, _)| {
-            match &e.sender_pubkey {
-                Some(spk) => spk == upk,
-                None => true,
-            }
-        }).collect()
-    } else {
-        threads
-    };
-    let mapped: Vec<EmailThreadSummary> = filtered.iter().map(|(email, count, unread, attachments)| {
+    let mapped: Vec<EmailThreadSummary> = threads.iter().map(|(email, count, unread, attachments)| {
         map_email_thread_to_summary(email, *count, *unread, *attachments)
     }).collect();
     Ok(mapped)

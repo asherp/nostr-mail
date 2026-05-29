@@ -52,6 +52,13 @@ class EmailService {
         this.sentLoadingMore = false;
         this.sentServerFetchTried = false;
         this._infiniteScrollInited = false;
+        // Auto-sync bookkeeping. `_lastInboxSyncAt` / `_lastSentSyncAt` are
+        // refreshed after any successful sync (auto or manual) so the
+        // tab-switch auto-sync backs off when the user just refreshed.
+        this._lastInboxSyncAt = 0;
+        this._lastSentSyncAt = 0;
+        this._inboxAutoSyncInFlight = false;
+        this._sentAutoSyncInFlight = false;
         this._htmlBody = null; // HTML alternative body for multipart emails
         this._plainBody = null; // BIP39-armored plaintext body for text/plain MIME part
         this._quotedOriginalArmor = null; // Original message armor to append as quote in replies
@@ -3059,6 +3066,109 @@ class EmailService {
             // Ensure we throw an Error object with a proper message
             const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
             throw new Error(errorMessage);
+        }
+    }
+
+    // ── Manual Refresh: forward delta + gap-fill scan ────────────────────
+    // The Refresh button calls these. They walk the same UID range as the
+    // normal sync but additionally re-check the [min_seen, last_seen] band
+    // for any UIDs whose Message-ID isn't in the local DB — the classic
+    // Gmail-index-lag recovery path.
+
+    async refreshInboxEmails() {
+        try {
+            const settings = appState.getSettings() || {};
+            const folderList = (settings.inbox_folder || '')
+                .split('\n')
+                .map(f => f.trim())
+                .filter(Boolean);
+            const selectedFolders = folderList.length > 0 ? folderList : null;
+            console.log(`[JS] Refreshing inbox (forward + gap-fill) from folders: ${selectedFolders ? selectedFolders.join(', ') : 'Default'}`);
+            const newCount = await TauriService.refreshInboxEmails(selectedFolders);
+            console.log(`[JS] Refreshed inbox: ${newCount} new email(s)`);
+            this._lastInboxSyncAt = Date.now();
+            return newCount;
+        } catch (error) {
+            console.error('[JS] Error in refreshInboxEmails:', error);
+            throw error;
+        }
+    }
+
+    async refreshSentEmails() {
+        try {
+            const newCount = await TauriService.refreshSentEmails();
+            console.log(`[JS] Refreshed sent: ${newCount} new email(s)`);
+            this._lastSentSyncAt = Date.now();
+            // Same DM-pubkey backfill that syncSentEmails runs.
+            try {
+                const updated = await window.__TAURI__.core.invoke('db_backfill_email_pubkeys');
+                if (updated > 0) {
+                    console.log(`[JS] Backfilled pubkeys on ${updated} email(s) via matching DMs`);
+                }
+            } catch (e) {
+                console.warn('[JS] db_backfill_email_pubkeys after sent refresh failed:', e);
+            }
+            return newCount;
+        } catch (error) {
+            console.error('[JS] Error in refreshSentEmails:', error);
+            const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
+            throw new Error(errorMessage);
+        }
+    }
+
+    // ── Auto-sync on tab switch ──────────────────────────────────────────
+    // Called by the tab-switch handler after the local DB load. Fires the
+    // cheap forward-delta sync in the background; reloads the visible list
+    // if new emails came in. Debounced so rapid switching doesn't hammer the
+    // server, and guarded against re-entry so the manual Refresh path can't
+    // race with an in-flight auto-sync.
+
+    static AUTO_SYNC_INTERVAL_MS = 30_000;
+
+    async autoSyncInboxIfStale() {
+        if (!appState.hasEmailSettingsConfigured()) return 0;
+        if (this._inboxAutoSyncInFlight) return 0;
+        if (Date.now() - this._lastInboxSyncAt < EmailService.AUTO_SYNC_INTERVAL_MS) {
+            return 0;
+        }
+        this._inboxAutoSyncInFlight = true;
+        try {
+            const newCount = await this.syncInboxEmails();
+            this._lastInboxSyncAt = Date.now();
+            if (newCount > 0) {
+                // New mail arrived since our DB snapshot — re-render from the
+                // top so the user sees it. `loadEmails()` with append=false
+                // also resets the infinite-scroll watermarks.
+                await this.loadEmails();
+            }
+            return newCount;
+        } catch (e) {
+            console.warn('[JS] autoSyncInboxIfStale failed:', e);
+            return 0;
+        } finally {
+            this._inboxAutoSyncInFlight = false;
+        }
+    }
+
+    async autoSyncSentIfStale() {
+        if (!appState.hasSettings()) return 0;
+        if (this._sentAutoSyncInFlight) return 0;
+        if (Date.now() - this._lastSentSyncAt < EmailService.AUTO_SYNC_INTERVAL_MS) {
+            return 0;
+        }
+        this._sentAutoSyncInFlight = true;
+        try {
+            const newCount = await this.syncSentEmails();
+            this._lastSentSyncAt = Date.now();
+            if (newCount > 0) {
+                await this.loadSentEmails();
+            }
+            return newCount;
+        } catch (e) {
+            console.warn('[JS] autoSyncSentIfStale failed:', e);
+            return 0;
+        } finally {
+            this._sentAutoSyncInFlight = false;
         }
     }
 

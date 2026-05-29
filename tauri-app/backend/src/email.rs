@@ -4921,6 +4921,18 @@ pub fn default_inbox_folders(imap_host: &str) -> Vec<String> {
 }
 
 pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+    sync_nostr_emails_to_db_inner(config, folders_arg, active_pubkey, db, /* include_gap_fill = */ false).await
+}
+
+/// Same as `sync_nostr_emails_to_db` but also runs `gap_fill_in_folder` per
+/// folder in the same IMAP session. Powers the Refresh button when the user
+/// wants a thorough check; the auto-sync path keeps the cheap forward-only
+/// behaviour.
+pub async fn refresh_inbox_emails_to_db(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+    sync_nostr_emails_to_db_inner(config, folders_arg, active_pubkey, db, /* include_gap_fill = */ true).await
+}
+
+async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
@@ -4994,6 +5006,13 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folders_arg: Option<&
                 }
                 Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
             }
+            if include_gap_fill {
+                match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                                          parse_nostr_email_from_imap_body) {
+                    Ok(emails) => raw_nostr_emails.extend(emails),
+                    Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
+                }
+            }
         }
     } else {
         let tcp_stream = TcpStream::connect(&addr)?;
@@ -5018,6 +5037,13 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folders_arg: Option<&
                     raw_nostr_emails.extend(r.emails);
                 }
                 Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
+            }
+            if include_gap_fill {
+                match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                                          parse_nostr_email_from_imap_body) {
+                    Ok(emails) => raw_nostr_emails.extend(emails),
+                    Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
+                }
             }
         }
     }
@@ -5240,6 +5266,16 @@ pub async fn fetch_older_sent_emails_to_db(
 }
 
 pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+    sync_sent_emails_to_db_inner(config, active_pubkey, db, /* include_gap_fill = */ false).await
+}
+
+/// Refresh-button variant of `sync_sent_emails_to_db`: also runs a gap-fill
+/// pass per folder. See `gap_fill_in_folder` for shape.
+pub async fn refresh_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+    sync_sent_emails_to_db_inner(config, active_pubkey, db, /* include_gap_fill = */ true).await
+}
+
+async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
     debug_log!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
@@ -5276,6 +5312,13 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                 }
                 Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
             }
+            if include_gap_fill {
+                match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                                          parse_nostr_sent_email_from_imap_body) {
+                    Ok(emails) => raw_sent_emails.extend(emails),
+                    Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
+                }
+            }
         }
     } else {
         let tcp_stream = TcpStream::connect(&addr)?;
@@ -5298,6 +5341,13 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                     raw_sent_emails.extend(r.emails);
                 }
                 Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
+            }
+            if include_gap_fill {
+                match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                                          parse_nostr_sent_email_from_imap_body) {
+                    Ok(emails) => raw_sent_emails.extend(emails),
+                    Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
+                }
             }
         }
     }
@@ -5845,6 +5895,124 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
         emails,
         new_floor_uid: Some(new_floor_uid),
     })
+}
+
+/// Gap-fill scan over one folder. Looks for UIDs the server claims should be
+/// in our "scanned range" (between `min_seen_uid` and `last_seen_uid`) but
+/// whose Message-IDs aren't in the local DB — the classic Gmail-index-lag
+/// scenario where a recent message wasn't returned by the bootstrap SEARCH
+/// but is now visible to subsequent searches.
+///
+/// Caller is responsible for SELECTing the folder via prior `uid_sync_folder`;
+/// we re-SELECT here defensively to refresh UIDVALIDITY.
+///
+/// Cost shape: 1 cheap UID SEARCH, 1 batched ENVELOPE fetch (server-side
+/// parse, no body bytes), then a body fetch only for the gaps we actually
+/// find. On a healthy DB with no gaps, the body fetch is skipped entirely.
+fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    config: &EmailConfig,
+    db: &Database,
+    account_key: &str,
+    folder_name: &str,
+    sync_cutoff_days: i64,
+    parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
+) -> anyhow::Result<Vec<RawNostrEmail>> {
+    let mb = session.select(folder_name)?;
+    let uid_validity = mb.uid_validity
+        .ok_or_else(|| anyhow::anyhow!("server did not advertise UIDVALIDITY for folder '{}'", folder_name))?;
+
+    let stored = match db.get_folder_sync_state(account_key, folder_name)? {
+        Some(s) if s.uid_validity == uid_validity => s,
+        // No state, or UIDVALIDITY change — bail. Forward sync will set up
+        // fresh watermarks; gap-fill only makes sense once we have a stable
+        // [min, last] range to scan inside of.
+        _ => return Ok(vec![]),
+    };
+
+    let claimed: Vec<u32> = session.uid_search(&build_bootstrap_query(sync_cutoff_days))?
+        .into_iter()
+        .collect();
+    if claimed.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // If we don't yet have a floor (legacy install), opportunistically backfill
+    // it from this SINCE result — same as fetch_older does — so the [floor,
+    // last_seen] range is well-defined.
+    let floor = match stored.min_seen_uid {
+        Some(v) => v,
+        None => {
+            let m = claimed.iter().copied().min().unwrap_or(0);
+            if m > 0 {
+                if let Err(e) = db.set_folder_min_seen_uid(account_key, folder_name, m) {
+                    debug_log!("[RUST] gap_fill: failed to backfill min_seen_uid for '{}': {}", folder_name, e);
+                }
+            }
+            m
+        }
+    };
+
+    // Candidates: UIDs the server returned that fall inside our scanned range.
+    // Below `floor` is fetch_older territory; above `last_seen_uid` is forward
+    // sync territory. Both have their own paths and shouldn't be re-touched
+    // here.
+    let candidates: Vec<u32> = claimed.into_iter()
+        .filter(|uid| *uid >= floor && *uid <= stored.last_seen_uid)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Resolve Message-IDs via ENVELOPE (server-side parse, no body fetch) and
+    // look each up in the local DB. UIDs whose Message-ID is missing — or
+    // whose server-side ENVELOPE has no Message-ID at all — are flagged as
+    // gaps and pulled in the next step.
+    const FETCH_BATCH: usize = 500;
+    let mut missing: Vec<u32> = Vec::new();
+    for chunk in candidates.chunks(FETCH_BATCH) {
+        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let msgs = session.uid_fetch(&uid_list, "(UID ENVELOPE)")?;
+        for msg in msgs.iter() {
+            let uid = match msg.uid { Some(u) => u, None => continue };
+            let mid = match msg.envelope().and_then(|e| e.message_id) {
+                Some(bytes) => std::str::from_utf8(bytes).unwrap_or("").to_string(),
+                None => { missing.push(uid); continue; }
+            };
+            let mid = mid.trim().trim_start_matches('<').trim_end_matches('>').trim().to_string();
+            if mid.is_empty() {
+                missing.push(uid);
+                continue;
+            }
+            match db.get_email(&mid) {
+                Ok(Some(_)) => continue,
+                Ok(None) => missing.push(uid),
+                Err(e) => debug_log!("[RUST] gap_fill: get_email({}) failed: {}", mid, e),
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(vec![]);
+    }
+    println!(
+        "[RUST] gap_fill_in_folder: '{}' found {} missing UID(s) within [{}, {}]",
+        folder_name, missing.len(), floor, stored.last_seen_uid
+    );
+
+    let mut emails: Vec<RawNostrEmail> = Vec::new();
+    for chunk in missing.chunks(FETCH_BATCH) {
+        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let msgs = session.uid_fetch(&uid_list, "(UID RFC822)")?;
+        for msg in msgs.iter() {
+            if let Some(body) = msg.body() {
+                if let Some(parsed) = parse_fn(body, config) {
+                    emails.push(parsed);
+                }
+            }
+        }
+    }
+    Ok(emails)
 }
 
 /// Read `sync_cutoff_days` for the active pubkey, defaulting to 30.

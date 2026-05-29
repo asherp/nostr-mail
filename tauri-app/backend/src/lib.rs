@@ -4759,6 +4759,25 @@ async fn reset_folder_sync_state(
         .map_err(|e| e.to_string())
 }
 
+/// Thorough refresh: forward UID delta + gap-fill within the scanned range.
+/// Maps to the Refresh button. Auto-sync on tab switch keeps using the cheap
+/// `sync_nostr_emails` (forward delta only).
+#[tauri::command]
+async fn refresh_inbox_emails(config: EmailConfig, folders: Option<Vec<String>>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::refresh_inbox_emails_to_db(&config, folders.as_deref(), &active_pubkey, &db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn refresh_sent_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::refresh_sent_emails_to_db(&config, &active_pubkey, &db).await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn fetch_older_inbox_emails(
     config: EmailConfig,
@@ -6874,6 +6893,8 @@ pub fn run() {
         sync_sent_emails,
         fetch_older_inbox_emails,
         fetch_older_sent_emails,
+        refresh_inbox_emails,
+        refresh_sent_emails,
         sync_all_emails,
         sync_direct_messages_with_network,
         sync_conversation_with_network,

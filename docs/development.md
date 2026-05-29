@@ -82,21 +82,42 @@ Use plain semver: `1.0.4`, `1.0.5`, etc. **Do not** add pre-release suffixes lik
    # wait for the build workflow's release job to publish assets
    git push origin master
    ```
+5. Once the GitHub Release assets are live, publish the public site by merging
+   `master` into `docs` (see below).
 
 ### Why the ordering matters
 
 Two workflows react to a release:
 
 - **`build.yml`** triggers on the tag push. It builds Windows/Linux/macOS installers on three runners, then its `release` job attaches them to a GitHub Release named after the tag. End-to-end: ~15–30 minutes.
-- **`mkdocs-deploy.yml`** triggers on any push to `master`. It reads `tauri.conf.json`, substitutes `{{VERSION_TAG}}` / `{{VERSION}}` placeholders in the landing page, and deploys to GitHub Pages. End-to-end: ~3–5 minutes.
+- **`mkdocs-deploy.yml`** triggers on pushes to the **`docs`** branch. It reads `tauri.conf.json`, substitutes `{{VERSION_TAG}}` / `{{VERSION}}` placeholders in the landing page, and deploys the landing page + docs to GitHub Pages (`gh-pages`). End-to-end: ~3–5 minutes.
 
-If you push the branch before the tag (or both at once), the landing page will go live pointing at download URLs for a release that doesn't exist yet, because `build.yml` is still compiling. Users hitting the site during that window get 404s on the download buttons.
+Because the deploy is gated on the `docs` branch rather than `master`, bumping the
+version and tagging on `master` does **not** change the public website. The site —
+including the version number and download links — only updates when you merge into
+`docs`. So after a release, wait until the GitHub Release assets exist, then merge
+`master → docs`. This deliberately closes the window where the landing page could
+point at download URLs for a release that is still compiling (which would 404).
 
-Pushing the tag first, waiting for the GitHub Release to appear, then pushing the branch closes the window. If you forget and push both together, the landing page self-heals once `build.yml` finishes and the release assets become available — no re-deploy needed.
+### Publishing docs (the `docs` branch)
+
+The public site is published from the long-lived `docs` branch; `master` is the
+authoring source of truth.
+
+- **To publish:** merge `master → docs`. The push to `docs` triggers the deploy.
+- **Documentation-only changes** may originate on `docs` (the site updates
+  immediately) and then be merged back to `master`. App and version changes
+  originate on `master` and reach the site when you merge to `docs`.
+- **Sync the two branches with ordinary merge commits only — never squash or
+  rebase them.** Squashing or rebasing rewrites SHAs and makes later merges in the
+  opposite direction see phantom conflicts, causing the branches to drift.
+- The version shown on the site is always whatever `tauri.conf.json` holds **on the
+  `docs` branch**, so keep the version bump off `docs` until the release is live.
 
 ### Manual trigger
 
-Both workflows also support `workflow_dispatch` from the Actions tab, useful for testing build changes without cutting a release.
+Both workflows also support `workflow_dispatch` from the Actions tab, useful for
+re-deploying or testing build changes without cutting a release.
 
 ## Code Organization
 

@@ -1337,9 +1337,11 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 // Show loading state immediately
                 domManager.disable('refreshInbox');
                 domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
-                // Sync and load all emails (no search filter)
+                // Refresh = forward delta + gap-fill within the scanned UID
+                // range; auto-sync on tab-switch uses the cheap forward-only
+                // path instead.
                 try {
-                    await window.emailService.syncInboxEmails();
+                    await window.emailService.refreshInboxEmails();
                     await window.emailService.loadEmails();
                     notificationService.showSuccess('Inbox synced successfully');
                 } catch (error) {
@@ -1469,10 +1471,13 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const folderSelect = document.getElementById('inbox-folder-preference');
         if (folderSelect) {
             folderSelect.addEventListener('change', async () => {
-                const selectedFolder = folderSelect.value;
-                console.log('[APP] Inbox folder preference changed to:', selectedFolder);
+                const selectedFolders = Array.from(folderSelect.selectedOptions)
+                    .map(o => o.value)
+                    .filter(Boolean);
+                const joined = selectedFolders.join('\n');
+                console.log('[APP] Inbox folder preference changed to:', selectedFolders);
                 const settings = appState.getSettings() || {};
-                settings.inbox_folder = selectedFolder;
+                settings.inbox_folder = joined;
                 appState.setSettings(settings);
                 if (window.emailService) {
                     window.emailService.inboxOffset = 0;
@@ -1769,7 +1774,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 refreshSent.innerHTML = '<span class="loading"></span> Syncing...';
                 
                 try {
-                    await window.emailService.syncSentEmails();
+                    await window.emailService.refreshSentEmails();
                     // loadSentEmails() will manage the button state from here
                     await window.emailService.loadSentEmails();
                     notificationService.showSuccess('Sent emails synced successfully');
@@ -2797,13 +2802,17 @@ NostrMailApp.prototype.switchTab = async function(tabName) {
     if (tabName === 'inbox') {
         if (window.emailService) {
             // Folder list is loaded when the Settings tab is opened. Here we
-            // just load emails using the persisted inbox_folder preference.
+            // just load emails using the persisted inbox_folder preference,
+            // then kick off a debounced background sync so newer mail shows
+            // up without the user having to press Refresh.
             window.emailService.loadEmails();
+            window.emailService.autoSyncInboxIfStale();
         }
     }
     if (tabName === 'sent') {
         if (window.emailService) {
             window.emailService.loadSentEmails();
+            window.emailService.autoSyncSentIfStale();
         }
     }
     if (tabName === 'drafts') {
@@ -2970,6 +2979,18 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             publicKey = currentPublicKey;
         }
         
+        // Read the inbox-folder multiselect: all selected option values joined
+        // by newlines (the in-memory and persisted shape). Newlines aren't
+        // valid in IMAP mailbox names so they're a safe delimiter.
+        const readInboxFolderSelection = () => {
+            const el = domManager.get('inboxFolderPreference');
+            if (!el) return '';
+            return Array.from(el.selectedOptions || [])
+                .map(o => o.value)
+                .filter(Boolean)
+                .join('\n');
+        };
+
         // Build settings object from form values (or use loaded settings if keypair changed)
         // If keypair changed and settings were loaded, use loaded settings from appState
         // Otherwise, use form values
@@ -2997,7 +3018,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 send_matching_dm: (loadedSettings && loadedSettings.send_matching_dm !== undefined) ? loadedSettings.send_matching_dm : (domManager.get('send-matching-dm-preference')?.checked !== false),
                 sync_cutoff_days: (loadedSettings && loadedSettings.sync_cutoff_days) ? loadedSettings.sync_cutoff_days : (parseInt(domManager.getValue('syncCutoffDays')) || 30),
                 emails_per_page: (loadedSettings && loadedSettings.emails_per_page) ? loadedSettings.emails_per_page : (parseInt(domManager.getValue('emailsPerPage')) || 50),
-                inbox_folder: (loadedSettings && loadedSettings.inbox_folder !== undefined) ? loadedSettings.inbox_folder : (domManager.getValue('inboxFolderPreference') || ''),
+                inbox_folder: (loadedSettings && loadedSettings.inbox_folder !== undefined) ? loadedSettings.inbox_folder : readInboxFolderSelection(),
                 require_signature: (loadedSettings && loadedSettings.require_signature !== undefined) ? loadedSettings.require_signature : (domManager.get('require-signature-preference')?.checked !== false),
                 hide_undecryptable_emails: (loadedSettings && loadedSettings.hide_undecryptable_emails !== undefined) ? loadedSettings.hide_undecryptable_emails : (domManager.get('hide-undecryptable-emails-preference')?.checked !== false),
                 automatically_encrypt: (loadedSettings && loadedSettings.automatically_encrypt !== undefined) ? loadedSettings.automatically_encrypt : (domManager.get('automatically-encrypt-preference')?.checked !== false),
@@ -3036,7 +3057,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false, // Default to true
                 sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 30, // Default to 30 days
                 emails_per_page: parseInt(domManager.getValue('emailsPerPage')) || 50, // Default to 50
-                inbox_folder: domManager.getValue('inboxFolderPreference') || '',
+                inbox_folder: readInboxFolderSelection(),
                 require_signature: domManager.get('require-signature-preference')?.checked !== false, // Default to true
                 hide_undecryptable_emails: domManager.get('hide-undecryptable-emails-preference')?.checked !== false, // Default to true
                 automatically_encrypt: autoEncryptEnabled,
@@ -3382,26 +3403,30 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.setValue('emailFilterPreference', settings.email_filter || 'nostr');
         domManager.setValue('syncCutoffDays', settings.sync_cutoff_days || 30);
         domManager.setValue('emailsPerPage', settings.emails_per_page || 50);
-        // Inbox folder: the dropdown's <option> list is per-account (driven by
-        // the active user's IMAP server). Reset it to just Default + persisted
-        // name so the value can be applied immediately, then trigger a silent
-        // background refresh to pull the live folder list for this account.
+        // Inbox folders: the <option> list is per-account (driven by the
+        // active user's IMAP server). Seed Tom Select with the persisted
+        // selections (newline-separated) so the saved value is visible
+        // immediately, then trigger a silent background refresh to pull the
+        // live folder list.
         const inboxFolderSelect = domManager.get('inboxFolderPreference');
         if (inboxFolderSelect) {
             const persistedFolder = settings.inbox_folder || '';
-            inboxFolderSelect.innerHTML = '';
-            const defaultOpt = document.createElement('option');
-            defaultOpt.value = '';
-            defaultOpt.textContent = 'Default';
-            inboxFolderSelect.appendChild(defaultOpt);
-            if (persistedFolder) {
-                const opt = document.createElement('option');
-                opt.value = persistedFolder;
-                opt.textContent = persistedFolder;
-                inboxFolderSelect.appendChild(opt);
+            const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
+            if (window.FolderMultiselect) {
+                window.FolderMultiselect.setSelectionOnly(persistedList);
+                // Reflect the backend's provider-aware defaults in the
+                // placeholder so the user can see what "no selection" will
+                // sync. The backend also auto-adds any *spam*-named folder at
+                // sync time; signal that with an ellipsis + a note in the
+                // help text.
+                TauriService.getDefaultInboxFolders(settings.imap_host).then(defaults => {
+                    if (defaults && defaults.length > 0) {
+                        window.FolderMultiselect.setPlaceholder(
+                            `Default (${defaults.join(', ')}, + spam/junk/bulk folders)`
+                        );
+                    }
+                }).catch(() => { /* placeholder stays at the initial value */ });
             }
-            inboxFolderSelect.value = persistedFolder;
-            inboxFolderSelect.disabled = false;
             if (window.emailService) {
                 window.emailService.listImapFolders({ silent: true }).catch(err => {
                     console.warn('[APP] Background folder refresh failed:', err);

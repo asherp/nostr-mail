@@ -40,6 +40,25 @@ class EmailService {
         this.sentSearchOffset = 0; // Track pagination offset for sent search results
         this.searchHasMore = false; // Track if there are more search results
         this.sentSearchHasMore = false; // Track if there are more sent search results
+        // Infinite scroll state. `hasMoreInDb` is true when the last DB page was
+        // full (so another DB fetch is worth trying). `loadingMore` is a
+        // re-entrancy guard for the scroll handler. `serverFetchTried` flips
+        // true after we've hit the server once for the current exhaustion;
+        // it resets when the server returns new rows or on a fresh refresh.
+        this.inboxHasMoreInDb = true;
+        this.inboxLoadingMore = false;
+        this.inboxServerFetchTried = false;
+        this.sentHasMoreInDb = true;
+        this.sentLoadingMore = false;
+        this.sentServerFetchTried = false;
+        this._infiniteScrollInited = false;
+        // Auto-sync bookkeeping. `_lastInboxSyncAt` / `_lastSentSyncAt` are
+        // refreshed after any successful sync (auto or manual) so the
+        // tab-switch auto-sync backs off when the user just refreshed.
+        this._lastInboxSyncAt = 0;
+        this._lastSentSyncAt = 0;
+        this._inboxAutoSyncInFlight = false;
+        this._sentAutoSyncInFlight = false;
         this._htmlBody = null; // HTML alternative body for multipart emails
         this._plainBody = null; // BIP39-armored plaintext body for text/plain MIME part
         this._quotedOriginalArmor = null; // Original message armor to append as quote in replies
@@ -2696,15 +2715,12 @@ class EmailService {
             if (!append) {
                 // Reset offset when loading fresh (not appending)
                 this.inboxOffset = 0;
+                this.inboxHasMoreInDb = true;
+                this.inboxServerFetchTried = false;
                 domManager.disable('refreshInbox');
                 domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
             } else {
-                // Show loading state on Load More button
-                const loadMoreBtn = document.getElementById('load-more-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = true;
-                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
-                }
+                this._setListStatus('email-list', 'Loading more...');
             }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
@@ -2747,9 +2763,9 @@ class EmailService {
 
             // Update offset for next load
             this.inboxOffset += emails.length;
+            this.inboxHasMoreInDb = emails.length === pageSize;
 
-            // Show Load More button if we got a full page of results
-            this.renderEmails(emails.length === pageSize, appendFrom);
+            this.renderEmails(this.inboxHasMoreInDb, appendFrom);
         } catch (error) {
             console.error('Failed to load emails:', error);
             notificationService.showError('Failed to load emails: ' + error);
@@ -2758,11 +2774,7 @@ class EmailService {
                 domManager.enable('refreshInbox');
                 domManager.setHTML('refreshInbox', '<i class="fas fa-sync"></i> Refresh');
             } else {
-                const loadMoreBtn = document.getElementById('load-more-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = false;
-                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                }
+                this._removeListStatus('email-list');
             }
         }
     }
@@ -2800,15 +2812,12 @@ class EmailService {
             if (!append) {
                 // Reset offset when loading fresh (not appending)
                 this.sentOffset = 0;
+                this.sentHasMoreInDb = true;
+                this.sentServerFetchTried = false;
                 domManager.disable('refreshSent');
                 domManager.setHTML('refreshSent', '<span class="loading"></span> Loading...');
             } else {
-                // Show loading state on Load More button
-                const loadMoreBtn = document.getElementById('load-more-sent-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = true;
-                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
-                }
+                this._setListStatus('sent-list', 'Loading more...');
             }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
@@ -2836,9 +2845,9 @@ class EmailService {
 
             // Update offset for next load
             this.sentOffset += emails.length;
+            this.sentHasMoreInDb = emails.length === pageSize;
 
-            // Show Load More button if we got a full page of results
-            this.renderSentEmails(emails.length === pageSize, appendFrom);
+            this.renderSentEmails(this.sentHasMoreInDb, appendFrom);
         } catch (error) {
             console.error('Failed to load sent emails:', error);
             notificationService.showError('Failed to load sent emails: ' + error);
@@ -2847,11 +2856,7 @@ class EmailService {
                 domManager.enable('refreshSent');
                 domManager.setHTML('refreshSent', '<i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>');
             } else {
-                const loadMoreBtn = document.getElementById('load-more-sent-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = false;
-                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                }
+                this._removeListStatus('sent-list');
             }
         }
     }
@@ -2859,6 +2864,155 @@ class EmailService {
     // Load more sent emails (pagination)
     async loadMoreSentEmails() {
         await this.loadSentEmails('', true);
+    }
+
+    // ── Infinite scroll ──────────────────────────────────────────────────
+    // Replaces the old "Load More" buttons. Loads the next DB page when the
+    // user scrolls within `_INFINITE_SCROLL_THRESHOLD_PX` of the bottom; when
+    // the DB is exhausted, falls through to a single server sync and tries
+    // the DB again.
+
+    _initInfiniteScroll() {
+        if (this._infiniteScrollInited) return;
+        const emailList = document.getElementById('email-list');
+        const sentList = document.getElementById('sent-list');
+        if (!emailList && !sentList) return;
+        this._infiniteScrollInited = true;
+        if (emailList) {
+            emailList.addEventListener('scroll', () => this._onListScroll('inbox'), { passive: true });
+        }
+        if (sentList) {
+            sentList.addEventListener('scroll', () => this._onListScroll('sent'), { passive: true });
+        }
+    }
+
+    _onListScroll(kind) {
+        const listEl = document.getElementById(kind === 'inbox' ? 'email-list' : 'sent-list');
+        if (!listEl) return;
+        const thresholdPx = 300;
+        const distanceFromBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
+        if (distanceFromBottom > thresholdPx) return;
+        this._tryLoadMore(kind);
+    }
+
+    // After a render, if the list isn't tall enough to scroll but more pages
+    // are available, pull the next page so the viewport always fills up.
+    // Guarded by `loadingMore` so it can't recurse infinitely.
+    _maybeFillViewport(kind) {
+        const listEl = document.getElementById(kind === 'inbox' ? 'email-list' : 'sent-list');
+        if (!listEl) return;
+        if (listEl.scrollHeight <= listEl.clientHeight + 8) {
+            this._tryLoadMore(kind);
+        }
+    }
+
+    _tryLoadMore(kind) {
+        if (kind === 'inbox') {
+            if (this.inboxLoadingMore) return;
+            const inSearch = (domManager.getValue('emailSearch')?.trim() || '') !== '';
+            if (this.inboxHasMoreInDb || (inSearch && this.searchHasMore)) {
+                this.inboxLoadingMore = true;
+                this.loadMoreEmails().finally(() => {
+                    this.inboxLoadingMore = false;
+                });
+            } else if (!inSearch && !this.inboxServerFetchTried) {
+                this.inboxServerFetchTried = true;
+                this.inboxLoadingMore = true;
+                this._fetchInboxFromServerAndAppend().finally(() => {
+                    this.inboxLoadingMore = false;
+                });
+            }
+        } else {
+            if (this.sentLoadingMore) return;
+            const inSearch = (domManager.getValue('sentSearch')?.trim() || '') !== '';
+            if (this.sentHasMoreInDb || (inSearch && this.sentSearchHasMore)) {
+                this.sentLoadingMore = true;
+                this.loadMoreSentEmails().finally(() => {
+                    this.sentLoadingMore = false;
+                });
+            } else if (!inSearch && !this.sentServerFetchTried) {
+                this.sentServerFetchTried = true;
+                this.sentLoadingMore = true;
+                this._fetchSentFromServerAndAppend().finally(() => {
+                    this.sentLoadingMore = false;
+                });
+            }
+        }
+    }
+
+    async _fetchInboxFromServerAndAppend() {
+        this._setListStatus('email-list', '<i class="fas fa-cloud-download-alt"></i> Fetching older emails from server...');
+        try {
+            const pageSize = (appState.getSettings()?.emails_per_page) || 50;
+            const result = await TauriService.fetchOlderInboxEmails(pageSize);
+            // Backend returns { new_count, hit_bottom }. `hit_bottom = false`
+            // means the per-call scan budget was exhausted before reaching
+            // the bottom of the folder — typically because non-nostr mail
+            // dominated the scanned range. Tell the user to scroll again
+            // rather than declaring the server empty.
+            const newCount = result?.new_count ?? 0;
+            const hitBottom = result?.hit_bottom === true;
+            console.log(`[JS] Infinite scroll: fetch_older_inbox_emails newCount=${newCount}, hitBottom=${hitBottom}`);
+            if (newCount > 0) {
+                this.inboxHasMoreInDb = true;
+                this.inboxServerFetchTried = false;
+                await this.loadEmails('', true);
+            } else if (hitBottom) {
+                this._setListStatus('email-list', 'No older emails on server');
+            } else {
+                this._setListStatus('email-list', 'No nostr matches in this batch — scroll for more');
+                this.inboxServerFetchTried = false;
+            }
+        } catch (e) {
+            console.error('[JS] Infinite scroll inbox server fetch failed:', e);
+            this._setListStatus('email-list', 'Failed to fetch older emails');
+        }
+    }
+
+    async _fetchSentFromServerAndAppend() {
+        this._setListStatus('sent-list', '<i class="fas fa-cloud-download-alt"></i> Fetching older emails from server...');
+        try {
+            const pageSize = (appState.getSettings()?.emails_per_page) || 50;
+            const result = await TauriService.fetchOlderSentEmails(pageSize);
+            const newCount = result?.new_count ?? 0;
+            const hitBottom = result?.hit_bottom === true;
+            console.log(`[JS] Infinite scroll: fetch_older_sent_emails newCount=${newCount}, hitBottom=${hitBottom}`);
+            if (newCount > 0) {
+                this.sentHasMoreInDb = true;
+                this.sentServerFetchTried = false;
+                await this.loadSentEmails('', true);
+            } else if (hitBottom) {
+                this._setListStatus('sent-list', 'No older emails on server');
+            } else {
+                this._setListStatus('sent-list', 'No nostr matches in this batch — scroll for more');
+                this.sentServerFetchTried = false;
+            }
+        } catch (e) {
+            console.error('[JS] Infinite scroll sent server fetch failed:', e);
+            this._setListStatus('sent-list', 'Failed to fetch older emails');
+        }
+    }
+
+    _setListStatus(listId, htmlMessage) {
+        const list = document.getElementById(listId);
+        if (!list) return;
+        let status = list.querySelector('.infinite-scroll-status');
+        if (!status) {
+            status = document.createElement('div');
+            status.className = 'infinite-scroll-status text-center text-muted';
+            status.style.cssText = 'padding: 15px; font-size: 0.9em;';
+            list.appendChild(status);
+        } else {
+            list.appendChild(status); // ensure it stays at the bottom
+        }
+        status.innerHTML = htmlMessage;
+    }
+
+    _removeListStatus(listId) {
+        const list = document.getElementById(listId);
+        if (!list) return;
+        const status = list.querySelector('.infinite-scroll-status');
+        if (status) status.remove();
     }
 
     // Sync and reload emails
@@ -2879,10 +3033,14 @@ class EmailService {
     async syncInboxEmails() {
         try {
             const settings = appState.getSettings() || {};
-            const selectedFolder = settings.inbox_folder ? settings.inbox_folder : null;
-            console.log(`[JS] Syncing inbox emails from folder: ${selectedFolder || 'Default (INBOX + nostr-mail)'}`);
+            const folderList = (settings.inbox_folder || '')
+                .split('\n')
+                .map(f => f.trim())
+                .filter(Boolean);
+            const selectedFolders = folderList.length > 0 ? folderList : null;
+            console.log(`[JS] Syncing inbox emails from folders: ${selectedFolders ? selectedFolders.join(', ') : 'Default (INBOX + nostr-mail)'}`);
 
-            const newCount = await TauriService.syncNostrEmails(selectedFolder);
+            const newCount = await TauriService.syncNostrEmails(selectedFolders);
             console.log(`[JS] Synced ${newCount} new inbox emails from network`);
             return newCount;
         } catch (error) {
@@ -2921,6 +3079,109 @@ class EmailService {
             // Ensure we throw an Error object with a proper message
             const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
             throw new Error(errorMessage);
+        }
+    }
+
+    // ── Manual Refresh: forward delta + gap-fill scan ────────────────────
+    // The Refresh button calls these. They walk the same UID range as the
+    // normal sync but additionally re-check the [min_seen, last_seen] band
+    // for any UIDs whose Message-ID isn't in the local DB — the classic
+    // Gmail-index-lag recovery path.
+
+    async refreshInboxEmails() {
+        try {
+            const settings = appState.getSettings() || {};
+            const folderList = (settings.inbox_folder || '')
+                .split('\n')
+                .map(f => f.trim())
+                .filter(Boolean);
+            const selectedFolders = folderList.length > 0 ? folderList : null;
+            console.log(`[JS] Refreshing inbox (forward + gap-fill) from folders: ${selectedFolders ? selectedFolders.join(', ') : 'Default'}`);
+            const newCount = await TauriService.refreshInboxEmails(selectedFolders);
+            console.log(`[JS] Refreshed inbox: ${newCount} new email(s)`);
+            this._lastInboxSyncAt = Date.now();
+            return newCount;
+        } catch (error) {
+            console.error('[JS] Error in refreshInboxEmails:', error);
+            throw error;
+        }
+    }
+
+    async refreshSentEmails() {
+        try {
+            const newCount = await TauriService.refreshSentEmails();
+            console.log(`[JS] Refreshed sent: ${newCount} new email(s)`);
+            this._lastSentSyncAt = Date.now();
+            // Same DM-pubkey backfill that syncSentEmails runs.
+            try {
+                const updated = await window.__TAURI__.core.invoke('db_backfill_email_pubkeys');
+                if (updated > 0) {
+                    console.log(`[JS] Backfilled pubkeys on ${updated} email(s) via matching DMs`);
+                }
+            } catch (e) {
+                console.warn('[JS] db_backfill_email_pubkeys after sent refresh failed:', e);
+            }
+            return newCount;
+        } catch (error) {
+            console.error('[JS] Error in refreshSentEmails:', error);
+            const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
+            throw new Error(errorMessage);
+        }
+    }
+
+    // ── Auto-sync on tab switch ──────────────────────────────────────────
+    // Called by the tab-switch handler after the local DB load. Fires the
+    // cheap forward-delta sync in the background; reloads the visible list
+    // if new emails came in. Debounced so rapid switching doesn't hammer the
+    // server, and guarded against re-entry so the manual Refresh path can't
+    // race with an in-flight auto-sync.
+
+    static AUTO_SYNC_INTERVAL_MS = 30_000;
+
+    async autoSyncInboxIfStale() {
+        if (!appState.hasEmailSettingsConfigured()) return 0;
+        if (this._inboxAutoSyncInFlight) return 0;
+        if (Date.now() - this._lastInboxSyncAt < EmailService.AUTO_SYNC_INTERVAL_MS) {
+            return 0;
+        }
+        this._inboxAutoSyncInFlight = true;
+        try {
+            const newCount = await this.syncInboxEmails();
+            this._lastInboxSyncAt = Date.now();
+            if (newCount > 0) {
+                // New mail arrived since our DB snapshot — re-render from the
+                // top so the user sees it. `loadEmails()` with append=false
+                // also resets the infinite-scroll watermarks.
+                await this.loadEmails();
+            }
+            return newCount;
+        } catch (e) {
+            console.warn('[JS] autoSyncInboxIfStale failed:', e);
+            return 0;
+        } finally {
+            this._inboxAutoSyncInFlight = false;
+        }
+    }
+
+    async autoSyncSentIfStale() {
+        if (!appState.hasSettings()) return 0;
+        if (this._sentAutoSyncInFlight) return 0;
+        if (Date.now() - this._lastSentSyncAt < EmailService.AUTO_SYNC_INTERVAL_MS) {
+            return 0;
+        }
+        this._sentAutoSyncInFlight = true;
+        try {
+            const newCount = await this.syncSentEmails();
+            this._lastSentSyncAt = Date.now();
+            if (newCount > 0) {
+                await this.loadSentEmails();
+            }
+            return newCount;
+        } catch (e) {
+            console.warn('[JS] autoSyncSentIfStale failed:', e);
+            return 0;
+        } finally {
+            this._sentAutoSyncInFlight = false;
         }
     }
 
@@ -3127,12 +3388,16 @@ class EmailService {
     async renderEmails(showLoadMore = false, appendFrom = 0) {
         const emailList = domManager.get('emailList');
         if (!emailList) return;
+        this._initInfiniteScroll();
         try {
-            // Remove existing Load More button if it exists
+            // Remove any legacy Load More button (now replaced by infinite scroll)
             const existingLoadMoreBtn = document.getElementById('load-more-emails');
             if (existingLoadMoreBtn) {
                 existingLoadMoreBtn.remove();
             }
+            // Drop any inline status row before re-rendering; the scroll
+            // handler will re-add one when it next kicks off a load.
+            this._removeListStatus('email-list');
 
             // Get all emails from state
             const allEmails = appState.getEmails();
@@ -3374,16 +3639,13 @@ class EmailService {
                 return;
             }
 
-            // Add Load More button if there might be more emails
-            if (showLoadMore) {
-                const loadMoreBtn = document.createElement('button');
-                loadMoreBtn.id = 'load-more-emails';
-                loadMoreBtn.className = 'btn btn-secondary';
-                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
-                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                loadMoreBtn.addEventListener('click', () => this.loadMoreEmails());
-                emailList.appendChild(loadMoreBtn);
-            }
+            // If the rendered list is shorter than the viewport, auto-pull
+            // the next page (DB or server, whichever applies) so the user
+            // doesn't have to manually trigger a scroll on a list that has
+            // nowhere to scroll. Called unconditionally — `_maybeFillViewport`
+            // no-ops when the list is already scrollable, and `_tryLoadMore`
+            // no-ops when there's nothing left to fetch.
+            queueMicrotask(() => this._maybeFillViewport('inbox'));
 
             console.log(`[JS] renderEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
@@ -5482,15 +5744,16 @@ ${attachmentsHtml}
             });
 
             // Preserve the currently-saved selection so we can re-apply it after
-            // repopulating the <option>s. Prefer the persisted setting over the
-            // current DOM value (DOM may be empty if this fires before
-            // populateSettingsForm runs).
+            // repopulating the <option>s. Prefer current DOM selections; fall
+            // back to the persisted setting (DOM may be empty if this fires
+            // before populateSettingsForm runs).
             const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
-            const previousValue = selectElement ? (selectElement.value || persistedFolder) : persistedFolder;
+            const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
+            const domSelected = window.FolderMultiselect ? window.FolderMultiselect.getSelection() : [];
+            const previousSelection = domSelected.length > 0 ? domSelected : persistedList;
 
-            if (selectElement) {
-                selectElement.disabled = true;
-                selectElement.innerHTML = '<option disabled>Loading folders...</option>';
+            if (window.FolderMultiselect) {
+                window.FolderMultiselect.setLoading();
             }
 
             const emailConfig = {
@@ -5512,35 +5775,43 @@ ${attachmentsHtml}
 
             const folders = await TauriService.listImapFolders(emailConfig);
 
-            if (selectElement) {
-                selectElement.innerHTML = '';
-                if (folders && folders.length > 0) {
-                    const allOption = document.createElement('option');
-                    allOption.value = '';
-                    allOption.textContent = 'Default';
-                    selectElement.appendChild(allOption);
+            if (window.FolderMultiselect) {
+                const filteredFolders = (folders || []).filter(folder =>
+                    folder.toLowerCase() !== 'sent'
+                );
+                // Only keep prior selections that still exist on the server.
+                const filteredSet = new Set(filteredFolders);
+                let restoreSelection = previousSelection.filter(name => filteredSet.has(name));
 
-                    const filteredFolders = folders.filter(folder =>
-                        folder.toLowerCase() !== 'sent'
-                    );
-
-                    filteredFolders.forEach(folder => {
-                        const option = document.createElement('option');
-                        option.value = folder;
-                        option.textContent = folder;
-                        selectElement.appendChild(option);
-                    });
-                    selectElement.disabled = false;
-
-                    if (previousValue && Array.from(selectElement.options).some(o => o.value === previousValue)) {
-                        selectElement.value = previousValue;
+                // No usable saved selection? Pre-select the provider-aware
+                // defaults so users SEE what will be synced as pills (rather
+                // than as ghosted placeholder text). Mirrors the backend's
+                // default logic: static defaults + any folder whose name
+                // contains spam/junk/bulk. setOptions calls setValue with
+                // silent=true so this doesn't trigger autosave — the user's
+                // persisted "" stays "" until they actively change something.
+                if (restoreSelection.length === 0) {
+                    const settings = appState.getSettings() || {};
+                    let staticDefaults = [];
+                    try {
+                        staticDefaults = await TauriService.getDefaultInboxFolders(settings.imap_host || '');
+                    } catch (e) {
+                        console.warn('[EMAIL-SERVICE] getDefaultInboxFolders failed:', e);
                     }
-                } else {
-                    const option = document.createElement('option');
-                    option.disabled = true;
-                    option.textContent = 'No folders found';
-                    selectElement.appendChild(option);
+                    const effective = new Set();
+                    for (const name of (staticDefaults || [])) {
+                        if (filteredSet.has(name)) effective.add(name);
+                    }
+                    for (const name of filteredFolders) {
+                        const lower = name.toLowerCase();
+                        if (lower.includes('spam') || lower.includes('junk') || lower.includes('bulk')) {
+                            effective.add(name);
+                        }
+                    }
+                    restoreSelection = Array.from(effective);
                 }
+
+                window.FolderMultiselect.setOptions(filteredFolders, restoreSelection);
             }
 
             console.log(`[EMAIL-SERVICE] Loaded ${folders?.length || 0} folders`);
@@ -5549,29 +5820,16 @@ ${attachmentsHtml}
             console.error('Failed to list IMAP folders:', error);
             if (!silent) notificationService.showError('Failed to list IMAP folders: ' + error);
 
-            const selectElement = document.getElementById('inbox-folder-preference');
-            if (selectElement) {
+            if (window.FolderMultiselect) {
                 if (silent) {
                     // Background refresh failed (network down, wrong creds, account
-                    // mid-switch). Leave the dropdown in a usable state with just
-                    // "Default" + the persisted folder name so the user isn't blocked.
+                    // mid-switch). Leave the dropdown in a usable state with the
+                    // persisted folder names so the user isn't blocked.
                     const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
-                    selectElement.innerHTML = '';
-                    selectElement.disabled = false;
-                    const defaultOpt = document.createElement('option');
-                    defaultOpt.value = '';
-                    defaultOpt.textContent = 'Default';
-                    selectElement.appendChild(defaultOpt);
-                    if (persistedFolder) {
-                        const opt = document.createElement('option');
-                        opt.value = persistedFolder;
-                        opt.textContent = persistedFolder;
-                        selectElement.appendChild(opt);
-                        selectElement.value = persistedFolder;
-                    }
+                    const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
+                    window.FolderMultiselect.setSelectionOnly(persistedList);
                 } else {
-                    selectElement.disabled = true;
-                    selectElement.innerHTML = '<option disabled>Failed to load folders</option>';
+                    window.FolderMultiselect.setLoading();
                 }
             }
         }
@@ -5579,6 +5837,12 @@ ${attachmentsHtml}
 
     getSelectedFolder() {
         return (appState.getSettings() || {}).inbox_folder || null;
+    }
+
+    getSelectedFolders() {
+        const raw = (appState.getSettings() || {}).inbox_folder || '';
+        const list = raw.split('\n').map(f => f.trim()).filter(Boolean);
+        return list.length > 0 ? list : null;
     }
 
     // Handle email provider selection
@@ -6774,12 +7038,14 @@ ${attachmentsHtml}
             console.error('[JS] renderSentEmails: sentList element not found');
             return;
         }
+        this._initInfiniteScroll();
         try {
-            // Remove existing Load More button if it exists
+            // Remove any legacy Load More button (now replaced by infinite scroll)
             const existingLoadMoreBtn = document.getElementById('load-more-sent-emails');
             if (existingLoadMoreBtn) {
                 existingLoadMoreBtn.remove();
             }
+            this._removeListStatus('sent-list');
 
             // Get all emails from state
             const allEmails = appState.getSentEmails();
@@ -6975,17 +7241,10 @@ ${attachmentsHtml}
                 return;
             }
             
-            // Add Load More button if there might be more emails
-            if (showLoadMore) {
-                const loadMoreBtn = document.createElement('button');
-                loadMoreBtn.id = 'load-more-sent-emails';
-                loadMoreBtn.className = 'btn btn-secondary';
-                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
-                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                loadMoreBtn.addEventListener('click', () => this.loadMoreSentEmails());
-                sentList.appendChild(loadMoreBtn);
-            }
-            
+            // See renderEmails — auto-fill the viewport when the rendered
+            // list is too short to scroll. Unconditional; guarded internally.
+            queueMicrotask(() => this._maybeFillViewport('sent'));
+
             console.log(`[JS] renderSentEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
             console.error('[JS] Error in renderSentEmails:', error);

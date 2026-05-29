@@ -151,6 +151,11 @@ pub struct Attachment {
 pub struct FolderSyncState {
     pub uid_validity: u32,
     pub last_seen_uid: u32,
+    // Lowest UID we've fetched for this folder. None on legacy rows that
+    // predate the backward-pagination feature; populated by the next
+    // forward sync (bootstrap fills it from the SINCE-cutoff range) or by
+    // the first fetch_older call.
+    pub min_seen_uid: Option<u32>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -496,6 +501,9 @@ impl Database {
 
         // Migrate: Add folder_sync_state table for UID-based incremental IMAP sync.
         Self::migrate_add_folder_sync_state_table(&conn)?;
+        // Migrate: Add min_seen_uid column to folder_sync_state for backward
+        // pagination ("fetch older from server").
+        Self::migrate_add_min_seen_uid_column(&conn)?;
 
         // Create indexes for better performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_pubkey ON contacts(pubkey)", [])?;
@@ -968,6 +976,30 @@ impl Database {
             )?;
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_folder_sync_state_pubkey ON folder_sync_state(pubkey)",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Migration: Add min_seen_uid column to folder_sync_state.
+    fn migrate_add_min_seen_uid_column(conn: &Connection) -> Result<()> {
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(folder_sync_state)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for r in rows {
+                if r? == "min_seen_uid" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_column {
+            println!("[DB] Adding min_seen_uid column to folder_sync_state");
+            conn.execute(
+                "ALTER TABLE folder_sync_state ADD COLUMN min_seen_uid INTEGER",
                 [],
             )?;
         }
@@ -1925,57 +1957,79 @@ impl Database {
         let limit = limit.unwrap_or(50);
         let offset = offset.unwrap_or(0);
 
-        // Build WHERE clauses for identifying which threads belong to the sent view
-        let mut filter_clauses = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        filter_clauses.push("is_draft = 0".to_string());
-
-        if let Some(email) = user_email {
-            let normalized_user_email = Self::normalize_gmail_address(email);
-            let user_email_lower = email.trim().to_lowercase();
-
-            if email.contains("@gmail.com") {
-                let user_email_no_plus = if let Some(plus_pos) = user_email_lower.find('+') {
-                    if let Some(at_pos) = user_email_lower.find('@') {
-                        format!("{}@{}", &user_email_lower[..plus_pos], &user_email_lower[at_pos+1..])
+        // SQL fragment that matches `from_address` to the active user, with
+        // Gmail dot/+alias normalization. Reused in two places (the
+        // view_threads filter and the per-thread rep ranking CASE), so we
+        // build it once and push its params twice — first for the filter,
+        // then for the CASE.
+        let (user_addr_match_sql, user_addr_match_params): (String, Vec<String>) = match user_email {
+            Some(email) => {
+                let user_email_lower = email.trim().to_lowercase();
+                if email.contains("@gmail.com") {
+                    let normalized_user_email = Self::normalize_gmail_address(email);
+                    let user_email_no_plus = if let Some(plus_pos) = user_email_lower.find('+') {
+                        if let Some(at_pos) = user_email_lower.find('@') {
+                            format!("{}@{}", &user_email_lower[..plus_pos], &user_email_lower[at_pos+1..])
+                        } else {
+                            user_email_lower.clone()
+                        }
                     } else {
                         user_email_lower.clone()
-                    }
+                    };
+                    let normalized_user_email_no_plus = Self::normalize_gmail_address(&user_email_no_plus);
+                    let sql =
+                        "(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR \
+                         (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ? OR \
+                         (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ?)".to_string();
+                    (sql, vec![user_email_lower, normalized_user_email, normalized_user_email_no_plus])
                 } else {
-                    user_email_lower.clone()
-                };
-                let normalized_user_email_no_plus = Self::normalize_gmail_address(&user_email_no_plus);
+                    ("LOWER(TRIM(from_address)) = LOWER(TRIM(?))".to_string(), vec![user_email_lower])
+                }
+            }
+            None => (String::new(), vec![]),
+        };
 
-                filter_clauses.push(
-                    "(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR \
-                     (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ? OR \
-                     (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ?)".to_string()
-                );
-                params.push(Box::new(user_email_lower.clone()));
-                params.push(Box::new(normalized_user_email.clone()));
-                params.push(Box::new(normalized_user_email_no_plus.clone()));
-            } else {
-                filter_clauses.push("LOWER(TRIM(from_address)) = LOWER(TRIM(?))".to_string());
-                params.push(Box::new(user_email_lower));
+        let mut filter_clauses = vec!["is_draft = 0".to_string()];
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !user_addr_match_sql.is_empty() {
+            filter_clauses.push(user_addr_match_sql.clone());
+            for p in &user_addr_match_params {
+                params.push(Box::new(p.clone()));
             }
         }
 
-        let filter_sql = if filter_clauses.is_empty() {
-            String::new()
+        let filter_sql = format!("WHERE {}", filter_clauses.join(" AND "));
+
+        // Per-thread rep selection. Prefer the user's own sent message
+        // (the `from_address` match used by view_threads) over received
+        // replies, then most recent. Mirror of the inbox rule that prefers
+        // non-sent reps. Without this, a Sent thread can be represented by
+        // a received reply from the user's *other* account — its
+        // sender_pubkey doesn't match the active account, the row gets
+        // filtered downstream, and the whole thread vanishes from Sent.
+        let rep_rank_expr = if !user_addr_match_sql.is_empty() {
+            format!("CASE WHEN {} THEN 0 ELSE 1 END,", user_addr_match_sql)
         } else {
-            format!("WHERE {}", filter_clauses.join(" AND "))
+            String::new()
         };
 
-        // Two-phase query: find sent thread_ids, then rank ALL emails in those threads
+        // Two-phase query: find sent thread_ids, then rank ALL emails in those threads.
+        // Final ORDER BY uses `thread_last_activity` (MAX received_at per thread)
+        // so threads sort by latest activity even when the rep is an older
+        // user-sent message.
         let query = format!(
             "WITH view_threads AS (
                 SELECT DISTINCT COALESCE(thread_id, message_id) AS tid
                 FROM emails
-                {}
+                {filter_sql}
             ),
             ranked AS (
                 SELECT e.*,
-                    ROW_NUMBER() OVER (PARTITION BY COALESCE(e.thread_id, e.message_id) ORDER BY e.received_at DESC, e.id DESC) AS rn,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(e.thread_id, e.message_id)
+                        ORDER BY {rep_rank_expr} e.received_at DESC, e.id DESC
+                    ) AS rn,
+                    MAX(e.received_at) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS thread_last_activity,
                     COUNT(*) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS message_count,
                     SUM(CASE WHEN e.is_read = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS unread_count
                 FROM emails e
@@ -1989,10 +2043,18 @@ impl Database {
                    message_count, unread_count,
                    (SELECT COUNT(*) FROM attachments WHERE email_id = ranked.id) AS attachment_count
             FROM ranked WHERE rn = 1
-            ORDER BY received_at DESC
+            ORDER BY thread_last_activity DESC
             LIMIT ? OFFSET ?",
-            filter_sql
         );
+        // Param order must match placeholders in the SQL string:
+        //   1) view_threads filter (user_addr_match)               — already pushed
+        //   2) ranked CTE rep-rank CASE (same SQL, same params)    — pushed here
+        //   3) LIMIT, OFFSET                                       — pushed last
+        if !user_addr_match_sql.is_empty() {
+            for p in &user_addr_match_params {
+                params.push(Box::new(p.clone()));
+            }
+        }
         params.push(Box::new(limit));
         params.push(Box::new(offset));
 
@@ -2233,7 +2295,7 @@ impl Database {
     pub fn get_folder_sync_state(&self, pubkey: &str, folder: &str) -> Result<Option<FolderSyncState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT uid_validity, last_seen_uid, updated_at
+            "SELECT uid_validity, last_seen_uid, min_seen_uid, updated_at
              FROM folder_sync_state
              WHERE pubkey = ? AND folder_name = ?",
         )?;
@@ -2241,17 +2303,22 @@ impl Database {
         if let Some(row) = rows.next()? {
             let uid_validity: i64 = row.get(0)?;
             let last_seen_uid: i64 = row.get(1)?;
+            let min_seen_uid: Option<i64> = row.get(2)?;
             Ok(Some(FolderSyncState {
                 uid_validity: uid_validity as u32,
                 last_seen_uid: last_seen_uid as u32,
-                updated_at: row.get(2)?,
+                min_seen_uid: min_seen_uid.map(|v| v as u32),
+                updated_at: row.get(3)?,
             }))
         } else {
             Ok(None)
         }
     }
 
-    /// Upsert the UID-based sync watermark for one (account, folder).
+    /// Upsert the forward watermark (uid_validity, last_seen_uid) for one
+    /// (account, folder). Does NOT touch `min_seen_uid` — that's owned by
+    /// `set_folder_min_seen_uid`, since it only changes on bootstrap or
+    /// during a backward (fetch-older) pull.
     pub fn set_folder_sync_state(
         &self,
         pubkey: &str,
@@ -2274,6 +2341,34 @@ impl Database {
                 uid_validity as i64,
                 last_seen_uid as i64,
                 now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Lower `min_seen_uid` for one (account, folder). Only writes if the row
+    /// exists (a forward sync should have created it) and the new value is
+    /// strictly smaller than the current value — or the current value is NULL.
+    /// Backward-only: never raises the floor.
+    pub fn set_folder_min_seen_uid(
+        &self,
+        pubkey: &str,
+        folder: &str,
+        new_min: u32,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "UPDATE folder_sync_state
+             SET min_seen_uid = ?, updated_at = ?
+             WHERE pubkey = ? AND folder_name = ?
+               AND (min_seen_uid IS NULL OR min_seen_uid > ?)",
+            params![
+                new_min as i64,
+                now,
+                pubkey.trim().to_lowercase(),
+                folder,
+                new_min as i64,
             ],
         )?;
         Ok(())
@@ -5288,6 +5383,56 @@ mod tests {
 
         // Clearing a non-existent row is a no-op.
         db.clear_folder_sync_state("alice@example.com", "INBOX").unwrap();
+    }
+
+    #[test]
+    fn test_folder_min_seen_uid_starts_null() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, None);
+    }
+
+    #[test]
+    fn test_folder_min_seen_uid_only_lowers() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+
+        // Initial: NULL -> 50 succeeds.
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 50).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, Some(50));
+
+        // 30 < 50: lowers.
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 30).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, Some(30));
+
+        // 40 > 30: no-op (floor stays at 30).
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 40).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, Some(30));
+    }
+
+    #[test]
+    fn test_folder_min_seen_uid_requires_existing_row() {
+        let (db, _dir) = create_test_db();
+        // No row yet. set_folder_min_seen_uid is UPDATE-only — silent no-op.
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 50).unwrap();
+        assert!(db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_folder_sync_state_preserves_min_on_forward_update() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 25).unwrap();
+
+        // Forward sync advances last_seen_uid but should not touch min_seen_uid.
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 200).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.last_seen_uid, 200);
+        assert_eq!(got.min_seen_uid, Some(25));
     }
 
     // =====================

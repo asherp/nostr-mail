@@ -1337,9 +1337,11 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 // Show loading state immediately
                 domManager.disable('refreshInbox');
                 domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
-                // Sync and load all emails (no search filter)
+                // Refresh = forward delta + gap-fill within the scanned UID
+                // range; auto-sync on tab-switch uses the cheap forward-only
+                // path instead.
                 try {
-                    await window.emailService.syncInboxEmails();
+                    await window.emailService.refreshInboxEmails();
                     await window.emailService.loadEmails();
                     notificationService.showSuccess('Inbox synced successfully');
                 } catch (error) {
@@ -1772,7 +1774,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 refreshSent.innerHTML = '<span class="loading"></span> Syncing...';
                 
                 try {
-                    await window.emailService.syncSentEmails();
+                    await window.emailService.refreshSentEmails();
                     // loadSentEmails() will manage the button state from here
                     await window.emailService.loadSentEmails();
                     notificationService.showSuccess('Sent emails synced successfully');
@@ -2800,13 +2802,17 @@ NostrMailApp.prototype.switchTab = async function(tabName) {
     if (tabName === 'inbox') {
         if (window.emailService) {
             // Folder list is loaded when the Settings tab is opened. Here we
-            // just load emails using the persisted inbox_folder preference.
+            // just load emails using the persisted inbox_folder preference,
+            // then kick off a debounced background sync so newer mail shows
+            // up without the user having to press Refresh.
             window.emailService.loadEmails();
+            window.emailService.autoSyncInboxIfStale();
         }
     }
     if (tabName === 'sent') {
         if (window.emailService) {
             window.emailService.loadSentEmails();
+            window.emailService.autoSyncSentIfStale();
         }
     }
     if (tabName === 'drafts') {

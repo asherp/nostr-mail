@@ -3114,20 +3114,17 @@ fn db_get_email_threads(limit: Option<i64>, offset: Option<i64>, nostr_only: Opt
 
 #[tauri::command]
 fn db_get_sent_email_threads(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailThreadSummary>, String> {
+    // user_pubkey is intentionally ignored. The previous post-filter on
+    // sender_pubkey ran AFTER the SQL LIMIT, so any thread whose rep didn't
+    // match the active pubkey shortened the returned page — which the
+    // frontend interprets via `emails.length === pageSize` as "DB exhausted"
+    // and stops paginating. get_sent_email_threads now selects the rep to
+    // be the user's own sent message (Gmail-normalized from_address match),
+    // making this filter both redundant and broken.
+    let _ = user_pubkey;
     let db = state.get_database()?;
     let threads = db.get_sent_email_threads(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
-    // Filter by sender_pubkey if user_pubkey is provided (same as db_get_sent_emails)
-    let filtered: Vec<_> = if let Some(ref upk) = user_pubkey {
-        threads.into_iter().filter(|(e, _, _, _)| {
-            match &e.sender_pubkey {
-                Some(spk) => spk == upk,
-                None => true,
-            }
-        }).collect()
-    } else {
-        threads
-    };
-    let mapped: Vec<EmailThreadSummary> = filtered.iter().map(|(email, count, unread, attachments)| {
+    let mapped: Vec<EmailThreadSummary> = threads.iter().map(|(email, count, unread, attachments)| {
         map_email_thread_to_summary(email, *count, *unread, *attachments)
     }).collect();
     Ok(mapped)
@@ -4756,6 +4753,54 @@ async fn reset_folder_sync_state(
 ) -> Result<(), String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     db.clear_folder_sync_state(&email_address, &folder_name)
+        .map_err(|e| e.to_string())
+}
+
+/// Thorough refresh: forward UID delta + gap-fill within the scanned range.
+/// Maps to the Refresh button. Auto-sync on tab switch keeps using the cheap
+/// `sync_nostr_emails` (forward delta only).
+#[tauri::command]
+async fn refresh_inbox_emails(config: EmailConfig, folders: Option<Vec<String>>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::refresh_inbox_emails_to_db(&config, folders.as_deref(), &active_pubkey, &db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn refresh_sent_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::refresh_sent_emails_to_db(&config, &active_pubkey, &db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_older_inbox_emails(
+    config: EmailConfig,
+    folder: Option<String>,
+    page_size: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<email::FetchOlderSummary, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::fetch_older_inbox_emails_to_db(&config, folder.as_deref(), page_size, &active_pubkey, &db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_older_sent_emails(
+    config: EmailConfig,
+    page_size: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<email::FetchOlderSummary, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::fetch_older_sent_emails_to_db(&config, page_size, &active_pubkey, &db)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -6843,6 +6888,10 @@ pub fn run() {
         get_default_inbox_folders,
         reset_folder_sync_state,
         sync_sent_emails,
+        fetch_older_inbox_emails,
+        fetch_older_sent_emails,
+        refresh_inbox_emails,
+        refresh_sent_emails,
         sync_all_emails,
         sync_direct_messages_with_network,
         sync_conversation_with_network,

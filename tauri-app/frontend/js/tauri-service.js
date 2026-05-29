@@ -461,6 +461,88 @@ const TauriService = {
         return await this.invoke('sync_sent_emails', { config: emailConfig });
     },
 
+    refreshInboxEmails: async function(folders = null) {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        const useTls = settings.use_tls !== undefined && settings.use_tls !== null
+            ? settings.use_tls
+            : true;
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+            private_key: null
+        };
+        return await this.invoke('refresh_inbox_emails', { config: emailConfig, folders });
+    },
+
+    refreshSentEmails: async function() {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: settings.use_tls,
+            private_key: null
+        };
+        return await this.invoke('refresh_sent_emails', { config: emailConfig });
+    },
+
+    fetchOlderInboxEmails: async function(pageSize = 50, folder = null) {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        const useTls = settings.use_tls !== undefined && settings.use_tls !== null
+            ? settings.use_tls
+            : true;
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+            private_key: null
+        };
+        return await this.invoke('fetch_older_inbox_emails', { config: emailConfig, folder, pageSize });
+    },
+
+    fetchOlderSentEmails: async function(pageSize = 50) {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: settings.use_tls,
+            private_key: null
+        };
+        return await this.invoke('fetch_older_sent_emails', { config: emailConfig, pageSize });
+    },
+
     syncAllEmails: async function() {
         const settings = window.appState?.getSettings();
         const keypair = window.appState?.getKeypair();

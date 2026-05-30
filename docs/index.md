@@ -107,7 +107,6 @@ Ready to get started? Check out the [Installation Guide](installation.md) and [Q
 ### Technical Documentation
 - [Architecture](architecture.md) - Project structure and data flow
 - [Development](development.md) - Building and development workflow
-- [Tech Stack](Techstack.md) - Building blocks and dependencies
 
 ### Protocol & Specification
 - [Nostr-Mail Protocol Specification](nostr-mail-spec.md) - Wire format for armor blocks and headers

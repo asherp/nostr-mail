@@ -27,7 +27,6 @@ nav:
 - Technical Documentation:
   - Architecture: architecture.md
   - Development: development.md
-  - Tech Stack: Techstack.md
 - Protocol & Specification:
   - Nostr-Mail Spec: nostr-mail-spec.md
   - NIP Proposal: NIP.md

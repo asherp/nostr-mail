@@ -11,6 +11,7 @@ View and manage sent email history.
 - **Sent Email List**: View all sent emails with recipient, subject, and timestamp
 - **Email Details**: View full sent email content
 - **Search**: Search sent emails by recipient or subject
+- **Threading**: Sent emails are grouped into conversation threads
 - **Pagination**: Load sent emails in pages
 
 ## Usage Instructions

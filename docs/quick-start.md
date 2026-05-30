@@ -8,6 +8,7 @@ Get up and running with nostr-mail in just a few steps!
 
    - Navigate to Settings → Nostr Settings
    - Click "Generate New Keypair" or paste your existing nsec/npriv key
+   - Your key is stored in the OS secure keychain. You can add and switch between multiple accounts from the account switcher in the sidebar — see [Accounts & Keys](pages/accounts.md).
    - **Important**: Save your private key securely! You'll need it to decrypt messages.
 
 ### **Configure Email**:

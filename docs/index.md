@@ -110,7 +110,6 @@ Ready to get started? Check out the [Installation Guide](installation.md) and [Q
 
 ### Protocol & Specification
 - [Nostr-Mail Protocol Specification](nostr-mail-spec.md) - Wire format for armor blocks and headers
-- [NIP Proposal](NIP.md) - Draft NIP for email alongside Nostr
 - [Glossia Design Philosophy](glossia-design.md) - Why glossia uses text/plain, not multipart/alternative
 - [Related Work](related_work.md) - Other approaches considered
 

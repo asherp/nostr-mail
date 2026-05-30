@@ -6061,7 +6061,7 @@ async fn handle_live_gift_wrap(
         }
     };
 
-    let UnwrappedGift { sender, rumor } = unwrapped;
+    let UnwrappedGift { sender, mut rumor } = unwrapped;
 
     // Discover this sender's NIP-65 outbox in the background so we catch
     // their next gift wraps on whichever relays they actually publish to.
@@ -6099,13 +6099,18 @@ async fn handle_live_gift_wrap(
 
     let received_from_relay = relay_url.map(|u| u.to_string());
 
+    // Dedup on the INNER rumor's id, not the outer gift wrap. The rumor id is
+    // content-addressed (hash of pubkey+created_at+kind+tags+content per NIP-01),
+    // so two different wraps of the same rumor — same wrap from another relay,
+    // sender publishing multiple wraps with different ephemeral keys, sender's
+    // self-wrap+recipient-wrap pair — collapse to one row via the existing
+    // UNIQUE constraint on direct_messages.event_id. Mirrors Amethyst's
+    // GiftWrapEventHandler, which dedupes by the inner rumor id.
+    let dedup_event_id = rumor.id().to_hex();
+
     let dm = DbDirectMessage {
         id: None,
-        // Use the OUTER wrap's event_id for dedup (UNIQUE constraint on event_id).
-        // Same wrap delivered by multiple relays gets one row. The recipient's
-        // wrap and the sender's self-wrap have different event_ids, so both
-        // sides naturally store their own wrap.
-        event_id: event.id.to_hex(),
+        event_id: dedup_event_id,
         sender_pubkey: sender_npub.clone(),
         recipient_pubkey: recipient_npub.clone(),
         // Verbatim — preserves email-DM hash matching.
@@ -6381,6 +6386,16 @@ fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String
         },
         None => Ok(false),
     }
+}
+
+#[tauri::command]
+fn db_check_dms_match_email_encrypted_batch(
+    dm_event_ids: Vec<String>,
+    state: tauri::State<AppState>,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    db.check_dms_match_email_encrypted_batch(&dm_event_ids)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -6912,6 +6927,7 @@ pub fn run() {
         db_delete_inbox_email,
         db_mark_as_read,
         db_check_dm_matches_email_encrypted,
+        db_check_dms_match_email_encrypted_batch,
         db_get_matching_email_id,
         db_get_matching_email_body,
         db_update_email_subject_hash,

@@ -2443,16 +2443,48 @@ impl Database {
             )?;
             id
         } else {
-            let _id = conn.execute(
-                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash, email_message_id, received_from_relay)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.created_at, dm.received_at, content_hash, dm.email_message_id,
-                    dm.received_from_relay
-                ],
-            )?;
-            conn.last_insert_rowid()
+            // Logical-key dedup, not just UNIQUE(event_id). Two NIP-17 wraps of
+            // the same rumor — another relay's copy, the sender's
+            // self-wrap+recipient-wrap pair, an ephemeral-key re-wrap — share
+            // (sender, recipient, created_at, content) but carry different outer
+            // event_ids. Worse, across the rumor-id upgrade a *legacy* row holds
+            // the old outer-wrap id while new deliveries compute the inner rumor
+            // id, so the two never collide on event_id and re-duplicate on every
+            // re-delivery. Collapse on the content-addressed logical key here,
+            // mirroring migrate_collapse_dm_rumor_duplicates, so upgraded users
+            // stop accumulating dups between restarts.
+            let existing_id: Option<i64> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM direct_messages
+                     WHERE sender_pubkey = ? AND recipient_pubkey = ?
+                       AND created_at = ? AND COALESCE(content_hash, '') = ?
+                     ORDER BY received_at, id LIMIT 1"
+                )?;
+                let mut rows = stmt.query(params![
+                    dm.sender_pubkey, dm.recipient_pubkey, dm.created_at, content_hash
+                ])?;
+                match rows.next()? {
+                    Some(row) => Some(row.get(0)?),
+                    None => None,
+                }
+            };
+
+            if let Some(id) = existing_id {
+                // Already have this rumor under another wrap/event_id. Skip the
+                // insert and keep the existing row.
+                id
+            } else {
+                conn.execute(
+                    "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash, email_message_id, received_from_relay)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
+                        dm.created_at, dm.received_at, content_hash, dm.email_message_id,
+                        dm.received_from_relay
+                    ],
+                )?;
+                conn.last_insert_rowid()
+            }
         };
         
         // Update conversation metadata for both sender and recipient
@@ -2470,14 +2502,25 @@ impl Database {
         let mut conversations_to_update = std::collections::HashSet::new();
         
         for dm in dms {
-            // Check if this event_id already exists
-            let mut stmt = conn.prepare("SELECT 1 FROM direct_messages WHERE event_id = ? LIMIT 1")?;
-            let mut rows = stmt.query(params![dm.event_id])?;
+            // Compute hash for DM content
+            let content_hash = Self::compute_content_hash(&dm.content);
+            // Dedup on the content-addressed logical key, not just event_id:
+            // legacy outer-wrap ids and new inner-rumor ids never collide, so an
+            // event_id-only check lets the same rumor in twice. See save_dm.
+            let mut stmt = conn.prepare(
+                "SELECT 1 FROM direct_messages
+                 WHERE event_id = ?
+                    OR (sender_pubkey = ? AND recipient_pubkey = ?
+                        AND created_at = ? AND COALESCE(content_hash, '') = ?)
+                 LIMIT 1"
+            )?;
+            let mut rows = stmt.query(params![
+                dm.event_id,
+                dm.sender_pubkey, dm.recipient_pubkey, dm.created_at, content_hash
+            ])?;
             if rows.next()?.is_some() {
                 continue; // Skip if already exists
             }
-            // Compute hash for DM content
-            let content_hash = Self::compute_content_hash(&dm.content);
             conn.execute(
                 "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash, email_message_id, received_from_relay)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -4835,17 +4878,77 @@ mod tests {
     #[test]
     fn test_save_dm_batch() {
         let (db, _dir) = create_test_db();
-        let dms = vec![
-            make_dm("batch_ev1", "alice", "bob"),
-            make_dm("batch_ev2", "alice", "bob"),
-            make_dm("batch_ev3", "bob", "alice"),
-        ];
+        // Distinct content per row: two messages sharing sender, recipient,
+        // created_at and content are the same content-addressed rumor, so the
+        // dedup would (correctly) collapse them. Give each a unique body.
+        let mut a = make_dm("batch_ev1", "alice", "bob");
+        a.content = "first".to_string();
+        let mut b = make_dm("batch_ev2", "alice", "bob");
+        b.content = "second".to_string();
+        let mut c = make_dm("batch_ev3", "bob", "alice");
+        c.content = "third".to_string();
+        let dms = vec![a, b, c];
         let inserted = db.save_dm_batch(&dms).unwrap();
         assert_eq!(inserted, 3);
 
         // Inserting the same batch again should skip all (idempotent)
         let inserted_again = db.save_dm_batch(&dms).unwrap();
         assert_eq!(inserted_again, 0);
+    }
+
+    #[test]
+    fn test_save_dm_dedups_legacy_outer_id_vs_rumor_id() {
+        // Reproduces the upgrade scenario: a legacy row stored under the old
+        // outer-wrap event_id, then the same rumor re-delivered under the new
+        // inner-rumor event_id. They never collide on event_id, so without
+        // logical-key dedup the second insert would create a duplicate row.
+        let (db, _dir) = create_test_db();
+        let when = Utc::now();
+
+        let legacy = DirectMessage {
+            id: None,
+            event_id: "outer_wrap_id".to_string(),
+            sender_pubkey: "alice".to_string(),
+            recipient_pubkey: "bob".to_string(),
+            content: "Re: testing attachment".to_string(),
+            created_at: when,
+            received_at: when,
+            email_message_id: None,
+            received_from_relay: None,
+        };
+        let id1 = db.save_dm(&legacy).unwrap();
+
+        // Same rumor, different (content-addressed) event_id, arriving later.
+        let rewrap = DirectMessage {
+            id: None,
+            event_id: "inner_rumor_id".to_string(),
+            received_at: when + chrono::Duration::minutes(15),
+            received_from_relay: Some("wss://relay.primal.net".to_string()),
+            ..legacy.clone()
+        };
+        let id2 = db.save_dm(&rewrap).unwrap();
+
+        // No new row; the existing legacy row is returned and kept.
+        assert_eq!(id2, id1);
+        let count: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM direct_messages WHERE sender_pubkey = 'alice' AND recipient_pubkey = 'bob'",
+                [],
+                |r| r.get(0),
+            ).unwrap()
+        };
+        assert_eq!(count, 1);
+
+        // A genuinely different message (different content) still inserts.
+        let other = DirectMessage {
+            id: None,
+            event_id: "another_rumor".to_string(),
+            content: "different body".to_string(),
+            ..legacy.clone()
+        };
+        let id3 = db.save_dm(&other).unwrap();
+        assert_ne!(id3, id1);
     }
 
     #[test]

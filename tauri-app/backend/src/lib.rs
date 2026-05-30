@@ -36,6 +36,27 @@ use serde_json;
 use tauri::Emitter;
 use chrono::{DateTime, Utc};
 
+/// Returns true when NOSTR_MAIL_DEBUG is set in the environment. Gates sensitive
+/// diagnostic logs (decrypted content, ciphertext previews, decryption metadata)
+/// so they never fire in release builds. Resolved once and cached.
+pub fn debug_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NOSTR_MAIL_DEBUG").is_ok())
+}
+
+/// Crate-wide gated logging macro. Use for any line that could expose plaintext,
+/// ciphertext, or other sensitive material — it only prints when NOSTR_MAIL_DEBUG
+/// is set. NEVER log raw private key material, even gated. Available in other
+/// modules as `crate::debug_log!`.
+#[macro_export]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if $crate::debug_log_enabled() {
+            println!($($arg)*);
+        }
+    };
+}
+
 /// Resolve a private key: prefer an explicit key if provided, fall back to AppState.
 fn resolve_private_key(explicit: Option<String>, state: &AppState) -> Result<String, String> {
     if let Some(key) = explicit.filter(|k| !k.is_empty()) {
@@ -1048,7 +1069,8 @@ fn generate_keypair() -> Result<KeyPair, String> {
 
 #[tauri::command]
 fn validate_private_key(private_key: String) -> Result<bool, String> {
-    println!("[RUST] validate_private_key called with: {}...", &private_key[..10.min(private_key.len())]);
+    // Never log private key material, even a prefix — on Android this lands in logcat.
+    println!("[RUST] validate_private_key called");
     crypto::validate_private_key(&private_key).map_err(|e| e.to_string())
 }
 
@@ -2949,7 +2971,7 @@ async fn db_search_emails(
                             }
                             Err(e) => {
                                 println!("[RUST] Failed to parse decrypted body as JSON: {}", e);
-                                println!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
+                                crate::debug_log!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
                             }
                         }
                     }
@@ -3310,7 +3332,7 @@ async fn db_search_sent_emails(
                             }
                             Err(e) => {
                                 println!("[RUST] Failed to parse decrypted body as JSON: {}", e);
-                                println!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
+                                crate::debug_log!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
                             }
                         }
                     }
@@ -3365,11 +3387,11 @@ async fn db_search_sent_emails(
         
         let matches = from_matches || to_matches || subject_matches || body_matches || attachment_matches;
         
-        // Always log search details for debugging
-        println!("[RUST] Sent email {} search for '{}': from={}, to={}, subject={}, body={}, attachments={}, is_manifest={}", 
+        // Search details — gated behind NOSTR_MAIL_DEBUG since they expose decrypted plaintext.
+        crate::debug_log!("[RUST] Sent email {} search for '{}': from={}, to={}, subject={}, body={}, attachments={}, is_manifest={}",
             email.id.unwrap_or(0), search_query, from_matches, to_matches, subject_matches, body_matches, attachment_matches, is_manifest);
-        println!("[RUST] Decrypted subject: {}", decrypted_subject.chars().take(100).collect::<String>());
-        println!("[RUST] Decrypted body (first 200 chars): {}", searchable_body.chars().take(200).collect::<String>());
+        crate::debug_log!("[RUST] Decrypted subject: {}", decrypted_subject.chars().take(100).collect::<String>());
+        crate::debug_log!("[RUST] Decrypted body (first 200 chars): {}", searchable_body.chars().take(200).collect::<String>());
         
             if matches {
                 // Skip results until we reach the offset

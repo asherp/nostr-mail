@@ -92,6 +92,18 @@ pub struct DbConversation {
     pub cached_at: DateTime<Utc>,
 }
 
+/// One-row-per-contact summary for the DM contact list. Carries just the
+/// latest message (still encrypted) plus a total count, so the contact list
+/// can render without fetching+decrypting every message of every conversation.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DmConversationPreview {
+    pub contact_pubkey: String,
+    pub last_event_id: String,
+    pub last_content: String,
+    pub last_created_at: DateTime<Utc>,
+    pub message_count: i64,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserSettings {
@@ -2569,6 +2581,136 @@ impl Database {
         })?;
 
         rows.collect()
+    }
+
+    /// Paginated fetch of a conversation, newest-first internally but returned
+    /// oldest→newest (ASC) so callers can append a page directly.
+    ///
+    /// Fetches at most `limit` messages. When `before` is `Some((created_at, id))`
+    /// only messages strictly older than that cursor are returned — the cursor is
+    /// the oldest message currently held by the caller. The `(created_at, id)` pair
+    /// is used as a compound key so messages sharing a `created_at` (second-
+    /// granularity) page cleanly without gaps or duplicates.
+    pub fn get_dms_for_conversation_page(
+        &self,
+        user_pubkey: &str,
+        contact_pubkey: &str,
+        limit: i64,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<DirectMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<DirectMessage> {
+            Ok(DirectMessage {
+                id: Some(row.get(0)?),
+                event_id: row.get(1)?,
+                sender_pubkey: row.get(2)?,
+                recipient_pubkey: row.get(3)?,
+                content: row.get(4)?,
+                created_at: row.get(5)?,
+                received_at: row.get(6)?,
+                email_message_id: row.get(7)?,
+                received_from_relay: row.get(8)?,
+            })
+        };
+
+        let mut messages: Vec<DirectMessage> = match before {
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, email_message_id, received_from_relay
+                     FROM direct_messages
+                     WHERE (sender_pubkey = ?1 AND recipient_pubkey = ?2) OR (sender_pubkey = ?2 AND recipient_pubkey = ?1)
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?3"
+                )?;
+                let rows = stmt.query_map(params![user_pubkey, contact_pubkey, limit], map_row)?;
+                rows.collect::<Result<Vec<_>>>()?
+            }
+            Some((cursor_created_at, cursor_id)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, email_message_id, received_from_relay
+                     FROM direct_messages
+                     WHERE ((sender_pubkey = ?1 AND recipient_pubkey = ?2) OR (sender_pubkey = ?2 AND recipient_pubkey = ?1))
+                       AND (created_at < ?3 OR (created_at = ?3 AND id < ?4))
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?5"
+                )?;
+                let rows = stmt.query_map(
+                    params![user_pubkey, contact_pubkey, cursor_created_at, cursor_id, limit],
+                    map_row,
+                )?;
+                rows.collect::<Result<Vec<_>>>()?
+            }
+        };
+
+        // Query is newest-first for the LIMIT to grab the most recent page;
+        // flip to chronological order for rendering.
+        messages.reverse();
+        Ok(messages)
+    }
+
+    /// One row per contact: the latest message (still encrypted) and a total
+    /// message count, ordered most-recent-conversation first. Lets the contact
+    /// list render without fetching+decrypting entire conversations.
+    pub fn get_dm_conversation_previews(&self, user_pubkey: &str) -> Result<Vec<DmConversationPreview>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT contact_pubkey, event_id, content, created_at, msg_count FROM (
+               SELECT
+                 CASE WHEN sender_pubkey = ?1 THEN recipient_pubkey ELSE sender_pubkey END AS contact_pubkey,
+                 event_id, content, created_at, id,
+                 COUNT(*) OVER (
+                   PARTITION BY CASE WHEN sender_pubkey = ?1 THEN recipient_pubkey ELSE sender_pubkey END
+                 ) AS msg_count,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY CASE WHEN sender_pubkey = ?1 THEN recipient_pubkey ELSE sender_pubkey END
+                   ORDER BY created_at DESC, id DESC
+                 ) AS rn
+               FROM direct_messages
+               WHERE sender_pubkey = ?1 OR recipient_pubkey = ?1
+             )
+             WHERE rn = 1 AND contact_pubkey != ''
+             ORDER BY created_at DESC"
+        )?;
+        let rows = stmt.query_map(params![user_pubkey], |row| {
+            Ok(DmConversationPreview {
+                contact_pubkey: row.get(0)?,
+                last_event_id: row.get(1)?,
+                last_content: row.get(2)?,
+                last_created_at: row.get(3)?,
+                message_count: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Contacts whose conversation contains at least one DM that matches a stored
+    /// email. Mirrors `db_check_dm_matches_email_encrypted`: a match is either a
+    /// NIP-17 message-id link (dm.email_message_id ↔ emails.message_id) or the
+    /// content-hash fallback (dm.content_hash ↔ emails.subject_hash). Computed in
+    /// one query so the contact list doesn't probe every message individually.
+    pub fn get_dm_pubkeys_with_email_match(&self, user_pubkey: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT contact_pubkey FROM (
+               SELECT CASE WHEN dm.sender_pubkey = ?1 THEN dm.recipient_pubkey ELSE dm.sender_pubkey END AS contact_pubkey
+               FROM direct_messages dm
+               WHERE (dm.sender_pubkey = ?1 OR dm.recipient_pubkey = ?1)
+                 AND (
+                   (dm.email_message_id IS NOT NULL AND dm.email_message_id != ''
+                    AND EXISTS (SELECT 1 FROM emails e WHERE e.message_id = dm.email_message_id))
+                   OR
+                   (dm.content_hash IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM emails e WHERE e.subject_hash = dm.content_hash AND e.is_nostr_encrypted = 1))
+                 )
+             )
+             WHERE contact_pubkey != ''"
+        )?;
+        let rows = stmt.query_map(params![user_pubkey], |row| row.get(0))?;
+        let mut pubkeys = Vec::new();
+        for row in rows {
+            pubkeys.push(row?);
+        }
+        Ok(pubkeys)
     }
 
     // Returns the latest created_at timestamp from direct_messages, or None if no messages exist

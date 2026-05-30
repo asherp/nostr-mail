@@ -19,7 +19,7 @@ use types::*;
 pub use state::{AppState, Relay};
 pub use types::{KeyPair, EmailConfig};
 use storage::{Storage, Contact, UserProfile, AppSettings, EmailDraft};
-use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation};
+use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation, DmConversationPreview};
 use crate::types::{EmailMessage, EmailThreadSummary, RelayStatus, RelayConnectionStatus};
 
 use nostr_sdk::Metadata;
@@ -3434,6 +3434,44 @@ fn db_get_dms_for_conversation(user_pubkey: String, contact_pubkey: String, stat
     println!("[RUST] db_get_dms_for_conversation called");
     let db = state.get_database()?;
     db.get_dms_for_conversation(&user_pubkey, &contact_pubkey).map_err(|e| e.to_string())
+}
+
+/// Paginated conversation fetch. Returns at most `limit` messages, oldest→newest.
+/// When `before_created_at` + `before_id` are both supplied they form the cursor
+/// (the oldest message the caller already holds); only older messages are returned.
+#[tauri::command]
+fn db_get_dms_for_conversation_page(
+    user_pubkey: String,
+    contact_pubkey: String,
+    limit: i64,
+    before_created_at: Option<DateTime<Utc>>,
+    before_id: Option<i64>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<DbDirectMessage>, String> {
+    let db = state.get_database()?;
+    let before = match (before_created_at, before_id) {
+        (Some(ts), Some(id)) => Some((ts, id)),
+        _ => None,
+    };
+    db.get_dms_for_conversation_page(&user_pubkey, &contact_pubkey, limit, before)
+        .map_err(|e| e.to_string())
+}
+
+/// One-row-per-contact previews (latest still-encrypted message + count) for the
+/// DM contact list. Avoids fetching+decrypting whole conversations just to render
+/// the list.
+#[tauri::command]
+fn db_get_dm_conversation_previews(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<DmConversationPreview>, String> {
+    let db = state.get_database()?;
+    db.get_dm_conversation_previews(&user_pubkey).map_err(|e| e.to_string())
+}
+
+/// Contacts whose conversation contains at least one email-matched DM, for the
+/// envelope indicator in the contact list.
+#[tauri::command]
+fn db_get_dm_pubkeys_with_email_match(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.get_database()?;
+    db.get_dm_pubkeys_with_email_match(&user_pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -6857,6 +6895,9 @@ pub fn run() {
         db_get_all_sent_message_ids,
         db_save_dm,
         db_get_dms_for_conversation,
+        db_get_dms_for_conversation_page,
+        db_get_dm_conversation_previews,
+        db_get_dm_pubkeys_with_email_match,
         db_get_decrypted_dms_for_conversation,
         db_save_conversation,
         db_get_conversations,

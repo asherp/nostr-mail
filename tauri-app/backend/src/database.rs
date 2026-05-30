@@ -505,6 +505,10 @@ impl Database {
         // pagination ("fetch older from server").
         Self::migrate_add_min_seen_uid_column(&conn)?;
 
+        // Migrate: One-shot cleanup of duplicate DM rows that slipped past the
+        // old outer-wrap-id dedup. Safe to run on every startup (idempotent).
+        Self::migrate_collapse_dm_rumor_duplicates(&conn)?;
+
         // Create indexes for better performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_pubkey ON contacts(pubkey)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_contacts_user_pubkey ON user_contacts(user_pubkey)", [])?;
@@ -731,6 +735,39 @@ impl Database {
                 "ALTER TABLE direct_messages ADD COLUMN received_from_relay TEXT",
                 [],
             )?;
+        }
+
+        Ok(())
+    }
+
+    /// One-shot: collapse legacy duplicate DM rows that the pre-rumor-id dedup
+    /// allowed in. Two gift wraps of the same NIP-17 rumor have different outer
+    /// event_ids, so they bypassed the UNIQUE constraint on event_id. Group by
+    /// the logical key (sender, recipient, created_at, content_hash) and keep
+    /// the row with the smallest received_at per group; delete the rest.
+    /// Idempotent: a clean DB has no groups with COUNT > 1, so this is a no-op.
+    fn migrate_collapse_dm_rumor_duplicates(conn: &Connection) -> Result<()> {
+        let deleted = conn.execute(
+            "DELETE FROM direct_messages
+             WHERE id IN (
+                 SELECT id FROM direct_messages dm
+                 WHERE EXISTS (
+                     SELECT 1 FROM direct_messages keeper
+                     WHERE keeper.sender_pubkey = dm.sender_pubkey
+                       AND keeper.recipient_pubkey = dm.recipient_pubkey
+                       AND keeper.created_at = dm.created_at
+                       AND COALESCE(keeper.content_hash, '') = COALESCE(dm.content_hash, '')
+                       AND (
+                           keeper.received_at < dm.received_at
+                           OR (keeper.received_at = dm.received_at AND keeper.id < dm.id)
+                       )
+                 )
+             )",
+            [],
+        )?;
+
+        if deleted > 0 {
+            println!("[DB] Collapsed {} duplicate DM row(s) from pre-rumor-id dedup", deleted);
         }
 
         Ok(())
@@ -4809,6 +4846,43 @@ mod tests {
         // Inserting the same batch again should skip all (idempotent)
         let inserted_again = db.save_dm_batch(&dms).unwrap();
         assert_eq!(inserted_again, 0);
+    }
+
+    #[test]
+    fn test_migrate_collapse_dm_rumor_duplicates() {
+        let (db, _dir) = create_test_db();
+        let conn = db.conn.lock().unwrap();
+
+        let base = Utc::now();
+        // Two DMs that share the same logical key (sender, recipient, created_at,
+        // content) but have different event_ids — what two NIP-17 wraps of one
+        // rumor look like on disk under the old dedup scheme.
+        conn.execute(
+            "INSERT INTO direct_messages
+                (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash)
+             VALUES
+                ('wrap_outer_A', 'alice', 'bob', 'hi', ?, ?, 'h1'),
+                ('wrap_outer_B', 'alice', 'bob', 'hi', ?, ?, 'h1'),
+                ('unrelated',    'carol', 'dave', 'yo', ?, ?, 'h2')",
+            params![base, base, base, base + chrono::Duration::seconds(30), base, base],
+        ).unwrap();
+        drop(conn);
+
+        // The migration is private; reach it via re-running init_tables-style
+        // call by invoking the function directly through a fresh lock.
+        let conn = db.conn.lock().unwrap();
+        Database::migrate_collapse_dm_rumor_duplicates(&conn).unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT event_id FROM direct_messages ORDER BY event_id"
+        ).unwrap();
+        let remaining: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Keeper has the smaller received_at (wrap_outer_A); B is collapsed.
+        assert_eq!(remaining, vec!["unrelated".to_string(), "wrap_outer_A".to_string()]);
     }
 
     #[test]

@@ -33,8 +33,6 @@ nav:
   - Related Work: related_work.md
 - Legacy Documentation:
   - Legacy Docker Setup: legacy.md
-- Project:
-  - WorkLog: WorkLog.md
 
 extra_files:
   - README.md

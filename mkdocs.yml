@@ -34,7 +34,6 @@ nav:
   - NIP Proposal: NIP.md
   - Glossia Design: glossia-design.md
   - Profiles: Profiles.md
-  - Amethyst Notifications: amethyst-immediate-notifications.md
   - Related Work: related_work.md
 - Legacy Documentation:
   - Legacy Docker Setup: legacy.md

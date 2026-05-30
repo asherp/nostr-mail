@@ -58,4 +58,3 @@ File attachments are encrypted with **hybrid encryption**: each file is encrypte
 - [Glossia Encoding](glossia.md) — rendering ciphertext as readable text so it survives email forwarding and reply quoting
 - [NIP-44 Encryption](nip44.md) — the cipher used by default
 - [Nostr-Mail Protocol Specification](nostr-mail-spec.md) — the exact armor/header wire format
-- [Encryption Architecture](encryption-architecture.md) — how encryption, decryption, and encoding fit together internally

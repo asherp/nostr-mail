@@ -26,7 +26,6 @@ nav:
   - NIP-44 Encryption: nip44.md
 - Technical Documentation:
   - Architecture: architecture.md
-  - Encryption Architecture: encryption-architecture.md
   - Development: development.md
   - Tech Stack: Techstack.md
 - Protocol & Specification:

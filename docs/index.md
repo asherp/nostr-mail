@@ -106,7 +106,6 @@ Ready to get started? Check out the [Installation Guide](installation.md) and [Q
 
 ### Technical Documentation
 - [Architecture](architecture.md) - Project structure and data flow
-- [Encryption Architecture](encryption-architecture.md) - Internal encryption/encoding flow
 - [Development](development.md) - Building and development workflow
 - [Tech Stack](Techstack.md) - Building blocks and dependencies
 

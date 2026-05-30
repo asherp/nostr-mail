@@ -30,7 +30,6 @@ nav:
 - Protocol & Specification:
   - Nostr-Mail Spec: nostr-mail-spec.md
   - Glossia Design: glossia-design.md
-  - Profiles: Profiles.md
   - Related Work: related_work.md
 - Legacy Documentation:
   - Legacy Docker Setup: legacy.md

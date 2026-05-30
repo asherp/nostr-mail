@@ -38,5 +38,4 @@ For each component you can choose:
 ## Related reading
 
 - [Glossia Design Philosophy](glossia-design.md) — why `text/plain` instead of `multipart/alternative`
-- [Glossia Seal Armor](glossia-seal-armor.md) — the ASCII-armor dialects used for signature/seal blocks
 - [Encryption & Signing](encryption.md) — how Glossia fits into the overall crypto flow

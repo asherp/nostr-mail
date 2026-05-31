@@ -224,12 +224,15 @@ body.dark-mode .confirmation-modal .confirmation-dialog {
     min-width: 320px;
     text-align: center;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    word-break: break-all;
+    overflow-wrap: break-word;
 }
 
-/* Ensure confirmation dialog text wraps and breaks long words */
+/* Wrap confirmation dialog text at word boundaries; only break a word if it's
+   too long to fit (e.g. a pubkey/nsec with no spaces). break-all is avoided so
+   normal prose doesn't split mid-word. */
 .confirmation-modal .confirmation-dialog p {
-    word-break: break-all;
+    word-break: normal;
+    overflow-wrap: break-word;
     white-space: normal;
 }
 

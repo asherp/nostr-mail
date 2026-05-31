@@ -3588,6 +3588,16 @@ NostrMailApp.prototype.setupQrCodeEventListeners = function() {
             // Never log the value: it is the nsec/npriv private key.
             console.log('[QR] Private key QR button clicked');
             if (!value) return;
+            // Require explicit confirmation before rendering the secret: a private-key
+            // QR grants full account control to anyone who can see it.
+            const confirmed = await notificationService.showConfirmation(
+                'This QR code contains your PRIVATE KEY. Anyone who scans, photographs, or screenshots it gains full control of your account — they can read your messages and impersonate you. Only reveal it somewhere completely private, and never share or send the image. Continue?',
+                '⚠️ Reveal Private Key?'
+            );
+            if (!confirmed) {
+                console.log('[QR] Private key QR reveal cancelled by user');
+                return;
+            }
             try {
                 const dataUrl = await TauriService.generateQrCode(value);
                 showQrModal('Private Key QR Code', dataUrl, value);

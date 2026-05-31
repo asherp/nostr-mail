@@ -12,6 +12,27 @@ try {
     tauriFs = undefined;
 }
 
+// Settings cached in localStorage are NON-SECRET preferences only. Secrets — the
+// nostr private key and the email account password — must never be written to
+// localStorage in plaintext. The private key lives only in the backend keychain;
+// the password is stored encrypted at rest in the DB (crypto::encrypt_setting_value,
+// keyed off the user's own private key) and decrypted backend-side on read.
+const SENSITIVE_SETTINGS_KEYS = ['password', 'npriv_key'];
+
+function sanitizeSettingsForCache(settings) {
+    if (!settings || typeof settings !== 'object') return settings;
+    const clean = { ...settings };
+    for (const key of SENSITIVE_SETTINGS_KEYS) {
+        delete clean[key];
+    }
+    return clean;
+}
+
+// Persist the non-secret settings cache to localStorage with secrets stripped.
+function persistSettingsCache(settings) {
+    localStorage.setItem('nostr_mail_settings', JSON.stringify(sanitizeSettingsForCache(settings)));
+}
+
 function NostrMailApp() {
     this.initialized = false;
     this.mobileNavState = 'navbar'; // 'navbar' or 'page'
@@ -108,6 +129,27 @@ NostrMailApp.prototype.init = async function() {
             console.error('[APP] Keychain migration failed:', e);
         }
         localStorage.setItem('nostr_mail_keychain_migrated', 'true');
+    }
+
+    // Scrub any secrets (private key, email password) left in the cached settings
+    // by older app versions. The private key lives only in the backend keychain and
+    // the password is encrypted at rest in the DB — neither belongs in localStorage.
+    // Runs unconditionally (outside the one-time migration guard) so already-migrated
+    // installs still get cleaned.
+    try {
+        const rawSettings = localStorage.getItem('nostr_mail_settings');
+        if (rawSettings) {
+            const parsedSettings = JSON.parse(rawSettings);
+            const sanitized = sanitizeSettingsForCache(parsedSettings);
+            if (JSON.stringify(sanitized) !== rawSettings) {
+                localStorage.setItem('nostr_mail_settings', JSON.stringify(sanitized));
+                console.log('[APP] Removed stale secrets from cached settings');
+            }
+        }
+    } catch (e) {
+        // Corrupt cache: drop it entirely rather than risk keeping secrets around.
+        console.warn('[APP] Could not parse cached settings during secret scrub, clearing:', e);
+        localStorage.removeItem('nostr_mail_settings');
     }
 
     try {
@@ -242,8 +284,8 @@ NostrMailApp.prototype.loadSettings = async function() {
                     appState.setSettings(settings);
                     this.populateSettingsForm();
                     this.updateComposeButtons();
-                    // Also update localStorage as backup
-                    localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
+                    // Also update localStorage as backup (secrets stripped)
+                    persistSettingsCache(settings);
                     return;
                 }
             } catch (error) {
@@ -274,7 +316,6 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
     
     // Define default settings
     const defaultSettings = {
-        npriv_key: '',
         encryption_algorithm: 'nip44',
         email_address: '',
         password: '',
@@ -415,8 +456,8 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
             appState.setSettings(settings);
             this.populateSettingsForm();
             this.updateComposeButtons();
-            // Update localStorage as backup
-            localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
+            // Update localStorage as backup (secrets stripped)
+            persistSettingsCache(settings);
             console.log('[APP] Settings loaded for pubkey:', pubkey);
             
             // Update last loaded pubkey tracker
@@ -2869,6 +2910,10 @@ NostrMailApp.prototype.hideModal = function() {
     try {
         const modalOverlay = domManager.get('modalOverlay');
         if (modalOverlay) modalOverlay.classList.add('hidden');
+        // Clear the body so secrets (e.g. an nsec rendered under a private-key QR)
+        // don't linger in the live DOM after the modal is dismissed.
+        const modalBody = domManager.get('modalBody');
+        if (modalBody) modalBody.innerHTML = '';
     } catch (error) {
         console.error('Error hiding modal:', error);
     }
@@ -3005,7 +3050,9 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             // Use loaded settings if available, otherwise use form values (which should be populated by loadSettingsForPubkey)
             // Prioritize loadedSettings but fall back to form values as they should match after populateSettingsForm()
             settings = {
-                npriv_key: nprivKey,
+                // NOTE: the private key is NOT stored here. It lives only in the
+                // backend keychain (added via profileManager.addAccount above).
+                // Persisting it in this object would leak it to localStorage.
                 encryption_algorithm: (loadedSettings && loadedSettings.encryption_algorithm) ? loadedSettings.encryption_algorithm : (domManager.getValue('encryptionAlgorithm') || 'nip44'),
                 email_address: (loadedSettings && loadedSettings.email_address) ? loadedSettings.email_address : (domManager.getValue('emailAddress') || ''),
                 password: (loadedSettings && loadedSettings.password) ? loadedSettings.password : (domManager.getValue('emailPassword') || ''),
@@ -3072,10 +3119,10 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             };
         }
         
-        // Keep localStorage as backup
-        localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
+        // Keep localStorage as backup, with secrets stripped: the private key lives
+        // only in the backend keychain and the password is encrypted at rest in the DB.
+        persistSettingsCache(settings);
         appState.setSettings(settings);
-        appState.setNprivKey(settings.npriv_key);
         
         // Save settings to database with pubkey association (REQUIRED)
         // Settings are saved under the public key, so each keypair has its own email settings
@@ -3538,8 +3585,19 @@ NostrMailApp.prototype.setupQrCodeEventListeners = function() {
         qrNprivBtn.parentNode.replaceChild(newQrNprivBtn, qrNprivBtn);
         newQrNprivBtn.addEventListener('click', async () => {
             const value = nprivKeyInput.value;
-            console.log('[QR] Private key QR button clicked. Value:', value);
+            // Never log the value: it is the nsec/npriv private key.
+            console.log('[QR] Private key QR button clicked');
             if (!value) return;
+            // Require explicit confirmation before rendering the secret: a private-key
+            // QR grants full account control to anyone who can see it.
+            const confirmed = await notificationService.showConfirmation(
+                'This QR code contains your PRIVATE KEY. Anyone who scans, photographs, or screenshots it gains full control of your account — they can read your messages and impersonate you. Only reveal it somewhere completely private, and never share or send the image. Continue?',
+                '⚠️ Reveal Private Key?'
+            );
+            if (!confirmed) {
+                console.log('[QR] Private key QR reveal cancelled by user');
+                return;
+            }
             try {
                 const dataUrl = await TauriService.generateQrCode(value);
                 showQrModal('Private Key QR Code', dataUrl, value);
@@ -3698,8 +3756,9 @@ NostrMailApp.prototype.scanPrivateKeyQRCode = async function() {
                     aspectRatio: 1.0
                 },
                 (decodedText, decodedResult) => {
-                    console.log('[QR] QR code scanned:', decodedText);
-                    
+                    // Never log decodedText: a scanned private-key QR is an nsec/npriv.
+                    console.log('[QR] QR code scanned');
+
                     // Validate the scanned text is a private key
                     const scannedKey = decodedText.trim();
                     if (!scannedKey.startsWith('npriv1') && !scannedKey.startsWith('nsec1')) {

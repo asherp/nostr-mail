@@ -509,7 +509,18 @@ class DMService {
         }, { passive: true });
     }
 
-    // Load profiles for DM contacts
+    // Enrich DM contacts with relay-fetched kind:0 profiles (names/avatars).
+    //
+    // INTENTIONALLY NOT CALLED. This is a deliberate anti-spoofing measure, not
+    // dead code. The DM list resolves names/avatars ONLY from saved contacts
+    // (DatabaseService.getContact). If we pulled relay profiles for unsaved
+    // pubkeys, a non-contact could copy a known contact's display name and
+    // avatar and appear identical to them in the list — letting the user mistake
+    // an impostor for someone they trust. Unsaved senders therefore stay shown as
+    // a truncated pubkey with no avatar, visually distinct from real contacts.
+    //
+    // Do NOT wire this into loadDmContacts() to "fix" missing names — that would
+    // reintroduce the impersonation vector. (See git history / issue discussion.)
     async loadDmContactProfiles() {
         // Only process contacts that don't already have profiles loaded
         const dmContacts = window.appState.getDmContacts();

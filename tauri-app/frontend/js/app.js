@@ -110,6 +110,26 @@ NostrMailApp.prototype.init = async function() {
         localStorage.setItem('nostr_mail_keychain_migrated', 'true');
     }
 
+    // Scrub any private key left in the cached settings by older app versions.
+    // The key now lives only in the backend keychain; it must never sit in
+    // localStorage. Runs unconditionally (outside the one-time migration guard)
+    // so already-migrated installs still get cleaned.
+    try {
+        const rawSettings = localStorage.getItem('nostr_mail_settings');
+        if (rawSettings) {
+            const parsedSettings = JSON.parse(rawSettings);
+            if (parsedSettings && parsedSettings.npriv_key) {
+                delete parsedSettings.npriv_key;
+                localStorage.setItem('nostr_mail_settings', JSON.stringify(parsedSettings));
+                console.log('[APP] Removed stale private key from cached settings');
+            }
+        }
+    } catch (e) {
+        // Corrupt cache: drop it entirely rather than risk keeping a key around.
+        console.warn('[APP] Could not parse cached settings during key scrub, clearing:', e);
+        localStorage.removeItem('nostr_mail_settings');
+    }
+
     try {
         console.log('Loading application settings...');
         // Settings will be loaded after keypair is loaded (in loadKeypair)
@@ -274,7 +294,6 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
     
     // Define default settings
     const defaultSettings = {
-        npriv_key: '',
         encryption_algorithm: 'nip44',
         email_address: '',
         password: '',
@@ -3005,7 +3024,9 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             // Use loaded settings if available, otherwise use form values (which should be populated by loadSettingsForPubkey)
             // Prioritize loadedSettings but fall back to form values as they should match after populateSettingsForm()
             settings = {
-                npriv_key: nprivKey,
+                // NOTE: the private key is NOT stored here. It lives only in the
+                // backend keychain (added via profileManager.addAccount above).
+                // Persisting it in this object would leak it to localStorage.
                 encryption_algorithm: (loadedSettings && loadedSettings.encryption_algorithm) ? loadedSettings.encryption_algorithm : (domManager.getValue('encryptionAlgorithm') || 'nip44'),
                 email_address: (loadedSettings && loadedSettings.email_address) ? loadedSettings.email_address : (domManager.getValue('emailAddress') || ''),
                 password: (loadedSettings && loadedSettings.password) ? loadedSettings.password : (domManager.getValue('emailPassword') || ''),
@@ -3072,10 +3093,10 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             };
         }
         
-        // Keep localStorage as backup
+        // Keep localStorage as backup. settings must never contain the private
+        // key — it lives only in the backend keychain.
         localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
         appState.setSettings(settings);
-        appState.setNprivKey(settings.npriv_key);
         
         // Save settings to database with pubkey association (REQUIRED)
         // Settings are saved under the public key, so each keypair has its own email settings

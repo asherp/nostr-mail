@@ -16,8 +16,9 @@ use std::net::TcpStream;
 
 // Verbose [RUST] logs in the decrypt hot path are silent by default — set the
 // NOSTR_MAIL_DEBUG environment variable to any value to re-enable them for
-// diagnostics. [RUST-PERF] lines (regular println!) remain on so profiling
-// info is always available.
+// diagnostics. [RUST-PERF] profiling lines are gated behind the same variable
+// (via debug_log!), so they're off in normal use and only printed when
+// NOSTR_MAIL_DEBUG is set.
 fn debug_log_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("NOSTR_MAIL_DEBUG").is_ok())
@@ -1767,7 +1768,7 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
 
     let cache_map = PARSE_ARMOR_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some(cached) = cache_map.lock().unwrap().get(&cache_key) {
-        println!("[RUST-PERF] parse_armor cache HIT key={:x} (in={}b, has_quoted={})",
+        debug_log!("[RUST-PERF] parse_armor cache HIT key={:x} (in={}b, has_quoted={})",
             cache_key, armor_text.len(), cached.quoted.is_some());
         return Some(cached.clone());
     }
@@ -1798,7 +1799,7 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
     debug_log!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
         result.body_type, result.encryption_nip, result.signature_hex.is_some(),
         result.seal_pubkey_hex.is_some(), result.quoted.is_some());
-    println!("[RUST-PERF] parse_armor cache MISS key={:x} compute={}ms (in={}b, has_quoted={})",
+    debug_log!("[RUST-PERF] parse_armor cache MISS key={:x} compute={}ms (in={}b, has_quoted={})",
         cache_key, perf.elapsed().as_millis(), armor_text.len(), result.quoted.is_some());
 
     // Insert outer + each nested level under its own hash key so
@@ -2261,7 +2262,7 @@ fn glossia_detect_and_decode_cached(text: &str) -> Option<GlossiaDecodeCached> {
     let cache = GLOSSIA_DECODE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
     if let Some(entry) = cache.lock().unwrap().get(&key) {
-        println!("[RUST-PERF] glossia cache HIT key={:x} (in={}b, dialect={}/{}, out={}b)",
+        debug_log!("[RUST-PERF] glossia cache HIT key={:x} (in={}b, dialect={}/{}, out={}b)",
             key, text.len(), entry.language, entry.wordlist, entry.decoded.len());
         return Some(entry.clone());
     }
@@ -2294,7 +2295,7 @@ fn glossia_detect_and_decode_cached(text: &str) -> Option<GlossiaDecodeCached> {
         decoded,
         hit_rate: best.hit_rate,
     };
-    println!("[RUST-PERF] glossia cache MISS key={:x} compute={}ms (in={}b, words={}, dialect={}/{}, out={}b, hit_rate={:.3})",
+    debug_log!("[RUST-PERF] glossia cache MISS key={:x} compute={}ms (in={}b, words={}, dialect={}/{}, out={}b, hit_rate={:.3})",
         key, perf.elapsed().as_millis(), text.len(), words.len(),
         entry.language, entry.wordlist, entry.decoded.len(), entry.hit_rate);
     {
@@ -2421,7 +2422,7 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
     let key = hash_subject(subject, nip_hint);
     let cache = GLOSSIA_SUBJECT_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some(cached) = cache.lock().unwrap().get(&key) {
-        println!("[RUST-PERF] glossia subject cache HIT key={:x} (in={}b, nip={})",
+        debug_log!("[RUST-PERF] glossia subject cache HIT key={:x} (in={}b, nip={})",
             key, subject.len(), nip_hint);
         return cached.clone();
     }
@@ -2689,7 +2690,7 @@ fn decrypt_single_block(
         }
     };
     let nip_decrypt_ms = perf_nip.elapsed().as_millis();
-    println!("[RUST-PERF] decrypt_single_block: nip={} glossia={}ms (ct={}b) nip_decrypt={}ms (out={}b)",
+    debug_log!("[RUST-PERF] decrypt_single_block: nip={} glossia={}ms (ct={}b) nip_decrypt={}ms (out={}b)",
         nip, glossia_ms, ciphertext_len, nip_decrypt_ms, decrypted.len());
 
     // Step 4: Detect manifest vs legacy
@@ -2902,7 +2903,7 @@ fn decrypt_armor_tree(
                 body_type: "encrypted".to_string(),
             });
             let sig_ms_reject = perf_sig.elapsed().as_millis();
-            println!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block=SKIPPED(sig fail) total={}ms",
+            debug_log!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block=SKIPPED(sig fail) total={}ms",
                 depth, parsed.body_text.len(), parsed.encryption_nip.as_deref(),
                 inner_ms, sig_ms_reject, sig_verify_bytes_len,
                 perf_level.elapsed().as_millis());
@@ -2930,7 +2931,7 @@ fn decrypt_armor_tree(
     }
     results.push(block);
 
-    println!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block={}ms total={}ms",
+    debug_log!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block={}ms total={}ms",
         depth, parsed.body_text.len(), parsed.encryption_nip.as_deref(),
         inner_ms, sig_verify_ms, sig_verify_bytes_len, block_ms,
         perf_level.elapsed().as_millis());
@@ -3072,7 +3073,7 @@ pub fn decrypt_email_body_pipeline(
     debug_log!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={} armor_sender_pubkey={:?}",
         success, is_manifest, block_results.len(), attachments.len(),
         armor_sender_pubkey.as_deref().map(|s: &str| &s[..std::cmp::min(s.len(), 20)]));
-    println!("[RUST-PERF] decrypt_email_body_pipeline: total={}ms parse={}ms derive_pk={}ms tree={}ms subject={}ms sender_extract={}ms (armor_len={}b, levels={})",
+    debug_log!("[RUST-PERF] decrypt_email_body_pipeline: total={}ms parse={}ms derive_pk={}ms tree={}ms subject={}ms sender_extract={}ms (armor_len={}b, levels={})",
         perf_total.elapsed().as_millis(), parse_ms, derive_pk_ms, tree_ms, subject_ms, sender_extract_ms,
         armor_text.len(), block_results.len());
 

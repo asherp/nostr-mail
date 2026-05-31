@@ -2639,7 +2639,8 @@ async fn check_message_confirmation(event_id: String, relays: Vec<String>) -> Re
 
 #[tauri::command]
 fn generate_qr_code(data: String, _size: Option<u32>) -> Result<String, String> {
-    println!("[RUST] generate_qr_code called with data: '{}', length: {}", data, data.len());
+    // Never log the data: it may be an nsec (private-key QR export). Length only.
+    println!("[RUST] generate_qr_code called, data length: {}", data.len());
     let qr = match qrcode::QrCode::new(data.as_bytes()) {
         Ok(qr) => qr,
         Err(e) => {

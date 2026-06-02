@@ -32,6 +32,28 @@ class DMService {
         this.pagination.set(contactPubkey, { ...current, ...patch });
     }
 
+    // Diagnostic logging gated on the backend NOSTR_MAIL_DEBUG env var, resolved
+    // once via the `get_debug_log_enabled` Tauri command and cached. Mirrors the
+    // Rust `debug_log!` macro so JS-side diagnostics honor the same switch and
+    // stay silent in normal runs. Reusable pattern for future JS gating — call
+    // `await this._debugLog(...)` anywhere a gated console line is wanted.
+    async _isDebugLogEnabled() {
+        if (this._debugLogEnabled === undefined) {
+            try {
+                this._debugLogEnabled = await window.__TAURI__.core.invoke('get_debug_log_enabled');
+            } catch (_) {
+                this._debugLogEnabled = false;
+            }
+        }
+        return this._debugLogEnabled;
+    }
+
+    async _debugLog(...args) {
+        if (await this._isDebugLogEnabled()) {
+            console.log('[JS-DEBUG]', ...args);
+        }
+    }
+
     // Decrypt a single DM content string via NIP-44/NIP-04.
     /// Sniff the format of a stored DM content string. Mirrors the backend's
     /// `crypto::detect_encryption_format` heuristic so the debug modal can
@@ -1315,6 +1337,15 @@ class DMService {
                     if (message.hasEmailMatch) {
                         // Email-match messages: always show subject + body inline.
                         // Quoted reply chains are hidden — envelope icon opens the full email.
+                        //
+                        // Rendering the full email body inline is intentional and a core
+                        // feature: it lets nostr-mail carry effectively *unbounded* message
+                        // content that plain nostr clients can't, since the body rides along
+                        // via the linked email rather than the DM event itself — sidestepping
+                        // the per-event size limits relay policies impose. The DM event stays
+                        // small; the body comes from the email. Only the most recent message
+                        // is shown here (the backend decrypts shallowly, skipping quoted
+                        // history); the full thread is one click away via the envelope icon.
                         messageElement.innerHTML = `
                             <div class="message-content">
                                 <div class="email-match-subject">${window.Utils.escapeHtml(message.content)}</div>

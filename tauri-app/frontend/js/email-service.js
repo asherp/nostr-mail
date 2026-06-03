@@ -5212,6 +5212,7 @@ ${attachmentsHtml}
                         isUnknownSigner = senderInfo.isUnknownSigner;
                         unknownSignerPubkey = senderInfo.senderPubkey;
                         if (senderInfo.hasSignature
+                            && !senderInfo.contact
                             && senderInfo.fromAddress
                             && senderInfo.identityName !== senderInfo.fromAddress) {
                             fromAddressLabelThread = `<span class="email-sender-secondary">&lt;${Utils.escapeHtml(senderInfo.fromAddress)}&gt;</span>`;

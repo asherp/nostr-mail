@@ -107,12 +107,22 @@ body.dark-mode .email-list {
     opacity: 0.7;
 }
 
+/* Missing signature — softer warning than the red "invalid": the message
+   simply wasn't signed (vs. a signature that's present but failed). */
+.signature-indicator.missing {
+    color: #f59e0b;
+}
+
 body.dark-mode .signature-indicator.verified {
     color: #4ade80;
 }
 
 body.dark-mode .signature-indicator.invalid {
     color: #f87171;
+}
+
+body.dark-mode .signature-indicator.missing {
+    color: #fbbf24;
 }
 
 /* Secondary From: address shown next to a cryptographically-bound identity.
@@ -629,6 +639,10 @@ body.dark-mode .email-sender-time {
     color: #ef4444;
 }
 
+.email-security-info .security-row.missing {
+    color: #f59e0b;
+}
+
 body.dark-mode .email-metadata-summary {
     color: #9ca3af;
 }
@@ -653,6 +667,10 @@ body.dark-mode .email-security-info .security-row.verified {
 
 body.dark-mode .email-security-info .security-row.invalid {
     color: #f87171;
+}
+
+body.dark-mode .email-security-info .security-row.missing {
+    color: #fbbf24;
 }
 
 /* Subject row styling removed - subject is now in page header */

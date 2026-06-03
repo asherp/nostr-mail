@@ -16,8 +16,9 @@ use std::net::TcpStream;
 
 // Verbose [RUST] logs in the decrypt hot path are silent by default — set the
 // NOSTR_MAIL_DEBUG environment variable to any value to re-enable them for
-// diagnostics. [RUST-PERF] lines (regular println!) remain on so profiling
-// info is always available.
+// diagnostics. [RUST-PERF] profiling lines are gated behind the same variable
+// (via debug_log!), so they're off in normal use and only printed when
+// NOSTR_MAIL_DEBUG is set.
 fn debug_log_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("NOSTR_MAIL_DEBUG").is_ok())
@@ -1355,26 +1356,42 @@ fn extract_armor_body_content(body: &str) -> Option<&str> {
 /// `decode_from_language` path used by `try_glossia_decode_to_bytes`
 /// assumes a leading bitpack header word and is wrong for raw fixed
 /// payloads (it round-trips by luck for high-entropy inputs).
-fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<u8>> {
-    use std::collections::HashSet;
+/// The only (language, wordlist) pairs nostr-mail ever emits as `bitpack_fixed`
+/// raw payloads — Latin and English-BIP39 (see `glossia_roundtrip_to_bytes`'s
+/// encoding map and the per-field `glossia_encoding_*` settings). `detect_dialect`
+/// will otherwise also propose large *cover-word* vocabularies (e.g.
+/// `english/lemmas`, `english/ngram` — 2^17 words each) because the Latin payload
+/// words incidentally overlap them, but those are never valid payload encodings
+/// here. Probing them cost a ~50ms cold `WordlistTree` build each (the "190ms
+/// decode_sig_and_pubkey" outlier) for a tree no nostr-mail payload is encoded
+/// against. We feed this allowlist to `glossia::detect_dialect_with`, which drops
+/// non-allowed wordlists *before* its binary searches (glossia #14).
+const PAYLOAD_WORDLISTS: &[(&str, &str)] = &[("latin", "default"), ("english", "bip39")];
 
+fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<u8>> {
     let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
     if words.is_empty() {
         return None;
     }
 
-    let candidates = glossia::detect_dialect(&words);
+    let mut filter = glossia::DialectFilter::new();
+    for (language, wordlist) in PAYLOAD_WORDLISTS {
+        filter = filter.allow_wordlist(*language, *wordlist);
+    }
+    let candidates = glossia::detect_dialect_with(&words, &filter);
     if candidates.is_empty() {
         return None;
     }
 
     for cand in candidates {
-        let payload_words = match glossia::load_payload_words_for_wordlist(&cand.language, &cand.wordlist) {
-            Ok(w) => w,
+        // Shared, process-wide-cached tree (glossia #12) — built at most once per
+        // dialect across glossia's encode pipeline and our decode path. Its
+        // internal index is already lowercased, so `contains()` IS the membership
+        // check; no separate payload set is needed.
+        let payload_tree = match glossia::cached_payload_tree(&cand.language, &cand.wordlist) {
+            Ok(t) => t,
             Err(_) => continue,
         };
-        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
-        let payload_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
 
         // Normalize every input token the same way (lowercase, strip leading/trailing
         // non-alphanumerics, drop empties), then split into kept-vs-dropped against
@@ -1386,7 +1403,7 @@ fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<
             .collect();
         let extracted: Vec<String> = all_tokens
             .iter()
-            .filter(|w| payload_set.contains(w.as_str()))
+            .filter(|w| payload_tree.contains(w.as_str()))
             .cloned()
             .collect();
 
@@ -1767,7 +1784,7 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
 
     let cache_map = PARSE_ARMOR_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some(cached) = cache_map.lock().unwrap().get(&cache_key) {
-        println!("[RUST-PERF] parse_armor cache HIT key={:x} (in={}b, has_quoted={})",
+        debug_log!("[RUST-PERF] parse_armor cache HIT key={:x} (in={}b, has_quoted={})",
             cache_key, armor_text.len(), cached.quoted.is_some());
         return Some(cached.clone());
     }
@@ -1778,15 +1795,19 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
     let perf = std::time::Instant::now();
 
     // Build the capnp ArmorMessage — this is the parsing target
+    let perf_populate = std::time::Instant::now();
     let mut capnp_msg = ::capnp::message::Builder::new_default();
     let (prefix_text, raw_quoted_text) = {
         let armor_builder = capnp_msg.init_root::<nostr_mail_capnp::armor_message::Builder>();
         populate_armor_from_text(armor_builder, &normalized)?
     };
+    let populate_ms = perf_populate.elapsed().as_millis();
 
     // Read the capnp message → serde struct (all fields derived from capnp)
+    let perf_serde = std::time::Instant::now();
     let reader = capnp_msg.get_root_as_reader::<nostr_mail_capnp::armor_message::Reader>().ok()?;
     let mut result = armor_message_to_serde(reader);
+    let serde_ms = perf_serde.elapsed().as_millis();
     result.prefix_text = prefix_text;
     // Override quoted_armor_text with the verbatim text from the input (the capnp
     // encoded_content field only stores the inner body text, losing delimiters,
@@ -1798,17 +1819,28 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
     debug_log!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
         result.body_type, result.encryption_nip, result.signature_hex.is_some(),
         result.seal_pubkey_hex.is_some(), result.quoted.is_some());
-    println!("[RUST-PERF] parse_armor cache MISS key={:x} compute={}ms (in={}b, has_quoted={})",
+    debug_log!("[RUST-PERF] parse_armor cache MISS key={:x} compute={}ms (in={}b, has_quoted={})",
         cache_key, perf.elapsed().as_millis(), armor_text.len(), result.quoted.is_some());
 
     // Insert outer + each nested level under its own hash key so
     // verify_all_signatures' recursive parse calls hit cache as well.
+    let perf_subtree = std::time::Instant::now();
     {
         let mut guard = cache_map.lock().unwrap();
         maybe_evict(&mut guard);
         guard.insert(cache_key, result.clone());
         populate_parse_subtree_cache(&result, &mut guard);
     }
+    let subtree_ms = perf_subtree.elapsed().as_millis();
+
+    // Sub-phase breakdown of the parse_armor cache-miss path. Lets us localize the
+    // ~500ms baseline: populate = text state machine + capnp build, serde =
+    // capnp→struct conversion (incl. NIP-04 glossia decode, deferred for NIP-44),
+    // subtree_cache = recursive clone of nested levels into the parse cache.
+    debug_log!("[RUST-PERF] parse_armor breakdown key={:x} total={}ms = populate={}ms + serde={}ms + subtree_cache={}ms (in={}b, normalized={}b, body={}b, nip={:?}, has_quoted={})",
+        cache_key, perf.elapsed().as_millis(), populate_ms, serde_ms, subtree_ms,
+        armor_text.len(), normalized.len(), result.body_text.len(),
+        result.encryption_nip, result.quoted.is_some());
 
     Some(result)
 }
@@ -1998,7 +2030,15 @@ fn populate_armor_from_text(
         let all_content = content_lines.join("\n").trim().to_string();
         if !all_content.is_empty() {
             sig_builder.set_encoded_sig_pubkey(&all_content);
-            if let Some((sig_hex, pubkey_hex)) = decode_sig_and_pubkey(&all_content) {
+            // Time the signature-block decode in isolation. Suspected to dominate
+            // the parse "populate" phase: decode_sig_and_pubkey can build a fresh
+            // 32k-word WordlistTree per attempt (try_decode_as_pubkey /
+            // try_decode_as_signature / try_decode_raw_base_n_fixed) with no cache.
+            let perf_sig_decode = std::time::Instant::now();
+            let decoded_sig = decode_sig_and_pubkey(&all_content);
+            debug_log!("[RUST-PERF] populate: decode_sig_and_pubkey={}ms (sig_content={}b, lines={})",
+                perf_sig_decode.elapsed().as_millis(), all_content.len(), content_lines.len());
+            if let Some((sig_hex, pubkey_hex)) = decoded_sig {
                 if let Ok(sig_bytes) = hex::decode(&sig_hex) {
                     sig_builder.set_signature(&sig_bytes);
                 }
@@ -2261,7 +2301,7 @@ fn glossia_detect_and_decode_cached(text: &str) -> Option<GlossiaDecodeCached> {
     let cache = GLOSSIA_DECODE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
     if let Some(entry) = cache.lock().unwrap().get(&key) {
-        println!("[RUST-PERF] glossia cache HIT key={:x} (in={}b, dialect={}/{}, out={}b)",
+        debug_log!("[RUST-PERF] glossia cache HIT key={:x} (in={}b, dialect={}/{}, out={}b)",
             key, text.len(), entry.language, entry.wordlist, entry.decoded.len());
         return Some(entry.clone());
     }
@@ -2294,7 +2334,7 @@ fn glossia_detect_and_decode_cached(text: &str) -> Option<GlossiaDecodeCached> {
         decoded,
         hit_rate: best.hit_rate,
     };
-    println!("[RUST-PERF] glossia cache MISS key={:x} compute={}ms (in={}b, words={}, dialect={}/{}, out={}b, hit_rate={:.3})",
+    debug_log!("[RUST-PERF] glossia cache MISS key={:x} compute={}ms (in={}b, words={}, dialect={}/{}, out={}b, hit_rate={:.3})",
         key, perf.elapsed().as_millis(), text.len(), words.len(),
         entry.language, entry.wordlist, entry.decoded.len(), entry.hit_rate);
     {
@@ -2421,7 +2461,7 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
     let key = hash_subject(subject, nip_hint);
     let cache = GLOSSIA_SUBJECT_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some(cached) = cache.lock().unwrap().get(&key) {
-        println!("[RUST-PERF] glossia subject cache HIT key={:x} (in={}b, nip={})",
+        debug_log!("[RUST-PERF] glossia subject cache HIT key={:x} (in={}b, nip={})",
             key, subject.len(), nip_hint);
         return cached.clone();
     }
@@ -2689,7 +2729,7 @@ fn decrypt_single_block(
         }
     };
     let nip_decrypt_ms = perf_nip.elapsed().as_millis();
-    println!("[RUST-PERF] decrypt_single_block: nip={} glossia={}ms (ct={}b) nip_decrypt={}ms (out={}b)",
+    debug_log!("[RUST-PERF] decrypt_single_block: nip={} glossia={}ms (ct={}b) nip_decrypt={}ms (out={}b)",
         nip, glossia_ms, ciphertext_len, nip_decrypt_ms, decrypted.len());
 
     // Step 4: Detect manifest vs legacy
@@ -2902,7 +2942,7 @@ fn decrypt_armor_tree(
                 body_type: "encrypted".to_string(),
             });
             let sig_ms_reject = perf_sig.elapsed().as_millis();
-            println!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block=SKIPPED(sig fail) total={}ms",
+            debug_log!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block=SKIPPED(sig fail) total={}ms",
                 depth, parsed.body_text.len(), parsed.encryption_nip.as_deref(),
                 inner_ms, sig_ms_reject, sig_verify_bytes_len,
                 perf_level.elapsed().as_millis());
@@ -2930,7 +2970,7 @@ fn decrypt_armor_tree(
     }
     results.push(block);
 
-    println!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block={}ms total={}ms",
+    debug_log!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block={}ms total={}ms",
         depth, parsed.body_text.len(), parsed.encryption_nip.as_deref(),
         inner_ms, sig_verify_ms, sig_verify_bytes_len, block_ms,
         perf_level.elapsed().as_millis());
@@ -2947,6 +2987,13 @@ pub fn decrypt_email_body_pipeline(
     sender_pubkey: Option<&str>,
     recipient_pubkey: Option<&str>,
     raw_headers: Option<&str>,
+    // When true, decrypt only the most recent (outermost) message and skip the
+    // quoted thread history. DM conversation rendering uses this: the inline body
+    // shows just the latest message (the full thread is reachable via the
+    // envelope icon), so decrypting nested quoted levels is wasted work the UI
+    // discards. No-op for NIP-04, whose signature is computed over the outer body
+    // PLUS all nested quoted bytes — see the gate where `parsed.quoted` is cleared.
+    shallow: bool,
 ) -> Result<crate::types::DecryptEmailResult, String> {
     let perf_total = std::time::Instant::now();
     debug_log!("[RUST] decrypt_email_body: armor_len={} subject_len={}", armor_text.len(), subject.len());
@@ -2956,7 +3003,7 @@ pub fn decrypt_email_body_pipeline(
 
     // Parse armor into capnp ArmorMessage → serde struct
     let perf_parse = std::time::Instant::now();
-    let parsed = match parse_armor_components(&normalized) {
+    let mut parsed = match parse_armor_components(&normalized) {
         Some(p) => p,
         None => {
             debug_log!("[RUST] decrypt_email_body: no armor found");
@@ -2974,6 +3021,15 @@ pub fn decrypt_email_body_pipeline(
         }
     };
     let parse_ms = perf_parse.elapsed().as_millis();
+
+    // Shallow mode: discard the quoted subtree so decrypt_armor_tree won't
+    // recurse into thread history the caller won't display. Skipped for NIP-04,
+    // where the signature is verified over the outer body PLUS all nested quoted
+    // bytes (see decrypt_armor_tree's collect_quoted_bytes) — dropping them there
+    // would fail verification and block decryption.
+    if shallow && parsed.encryption_nip.as_deref() != Some("nip04") {
+        parsed.quoted = None;
+    }
 
     // Derive user's pubkey hex from private key
     let perf_derive = std::time::Instant::now();
@@ -3072,7 +3128,7 @@ pub fn decrypt_email_body_pipeline(
     debug_log!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={} armor_sender_pubkey={:?}",
         success, is_manifest, block_results.len(), attachments.len(),
         armor_sender_pubkey.as_deref().map(|s: &str| &s[..std::cmp::min(s.len(), 20)]));
-    println!("[RUST-PERF] decrypt_email_body_pipeline: total={}ms parse={}ms derive_pk={}ms tree={}ms subject={}ms sender_extract={}ms (armor_len={}b, levels={})",
+    debug_log!("[RUST-PERF] decrypt_email_body_pipeline: total={}ms parse={}ms derive_pk={}ms tree={}ms subject={}ms sender_extract={}ms (armor_len={}b, levels={})",
         perf_total.elapsed().as_millis(), parse_ms, derive_pk_ms, tree_ms, subject_ms, sender_extract_ms,
         armor_text.len(), block_results.len());
 
@@ -6169,4 +6225,80 @@ fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::i
     
     debug_log!("[RUST] discover_sent_mailbox: No sent mailbox found");
     Ok(None)
+}
+
+#[cfg(test)]
+mod decode_perf_bench {
+    //! Opt-level isolation harness for the glossia signature-block decode path.
+    //!
+    //! Times `decode_sig_and_pubkey` — the function profiled as the dominant cost
+    //! in `parse_armor` (the `[RUST-PERF] populate: decode_sig_and_pubkey` line).
+    //! Run under a speed profile to tell whether residual decode cost is
+    //! algorithmic or just opt-level=0 codegen overhead:
+    //!
+    //! ```sh
+    //! CARGO_PROFILE_RELEASE_OPT_LEVEL=3 CARGO_PROFILE_RELEASE_LTO=false \
+    //!   cargo test --release --lib decode_sig_and_pubkey_timing -- --ignored --nocapture
+    //! ```
+    //!
+    //! `--lib` (no backend bins) sidesteps the glossia cdylib+rlib output-filename
+    //! collision (cargo #6313) that breaks `cargo test --release` on the bin graph.
+    //! `#[ignore]` keeps it out of normal test sweeps.
+
+    /// Encode raw bytes into bare Latin payload words via the same bitpack_fixed
+    /// codec the app's `glossia_encode_raw_base_n` (lib.rs) uses on the encode side.
+    fn encode_latin(bytes: &[u8]) -> String {
+        let wordlist = glossia::generator::data::default_wordlist("latin");
+        let payload_words = glossia::generator::data::load_payload_words_for_wordlist("latin", wordlist)
+            .expect("load latin payload wordlist");
+        let tree = glossia::WordlistTree::new(payload_words);
+        let words = glossia::codec::encode_base_n(bytes, &tree, "bitpack_fixed")
+            .expect("encode_base_n");
+        words.join(" ")
+    }
+
+    fn percentile(sorted_us: &[u128], p: f64) -> u128 {
+        if sorted_us.is_empty() { return 0; }
+        let idx = ((sorted_us.len() as f64 - 1.0) * p).round() as usize;
+        sorted_us[idx]
+    }
+
+    #[test]
+    #[ignore]
+    fn decode_sig_and_pubkey_timing() {
+        // Deterministic 64-byte signature + 32-byte pubkey (no RNG needed).
+        let sig_bytes: Vec<u8> = (0..64u16).map(|i| (i.wrapping_mul(37) ^ 0xA5) as u8).collect();
+        let pubkey_bytes: Vec<u8> = (0..32u16).map(|i| (i.wrapping_mul(53) ^ 0x3C) as u8).collect();
+
+        // Canonical two-line SIGNATURE block: glossia sig line(s) then pubkey line.
+        let content = format!("{}\n{}", encode_latin(&sig_bytes), encode_latin(&pubkey_bytes));
+        let sig_hex = hex::encode(&sig_bytes);
+        let pubkey_hex = hex::encode(&pubkey_bytes);
+
+        // Cold call — first decode for this dialect builds the cached WordlistTree
+        // + payload HashSet (the ~497ms cold build in the debug-profile profiling).
+        let t0 = std::time::Instant::now();
+        let cold = super::decode_sig_and_pubkey(&content);
+        let cold_us = t0.elapsed().as_micros();
+        assert_eq!(cold, Some((sig_hex.clone(), pubkey_hex.clone())),
+            "decode must round-trip the encoded sig+pubkey (else we're timing an early bail, not real work)");
+
+        // Warm calls — steady state with the cache populated.
+        const N: usize = 100;
+        let mut warm_us: Vec<u128> = Vec::with_capacity(N);
+        for _ in 0..N {
+            let t = std::time::Instant::now();
+            let r = super::decode_sig_and_pubkey(&content);
+            warm_us.push(t.elapsed().as_micros());
+            assert!(r.is_some());
+        }
+        warm_us.sort_unstable();
+        let sum: u128 = warm_us.iter().sum();
+
+        println!("[BENCH] decode_sig_and_pubkey  cold={}us ({:.2}ms)", cold_us, cold_us as f64 / 1000.0);
+        println!("[BENCH] decode_sig_and_pubkey  warm n={} min={}us p50={}us p90={}us p99={}us mean={:.1}us ({:.3}ms)",
+            N, warm_us[0], percentile(&warm_us, 0.50), percentile(&warm_us, 0.90),
+            percentile(&warm_us, 0.99), sum as f64 / N as f64, (sum as f64 / N as f64) / 1000.0);
+        println!("[BENCH] sig block: {} chars, {} words", content.len(), content.split_whitespace().count());
+    }
 }

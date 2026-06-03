@@ -594,6 +594,7 @@ async fn nip04_header_sig_fallback_unlocks_decrypt() {
         Some(&alice_npub),
         Some(&bob_npub),
         None,
+        false,
     )
     .expect("pipeline returns Ok even on signature rejection");
     assert!(
@@ -619,6 +620,7 @@ async fn nip04_header_sig_fallback_unlocks_decrypt() {
         Some(&alice_npub),
         Some(&bob_npub),
         Some(&raw_headers),
+        false,
     )
     .expect("pipeline returns Ok when header sig verifies");
     assert!(
@@ -944,6 +946,7 @@ async fn sent_mail_decrypts_via_recipient_header_without_dm() {
         None,
         Some(&recipient_from_header),
         None,
+        false,
     )
     .expect("decrypt_email_body_pipeline");
 
@@ -1034,6 +1037,7 @@ async fn sent_mail_undecryptable_without_any_counterparty_hint() {
         None,
         None,
         None,
+        false,
     )
     .expect("decrypt_email_body_pipeline returns Ok even when content can't be decrypted");
 
@@ -2225,6 +2229,7 @@ async fn nip44_reply_preserves_nested_encrypted_armor() {
         Some(&bob_npub),
         Some(&alice_npub),
         None,
+        false,
     )
     .expect("decrypt_email_body_pipeline");
     assert!(decrypt.success, "decrypt must succeed: {:?}", decrypt.error);
@@ -2444,6 +2449,7 @@ async fn nip44_three_level_reply_chain() {
         Some(&alice_npub),
         Some(&bob_npub),
         None,
+        false,
     )
     .expect("decrypt pipeline");
     assert!(decrypt.success, "decrypt failed: {:?}", decrypt.error);

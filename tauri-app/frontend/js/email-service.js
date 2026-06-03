@@ -1171,6 +1171,15 @@ class EmailService {
                 email.sender_pubkey = fresh.sender_pubkey;
                 changed = true;
             }
+            // (B) A newly-anchored pubkey can flip an earlier "could not decrypt"
+            // into a success. Drop any cached preview for this row so the next
+            // render re-decrypts with the fresh anchor instead of showing a stale
+            // miss. _previewCache is never otherwise cleared, so without this the
+            // failure would stick for the whole session.
+            if (changed && email.id != null) {
+                this._previewCache.delete(`inbox-${email.id}`);
+                this._previewCache.delete(`sent-${email.id}`);
+            }
             return changed;
         } catch (e) {
             console.warn('[JS] subject_hash retrofit/backfill failed:', e);
@@ -3525,14 +3534,14 @@ class EmailService {
                                 previewSubject: item.result.subject,
                                 showSubject: true,
                             });
-                        } else {
-                            // Cache the failure too so we don't re-attempt
-                            this._previewCache.set(`inbox-${item.id}`, {
-                                previewText: 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.',
-                                previewSubject: email ? email.subject : '',
-                                showSubject: false,
-                            });
                         }
+                        // (A) Deliberately do NOT cache decrypt failures. A miss
+                        // here is often transient — the retrofit/backfill below can
+                        // anchor a sender/recipient pubkey that makes the very next
+                        // render succeed. Caching the failure (which is never
+                        // invalidated) is what made the inbox show a permanent
+                        // "could not decrypt" for messages that decrypt fine on
+                        // click. The per-row renderInboxEmailItem pass re-attempts.
                         // Side effects fire regardless of full-decrypt success:
                         // subject_ciphertext is produced as long as glossia decode
                         // worked, which is enough to self-heal recipient_pubkey for
@@ -3762,8 +3771,21 @@ class EmailService {
                 showSubject = true;
             }
 
-            // Cache the result for future re-renders
-            this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
+            // Cache the result for future re-renders — but (A) never cache a
+            // decrypt failure. A miss here is often transient: the row's
+            // sender/recipient pubkey gets backfilled after this attempt and the
+            // next render succeeds. Caching the failure (never invalidated) is
+            // what pinned a permanent "could not decrypt" on messages that
+            // decrypt fine on click. The failure strings mirror the isDecryptable
+            // check below — note showSubject is initialized differently across the
+            // inbox/sent renderers, so we classify on previewText, not showSubject.
+            const decryptFailed =
+                previewText.includes('Unable to decrypt') ||
+                previewText.includes('could not decrypt') ||
+                previewText.includes('Could not decrypt');
+            if (!decryptFailed) {
+                this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
+            }
         }
 
         // Check if email is decryptable (for filtering)
@@ -3797,6 +3819,9 @@ class EmailService {
             signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
         } else if (email.signature_valid === false) {
             signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+        } else {
+            // No signature at all — softer "Unsigned" warning, distinct from invalid.
+            signatureIndicator = `<span class="signature-indicator missing" title="No Nostr signature"><i class="fas fa-exclamation-triangle"></i> Unsigned</span>`;
         }
 
         // Add transport authentication indicator
@@ -4457,6 +4482,11 @@ class EmailService {
                     } else if (email.signature_valid === false) {
                         signatureIcon = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
                         securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
+                    } else {
+                        // No signature at all (signature_valid null/undefined, no inline sig).
+                        // Softer "Unsigned" warning — distinct from a present-but-bad signature.
+                        signatureIcon = `<span class="signature-indicator missing" title="No signature"><i class="fas fa-exclamation-triangle"></i></span>`;
+                        securityRows += `<div class="security-row missing"><i class="fas fa-exclamation-triangle"></i> Unsigned</div>`;
                     }
                     if (email.transport_auth_verified === true) {
                         securityRows += `<div class="security-row verified"><i class="fas fa-envelope"></i> Email Transport Verified</div>`;
@@ -5170,6 +5200,10 @@ ${attachmentsHtml}
                     } else if (email.signature_valid === false) {
                         signatureIcon = `<span class="signature-indicator invalid" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
                         securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
+                    } else {
+                        // No signature at all — softer "Unsigned" warning (see detail card).
+                        signatureIcon = `<span class="signature-indicator missing" title="No signature"><i class="fas fa-exclamation-triangle"></i></span>`;
+                        securityRows += `<div class="security-row missing"><i class="fas fa-exclamation-triangle"></i> Unsigned</div>`;
                     }
 
                     // Suppress green inline sig icon for unknown signers; the
@@ -7148,13 +7182,12 @@ ${attachmentsHtml}
                                 this._saveRecipientPubkeyToDb(email, email.recipient_pubkey)
                                     .catch(e => console.warn('[JS] Failed to backfill recipient_pubkey:', e));
                             }
-                        } else {
-                            this._previewCache.set(`sent-${item.id}`, {
-                                previewText: 'Could not decrypt',
-                                previewSubject: email ? email.subject : '',
-                                showSubject: true,
-                            });
                         }
+                        // (A) Do NOT cache decrypt failures — the retrofit below
+                        // may anchor recipient_pubkey and make the next render
+                        // succeed. A cached miss is never invalidated, so it would
+                        // otherwise pin a permanent "Could not decrypt" on a row
+                        // that decrypts fine once backfilled.
                         // Retrofit subject_hash whenever the backend produced a
                         // glossia-decoded ciphertext — even on full-decrypt failure.
                         // This breaks the catch-22 where missing recipient_pubkey
@@ -7331,8 +7364,21 @@ ${attachmentsHtml}
                 showSubject = true;
             }
 
-            // Cache the result for future re-renders
-            this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
+            // Cache the result for future re-renders — but (A) never cache a
+            // decrypt failure. A miss here is often transient: the row's
+            // sender/recipient pubkey gets backfilled after this attempt and the
+            // next render succeeds. Caching the failure (never invalidated) is
+            // what pinned a permanent "could not decrypt" on messages that
+            // decrypt fine on click. The failure strings mirror the isDecryptable
+            // check below — note showSubject is initialized differently across the
+            // inbox/sent renderers, so we classify on previewText, not showSubject.
+            const decryptFailed =
+                previewText.includes('Unable to decrypt') ||
+                previewText.includes('could not decrypt') ||
+                previewText.includes('Could not decrypt');
+            if (!decryptFailed) {
+                this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
+            }
         }
 
         // Check if email is decryptable (for filtering)

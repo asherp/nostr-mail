@@ -19,7 +19,7 @@ use types::*;
 pub use state::{AppState, Relay};
 pub use types::{KeyPair, EmailConfig};
 use storage::{Storage, Contact, UserProfile, AppSettings, EmailDraft};
-use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation};
+use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation, DmConversationPreview};
 use crate::types::{EmailMessage, EmailThreadSummary, RelayStatus, RelayConnectionStatus};
 
 use nostr_sdk::Metadata;
@@ -55,6 +55,14 @@ macro_rules! debug_log {
             println!($($arg)*);
         }
     };
+}
+
+/// Expose the NOSTR_MAIL_DEBUG gate to the frontend so JS-side diagnostics can
+/// honor the same env var as the backend `debug_log!` macro. Returns whether
+/// gated logging is enabled; carries no sensitive data.
+#[tauri::command]
+fn get_debug_log_enabled() -> bool {
+    debug_log_enabled()
 }
 
 /// Resolve a private key: prefer an explicit key if provided, fall back to AppState.
@@ -3459,6 +3467,44 @@ fn db_get_dms_for_conversation(user_pubkey: String, contact_pubkey: String, stat
     db.get_dms_for_conversation(&user_pubkey, &contact_pubkey).map_err(|e| e.to_string())
 }
 
+/// Paginated conversation fetch. Returns at most `limit` messages, oldest→newest.
+/// When `before_created_at` + `before_id` are both supplied they form the cursor
+/// (the oldest message the caller already holds); only older messages are returned.
+#[tauri::command]
+fn db_get_dms_for_conversation_page(
+    user_pubkey: String,
+    contact_pubkey: String,
+    limit: i64,
+    before_created_at: Option<DateTime<Utc>>,
+    before_id: Option<i64>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<DbDirectMessage>, String> {
+    let db = state.get_database()?;
+    let before = match (before_created_at, before_id) {
+        (Some(ts), Some(id)) => Some((ts, id)),
+        _ => None,
+    };
+    db.get_dms_for_conversation_page(&user_pubkey, &contact_pubkey, limit, before)
+        .map_err(|e| e.to_string())
+}
+
+/// One-row-per-contact previews (latest still-encrypted message + count) for the
+/// DM contact list. Avoids fetching+decrypting whole conversations just to render
+/// the list.
+#[tauri::command]
+fn db_get_dm_conversation_previews(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<DmConversationPreview>, String> {
+    let db = state.get_database()?;
+    db.get_dm_conversation_previews(&user_pubkey).map_err(|e| e.to_string())
+}
+
+/// Contacts whose conversation contains at least one email-matched DM, for the
+/// envelope indicator in the contact list.
+#[tauri::command]
+fn db_get_dm_pubkeys_with_email_match(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.get_database()?;
+    db.get_dm_pubkeys_with_email_match(&user_pubkey).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn db_get_decrypted_dms_for_conversation(
     private_key: Option<String>,
@@ -4193,6 +4239,7 @@ fn decrypt_email_body(
         sender_pubkey.as_deref(),
         recipient_pubkey.as_deref(),
         raw_headers.as_deref(),
+        false, // full thread: the email detail view may show quoted history
     )
 }
 
@@ -4222,6 +4269,7 @@ fn decrypt_email_bodies_batch(
                 e.sender_pubkey.as_deref(),
                 e.recipient_pubkey.as_deref(),
                 raw_headers.as_deref(),
+                false, // batch decrypt feeds the email list/detail; keep full thread
             ) {
                 Ok(result) => types::BatchDecryptResultItem {
                     id,
@@ -4297,7 +4345,8 @@ fn encode_bip39(ciphertext: String, language: String, wordlist: String, mode: St
     let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
         .map_err(|e| format!("Failed to load wordlist: {}", e))?;
     let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
-    let tree = glossia::WordlistTree::new(payload_words);
+    let tree = glossia::cached_payload_tree(&language, &wordlist)
+        .map_err(|e| format!("Failed to build wordlist tree: {}", e))?;
     let encoded_words = glossia::codec::encode_base_n(&raw_bytes, &tree, "bip39")
         .map_err(|e| format!("BIP39 encoding failed: {:?}", e))?;
 
@@ -4350,7 +4399,8 @@ fn decode_bip39(text: String, language: String, wordlist: String, algorithm: Str
     let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
         .map_err(|e| format!("Failed to load wordlist: {}", e))?;
     let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
-    let tree = glossia::WordlistTree::new(payload_words);
+    let tree = glossia::cached_payload_tree(&language, &wordlist)
+        .map_err(|e| format!("Failed to build wordlist tree: {}", e))?;
 
     // 2. Filter text to extract only payload words (preserving order)
     let extracted: Vec<String> = text.split_whitespace()
@@ -4563,7 +4613,8 @@ fn glossia_encode_raw_base_n(input: String, language: String, wordlist: String, 
         // 2. Load payload wordlist and build WordlistTree
         let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
             .map_err(|e| format!("Failed to load wordlist: {}", e))?;
-        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
+        let payload_tree = glossia::cached_payload_tree(&language, &wordlist)
+            .map_err(|e| format!("Failed to build wordlist tree: {}", e))?;
 
         // 3. Encode bytes to payload words via bitpack_fixed codec
         let byte_count = bytes.len();
@@ -4691,7 +4742,8 @@ fn glossia_decode_raw_base_n(text: String, language: String, wordlist: String, e
         // 1. Load payload wordlist
         let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
             .map_err(|e| format!("Failed to load wordlist: {}", e))?;
-        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
+        let payload_tree = glossia::cached_payload_tree(&language, &wordlist)
+            .map_err(|e| format!("Failed to build wordlist tree: {}", e))?;
 
         // 2. Build payload set for filtering
         let payload_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
@@ -6693,7 +6745,11 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: Option<String>, 
     for pubkey in &pubkeys_to_try {
         let sender_pk = if user_received_email { Some(pubkey.as_str()) } else { None };
         let recipient_pk = if user_sent_email { Some(pubkey.as_str()) } else { Some(pubkey.as_str()) };
-        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk, email.raw_headers.as_deref()) {
+        // shallow=true: the DM conversation renders only the most recent message
+        // inline (the full thread is one click away via the envelope icon), so we
+        // skip decrypting quoted history the view never shows. See the pipeline's
+        // `shallow` param — it's a no-op for NIP-04.
+        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk, email.raw_headers.as_deref(), true) {
             Ok(result) if result.success => {
                 println!("[RUST] decrypt_email_body_pipeline succeeded with pubkey: {}", pubkey);
                 return Ok(Some(types::MatchingEmailBodyResult {
@@ -6769,6 +6825,7 @@ pub fn run() {
     
     let builder = builder.invoke_handler(tauri::generate_handler![
         greet,
+        get_debug_log_enabled,
         should_clear_localstorage_cache,
         generate_keypair,
         keychain_add_account,
@@ -6880,6 +6937,9 @@ pub fn run() {
         db_get_all_sent_message_ids,
         db_save_dm,
         db_get_dms_for_conversation,
+        db_get_dms_for_conversation_page,
+        db_get_dm_conversation_previews,
+        db_get_dm_pubkeys_with_email_match,
         db_get_decrypted_dms_for_conversation,
         db_save_conversation,
         db_get_conversations,

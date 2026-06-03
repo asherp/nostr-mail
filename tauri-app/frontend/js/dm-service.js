@@ -16,6 +16,42 @@ class DMService {
         this.swipeStartY = null;
         this.swipeThreshold = 50; // Minimum distance for swipe
         this.loadingMessages = new Map(); // Track ongoing loadDmMessages calls to prevent race conditions
+        // Pagination: conversations load the newest PAGE_SIZE messages, then fetch
+        // older pages on scroll-up. Per-contact state tracks whether more history
+        // exists and whether an older-page fetch is in flight.
+        this.PAGE_SIZE = 30;
+        this.pagination = new Map(); // contactPubkey -> { hasMore: bool, loadingOlder: bool }
+    }
+
+    _getPagination(contactPubkey) {
+        return this.pagination.get(contactPubkey) || { hasMore: false, loadingOlder: false };
+    }
+
+    _setPagination(contactPubkey, patch) {
+        const current = this._getPagination(contactPubkey);
+        this.pagination.set(contactPubkey, { ...current, ...patch });
+    }
+
+    // Diagnostic logging gated on the backend NOSTR_MAIL_DEBUG env var, resolved
+    // once via the `get_debug_log_enabled` Tauri command and cached. Mirrors the
+    // Rust `debug_log!` macro so JS-side diagnostics honor the same switch and
+    // stay silent in normal runs. Reusable pattern for future JS gating — call
+    // `await this._debugLog(...)` anywhere a gated console line is wanted.
+    async _isDebugLogEnabled() {
+        if (this._debugLogEnabled === undefined) {
+            try {
+                this._debugLogEnabled = await window.__TAURI__.core.invoke('get_debug_log_enabled');
+            } catch (_) {
+                this._debugLogEnabled = false;
+            }
+        }
+        return this._debugLogEnabled;
+    }
+
+    async _debugLog(...args) {
+        if (await this._isDebugLogEnabled()) {
+            console.log('[JS-DEBUG]', ...args);
+        }
     }
 
     // Decrypt a single DM content string via NIP-44/NIP-04.
@@ -227,28 +263,85 @@ class DMService {
         }
     }
 
-    // Fetch raw DMs from DB and decrypt in the frontend (supports glossia).
-    async _fetchAndDecryptDms(contactPubkey) {
-        const myPubkey = window.appState.getKeypair().public_key;
-
-        const rawMessages = await window.__TAURI__.core.invoke('db_get_dms_for_conversation', {
-            userPubkey: myPubkey,
-            contactPubkey: contactPubkey
-        });
-
-        if (!rawMessages || rawMessages.length === 0) return [];
-
-        // Decrypt each message — use the other party's pubkey for the shared secret.
-        // Preserve the original ciphertext on `raw_content` so the debug-info modal
-        // can show what's actually stored in the DB. Decryption calls are independent,
-        // so run them in parallel to avoid serializing N IPC round trips.
+    // Decrypt a batch of raw DB messages in place. Uses the other party's pubkey
+    // for the shared secret. Preserves the original ciphertext on `raw_content` so
+    // the debug-info modal can show what's actually stored. Decryptions are
+    // independent, so run them in parallel to avoid serializing N IPC round trips.
+    async _decryptDmsInPlace(rawMessages, myPubkey) {
         await Promise.all(rawMessages.map(async (msg) => {
             const otherPubkey = (msg.sender_pubkey === myPubkey) ? msg.recipient_pubkey : msg.sender_pubkey;
             msg.raw_content = msg.content;
             msg.content = await this._decryptDmContent(msg.content, otherPubkey);
         }));
-
         return rawMessages;
+    }
+
+    // Fetch+decrypt a single page of a conversation (newest-first window).
+    // `before` is the oldest message already held: { created_at, id }, or null
+    // for the most recent page. Returns messages oldest→newest.
+    async _fetchAndDecryptDmsPage(contactPubkey, before) {
+        const myPubkey = window.appState.getKeypair().public_key;
+
+        const rawMessages = await window.__TAURI__.core.invoke('db_get_dms_for_conversation_page', {
+            userPubkey: myPubkey,
+            contactPubkey: contactPubkey,
+            limit: this.PAGE_SIZE,
+            beforeCreatedAt: before ? before.created_at : null,
+            beforeId: before ? before.id : null
+        });
+
+        if (!rawMessages || rawMessages.length === 0) return [];
+        return this._decryptDmsInPlace(rawMessages, myPubkey);
+    }
+
+    // Normalize a decrypted raw DB message into the shape the renderer/debug modal
+    // expect. `matchMap` is a Map<event_id, bool> of email-match results.
+    _formatDmMessage(msg, myPubkey, matchMap) {
+        return {
+            id: msg.id,
+            event_id: msg.event_id || null,
+            content: msg.content || '',
+            created_at: msg.created_at || msg.timestamp,
+            sender_pubkey: msg.sender_pubkey,
+            // Preserve the rest of the DirectMessage shape so the debug modal can
+            // show the full record. These fields don't affect rendering but are
+            // essential for diagnosing send/receive issues from the inspector.
+            recipient_pubkey: msg.recipient_pubkey ?? null,
+            received_at: msg.received_at ?? null,
+            email_message_id: msg.email_message_id ?? null,
+            received_from_relay: msg.received_from_relay ?? null,
+            raw_content: msg.raw_content ?? null,
+            is_sent: msg.sender_pubkey === myPubkey,
+            confirmed: true, // All DB messages are confirmed
+            hasEmailMatch: msg.event_id ? (matchMap.get(msg.event_id) === true) : false
+        };
+    }
+
+    // created_at may arrive as an ISO string (DB serialization) or an epoch-seconds
+    // number; normalize to epoch milliseconds for ordering.
+    _createdAtMs(message) {
+        const c = message?.created_at;
+        if (typeof c === 'number') return c * 1000;
+        const parsed = Date.parse(c);
+        return Number.isNaN(parsed) ? 0 : parsed;
+    }
+
+    // Merge two formatted-message lists, deduping by event_id (falling back to db
+    // id), and return them sorted oldest→newest. Used to fold a freshly-fetched
+    // newest page into already-loaded history without losing older pages. Existing
+    // entries win on a tie so already-computed fields (e.g. hasEmailMatch) survive.
+    _mergeDmMessages(existing, incoming) {
+        const seen = new Set();
+        const keyOf = (m) => m.event_id || (m.id != null ? `id:${m.id}` : null);
+        const out = [];
+        for (const m of [...existing, ...incoming]) {
+            const key = keyOf(m);
+            if (key && seen.has(key)) continue;
+            if (key) seen.add(key);
+            out.push(m);
+        }
+        out.sort((a, b) => this._createdAtMs(a) - this._createdAtMs(b));
+        return out;
     }
 
     // Load DM contacts from backend and network
@@ -261,48 +354,42 @@ class DMService {
 
             const myPubkey = window.appState.getKeypair().public_key;
 
-            // 1. Get sorted list of DM pubkeys scoped to the active profile
-            const pubkeys = await window.__TAURI__.core.invoke('db_get_all_dm_pubkeys_sorted', {
+            // 1. One-row-per-contact previews: latest (still-encrypted) message +
+            //    total count, ordered most-recent-conversation first. This replaces
+            //    the old per-contact "fetch + decrypt the ENTIRE conversation" loop —
+            //    the contact list now decrypts a single message per contact.
+            const previews = await window.__TAURI__.core.invoke('db_get_dm_conversation_previews', {
                 userPubkey: myPubkey
             });
 
-            if (!pubkeys || pubkeys.length === 0) {
+            if (!previews || previews.length === 0) {
                 window.appState.setDmContacts([]);
                 this.renderDmContacts();
                 return;
             }
 
+            // 2. Which conversations contain an email-matched DM — one batched query
+            //    instead of probing every message of every conversation.
+            let emailMatchSet = new Set();
+            try {
+                const matchPubkeys = await window.__TAURI__.core.invoke('db_get_dm_pubkeys_with_email_match', {
+                    userPubkey: myPubkey
+                });
+                emailMatchSet = new Set(matchPubkeys || []);
+            } catch (error) {
+                console.error('[LOAD_CONTACTS] email-match lookup failed:', error);
+            }
+
             const dmContacts = [];
 
-            for (const contactPubkey of pubkeys) {
+            // 3. Decrypt just the latest message per contact (one decryption each)
+            //    and attach DB-backed profile info. Independent per contact, so run
+            //    them in parallel.
+            await Promise.all(previews.map(async (preview) => {
+                const contactPubkey = preview.contact_pubkey;
                 try {
-                    // 1. Fetch and decrypt messages for this conversation (frontend decryption with glossia support)
-                    const messages = await this._fetchAndDecryptDms(contactPubkey);
-                    // LOG: Show how many messages were returned
-                    if (!messages || messages.length === 0) {
-                        continue;
-                    }
+                    const lastMessage = await this._decryptDmContent(preview.last_content, contactPubkey);
 
-                    // 2. Find the most recent message
-                    const lastMessageObj = messages[messages.length - 1];
-                    const lastMessage = lastMessageObj.content;
-                    const lastMessageTime = new Date(lastMessageObj.created_at);
-
-                    // 3. Check if any messages have email matches
-                    let hasEmailMatch = false;
-                    for (const msg of messages) {
-                        const emailMatch = await window.__TAURI__.core.invoke('db_check_dm_matches_email_encrypted', {
-                            dmEventId: msg.event_id,
-                            userPubkey: myPubkey,
-                            contactPubkey: contactPubkey
-                        });
-                        if (emailMatch) {
-                            hasEmailMatch = true;
-                            break;
-                        }
-                    }
-
-                    // 4. Always fetch contact info from the database
                     const profile = await window.DatabaseService.getContact(contactPubkey);
                     const name = profile?.name || contactPubkey.substring(0, 16) + '...';
                     // Use picture_data_url for avatars, fallback to picture_url or picture
@@ -310,52 +397,28 @@ class DMService {
                     const picture = profile?.picture_url || profile?.picture || '';
                     const profileLoaded = !!profile;
 
-                    const contactData = {
+                    dmContacts.push({
                         pubkey: contactPubkey,
                         name,
                         lastMessage,
-                        lastMessageTime,
-                        messageCount: messages.length,
+                        lastMessageTime: new Date(preview.last_created_at),
+                        messageCount: preview.message_count,
                         picture_data_url,
                         picture, // ensure this is set for avatar fallback
                         profileLoaded,
-                        hasEmailMatch // New field to track if this conversation has email matches
-                    };
-                    dmContacts.push(contactData);
-
-                    // 5. Cache decrypted messages in appState
-                    // CRITICAL FIX: Don't overwrite messages if we're currently viewing this conversation
-                    // and have newer messages loaded. This prevents race conditions where loadDmContacts()
-                    // overwrites messages that loadDmMessages() just loaded and rendered.
-                    const currentContact = window.appState.getSelectedDmContact();
-                    const isCurrentlyViewing = currentContact && currentContact.pubkey === contactPubkey;
-                    const existingMessages = window.appState.getDmMessages(contactPubkey) || [];
-                    
-                    if (isCurrentlyViewing && existingMessages.length > 0) {
-                        // Check if existing messages are newer (more recent) than what we're about to cache
-                        const existingLatestTime = existingMessages.length > 0 
-                            ? new Date(existingMessages[existingMessages.length - 1].created_at).getTime()
-                            : 0;
-                        const newLatestTime = messages.length > 0
-                            ? new Date(messages[messages.length - 1].created_at).getTime()
-                            : 0;
-                        
-                        // Only overwrite if the new messages are actually newer
-                        if (newLatestTime > existingLatestTime) {
-                            window.appState.setDmMessages(contactPubkey, messages);
-                        }
-                        // Otherwise, keep the existing messages (they're already rendered and up-to-date)
-                    } else {
-                        // Not currently viewing this conversation, safe to cache
-                        window.appState.setDmMessages(contactPubkey, messages);
-                    }
+                        hasEmailMatch: emailMatchSet.has(contactPubkey)
+                    });
                 } catch (error) {
                     console.error(`[LOAD_CONTACTS] Error processing contact ${contactPubkey}:`, error);
                     console.error(`[LOAD_CONTACTS] Error stack:`, error.stack);
-                    // Continue with next contact instead of failing entirely
-                    continue;
+                    // Skip this contact instead of failing the whole list.
                 }
-            }
+            }));
+
+            // Promise.all may resolve out of order; restore the recency order the
+            // previews query returned.
+            const order = new Map(previews.map((p, i) => [p.contact_pubkey, i]));
+            dmContacts.sort((a, b) => (order.get(a.pubkey) ?? 0) - (order.get(b.pubkey) ?? 0));
 
         // 6. Set and render contacts
         window.appState.setDmContacts(dmContacts);
@@ -468,7 +531,18 @@ class DMService {
         }, { passive: true });
     }
 
-    // Load profiles for DM contacts
+    // Enrich DM contacts with relay-fetched kind:0 profiles (names/avatars).
+    //
+    // INTENTIONALLY NOT CALLED. This is a deliberate anti-spoofing measure, not
+    // dead code. The DM list resolves names/avatars ONLY from saved contacts
+    // (DatabaseService.getContact). If we pulled relay profiles for unsaved
+    // pubkeys, a non-contact could copy a known contact's display name and
+    // avatar and appear identical to them in the list — letting the user mistake
+    // an impostor for someone they trust. Unsaved senders therefore stay shown as
+    // a truncated pubkey with no avatar, visually distinct from real contacts.
+    //
+    // Do NOT wire this into loadDmContacts() to "fix" missing names — that would
+    // reintroduce the impersonation vector. (See git history / issue discussion.)
     async loadDmContactProfiles() {
         // Only process contacts that don't already have profiles loaded
         const dmContacts = window.appState.getDmContacts();
@@ -874,8 +948,9 @@ class DMService {
         }
 
         try {
-            // Fetch and decrypt messages in the frontend (supports glossia-encoded DMs)
-            const messages = await this._fetchAndDecryptDms(contactPubkey);
+            // Fetch+decrypt only the newest page (supports glossia-encoded DMs).
+            // Older history is pulled in on scroll-up via loadOlderMessages().
+            const messages = await this._fetchAndDecryptDmsPage(contactPubkey, null);
 
             if (!messages || !Array.isArray(messages)) {
                 console.error('[JS] Invalid messages response:', messages);
@@ -883,46 +958,92 @@ class DMService {
                 return;
             }
 
-            // Check for email matches for all messages in a single batched call.
+            // A full page implies there's probably older history to fetch.
+            const hasMore = messages.length >= this.PAGE_SIZE;
+
+            // Check for email matches for this page in a single batched call.
             const matchMap = await this._fetchEmailMatchMap(
                 messages.filter((m) => m.event_id).map((m) => m.event_id)
             );
 
-            const formattedMessages = messages.map((msg) => ({
-                id: msg.id,
-                event_id: msg.event_id || null,
-                content: msg.content || '',
-                created_at: msg.created_at || msg.timestamp,
-                sender_pubkey: msg.sender_pubkey,
-                // Preserve the rest of the DirectMessage shape so the debug
-                // modal can show the full record. These fields don't affect
-                // rendering but are essential for diagnosing send/receive
-                // issues from the in-app inspector.
-                recipient_pubkey: msg.recipient_pubkey ?? null,
-                received_at: msg.received_at ?? null,
-                email_message_id: msg.email_message_id ?? null,
-                received_from_relay: msg.received_from_relay ?? null,
-                raw_content: msg.raw_content ?? null,
-                is_sent: msg.sender_pubkey === myPubkey,
-                confirmed: true, // All DB messages are confirmed
-                hasEmailMatch: msg.event_id ? (matchMap.get(msg.event_id) === true) : false
-            }));
-            
-            window.appState.setDmMessages(contactPubkey, formattedMessages);
-            const renderStart = Date.now();
+            const formattedMessages = messages.map((msg) => this._formatDmMessage(msg, myPubkey, matchMap));
+
+            if (forceRefresh && cachedMessages && cachedMessages.length > 0) {
+                // Live-refresh: fold the newest page into already-loaded history so
+                // scrolled-back pages aren't lost and a just-arrived message appears.
+                const merged = this._mergeDmMessages(cachedMessages, formattedMessages);
+                const prior = this.pagination.get(contactPubkey);
+                this._setPagination(contactPubkey, {
+                    hasMore: prior ? prior.hasMore : hasMore,
+                    loadingOlder: false
+                });
+                window.appState.setDmMessages(contactPubkey, merged);
+            } else {
+                this._setPagination(contactPubkey, { hasMore, loadingOlder: false });
+                window.appState.setDmMessages(contactPubkey, formattedMessages);
+            }
+
             this.renderDmMessages(contactPubkey);
-            const renderEnd = Date.now();
-            
-            console.log(`✅ Loaded ${formattedMessages.length} messages from DB`);
+
+            const count = (window.appState.getDmMessages(contactPubkey) || []).length;
+            console.log(`✅ Loaded ${count} messages from DB (page of ${formattedMessages.length}, hasMore=${this._getPagination(contactPubkey).hasMore})`);
         } catch (error) {
             console.error('Failed to load DM messages:', error);
             window.notificationService.showError('Failed to load messages');
         }
     }
 
-    // Render DM messages
-    renderDmMessages(contactPubkey) {
-        
+    // Fetch the next older page and prepend it to the current conversation view,
+    // preserving the user's scroll position. Triggered by scrolling near the top.
+    async loadOlderMessages(contactPubkey) {
+        const state = this._getPagination(contactPubkey);
+        if (!state.hasMore || state.loadingOlder) return;
+
+        const existing = window.appState.getDmMessages(contactPubkey) || [];
+        if (existing.length === 0) return;
+
+        // Cursor = oldest message currently held (list is kept oldest→newest).
+        const oldest = existing[0];
+        const before = { created_at: oldest.created_at, id: oldest.id };
+
+        // Capture scroll metrics from the live container BEFORE we rebuild it, so
+        // we can restore the viewport to the same messages after prepending.
+        const dmMessages = window.domManager.get('dmMessages');
+        const container = dmMessages?.querySelector('.messages-container');
+        const prevScrollHeight = container ? container.scrollHeight : 0;
+        const prevScrollTop = container ? container.scrollTop : 0;
+
+        this._setPagination(contactPubkey, { loadingOlder: true });
+        try {
+            const myPubkey = window.appState.getKeypair().public_key;
+            const olderRaw = await this._fetchAndDecryptDmsPage(contactPubkey, before);
+
+            // Fewer than a full page back means we've reached the start of history.
+            const hasMore = olderRaw.length >= this.PAGE_SIZE;
+
+            const matchMap = await this._fetchEmailMatchMap(
+                olderRaw.filter((m) => m.event_id).map((m) => m.event_id)
+            );
+            const olderFormatted = olderRaw.map((msg) => this._formatDmMessage(msg, myPubkey, matchMap));
+
+            const merged = this._mergeDmMessages(olderFormatted, existing);
+            window.appState.setDmMessages(contactPubkey, merged);
+            this._setPagination(contactPubkey, { hasMore, loadingOlder: false });
+
+            // Re-render and restore scroll so the previously-visible message stays put.
+            this.renderDmMessages(contactPubkey, { preserveScroll: true, prevScrollHeight, prevScrollTop });
+        } catch (error) {
+            console.error('Failed to load older DM messages:', error);
+            this._setPagination(contactPubkey, { loadingOlder: false });
+        }
+    }
+
+    // Render DM messages.
+    // `options.preserveScroll` (with prevScrollHeight/prevScrollTop) keeps the
+    // viewport anchored after prepending older messages; otherwise we scroll to
+    // the newest message at the bottom.
+    renderDmMessages(contactPubkey, options = {}) {
+
         const dmMessages = window.domManager.get('dmMessages');
         if (!dmMessages) {
             console.error('[RENDER] dmMessages element not found!');
@@ -1126,11 +1247,25 @@ class DMService {
                 // Create messages container
                 const messagesContainer = document.createElement('div');
                 messagesContainer.className = 'messages-container';
-                
-                // Sort messages from oldest to newest (top to bottom)
-                const sortedMessages = [...messages].sort((a, b) => a.created_at - b.created_at);
-                
-                
+
+                // Sort messages from oldest to newest (top to bottom). created_at is
+                // an ISO string, so compare normalized timestamps rather than doing
+                // numeric subtraction on strings.
+                const sortedMessages = [...messages].sort((a, b) => this._createdAtMs(a) - this._createdAtMs(b));
+
+                // When older history remains, show a thin top affordance and wire
+                // scroll-up to fetch the next page.
+                const paginationState = this._getPagination(contactPubkey);
+                if (paginationState.hasMore) {
+                    const loadOlderEl = document.createElement('div');
+                    loadOlderEl.className = 'dm-load-older';
+                    loadOlderEl.style.cssText = 'text-align:center; padding:8px; font-size:12px; opacity:0.6;';
+                    loadOlderEl.innerHTML = paginationState.loadingOlder
+                        ? '<i class="fas fa-spinner fa-spin"></i> Loading earlier messages…'
+                        : '<i class="fas fa-clock-rotate-left"></i> Scroll up for earlier messages';
+                    messagesContainer.appendChild(loadOlderEl);
+                }
+
                 const myPubkey = window.appState.getKeypair()?.public_key;
                 sortedMessages.forEach((message, index) => {
                     const isMe = message.sender_pubkey === myPubkey;
@@ -1202,6 +1337,15 @@ class DMService {
                     if (message.hasEmailMatch) {
                         // Email-match messages: always show subject + body inline.
                         // Quoted reply chains are hidden — envelope icon opens the full email.
+                        //
+                        // Rendering the full email body inline is intentional and a core
+                        // feature: it lets nostr-mail carry effectively *unbounded* message
+                        // content that plain nostr clients can't, since the body rides along
+                        // via the linked email rather than the DM event itself — sidestepping
+                        // the per-event size limits relay policies impose. The DM event stays
+                        // small; the body comes from the email. Only the most recent message
+                        // is shown here (the backend decrypts shallowly, skipping quoted
+                        // history); the full thread is one click away via the envelope icon.
                         messageElement.innerHTML = `
                             <div class="message-content">
                                 <div class="email-match-subject">${window.Utils.escapeHtml(message.content)}</div>
@@ -1349,11 +1493,30 @@ class DMService {
                 });
                 
                 dmMessages.appendChild(messagesContainer);
-                
-                // Scroll to bottom to show the newest messages
-                setTimeout(() => {
-                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                }, 0);
+
+                if (options.preserveScroll && options.prevScrollHeight != null) {
+                    // Older messages were prepended — keep the previously-visible
+                    // message anchored by offsetting scrollTop by the added height.
+                    const delta = messagesContainer.scrollHeight - options.prevScrollHeight;
+                    messagesContainer.scrollTop = (options.prevScrollTop || 0) + delta;
+                } else {
+                    // Scroll to bottom to show the newest messages
+                    setTimeout(() => {
+                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                    }, 0);
+                }
+
+                // Infinite scroll-up: fetch the next older page when the user nears
+                // the top. The loadingOlder guard inside loadOlderMessages prevents
+                // overlapping fetches.
+                messagesContainer.addEventListener('scroll', () => {
+                    if (messagesContainer.scrollTop <= 80) {
+                        const st = this._getPagination(contactPubkey);
+                        if (st.hasMore && !st.loadingOlder) {
+                            this.loadOlderMessages(contactPubkey);
+                        }
+                    }
+                });
             }
             
             // Add message input box at the bottom of conversation panel (not inside scrollable messages)

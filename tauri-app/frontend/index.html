@@ -679,7 +679,7 @@
                                             <input type="checkbox" id="require-signature-preference" checked>
                                         </label>
                                     </div>
-                                    <small class="form-text text-muted">Only accept emails with valid Nostr signatures. Emails without signatures will be ignored.</small>
+                                    <small class="form-text text-muted">Permanently reject incoming emails that claim a Nostr pubkey but whose signature fails to verify (likely forged or tampered). These are never saved to your inbox. Plain emails with no Nostr signature are still accepted.</small>
                                 </li>
                                 
                                 <li class="toggle-settings-item">
@@ -719,7 +719,7 @@
                                             <input type="checkbox" id="hide-unsigned-messages-preference" checked>
                                         </label>
                                     </div>
-                                    <small class="form-text text-muted">Hide messages with missing or unverified signatures.</small>
+                                    <small class="form-text text-muted">Hide messages from the inbox view unless they have a valid Nostr signature — this includes both unsigned messages and those that fail verification. Messages stay in your inbox and reappear if you turn this off.</small>
                                 </li>
 
                                 <li class="toggle-settings-item">

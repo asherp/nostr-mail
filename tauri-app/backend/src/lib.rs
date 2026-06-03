@@ -80,6 +80,17 @@ fn active_user_npub(state: &AppState) -> Option<String> {
         .and_then(|k| k.public_key().to_bech32().ok())
 }
 
+/// Read the active account's "Require Signatures" setting (defaults to true).
+/// Threaded into the decrypt pipeline so NIP-04 signature enforcement honors the
+/// user's choice instead of rejecting unverified mail unconditionally. Keyed by
+/// the same npub the inbox-sync filter uses (see email::lookup_require_signature).
+fn active_require_signature(state: &AppState) -> bool {
+    match (active_user_npub(state), state.get_database().ok()) {
+        (Some(pk), Some(db)) => email::lookup_require_signature(&db, &pk),
+        _ => true,
+    }
+}
+
 /// Best-effort: after saving a DM, fill in any matching email row's NULL
 /// pubkey fields using the DM's counterparty. Failures are logged, not
 /// surfaced — backfill is a recovery hint, not a critical write.
@@ -4239,6 +4250,7 @@ fn decrypt_email_body(
         sender_pubkey.as_deref(),
         recipient_pubkey.as_deref(),
         raw_headers.as_deref(),
+        active_require_signature(&state),
         false, // full thread: the email detail view may show quoted history
     )
 }
@@ -4253,6 +4265,8 @@ fn decrypt_email_bodies_batch(
     // Open DB once for the whole batch so each item can look up its raw_headers
     // by message_id for NIP-04 header-sig fallback verification.
     let db_opt = state.get_database().ok();
+    // One setting read for the whole batch — same value applies to every row.
+    let require_signature = active_require_signature(&state);
     let results = emails
         .into_iter()
         .map(|e| {
@@ -4269,6 +4283,7 @@ fn decrypt_email_bodies_batch(
                 e.sender_pubkey.as_deref(),
                 e.recipient_pubkey.as_deref(),
                 raw_headers.as_deref(),
+                require_signature,
                 false, // batch decrypt feeds the email list/detail; keep full thread
             ) {
                 Ok(result) => types::BatchDecryptResultItem {
@@ -6742,6 +6757,7 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: Option<String>, 
     
     // Use the unified decrypt pipeline (handles glossia, NIP-04/44, manifest, nested blocks)
     // Try each candidate pubkey until one succeeds
+    let require_signature = active_require_signature(&state);
     for pubkey in &pubkeys_to_try {
         let sender_pk = if user_received_email { Some(pubkey.as_str()) } else { None };
         let recipient_pk = if user_sent_email { Some(pubkey.as_str()) } else { Some(pubkey.as_str()) };
@@ -6749,7 +6765,7 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: Option<String>, 
         // inline (the full thread is one click away via the envelope icon), so we
         // skip decrypting quoted history the view never shows. See the pipeline's
         // `shallow` param — it's a no-op for NIP-04.
-        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk, email.raw_headers.as_deref(), true) {
+        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk, email.raw_headers.as_deref(), require_signature, true) {
             Ok(result) if result.success => {
                 println!("[RUST] decrypt_email_body_pipeline succeeded with pubkey: {}", pubkey);
                 return Ok(Some(types::MatchingEmailBodyResult {

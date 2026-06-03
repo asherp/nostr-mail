@@ -594,6 +594,7 @@ async fn nip04_header_sig_fallback_unlocks_decrypt() {
         Some(&alice_npub),
         Some(&bob_npub),
         None,
+        true,
         false,
     )
     .expect("pipeline returns Ok even on signature rejection");
@@ -620,6 +621,7 @@ async fn nip04_header_sig_fallback_unlocks_decrypt() {
         Some(&alice_npub),
         Some(&bob_npub),
         Some(&raw_headers),
+        true,
         false,
     )
     .expect("pipeline returns Ok when header sig verifies");
@@ -632,6 +634,31 @@ async fn nip04_header_sig_fallback_unlocks_decrypt() {
         with_headers.body.trim(),
         plaintext,
         "decrypted plaintext must round-trip"
+    );
+
+    // require_signature = false: the user opted into reading unauthenticated
+    // mail, so the same unsigned NIP-04 message decrypts even with no header sig
+    // available. This is the "Require Signatures" off path.
+    let unsigned_allowed = email::decrypt_email_body_pipeline(
+        &bob_nsec,
+        &delivered.body,
+        &delivered.subject,
+        Some(&alice_npub),
+        Some(&bob_npub),
+        None,
+        false, // require_signature off
+        false,
+    )
+    .expect("pipeline returns Ok with require_signature off");
+    assert!(
+        unsigned_allowed.success,
+        "unsigned NIP-04 must decrypt when Require Signatures is off, error={:?}",
+        unsigned_allowed.error
+    );
+    assert_eq!(
+        unsigned_allowed.body.trim(),
+        plaintext,
+        "decrypted plaintext must round-trip on the require_signature-off path"
     );
 }
 
@@ -946,6 +973,7 @@ async fn sent_mail_decrypts_via_recipient_header_without_dm() {
         None,
         Some(&recipient_from_header),
         None,
+        true,
         false,
     )
     .expect("decrypt_email_body_pipeline");
@@ -1037,6 +1065,7 @@ async fn sent_mail_undecryptable_without_any_counterparty_hint() {
         None,
         None,
         None,
+        true,
         false,
     )
     .expect("decrypt_email_body_pipeline returns Ok even when content can't be decrypted");
@@ -2229,6 +2258,7 @@ async fn nip44_reply_preserves_nested_encrypted_armor() {
         Some(&bob_npub),
         Some(&alice_npub),
         None,
+        true,
         false,
     )
     .expect("decrypt_email_body_pipeline");
@@ -2449,6 +2479,7 @@ async fn nip44_three_level_reply_chain() {
         Some(&alice_npub),
         Some(&bob_npub),
         None,
+        true,
         false,
     )
     .expect("decrypt pipeline");

@@ -2800,6 +2800,12 @@ fn decrypt_armor_tree(
     user_pubkey_hex: &str,
     fallback_pubkey: &str,
     raw_headers: Option<&str>,
+    // When false (user disabled "Require Signatures"), NIP-04 signature
+    // verification failures no longer block decryption — the body is decrypted
+    // anyway and the UI still surfaces the invalid/missing-signature indicator
+    // via the separate verify path. When true (default), an unverified NIP-04
+    // message is rejected before decryption (the signature is NIP-04's only MAC).
+    require_signature: bool,
     depth: usize,
 ) -> (Vec<crate::types::DecryptedBlock>, Option<JsonManifest>) {
     let perf_level = std::time::Instant::now();
@@ -2823,7 +2829,7 @@ fn decrypt_armor_tree(
         // slice of that signed data, so the header sig would never verify against
         // them — pass None so inner levels rely solely on their inline signatures.
         let perf_inner = std::time::Instant::now();
-        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback, None, depth + 1);
+        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback, None, require_signature, depth + 1);
         inner_ms = perf_inner.elapsed().as_millis();
         results.extend(inner_results);
     }
@@ -2835,7 +2841,12 @@ fn decrypt_armor_tree(
     let perf_sig = std::time::Instant::now();
     let mut sig_verify_ran = false;
     let mut sig_verify_bytes_len: usize = 0;
-    if parsed.encryption_nip.as_deref() == Some("nip04") {
+    // Only enforce (and even compute) NIP-04 signature verification when the user
+    // requires signatures. With "Require Signatures" off, the user has opted into
+    // reading unauthenticated mail, so we skip the gate entirely and let decryption
+    // proceed; the missing/invalid signature still shows in the UI via the separate
+    // verify_all_signatures path.
+    if require_signature && parsed.encryption_nip.as_deref() == Some("nip04") {
         sig_verify_ran = true;
         // Compute the canonical signed bytes once: this level's raw decoded body
         // concatenated with all nested quoted body bytes. Both the inline
@@ -2987,6 +2998,10 @@ pub fn decrypt_email_body_pipeline(
     sender_pubkey: Option<&str>,
     recipient_pubkey: Option<&str>,
     raw_headers: Option<&str>,
+    // When false (user disabled "Require Signatures"), skip the NIP-04 signature
+    // gate so unauthenticated mail still decrypts. When true (default), an
+    // unverified NIP-04 message is rejected before decryption.
+    require_signature: bool,
     // When true, decrypt only the most recent (outermost) message and skip the
     // quoted thread history. DM conversation rendering uses this: the inline body
     // shows just the latest message (the full thread is reachable via the
@@ -3048,7 +3063,7 @@ pub fn decrypt_email_body_pipeline(
 
     // Walk the armor tree, decrypt each level
     let perf_tree = std::time::Instant::now();
-    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback, raw_headers, 0);
+    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback, raw_headers, require_signature, 0);
     let tree_ms = perf_tree.elapsed().as_millis();
 
     // Extract outermost decrypted body (last element in innermost-first array)
@@ -6154,7 +6169,7 @@ fn lookup_sync_cutoff_days(db: &Database, pubkey: &str) -> i64 {
 }
 
 /// Read `require_signature` for the active pubkey, defaulting to true.
-fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
+pub(crate) fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
     if let Ok(Some(value)) = db.get_setting(pubkey, "require_signature") {
         return value == "true";
     }

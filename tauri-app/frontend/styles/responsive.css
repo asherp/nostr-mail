@@ -238,6 +238,7 @@
     }
 
     .email-detail-header,
+    .email-detail-subject,
     .thread-subject-header {
         padding-left: var(--spacing-md);
         padding-right: var(--spacing-md);

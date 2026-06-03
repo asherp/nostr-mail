@@ -5285,6 +5285,14 @@ ${attachmentsHtml}
                     const attachmentsHtml = await this._buildThreadCardAttachmentsHtml(
                         email, manifestAttachmentsForCard, source
                     );
+                    // When the card is collapsed we hide the full download section and
+                    // surface just a paperclip indicator in the header instead (issue #62).
+                    const threadAttachmentCount = typeof email.attachment_count === 'number'
+                        ? email.attachment_count
+                        : (email.attachments ? email.attachments.length : 0);
+                    const collapsedAttachmentIndicator = attachmentsHtml
+                        ? `<span class="thread-attachment-indicator" title="Has attachments">📎${threadAttachmentCount > 0 ? ' ' + threadAttachmentCount : ''}</span>`
+                        : '';
 
                     const cardDiv = document.createElement('div');
                     cardDiv.className = 'email-detail-card';
@@ -5299,6 +5307,7 @@ ${signatureIcon}
 ${unknownBadgeThread}
 ${fromAddressLabelThread}
 ${transportAuthIcon}
+${collapsedAttachmentIndicator}
 <span class="email-body-snippet">${snippet}</span>
 <div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
 </div>

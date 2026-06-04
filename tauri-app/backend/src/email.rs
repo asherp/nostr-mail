@@ -6381,18 +6381,34 @@ fn list_spam_folders(
         .collect()
 }
 
-/// Lenient nostr-message detector for the rescue path: a message qualifies if it
-/// carries the `X-Nostr-Pubkey` header OR an inline encryption armor marker.
-/// Deliberately does NOT require transport authentication (DKIM/SPF) — messages
-/// often land in spam precisely because that check failed, so demanding it here
-/// would refuse to rescue the very mail this feature targets.
-fn body_is_nostr_message(raw_body: &[u8]) -> bool {
+/// Decide whether a message sitting in a spam folder should be rescued.
+///
+/// A message qualifies when BOTH hold:
+/// 1. It carries a nostr marker — an `X-Nostr-Pubkey` or `X-Nostr-Sig` header,
+///    or an inline `BEGIN NOSTR ...` armor block (encrypted body, signed body,
+///    signature, or seal).
+/// 2. It passes transport authentication (SPF/DKIM/alignment).
+///
+/// Transport auth is required because the rest of the inbox enforces it: a
+/// message that fails it would be moved out of spam yet still get filtered from
+/// the inbox, stranding it where the user can't see it. Mail that fails SPF/DKIM
+/// is therefore deliberately left in spam — only authenticated nostr mail that
+/// the provider misfiled gets rescued.
+fn should_rescue_message(raw_body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(raw_body);
-    text.contains("X-Nostr-Pubkey:")
-        || text.contains("BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE")
-        || text.contains("BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE")
-        || text.contains("BEGIN NOSTR NIP-04 ENCRYPTED BODY")
-        || text.contains("BEGIN NOSTR NIP-44 ENCRYPTED BODY")
+    let has_nostr_marker = text.contains("X-Nostr-Pubkey:")
+        || text.contains("X-Nostr-Sig:")
+        || text.contains("BEGIN NOSTR NIP-")
+        || text.contains("BEGIN NOSTR SIGNED")
+        || text.contains("BEGIN NOSTR SIGNATURE")
+        || text.contains("BEGIN NOSTR SEAL");
+    if !has_nostr_marker {
+        return false;
+    }
+    match verify_transport_authentication(Some(raw_body), None) {
+        Ok(verdict) => verdict.transport_verified,
+        Err(_) => false,
+    }
 }
 
 /// Move a UID set into `target_folder`, creating the folder if needed. Uses the
@@ -6444,13 +6460,18 @@ fn rescue_nostr_emails_from_spam(
         }
 
         // Cheap server-side narrowing to candidate UIDs: header-marked messages
-        // plus anything whose body carries an armor marker. BODY search support
-        // varies by server, so we re-confirm each candidate by fetching it.
+        // (X-Nostr-Pubkey / X-Nostr-Sig) plus anything whose body carries a nostr
+        // armor block (encrypted, signed, signature, or seal). BODY search support
+        // varies by server, so we re-confirm each candidate by fetching it and
+        // checking the transport auth gate.
         let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for query in &[
             "HEADER X-Nostr-Pubkey \"\"",
-            "BODY \"BEGIN NOSTR NIP-04 ENCRYPTED\"",
-            "BODY \"BEGIN NOSTR NIP-44 ENCRYPTED\"",
+            "HEADER X-Nostr-Sig \"\"",
+            "BODY \"BEGIN NOSTR NIP-\"",
+            "BODY \"BEGIN NOSTR SIGNED\"",
+            "BODY \"BEGIN NOSTR SIGNATURE\"",
+            "BODY \"BEGIN NOSTR SEAL\"",
         ] {
             if let Ok(found) = session.uid_search(*query) {
                 candidates.extend(found);
@@ -6473,7 +6494,7 @@ fn rescue_nostr_emails_from_spam(
             };
             for msg in messages.iter() {
                 if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
-                    if body_is_nostr_message(body) {
+                    if should_rescue_message(body) {
                         confirmed.push(uid);
                     }
                 }

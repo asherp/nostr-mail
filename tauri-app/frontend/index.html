@@ -681,7 +681,21 @@
                                     </div>
                                     <small class="form-text text-muted">Permanently reject incoming emails that claim a Nostr pubkey but whose signature fails to verify (likely forged or tampered). These are never saved to your inbox. Plain emails with no Nostr signature are still accepted.</small>
                                 </li>
-                                
+
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
+                                        <label for="spam-rescue-preference">Spam Rescue</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="spam-rescue-preference">
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">On each sync, automatically move Nostr-encrypted messages out of your Spam/Junk folder into the folder below. Encrypted bodies are often misflagged as spam by mail providers; this keeps them reliably accessible.</small>
+                                    <div class="form-group" style="margin-top: 8px;">
+                                        <label for="spam-rescue-target-preference">Rescue into folder</label>
+                                        <input type="text" id="spam-rescue-target-preference" class="form-control" placeholder="nostr-mail">
+                                    </div>
+                                </li>
+
                                 <li class="toggle-settings-item">
                                     <div class="toggle-setting">
                                         <label for="hide-undecryptable-emails-preference">Hide Undecryptable Emails</label>

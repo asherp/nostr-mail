@@ -5141,6 +5141,8 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
+    let spam_rescue = lookup_spam_rescue(db, active_pubkey);
+    let rescue_target = lookup_spam_rescue_target(db, active_pubkey);
 
     // Folders to scan. Default (empty/None) = provider-aware list from
     // `default_inbox_folders`, with any *spam*-named server folder appended
@@ -5169,6 +5171,12 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     };
     let mut folders = folders;
 
+    // With spam rescue on, ensure the rescue target is in the scan set so moved
+    // messages land in the local DB during this same pass.
+    if spam_rescue && !folders.iter().any(|f| f.eq_ignore_ascii_case(&rescue_target)) {
+        folders.push(rescue_target.clone());
+    }
+
     println!(
         "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, sync_cutoff_days={} (bootstrap only)",
         account_key, folders, sync_cutoff_days
@@ -5193,6 +5201,12 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         if expand_spam {
             extend_with_spam_folders(&mut session, &mut folders);
+        }
+        if spam_rescue {
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target);
+            if moved > 0 {
+                println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
+            }
         }
         println!("[RUST] sync_nostr_emails_to_db: folders after spam expansion: {:?}", folders);
         for f in &folders {
@@ -5225,6 +5239,12 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
         if expand_spam {
             extend_with_spam_folders(&mut session, &mut folders);
+        }
+        if spam_rescue {
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target);
+            if moved > 0 {
+                println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
+            }
         }
         println!("[RUST] sync_nostr_emails_to_db: folders after spam expansion: {:?}", folders);
         for f in &folders {
@@ -6310,6 +6330,26 @@ pub(crate) fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
     true
 }
 
+/// Read `spam_rescue` for the active pubkey, defaulting to false (opt-in).
+pub(crate) fn lookup_spam_rescue(db: &Database, pubkey: &str) -> bool {
+    if let Ok(Some(value)) = db.get_setting(pubkey, "spam_rescue") {
+        return value == "true";
+    }
+    false
+}
+
+/// Read the folder spam-rescued nostr mail should be moved into, defaulting to
+/// `nostr-mail`. Blank/whitespace settings fall back to the default.
+pub(crate) fn lookup_spam_rescue_target(db: &Database, pubkey: &str) -> String {
+    if let Ok(Some(value)) = db.get_setting(pubkey, "spam_rescue_target") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "nostr-mail".to_string()
+}
+
 /// Discover sent mailbox name using IMAP LIST command
 /// Returns the actual mailbox name found, or None if no sent mailbox exists
 /// Append any server mailbox whose name contains "spam", "junk", or "bulk"
@@ -6319,6 +6359,143 @@ pub(crate) fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
 /// `Junk Email`, Fastmail's `Junk`, Yahoo's `Bulk Mail`, etc. Failures during
 /// LIST are non-fatal — the sync will just proceed with the pre-expansion
 /// folder set.
+/// Return every server mailbox whose name contains "spam", "junk", or "bulk"
+/// (case-insensitive). Failures during LIST are non-fatal — returns empty.
+fn list_spam_folders(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+) -> Vec<String> {
+    let mailboxes = match session.list(Some(""), Some("*")) {
+        Ok(m) => m,
+        Err(e) => {
+            debug_log!("[RUST] list_spam_folders: LIST failed: {}", e);
+            return Vec::new();
+        }
+    };
+    mailboxes
+        .iter()
+        .map(|mb| mb.name().to_string())
+        .filter(|name| {
+            let lower = name.to_lowercase();
+            lower.contains("spam") || lower.contains("junk") || lower.contains("bulk")
+        })
+        .collect()
+}
+
+/// Lenient nostr-message detector for the rescue path: a message qualifies if it
+/// carries the `X-Nostr-Pubkey` header OR an inline encryption armor marker.
+/// Deliberately does NOT require transport authentication (DKIM/SPF) — messages
+/// often land in spam precisely because that check failed, so demanding it here
+/// would refuse to rescue the very mail this feature targets.
+fn body_is_nostr_message(raw_body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(raw_body);
+    text.contains("X-Nostr-Pubkey:")
+        || text.contains("BEGIN NOSTR NIP-04 ENCRYPTED MESSAGE")
+        || text.contains("BEGIN NOSTR NIP-44 ENCRYPTED MESSAGE")
+        || text.contains("BEGIN NOSTR NIP-04 ENCRYPTED BODY")
+        || text.contains("BEGIN NOSTR NIP-44 ENCRYPTED BODY")
+}
+
+/// Move a UID set into `target_folder`, creating the folder if needed. Uses the
+/// IMAP UID MOVE command, falling back to UID COPY + flag-deleted + EXPUNGE on
+/// servers without MOVE. UID-based so source sequence renumbering during the
+/// operation can't misaddress messages.
+fn move_uids_to_folder(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    uid_set: &str,
+    target_folder: &str,
+) -> Result<()> {
+    if session.uid_mv(uid_set, target_folder).is_ok() {
+        return Ok(());
+    }
+    // Target may not exist yet — create and retry.
+    if session.create(target_folder).is_ok() && session.uid_mv(uid_set, target_folder).is_ok() {
+        return Ok(());
+    }
+    if session.uid_copy(uid_set, target_folder).is_ok() {
+        session.uid_store(uid_set, "+FLAGS (\\Deleted)")?;
+        session.expunge()?;
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("Failed to move UIDs {} to folder {}", uid_set, target_folder))
+}
+
+/// Scan every spam/junk/bulk folder and move nostr messages out of them into
+/// `target_folder`, so providers' misclassified encrypted mail stays reachable.
+/// Returns the number of messages moved. Per-folder failures are logged and
+/// skipped — rescue is best-effort and never aborts the surrounding sync.
+fn rescue_nostr_emails_from_spam(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    target_folder: &str,
+) -> usize {
+    let spam_folders = list_spam_folders(session);
+    if spam_folders.is_empty() {
+        return 0;
+    }
+    // Make sure the destination exists before we start moving into it.
+    let _ = session.create(target_folder);
+
+    let mut moved_total = 0usize;
+    for folder in spam_folders {
+        if folder.eq_ignore_ascii_case(target_folder) {
+            continue;
+        }
+        if session.select(&folder).is_err() {
+            continue;
+        }
+
+        // Cheap server-side narrowing to candidate UIDs: header-marked messages
+        // plus anything whose body carries an armor marker. BODY search support
+        // varies by server, so we re-confirm each candidate by fetching it.
+        let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for query in &[
+            "HEADER X-Nostr-Pubkey \"\"",
+            "BODY \"BEGIN NOSTR NIP-04 ENCRYPTED\"",
+            "BODY \"BEGIN NOSTR NIP-44 ENCRYPTED\"",
+        ] {
+            if let Ok(found) = session.uid_search(*query) {
+                candidates.extend(found);
+            }
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+
+        let mut confirmed: Vec<u32> = Vec::new();
+        let uids: Vec<u32> = candidates.into_iter().collect();
+        for chunk in uids.chunks(500) {
+            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            let messages = match session.uid_fetch(&uid_list, "(UID RFC822)") {
+                Ok(m) => m,
+                Err(e) => {
+                    debug_log!("[RUST] rescue_nostr_emails_from_spam: fetch in '{}' failed: {}", folder, e);
+                    continue;
+                }
+            };
+            for msg in messages.iter() {
+                if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
+                    if body_is_nostr_message(body) {
+                        confirmed.push(uid);
+                    }
+                }
+            }
+        }
+
+        if confirmed.is_empty() {
+            continue;
+        }
+        let uid_set = confirmed.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        match move_uids_to_folder(session, &uid_set, target_folder) {
+            Ok(_) => {
+                debug_log!("[RUST] rescue_nostr_emails_from_spam: moved {} message(s) from '{}' to '{}'",
+                    confirmed.len(), folder, target_folder);
+                moved_total += confirmed.len();
+            }
+            Err(e) => debug_log!("[RUST] rescue_nostr_emails_from_spam: move from '{}' failed: {}", folder, e),
+        }
+    }
+    moved_total
+}
+
 fn extend_with_spam_folders(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     folders: &mut Vec<String>,

@@ -1374,9 +1374,27 @@ body.dark-mode .email-body-snippet {
 .email-detail-card.collapsed .thread-card-actions,
 .email-detail-card.collapsed .email-detail-body,
 .email-detail-card.collapsed .email-raw-content,
+.email-detail-card.collapsed .email-attachments,
 .email-detail-card.collapsed .signature-indicator,
 .email-detail-card.collapsed .transport-auth-indicator {
     display: none;
+}
+
+/* Attachment paperclip shown in the collapsed card header in place of the
+   full download section (issue #62). Hidden once the card is expanded. */
+.thread-attachment-indicator {
+    display: none;
+    font-size: 0.8125rem;
+    color: #6b7280;
+    white-space: nowrap;
+}
+
+body.dark-mode .thread-attachment-indicator {
+    color: #9ca3af;
+}
+
+.email-detail-card.collapsed .thread-attachment-indicator {
+    display: inline;
 }
 
 .email-detail-card.collapsed {

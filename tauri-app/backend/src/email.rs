@@ -6114,8 +6114,8 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
         let msgs = session.uid_fetch(&uid_list, "(UID ENVELOPE)")?;
         for msg in msgs.iter() {
             let uid = match msg.uid { Some(u) => u, None => continue };
-            let mid = match msg.envelope().and_then(|e| e.message_id) {
-                Some(bytes) => std::str::from_utf8(bytes).unwrap_or("").to_string(),
+            let mid = match msg.envelope().and_then(|e| e.message_id.clone()) {
+                Some(bytes) => std::str::from_utf8(&bytes).unwrap_or("").to_string(),
                 None => { missing.push(uid); continue; }
             };
             let mid = mid.trim().trim_start_matches('<').trim_end_matches('>').trim().to_string();

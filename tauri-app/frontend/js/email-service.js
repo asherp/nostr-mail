@@ -214,7 +214,11 @@ class EmailService {
         const from = Utils.escapeHtml(senderInfo.fromAddress);
         const unknownBadge = this._renderUnknownContactBadge(senderInfo);
         if (senderInfo.hasSignature) {
-            const showSecondary = senderInfo.fromAddress
+            // For known contacts show only the nostr identity name — not the email
+            // address (issue #62). Unknown signers still surface the From: address,
+            // but there identityName already equals fromAddress so nothing is duplicated.
+            const showSecondary = !senderInfo.contact
+                && senderInfo.fromAddress
                 && senderInfo.identityName !== senderInfo.fromAddress;
             const secondary = showSecondary
                 ? ` <span class="email-sender-secondary">&lt;${from}&gt;</span>`
@@ -303,19 +307,24 @@ class EmailService {
                             <div class="attachment-meta" style="font-size:0.9em;color:#666;">${sizeFormatted}</div>
                         </div>
                     </div>
-                    <button class="btn btn-sm btn-outline-primary" onclick="${downloadCall}">
-                        <i class="fas fa-download"></i> Download
+                    <button class="btn btn-sm btn-outline-primary" onclick="${downloadCall}" title="Download ${Utils.escapeHtml(displayName)}" aria-label="Download ${Utils.escapeHtml(displayName)}">
+                        <i class="fas fa-download"></i>
                     </button>
                 </div>`;
         }).join('');
 
+        // Only offer "Download All" when there's more than one attachment —
+        // with a single file the per-item download button already covers it (issue #62).
+        const downloadAllHtml = items.length > 1
+            ? `<button class="btn btn-sm btn-outline-success" onclick="window.emailService.${downloadAllFn}(${email.id})" title="Download all attachments as ZIP">
+                        <i class="fas fa-download"></i> Download All
+                    </button>`
+            : '';
         return `
             <div class="email-attachments" style="margin:15px 0;">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
                     <h4 style="margin:0;">Attachments (${items.length})</h4>
-                    <button class="btn btn-sm btn-outline-success" onclick="window.emailService.${downloadAllFn}(${email.id})" title="Download all attachments as ZIP">
-                        <i class="fas fa-download"></i> Download All
-                    </button>
+                    ${downloadAllHtml}
                 </div>
                 <div class="attachment-list">${itemsHtml}</div>
             </div>`;
@@ -2401,7 +2410,7 @@ class EmailService {
             <div style="margin-bottom:1em;font-size:0.95em;line-height:1.8;">
                 <div><strong>From:</strong> ${fromAddr} ${headerBadge}</div>
                 <div><strong>To:</strong> ${toAddr}</div>
-                <div><strong>Subject:</strong> ${subject}</div>
+                <div><strong>Subject:</strong> <span id="preview-subject-text">${subject}</span></div>
             </div>
             <hr style="border:none;border-top:1px solid #ccc;margin:0 0 1em;">`;
 
@@ -2492,7 +2501,7 @@ class EmailService {
                 } catch (e) {
                     console.warn('[JS] Preview pre-decrypt failed:', e);
                 }
-                Utils.renderHtmlBodyInIframe('preview-html-body', htmlToRender, { decryptedTexts: decryptResults });
+                Utils.renderHtmlBodyInIframe('preview-html-body', htmlToRender, { decryptedTexts: decryptResults, startDecrypted: true });
             };
             renderHtmlWithSigBadge();
         } else if (hasHtml) {
@@ -2509,6 +2518,49 @@ class EmailService {
                 modal.querySelector(`.preview-tab-panel[data-panel="${tab.dataset.tab}"]`).classList.add('active');
             });
         });
+
+        // Subject lock/unlock toggle (issue #62): when the composed subject is
+        // encrypted, show it decrypted first with an unlock icon and let the user
+        // toggle back to the ciphertext — mirroring the body decrypt toggle.
+        const rawSubject = domManager.getValue('subject') || '';
+        (async () => {
+            try {
+                // The subject may be raw NIP ciphertext OR glossia-encoded prose
+                // (default encoding is glossia latin, which looks like plain words
+                // and is indistinguishable from a real subject without decoding).
+                // isLikelyEncryptedContent only recognizes the base64 layer, so we
+                // also attempt a glossia decode — mirroring the sent-mail detection
+                // at _loadSentEmailDetail. The backend decrypt_subject re-decodes
+                // glossia internally, so rawSubject can be passed through as-is.
+                const looksEncrypted = (window.Utils && window.Utils.isLikelyEncryptedContent(rawSubject))
+                    || !!(await this.decodeGlossiaSubject(rawSubject));
+                if (looksEncrypted) {
+                    const pubkey = this.selectedNostrContact?.pubkey;
+                    if (!pubkey || !appState.hasKeypair()) return;
+                    const bodyForDecrypt = plainBody || this._plainBody || domManager.getValue('messageBody') || '';
+                    const res = await TauriService.decryptEmailBody(bodyForDecrypt, rawSubject, pubkey, null);
+                    const decryptedSubject = res && res.subject;
+                    if (!decryptedSubject || decryptedSubject === rawSubject) return;
+                    const span = document.getElementById('preview-subject-text');
+                    if (!span) return;
+                    const lock = document.createElement('i');
+                    lock.className = 'fas fa-lock-open';
+                    lock.style.cssText = 'cursor:pointer;margin-left:0.5em;opacity:0.7;';
+                    lock.title = 'Click to show encrypted';
+                    let isDecrypted = true;
+                    span.textContent = decryptedSubject; // decrypted view first (issue #62)
+                    lock.addEventListener('click', () => {
+                        isDecrypted = !isDecrypted;
+                        span.textContent = isDecrypted ? decryptedSubject : rawSubject;
+                        lock.className = isDecrypted ? 'fas fa-lock-open' : 'fas fa-lock';
+                        lock.title = isDecrypted ? 'Click to show encrypted' : 'Click to decrypt';
+                    });
+                    span.insertAdjacentElement('afterend', lock);
+                }
+            } catch (e) {
+                console.warn('[JS] Preview subject decrypt toggle failed:', e);
+            }
+        })();
     }
 
     async sendEncryptedEmail(emailConfig, contact, subject, body, messageId, toAddress) {
@@ -4498,6 +4550,7 @@ class EmailService {
                     const defaultAvatar = senderInfo.defaultAvatar;
                     const senderName = senderInfo.identityName;
                     const fromAddressLabel = senderInfo.hasSignature
+                        && !senderInfo.contact
                         && senderInfo.fromAddress
                         && senderInfo.identityName !== senderInfo.fromAddress
                         ? `<span class="email-sender-secondary">&lt;${Utils.escapeHtml(senderInfo.fromAddress)}&gt;</span>`
@@ -5168,6 +5221,7 @@ ${attachmentsHtml}
                         isUnknownSigner = senderInfo.isUnknownSigner;
                         unknownSignerPubkey = senderInfo.senderPubkey;
                         if (senderInfo.hasSignature
+                            && !senderInfo.contact
                             && senderInfo.fromAddress
                             && senderInfo.identityName !== senderInfo.fromAddress) {
                             fromAddressLabelThread = `<span class="email-sender-secondary">&lt;${Utils.escapeHtml(senderInfo.fromAddress)}&gt;</span>`;
@@ -5241,6 +5295,14 @@ ${attachmentsHtml}
                     const attachmentsHtml = await this._buildThreadCardAttachmentsHtml(
                         email, manifestAttachmentsForCard, source
                     );
+                    // When the card is collapsed we hide the full download section and
+                    // surface just a paperclip indicator in the header instead (issue #62).
+                    const threadAttachmentCount = typeof email.attachment_count === 'number'
+                        ? email.attachment_count
+                        : (email.attachments ? email.attachments.length : 0);
+                    const collapsedAttachmentIndicator = attachmentsHtml
+                        ? `<span class="thread-attachment-indicator" title="Has attachments">📎${threadAttachmentCount > 0 ? ' ' + threadAttachmentCount : ''}</span>`
+                        : '';
 
                     const cardDiv = document.createElement('div');
                     cardDiv.className = 'email-detail-card';
@@ -5255,6 +5317,7 @@ ${signatureIcon}
 ${unknownBadgeThread}
 ${fromAddressLabelThread}
 ${transportAuthIcon}
+${collapsedAttachmentIndicator}
 <span class="email-body-snippet">${snippet}</span>
 <div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
 </div>
@@ -7326,10 +7389,12 @@ ${attachmentsHtml}
                 const keypair = appState.getKeypair();
                 if (!keypair) {
                     previewText = 'Unable to decrypt: no keypair';
+                    showSubject = false; // don't show the encrypted subject (issue #62)
                 } else {
                     const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                     if (!recipientPubkey) {
                         previewText = 'Could not decrypt';
+                        showSubject = false; // don't show the encrypted subject (issue #62)
                     } else {
                         try {
                             const result = await TauriService.decryptEmailBody(
@@ -7344,11 +7409,13 @@ ${attachmentsHtml}
                                 showSubject = true;
                             } else {
                                 previewText = 'Could not decrypt';
+                                showSubject = false; // don't show the encrypted subject (issue #62)
                             }
                             this._retrofitSubjectHashAndBackfill(email, result.subjectCiphertext);
                         } catch (e) {
                             console.error('[JS] Backend decrypt failed for sent preview:', e);
                             previewText = 'Could not decrypt';
+                            showSubject = false; // don't show the encrypted subject (issue #62)
                         }
                     }
                 }

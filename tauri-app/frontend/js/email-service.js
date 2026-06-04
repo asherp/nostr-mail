@@ -4619,6 +4619,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+<button class="thread-menu-item thread-move-action">Move to folder</button>
 <button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
@@ -4710,6 +4711,17 @@ ${attachmentsHtml}
                         inboxDeleteBtn.addEventListener('click', async () => {
                             inboxMoreDropdown.classList.remove('open');
                             const ok = await this._deleteEmailFromDetail(email.message_id || email.id, 'inbox');
+                            if (!ok) return;
+                            this.showEmailList();
+                            await this.loadEmails();
+                        });
+                    }
+
+                    const inboxMoveBtn = emailDetailContent.querySelector('.thread-move-action');
+                    if (inboxMoveBtn) {
+                        inboxMoveBtn.addEventListener('click', async () => {
+                            inboxMoreDropdown.classList.remove('open');
+                            const ok = await this._moveEmailFromDetail(email.message_id || email.id);
                             if (!ok) return;
                             this.showEmailList();
                             await this.loadEmails();
@@ -5670,6 +5682,47 @@ ${attachmentsHtml}
         } catch (error) {
             console.error(`[JS] Error deleting ${source} email:`, error);
             notificationService.showError('Failed to delete email: ' + error);
+            return false;
+        }
+    }
+
+    // Prompt for a destination folder and move a single inbox email there on the
+    // server. Returns true if the move succeeded so the caller can refresh the UI.
+    async _moveEmailFromDetail(messageId) {
+        const settings = appState.getSettings() || {};
+        const userEmail = settings.email_address || null;
+
+        // Fetch the current server folder list to populate the picker. Failure is
+        // non-fatal — the user can still type a new folder name.
+        let folders = [];
+        try {
+            const emailConfig = {
+                email_address: settings.email_address,
+                password: settings.password,
+                smtp_host: settings.smtp_host || '',
+                smtp_port: settings.smtp_port || 587,
+                imap_host: settings.imap_host,
+                imap_port: settings.imap_port || 993,
+                use_tls: settings.use_tls !== false,
+            };
+            folders = (await TauriService.listImapFolders(emailConfig)) || [];
+        } catch (error) {
+            console.warn('[JS] Could not list folders for move picker:', error);
+        }
+
+        const target = await notificationService.showFolderPicker(folders, 'Move to folder');
+        if (!target) return false;
+
+        const loading = notificationService.showLoading('Moving email...');
+        try {
+            await TauriService.moveInboxEmail(messageId, target, userEmail);
+            notificationService.hideLoading(loading);
+            notificationService.showSuccess(`Email moved to "${target}".`);
+            return true;
+        } catch (error) {
+            notificationService.hideLoading(loading);
+            console.error('[JS] Error moving email:', error);
+            notificationService.showError('Failed to move email: ' + error);
             return false;
         }
     }

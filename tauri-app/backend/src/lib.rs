@@ -6438,6 +6438,57 @@ async fn db_delete_inbox_email(message_id: String, delete_from_server: Option<bo
 }
 
 #[tauri::command]
+async fn move_inbox_email(message_id: String, target_folder: String, _user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] move_inbox_email called for message_id: {}, target_folder: {}", message_id, target_folder);
+
+    let target_folder = target_folder.trim().to_string();
+    if target_folder.is_empty() {
+        return Err("Target folder must not be empty".to_string());
+    }
+
+    // Same active-pubkey scoping rationale as db_delete_inbox_email above.
+    let active_pubkey = active_user_npub(&state).ok_or_else(|| "No active user".to_string())?;
+    let db = state.get_database()?;
+    let all_settings = db.get_all_settings(&active_pubkey).map_err(|e| e.to_string())?;
+
+    let email_address = all_settings.get("email_address").cloned();
+    let password = all_settings.get("password").cloned();
+    let imap_host = all_settings.get("imap_host").cloned();
+    let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+    let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+    if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+        let email_config = crate::types::EmailConfig {
+            email_address: email_addr,
+            password: pwd,
+            smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+            smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+            imap_host: host,
+            imap_port: port,
+            use_tls,
+            private_key: all_settings.get("nostr_private_key").cloned(),
+        };
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::email::move_inbox_email_to_folder(&email_config, &message_id, &target_folder)
+        ).await {
+            Ok(Ok(_)) => {
+                println!("[RUST] move_inbox_email: Successfully moved email on server to {}", target_folder);
+                // Drop the local copy; the next sync re-surfaces it if the target
+                // folder is part of the synced inbox folder set.
+                db.delete_inbox_email(&message_id).map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(format!("Failed to move email: {}", e)),
+            Err(_) => Err("Server move timed out after 30 seconds".to_string()),
+        }
+    } else {
+        Err("Incomplete email configuration".to_string())
+    }
+}
+
+#[tauri::command]
 fn db_mark_as_read(message_id: String, state: tauri::State<AppState>) -> Result<(), String> {
     let db = state.get_database()?;
     db.mark_as_read(&message_id).map_err(|e| e.to_string())
@@ -7024,6 +7075,7 @@ pub fn run() {
         db_delete_draft,
         db_delete_sent_email,
         db_delete_inbox_email,
+        move_inbox_email,
         db_mark_as_read,
         db_check_dm_matches_email_encrypted,
         db_check_dms_match_email_encrypted_batch,

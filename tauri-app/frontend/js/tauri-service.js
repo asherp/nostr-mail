@@ -662,6 +662,10 @@ const TauriService = {
         return await this.invoke('db_delete_inbox_email', { messageId, deleteFromServer, userEmail });
     },
 
+    moveInboxEmail: async function(messageId, targetFolder, userEmail) {
+        return await this.invoke('move_inbox_email', { messageId, targetFolder, userEmail });
+    },
+
     markAsRead: async function(messageId) {
         return await this.invoke('db_mark_as_read', { messageId });
     },

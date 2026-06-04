@@ -385,6 +385,104 @@ class NotificationService {
             });
         });
     }
+
+    /**
+     * Prompt the user to pick a destination folder for moving an email.
+     * Shows a dropdown of existing folders plus a field for creating a new one.
+     * Resolves to the chosen folder name, or null if cancelled.
+     */
+    async showFolderPicker(folders = [], title = 'Move to folder') {
+        return new Promise((resolve) => {
+            const options = (folders || [])
+                .filter(Boolean)
+                .map(f => `<option value="${this.escapeAttr(f)}">${this.escapeAttr(f)}</option>`)
+                .join('');
+
+            const modal = document.createElement('div');
+            modal.className = 'confirmation-modal';
+            modal.innerHTML = `
+                <div class="confirmation-overlay">
+                    <div class="confirmation-dialog">
+                        <h3>${title}</h3>
+                        <p>Choose an existing folder or type a new one.</p>
+                        <select id="folder-picker-select" style="width:100%;padding:8px;margin-bottom:10px;">
+                            ${options}
+                        </select>
+                        <input type="text" id="folder-picker-new" placeholder="Or new folder name" style="width:100%;padding:8px;box-sizing:border-box;" />
+                        <div class="confirmation-actions">
+                            <button class="btn btn-secondary" id="folder-cancel">Cancel</button>
+                            <button class="btn btn-primary" id="folder-confirm">Move</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            modal.style.cssText = `
+                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                z-index: 10000; display: flex; align-items: center;
+                justify-content: center; pointer-events: auto;
+            `;
+
+            const overlay = modal.querySelector('.confirmation-overlay');
+            overlay.style.cssText = `
+                position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+                background: rgba(0, 0, 0, 0.5); display: flex;
+                align-items: center; justify-content: center;
+            `;
+
+            const dialog = modal.querySelector('.confirmation-dialog');
+            dialog.style.cssText = `
+                background: white; padding: 20px; border-radius: 8px;
+                max-width: 480px; width: 90%; text-align: center;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); word-wrap: break-word;
+            `;
+
+            const actions = modal.querySelector('.confirmation-actions');
+            actions.style.cssText = `
+                margin-top: 20px; display: flex; gap: 10px;
+                justify-content: center; flex-wrap: wrap;
+            `;
+
+            document.body.appendChild(modal);
+
+            const select = modal.querySelector('#folder-picker-select');
+            const newInput = modal.querySelector('#folder-picker-new');
+            const cancelBtn = modal.querySelector('#folder-cancel');
+            const confirmBtn = modal.querySelector('#folder-confirm');
+
+            const cleanup = () => {
+                if (modal.parentNode) modal.parentNode.removeChild(modal);
+            };
+
+            cancelBtn.addEventListener('click', () => { cleanup(); resolve(null); });
+
+            confirmBtn.addEventListener('click', () => {
+                const typed = (newInput.value || '').trim();
+                const chosen = typed || (select.value || '').trim();
+                cleanup();
+                resolve(chosen || null);
+            });
+
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    cleanup();
+                    resolve(null);
+                }
+            });
+
+            dialog.addEventListener('click', (e) => e.stopPropagation());
+        });
+    }
+
+    escapeAttr(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
 }
 
 // Create and export a singleton instance

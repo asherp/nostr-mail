@@ -978,6 +978,140 @@ fn move_to_trash(
     Err(anyhow::anyhow!("Failed to move email to trash"))
 }
 
+/// Move an inbox email (identified by Message-ID) to an arbitrary IMAP folder.
+///
+/// Mirrors `delete_inbox_email_from_server`, but instead of moving the matched
+/// message to trash it moves it into `target_folder`, creating that folder if it
+/// does not already exist. Searches the same source folders the inbox is synced
+/// from (`INBOX`, `nostr-mail`).
+pub async fn move_inbox_email_to_folder(
+    config: &EmailConfig,
+    message_id: &str,
+    target_folder: &str,
+) -> Result<()> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+    let target_folder = target_folder.to_string();
+
+    debug_log!("[RUST] move_inbox_email_to_folder: Moving Message-ID {} to folder {}", message_id, target_folder);
+
+    tokio::task::spawn_blocking(move || {
+        use std::net::TcpStream;
+        let addr = format!("{}:{}", host, port);
+
+        let result = if use_tls {
+            let client = create_imap_tls_client!(&host, &addr)?;
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &["INBOX", "nostr-mail"]);
+            let _ = session.logout();
+            result
+        } else {
+            let tcp_stream = TcpStream::connect(&addr)?;
+            let client = imap::Client::new(tcp_stream);
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &["INBOX", "nostr-mail"]);
+            let _ = session.logout();
+            result
+        };
+        result
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+/// Find an email by Message-ID across `source_folders` and move it to `target_folder`.
+fn move_email_to_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_id: &str,
+    target_folder: &str,
+    source_folders: &[&str],
+) -> Result<()> {
+    let mut folder_selected = false;
+    for folder in source_folders {
+        // No-op if the message already lives in the destination folder.
+        if folder.eq_ignore_ascii_case(target_folder) {
+            continue;
+        }
+        debug_log!("[RUST] move_email_to_folder_sync: Trying folder: {}", folder);
+        if session.select(folder).is_ok() {
+            folder_selected = true;
+
+            let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+            let full_msg_id = if normalized_msg_id.contains('@') {
+                format!("<{}>", normalized_msg_id)
+            } else {
+                format!("<{}@nostr-mail>", normalized_msg_id)
+            };
+
+            let search_queries = vec![
+                format!("HEADER Message-ID \"{}\"", full_msg_id),
+                format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+                format!("HEADER Message-ID \"{}\"", message_id.trim()),
+            ];
+
+            let mut matching_messages = std::collections::HashSet::new();
+            for search_query in &search_queries {
+                if let Ok(results) = session.search(search_query) {
+                    if !results.is_empty() {
+                        matching_messages.extend(results);
+                        debug_log!("[RUST] move_email_to_folder_sync: Found {} match(es) in {}", matching_messages.len(), folder);
+                        break;
+                    }
+                }
+            }
+
+            if !matching_messages.is_empty() {
+                let message_seq = *matching_messages.iter().next().unwrap();
+                return move_message_to_folder(session, message_seq, target_folder);
+            }
+        }
+    }
+
+    if !folder_selected {
+        return Err(anyhow::anyhow!("Could not select any source folder"));
+    }
+    Err(anyhow::anyhow!("Email not found on server"))
+}
+
+/// Move a message (by sequence number) into `target_folder`, creating the folder
+/// if necessary. Uses the IMAP MOVE command, falling back to COPY + DELETE +
+/// EXPUNGE on servers that don't support MOVE.
+fn move_message_to_folder(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_seq: u32,
+    target_folder: &str,
+) -> Result<()> {
+    let seq_str = format!("{}", message_seq);
+
+    debug_log!("[RUST] move_message_to_folder: Moving message {} to {}", message_seq, target_folder);
+
+    // Try MOVE first.
+    if session.mv(&seq_str, target_folder).is_ok() {
+        debug_log!("[RUST] move_message_to_folder: Successfully moved via MOVE command");
+        return Ok(());
+    }
+
+    // The target folder may not exist yet — create it and retry MOVE.
+    if session.create(target_folder).is_ok() {
+        debug_log!("[RUST] move_message_to_folder: Created folder {}", target_folder);
+        if session.mv(&seq_str, target_folder).is_ok() {
+            return Ok(());
+        }
+    }
+
+    // Fallback for servers without MOVE support: COPY + flag deleted + EXPUNGE.
+    if session.copy(&seq_str, target_folder).is_ok() {
+        session.store(&seq_str, "+FLAGS (\\Deleted)")?;
+        session.expunge()?;
+        debug_log!("[RUST] move_message_to_folder: Successfully moved to {} via COPY", target_folder);
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!("Failed to move email to folder {}", target_folder))
+}
+
 /// List available IMAP folders/mailboxes
 pub async fn list_imap_folders(config: &EmailConfig) -> Result<Vec<String>> {
     let host = &config.imap_host;

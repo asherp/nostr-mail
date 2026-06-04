@@ -2523,9 +2523,18 @@ class EmailService {
         // encrypted, show it decrypted first with an unlock icon and let the user
         // toggle back to the ciphertext — mirroring the body decrypt toggle.
         const rawSubject = domManager.getValue('subject') || '';
-        if (window.Utils && window.Utils.isLikelyEncryptedContent(rawSubject)) {
-            (async () => {
-                try {
+        (async () => {
+            try {
+                // The subject may be raw NIP ciphertext OR glossia-encoded prose
+                // (default encoding is glossia latin, which looks like plain words
+                // and is indistinguishable from a real subject without decoding).
+                // isLikelyEncryptedContent only recognizes the base64 layer, so we
+                // also attempt a glossia decode — mirroring the sent-mail detection
+                // at _loadSentEmailDetail. The backend decrypt_subject re-decodes
+                // glossia internally, so rawSubject can be passed through as-is.
+                const looksEncrypted = (window.Utils && window.Utils.isLikelyEncryptedContent(rawSubject))
+                    || !!(await this.decodeGlossiaSubject(rawSubject));
+                if (looksEncrypted) {
                     const pubkey = this.selectedNostrContact?.pubkey;
                     if (!pubkey || !appState.hasKeypair()) return;
                     const bodyForDecrypt = plainBody || this._plainBody || domManager.getValue('messageBody') || '';
@@ -2547,11 +2556,11 @@ class EmailService {
                         lock.title = isDecrypted ? 'Click to show encrypted' : 'Click to decrypt';
                     });
                     span.insertAdjacentElement('afterend', lock);
-                } catch (e) {
-                    console.warn('[JS] Preview subject decrypt toggle failed:', e);
                 }
-            })();
-        }
+            } catch (e) {
+                console.warn('[JS] Preview subject decrypt toggle failed:', e);
+            }
+        })();
     }
 
     async sendEncryptedEmail(emailConfig, contact, subject, body, messageId, toAddress) {

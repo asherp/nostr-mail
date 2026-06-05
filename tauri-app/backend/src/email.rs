@@ -5203,7 +5203,7 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
             extend_with_spam_folders(&mut session, &mut folders);
         }
         if spam_rescue {
-            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target);
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, db, active_pubkey);
             if moved > 0 {
                 println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
             }
@@ -5241,7 +5241,7 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
             extend_with_spam_folders(&mut session, &mut folders);
         }
         if spam_rescue {
-            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target);
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, db, active_pubkey);
             if moved > 0 {
                 println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
             }
@@ -6442,6 +6442,8 @@ fn move_uids_to_folder(
 fn rescue_nostr_emails_from_spam(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     target_folder: &str,
+    db: &Database,
+    active_pubkey: &str,
 ) -> usize {
     let spam_folders = list_spam_folders(session);
     if spam_folders.is_empty() {
@@ -6459,19 +6461,20 @@ fn rescue_nostr_emails_from_spam(
             continue;
         }
 
-        // Cheap server-side narrowing to candidate UIDs: header-marked messages
-        // (X-Nostr-Pubkey / X-Nostr-Sig) plus anything whose body carries a nostr
-        // armor block (encrypted, signed, signature, or seal). BODY search support
-        // varies by server, so we re-confirm each candidate by fetching it and
-        // checking the transport auth gate.
+        // Cheap server-side narrowing to candidate UIDs: UNREAD messages that are
+        // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor block
+        // (encrypted, signed, signature, or seal). The UNSEEN guard means a message
+        // the user has read and deliberately filed into spam is left alone. BODY
+        // search support varies by server, so we re-confirm each candidate by
+        // fetching it and checking the transport auth gate.
         let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for query in &[
-            "HEADER X-Nostr-Pubkey \"\"",
-            "HEADER X-Nostr-Sig \"\"",
-            "BODY \"BEGIN NOSTR NIP-\"",
-            "BODY \"BEGIN NOSTR SIGNED\"",
-            "BODY \"BEGIN NOSTR SIGNATURE\"",
-            "BODY \"BEGIN NOSTR SEAL\"",
+            "UNSEEN HEADER X-Nostr-Pubkey \"\"",
+            "UNSEEN HEADER X-Nostr-Sig \"\"",
+            "UNSEEN BODY \"BEGIN NOSTR NIP-\"",
+            "UNSEEN BODY \"BEGIN NOSTR SIGNED\"",
+            "UNSEEN BODY \"BEGIN NOSTR SIGNATURE\"",
+            "UNSEEN BODY \"BEGIN NOSTR SEAL\"",
         ] {
             if let Ok(found) = session.uid_search(*query) {
                 candidates.extend(found);
@@ -6481,7 +6484,10 @@ fn rescue_nostr_emails_from_spam(
             continue;
         }
 
-        let mut confirmed: Vec<u32> = Vec::new();
+        // (uid, message_id) pairs that pass all checks and haven't been rescued
+        // before. Skipping already-rescued message-ids means that if the user
+        // later moves a rescued message back into spam, we respect that choice.
+        let mut to_move: Vec<(u32, String)> = Vec::new();
         let uids: Vec<u32> = candidates.into_iter().collect();
         for chunk in uids.chunks(500) {
             let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
@@ -6494,27 +6500,52 @@ fn rescue_nostr_emails_from_spam(
             };
             for msg in messages.iter() {
                 if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
-                    if should_rescue_message(body) {
-                        confirmed.push(uid);
+                    if !should_rescue_message(body) {
+                        continue;
                     }
+                    let message_id = match extract_message_id_from_raw(body) {
+                        Some(id) => id,
+                        None => continue,
+                    };
+                    if db.is_message_id_rescued(active_pubkey, &message_id).unwrap_or(false) {
+                        continue;
+                    }
+                    to_move.push((uid, message_id));
                 }
             }
         }
 
-        if confirmed.is_empty() {
+        if to_move.is_empty() {
             continue;
         }
-        let uid_set = confirmed.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let uid_set = to_move.iter().map(|(u, _)| u.to_string()).collect::<Vec<_>>().join(",");
         match move_uids_to_folder(session, &uid_set, target_folder) {
             Ok(_) => {
                 debug_log!("[RUST] rescue_nostr_emails_from_spam: moved {} message(s) from '{}' to '{}'",
-                    confirmed.len(), folder, target_folder);
-                moved_total += confirmed.len();
+                    to_move.len(), folder, target_folder);
+                for (_, message_id) in &to_move {
+                    if let Err(e) = db.add_rescued_message_id(active_pubkey, message_id) {
+                        debug_log!("[RUST] rescue_nostr_emails_from_spam: failed to record rescued id {}: {}", message_id, e);
+                    }
+                }
+                moved_total += to_move.len();
             }
             Err(e) => debug_log!("[RUST] rescue_nostr_emails_from_spam: move from '{}' failed: {}", folder, e),
         }
     }
     moved_total
+}
+
+/// Extract and return the `Message-ID` of a raw RFC822 message, if present.
+fn extract_message_id_from_raw(raw_body: &[u8]) -> Option<String> {
+    let email = parse_mail(raw_body).ok()?;
+    let raw_headers = email
+        .headers
+        .iter()
+        .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    extract_message_id_from_headers(&raw_headers)
 }
 
 fn extend_with_spam_folders(

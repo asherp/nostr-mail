@@ -5964,6 +5964,12 @@ ${attachmentsHtml}
                 window.FolderMultiselect.setOptions(filteredFolders, restoreSelection);
             }
 
+            // The spam-rescue target dropdown derives its options from the inbox
+            // folder selection, so refresh it once the live folder list lands.
+            if (window.app && typeof window.app.populateSpamRescueTargetOptions === 'function') {
+                window.app.populateSpamRescueTargetOptions();
+            }
+
             console.log(`[EMAIL-SERVICE] Loaded ${folders?.length || 0} folders`);
 
         } catch (error) {

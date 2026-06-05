@@ -1528,6 +1528,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 const settings = appState.getSettings() || {};
                 settings.inbox_folder = joined;
                 appState.setSettings(settings);
+                // Keep the spam-rescue target dropdown in sync with the inbox
+                // folder selection (its options are derived from it, minus spam).
+                this.populateSpamRescueTargetOptions(settings);
                 if (window.emailService) {
                     window.emailService.inboxOffset = 0;
                     await window.emailService.loadEmails();
@@ -3422,6 +3425,47 @@ NostrMailApp.prototype.setupEmailValidation = function() {
     }
 }
 
+// Populate the "Rescue into folder" <select> from the folders the user selected
+// for their inbox, excluding spam/junk/bulk folders (we never rescue into spam).
+// The currently-saved target is preserved as an option even if it isn't part of
+// the current inbox selection, so changing inbox folders can't silently drop it.
+NostrMailApp.prototype.populateSpamRescueTargetOptions = function(settings) {
+    const select = domManager.get('spam-rescue-target-preference');
+    if (!select) return;
+
+    settings = settings || appState.getSettings() || {};
+
+    // Prefer the live multiselect DOM selection; fall back to the persisted list.
+    let inboxFolders = (window.FolderMultiselect && window.FolderMultiselect.getSelection)
+        ? window.FolderMultiselect.getSelection()
+        : [];
+    if (!inboxFolders || inboxFolders.length === 0) {
+        inboxFolders = (settings.inbox_folder || '').split('\n').map(f => f.trim()).filter(Boolean);
+    }
+
+    const isSpammy = (name) => {
+        const lower = name.toLowerCase();
+        return lower.includes('spam') || lower.includes('junk') || lower.includes('bulk');
+    };
+
+    const options = inboxFolders.filter(f => f && !isSpammy(f));
+
+    const saved = (settings.spam_rescue_target || 'nostr-mail').trim() || 'nostr-mail';
+    // Keep the saved target selectable even if it's not in the inbox selection.
+    if (saved && !options.includes(saved)) {
+        options.unshift(saved);
+    }
+
+    select.innerHTML = '';
+    for (const folder of options) {
+        const opt = document.createElement('option');
+        opt.value = folder;
+        opt.textContent = folder;
+        select.appendChild(opt);
+    }
+    select.value = saved;
+};
+
 NostrMailApp.prototype.populateSettingsForm = async function() {
     console.log('[QR] populateSettingsForm called');
     const settings = appState.getSettings();
@@ -3514,10 +3558,7 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         if (spamRescuePref) {
             spamRescuePref.checked = settings.spam_rescue === true;
         }
-        const spamRescueTargetPref = domManager.get('spam-rescue-target-preference');
-        if (spamRescueTargetPref) {
-            spamRescueTargetPref.value = settings.spam_rescue_target || 'nostr-mail';
-        }
+        this.populateSpamRescueTargetOptions(settings);
 
         // Set hide undecryptable emails preference (default to true if not set)
         const hideUndecryptablePref = domManager.get('hide-undecryptable-emails-preference');

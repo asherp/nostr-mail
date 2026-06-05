@@ -52,6 +52,10 @@ jobs:
         cp tauri-app/frontend/assets/nostr-mail-logo-white.png _site/assets/
         # MkDocs docs under /docs/
         cp -r _site_docs/* _site/docs/
+        # NIP-05 identity: serve /.well-known/nostr.json at the apex domain.
+        # .nojekyll keeps GitHub Pages from stripping the dotfile directory.
+        touch _site/.nojekyll
+        cp -r docs/landing/.well-known _site/.well-known
         # Preserve CNAME for custom domain
         echo "nostr-mail.com" > _site/CNAME
 

@@ -3,6 +3,15 @@
     "_": "ea11ede7f866f99f31d25380dbab5ad56953328c8379e9a97bb33d14fdfd7ae0"
   },
   "relays": {
-    "ea11ede7f866f99f31d25380dbab5ad56953328c8379e9a97bb33d14fdfd7ae0": []
+    "ea11ede7f866f99f31d25380dbab5ad56953328c8379e9a97bb33d14fdfd7ae0": [
+      "wss://relay.damus.io",
+      "wss://nos.lol",
+      "wss://relay.nostr.pub",
+      "wss://nostr.rocks",
+      "wss://nostr.mom",
+      "wss://nostr.wine",
+      "wss://cache1.primal.net",
+      "wss://relay.nostr.band"
+    ]
   }
 }

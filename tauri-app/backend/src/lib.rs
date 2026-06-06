@@ -6489,9 +6489,75 @@ async fn move_inbox_email(message_id: String, target_folder: String, _user_email
 }
 
 #[tauri::command]
-fn db_mark_as_read(message_id: String, state: tauri::State<AppState>) -> Result<(), String> {
+async fn db_mark_as_read(message_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let db = state.get_database()?;
-    db.mark_as_read(&message_id).map_err(|e| e.to_string())
+
+    // Only mirror to the server on a genuine unread -> read transition, so
+    // re-opening an already-read email doesn't trigger a redundant IMAP login.
+    let was_unread = db
+        .get_email(&message_id)
+        .map_err(|e| e.to_string())?
+        .map(|e| !e.is_read)
+        .unwrap_or(false);
+
+    db.mark_as_read(&message_id).map_err(|e| e.to_string())?;
+
+    if !was_unread {
+        return Ok(());
+    }
+
+    // Best-effort: mirror read state to the IMAP server (\Seen) so other
+    // clients/devices see the message as read. Local read state is already
+    // persisted above; a server failure must not fail the command or block the
+    // UI, so this runs detached and its result is only logged. Scoped to
+    // non-spam folders inside `mark_inbox_email_seen_on_server`.
+    let active_pubkey = match active_user_npub(&state) {
+        Some(pk) => pk,
+        None => return Ok(()),
+    };
+    let all_settings = match db.get_all_settings(&active_pubkey) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+
+    let email_address = all_settings.get("email_address").cloned();
+    let password = all_settings.get("password").cloned();
+    let imap_host = all_settings.get("imap_host").cloned();
+    let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+    let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+    if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+        let email_config = crate::types::EmailConfig {
+            email_address: email_addr,
+            password: pwd,
+            smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+            smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+            imap_host: host,
+            imap_port: port,
+            use_tls,
+            private_key: all_settings.get("nostr_private_key").cloned(),
+        };
+        // Search the logged-in user's configured inbox folders (the `inbox_folder`
+        // setting, else provider defaults), with spam/junk excluded — the same
+        // source set the sync uses, not a hardcoded list.
+        let source_folders = crate::email::configured_inbox_folders_excluding_spam(
+            all_settings.get("inbox_folder").map(|s| s.as_str()),
+            &email_config.imap_host,
+        );
+        let msg_id = message_id.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                crate::email::mark_inbox_email_seen_on_server(&email_config, &msg_id, &source_folders),
+            ).await {
+                Ok(Ok(_)) => println!("[RUST] db_mark_as_read: marked {} \\Seen on server", msg_id),
+                Ok(Err(e)) => crate::debug_log!("[RUST] db_mark_as_read: server \\Seen failed for {}: {}", msg_id, e),
+                Err(_) => crate::debug_log!("[RUST] db_mark_as_read: server \\Seen timed out for {}", msg_id),
+            }
+        });
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

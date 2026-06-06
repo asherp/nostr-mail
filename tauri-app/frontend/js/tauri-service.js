@@ -292,6 +292,9 @@ const TauriService = {
     listImapFolders: async function(emailConfig) {
         return await this.invoke('list_imap_folders', { emailConfig });
     },
+    findMessageFolder: async function(emailConfig, messageId, candidateFolders) {
+        return await this.invoke('find_message_folder', { emailConfig, messageId, candidateFolders });
+    },
     fetchImage: async function(url) {
         return await this.invoke('fetch_image', { url });
     },
@@ -660,6 +663,16 @@ const TauriService = {
 
     deleteInboxEmail: async function(messageId, deleteFromServer, userEmail) {
         return await this.invoke('db_delete_inbox_email', { messageId, deleteFromServer, userEmail });
+    },
+
+    moveInboxEmail: async function(messageId, targetFolder, userEmail) {
+        return await this.invoke('move_inbox_email', { messageId, targetFolder, userEmail });
+    },
+
+    // One-time catch-up rescue when the user first enables spam rescue: moves
+    // ALL nostr mail (read + unread) out of spam and returns how many moved.
+    rescueSpamNow: async function() {
+        return await this.invoke('rescue_spam_now', {});
     },
 
     markAsRead: async function(messageId) {

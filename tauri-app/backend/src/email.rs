@@ -978,6 +978,392 @@ fn move_to_trash(
     Err(anyhow::anyhow!("Failed to move email to trash"))
 }
 
+/// Move an inbox email (identified by Message-ID) to an arbitrary IMAP folder.
+///
+/// Mirrors `delete_inbox_email_from_server`, but instead of moving the matched
+/// message to trash it moves it into `target_folder`, creating that folder if it
+/// does not already exist. The message may live anywhere (it could have been
+/// moved before), so the search spans the user's real folders rather than a fixed
+/// `INBOX`/`nostr-mail` pair; if it's already in `target_folder` the move is a
+/// no-op success.
+pub async fn move_inbox_email_to_folder(
+    config: &EmailConfig,
+    message_id: &str,
+    target_folder: &str,
+) -> Result<()> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+    let target_folder = target_folder.to_string();
+
+    debug_log!("[RUST] move_inbox_email_to_folder: Moving Message-ID {} to folder {}", message_id, target_folder);
+
+    tokio::task::spawn_blocking(move || {
+        use std::net::TcpStream;
+        let addr = format!("{}:{}", host, port);
+
+        let result = if use_tls {
+            let client = create_imap_tls_client!(&host, &addr)?;
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let source_folders = searchable_source_folders(&mut session, &target_folder);
+            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &source_folders);
+            let _ = session.logout();
+            result
+        } else {
+            let tcp_stream = TcpStream::connect(&addr)?;
+            let client = imap::Client::new(tcp_stream);
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let source_folders = searchable_source_folders(&mut session, &target_folder);
+            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &source_folders);
+            let _ = session.logout();
+            result
+        };
+        result
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+/// List the folders worth searching for a message we're about to move, ordered so
+/// the cheap/likely ones come first: the target itself (to detect an already-there
+/// no-op), then INBOX and nostr-mail, then everything else. Gmail's "All Mail" is
+/// excluded — it contains every message (labels, not folders), so it would always
+/// match and make the move ambiguous. Falls back to INBOX/nostr-mail if LIST fails.
+fn searchable_source_folders(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    target_folder: &str,
+) -> Vec<String> {
+    let mut folders: Vec<String> = match session.list(Some(""), Some("*")) {
+        Ok(mailboxes) => mailboxes
+            .iter()
+            .map(|mb| mb.name().to_string())
+            .filter(|n| !n.to_lowercase().contains("all mail"))
+            .collect(),
+        Err(_) => vec!["INBOX".to_string(), "nostr-mail".to_string()],
+    };
+
+    let rank = |f: &str| -> u8 {
+        let fl = f.to_lowercase();
+        if fl == target_folder.to_lowercase() {
+            0
+        } else if fl == "inbox" {
+            1
+        } else if fl == "nostr-mail" {
+            2
+        } else {
+            3
+        }
+    };
+    // Stable sort preserves the server's order within each rank.
+    folders.sort_by_key(|f| rank(f));
+    folders
+}
+
+/// Find an email by Message-ID across `source_folders` and move it to
+/// `target_folder`. Finding it already in `target_folder` is a no-op success.
+fn move_email_to_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_id: &str,
+    target_folder: &str,
+    source_folders: &[String],
+) -> Result<()> {
+    let mut folder_selected = false;
+    for folder in source_folders {
+        debug_log!("[RUST] move_email_to_folder_sync: Trying folder: {}", folder);
+        if session.select(folder).is_ok() {
+            folder_selected = true;
+
+            let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+            let full_msg_id = if normalized_msg_id.contains('@') {
+                format!("<{}>", normalized_msg_id)
+            } else {
+                format!("<{}@nostr-mail>", normalized_msg_id)
+            };
+
+            let search_queries = vec![
+                format!("HEADER Message-ID \"{}\"", full_msg_id),
+                format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+                format!("HEADER Message-ID \"{}\"", message_id.trim()),
+            ];
+
+            let mut matching_messages = std::collections::HashSet::new();
+            for search_query in &search_queries {
+                if let Ok(results) = session.search(search_query) {
+                    if !results.is_empty() {
+                        matching_messages.extend(results);
+                        debug_log!("[RUST] move_email_to_folder_sync: Found {} match(es) in {}", matching_messages.len(), folder);
+                        break;
+                    }
+                }
+            }
+
+            if !matching_messages.is_empty() {
+                // Already in the destination — nothing to move.
+                if folder.eq_ignore_ascii_case(target_folder) {
+                    debug_log!("[RUST] move_email_to_folder_sync: Already in target {}, no-op", target_folder);
+                    return Ok(());
+                }
+                let message_seq = *matching_messages.iter().next().unwrap();
+                return move_message_to_folder(session, message_seq, target_folder);
+            }
+        }
+    }
+
+    if !folder_selected {
+        return Err(anyhow::anyhow!("Could not select any source folder"));
+    }
+    Err(anyhow::anyhow!("Email not found on server"))
+}
+
+/// Move a message (by sequence number) into `target_folder`, creating the folder
+/// if necessary. Uses the IMAP MOVE command, falling back to COPY + DELETE +
+/// EXPUNGE on servers that don't support MOVE.
+fn move_message_to_folder(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_seq: u32,
+    target_folder: &str,
+) -> Result<()> {
+    let seq_str = format!("{}", message_seq);
+
+    debug_log!("[RUST] move_message_to_folder: Moving message {} to {}", message_seq, target_folder);
+
+    // When the user deliberately files a message INTO a spam folder, mark it
+    // \Seen first. Spam rescue only pulls UNSEEN mail out of spam, so a read
+    // message sitting in spam is the user's "leave it here" signal — and because
+    // it's a server flag it's the same answer on every device. Our fetches use
+    // BODY.PEEK[] (reading a body never sets \Seen), and the read-state sync
+    // (`mark_inbox_email_seen_on_server`) only sets \Seen in non-spam inbox
+    // folders — so within spam folders this move path is the only thing that
+    // ever sets \Seen, and that flag must not be auto-cleared on spam mail.
+    // IMAP COPY/MOVE preserve flags, so setting it before the move is enough.
+    if is_spam_folder_name(target_folder) {
+        let _ = session.store(&seq_str, "+FLAGS (\\Seen)");
+    }
+
+    // Try MOVE first.
+    if session.mv(&seq_str, target_folder).is_ok() {
+        debug_log!("[RUST] move_message_to_folder: Successfully moved via MOVE command");
+        return Ok(());
+    }
+
+    // The target folder may not exist yet — create it and retry MOVE.
+    if session.create(target_folder).is_ok() {
+        debug_log!("[RUST] move_message_to_folder: Created folder {}", target_folder);
+        if session.mv(&seq_str, target_folder).is_ok() {
+            return Ok(());
+        }
+    }
+
+    // Fallback for servers without MOVE support: COPY + flag deleted + EXPUNGE.
+    if session.copy(&seq_str, target_folder).is_ok() {
+        session.store(&seq_str, "+FLAGS (\\Deleted)")?;
+        session.expunge()?;
+        debug_log!("[RUST] move_message_to_folder: Successfully moved to {} via COPY", target_folder);
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!("Failed to move email to folder {}", target_folder))
+}
+
+/// Find which of `candidate_folders` currently contains the message identified by
+/// `message_id`, returning the first match in the given order (or None if it
+/// isn't found in any). Inbox emails carry no folder field, so the server is the
+/// only source of truth for the move picker's "(current)" label once a message
+/// has been moved. Callers should order cheap/likely folders first; the search
+/// stops at the first hit.
+pub async fn find_message_folder(
+    config: &EmailConfig,
+    message_id: &str,
+    candidate_folders: Vec<String>,
+) -> Result<Option<String>> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        use std::net::TcpStream;
+        let addr = format!("{}:{}", host, port);
+        if use_tls {
+            let client = create_imap_tls_client!(&host, &addr)?;
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let found = find_message_folder_sync(&mut session, &message_id, &candidate_folders);
+            let _ = session.logout();
+            found
+        } else {
+            let tcp_stream = TcpStream::connect(&addr)?;
+            let client = imap::Client::new(tcp_stream);
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let found = find_message_folder_sync(&mut session, &message_id, &candidate_folders);
+            let _ = session.logout();
+            found
+        }
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+fn find_message_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_id: &str,
+    candidate_folders: &[String],
+) -> Result<Option<String>> {
+    let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+    let full_msg_id = if normalized_msg_id.contains('@') {
+        format!("<{}>", normalized_msg_id)
+    } else {
+        format!("<{}@nostr-mail>", normalized_msg_id)
+    };
+    let search_queries = [
+        format!("HEADER Message-ID \"{}\"", full_msg_id),
+        format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+        format!("HEADER Message-ID \"{}\"", message_id.trim()),
+    ];
+
+    for folder in candidate_folders {
+        if session.select(folder).is_err() {
+            continue;
+        }
+        for search_query in &search_queries {
+            if let Ok(results) = session.search(search_query) {
+                if !results.is_empty() {
+                    return Ok(Some(folder.clone()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve the logged-in user's configured inbox source folders, with spam/junk
+/// folders filtered out. Mirrors how the sync chooses folders: the `inbox_folder`
+/// setting (one folder per line) when set, otherwise the provider-aware
+/// `default_inbox_folders`. Spam/junk folders are excluded because the read-state
+/// sync must not touch the `\Seen` flag inside spam folders, where that flag is
+/// reserved as the spam-rescue "user filed this here" signal.
+pub fn configured_inbox_folders_excluding_spam(
+    inbox_folder_setting: Option<&str>,
+    imap_host: &str,
+) -> Vec<String> {
+    let configured: Vec<String> = inbox_folder_setting
+        .map(|s| {
+            s.split('\n')
+                .map(|f| f.trim().to_string())
+                .filter(|f| !f.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let folders = if configured.is_empty() {
+        default_inbox_folders(imap_host)
+    } else {
+        configured
+    };
+    folders.into_iter().filter(|f| !is_spam_folder_name(f)).collect()
+}
+
+/// Mark an inbox email (identified by Message-ID) as `\Seen` on the IMAP server,
+/// so read state set in the app propagates to other clients/devices.
+///
+/// `source_folders` is the user's configured inbox folders with spam/junk
+/// excluded (see `configured_inbox_folders_excluding_spam`). Restricting the
+/// search to non-spam folders is deliberate: inside spam/junk folders the
+/// `\Seen` flag is reserved as the "user deliberately filed this here" signal
+/// that spam rescue keys off of (see `move_message_to_folder`), so the read path
+/// must never set it there.
+pub async fn mark_inbox_email_seen_on_server(
+    config: &EmailConfig,
+    message_id: &str,
+    source_folders: &[String],
+) -> Result<()> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+    let source_folders: Vec<String> = source_folders.to_vec();
+
+    debug_log!("[RUST] mark_inbox_email_seen_on_server: Marking Message-ID {} as \\Seen in {:?}", message_id, source_folders);
+
+    tokio::task::spawn_blocking(move || {
+        use std::net::TcpStream;
+        let addr = format!("{}:{}", host, port);
+
+        let result = if use_tls {
+            let client = create_imap_tls_client!(&host, &addr)?;
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = set_seen_in_folder_sync(&mut session, &message_id, &source_folders);
+            let _ = session.logout();
+            result
+        } else {
+            let tcp_stream = TcpStream::connect(&addr)?;
+            let client = imap::Client::new(tcp_stream);
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let result = set_seen_in_folder_sync(&mut session, &message_id, &source_folders);
+            let _ = session.logout();
+            result
+        };
+        result
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+/// Find an email by Message-ID across `source_folders` and set its `\Seen` flag.
+/// Stops at the first folder where the message is found. Mirrors the Message-ID
+/// search used by `delete_email_from_folder_sync` / `move_email_to_folder_sync`.
+fn set_seen_in_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_id: &str,
+    source_folders: &[String],
+) -> Result<()> {
+    let mut folder_selected = false;
+    for folder in source_folders {
+        debug_log!("[RUST] set_seen_in_folder_sync: Trying folder: {}", folder);
+        if session.select(folder).is_ok() {
+            folder_selected = true;
+
+            let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+            let full_msg_id = if normalized_msg_id.contains('@') {
+                format!("<{}>", normalized_msg_id)
+            } else {
+                format!("<{}@nostr-mail>", normalized_msg_id)
+            };
+
+            let search_queries = vec![
+                format!("HEADER Message-ID \"{}\"", full_msg_id),
+                format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+                format!("HEADER Message-ID \"{}\"", message_id.trim()),
+            ];
+
+            let mut matching_messages = std::collections::HashSet::new();
+            for search_query in &search_queries {
+                if let Ok(results) = session.search(search_query) {
+                    if !results.is_empty() {
+                        matching_messages.extend(results);
+                        break;
+                    }
+                }
+            }
+
+            if !matching_messages.is_empty() {
+                let seq_list = matching_messages
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                session.store(&seq_list, "+FLAGS (\\Seen)")?;
+                debug_log!("[RUST] set_seen_in_folder_sync: marked {} message(s) \\Seen in {}", matching_messages.len(), folder);
+                return Ok(());
+            }
+        }
+    }
+
+    if !folder_selected {
+        return Err(anyhow::anyhow!("Could not select any source folder"));
+    }
+    Err(anyhow::anyhow!("Email not found on server"))
+}
+
 /// List available IMAP folders/mailboxes
 pub async fn list_imap_folders(config: &EmailConfig) -> Result<Vec<String>> {
     let host = &config.imap_host;
@@ -4919,7 +5305,11 @@ fn persist_inbox_raw_emails(
                 recipient_pubkey: email.recipient_pubkey.clone(),
                 raw_headers: Some(email.raw_headers.clone()),
                 is_draft: false,
-                is_read: false,
+                // Seed read state from the server `\Seen` flag captured at fetch
+                // time, so mail already read on another client/device imports as
+                // read. Unknown (`None`) → unread. Existing rows above keep their
+                // local read state; this only seeds the initial insert.
+                is_read: email.seen.unwrap_or(false),
                 updated_at: None,
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
@@ -4967,9 +5357,11 @@ fn persist_attachments_for_email(db: &Database, email: &RawNostrEmail, email_id:
 /// server are tolerated by `uid_sync_folder` (logged and skipped), so this can
 /// include best-guess names like `Archive` without breaking anything.
 ///
-/// Spam/junk folders are NOT in this static list — they're appended at sync
-/// time by `extend_with_spam_folders` which finds the real folder names on
-/// the server (`[Gmail]/Spam`, `Junk Email`, `Junk`, etc.).
+/// Spam/junk folders are not in this static list. How spam is handled depends
+/// on the spam-rescue setting (decided at sync time): with rescue ON, spam is
+/// never scanned and `rescue_nostr_emails_from_spam` moves misfiled nostr mail
+/// into the rescue target; with rescue OFF, `extend_with_spam_folders` appends
+/// discovered spam folders so that mail still surfaces in the inbox.
 pub fn default_inbox_folders(imap_host: &str) -> Vec<String> {
     let h = imap_host.to_lowercase();
     if h.contains("gmail.com") || h.contains("googlemail.com") {
@@ -5007,14 +5399,15 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
+    let spam_rescue = lookup_spam_rescue(db, active_pubkey);
+    let rescue_target = lookup_spam_rescue_target(db, active_pubkey);
+    debug_log!("[RUST] sync: spam_rescue={}, rescue_target='{}'", spam_rescue, rescue_target);
 
     // Folders to scan. Default (empty/None) = provider-aware list from
-    // `default_inbox_folders`, with any *spam*-named server folder appended
-    // after login (Nostr-encrypted bodies routinely get mis-classified as
-    // spam). Multiple folders may be supplied to scan in a single pass;
-    // dedupe to avoid re-scanning the same folder twice if a caller passed
-    // duplicates.
-    let (folders, expand_spam): (Vec<String>, bool) = match folders_arg {
+    // `default_inbox_folders`. Multiple folders may be supplied to scan in a
+    // single pass; dedupe to avoid re-scanning the same folder twice if a
+    // caller passed duplicates.
+    let folders: Vec<String> = match folders_arg {
         Some(list) => {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut out: Vec<String> = Vec::new();
@@ -5026,14 +5419,35 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
                 }
             }
             if out.is_empty() {
-                (default_inbox_folders(&config.imap_host), true)
+                default_inbox_folders(&config.imap_host)
             } else {
-                (out, false)
+                out
             }
         }
-        None => (default_inbox_folders(&config.imap_host), true),
+        None => default_inbox_folders(&config.imap_host),
     };
-    let mut folders = folders;
+
+    // Strip any spam/junk/bulk name from the base list (a default never has
+    // one; a stale persisted selection might). Whether spam gets scanned is
+    // decided below, by the spam_rescue flag — not by the saved selection:
+    //   - rescue ON  → spam is NOT scanned. Scanning it would let an in-app
+    //     read mark the message \Seen, which rescue treats as "the user filed
+    //     this here, leave it" — permanently suppressing the rescue. Rescue
+    //     instead moves eligible mail into the rescue target (added below).
+    //   - rescue OFF → discovered spam folders ARE appended to the scan set
+    //     (inside the IMAP session) so nostr mail a provider misfiled still
+    //     surfaces in the inbox. Nothing moves it, so it stays in spam and is
+    //     eventually auto-purged by the provider — which some users prefer.
+    let mut folders: Vec<String> = folders
+        .into_iter()
+        .filter(|f| !is_spam_folder_name(f))
+        .collect();
+
+    // With spam rescue on, ensure the rescue target is in the scan set so moved
+    // messages land in the local DB during this same pass.
+    if spam_rescue && !folders.iter().any(|f| f.eq_ignore_ascii_case(&rescue_target)) {
+        folders.push(rescue_target.clone());
+    }
 
     println!(
         "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, sync_cutoff_days={} (bootstrap only)",
@@ -5057,10 +5471,15 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     if config.use_tls {
         let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        if expand_spam {
+        if spam_rescue {
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, /* unseen_only = */ true);
+            if moved > 0 {
+                println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
+            }
+        } else {
             extend_with_spam_folders(&mut session, &mut folders);
         }
-        println!("[RUST] sync_nostr_emails_to_db: folders after spam expansion: {:?}", folders);
+        println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
         for f in &folders {
             match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
                                   parse_nostr_email_from_imap_body) {
@@ -5089,10 +5508,15 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         let tcp_stream = TcpStream::connect(&addr)?;
         let client = imap::Client::new(tcp_stream);
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        if expand_spam {
+        if spam_rescue {
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, /* unseen_only = */ true);
+            if moved > 0 {
+                println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
+            }
+        } else {
             extend_with_spam_folders(&mut session, &mut folders);
         }
-        println!("[RUST] sync_nostr_emails_to_db: folders after spam expansion: {:?}", folders);
+        println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
         for f in &folders {
             match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
                                   parse_nostr_email_from_imap_body) {
@@ -5667,6 +6091,11 @@ pub struct RawNostrEmail {
     pub signature_valid: Option<bool>,
     pub signature_source: Option<String>,
     pub transport_auth_verified: Option<bool>,
+    /// Server `\Seen` flag at fetch time, when the IMAP fetch requested FLAGS.
+    /// `None` means "not known from this fetch" (parse paths don't see flags);
+    /// callers treat `None` as unread for new inserts. Set by the inbox fetch
+    /// loops so read state set on another client/device imports on first sync.
+    pub seen: Option<bool>,
 }
 
 /// Parse an IMAP RFC822 message body and return Some(RawNostrEmail) if it is a
@@ -5758,6 +6187,9 @@ fn parse_nostr_email_from_imap_body_inner(
         signature_valid,
         signature_source,
         transport_auth_verified,
+        // Parsing only sees the message body, not IMAP flags. The fetch loop
+        // overrides this from `msg.flags()` when it requested FLAGS.
+        seen: None,
     })
 }
 
@@ -5865,7 +6297,11 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
     let mut max_uid: u32 = 0;
     for chunk in uids.chunks(FETCH_BATCH) {
         let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        let messages = session.uid_fetch(&uid_list, "(UID RFC822)")?;
+        // BODY.PEEK[] (not RFC822) so reading a message body never *sets* \Seen.
+        // We additionally request FLAGS so we can *read* the server's \Seen flag
+        // and seed local read state from it (import read-elsewhere on first
+        // sync). Response key is still BODY[], so msg.body() works unchanged.
+        let messages = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
         for msg in messages.iter() {
             if let Some(uid) = msg.uid {
                 if uid > max_uid {
@@ -5873,7 +6309,8 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
                 }
             }
             if let Some(body) = msg.body() {
-                if let Some(parsed) = parse_fn(body, config) {
+                if let Some(mut parsed) = parse_fn(body, config) {
+                    parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
                     emails.push(parsed);
                 }
             }
@@ -6005,13 +6442,16 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
         let batch = &uids[start..end];
 
         let uid_list = batch.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        let msgs = session.uid_fetch(&uid_list, "(UID RFC822)")?;
+        // BODY.PEEK[] so paging older mail doesn't *set* \Seen; FLAGS so we can
+        // read it and seed local read state for newly-imported rows.
+        let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
         for msg in msgs.iter() {
             if let Some(uid) = msg.uid {
                 if uid < lowest_scanned { lowest_scanned = uid; }
             }
             if let Some(body) = msg.body() {
-                if let Some(parsed) = parse_fn(body, config) {
+                if let Some(mut parsed) = parse_fn(body, config) {
+                    parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
                     emails.push(parsed);
                 }
             }
@@ -6142,10 +6582,13 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     let mut emails: Vec<RawNostrEmail> = Vec::new();
     for chunk in missing.chunks(FETCH_BATCH) {
         let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        let msgs = session.uid_fetch(&uid_list, "(UID RFC822)")?;
+        // BODY.PEEK[] so gap-fill backfill doesn't *set* \Seen; FLAGS so we can
+        // read it and seed local read state for newly-imported rows.
+        let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
         for msg in msgs.iter() {
             if let Some(body) = msg.body() {
-                if let Some(parsed) = parse_fn(body, config) {
+                if let Some(mut parsed) = parse_fn(body, config) {
+                    parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
                     emails.push(parsed);
                 }
             }
@@ -6176,34 +6619,265 @@ pub(crate) fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
     true
 }
 
-/// Discover sent mailbox name using IMAP LIST command
-/// Returns the actual mailbox name found, or None if no sent mailbox exists
-/// Append any server mailbox whose name contains "spam", "junk", or "bulk"
-/// (case-insensitive) to `folders`, skipping names already present. Used to
-/// expand the default sync set so Nostr-encrypted mail that providers
-/// mis-classified still gets picked up. Catches `[Gmail]/Spam`, Outlook's
-/// `Junk Email`, Fastmail's `Junk`, Yahoo's `Bulk Mail`, etc. Failures during
-/// LIST are non-fatal — the sync will just proceed with the pre-expansion
-/// folder set.
+/// Read `spam_rescue` for the active pubkey, defaulting to true (on by default).
+/// Only an explicit "false" disables it; absent/blank settings stay on.
+pub(crate) fn lookup_spam_rescue(db: &Database, pubkey: &str) -> bool {
+    if let Ok(Some(value)) = db.get_setting(pubkey, "spam_rescue") {
+        return value != "false";
+    }
+    true
+}
+
+/// Read the folder spam-rescued nostr mail should be moved into, defaulting to
+/// `nostr-mail`. Blank/whitespace settings fall back to the default.
+pub(crate) fn lookup_spam_rescue_target(db: &Database, pubkey: &str) -> String {
+    if let Ok(Some(value)) = db.get_setting(pubkey, "spam_rescue_target") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "nostr-mail".to_string()
+}
+
+/// True if a mailbox name looks like a provider spam/junk/bulk folder
+/// (case-insensitive). Catches `[Gmail]/Spam`, Outlook's `Junk Email`,
+/// Fastmail's `Junk`, Yahoo's `Bulk Mail`, etc.
+fn is_spam_folder_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("spam") || lower.contains("junk") || lower.contains("bulk")
+}
+
+fn list_spam_folders(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+) -> Vec<String> {
+    let mailboxes = match session.list(Some(""), Some("*")) {
+        Ok(m) => m,
+        Err(e) => {
+            debug_log!("[RUST] list_spam_folders: LIST failed: {}", e);
+            return Vec::new();
+        }
+    };
+    mailboxes
+        .iter()
+        .map(|mb| mb.name().to_string())
+        .filter(|name| is_spam_folder_name(name))
+        .collect()
+}
+
+/// Append discovered spam/junk/bulk server folders to `folders` (deduped).
+/// Called only when spam rescue is OFF, so nostr mail a provider misfiled into
+/// spam still surfaces in the inbox view. (With rescue ON we never scan spam —
+/// rescue moves eligible mail into the rescue target instead, and scanning spam
+/// would let an in-app read mark it \Seen and suppress its rescue.) LIST
+/// failures are non-fatal: the sync proceeds with the unexpanded folder set.
 fn extend_with_spam_folders(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     folders: &mut Vec<String>,
 ) {
-    let mailboxes = match session.list(Some(""), Some("*")) {
-        Ok(m) => m,
-        Err(e) => {
-            debug_log!("[RUST] extend_with_spam_folders: LIST failed: {}", e);
-            return;
-        }
-    };
-    for mailbox in mailboxes.iter() {
-        let name = mailbox.name();
-        let lower = name.to_lowercase();
-        if !lower.contains("spam") && !lower.contains("junk") && !lower.contains("bulk") { continue; }
-        if folders.iter().any(|f| f.eq_ignore_ascii_case(name)) { continue; }
+    for name in list_spam_folders(session) {
+        if folders.iter().any(|f| f.eq_ignore_ascii_case(&name)) { continue; }
         debug_log!("[RUST] extend_with_spam_folders: adding {}", name);
-        folders.push(name.to_string());
+        folders.push(name);
     }
+}
+
+/// Decide whether a message sitting in a spam folder should be rescued.
+///
+/// A message qualifies when BOTH hold:
+/// 1. It carries a nostr marker — an `X-Nostr-Pubkey` or `X-Nostr-Sig` header,
+///    or an inline `BEGIN NOSTR ...` armor block (encrypted body, signed body,
+///    signature, or seal).
+/// 2. It passes transport authentication (SPF/DKIM/alignment).
+///
+/// Transport auth is required because the rest of the inbox enforces it: a
+/// message that fails it would be moved out of spam yet still get filtered from
+/// the inbox, stranding it where the user can't see it. Mail that fails SPF/DKIM
+/// is therefore deliberately left in spam — only authenticated nostr mail that
+/// the provider misfiled gets rescued.
+fn should_rescue_message(raw_body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(raw_body);
+    let has_nostr_marker = text.contains("X-Nostr-Pubkey:")
+        || text.contains("X-Nostr-Sig:")
+        || text.contains("BEGIN NOSTR NIP-")
+        || text.contains("BEGIN NOSTR SIGNED")
+        || text.contains("BEGIN NOSTR SIGNATURE")
+        || text.contains("BEGIN NOSTR SEAL");
+    if !has_nostr_marker {
+        debug_log!("[RUST] rescue: should_rescue_message=false (no nostr marker)");
+        return false;
+    }
+    match verify_transport_authentication(Some(raw_body), None) {
+        Ok(verdict) => {
+            if !verdict.transport_verified {
+                debug_log!("[RUST] rescue: should_rescue_message=false (has marker, transport auth NOT verified)");
+            }
+            verdict.transport_verified
+        }
+        Err(e) => {
+            debug_log!("[RUST] rescue: should_rescue_message=false (transport auth check errored: {})", e);
+            false
+        }
+    }
+}
+
+/// Move a UID set into `target_folder`, creating the folder if needed. Uses the
+/// IMAP UID MOVE command, falling back to UID COPY + flag-deleted + EXPUNGE on
+/// servers without MOVE. UID-based so source sequence renumbering during the
+/// operation can't misaddress messages.
+fn move_uids_to_folder(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    uid_set: &str,
+    target_folder: &str,
+) -> Result<()> {
+    if session.uid_mv(uid_set, target_folder).is_ok() {
+        return Ok(());
+    }
+    // Target may not exist yet — create and retry.
+    if session.create(target_folder).is_ok() && session.uid_mv(uid_set, target_folder).is_ok() {
+        return Ok(());
+    }
+    if session.uid_copy(uid_set, target_folder).is_ok() {
+        session.uid_store(uid_set, "+FLAGS (\\Deleted)")?;
+        session.expunge()?;
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("Failed to move UIDs {} to folder {}", uid_set, target_folder))
+}
+
+/// Scan every spam/junk/bulk folder and move nostr messages out of them into
+/// `target_folder`, so providers' misclassified encrypted mail stays reachable.
+/// Returns the number of messages moved. Per-folder failures are logged and
+/// skipped — rescue is best-effort and never aborts the surrounding sync.
+///
+/// When `unseen_only` is true (the normal per-sync rescue) only UNSEEN mail is
+/// considered: there is no rescue-once ledger — to keep a message in spam, the
+/// user (via the app's move-to-spam) marks it \Seen, which the server
+/// replicates to every device, so the UNSEEN guard alone encodes intent
+/// identically on all clients. When false (the one-time catch-up run when a
+/// user first enables rescue) the \Seen guard is dropped so already-read nostr
+/// mail sitting in spam — which the normal run would skip — is swept out too.
+fn rescue_nostr_emails_from_spam(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    target_folder: &str,
+    unseen_only: bool,
+) -> usize {
+    let spam_folders = list_spam_folders(session);
+    debug_log!("[RUST] rescue: spam folders found = {:?}, target = '{}', unseen_only = {}", spam_folders, target_folder, unseen_only);
+    if spam_folders.is_empty() {
+        return 0;
+    }
+    // Make sure the destination exists before we start moving into it.
+    let _ = session.create(target_folder);
+
+    let mut moved_total = 0usize;
+    for folder in spam_folders {
+        if folder.eq_ignore_ascii_case(target_folder) {
+            continue;
+        }
+        if session.select(&folder).is_err() {
+            continue;
+        }
+
+        // Cheap server-side narrowing to candidate UIDs: messages that are
+        // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor
+        // block (encrypted, signed, signature, or seal). With `unseen_only` the
+        // search is gated by UNSEEN so a message the user read and deliberately
+        // filed into spam is left alone; the catch-up run drops that gate. BODY
+        // search support varies by server, so we re-confirm each candidate by
+        // fetching it and checking the transport auth gate.
+        let guard = if unseen_only { "UNSEEN " } else { "" };
+        let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for q in &[
+            "HEADER X-Nostr-Pubkey \"\"",
+            "HEADER X-Nostr-Sig \"\"",
+            "BODY \"BEGIN NOSTR NIP-\"",
+            "BODY \"BEGIN NOSTR SIGNED\"",
+            "BODY \"BEGIN NOSTR SIGNATURE\"",
+            "BODY \"BEGIN NOSTR SEAL\"",
+        ] {
+            let query = format!("{}{}", guard, q);
+            if let Ok(found) = session.uid_search(&query) {
+                candidates.extend(found);
+            }
+        }
+        debug_log!("[RUST] rescue: folder '{}' nostr candidate UIDs = {}", folder, candidates.len());
+        if candidates.is_empty() {
+            continue;
+        }
+
+        // UIDs that pass the eligibility gate. No ledger: in the normal run a
+        // deliberate move-to-spam is respected because the app marks such mail
+        // \Seen, so it never appears in the UNSEEN candidate set above.
+        let mut to_move: Vec<u32> = Vec::new();
+        let uids: Vec<u32> = candidates.into_iter().collect();
+        for chunk in uids.chunks(500) {
+            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            // BODY.PEEK[] (not RFC822) so confirming a candidate doesn't set the
+            // \Seen flag — rescued messages must stay unread on the server. The
+            // response key is still BODY[], so msg.body() works unchanged.
+            let messages = match session.uid_fetch(&uid_list, "(UID BODY.PEEK[])") {
+                Ok(m) => m,
+                Err(e) => {
+                    debug_log!("[RUST] rescue_nostr_emails_from_spam: fetch in '{}' failed: {}", folder, e);
+                    continue;
+                }
+            };
+            for msg in messages.iter() {
+                if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
+                    if should_rescue_message(body) {
+                        to_move.push(uid);
+                    } else {
+                        debug_log!("[RUST] rescue: uid {} in '{}' not eligible (missing nostr marker or transport auth failed)", uid, folder);
+                    }
+                }
+            }
+        }
+
+        if to_move.is_empty() {
+            continue;
+        }
+        let uid_set = to_move.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        match move_uids_to_folder(session, &uid_set, target_folder) {
+            Ok(_) => {
+                debug_log!("[RUST] rescue_nostr_emails_from_spam: moved {} message(s) from '{}' to '{}'",
+                    to_move.len(), folder, target_folder);
+                moved_total += to_move.len();
+            }
+            Err(e) => debug_log!("[RUST] rescue_nostr_emails_from_spam: move from '{}' failed: {}", folder, e),
+        }
+    }
+    moved_total
+}
+
+/// One-time "catch-up" rescue invoked when the user first switches spam rescue
+/// ON. Opens an IMAP session and runs `rescue_nostr_emails_from_spam` with the
+/// \Seen guard dropped, so already-read nostr mail sitting in spam (which the
+/// per-sync rescue intentionally skips) is moved into `target_folder` too.
+/// Returns the number of messages moved. The caller is expected to sync
+/// afterwards so the moved messages land in the local DB.
+pub async fn rescue_spam_now(config: &EmailConfig, target_folder: &str) -> anyhow::Result<usize> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = &config.email_address;
+    let password = &config.password;
+    let addr = format!("{}:{}", host, port);
+
+    let moved = if config.use_tls {
+        let client = create_imap_tls_client!(&host, &addr)?;
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        let m = rescue_nostr_emails_from_spam(&mut session, target_folder, /* unseen_only = */ false);
+        let _ = session.logout();
+        m
+    } else {
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let client = imap::Client::new(tcp_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        let m = rescue_nostr_emails_from_spam(&mut session, target_folder, /* unseen_only = */ false);
+        let _ = session.logout();
+        m
+    };
+    Ok(moved)
 }
 
 fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::io::Write>) -> anyhow::Result<Option<String>> {

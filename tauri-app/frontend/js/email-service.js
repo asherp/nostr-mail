@@ -4619,6 +4619,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+<button class="thread-menu-item thread-move-action">Move to folder</button>
 <button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
@@ -4710,6 +4711,17 @@ ${attachmentsHtml}
                         inboxDeleteBtn.addEventListener('click', async () => {
                             inboxMoreDropdown.classList.remove('open');
                             const ok = await this._deleteEmailFromDetail(email.message_id || email.id, 'inbox');
+                            if (!ok) return;
+                            this.showEmailList();
+                            await this.loadEmails();
+                        });
+                    }
+
+                    const inboxMoveBtn = emailDetailContent.querySelector('.thread-move-action');
+                    if (inboxMoveBtn) {
+                        inboxMoveBtn.addEventListener('click', async () => {
+                            inboxMoreDropdown.classList.remove('open');
+                            const ok = await this._moveEmailFromDetail(email.message_id || email.id);
                             if (!ok) return;
                             this.showEmailList();
                             await this.loadEmails();
@@ -5338,6 +5350,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+${source === 'inbox' ? '<button class="thread-menu-item thread-move-action">Move to folder</button>' : ''}
 <button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
@@ -5437,6 +5450,21 @@ ${attachmentsHtml}
                                     this.showSentList();
                                     await this.loadSentEmails();
                                 }
+                            }
+                        });
+                    }
+                    const moveCardBtn = cardDiv.querySelector('.thread-move-action');
+                    if (moveCardBtn) {
+                        moveCardBtn.addEventListener('click', async () => {
+                            moreDropdown.classList.remove('open');
+                            const messageId = email.message_id || email.id;
+                            const ok = await this._moveEmailFromDetail(messageId);
+                            if (!ok) return;
+                            cardDiv.remove();
+                            const remaining = threadContent.querySelectorAll('.email-detail-card').length;
+                            if (remaining === 0) {
+                                this.showEmailList();
+                                await this.loadEmails();
                             }
                         });
                     }
@@ -5674,6 +5702,75 @@ ${attachmentsHtml}
         }
     }
 
+    // Prompt for a destination folder and move a single inbox email there on the
+    // server. Returns true if the move succeeded so the caller can refresh the UI.
+    async _moveEmailFromDetail(messageId) {
+        const settings = appState.getSettings() || {};
+        const userEmail = settings.email_address || null;
+
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host || '',
+            smtp_port: settings.smtp_port || 587,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port || 993,
+            use_tls: settings.use_tls !== false,
+        };
+
+        // Fetch the current server folder list to populate the picker. Failure is
+        // non-fatal — the user can still type a new folder name.
+        let folders = [];
+        try {
+            folders = (await TauriService.listImapFolders(emailConfig)) || [];
+        } catch (error) {
+            console.warn('[JS] Could not list folders for move picker:', error);
+        }
+
+        // Resolve the message's ACTUAL current folder from the server so the
+        // picker's "(current)" label is correct even after a prior move (inbox
+        // emails carry no per-email folder). Check inbox folders first (cheap,
+        // common case), then the rest; fall back to the inbox heuristic if the
+        // server can't be reached or the message isn't found.
+        const inboxFolders = (settings.inbox_folder || '')
+            .split('\n')
+            .map(s => s.trim())
+            .filter(Boolean);
+        if (inboxFolders.length === 0) inboxFolders.push('INBOX');
+        let currentFolder = inboxFolders[0];
+        try {
+            // Gmail's "All Mail"/"Important"/"Starred" are label views that match
+            // virtually every message, so excluding them keeps the resolved folder
+            // a real storage location.
+            const isVirtual = f => /all mail|important|starred/i.test(f);
+            const seen = new Set(inboxFolders.map(f => f.toLowerCase()));
+            const ordered = [
+                ...inboxFolders,
+                ...folders.filter(f => !seen.has(f.toLowerCase()) && !isVirtual(f)),
+            ];
+            const actual = await TauriService.findMessageFolder(emailConfig, messageId, ordered);
+            if (actual) currentFolder = actual;
+        } catch (error) {
+            console.warn('[JS] Could not resolve current folder for move picker:', error);
+        }
+
+        const target = await notificationService.showFolderPicker(folders, 'Move to folder', currentFolder);
+        if (!target) return false;
+
+        const loading = notificationService.showLoading('Moving email...');
+        try {
+            await TauriService.moveInboxEmail(messageId, target, userEmail);
+            notificationService.hideLoading(loading);
+            notificationService.showSuccess(`Email moved to "${target}".`);
+            return true;
+        } catch (error) {
+            notificationService.hideLoading(loading);
+            console.error('[JS] Error moving email:', error);
+            notificationService.showError('Failed to move email: ' + error);
+            return false;
+        }
+    }
+
     async deleteDraft(messageId) {
         try {
             await TauriService.deleteDraft(messageId);
@@ -5873,8 +5970,16 @@ ${attachmentsHtml}
             const folders = await TauriService.listImapFolders(emailConfig);
 
             if (window.FolderMultiselect) {
+                // Spam/junk/bulk folders are never inbox folders — the backend
+                // recovers misfiled nostr mail via spam rescue instead. Keep
+                // them out of the option list entirely so they can't be picked
+                // (and aren't shown as selected from a stale persisted value).
+                const isSpammy = (name) => {
+                    const lower = name.toLowerCase();
+                    return lower.includes('spam') || lower.includes('junk') || lower.includes('bulk');
+                };
                 const filteredFolders = (folders || []).filter(folder =>
-                    folder.toLowerCase() !== 'sent'
+                    folder.toLowerCase() !== 'sent' && !isSpammy(folder)
                 );
                 // Only keep prior selections that still exist on the server.
                 const filteredSet = new Set(filteredFolders);
@@ -5883,8 +5988,7 @@ ${attachmentsHtml}
                 // No usable saved selection? Pre-select the provider-aware
                 // defaults so users SEE what will be synced as pills (rather
                 // than as ghosted placeholder text). Mirrors the backend's
-                // default logic: static defaults + any folder whose name
-                // contains spam/junk/bulk. setOptions calls setValue with
+                // `default_inbox_folders`. setOptions calls setValue with
                 // silent=true so this doesn't trigger autosave — the user's
                 // persisted "" stays "" until they actively change something.
                 if (restoreSelection.length === 0) {
@@ -5899,16 +6003,16 @@ ${attachmentsHtml}
                     for (const name of (staticDefaults || [])) {
                         if (filteredSet.has(name)) effective.add(name);
                     }
-                    for (const name of filteredFolders) {
-                        const lower = name.toLowerCase();
-                        if (lower.includes('spam') || lower.includes('junk') || lower.includes('bulk')) {
-                            effective.add(name);
-                        }
-                    }
                     restoreSelection = Array.from(effective);
                 }
 
                 window.FolderMultiselect.setOptions(filteredFolders, restoreSelection);
+            }
+
+            // The spam-rescue target dropdown derives its options from the inbox
+            // folder selection, so refresh it once the live folder list lands.
+            if (window.app && typeof window.app.populateSpamRescueTargetOptions === 'function') {
+                window.app.populateSpamRescueTargetOptions();
             }
 
             console.log(`[EMAIL-SERVICE] Loaded ${folders?.length || 0} folders`);

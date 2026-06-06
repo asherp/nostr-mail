@@ -105,6 +105,8 @@ class DOMManager {
             emailFilterPreference: this.getElement('email-filter-preference'),
             'send-matching-dm-preference': this.getElement('send-matching-dm-preference'),
             'require-signature-preference': this.getElement('require-signature-preference'),
+            'spam-rescue-preference': this.getElement('spam-rescue-preference'),
+            'spam-rescue-target-preference': this.getElement('spam-rescue-target-preference'),
             'hide-undecryptable-emails-preference': this.getElement('hide-undecryptable-emails-preference'),
             'automatically-encrypt-preference': this.getElement('automatically-encrypt-preference'),
             'automatically-sign-preference': this.getElement('automatically-sign-preference'),

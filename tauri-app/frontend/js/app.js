@@ -273,6 +273,8 @@ NostrMailApp.prototype.loadSettings = async function() {
                         emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                         inbox_folder: dbSettings.inbox_folder || '',
                         require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
+                        spam_rescue: dbSettings.spam_rescue !== 'false', // Default to true (on by default)
+                        spam_rescue_target: dbSettings.spam_rescue_target || 'nostr-mail',
                         hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                         automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                         automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
@@ -330,6 +332,8 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
         emails_per_page: 50,
         inbox_folder: '',
         require_signature: true,
+        spam_rescue: true,
+        spam_rescue_target: 'nostr-mail',
         glossia_encoding_body: 'latin',
         glossia_encoding_signature: 'latin',
         glossia_encoding_pubkey: 'latin'
@@ -379,6 +383,8 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         emails_per_page: 50,
         inbox_folder: '',
         require_signature: true,
+        spam_rescue: true,
+        spam_rescue_target: 'nostr-mail',
         hide_undecryptable_emails: true,
         automatically_encrypt: true,
         automatically_sign: true,
@@ -441,6 +447,8 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                 inbox_folder: dbSettings.inbox_folder || '',
                 require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
+                spam_rescue: dbSettings.spam_rescue !== 'false', // Default to true (on by default)
+                spam_rescue_target: dbSettings.spam_rescue_target || 'nostr-mail',
                 hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                 automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                 automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
@@ -1520,6 +1528,9 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 const settings = appState.getSettings() || {};
                 settings.inbox_folder = joined;
                 appState.setSettings(settings);
+                // Keep the spam-rescue target dropdown in sync with the inbox
+                // folder selection (its options are derived from it, minus spam).
+                this.populateSpamRescueTargetOptions(settings);
                 if (window.emailService) {
                     window.emailService.inboxOffset = 0;
                     await window.emailService.loadEmails();
@@ -3067,6 +3078,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 emails_per_page: (loadedSettings && loadedSettings.emails_per_page) ? loadedSettings.emails_per_page : (parseInt(domManager.getValue('emailsPerPage')) || 50),
                 inbox_folder: (loadedSettings && loadedSettings.inbox_folder !== undefined) ? loadedSettings.inbox_folder : readInboxFolderSelection(),
                 require_signature: (loadedSettings && loadedSettings.require_signature !== undefined) ? loadedSettings.require_signature : (domManager.get('require-signature-preference')?.checked !== false),
+                spam_rescue: (loadedSettings && loadedSettings.spam_rescue !== undefined) ? loadedSettings.spam_rescue : (domManager.get('spam-rescue-preference')?.checked !== false),
+                spam_rescue_target: (loadedSettings && loadedSettings.spam_rescue_target !== undefined) ? loadedSettings.spam_rescue_target : ((domManager.get('spam-rescue-target-preference')?.value || '').trim() || 'nostr-mail'),
                 hide_undecryptable_emails: (loadedSettings && loadedSettings.hide_undecryptable_emails !== undefined) ? loadedSettings.hide_undecryptable_emails : (domManager.get('hide-undecryptable-emails-preference')?.checked !== false),
                 automatically_encrypt: (loadedSettings && loadedSettings.automatically_encrypt !== undefined) ? loadedSettings.automatically_encrypt : (domManager.get('automatically-encrypt-preference')?.checked !== false),
                 automatically_sign: (loadedSettings && loadedSettings.automatically_sign !== undefined) ? loadedSettings.automatically_sign : (domManager.get('automatically-sign-preference')?.checked !== false),
@@ -3106,6 +3119,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 emails_per_page: parseInt(domManager.getValue('emailsPerPage')) || 50, // Default to 50
                 inbox_folder: readInboxFolderSelection(),
                 require_signature: domManager.get('require-signature-preference')?.checked !== false, // Default to true
+                spam_rescue: domManager.get('spam-rescue-preference')?.checked !== false, // Default to true (on by default)
+                spam_rescue_target: (domManager.get('spam-rescue-target-preference')?.value || '').trim() || 'nostr-mail',
                 hide_undecryptable_emails: domManager.get('hide-undecryptable-emails-preference')?.checked !== false, // Default to true
                 automatically_encrypt: autoEncryptEnabled,
                 automatically_sign: autoSignPref?.checked !== false, // Default to true (will be true if auto-encrypt is enabled)
@@ -3151,6 +3166,8 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('emails_per_page', settings.emails_per_page.toString());
             settingsMap.set('inbox_folder', settings.inbox_folder || '');
             settingsMap.set('require_signature', settings.require_signature.toString());
+            settingsMap.set('spam_rescue', (settings.spam_rescue !== false).toString());
+            settingsMap.set('spam_rescue_target', settings.spam_rescue_target || 'nostr-mail');
             settingsMap.set('hide_undecryptable_emails', (settings.hide_undecryptable_emails || false).toString());
             settingsMap.set('automatically_encrypt', (settings.automatically_encrypt !== undefined ? settings.automatically_encrypt : true).toString());
             settingsMap.set('automatically_sign', (settings.automatically_sign !== undefined ? settings.automatically_sign : true).toString());
@@ -3248,6 +3265,8 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'emailFilterPreference',
         'send-matching-dm-preference',
         'require-signature-preference',
+        'spam-rescue-preference',
+        'spam-rescue-target-preference',
         'hide-undecryptable-emails-preference',
         'automatically-encrypt-preference',
         'automatically-sign-preference',
@@ -3276,6 +3295,40 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         }
     });
     
+    // Special handling: enabling Spam Rescue triggers a one-time catch-up that
+    // sweeps ALL nostr mail (read + unread) out of spam. The normal per-sync
+    // rescue only moves UNSEEN mail, so messages the user already read while
+    // they sat in spam would otherwise be stranded; this run clears them once,
+    // then reports how many were moved. Programmatic `.checked =` during form
+    // population doesn't fire 'change', so a checked=true event here is always
+    // a genuine user-initiated off→on transition.
+    const spamRescuePref = domManager.get('spam-rescue-preference');
+    if (spamRescuePref) {
+        spamRescuePref.addEventListener('change', async (e) => {
+            if (isPopulatingForm || !e.target.checked) return;
+            try {
+                // Persist spam_rescue=true first so the catch-up's post-move
+                // sync scans with rescue enabled (target folder in the set).
+                await this.saveSettings(false);
+                const moved = await TauriService.rescueSpamNow();
+                if (moved > 0) {
+                    notificationService.showSuccess(
+                        `Spam rescue: moved ${moved} message${moved === 1 ? '' : 's'} out of spam.`
+                    );
+                    if (window.emailService && typeof window.emailService.loadEmails === 'function') {
+                        window.emailService.loadEmails().catch(err =>
+                            console.warn('[APP] reload after spam rescue failed:', err));
+                    }
+                } else {
+                    notificationService.showInfo('Spam rescue: no messages needed rescuing.');
+                }
+            } catch (err) {
+                console.error('[APP] rescue_spam_now failed:', err);
+                notificationService.showError('Spam rescue failed: ' + err);
+            }
+        });
+    }
+
     // Special handling: When auto-encrypt is enabled, also enable auto-sign
     const autoEncryptPref = domManager.get('automatically-encrypt-preference');
     const autoSignPref = domManager.get('automatically-sign-preference');
@@ -3406,6 +3459,47 @@ NostrMailApp.prototype.setupEmailValidation = function() {
     }
 }
 
+// Populate the "Rescue into folder" <select> from the folders the user selected
+// for their inbox, excluding spam/junk/bulk folders (we never rescue into spam).
+// The currently-saved target is preserved as an option even if it isn't part of
+// the current inbox selection, so changing inbox folders can't silently drop it.
+NostrMailApp.prototype.populateSpamRescueTargetOptions = function(settings) {
+    const select = domManager.get('spam-rescue-target-preference');
+    if (!select) return;
+
+    settings = settings || appState.getSettings() || {};
+
+    // Prefer the live multiselect DOM selection; fall back to the persisted list.
+    let inboxFolders = (window.FolderMultiselect && window.FolderMultiselect.getSelection)
+        ? window.FolderMultiselect.getSelection()
+        : [];
+    if (!inboxFolders || inboxFolders.length === 0) {
+        inboxFolders = (settings.inbox_folder || '').split('\n').map(f => f.trim()).filter(Boolean);
+    }
+
+    const isSpammy = (name) => {
+        const lower = name.toLowerCase();
+        return lower.includes('spam') || lower.includes('junk') || lower.includes('bulk');
+    };
+
+    const options = inboxFolders.filter(f => f && !isSpammy(f));
+
+    const saved = (settings.spam_rescue_target || 'nostr-mail').trim() || 'nostr-mail';
+    // Keep the saved target selectable even if it's not in the inbox selection.
+    if (saved && !options.includes(saved)) {
+        options.unshift(saved);
+    }
+
+    select.innerHTML = '';
+    for (const folder of options) {
+        const opt = document.createElement('option');
+        opt.value = folder;
+        opt.textContent = folder;
+        select.appendChild(opt);
+    }
+    select.value = saved;
+};
+
 NostrMailApp.prototype.populateSettingsForm = async function() {
     console.log('[QR] populateSettingsForm called');
     const settings = appState.getSettings();
@@ -3463,13 +3557,12 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
                 window.FolderMultiselect.setSelectionOnly(persistedList);
                 // Reflect the backend's provider-aware defaults in the
                 // placeholder so the user can see what "no selection" will
-                // sync. The backend also auto-adds any *spam*-named folder at
-                // sync time; signal that with an ellipsis + a note in the
-                // help text.
+                // sync. Spam/junk/bulk folders are intentionally excluded —
+                // misfiled nostr mail is recovered by spam rescue instead.
                 TauriService.getDefaultInboxFolders(settings.imap_host).then(defaults => {
                     if (defaults && defaults.length > 0) {
                         window.FolderMultiselect.setPlaceholder(
-                            `Default (${defaults.join(', ')}, + spam/junk/bulk folders)`
+                            `Default (${defaults.join(', ')})`
                         );
                     }
                 }).catch(() => { /* placeholder stays at the initial value */ });
@@ -3492,7 +3585,14 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         if (requireSignaturePref) {
             requireSignaturePref.checked = settings.require_signature !== false;
         }
-        
+
+        // Set spam rescue preference (default to false — opt-in) and target folder
+        const spamRescuePref = domManager.get('spam-rescue-preference');
+        if (spamRescuePref) {
+            spamRescuePref.checked = settings.spam_rescue !== false;
+        }
+        this.populateSpamRescueTargetOptions(settings);
+
         // Set hide undecryptable emails preference (default to true if not set)
         const hideUndecryptablePref = domManager.get('hide-undecryptable-emails-preference');
         if (hideUndecryptablePref) {

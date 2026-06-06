@@ -5350,6 +5350,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+${source === 'inbox' ? '<button class="thread-menu-item thread-move-action">Move to folder</button>' : ''}
 <button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
@@ -5449,6 +5450,21 @@ ${attachmentsHtml}
                                     this.showSentList();
                                     await this.loadSentEmails();
                                 }
+                            }
+                        });
+                    }
+                    const moveCardBtn = cardDiv.querySelector('.thread-move-action');
+                    if (moveCardBtn) {
+                        moveCardBtn.addEventListener('click', async () => {
+                            moreDropdown.classList.remove('open');
+                            const messageId = email.message_id || email.id;
+                            const ok = await this._moveEmailFromDetail(messageId);
+                            if (!ok) return;
+                            cardDiv.remove();
+                            const remaining = threadContent.querySelectorAll('.email-detail-card').length;
+                            if (remaining === 0) {
+                                this.showEmailList();
+                                await this.loadEmails();
                             }
                         });
                     }

@@ -73,6 +73,27 @@ fn resolve_private_key(explicit: Option<String>, state: &AppState) -> Result<Str
     state.get_active_private_key()
 }
 
+/// Decrypt the IMAP/SMTP password stored in settings.
+///
+/// The password is encrypted-at-rest with the active account's private key (see
+/// `db_save_settings_batch`); the raw `db.get_all_settings()` returns ciphertext.
+/// Frontend-supplied `EmailConfig`s already carry the decrypted password (the UI
+/// gets it via `db_get_all_settings`, which decrypts), but any backend path that
+/// builds an `EmailConfig` directly from the DB must decrypt it here first — else
+/// IMAP login is attempted with ciphertext and fails with "Invalid credentials".
+/// Falls back to the stored value when no key is available or decryption fails,
+/// matching `db_get_all_settings`' backward-compatibility with plaintext records.
+fn decrypt_setting_password(encrypted: &str, state: &AppState) -> String {
+    if encrypted.is_empty() {
+        return String::new();
+    }
+    match state.get_active_private_key() {
+        Ok(priv_key) => crypto::decrypt_setting_value(&priv_key, encrypted)
+            .unwrap_or_else(|_| encrypted.to_string()),
+        Err(_) => encrypted.to_string(),
+    }
+}
+
 /// The active user's pubkey in bech32 (npub) form, if any. Used as the
 /// direction anchor for DM↔email pubkey backfill.
 fn active_user_npub(state: &AppState) -> Option<String> {
@@ -6353,7 +6374,7 @@ async fn db_delete_sent_email(message_id: String, delete_from_server: Option<boo
                 if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
                     let email_config = crate::types::EmailConfig {
                         email_address: email_addr,
-                        password: pwd,
+                        password: decrypt_setting_password(&pwd, &state),
                         smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
                         smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
                         imap_host: host,
@@ -6404,7 +6425,7 @@ async fn db_delete_inbox_email(message_id: String, delete_from_server: Option<bo
                 if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
                     let email_config = crate::types::EmailConfig {
                         email_address: email_addr,
-                        password: pwd,
+                        password: decrypt_setting_password(&pwd, &state),
                         smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
                         smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
                         imap_host: host,
@@ -6460,7 +6481,7 @@ async fn move_inbox_email(message_id: String, target_folder: String, _user_email
     if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
         let email_config = crate::types::EmailConfig {
             email_address: email_addr,
-            password: pwd,
+            password: decrypt_setting_password(&pwd, &state),
             smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
             smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
             imap_host: host,
@@ -6508,7 +6529,7 @@ async fn rescue_spam_now(state: tauri::State<'_, AppState>) -> Result<usize, Str
     if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
         let email_config = crate::types::EmailConfig {
             email_address: email_addr,
-            password: pwd,
+            password: decrypt_setting_password(&pwd, &state),
             smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
             smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
             imap_host: host,
@@ -6577,7 +6598,7 @@ async fn db_mark_as_read(message_id: String, state: tauri::State<'_, AppState>) 
     if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
         let email_config = crate::types::EmailConfig {
             email_address: email_addr,
-            password: pwd,
+            password: decrypt_setting_password(&pwd, &state),
             smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
             smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
             imap_host: host,

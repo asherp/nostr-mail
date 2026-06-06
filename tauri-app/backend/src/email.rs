@@ -1087,6 +1087,17 @@ fn move_message_to_folder(
 
     debug_log!("[RUST] move_message_to_folder: Moving message {} to {}", message_seq, target_folder);
 
+    // When the user deliberately files a message INTO a spam folder, mark it
+    // \Seen first. Spam rescue only pulls UNSEEN mail out of spam, so a read
+    // message sitting in spam is the user's "leave it here" signal — and because
+    // it's a server flag it's the same answer on every device. Our sync uses
+    // BODY.PEEK[] everywhere, so nothing automated ever sets \Seen; this is the
+    // only path that does, and that flag must not be auto-cleared on spam mail.
+    // IMAP COPY/MOVE preserve flags, so setting it before the move is enough.
+    if is_spam_folder_name(target_folder) {
+        let _ = session.store(&seq_str, "+FLAGS (\\Seen)");
+    }
+
     // Try MOVE first.
     if session.mv(&seq_str, target_folder).is_ok() {
         debug_log!("[RUST] move_message_to_folder: Successfully moved via MOVE command");
@@ -5143,6 +5154,7 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     let require_signature = lookup_require_signature(db, active_pubkey);
     let spam_rescue = lookup_spam_rescue(db, active_pubkey);
     let rescue_target = lookup_spam_rescue_target(db, active_pubkey);
+    debug_log!("[RUST] sync: spam_rescue={}, rescue_target='{}'", spam_rescue, rescue_target);
 
     // Folders to scan. Default (empty/None) = provider-aware list from
     // `default_inbox_folders`, with any *spam*-named server folder appended
@@ -5203,7 +5215,7 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
             extend_with_spam_folders(&mut session, &mut folders);
         }
         if spam_rescue {
-            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, db, active_pubkey);
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target);
             if moved > 0 {
                 println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
             }
@@ -5241,7 +5253,7 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
             extend_with_spam_folders(&mut session, &mut folders);
         }
         if spam_rescue {
-            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, db, active_pubkey);
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target);
             if moved > 0 {
                 println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
             }
@@ -6019,7 +6031,10 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
     let mut max_uid: u32 = 0;
     for chunk in uids.chunks(FETCH_BATCH) {
         let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        let messages = session.uid_fetch(&uid_list, "(UID RFC822)")?;
+        // BODY.PEEK[] (not RFC822) so background sync never sets \Seen — read
+        // state is tracked in our own DB, not the server flag. Response key is
+        // still BODY[], so msg.body() works unchanged.
+        let messages = session.uid_fetch(&uid_list, "(UID BODY.PEEK[])")?;
         for msg in messages.iter() {
             if let Some(uid) = msg.uid {
                 if uid > max_uid {
@@ -6159,7 +6174,8 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
         let batch = &uids[start..end];
 
         let uid_list = batch.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        let msgs = session.uid_fetch(&uid_list, "(UID RFC822)")?;
+        // BODY.PEEK[] so paging older mail doesn't mark it \Seen on the server.
+        let msgs = session.uid_fetch(&uid_list, "(UID BODY.PEEK[])")?;
         for msg in msgs.iter() {
             if let Some(uid) = msg.uid {
                 if uid < lowest_scanned { lowest_scanned = uid; }
@@ -6296,7 +6312,8 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     let mut emails: Vec<RawNostrEmail> = Vec::new();
     for chunk in missing.chunks(FETCH_BATCH) {
         let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        let msgs = session.uid_fetch(&uid_list, "(UID RFC822)")?;
+        // BODY.PEEK[] so gap-fill backfill doesn't mark messages \Seen.
+        let msgs = session.uid_fetch(&uid_list, "(UID BODY.PEEK[])")?;
         for msg in msgs.iter() {
             if let Some(body) = msg.body() {
                 if let Some(parsed) = parse_fn(body, config) {
@@ -6330,12 +6347,13 @@ pub(crate) fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
     true
 }
 
-/// Read `spam_rescue` for the active pubkey, defaulting to false (opt-in).
+/// Read `spam_rescue` for the active pubkey, defaulting to true (on by default).
+/// Only an explicit "false" disables it; absent/blank settings stay on.
 pub(crate) fn lookup_spam_rescue(db: &Database, pubkey: &str) -> bool {
     if let Ok(Some(value)) = db.get_setting(pubkey, "spam_rescue") {
-        return value == "true";
+        return value != "false";
     }
-    false
+    true
 }
 
 /// Read the folder spam-rescued nostr mail should be moved into, defaulting to
@@ -6361,6 +6379,12 @@ pub(crate) fn lookup_spam_rescue_target(db: &Database, pubkey: &str) -> String {
 /// folder set.
 /// Return every server mailbox whose name contains "spam", "junk", or "bulk"
 /// (case-insensitive). Failures during LIST are non-fatal — returns empty.
+/// True if a mailbox name looks like a provider spam/junk/bulk folder.
+fn is_spam_folder_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("spam") || lower.contains("junk") || lower.contains("bulk")
+}
+
 fn list_spam_folders(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
 ) -> Vec<String> {
@@ -6374,10 +6398,7 @@ fn list_spam_folders(
     mailboxes
         .iter()
         .map(|mb| mb.name().to_string())
-        .filter(|name| {
-            let lower = name.to_lowercase();
-            lower.contains("spam") || lower.contains("junk") || lower.contains("bulk")
-        })
+        .filter(|name| is_spam_folder_name(name))
         .collect()
 }
 
@@ -6403,11 +6424,20 @@ fn should_rescue_message(raw_body: &[u8]) -> bool {
         || text.contains("BEGIN NOSTR SIGNATURE")
         || text.contains("BEGIN NOSTR SEAL");
     if !has_nostr_marker {
+        debug_log!("[RUST] rescue: should_rescue_message=false (no nostr marker)");
         return false;
     }
     match verify_transport_authentication(Some(raw_body), None) {
-        Ok(verdict) => verdict.transport_verified,
-        Err(_) => false,
+        Ok(verdict) => {
+            if !verdict.transport_verified {
+                debug_log!("[RUST] rescue: should_rescue_message=false (has marker, transport auth NOT verified)");
+            }
+            verdict.transport_verified
+        }
+        Err(e) => {
+            debug_log!("[RUST] rescue: should_rescue_message=false (transport auth check errored: {})", e);
+            false
+        }
     }
 }
 
@@ -6439,13 +6469,18 @@ fn move_uids_to_folder(
 /// `target_folder`, so providers' misclassified encrypted mail stays reachable.
 /// Returns the number of messages moved. Per-folder failures are logged and
 /// skipped — rescue is best-effort and never aborts the surrounding sync.
+///
+/// Rescue is stateless: a message is moved out whenever it's UNSEEN in spam and
+/// looks like authenticated nostr mail. There is no rescue-once ledger — to keep
+/// a message in spam, the user (via the app's move-to-spam) marks it \Seen, which
+/// the server replicates to every device. The UNSEEN guard alone therefore
+/// encodes intent, identically on all clients.
 fn rescue_nostr_emails_from_spam(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     target_folder: &str,
-    db: &Database,
-    active_pubkey: &str,
 ) -> usize {
     let spam_folders = list_spam_folders(session);
+    debug_log!("[RUST] rescue: spam folders found = {:?}, target = '{}'", spam_folders, target_folder);
     if spam_folders.is_empty() {
         return 0;
     }
@@ -6480,18 +6515,22 @@ fn rescue_nostr_emails_from_spam(
                 candidates.extend(found);
             }
         }
+        debug_log!("[RUST] rescue: folder '{}' UNSEEN nostr candidate UIDs = {}", folder, candidates.len());
         if candidates.is_empty() {
             continue;
         }
 
-        // (uid, message_id) pairs that pass all checks and haven't been rescued
-        // before. Skipping already-rescued message-ids means that if the user
-        // later moves a rescued message back into spam, we respect that choice.
-        let mut to_move: Vec<(u32, String)> = Vec::new();
+        // UIDs that pass the eligibility gate. No ledger: a deliberate
+        // move-to-spam is respected because the app marks such mail \Seen, so it
+        // never appears in the UNSEEN candidate set above.
+        let mut to_move: Vec<u32> = Vec::new();
         let uids: Vec<u32> = candidates.into_iter().collect();
         for chunk in uids.chunks(500) {
             let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-            let messages = match session.uid_fetch(&uid_list, "(UID RFC822)") {
+            // BODY.PEEK[] (not RFC822) so confirming a candidate doesn't set the
+            // \Seen flag — rescued messages must stay unread on the server. The
+            // response key is still BODY[], so msg.body() works unchanged.
+            let messages = match session.uid_fetch(&uid_list, "(UID BODY.PEEK[])") {
                 Ok(m) => m,
                 Err(e) => {
                     debug_log!("[RUST] rescue_nostr_emails_from_spam: fetch in '{}' failed: {}", folder, e);
@@ -6500,17 +6539,11 @@ fn rescue_nostr_emails_from_spam(
             };
             for msg in messages.iter() {
                 if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
-                    if !should_rescue_message(body) {
-                        continue;
+                    if should_rescue_message(body) {
+                        to_move.push(uid);
+                    } else {
+                        debug_log!("[RUST] rescue: uid {} in '{}' not eligible (missing nostr marker or transport auth failed)", uid, folder);
                     }
-                    let message_id = match extract_message_id_from_raw(body) {
-                        Some(id) => id,
-                        None => continue,
-                    };
-                    if db.is_message_id_rescued(active_pubkey, &message_id).unwrap_or(false) {
-                        continue;
-                    }
-                    to_move.push((uid, message_id));
                 }
             }
         }
@@ -6518,34 +6551,17 @@ fn rescue_nostr_emails_from_spam(
         if to_move.is_empty() {
             continue;
         }
-        let uid_set = to_move.iter().map(|(u, _)| u.to_string()).collect::<Vec<_>>().join(",");
+        let uid_set = to_move.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
         match move_uids_to_folder(session, &uid_set, target_folder) {
             Ok(_) => {
                 debug_log!("[RUST] rescue_nostr_emails_from_spam: moved {} message(s) from '{}' to '{}'",
                     to_move.len(), folder, target_folder);
-                for (_, message_id) in &to_move {
-                    if let Err(e) = db.add_rescued_message_id(active_pubkey, message_id) {
-                        debug_log!("[RUST] rescue_nostr_emails_from_spam: failed to record rescued id {}: {}", message_id, e);
-                    }
-                }
                 moved_total += to_move.len();
             }
             Err(e) => debug_log!("[RUST] rescue_nostr_emails_from_spam: move from '{}' failed: {}", folder, e),
         }
     }
     moved_total
-}
-
-/// Extract and return the `Message-ID` of a raw RFC822 message, if present.
-fn extract_message_id_from_raw(raw_body: &[u8]) -> Option<String> {
-    let email = parse_mail(raw_body).ok()?;
-    let raw_headers = email
-        .headers
-        .iter()
-        .map(|h| format!("{}: {}", h.get_key(), h.get_value()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    extract_message_id_from_headers(&raw_headers)
 }
 
 fn extend_with_spam_folders(

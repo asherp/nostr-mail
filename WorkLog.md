@@ -1,3 +1,5 @@
+* inbox doesn't show emails when no email is set up, but sent mail does - should we display any emails that matched from the db? messages does.
+* preview is inverted from conversation view - can't decrypt when convo does and vice versa. sent seems to be displaying emails from the wrong user
 * adding mock data relays
 
 Workflow for android

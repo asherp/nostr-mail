@@ -517,10 +517,6 @@ impl Database {
         // pagination ("fetch older from server").
         Self::migrate_add_min_seen_uid_column(&conn)?;
 
-        // Migrate: Add rescued_message_ids table so spam rescue moves each
-        // message at most once (respects a user's deliberate move-to-spam).
-        Self::migrate_add_rescued_message_ids_table(&conn)?;
-
         // Migrate: One-shot cleanup of duplicate DM rows that slipped past the
         // old outer-wrap-id dedup. Safe to run on every startup (idempotent).
         Self::migrate_collapse_dm_rumor_duplicates(&conn)?;
@@ -1032,67 +1028,6 @@ impl Database {
                 [],
             )?;
         }
-        Ok(())
-    }
-
-    /// Migration: Add rescued_message_ids table.
-    /// Records which messages spam rescue has already moved out of Spam, keyed
-    /// by (pubkey, normalized message_id), so a message is rescued at most once
-    /// and a later deliberate move-to-spam by the user is respected.
-    fn migrate_add_rescued_message_ids_table(conn: &Connection) -> Result<()> {
-        let table_exists = {
-            let mut stmt = conn.prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='rescued_message_ids'"
-            )?;
-            let mut rows = stmt.query([])?;
-            rows.next()?.is_some()
-        };
-
-        if !table_exists {
-            println!("[DB] Creating rescued_message_ids table");
-            conn.execute(
-                "CREATE TABLE rescued_message_ids (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pubkey TEXT NOT NULL,
-                    message_id TEXT NOT NULL,
-                    rescued_at DATETIME NOT NULL,
-                    UNIQUE(pubkey, message_id)
-                )",
-                [],
-            )?;
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_rescued_message_ids_pubkey ON rescued_message_ids(pubkey)",
-                [],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// True if spam rescue has already moved this message for this account.
-    pub fn is_message_id_rescued(&self, pubkey: &str, message_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT 1 FROM rescued_message_ids WHERE pubkey = ? AND message_id = ? LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![
-            pubkey.trim().to_lowercase(),
-            Self::normalize_message_id(message_id),
-        ])?;
-        Ok(rows.next()?.is_some())
-    }
-
-    /// Record that spam rescue moved this message (idempotent).
-    pub fn add_rescued_message_id(&self, pubkey: &str, message_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR IGNORE INTO rescued_message_ids (pubkey, message_id, rescued_at)
-             VALUES (?, ?, ?)",
-            params![
-                pubkey.trim().to_lowercase(),
-                Self::normalize_message_id(message_id),
-                Utc::now(),
-            ],
-        )?;
         Ok(())
     }
 

@@ -292,6 +292,9 @@ const TauriService = {
     listImapFolders: async function(emailConfig) {
         return await this.invoke('list_imap_folders', { emailConfig });
     },
+    findMessageFolder: async function(emailConfig, messageId, candidateFolders) {
+        return await this.invoke('find_message_folder', { emailConfig, messageId, candidateFolders });
+    },
     fetchImage: async function(url) {
         return await this.invoke('fetch_image', { url });
     },

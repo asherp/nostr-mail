@@ -2655,6 +2655,20 @@ async fn list_imap_folders(email_config: EmailConfig) -> Result<Vec<String>, Str
         })
 }
 
+/// Find the IMAP folder a message currently lives in, searching `candidate_folders`
+/// in order and returning the first match (or None). Used by the move picker so the
+/// "(current)" label reflects the server, not a local guess.
+#[tauri::command]
+async fn find_message_folder(
+    email_config: EmailConfig,
+    message_id: String,
+    candidate_folders: Vec<String>,
+) -> Result<Option<String>, String> {
+    email::find_message_folder(&email_config, &message_id, candidate_folders)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn test_smtp_connection(email_config: EmailConfig) -> Result<(), String> {
     email::test_smtp_connection(&email_config)
@@ -7104,6 +7118,7 @@ pub fn run() {
         test_imap_connection,
         test_smtp_connection,
         list_imap_folders,
+        find_message_folder,
         check_message_confirmation,
         get_default_private_key_from_config,
         generate_qr_code,

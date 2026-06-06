@@ -5708,25 +5708,53 @@ ${attachmentsHtml}
         const settings = appState.getSettings() || {};
         const userEmail = settings.email_address || null;
 
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host || '',
+            smtp_port: settings.smtp_port || 587,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port || 993,
+            use_tls: settings.use_tls !== false,
+        };
+
         // Fetch the current server folder list to populate the picker. Failure is
         // non-fatal — the user can still type a new folder name.
         let folders = [];
         try {
-            const emailConfig = {
-                email_address: settings.email_address,
-                password: settings.password,
-                smtp_host: settings.smtp_host || '',
-                smtp_port: settings.smtp_port || 587,
-                imap_host: settings.imap_host,
-                imap_port: settings.imap_port || 993,
-                use_tls: settings.use_tls !== false,
-            };
             folders = (await TauriService.listImapFolders(emailConfig)) || [];
         } catch (error) {
             console.warn('[JS] Could not list folders for move picker:', error);
         }
 
-        const target = await notificationService.showFolderPicker(folders, 'Move to folder');
+        // Resolve the message's ACTUAL current folder from the server so the
+        // picker's "(current)" label is correct even after a prior move (inbox
+        // emails carry no per-email folder). Check inbox folders first (cheap,
+        // common case), then the rest; fall back to the inbox heuristic if the
+        // server can't be reached or the message isn't found.
+        const inboxFolders = (settings.inbox_folder || '')
+            .split('\n')
+            .map(s => s.trim())
+            .filter(Boolean);
+        if (inboxFolders.length === 0) inboxFolders.push('INBOX');
+        let currentFolder = inboxFolders[0];
+        try {
+            // Gmail's "All Mail"/"Important"/"Starred" are label views that match
+            // virtually every message, so excluding them keeps the resolved folder
+            // a real storage location.
+            const isVirtual = f => /all mail|important|starred/i.test(f);
+            const seen = new Set(inboxFolders.map(f => f.toLowerCase()));
+            const ordered = [
+                ...inboxFolders,
+                ...folders.filter(f => !seen.has(f.toLowerCase()) && !isVirtual(f)),
+            ];
+            const actual = await TauriService.findMessageFolder(emailConfig, messageId, ordered);
+            if (actual) currentFolder = actual;
+        } catch (error) {
+            console.warn('[JS] Could not resolve current folder for move picker:', error);
+        }
+
+        const target = await notificationService.showFolderPicker(folders, 'Move to folder', currentFolder);
         if (!target) return false;
 
         const loading = notificationService.showLoading('Moving email...');

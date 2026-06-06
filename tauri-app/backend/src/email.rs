@@ -982,8 +982,10 @@ fn move_to_trash(
 ///
 /// Mirrors `delete_inbox_email_from_server`, but instead of moving the matched
 /// message to trash it moves it into `target_folder`, creating that folder if it
-/// does not already exist. Searches the same source folders the inbox is synced
-/// from (`INBOX`, `nostr-mail`).
+/// does not already exist. The message may live anywhere (it could have been
+/// moved before), so the search spans the user's real folders rather than a fixed
+/// `INBOX`/`nostr-mail` pair; if it's already in `target_folder` the move is a
+/// no-op success.
 pub async fn move_inbox_email_to_folder(
     config: &EmailConfig,
     message_id: &str,
@@ -1006,14 +1008,16 @@ pub async fn move_inbox_email_to_folder(
         let result = if use_tls {
             let client = create_imap_tls_client!(&host, &addr)?;
             let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &["INBOX", "nostr-mail"]);
+            let source_folders = searchable_source_folders(&mut session, &target_folder);
+            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &source_folders);
             let _ = session.logout();
             result
         } else {
             let tcp_stream = TcpStream::connect(&addr)?;
             let client = imap::Client::new(tcp_stream);
             let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &["INBOX", "nostr-mail"]);
+            let source_folders = searchable_source_folders(&mut session, &target_folder);
+            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &source_folders);
             let _ = session.logout();
             result
         };
@@ -1021,19 +1025,51 @@ pub async fn move_inbox_email_to_folder(
     }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
 }
 
-/// Find an email by Message-ID across `source_folders` and move it to `target_folder`.
+/// List the folders worth searching for a message we're about to move, ordered so
+/// the cheap/likely ones come first: the target itself (to detect an already-there
+/// no-op), then INBOX and nostr-mail, then everything else. Gmail's "All Mail" is
+/// excluded — it contains every message (labels, not folders), so it would always
+/// match and make the move ambiguous. Falls back to INBOX/nostr-mail if LIST fails.
+fn searchable_source_folders(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    target_folder: &str,
+) -> Vec<String> {
+    let mut folders: Vec<String> = match session.list(Some(""), Some("*")) {
+        Ok(mailboxes) => mailboxes
+            .iter()
+            .map(|mb| mb.name().to_string())
+            .filter(|n| !n.to_lowercase().contains("all mail"))
+            .collect(),
+        Err(_) => vec!["INBOX".to_string(), "nostr-mail".to_string()],
+    };
+
+    let rank = |f: &str| -> u8 {
+        let fl = f.to_lowercase();
+        if fl == target_folder.to_lowercase() {
+            0
+        } else if fl == "inbox" {
+            1
+        } else if fl == "nostr-mail" {
+            2
+        } else {
+            3
+        }
+    };
+    // Stable sort preserves the server's order within each rank.
+    folders.sort_by_key(|f| rank(f));
+    folders
+}
+
+/// Find an email by Message-ID across `source_folders` and move it to
+/// `target_folder`. Finding it already in `target_folder` is a no-op success.
 fn move_email_to_folder_sync(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     message_id: &str,
     target_folder: &str,
-    source_folders: &[&str],
+    source_folders: &[String],
 ) -> Result<()> {
     let mut folder_selected = false;
     for folder in source_folders {
-        // No-op if the message already lives in the destination folder.
-        if folder.eq_ignore_ascii_case(target_folder) {
-            continue;
-        }
         debug_log!("[RUST] move_email_to_folder_sync: Trying folder: {}", folder);
         if session.select(folder).is_ok() {
             folder_selected = true;
@@ -1063,6 +1099,11 @@ fn move_email_to_folder_sync(
             }
 
             if !matching_messages.is_empty() {
+                // Already in the destination — nothing to move.
+                if folder.eq_ignore_ascii_case(target_folder) {
+                    debug_log!("[RUST] move_email_to_folder_sync: Already in target {}, no-op", target_folder);
+                    return Ok(());
+                }
                 let message_seq = *matching_messages.iter().next().unwrap();
                 return move_message_to_folder(session, message_seq, target_folder);
             }
@@ -1123,6 +1164,76 @@ fn move_message_to_folder(
     }
 
     Err(anyhow::anyhow!("Failed to move email to folder {}", target_folder))
+}
+
+/// Find which of `candidate_folders` currently contains the message identified by
+/// `message_id`, returning the first match in the given order (or None if it
+/// isn't found in any). Inbox emails carry no folder field, so the server is the
+/// only source of truth for the move picker's "(current)" label once a message
+/// has been moved. Callers should order cheap/likely folders first; the search
+/// stops at the first hit.
+pub async fn find_message_folder(
+    config: &EmailConfig,
+    message_id: &str,
+    candidate_folders: Vec<String>,
+) -> Result<Option<String>> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        use std::net::TcpStream;
+        let addr = format!("{}:{}", host, port);
+        if use_tls {
+            let client = create_imap_tls_client!(&host, &addr)?;
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let found = find_message_folder_sync(&mut session, &message_id, &candidate_folders);
+            let _ = session.logout();
+            found
+        } else {
+            let tcp_stream = TcpStream::connect(&addr)?;
+            let client = imap::Client::new(tcp_stream);
+            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
+            let found = find_message_folder_sync(&mut session, &message_id, &candidate_folders);
+            let _ = session.logout();
+            found
+        }
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+fn find_message_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_id: &str,
+    candidate_folders: &[String],
+) -> Result<Option<String>> {
+    let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+    let full_msg_id = if normalized_msg_id.contains('@') {
+        format!("<{}>", normalized_msg_id)
+    } else {
+        format!("<{}@nostr-mail>", normalized_msg_id)
+    };
+    let search_queries = [
+        format!("HEADER Message-ID \"{}\"", full_msg_id),
+        format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+        format!("HEADER Message-ID \"{}\"", message_id.trim()),
+    ];
+
+    for folder in candidate_folders {
+        if session.select(folder).is_err() {
+            continue;
+        }
+        for search_query in &search_queries {
+            if let Ok(results) = session.search(search_query) {
+                if !results.is_empty() {
+                    return Ok(Some(folder.clone()));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve the logged-in user's configured inbox source folders, with spam/junk

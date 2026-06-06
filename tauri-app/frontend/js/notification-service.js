@@ -391,11 +391,20 @@ class NotificationService {
      * Shows a dropdown of existing folders plus a field for creating a new one.
      * Resolves to the chosen folder name, or null if cancelled.
      */
-    async showFolderPicker(folders = [], title = 'Move to folder') {
+    async showFolderPicker(folders = [], title = 'Move to folder', currentFolder = '') {
         return new Promise((resolve) => {
-            const options = (folders || [])
-                .filter(Boolean)
-                .map(f => `<option value="${this.escapeAttr(f)}">${this.escapeAttr(f)}</option>`)
+            const cur = (currentFolder || '').trim();
+            const folderList = (folders || []).filter(Boolean);
+            // Make sure the current folder is present so it can be shown/selected.
+            if (cur && !folderList.some(f => f.toLowerCase() === cur.toLowerCase())) {
+                folderList.unshift(cur);
+            }
+            const options = folderList
+                .map(f => {
+                    const isCurrent = cur && f.toLowerCase() === cur.toLowerCase();
+                    const label = isCurrent ? `${f} (current)` : f;
+                    return `<option value="${this.escapeAttr(f)}"${isCurrent ? ' selected' : ''}>${this.escapeAttr(label)}</option>`;
+                })
                 .join('');
 
             const modal = document.createElement('div');
@@ -405,13 +414,13 @@ class NotificationService {
                     <div class="confirmation-dialog">
                         <h3>${title}</h3>
                         <p>Choose an existing folder or type a new one.</p>
-                        <select id="folder-picker-select" style="width:100%;padding:8px;margin-bottom:10px;">
+                        <select id="folder-picker-select" style="width:100%;margin-bottom:10px;">
                             ${options}
                         </select>
-                        <input type="text" id="folder-picker-new" placeholder="Or new folder name" style="width:100%;padding:8px;box-sizing:border-box;" />
+                        <input type="text" id="folder-picker-new" placeholder="Or new folder name" style="width:100%;box-sizing:border-box;" />
                         <div class="confirmation-actions">
                             <button class="btn btn-secondary" id="folder-cancel">Cancel</button>
-                            <button class="btn btn-primary" id="folder-confirm">Move</button>
+                            <button class="btn btn-primary" id="folder-confirm" disabled>Move</button>
                         </div>
                     </div>
                 </div>
@@ -454,11 +463,26 @@ class NotificationService {
                 if (modal.parentNode) modal.parentNode.removeChild(modal);
             };
 
+            // Keep Move disabled until the user picks a folder that differs from
+            // the current one (typed name takes precedence over the dropdown).
+            const resolvedTarget = () => {
+                const typed = (newInput.value || '').trim();
+                return typed || (select.value || '').trim();
+            };
+            const updateConfirmState = () => {
+                const target = resolvedTarget();
+                const unchanged = !target || target.toLowerCase() === cur.toLowerCase();
+                confirmBtn.disabled = unchanged;
+            };
+            select.addEventListener('change', updateConfirmState);
+            newInput.addEventListener('input', updateConfirmState);
+            updateConfirmState();
+
             cancelBtn.addEventListener('click', () => { cleanup(); resolve(null); });
 
             confirmBtn.addEventListener('click', () => {
-                const typed = (newInput.value || '').trim();
-                const chosen = typed || (select.value || '').trim();
+                if (confirmBtn.disabled) return;
+                const chosen = resolvedTarget();
                 cleanup();
                 resolve(chosen || null);
             });

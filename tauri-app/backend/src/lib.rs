@@ -6488,6 +6488,54 @@ async fn move_inbox_email(message_id: String, target_folder: String, _user_email
     }
 }
 
+/// One-time spam-rescue catch-up, run when the user first enables spam rescue.
+/// Moves ALL authenticated nostr mail out of spam — including already-read
+/// messages that the normal per-sync rescue (UNSEEN-only) would skip — then
+/// syncs so the moved messages appear in the inbox. Returns how many were moved
+/// so the frontend can tell the user.
+#[tauri::command]
+async fn rescue_spam_now(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let active_pubkey = active_user_npub(&state).ok_or_else(|| "No active user".to_string())?;
+    let db = state.get_database()?;
+    let all_settings = db.get_all_settings(&active_pubkey).map_err(|e| e.to_string())?;
+
+    let email_address = all_settings.get("email_address").cloned();
+    let password = all_settings.get("password").cloned();
+    let imap_host = all_settings.get("imap_host").cloned();
+    let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+    let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+    if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+        let email_config = crate::types::EmailConfig {
+            email_address: email_addr,
+            password: pwd,
+            smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+            smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+            imap_host: host,
+            imap_port: port,
+            use_tls,
+            private_key: all_settings.get("nostr_private_key").cloned(),
+        };
+
+        let target = crate::email::lookup_spam_rescue_target(&db, &active_pubkey);
+        let moved = crate::email::rescue_spam_now(&email_config, &target)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Ingest the moved messages so they surface in the inbox immediately.
+        // The rescue target is part of the synced folder set whenever rescue is
+        // on, so a normal sync picks them up. Best-effort: a sync failure here
+        // doesn't undo the (already-completed) move, so just log it.
+        if let Err(e) = crate::email::sync_nostr_emails_to_db(&email_config, None, &active_pubkey, &db).await {
+            println!("[RUST] rescue_spam_now: post-rescue sync failed: {}", e);
+        }
+
+        Ok(moved)
+    } else {
+        Err("Incomplete email configuration".to_string())
+    }
+}
+
 #[tauri::command]
 async fn db_mark_as_read(message_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let db = state.get_database()?;
@@ -7142,6 +7190,7 @@ pub fn run() {
         db_delete_sent_email,
         db_delete_inbox_email,
         move_inbox_email,
+        rescue_spam_now,
         db_mark_as_read,
         db_check_dm_matches_email_encrypted,
         db_check_dms_match_email_encrypted_batch,

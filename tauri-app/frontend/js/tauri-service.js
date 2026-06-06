@@ -666,6 +666,12 @@ const TauriService = {
         return await this.invoke('move_inbox_email', { messageId, targetFolder, userEmail });
     },
 
+    // One-time catch-up rescue when the user first enables spam rescue: moves
+    // ALL nostr mail (read + unread) out of spam and returns how many moved.
+    rescueSpamNow: async function() {
+        return await this.invoke('rescue_spam_now', {});
+    },
+
     markAsRead: async function(messageId) {
         return await this.invoke('db_mark_as_read', { messageId });
     },

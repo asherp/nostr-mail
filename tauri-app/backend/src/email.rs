@@ -5246,9 +5246,11 @@ fn persist_attachments_for_email(db: &Database, email: &RawNostrEmail, email_id:
 /// server are tolerated by `uid_sync_folder` (logged and skipped), so this can
 /// include best-guess names like `Archive` without breaking anything.
 ///
-/// Spam/junk folders are NOT in this static list — they're appended at sync
-/// time by `extend_with_spam_folders` which finds the real folder names on
-/// the server (`[Gmail]/Spam`, `Junk Email`, `Junk`, etc.).
+/// Spam/junk folders are not in this static list. How spam is handled depends
+/// on the spam-rescue setting (decided at sync time): with rescue ON, spam is
+/// never scanned and `rescue_nostr_emails_from_spam` moves misfiled nostr mail
+/// into the rescue target; with rescue OFF, `extend_with_spam_folders` appends
+/// discovered spam folders so that mail still surfaces in the inbox.
 pub fn default_inbox_folders(imap_host: &str) -> Vec<String> {
     let h = imap_host.to_lowercase();
     if h.contains("gmail.com") || h.contains("googlemail.com") {
@@ -5291,12 +5293,10 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     debug_log!("[RUST] sync: spam_rescue={}, rescue_target='{}'", spam_rescue, rescue_target);
 
     // Folders to scan. Default (empty/None) = provider-aware list from
-    // `default_inbox_folders`, with any *spam*-named server folder appended
-    // after login (Nostr-encrypted bodies routinely get mis-classified as
-    // spam). Multiple folders may be supplied to scan in a single pass;
-    // dedupe to avoid re-scanning the same folder twice if a caller passed
-    // duplicates.
-    let (folders, expand_spam): (Vec<String>, bool) = match folders_arg {
+    // `default_inbox_folders`. Multiple folders may be supplied to scan in a
+    // single pass; dedupe to avoid re-scanning the same folder twice if a
+    // caller passed duplicates.
+    let folders: Vec<String> = match folders_arg {
         Some(list) => {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut out: Vec<String> = Vec::new();
@@ -5308,14 +5308,29 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
                 }
             }
             if out.is_empty() {
-                (default_inbox_folders(&config.imap_host), true)
+                default_inbox_folders(&config.imap_host)
             } else {
-                (out, false)
+                out
             }
         }
-        None => (default_inbox_folders(&config.imap_host), true),
+        None => default_inbox_folders(&config.imap_host),
     };
-    let mut folders = folders;
+
+    // Strip any spam/junk/bulk name from the base list (a default never has
+    // one; a stale persisted selection might). Whether spam gets scanned is
+    // decided below, by the spam_rescue flag — not by the saved selection:
+    //   - rescue ON  → spam is NOT scanned. Scanning it would let an in-app
+    //     read mark the message \Seen, which rescue treats as "the user filed
+    //     this here, leave it" — permanently suppressing the rescue. Rescue
+    //     instead moves eligible mail into the rescue target (added below).
+    //   - rescue OFF → discovered spam folders ARE appended to the scan set
+    //     (inside the IMAP session) so nostr mail a provider misfiled still
+    //     surfaces in the inbox. Nothing moves it, so it stays in spam and is
+    //     eventually auto-purged by the provider — which some users prefer.
+    let mut folders: Vec<String> = folders
+        .into_iter()
+        .filter(|f| !is_spam_folder_name(f))
+        .collect();
 
     // With spam rescue on, ensure the rescue target is in the scan set so moved
     // messages land in the local DB during this same pass.
@@ -5345,16 +5360,15 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     if config.use_tls {
         let client = create_imap_tls_client!(host, &addr)?;
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        if expand_spam {
-            extend_with_spam_folders(&mut session, &mut folders);
-        }
         if spam_rescue {
-            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target);
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, /* unseen_only = */ true);
             if moved > 0 {
                 println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
             }
+        } else {
+            extend_with_spam_folders(&mut session, &mut folders);
         }
-        println!("[RUST] sync_nostr_emails_to_db: folders after spam expansion: {:?}", folders);
+        println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
         for f in &folders {
             match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
                                   parse_nostr_email_from_imap_body) {
@@ -5383,16 +5397,15 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         let tcp_stream = TcpStream::connect(&addr)?;
         let client = imap::Client::new(tcp_stream);
         let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        if expand_spam {
-            extend_with_spam_folders(&mut session, &mut folders);
-        }
         if spam_rescue {
-            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target);
+            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, /* unseen_only = */ true);
             if moved > 0 {
                 println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
             }
+        } else {
+            extend_with_spam_folders(&mut session, &mut folders);
         }
-        println!("[RUST] sync_nostr_emails_to_db: folders after spam expansion: {:?}", folders);
+        println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
         for f in &folders {
             match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
                                   parse_nostr_email_from_imap_body) {
@@ -6516,18 +6529,9 @@ pub(crate) fn lookup_spam_rescue_target(db: &Database, pubkey: &str) -> String {
     "nostr-mail".to_string()
 }
 
-/// Discover sent mailbox name using IMAP LIST command
-/// Returns the actual mailbox name found, or None if no sent mailbox exists
-/// Append any server mailbox whose name contains "spam", "junk", or "bulk"
-/// (case-insensitive) to `folders`, skipping names already present. Used to
-/// expand the default sync set so Nostr-encrypted mail that providers
-/// mis-classified still gets picked up. Catches `[Gmail]/Spam`, Outlook's
-/// `Junk Email`, Fastmail's `Junk`, Yahoo's `Bulk Mail`, etc. Failures during
-/// LIST are non-fatal — the sync will just proceed with the pre-expansion
-/// folder set.
-/// Return every server mailbox whose name contains "spam", "junk", or "bulk"
-/// (case-insensitive). Failures during LIST are non-fatal — returns empty.
-/// True if a mailbox name looks like a provider spam/junk/bulk folder.
+/// True if a mailbox name looks like a provider spam/junk/bulk folder
+/// (case-insensitive). Catches `[Gmail]/Spam`, Outlook's `Junk Email`,
+/// Fastmail's `Junk`, Yahoo's `Bulk Mail`, etc.
 fn is_spam_folder_name(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.contains("spam") || lower.contains("junk") || lower.contains("bulk")
@@ -6548,6 +6552,23 @@ fn list_spam_folders(
         .map(|mb| mb.name().to_string())
         .filter(|name| is_spam_folder_name(name))
         .collect()
+}
+
+/// Append discovered spam/junk/bulk server folders to `folders` (deduped).
+/// Called only when spam rescue is OFF, so nostr mail a provider misfiled into
+/// spam still surfaces in the inbox view. (With rescue ON we never scan spam —
+/// rescue moves eligible mail into the rescue target instead, and scanning spam
+/// would let an in-app read mark it \Seen and suppress its rescue.) LIST
+/// failures are non-fatal: the sync proceeds with the unexpanded folder set.
+fn extend_with_spam_folders(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    folders: &mut Vec<String>,
+) {
+    for name in list_spam_folders(session) {
+        if folders.iter().any(|f| f.eq_ignore_ascii_case(&name)) { continue; }
+        debug_log!("[RUST] extend_with_spam_folders: adding {}", name);
+        folders.push(name);
+    }
 }
 
 /// Decide whether a message sitting in a spam folder should be rescued.
@@ -6618,17 +6639,20 @@ fn move_uids_to_folder(
 /// Returns the number of messages moved. Per-folder failures are logged and
 /// skipped — rescue is best-effort and never aborts the surrounding sync.
 ///
-/// Rescue is stateless: a message is moved out whenever it's UNSEEN in spam and
-/// looks like authenticated nostr mail. There is no rescue-once ledger — to keep
-/// a message in spam, the user (via the app's move-to-spam) marks it \Seen, which
-/// the server replicates to every device. The UNSEEN guard alone therefore
-/// encodes intent, identically on all clients.
+/// When `unseen_only` is true (the normal per-sync rescue) only UNSEEN mail is
+/// considered: there is no rescue-once ledger — to keep a message in spam, the
+/// user (via the app's move-to-spam) marks it \Seen, which the server
+/// replicates to every device, so the UNSEEN guard alone encodes intent
+/// identically on all clients. When false (the one-time catch-up run when a
+/// user first enables rescue) the \Seen guard is dropped so already-read nostr
+/// mail sitting in spam — which the normal run would skip — is swept out too.
 fn rescue_nostr_emails_from_spam(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     target_folder: &str,
+    unseen_only: bool,
 ) -> usize {
     let spam_folders = list_spam_folders(session);
-    debug_log!("[RUST] rescue: spam folders found = {:?}, target = '{}'", spam_folders, target_folder);
+    debug_log!("[RUST] rescue: spam folders found = {:?}, target = '{}', unseen_only = {}", spam_folders, target_folder, unseen_only);
     if spam_folders.is_empty() {
         return 0;
     }
@@ -6644,33 +6668,36 @@ fn rescue_nostr_emails_from_spam(
             continue;
         }
 
-        // Cheap server-side narrowing to candidate UIDs: UNREAD messages that are
-        // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor block
-        // (encrypted, signed, signature, or seal). The UNSEEN guard means a message
-        // the user has read and deliberately filed into spam is left alone. BODY
+        // Cheap server-side narrowing to candidate UIDs: messages that are
+        // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor
+        // block (encrypted, signed, signature, or seal). With `unseen_only` the
+        // search is gated by UNSEEN so a message the user read and deliberately
+        // filed into spam is left alone; the catch-up run drops that gate. BODY
         // search support varies by server, so we re-confirm each candidate by
         // fetching it and checking the transport auth gate.
+        let guard = if unseen_only { "UNSEEN " } else { "" };
         let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for query in &[
-            "UNSEEN HEADER X-Nostr-Pubkey \"\"",
-            "UNSEEN HEADER X-Nostr-Sig \"\"",
-            "UNSEEN BODY \"BEGIN NOSTR NIP-\"",
-            "UNSEEN BODY \"BEGIN NOSTR SIGNED\"",
-            "UNSEEN BODY \"BEGIN NOSTR SIGNATURE\"",
-            "UNSEEN BODY \"BEGIN NOSTR SEAL\"",
+        for q in &[
+            "HEADER X-Nostr-Pubkey \"\"",
+            "HEADER X-Nostr-Sig \"\"",
+            "BODY \"BEGIN NOSTR NIP-\"",
+            "BODY \"BEGIN NOSTR SIGNED\"",
+            "BODY \"BEGIN NOSTR SIGNATURE\"",
+            "BODY \"BEGIN NOSTR SEAL\"",
         ] {
-            if let Ok(found) = session.uid_search(*query) {
+            let query = format!("{}{}", guard, q);
+            if let Ok(found) = session.uid_search(&query) {
                 candidates.extend(found);
             }
         }
-        debug_log!("[RUST] rescue: folder '{}' UNSEEN nostr candidate UIDs = {}", folder, candidates.len());
+        debug_log!("[RUST] rescue: folder '{}' nostr candidate UIDs = {}", folder, candidates.len());
         if candidates.is_empty() {
             continue;
         }
 
-        // UIDs that pass the eligibility gate. No ledger: a deliberate
-        // move-to-spam is respected because the app marks such mail \Seen, so it
-        // never appears in the UNSEEN candidate set above.
+        // UIDs that pass the eligibility gate. No ledger: in the normal run a
+        // deliberate move-to-spam is respected because the app marks such mail
+        // \Seen, so it never appears in the UNSEEN candidate set above.
         let mut to_move: Vec<u32> = Vec::new();
         let uids: Vec<u32> = candidates.into_iter().collect();
         for chunk in uids.chunks(500) {
@@ -6712,25 +6739,34 @@ fn rescue_nostr_emails_from_spam(
     moved_total
 }
 
-fn extend_with_spam_folders(
-    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
-    folders: &mut Vec<String>,
-) {
-    let mailboxes = match session.list(Some(""), Some("*")) {
-        Ok(m) => m,
-        Err(e) => {
-            debug_log!("[RUST] extend_with_spam_folders: LIST failed: {}", e);
-            return;
-        }
+/// One-time "catch-up" rescue invoked when the user first switches spam rescue
+/// ON. Opens an IMAP session and runs `rescue_nostr_emails_from_spam` with the
+/// \Seen guard dropped, so already-read nostr mail sitting in spam (which the
+/// per-sync rescue intentionally skips) is moved into `target_folder` too.
+/// Returns the number of messages moved. The caller is expected to sync
+/// afterwards so the moved messages land in the local DB.
+pub async fn rescue_spam_now(config: &EmailConfig, target_folder: &str) -> anyhow::Result<usize> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = &config.email_address;
+    let password = &config.password;
+    let addr = format!("{}:{}", host, port);
+
+    let moved = if config.use_tls {
+        let client = create_imap_tls_client!(&host, &addr)?;
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        let m = rescue_nostr_emails_from_spam(&mut session, target_folder, /* unseen_only = */ false);
+        let _ = session.logout();
+        m
+    } else {
+        let tcp_stream = TcpStream::connect(&addr)?;
+        let client = imap::Client::new(tcp_stream);
+        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+        let m = rescue_nostr_emails_from_spam(&mut session, target_folder, /* unseen_only = */ false);
+        let _ = session.logout();
+        m
     };
-    for mailbox in mailboxes.iter() {
-        let name = mailbox.name();
-        let lower = name.to_lowercase();
-        if !lower.contains("spam") && !lower.contains("junk") && !lower.contains("bulk") { continue; }
-        if folders.iter().any(|f| f.eq_ignore_ascii_case(name)) { continue; }
-        debug_log!("[RUST] extend_with_spam_folders: adding {}", name);
-        folders.push(name.to_string());
-    }
+    Ok(moved)
 }
 
 fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::io::Write>) -> anyhow::Result<Option<String>> {

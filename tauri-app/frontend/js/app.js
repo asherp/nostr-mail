@@ -3295,6 +3295,40 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         }
     });
     
+    // Special handling: enabling Spam Rescue triggers a one-time catch-up that
+    // sweeps ALL nostr mail (read + unread) out of spam. The normal per-sync
+    // rescue only moves UNSEEN mail, so messages the user already read while
+    // they sat in spam would otherwise be stranded; this run clears them once,
+    // then reports how many were moved. Programmatic `.checked =` during form
+    // population doesn't fire 'change', so a checked=true event here is always
+    // a genuine user-initiated off→on transition.
+    const spamRescuePref = domManager.get('spam-rescue-preference');
+    if (spamRescuePref) {
+        spamRescuePref.addEventListener('change', async (e) => {
+            if (isPopulatingForm || !e.target.checked) return;
+            try {
+                // Persist spam_rescue=true first so the catch-up's post-move
+                // sync scans with rescue enabled (target folder in the set).
+                await this.saveSettings(false);
+                const moved = await TauriService.rescueSpamNow();
+                if (moved > 0) {
+                    notificationService.showSuccess(
+                        `Spam rescue: moved ${moved} message${moved === 1 ? '' : 's'} out of spam.`
+                    );
+                    if (window.emailService && typeof window.emailService.loadEmails === 'function') {
+                        window.emailService.loadEmails().catch(err =>
+                            console.warn('[APP] reload after spam rescue failed:', err));
+                    }
+                } else {
+                    notificationService.showInfo('Spam rescue: no messages needed rescuing.');
+                }
+            } catch (err) {
+                console.error('[APP] rescue_spam_now failed:', err);
+                notificationService.showError('Spam rescue failed: ' + err);
+            }
+        });
+    }
+
     // Special handling: When auto-encrypt is enabled, also enable auto-sign
     const autoEncryptPref = domManager.get('automatically-encrypt-preference');
     const autoSignPref = domManager.get('automatically-sign-preference');
@@ -3523,13 +3557,12 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
                 window.FolderMultiselect.setSelectionOnly(persistedList);
                 // Reflect the backend's provider-aware defaults in the
                 // placeholder so the user can see what "no selection" will
-                // sync. The backend also auto-adds any *spam*-named folder at
-                // sync time; signal that with an ellipsis + a note in the
-                // help text.
+                // sync. Spam/junk/bulk folders are intentionally excluded —
+                // misfiled nostr mail is recovered by spam rescue instead.
                 TauriService.getDefaultInboxFolders(settings.imap_host).then(defaults => {
                     if (defaults && defaults.length > 0) {
                         window.FolderMultiselect.setPlaceholder(
-                            `Default (${defaults.join(', ')}, + spam/junk/bulk folders)`
+                            `Default (${defaults.join(', ')})`
                         );
                     }
                 }).catch(() => { /* placeholder stays at the initial value */ });

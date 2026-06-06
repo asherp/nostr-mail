@@ -5926,8 +5926,16 @@ ${attachmentsHtml}
             const folders = await TauriService.listImapFolders(emailConfig);
 
             if (window.FolderMultiselect) {
+                // Spam/junk/bulk folders are never inbox folders — the backend
+                // recovers misfiled nostr mail via spam rescue instead. Keep
+                // them out of the option list entirely so they can't be picked
+                // (and aren't shown as selected from a stale persisted value).
+                const isSpammy = (name) => {
+                    const lower = name.toLowerCase();
+                    return lower.includes('spam') || lower.includes('junk') || lower.includes('bulk');
+                };
                 const filteredFolders = (folders || []).filter(folder =>
-                    folder.toLowerCase() !== 'sent'
+                    folder.toLowerCase() !== 'sent' && !isSpammy(folder)
                 );
                 // Only keep prior selections that still exist on the server.
                 const filteredSet = new Set(filteredFolders);
@@ -5936,8 +5944,7 @@ ${attachmentsHtml}
                 // No usable saved selection? Pre-select the provider-aware
                 // defaults so users SEE what will be synced as pills (rather
                 // than as ghosted placeholder text). Mirrors the backend's
-                // default logic: static defaults + any folder whose name
-                // contains spam/junk/bulk. setOptions calls setValue with
+                // `default_inbox_folders`. setOptions calls setValue with
                 // silent=true so this doesn't trigger autosave — the user's
                 // persisted "" stays "" until they actively change something.
                 if (restoreSelection.length === 0) {
@@ -5951,12 +5958,6 @@ ${attachmentsHtml}
                     const effective = new Set();
                     for (const name of (staticDefaults || [])) {
                         if (filteredSet.has(name)) effective.add(name);
-                    }
-                    for (const name of filteredFolders) {
-                        const lower = name.toLowerCase();
-                        if (lower.includes('spam') || lower.includes('junk') || lower.includes('bulk')) {
-                            effective.add(name);
-                        }
                     }
                     restoreSelection = Array.from(effective);
                 }

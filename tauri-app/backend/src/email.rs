@@ -12,7 +12,6 @@ use tokio::task;
 use tokio::time::timeout;
 use std::time::Duration;
 use crate::types::{TransportAuthVerdict, TransportAuthMethod};
-use std::net::TcpStream;
 
 // Verbose [RUST] logs in the decrypt hot path are silent by default — set the
 // NOSTR_MAIL_DEBUG environment variable to any value to re-enable them for
@@ -50,56 +49,13 @@ fn maybe_evict<K: Clone + Eq + std::hash::Hash, V>(
         }
     }
 }
-#[cfg(not(target_os = "android"))]
-use native_tls::TlsConnector;
-#[cfg(target_os = "android")]
-use rustls::{ClientConfig, ClientConnection, RootCertStore, pki_types::ServerName};
-#[cfg(target_os = "android")]
-use std::sync::Arc;
 use uuid::Uuid;
 use base64::{Engine as _, engine::general_purpose};
 
-/// Macro to create a TLS-wrapped IMAP client connection
-/// Uses native-tls on desktop and rustls on Android
-#[cfg(not(target_os = "android"))]
-macro_rules! create_imap_tls_client {
-    ($host:expr, $addr:expr) => {{
-        let tls = TlsConnector::builder().build()?;
-        let tcp_stream = TcpStream::connect($addr)?;
-        let tls_stream: native_tls::TlsStream<TcpStream> = tls.connect($host, tcp_stream)?;
-        Ok::<imap::Client<native_tls::TlsStream<TcpStream>>, anyhow::Error>(imap::Client::new(tls_stream))
-    }};
-}
-
-#[cfg(target_os = "android")]
-macro_rules! create_imap_tls_client {
-    ($host:expr, $addr:expr) => {{
-        // Initialize rustls crypto provider if not already initialized (required for rustls 0.23+)
-        {
-            use std::sync::Once;
-            static INIT: Once = Once::new();
-            INIT.call_once(|| {
-                // Try to install default provider, but don't fail if already installed
-                let _ = rustls::crypto::ring::default_provider().install_default();
-            });
-        }
-        
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        
-        let server_name = ServerName::try_from($host.to_string())
-            .map_err(|_| anyhow::anyhow!("Invalid server name"))?;
-        
-        let tcp_stream = TcpStream::connect($addr)?;
-        let client = ClientConnection::new(Arc::new(config), server_name)?;
-        let tls_stream = rustls::StreamOwned::new(client, tcp_stream);
-        Ok::<imap::Client<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>, anyhow::Error>(imap::Client::new(tls_stream))
-    }};
-}
+// IMAP connections are established and reused through `crate::imap_pool`, which
+// owns TLS setup, socket timeouts, and warm-connection pooling for the active
+// account. See that module for the per-transport details.
+use crate::imap_pool::{self, ImapTarget};
 
 /// Decode RFC 2047 encoded header value and fix UTF-8 encoding issues
 /// mailparse should handle RFC 2047 automatically, but this fixes common UTF-8 misinterpretations
@@ -652,27 +608,11 @@ pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &st
 
     // Run all blocking IMAP I/O on a dedicated thread to avoid blocking the Tokio runtime
     tokio::task::spawn_blocking(move || {
-        use std::net::TcpStream;
-        let addr = format!("{}:{}", host, port);
-        let is_gmail = host.contains("gmail.com");
-
-        let result = if use_tls {
-            let client = create_imap_tls_client!(&host, &addr)?;
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = delete_sent_email_from_session_sync(&mut session, is_gmail, &message_id);
-            let _ = session.logout();
-            debug_log!("[RUST] delete_sent_email_from_server: Session closed");
-            result
-        } else {
-            let tcp_stream = TcpStream::connect(&addr)?;
-            let client = imap::Client::new(tcp_stream);
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = delete_sent_email_from_session_sync(&mut session, is_gmail, &message_id);
-            let _ = session.logout();
-            debug_log!("[RUST] delete_sent_email_from_server: Session closed");
-            result
-        };
-        result
+        let target = ImapTarget { host, port, username, password, use_tls };
+        let is_gmail = target.host.contains("gmail.com");
+        imap_pool::with_session(&target, |session| {
+            delete_sent_email_from_session_sync(session, is_gmail, &message_id)
+        })
     }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
 }
 
@@ -868,25 +808,11 @@ pub async fn delete_inbox_email_from_server(config: &EmailConfig, message_id: &s
     debug_log!("[RUST] delete_inbox_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
 
     tokio::task::spawn_blocking(move || {
-        use std::net::TcpStream;
-        let addr = format!("{}:{}", host, port);
-        let is_gmail = host.contains("gmail.com");
-
-        let result = if use_tls {
-            let client = create_imap_tls_client!(&host, &addr)?;
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = delete_email_from_folder_sync(&mut session, is_gmail, &message_id, &["INBOX", "nostr-mail"]);
-            let _ = session.logout();
-            result
-        } else {
-            let tcp_stream = TcpStream::connect(&addr)?;
-            let client = imap::Client::new(tcp_stream);
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = delete_email_from_folder_sync(&mut session, is_gmail, &message_id, &["INBOX", "nostr-mail"]);
-            let _ = session.logout();
-            result
-        };
-        result
+        let target = ImapTarget { host, port, username, password, use_tls };
+        let is_gmail = target.host.contains("gmail.com");
+        imap_pool::with_session(&target, |session| {
+            delete_email_from_folder_sync(session, is_gmail, &message_id, &["INBOX", "nostr-mail"])
+        })
     }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
 }
 
@@ -1002,26 +928,11 @@ pub async fn move_inbox_email_to_folder(
     debug_log!("[RUST] move_inbox_email_to_folder: Moving Message-ID {} to folder {}", message_id, target_folder);
 
     tokio::task::spawn_blocking(move || {
-        use std::net::TcpStream;
-        let addr = format!("{}:{}", host, port);
-
-        let result = if use_tls {
-            let client = create_imap_tls_client!(&host, &addr)?;
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let source_folders = searchable_source_folders(&mut session, &target_folder);
-            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &source_folders);
-            let _ = session.logout();
-            result
-        } else {
-            let tcp_stream = TcpStream::connect(&addr)?;
-            let client = imap::Client::new(tcp_stream);
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let source_folders = searchable_source_folders(&mut session, &target_folder);
-            let result = move_email_to_folder_sync(&mut session, &message_id, &target_folder, &source_folders);
-            let _ = session.logout();
-            result
-        };
-        result
+        let target = ImapTarget { host, port, username, password, use_tls };
+        imap_pool::with_session(&target, |session| {
+            let source_folders = searchable_source_folders(session, &target_folder);
+            move_email_to_folder_sync(session, &message_id, &target_folder, &source_folders)
+        })
     }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
 }
 
@@ -1185,22 +1096,10 @@ pub async fn find_message_folder(
     let message_id = message_id.to_string();
 
     tokio::task::spawn_blocking(move || {
-        use std::net::TcpStream;
-        let addr = format!("{}:{}", host, port);
-        if use_tls {
-            let client = create_imap_tls_client!(&host, &addr)?;
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let found = find_message_folder_sync(&mut session, &message_id, &candidate_folders);
-            let _ = session.logout();
-            found
-        } else {
-            let tcp_stream = TcpStream::connect(&addr)?;
-            let client = imap::Client::new(tcp_stream);
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let found = find_message_folder_sync(&mut session, &message_id, &candidate_folders);
-            let _ = session.logout();
-            found
-        }
+        let target = ImapTarget { host, port, username, password, use_tls };
+        imap_pool::with_session(&target, |session| {
+            find_message_folder_sync(session, &message_id, &candidate_folders)
+        })
     }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
 }
 
@@ -1287,24 +1186,10 @@ pub async fn mark_inbox_email_seen_on_server(
     debug_log!("[RUST] mark_inbox_email_seen_on_server: Marking Message-ID {} as \\Seen in {:?}", message_id, source_folders);
 
     tokio::task::spawn_blocking(move || {
-        use std::net::TcpStream;
-        let addr = format!("{}:{}", host, port);
-
-        let result = if use_tls {
-            let client = create_imap_tls_client!(&host, &addr)?;
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = set_seen_in_folder_sync(&mut session, &message_id, &source_folders);
-            let _ = session.logout();
-            result
-        } else {
-            let tcp_stream = TcpStream::connect(&addr)?;
-            let client = imap::Client::new(tcp_stream);
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = set_seen_in_folder_sync(&mut session, &message_id, &source_folders);
-            let _ = session.logout();
-            result
-        };
-        result
+        let target = ImapTarget { host, port, username, password, use_tls };
+        imap_pool::with_session(&target, |session| {
+            set_seen_in_folder_sync(session, &message_id, &source_folders)
+        })
     }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
 }
 
@@ -1366,61 +1251,30 @@ fn set_seen_in_folder_sync(
 
 /// List available IMAP folders/mailboxes
 pub async fn list_imap_folders(config: &EmailConfig) -> Result<Vec<String>> {
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let use_tls = config.use_tls;
-    let addr = format!("{}:{}", host, port);
-    
-    debug_log!("[RUST] list_imap_folders: Connecting to IMAP server: {}", addr);
-    
-    let mailboxes = if use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+    let target = ImapTarget::from_config(config);
+    debug_log!("[RUST] list_imap_folders: Connecting to IMAP server: {}:{}", config.imap_host, config.imap_port);
+
+    let folder_names = imap_pool::with_session(&target, |session| {
         let mailboxes = session.list(Some(""), Some("*"))?;
-        session.logout()?;
-        mailboxes
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let mailboxes = session.list(Some(""), Some("*"))?;
-        session.logout()?;
-        mailboxes
-    };
-    
-    let folder_names: Vec<String> = mailboxes.iter()
-        .map(|mb| mb.name().to_string())
-        .collect();
-    
+        Ok(mailboxes.iter().map(|mb| mb.name().to_string()).collect::<Vec<String>>())
+    })?;
+
     debug_log!("[RUST] list_imap_folders: Found {} folders", folder_names.len());
     Ok(folder_names)
 }
 
 /// Test IMAP connection with the given config. Returns Ok(()) if successful, Err otherwise.
 pub async fn test_imap_connection(config: &EmailConfig) -> Result<()> {
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let use_tls = config.use_tls;
+    let target = ImapTarget::from_config(config);
+    debug_log!("[RUST] Testing IMAP connection to: {}:{} (TLS: {})", config.imap_host, config.imap_port, config.use_tls);
 
-    let addr = format!("{}:{}", host, port);
-    
-    debug_log!("[RUST] Testing IMAP connection to: {}", addr);
-    debug_log!("[RUST] Host: {}, Port: {}, Use TLS: {}", host, port, use_tls);
+    // checkout connects (or validates a warm connection), proving credentials
+    // and reachability; with_session returns it to the pool so the test also
+    // warms the pool for the next real operation.
+    imap_pool::with_session(&target, |session| {
+        session.noop().map_err(|e| anyhow::anyhow!("{}", e))
+    })?;
 
-    if use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        session.logout()?;
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        session.logout()?;
-    }
     debug_log!("[RUST] IMAP connection test successful");
     Ok(())
 }
@@ -5462,86 +5316,42 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
     let mut raw_nostr_emails: Vec<RawNostrEmail> = Vec::new();
 
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let addr = format!("{}:{}", host, port);
-
-    if config.use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        if spam_rescue {
-            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, /* unseen_only = */ true);
-            if moved > 0 {
-                println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
-            }
-        } else {
-            extend_with_spam_folders(&mut session, &mut folders);
-        }
-        println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
-        for f in &folders {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
-                            Some(r.min_uid)
-                        } else {
-                            None
-                        };
-                        pending_state.push((f.clone(), r.uid_validity, r.max_uid, bootstrap_min));
-                    }
-                    raw_nostr_emails.extend(r.emails);
-                }
-                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
-            }
-            if include_gap_fill {
-                match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                          parse_nostr_email_from_imap_body) {
-                    Ok(emails) => raw_nostr_emails.extend(emails),
-                    Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
-                }
-            }
+    let target = ImapTarget::from_config(config);
+    let mut session = imap_pool::checkout(&target)?;
+    if spam_rescue {
+        let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, /* unseen_only = */ true);
+        if moved > 0 {
+            println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
         }
     } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        if spam_rescue {
-            let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, /* unseen_only = */ true);
-            if moved > 0 {
-                println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
+        extend_with_spam_folders(&mut session, &mut folders);
+    }
+    println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
+    for f in &folders {
+        match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                              parse_nostr_email_from_imap_body) {
+            Ok(r) => {
+                if r.max_uid > 0 || !r.had_existing_state {
+                    let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
+                        Some(r.min_uid)
+                    } else {
+                        None
+                    };
+                    pending_state.push((f.clone(), r.uid_validity, r.max_uid, bootstrap_min));
+                }
+                raw_nostr_emails.extend(r.emails);
             }
-        } else {
-            extend_with_spam_folders(&mut session, &mut folders);
+            Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
         }
-        println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
-        for f in &folders {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
-                            Some(r.min_uid)
-                        } else {
-                            None
-                        };
-                        pending_state.push((f.clone(), r.uid_validity, r.max_uid, bootstrap_min));
-                    }
-                    raw_nostr_emails.extend(r.emails);
-                }
-                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
-            }
-            if include_gap_fill {
-                match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                          parse_nostr_email_from_imap_body) {
-                    Ok(emails) => raw_nostr_emails.extend(emails),
-                    Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
-                }
+        if include_gap_fill {
+            match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                                      parse_nostr_email_from_imap_body) {
+                Ok(emails) => raw_nostr_emails.extend(emails),
+                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
             }
         }
     }
+    imap_pool::checkin(&target, session);
 
     let new_count = persist_inbox_raw_emails(raw_nostr_emails, db, require_signature)?;
 
@@ -5624,56 +5434,27 @@ pub async fn fetch_older_inbox_emails_to_db(
     let mut any_folder_scanned = false;
     let mut all_folders_exhausted = true;
 
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let addr = format!("{}:{}", host, port);
-
-    if config.use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        for f in &folders {
-            match fetch_older_in_folder(&mut session, config, db, &account_key, f,
-                                         page_size, sync_cutoff_days,
-                                         parse_nostr_email_from_imap_body) {
-                Ok(r) => {
-                    any_folder_scanned = true;
-                    if !r.hit_bottom { all_folders_exhausted = false; }
-                    if let Some(new_floor) = r.new_floor_uid {
-                        pending_floors.push((f.clone(), new_floor));
-                    }
-                    raw_emails.extend(r.emails);
+    let target = ImapTarget::from_config(config);
+    let mut session = imap_pool::checkout(&target)?;
+    for f in &folders {
+        match fetch_older_in_folder(&mut session, config, db, &account_key, f,
+                                     page_size, sync_cutoff_days,
+                                     parse_nostr_email_from_imap_body) {
+            Ok(r) => {
+                any_folder_scanned = true;
+                if !r.hit_bottom { all_folders_exhausted = false; }
+                if let Some(new_floor) = r.new_floor_uid {
+                    pending_floors.push((f.clone(), new_floor));
                 }
-                Err(e) => {
-                    debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e);
-                    all_folders_exhausted = false;
-                }
+                raw_emails.extend(r.emails);
             }
-        }
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        for f in &folders {
-            match fetch_older_in_folder(&mut session, config, db, &account_key, f,
-                                         page_size, sync_cutoff_days,
-                                         parse_nostr_email_from_imap_body) {
-                Ok(r) => {
-                    any_folder_scanned = true;
-                    if !r.hit_bottom { all_folders_exhausted = false; }
-                    if let Some(new_floor) = r.new_floor_uid {
-                        pending_floors.push((f.clone(), new_floor));
-                    }
-                    raw_emails.extend(r.emails);
-                }
-                Err(e) => {
-                    debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e);
-                    all_folders_exhausted = false;
-                }
+            Err(e) => {
+                debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e);
+                all_folders_exhausted = false;
             }
         }
     }
+    imap_pool::checkin(&target, session);
 
     let new_count = persist_inbox_raw_emails(raw_emails, db, require_signature)?;
 
@@ -5709,66 +5490,36 @@ pub async fn fetch_older_sent_emails_to_db(
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
 
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let addr = format!("{}:{}", host, port);
-    let is_gmail = host.contains("gmail.com");
+    let is_gmail = config.imap_host.contains("gmail.com");
 
     let mut pending_floors: Vec<(String, u32)> = Vec::new();
     let mut raw_emails: Vec<RawNostrEmail> = Vec::new();
     let mut any_folder_scanned = false;
     let mut all_folders_exhausted = true;
 
-    if config.use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let sent_folder = discover_sent_mailbox(&mut session)?
-            .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
-        for f in [sent_folder.as_str(), "nostr-mail"] {
-            match fetch_older_in_folder(&mut session, config, db, &account_key, f,
-                                         page_size, sync_cutoff_days,
-                                         parse_nostr_sent_email_from_imap_body) {
-                Ok(r) => {
-                    any_folder_scanned = true;
-                    if !r.hit_bottom { all_folders_exhausted = false; }
-                    if let Some(new_floor) = r.new_floor_uid {
-                        pending_floors.push((f.to_string(), new_floor));
-                    }
-                    raw_emails.extend(r.emails);
+    let target = ImapTarget::from_config(config);
+    let mut session = imap_pool::checkout(&target)?;
+    let sent_folder = discover_sent_mailbox(&mut session)?
+        .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
+    for f in [sent_folder.as_str(), "nostr-mail"] {
+        match fetch_older_in_folder(&mut session, config, db, &account_key, f,
+                                     page_size, sync_cutoff_days,
+                                     parse_nostr_sent_email_from_imap_body) {
+            Ok(r) => {
+                any_folder_scanned = true;
+                if !r.hit_bottom { all_folders_exhausted = false; }
+                if let Some(new_floor) = r.new_floor_uid {
+                    pending_floors.push((f.to_string(), new_floor));
                 }
-                Err(e) => {
-                    debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e);
-                    all_folders_exhausted = false;
-                }
+                raw_emails.extend(r.emails);
             }
-        }
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let sent_folder = discover_sent_mailbox(&mut session)?
-            .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
-        for f in [sent_folder.as_str(), "nostr-mail"] {
-            match fetch_older_in_folder(&mut session, config, db, &account_key, f,
-                                         page_size, sync_cutoff_days,
-                                         parse_nostr_sent_email_from_imap_body) {
-                Ok(r) => {
-                    any_folder_scanned = true;
-                    if !r.hit_bottom { all_folders_exhausted = false; }
-                    if let Some(new_floor) = r.new_floor_uid {
-                        pending_floors.push((f.to_string(), new_floor));
-                    }
-                    raw_emails.extend(r.emails);
-                }
-                Err(e) => {
-                    debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e);
-                    all_folders_exhausted = false;
-                }
+            Err(e) => {
+                debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e);
+                all_folders_exhausted = false;
             }
         }
     }
+    imap_pool::checkin(&target, session);
 
     // Sent emails skip the require_signature filter — see the forward sync
     // path for the same exception.
@@ -5815,73 +5566,37 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
     let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
     let mut raw_sent_emails: Vec<RawNostrEmail> = Vec::new();
 
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let addr = format!("{}:{}", host, port);
-    let is_gmail = host.contains("gmail.com");
+    let is_gmail = config.imap_host.contains("gmail.com");
 
-    if config.use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let sent_folder = discover_sent_mailbox(&mut session)?
-            .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
-        for f in [sent_folder.as_str(), "nostr-mail"] {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_sent_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
-                            Some(r.min_uid)
-                        } else {
-                            None
-                        };
-                        pending_state.push((f.to_string(), r.uid_validity, r.max_uid, bootstrap_min));
-                    }
-                    raw_sent_emails.extend(r.emails);
+    let target = ImapTarget::from_config(config);
+    let mut session = imap_pool::checkout(&target)?;
+    let sent_folder = discover_sent_mailbox(&mut session)?
+        .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
+    for f in [sent_folder.as_str(), "nostr-mail"] {
+        match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                              parse_nostr_sent_email_from_imap_body) {
+            Ok(r) => {
+                if r.max_uid > 0 || !r.had_existing_state {
+                    let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
+                        Some(r.min_uid)
+                    } else {
+                        None
+                    };
+                    pending_state.push((f.to_string(), r.uid_validity, r.max_uid, bootstrap_min));
                 }
-                Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
+                raw_sent_emails.extend(r.emails);
             }
-            if include_gap_fill {
-                match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                          parse_nostr_sent_email_from_imap_body) {
-                    Ok(emails) => raw_sent_emails.extend(emails),
-                    Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
-                }
-            }
+            Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
         }
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let sent_folder = discover_sent_mailbox(&mut session)?
-            .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
-        for f in [sent_folder.as_str(), "nostr-mail"] {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_sent_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
-                            Some(r.min_uid)
-                        } else {
-                            None
-                        };
-                        pending_state.push((f.to_string(), r.uid_validity, r.max_uid, bootstrap_min));
-                    }
-                    raw_sent_emails.extend(r.emails);
-                }
-                Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
-            }
-            if include_gap_fill {
-                match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                          parse_nostr_sent_email_from_imap_body) {
-                    Ok(emails) => raw_sent_emails.extend(emails),
-                    Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
-                }
+        if include_gap_fill {
+            match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+                                      parse_nostr_sent_email_from_imap_body) {
+                Ok(emails) => raw_sent_emails.extend(emails),
+                Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
             }
         }
     }
+    imap_pool::checkin(&target, session);
 
     debug_log!("[RUST] sync_sent_emails_to_db: Fetched {} emails from IMAP", raw_sent_emails.len());
 
@@ -6857,26 +6572,10 @@ fn rescue_nostr_emails_from_spam(
 /// Returns the number of messages moved. The caller is expected to sync
 /// afterwards so the moved messages land in the local DB.
 pub async fn rescue_spam_now(config: &EmailConfig, target_folder: &str) -> anyhow::Result<usize> {
-    let host = config.imap_host.clone();
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let addr = format!("{}:{}", host, port);
-
-    let moved = if config.use_tls {
-        let client = create_imap_tls_client!(&host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let m = rescue_nostr_emails_from_spam(&mut session, target_folder, /* unseen_only = */ false);
-        let _ = session.logout();
-        m
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let m = rescue_nostr_emails_from_spam(&mut session, target_folder, /* unseen_only = */ false);
-        let _ = session.logout();
-        m
-    };
+    let target = ImapTarget::from_config(config);
+    let moved = imap_pool::with_session(&target, |session| {
+        Ok(rescue_nostr_emails_from_spam(session, target_folder, /* unseen_only = */ false))
+    })?;
     Ok(moved)
 }
 

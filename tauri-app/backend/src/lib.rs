@@ -6,6 +6,8 @@
 
 pub mod crypto;
 pub mod email;
+pub mod imap_pool;
+pub mod imap_idle;
 mod nostr;
 pub mod types;
 pub mod state;
@@ -1211,6 +1213,10 @@ fn keychain_list_accounts(state: tauri::State<AppState>) -> Result<Vec<AccountIn
 #[tauri::command]
 fn keychain_set_active_account(public_key: String, state: tauri::State<AppState>) -> Result<(), String> {
     println!("[RUST] keychain_set_active_account called for: {}...", &public_key[..20.min(public_key.len())]);
+    // Switching the active account: tear down the previous account's IMAP IDLE
+    // watcher and pooled connections so nothing credential-bound to the old
+    // user is reused. The frontend restarts IDLE for the new account.
+    state.stop_idle_watcher();
     let private_key = state.keychain.get_key(&public_key)?
         .ok_or_else(|| format!("No key found in keychain for {}", &public_key[..20.min(public_key.len())]))?;
     let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
@@ -1237,6 +1243,8 @@ fn keychain_get_private_key(public_key: String, state: tauri::State<AppState>) -
 #[tauri::command]
 fn keychain_clear_all(state: tauri::State<AppState>) -> Result<(), String> {
     println!("[RUST] keychain_clear_all called");
+    // Logout: stop the IDLE watcher and drop all pooled IMAP connections.
+    state.stop_idle_watcher();
     state.keychain.clear_all()?;
     *state.current_private_key.lock().unwrap() = None;
     *state.current_keys.lock().unwrap() = None;
@@ -2630,6 +2638,28 @@ fn update_contact_picture_data_url(pubkey: String, picture_data_url: String) -> 
     storage.update_contact_picture_data_url(&pubkey, picture_data_url).map_err(|e| e.to_string())
 }
 
+
+/// Start the background IMAP IDLE watcher for the active account. Replaces any
+/// previously running watcher (and clears the pool) so only the active account
+/// is ever watched. Emits `imap-new-mail` events when the INBOX changes.
+#[tauri::command]
+fn start_imap_idle(email_config: EmailConfig, app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] start_imap_idle called for: {}@{}:{}",
+        email_config.email_address, email_config.imap_host, email_config.imap_port);
+    // Stop any prior watcher + clear pooled connections before starting fresh.
+    state.stop_idle_watcher();
+    let handle = imap_idle::start(app, &email_config);
+    state.set_idle_watcher(handle);
+    Ok(())
+}
+
+/// Stop the background IMAP IDLE watcher and drop pooled connections.
+#[tauri::command]
+fn stop_imap_idle(state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] stop_imap_idle called");
+    state.stop_idle_watcher();
+    Ok(())
+}
 
 #[tauri::command]
 async fn test_imap_connection(email_config: EmailConfig) -> Result<(), String> {
@@ -7117,6 +7147,8 @@ pub fn run() {
         update_contact_picture_data_url,
         test_imap_connection,
         test_smtp_connection,
+        start_imap_idle,
+        stop_imap_idle,
         list_imap_folders,
         find_message_folder,
         check_message_confirmation,

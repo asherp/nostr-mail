@@ -1613,12 +1613,15 @@ impl Database {
     }
 
     pub fn get_email(&self, message_id: &str) -> Result<Option<Email>> {
-        println!("[DB] get_email: Checking for message_id={}", message_id);
+        // These traces fire once per message during sync/gap-fill (one call per
+        // server Message-ID in the scanned window), so they're gated behind
+        // NOSTR_MAIL_DEBUG via debug_log! rather than unconditional println!.
+        crate::debug_log!("[DB] get_email: Checking for message_id={}", message_id);
         let conn = self.conn.lock().unwrap();
-        println!("[DB] get_email: Acquired database lock");
+        crate::debug_log!("[DB] get_email: Acquired database lock");
         // Normalize message_id for comparison
         let normalized_id = Self::normalize_message_id(message_id);
-        println!("[DB] get_email: Normalized message_id={}", normalized_id);
+        crate::debug_log!("[DB] get_email: Normalized message_id={}", normalized_id);
         
         // Use SQL query with normalization to find matching email efficiently
         // SQLite's TRIM and REPLACE can handle the normalization
@@ -1629,7 +1632,7 @@ impl Database {
              WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?
              ORDER BY received_at DESC"
         )?;
-        println!("[DB] get_email: Prepared optimized query with normalization");
+        crate::debug_log!("[DB] get_email: Prepared optimized query with normalization");
         
         let mut rows = stmt.query(params![normalized_id])?;
         
@@ -1661,11 +1664,11 @@ impl Database {
                 references: row.get(21)?,
                 thread_id: row.get(22)?,
             };
-            println!("[DB] get_email: Found matching email, id={:?}", email.id);
+            crate::debug_log!("[DB] get_email: Found matching email, id={:?}", email.id);
             return Ok(Some(email));
         }
-        
-        println!("[DB] get_email: No matching email found");
+
+        crate::debug_log!("[DB] get_email: No matching email found");
         Ok(None)
     }
 

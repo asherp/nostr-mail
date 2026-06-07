@@ -162,6 +162,7 @@ jobs:
           if-no-files-found: warn
 
   android:
+    if: github.ref == 'refs/heads/android' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
 
     steps:

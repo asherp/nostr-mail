@@ -48,11 +48,13 @@ jobs:
           #  - manual run   -> honor the chosen platform input (default "all")
           #  - android push -> android only
           #  - v* tag       -> everything (feeds the release job)
-          #  - staging push -> all desktop, no android
+          #  - staging push -> everything (full smoke test, no release)
           if [ "$EVENT" = "workflow_dispatch" ]; then
             sel="${PLATFORM:-all}"
           elif [ "$REF" = "refs/heads/android" ]; then
             sel="android"
+          elif [ "$REF" = "refs/heads/staging" ]; then
+            sel="all"
           elif [[ "$REF" == refs/tags/v* ]]; then
             sel="all"
           else

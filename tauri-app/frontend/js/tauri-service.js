@@ -427,6 +427,39 @@ const TauriService = {
         return await this.invoke('sync_nostr_emails', { config: emailConfig, folders: foldersArg });
     },
 
+    /* Start the backend IMAP IDLE watcher for the active account. The backend
+       emits `imap-new-mail` when the INBOX changes; app.js listens and runs a
+       normal sync. No-op (resolves) when settings/keypair aren't ready yet. */
+    startImapIdle: async function() {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair || !settings.email_address || !settings.imap_host) {
+            return; // not configured; nothing to watch
+        }
+
+        const useTls = settings.use_tls !== undefined && settings.use_tls !== null
+            ? settings.use_tls
+            : true;
+
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+            private_key: null
+        };
+
+        return await this.invoke('start_imap_idle', { emailConfig });
+    },
+
+    /* Stop the backend IMAP IDLE watcher and drop pooled connections. */
+    stopImapIdle: async function() {
+        return await this.invoke('stop_imap_idle');
+    },
+
     /* Provider-aware default folder list for the inbox-folder placeholder.
        Mirrors the backend's `default_inbox_folders` — the source of truth for
        what gets scanned when the user has nothing selected. The backend also

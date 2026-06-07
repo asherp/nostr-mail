@@ -470,7 +470,13 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
             
             // Update last loaded pubkey tracker
             appState.setLastLoadedPubkey(pubkey);
-            
+
+            // (Re)start the IMAP IDLE watcher for this account so the inbox
+            // updates via push. The backend stops any prior account's watcher
+            // and clears its pooled connections first.
+            TauriService.startImapIdle().catch(err =>
+                console.warn('[APP] Failed to start IMAP IDLE watcher:', err));
+
             // Show toast notification that settings were loaded
             notificationService.showSuccess('Settings loaded');
         } else {
@@ -1901,6 +1907,28 @@ NostrMailApp.prototype.setupLiveEventListeners = async function() {
             this.handleLiveProfileUpdate(event.payload);
         });
         
+        // Listen for IMAP IDLE push: backend detected the active account's INBOX
+        // changed. Sync + reload, guarded so overlapping pushes don't pile up.
+        this.newMailUnlisten = await window.__TAURI__.event.listen('imap-new-mail', async (event) => {
+            const account = event.payload;
+            const active = window.appState?.getSettings()?.email_address;
+            if (account && active && account !== active) {
+                return; // stale event from a previous account; ignore
+            }
+            if (this._idleSyncInFlight) return;
+            this._idleSyncInFlight = true;
+            try {
+                console.log('[APP] imap-new-mail: syncing inbox for', account);
+                if (window.emailService) {
+                    await window.emailService.syncAndReloadEmails();
+                }
+            } catch (err) {
+                console.error('[APP] imap-new-mail sync failed:', err);
+            } finally {
+                this._idleSyncInFlight = false;
+            }
+        });
+
         // Listen for relay status changes (when relays fail/disconnect)
         this.relayStatusUnlisten = await window.__TAURI__.event.listen('relay-status-changed', async (event) => {
             console.log('[APP] Relay status changed event received:', event.payload);
@@ -2076,7 +2104,12 @@ NostrMailApp.prototype.cleanupLiveEvents = async function() {
                 this.profileUnlisten();
                 this.profileUnlisten = null;
             }
-            
+
+            if (this.newMailUnlisten) {
+                this.newMailUnlisten();
+                this.newMailUnlisten = null;
+            }
+
             this.liveEventsActive = false;
             this.updateLiveEventsStatus('inactive', 'Disconnected');
             
@@ -3186,7 +3219,12 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             
             // Update last loaded pubkey tracker after successful save
             appState.setLastLoadedPubkey(publicKey);
-            
+
+            // IMAP credentials/host may have changed — rebind the IDLE watcher
+            // (and drop stale pooled connections) to the new settings.
+            TauriService.startImapIdle().catch(err =>
+                console.warn('[APP] Failed to restart IMAP IDLE watcher after save:', err));
+
             // Update compose page warning if on compose tab
             if (document.querySelector('.tab-content#compose.active')) {
                 this.checkEmailSettingsForCompose();

@@ -60,6 +60,10 @@ pub struct AppState {
     /// session. Prevents republishing on reconnect storms; flipped back to
     /// false by `republish_relay_lists` when settings change.
     pub relay_lists_published_session: Arc<Mutex<bool>>,
+    /// Background IMAP IDLE watcher for the active account, if running. Holds
+    /// at most one watcher at a time — switching accounts stops the old one and
+    /// starts a new one (see `crate::imap_idle`).
+    pub idle_watcher: Arc<Mutex<Option<crate::imap_idle::IdleHandle>>>,
 }
 
 impl AppState {
@@ -81,7 +85,27 @@ impl AppState {
             inbox_fetched: Arc::new(RwLock::new(HashMap::new())),
             nip17_capable: Arc::new(RwLock::new(HashMap::new())),
             relay_lists_published_session: Arc::new(Mutex::new(false)),
+            idle_watcher: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Stop and clear the active IMAP IDLE watcher, if any. Also clears the
+    /// IMAP connection pool so no stale or foreign connection lingers. Safe to
+    /// call when no watcher is running.
+    pub fn stop_idle_watcher(&self) {
+        if let Some(handle) = self.idle_watcher.lock().unwrap().take() {
+            handle.stop();
+        }
+        crate::imap_pool::clear_all();
+    }
+
+    /// Replace the active IMAP IDLE watcher, stopping any previous one first.
+    pub fn set_idle_watcher(&self, handle: crate::imap_idle::IdleHandle) {
+        let mut guard = self.idle_watcher.lock().unwrap();
+        if let Some(prev) = guard.take() {
+            prev.stop();
+        }
+        *guard = Some(handle);
     }
 
     pub fn init_database(&self, db_path: &std::path::Path) -> Result<(), String> {

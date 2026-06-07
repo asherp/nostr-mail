@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches:
+      - staging
       - android
     tags:
       - "v*"
@@ -47,7 +48,7 @@ jobs:
           #  - manual run   -> honor the chosen platform input (default "all")
           #  - android push -> android only
           #  - v* tag       -> everything (feeds the release job)
-          #  - master/main  -> all desktop, no android
+          #  - staging push -> all desktop, no android
           if [ "$EVENT" = "workflow_dispatch" ]; then
             sel="${PLATFORM:-all}"
           elif [ "$REF" = "refs/heads/android" ]; then

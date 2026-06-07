@@ -3,39 +3,91 @@ name: Build
 on:
   push:
     branches:
-      - master
-      - main
+      - staging
       - android
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      platform:
+        description: "Platform(s) to build on demand"
+        type: choice
+        default: all
+        options:
+          - all
+          - windows
+          - linux
+          - macos
+          - android
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      desktop-matrix: ${{ steps.compute.outputs.desktop-matrix }}
+      build-desktop: ${{ steps.compute.outputs.build-desktop }}
+      build-android: ${{ steps.compute.outputs.build-android }}
+    steps:
+      - name: Compute build selection
+        id: compute
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          PLATFORM: ${{ github.event.inputs.platform }}
+        run: |
+          windows='{"os":"windows-latest","target":"x86_64-pc-windows-msvc","arch":"x64","platform":"windows"}'
+          linux='{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","arch":"x64","platform":"linux"}'
+          macos_arm='{"os":"macos-latest","target":"aarch64-apple-darwin","arch":"arm64","platform":"macos"}'
+          macos_x64='{"os":"macos-latest","target":"x86_64-apple-darwin","arch":"x64","platform":"macos"}'
+
+          # Decide what to build based on the event:
+          #  - manual run   -> honor the chosen platform input (default "all")
+          #  - android push -> android only
+          #  - v* tag       -> everything (feeds the release job)
+          #  - staging push -> everything (full smoke test, no release)
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            sel="${PLATFORM:-all}"
+          elif [ "$REF" = "refs/heads/android" ]; then
+            sel="android"
+          elif [ "$REF" = "refs/heads/staging" ]; then
+            sel="all"
+          elif [[ "$REF" == refs/tags/v* ]]; then
+            sel="all"
+          else
+            sel="desktop"
+          fi
+
+          android="false"
+          entries=()
+          case "$sel" in
+            all)     entries=("$windows" "$linux" "$macos_arm" "$macos_x64"); android="true" ;;
+            desktop) entries=("$windows" "$linux" "$macos_arm" "$macos_x64") ;;
+            windows) entries=("$windows") ;;
+            linux)   entries=("$linux") ;;
+            macos)   entries=("$macos_arm" "$macos_x64") ;;
+            android) android="true" ;;
+          esac
+
+          if [ "${#entries[@]}" -gt 0 ]; then
+            joined=$(IFS=,; echo "${entries[*]}")
+            echo "desktop-matrix={\"include\":[$joined]}" >> "$GITHUB_OUTPUT"
+            echo "build-desktop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "desktop-matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "build-desktop=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "build-android=$android" >> "$GITHUB_OUTPUT"
+
   build:
-    if: github.ref != 'refs/heads/android'
+    needs: setup
+    if: needs.setup.outputs.build-desktop == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            arch: x64
-            platform: windows
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            arch: x64
-            platform: linux
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            arch: arm64
-            platform: macos
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            arch: x64
-            platform: macos
+      matrix: ${{ fromJSON(needs.setup.outputs.desktop-matrix) }}
 
     runs-on: ${{ matrix.os }}
 
@@ -162,6 +214,8 @@ jobs:
           if-no-files-found: warn
 
   android:
+    needs: setup
+    if: needs.setup.outputs.build-android == 'true'
     runs-on: ubuntu-22.04
 
     steps:

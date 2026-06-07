@@ -168,6 +168,13 @@ pub struct FolderSyncState {
     // forward sync (bootstrap fills it from the SINCE-cutoff range) or by
     // the first fetch_older call.
     pub min_seen_uid: Option<u32>,
+    // Contiguous UID range gap-fill has already examined (under the current
+    // uid_validity). gap_fill_in_folder skips UIDs inside [min, max] so the
+    // expensive ENVELOPE + body re-fetch of already-seen (non-nostr) mail only
+    // happens once. None = nothing examined yet (full scan). Reset to None when
+    // uid_validity changes. Always written together.
+    pub gap_examined_min_uid: Option<u32>,
+    pub gap_examined_max_uid: Option<u32>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -516,6 +523,9 @@ impl Database {
         // Migrate: Add min_seen_uid column to folder_sync_state for backward
         // pagination ("fetch older from server").
         Self::migrate_add_min_seen_uid_column(&conn)?;
+        // Migrate: Add gap_examined_{min,max}_uid columns so gap-fill examines
+        // each UID at most once instead of rescanning the whole window.
+        Self::migrate_add_gap_examined_columns(&conn)?;
 
         // Migrate: One-shot cleanup of duplicate DM rows that slipped past the
         // old outer-wrap-id dedup. Safe to run on every startup (idempotent).
@@ -1051,6 +1061,27 @@ impl Database {
                 "ALTER TABLE folder_sync_state ADD COLUMN min_seen_uid INTEGER",
                 [],
             )?;
+        }
+        Ok(())
+    }
+
+    /// Migration: Add gap_examined_{min,max}_uid columns to folder_sync_state.
+    /// These track the contiguous UID range gap-fill has already examined so it
+    /// doesn't re-fetch already-seen (non-nostr) messages on every refresh.
+    fn migrate_add_gap_examined_columns(conn: &Connection) -> Result<()> {
+        let existing: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(folder_sync_state)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for col in ["gap_examined_min_uid", "gap_examined_max_uid"] {
+            if !existing.contains(col) {
+                println!("[DB] Adding {} column to folder_sync_state", col);
+                conn.execute(
+                    &format!("ALTER TABLE folder_sync_state ADD COLUMN {} INTEGER", col),
+                    [],
+                )?;
+            }
         }
         Ok(())
     }
@@ -2344,7 +2375,7 @@ impl Database {
     pub fn get_folder_sync_state(&self, pubkey: &str, folder: &str) -> Result<Option<FolderSyncState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT uid_validity, last_seen_uid, min_seen_uid, updated_at
+            "SELECT uid_validity, last_seen_uid, min_seen_uid, gap_examined_min_uid, gap_examined_max_uid, updated_at
              FROM folder_sync_state
              WHERE pubkey = ? AND folder_name = ?",
         )?;
@@ -2353,11 +2384,15 @@ impl Database {
             let uid_validity: i64 = row.get(0)?;
             let last_seen_uid: i64 = row.get(1)?;
             let min_seen_uid: Option<i64> = row.get(2)?;
+            let gap_examined_min_uid: Option<i64> = row.get(3)?;
+            let gap_examined_max_uid: Option<i64> = row.get(4)?;
             Ok(Some(FolderSyncState {
                 uid_validity: uid_validity as u32,
                 last_seen_uid: last_seen_uid as u32,
                 min_seen_uid: min_seen_uid.map(|v| v as u32),
-                updated_at: row.get(3)?,
+                gap_examined_min_uid: gap_examined_min_uid.map(|v| v as u32),
+                gap_examined_max_uid: gap_examined_max_uid.map(|v| v as u32),
+                updated_at: row.get(5)?,
             }))
         } else {
             Ok(None)
@@ -2383,13 +2418,56 @@ impl Database {
              ON CONFLICT(pubkey, folder_name) DO UPDATE SET
                  uid_validity = excluded.uid_validity,
                  last_seen_uid = excluded.last_seen_uid,
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at,
+                 -- A UIDVALIDITY change renumbers messages, so previously
+                 -- examined UIDs are meaningless: clear the gap-fill range.
+                 -- Same uid_validity preserves it.
+                 gap_examined_min_uid = CASE WHEN folder_sync_state.uid_validity <> excluded.uid_validity
+                     THEN NULL ELSE folder_sync_state.gap_examined_min_uid END,
+                 gap_examined_max_uid = CASE WHEN folder_sync_state.uid_validity <> excluded.uid_validity
+                     THEN NULL ELSE folder_sync_state.gap_examined_max_uid END",
             params![
                 pubkey.trim().to_lowercase(),
                 folder,
                 uid_validity as i64,
                 last_seen_uid as i64,
                 now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record the contiguous UID range gap-fill has examined for one (account,
+    /// folder), under `uid_validity`. Stored as [min(existing, lo), max(existing,
+    /// hi)] so the range only grows (matching the always-growing [floor,
+    /// last_seen] scan window). No-op unless the row exists and its stored
+    /// uid_validity still matches — guards against a UIDVALIDITY change between
+    /// the gap-fill scan and this post-persist commit.
+    pub fn set_folder_gap_examined(
+        &self,
+        pubkey: &str,
+        folder: &str,
+        uid_validity: u32,
+        lo: u32,
+        hi: u32,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "UPDATE folder_sync_state
+             SET gap_examined_min_uid = MIN(COALESCE(gap_examined_min_uid, ?), ?),
+                 gap_examined_max_uid = MAX(COALESCE(gap_examined_max_uid, ?), ?),
+                 updated_at = ?
+             WHERE pubkey = ? AND folder_name = ? AND uid_validity = ?",
+            params![
+                lo as i64,
+                lo as i64,
+                hi as i64,
+                hi as i64,
+                now,
+                pubkey.trim().to_lowercase(),
+                folder,
+                uid_validity as i64,
             ],
         )?;
         Ok(())
@@ -5910,6 +5988,61 @@ mod tests {
         let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
         assert_eq!(got.last_seen_uid, 200);
         assert_eq!(got.min_seen_uid, Some(25));
+    }
+
+    #[test]
+    fn test_folder_gap_examined_records_and_only_grows() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+
+        // Unset on a fresh row.
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, None);
+        assert_eq!(got.gap_examined_max_uid, None);
+
+        // First recorded window.
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 1, 30, 80).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, Some(30));
+        assert_eq!(got.gap_examined_max_uid, Some(80));
+
+        // A wider window grows the range in both directions.
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 1, 20, 100).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, Some(20));
+        assert_eq!(got.gap_examined_max_uid, Some(100));
+
+        // A narrower window never shrinks it.
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 1, 50, 60).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, Some(20));
+        assert_eq!(got.gap_examined_max_uid, Some(100));
+    }
+
+    #[test]
+    fn test_folder_gap_examined_reset_on_uidvalidity_change() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 1, 20, 100).unwrap();
+
+        // Forward sync with the SAME uid_validity preserves the examined range.
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 150).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, Some(20));
+        assert_eq!(got.gap_examined_max_uid, Some(100));
+
+        // A UIDVALIDITY change clears it — the old UIDs are meaningless now.
+        db.set_folder_sync_state("alice@example.com", "INBOX", 2, 10).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, None);
+        assert_eq!(got.gap_examined_max_uid, None);
+
+        // set_folder_gap_examined is a no-op when the passed uid_validity does
+        // not match the stored row (guards against a mid-flight change).
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 99, 5, 9).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, None);
+        assert_eq!(got.gap_examined_max_uid, None);
     }
 
     // =====================

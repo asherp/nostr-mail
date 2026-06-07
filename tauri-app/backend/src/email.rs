@@ -5314,6 +5314,9 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     // row — it seeds folder_sync_state.min_seen_uid so backward pagination has
     // a defined floor. Incremental runs leave min_seen_uid alone.
     let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
+    // Per-folder gap-fill examined windows (folder, uid_validity, floor,
+    // last_seen), committed after persist so a future pass skips them.
+    let mut pending_gap_examined: Vec<(String, u32, u32, u32)> = Vec::new();
     let mut raw_nostr_emails: Vec<RawNostrEmail> = Vec::new();
 
     let target = ImapTarget::from_config(config);
@@ -5346,7 +5349,12 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         if include_gap_fill {
             match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
                                       parse_nostr_email_from_imap_body) {
-                Ok(emails) => raw_nostr_emails.extend(emails),
+                Ok(r) => {
+                    raw_nostr_emails.extend(r.emails);
+                    if let Some((uidv, lo, hi)) = r.examined {
+                        pending_gap_examined.push((f.clone(), uidv, lo, hi));
+                    }
+                }
                 Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
             }
         }
@@ -5382,6 +5390,16 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
                     min, folder_name
                 );
             }
+        }
+    }
+
+    // Commit gap-fill examined windows after the persist succeeded, so the next
+    // refresh skips this range instead of re-fetching all the (non-nostr) mail
+    // in it. Done post-persist for the same reason as the watermarks above: a
+    // persist failure must leave the range unexamined so it's rescanned.
+    for (folder_name, uid_validity, lo, hi) in pending_gap_examined {
+        if let Err(e) = db.set_folder_gap_examined(&account_key, &folder_name, uid_validity, lo, hi) {
+            debug_log!("[RUST] sync_nostr_emails_to_db: failed to record gap_examined for '{}': {}", folder_name, e);
         }
     }
 
@@ -5564,6 +5582,8 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
 
     // See sync_nostr_emails_to_db for the meaning of the 4-tuple.
     let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
+    // Per-folder gap-fill examined windows (folder, uid_validity, floor, last_seen).
+    let mut pending_gap_examined: Vec<(String, u32, u32, u32)> = Vec::new();
     let mut raw_sent_emails: Vec<RawNostrEmail> = Vec::new();
 
     let is_gmail = config.imap_host.contains("gmail.com");
@@ -5591,7 +5611,12 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
         if include_gap_fill {
             match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
                                       parse_nostr_sent_email_from_imap_body) {
-                Ok(emails) => raw_sent_emails.extend(emails),
+                Ok(r) => {
+                    raw_sent_emails.extend(r.emails);
+                    if let Some((uidv, lo, hi)) = r.examined {
+                        pending_gap_examined.push((f.to_string(), uidv, lo, hi));
+                    }
+                }
                 Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
             }
         }
@@ -5784,6 +5809,13 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
                     min, folder_name
                 );
             }
+        }
+    }
+
+    // Commit gap-fill examined windows post-persist (see sync_nostr_emails_to_db).
+    for (folder_name, uid_validity, lo, hi) in pending_gap_examined {
+        if let Err(e) = db.set_folder_gap_examined(&account_key, &folder_name, uid_validity, lo, hi) {
+            debug_log!("[RUST] sync_sent_emails_to_db: failed to record gap_examined for '{}': {}", folder_name, e);
         }
     }
 
@@ -6203,6 +6235,24 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
 /// Cost shape: 1 cheap UID SEARCH, 1 batched ENVELOPE fetch (server-side
 /// parse, no body bytes), then a body fetch only for the gaps we actually
 /// find. On a healthy DB with no gaps, the body fetch is skipped entirely.
+/// Outcome of one `gap_fill_in_folder` pass.
+struct GapFillResult {
+    /// Newly-found nostr emails to persist.
+    emails: Vec<RawNostrEmail>,
+    /// The `[floor, last_seen]` window now considered fully gap-examined under
+    /// the current `uid_validity`. The caller persists it (via
+    /// `set_folder_gap_examined`) *after* a successful save, so a future pass
+    /// can skip this range. `None` when gap-fill bailed before establishing a
+    /// window (no state / UIDVALIDITY mismatch / empty search).
+    examined: Option<(u32, u32, u32)>, // (uid_validity, floor, last_seen)
+}
+
+impl GapFillResult {
+    fn empty() -> Self {
+        GapFillResult { emails: Vec::new(), examined: None }
+    }
+}
+
 fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     config: &EmailConfig,
@@ -6211,7 +6261,7 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     folder_name: &str,
     sync_cutoff_days: i64,
     parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
-) -> anyhow::Result<Vec<RawNostrEmail>> {
+) -> anyhow::Result<GapFillResult> {
     let mb = session.select(folder_name)?;
     let uid_validity = mb.uid_validity
         .ok_or_else(|| anyhow::anyhow!("server did not advertise UIDVALIDITY for folder '{}'", folder_name))?;
@@ -6221,14 +6271,14 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
         // No state, or UIDVALIDITY change — bail. Forward sync will set up
         // fresh watermarks; gap-fill only makes sense once we have a stable
         // [min, last] range to scan inside of.
-        _ => return Ok(vec![]),
+        _ => return Ok(GapFillResult::empty()),
     };
 
     let claimed: Vec<u32> = session.uid_search(&build_bootstrap_query(sync_cutoff_days))?
         .into_iter()
         .collect();
     if claimed.is_empty() {
-        return Ok(vec![]);
+        return Ok(GapFillResult::empty());
     }
 
     // If we don't yet have a floor (legacy install), opportunistically backfill
@@ -6247,15 +6297,28 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
         }
     };
 
+    // The window we'll report as gap-examined to the caller (committed only
+    // after a successful persist). Covers the full scanned range even when no
+    // gaps are found, so a future pass can skip it.
+    let examined = Some((uid_validity, floor, stored.last_seen_uid));
+
     // Candidates: UIDs the server returned that fall inside our scanned range.
     // Below `floor` is fetch_older territory; above `last_seen_uid` is forward
     // sync territory. Both have their own paths and shouldn't be re-touched
-    // here.
+    // here. Also skip UIDs already inside the previously-examined range
+    // [gap_examined_min, gap_examined_max] — their nostr-ness was already
+    // determined (message bodies are immutable), so re-fetching them is wasted
+    // work. This is what stops every refresh from re-downloading all the
+    // non-nostr mail in the window.
+    let already_examined = |uid: u32| match (stored.gap_examined_min_uid, stored.gap_examined_max_uid) {
+        (Some(lo), Some(hi)) => uid >= lo && uid <= hi,
+        _ => false,
+    };
     let candidates: Vec<u32> = claimed.into_iter()
-        .filter(|uid| *uid >= floor && *uid <= stored.last_seen_uid)
+        .filter(|uid| *uid >= floor && *uid <= stored.last_seen_uid && !already_examined(*uid))
         .collect();
     if candidates.is_empty() {
-        return Ok(vec![]);
+        return Ok(GapFillResult { emails: Vec::new(), examined });
     }
 
     // Resolve Message-IDs via ENVELOPE (server-side parse, no body fetch) and
@@ -6287,7 +6350,7 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     }
 
     if missing.is_empty() {
-        return Ok(vec![]);
+        return Ok(GapFillResult { emails: Vec::new(), examined });
     }
     println!(
         "[RUST] gap_fill_in_folder: '{}' found {} missing UID(s) within [{}, {}]",
@@ -6309,7 +6372,7 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
             }
         }
     }
-    Ok(emails)
+    Ok(GapFillResult { emails, examined })
 }
 
 /// Read `sync_cutoff_days` for the active pubkey, defaulting to 30.

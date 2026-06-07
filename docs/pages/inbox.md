@@ -14,6 +14,7 @@ View, search, and decrypt received emails from your IMAP server.
 - **Filtering**: Filter to show only Nostr-encrypted emails or all emails
 - **Decryption**: Automatic decryption of encrypted emails using your private key
 - **Pagination**: Load emails in pages (configurable page size)
+- **Threading**: Related emails are grouped into conversation threads
 - **Signature Verification**: Verify Nostr signatures on received emails
 
 ## Usage Instructions
@@ -39,7 +40,12 @@ View, search, and decrypt received emails from your IMAP server.
 
 - Click "Refresh" button to fetch new emails from server
 
-### 5. Navigate Back
+### 5. View Threads
+
+- Emails that belong to the same conversation are grouped into a thread, using the standard `In-Reply-To` and `References` headers
+- Open a thread to see every message in the conversation in order
+
+### 6. Navigate Back
 
 - Click "Back to Inbox" to return to the email list
 

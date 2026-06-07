@@ -13,12 +13,18 @@ A modern email client built with Tauri that integrates Nostr protocol features f
 - **Email Details**: Full email viewing with formatted content
 
 ### 🔐 Nostr Integration
-- **Key Management**: Generate and manage Nostr keypairs (nsec/npriv format)
+- **Multi-Account Key Management**: Generate and manage multiple Nostr keypairs (nsec/npriv), stored in the OS keychain, with an account switcher
 - **Profile Management**: Create and update Nostr profiles with metadata
-- **Direct Messages**: Send and receive encrypted direct messages via Nostr
-- **Relay Management**: Configure and manage Nostr relays with enable/disable controls
-- **Contact Discovery**: Automatically load contacts from your Nostr follow list
+- **Direct Messages**: Send and receive encrypted direct messages via Nostr (NIP-17 gift wrap, with NIP-04 fallback)
+- **Relay Management**: Configure and manage Nostr relays with enable/disable controls, with live event subscriptions
+- **Contact Discovery**: Automatically load contacts from your Nostr follow list (kind 3)
 - **Profile Caching**: Cache profile data and images for offline access
+
+### 🔏 Encryption & Encoding
+- **NIP-44 / NIP-04**: Modern (default) and legacy encryption, with transparent decryption of either
+- **Email Signing**: Sign and verify emails, optionally via X-Nostr headers
+- **Glossia Encoding**: Render ciphertext as readable text so encrypted mail survives forwarding/reply
+- **Encrypted Attachments**: Hybrid AES-256 + NIP-44 attachment encryption
 
 ### 👥 Contact Management
 - **Contact List**: View all your Nostr contacts in a clean, organized interface
@@ -32,7 +38,7 @@ A modern email client built with Tauri that integrates Nostr protocol features f
 ### 🎨 User Interface
 - **Modern Design**: Clean, responsive interface with gradient accents
 - **Dark Mode**: Toggle between light and dark themes
-- **Tabbed Interface**: Organized sections for Compose, Inbox, DMs, Contacts, Profile, and Settings
+- **Tabbed Interface**: Organized sections for Compose, Inbox, Sent, Drafts, Messages (DMs), Contacts, Profile, and Settings
 - **Responsive Layout**: Works on desktop and mobile devices
 - **Loading States**: Visual feedback during data loading and operations
 - **Notifications**: Success and error notifications for user actions
@@ -58,7 +64,8 @@ A modern email client built with Tauri that integrates Nostr protocol features f
 - **Email Libraries**: SMTP and IMAP support for email functionality
 
 ### Data Management
-- **Local Storage**: Settings, contacts, and profile data cached locally
+- **Secure Key Storage**: Private keys stored in the OS keychain (Android: encrypted file backed by the Keystore), never in `localStorage`
+- **Local Database**: SQLite stores per-account settings, contacts, emails, threads, and DM history
 - **Progressive Loading**: Images and data loaded progressively for better UX
 - **Smart Caching**: Intelligent cache management with expiration and updates
 
@@ -144,15 +151,25 @@ The HTTP server runs on `http://127.0.0.1:1420` and the frontend is served on `h
 ### Project Structure
 ```
 tauri-app/
-├── frontend/           # Frontend assets
-│   ├── index.html     # Main HTML file
-│   ├── styles.css     # Styles and themes
-│   └── main.js        # Main JavaScript logic
-├── src/               # Rust backend
-│   ├── main.rs        # Main application logic
-│   └── nostr/         # Nostr protocol implementation
-└── tauri.conf.json    # Tauri configuration
+├── frontend/              # Frontend assets (vanilla JS, no build step)
+│   ├── index.html        # Main HTML file (all views/tabs)
+│   ├── js/               # JavaScript modules (app.js, email-service.js,
+│   │                     #   dm-service.js, contacts-service.js, glossia-service.js, ...)
+│   └── styles/           # CSS files (one per concern)
+├── backend/              # Rust backend
+│   ├── src/
+│   │   ├── main.rs       # Thin entry point (calls lib::run)
+│   │   ├── lib.rs        # Tauri command definitions + invoke_handler
+│   │   ├── email.rs      # SMTP / IMAP / sync
+│   │   ├── nostr.rs      # Nostr protocol
+│   │   ├── crypto.rs     # Encryption/decryption, glossia
+│   │   ├── database.rs   # SQLite
+│   │   ├── keychain.rs   # OS-keychain key vault (multi-account)
+│   │   └── ...
+│   └── tauri.conf.json   # Tauri configuration
 ```
+
+> Tauri commands are registered in `lib.rs`, not `main.rs`.
 
 ### Key Features Implementation
 - **Contact Loading**: Progressive loading with cache management
@@ -185,10 +202,10 @@ limitations under the License.
 
 ## Roadmap
 
-- [ ] Email threading and conversation view
+- [x] Email threading and conversation view
+- [x] Multi-account support
 - [ ] Advanced Nostr filters and search
 - [ ] Contact groups and organization
 - [ ] Email templates and signatures
-- [ ] Multi-account support
 - [ ] Offline mode improvements
 - [ ] Advanced security features

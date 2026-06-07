@@ -55,7 +55,8 @@ Compose and send encrypted emails to recipients, with optional Nostr direct mess
 
 - **Automatic Encryption**: Enable in Settings → Advanced → Automatically Encrypt
 - **Automatic Signing**: Enable in Settings → Advanced → Automatically Sign
-- **Send Matching DM**: Enable in Settings → Advanced → Send Matching DM (sends DM with same subject when emailing Nostr contacts)
+- **Send Matching DM**: Enable in Settings → Advanced → Send Matching DM (sends a NIP-17 gift-wrapped DM with the same subject when emailing Nostr contacts)
+- **Encoding & headers**: The encryption algorithm, [Glossia encoding](../glossia.md), and [X-Nostr headers](../encryption.md#x-nostr-email-headers) used for outgoing mail are configured in Settings → Advanced. See [Encryption & Signing](../encryption.md) for an overview.
 
 ## Tips and Best Practices
 

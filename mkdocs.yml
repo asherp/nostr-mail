@@ -4,14 +4,12 @@ repo_url: https://github.com/asherp/nostr-mail
 site_url: https://nostr-mail.com/docs/
 
 
-repo_url: https://github.com/asherp/nostr-mail
-
-
 nav:
 - Home: index.md
 - Getting Started:
   - Installation: installation.md
   - Quick Start: quick-start.md
+  - Accounts & Keys: pages/accounts.md
   - Nostr Clients: nostr-clients.md
 - User Guides:
   - Compose Page: pages/compose.md
@@ -22,17 +20,19 @@ nav:
   - Contacts Page: pages/contacts.md
   - Profile Page: pages/profile.md
   - Settings Page: pages/settings.md
+- Encryption & Privacy:
+  - Encryption & Signing: encryption.md
+  - Glossia Encoding: glossia.md
+  - NIP-44 Encryption: nip44.md
 - Technical Documentation:
   - Architecture: architecture.md
   - Development: development.md
-  - NIP-44 Encryption: nip44.md
+- Protocol & Specification:
+  - Nostr-Mail Spec: nostr-mail-spec.md
+  - Glossia Design: glossia-design.md
+  - Related Work: related_work.md
 - Legacy Documentation:
   - Legacy Docker Setup: legacy.md
-- Additional Documentation:
-  - NIP: NIP.md
-  - Techstack: Techstack.md
-  - Related Work: related_work.md
-  - WorkLog: WorkLog.md
 
 extra_files:
   - README.md

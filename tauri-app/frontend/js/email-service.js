@@ -291,34 +291,50 @@ class EmailService {
         });
 
         const isSent = source === 'sent';
+        const isMobile = this._isMobilePlatform();
         const downloadAllFn = isSent ? 'downloadAllSentAttachments' : 'downloadAllInboxAttachments';
         const itemsHtml = items.map(({ att, displayName, displaySize }) => {
             const sizeFormatted = (displaySize / 1024).toFixed(2) + ' KB';
             const escapedFilename = Utils.escapeHtml(att.filename || '');
-            const downloadCall = isSent
-                ? `window.emailService.downloadSentAttachment(${email.id}, ${att.id})`
-                : `window.emailService.downloadInboxAttachment(${email.id}, ${att.id}, '${escapedFilename}')`;
+            const escapedName = Utils.escapeHtml(displayName);
+            // Common call prefix; download appends ")", share appends ", 'share')".
+            const callPrefix = isSent
+                ? `window.emailService.downloadSentAttachment(${email.id}, ${att.id}`
+                : `window.emailService.downloadInboxAttachment(${email.id}, ${att.id}, '${escapedFilename}'`;
+            const shareBtn = isMobile
+                ? `<button class="btn btn-sm btn-outline-secondary" onclick="${callPrefix}, 'share')" title="Share ${escapedName}" aria-label="Share ${escapedName}" style="margin-left:5px;">
+                        <i class="fas fa-share-alt"></i>
+                    </button>`
+                : '';
             return `
                 <div class="attachment-item" style="display:flex;justify-content:space-between;align-items:center;padding:10px;border:1px solid #ddd;border-radius:4px;margin:5px 0;">
                     <div class="attachment-info" style="display:flex;align-items:center;">
                         <i class="fas fa-file" style="margin-right:10px;"></i>
                         <div>
-                            <div class="attachment-name" style="font-weight:bold;">${Utils.escapeHtml(displayName)}</div>
+                            <div class="attachment-name" style="font-weight:bold;">${escapedName}</div>
                             <div class="attachment-meta" style="font-size:0.9em;color:#666;">${sizeFormatted}</div>
                         </div>
                     </div>
-                    <button class="btn btn-sm btn-outline-primary" onclick="${downloadCall}" title="Download ${Utils.escapeHtml(displayName)}" aria-label="Download ${Utils.escapeHtml(displayName)}">
-                        <i class="fas fa-download"></i>
-                    </button>
+                    <div class="attachment-actions" style="display:flex;align-items:center;">
+                        <button class="btn btn-sm btn-outline-primary" onclick="${callPrefix})" title="Download ${escapedName}" aria-label="Download ${escapedName}">
+                            <i class="fas fa-download"></i>
+                        </button>
+                        ${shareBtn}
+                    </div>
                 </div>`;
         }).join('');
 
         // Only offer "Download All" when there's more than one attachment —
-        // with a single file the per-item download button already covers it (issue #62).
+        // with a single file the per-item buttons already cover it (issue #62).
         const downloadAllHtml = items.length > 1
-            ? `<button class="btn btn-sm btn-outline-success" onclick="window.emailService.${downloadAllFn}(${email.id})" title="Download all attachments as ZIP">
-                        <i class="fas fa-download"></i> Download All
+            ? `<button class="btn btn-sm btn-outline-success" onclick="window.emailService.${downloadAllFn}(${email.id})" title="Download all attachments as ZIP" aria-label="Download all attachments">
+                        <i class="fas fa-download"></i>${isMobile ? '' : ' Download All'}
+                    </button>` +
+              (isMobile
+                ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.${downloadAllFn}(${email.id}, 'share')" title="Share all attachments as ZIP" aria-label="Share all attachments" style="margin-left:5px;">
+                        <i class="fas fa-share-alt"></i>
                     </button>`
+                : '')
             : '';
         return `
             <div class="email-attachments" style="margin:15px 0;">
@@ -4477,9 +4493,14 @@ class EmailService {
                         <div class="email-attachments" id="inbox-email-attachments" style="margin: 15px 0;">
                             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                                 <h4>Attachments (${attachmentDisplayData.length})</h4>
-                                <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllInboxAttachments(${email.id})" title="Download all attachments as ZIP">
-                                    <i class="fas fa-download"></i> Download All
-                                </button>
+                                ${attachmentDisplayData.length > 1 ? `<div class="attachment-actions" style="display: flex; align-items: center; gap: 5px;">
+                                    <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllInboxAttachments(${email.id})" title="Download all attachments as ZIP" aria-label="Download all attachments">
+                                        <i class="fas fa-download"></i>${window.emailService._isMobilePlatform() ? '' : ' Download All'}
+                                    </button>
+                                    ${window.emailService._isMobilePlatform() ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.downloadAllInboxAttachments(${email.id}, 'share')" title="Share all attachments as ZIP" aria-label="Share all attachments">
+                                        <i class="fas fa-share-alt"></i>
+                                    </button>` : ''}
+                                </div>` : ''}
                             </div>
                             <div class="attachment-list">
                                 ${attachmentDisplayData.map(attachment => {
@@ -4507,10 +4528,13 @@ class EmailService {
                                                 </div>
                                             </div>
                                         </div>
-                                        <div class="attachment-actions">
-                                            <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadInboxAttachment(${email.id}, ${attachment.id}, '${Utils.escapeHtml(encryptedFilename)}')">
-                                                <i class="fas fa-download"></i> Download
+                                        <div class="attachment-actions" style="display: flex; align-items: center; gap: 5px;">
+                                            <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadInboxAttachment(${email.id}, ${attachment.id}, '${Utils.escapeHtml(encryptedFilename)}')" title="Download" aria-label="Download">
+                                                <i class="fas fa-download"></i>${window.emailService._isMobilePlatform() ? '' : ' Download'}
                                             </button>
+                                            ${window.emailService._isMobilePlatform() ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.downloadInboxAttachment(${email.id}, ${attachment.id}, '${Utils.escapeHtml(encryptedFilename)}', 'share')" title="Share" aria-label="Share">
+                                                <i class="fas fa-share-alt"></i>
+                                            </button>` : ''}
                                         </div>
                                     </div>`;
                                 }).join('')}
@@ -8253,9 +8277,14 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 <div class="email-attachments" id="sent-email-attachments" style="margin: 15px 0;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                         <h4>Attachments (${attachmentDisplayData.length})</h4>
-                        <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllSentAttachments(${email.id})" title="Download all attachments as ZIP">
-                            <i class="fas fa-download"></i> Download All
-                        </button>
+                        ${attachmentDisplayData.length > 1 ? `<div class="attachment-actions" style="display: flex; align-items: center; gap: 5px;">
+                            <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllSentAttachments(${email.id})" title="Download all attachments as ZIP" aria-label="Download all attachments">
+                                <i class="fas fa-download"></i>${window.emailService._isMobilePlatform() ? '' : ' Download All'}
+                            </button>
+                            ${window.emailService._isMobilePlatform() ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.downloadAllSentAttachments(${email.id}, 'share')" title="Share all attachments as ZIP" aria-label="Share all attachments">
+                                <i class="fas fa-share-alt"></i>
+                            </button>` : ''}
+                        </div>` : ''}
                     </div>
                     <div class="attachment-list">
                         ${attachmentDisplayData.map(attachment => {
@@ -8282,10 +8311,13 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                         </div>
                                     </div>
                                 </div>
-                                <div class="attachment-actions">
-                                    <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadSentAttachment(${email.id}, ${attachment.id})">
-                                        <i class="fas fa-download"></i> Download
+                                <div class="attachment-actions" style="display: flex; align-items: center; gap: 5px;">
+                                    <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadSentAttachment(${email.id}, ${attachment.id})" title="Download" aria-label="Download">
+                                        <i class="fas fa-download"></i>${window.emailService._isMobilePlatform() ? '' : ' Download'}
                                     </button>
+                                    ${window.emailService._isMobilePlatform() ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.downloadSentAttachment(${email.id}, ${attachment.id}, 'share')" title="Share" aria-label="Share">
+                                        <i class="fas fa-share-alt"></i>
+                                    </button>` : ''}
                                 </div>
                             </div>`;
                         }).join('')}
@@ -8804,7 +8836,7 @@ ${attachmentsHtml}
     }
 
     // Download attachment from sent email
-    async downloadSentAttachment(emailId, attachmentId) {
+    async downloadSentAttachment(emailId, attachmentId, action = 'download') {
         try {
             console.log(`[JS] Downloading attachment ${attachmentId} from sent email ${emailId}`);
             console.log(`[JS] EmailId type: ${typeof emailId}, AttachmentId type: ${typeof attachmentId}`);
@@ -8874,26 +8906,22 @@ ${attachmentsHtml}
                     opaqueId
                 );
 
-                // Save decrypted attachment to disk using Tauri
-                const filePath = await TauriService.saveAttachmentToDisk(
+                // Deliver decrypted attachment (save or share)
+                await this._deliverFile(
+                    action,
                     decryptedAttachment.filename,
                     decryptedAttachment.dataB64,
-                    decryptedAttachment.contentType || 'application/octet-stream'
+                    decryptedAttachment.contentType
                 );
 
-                console.log(`[JS] Downloaded decrypted attachment: ${decryptedAttachment.filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
-                
             } else {
-                // Plain attachment - save directly to disk using Tauri
-                const filePath = await TauriService.saveAttachmentToDisk(
-                    attachment.filename, 
-                    attachment.data, 
-                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                // Plain attachment - deliver directly (save or share)
+                await this._deliverFile(
+                    action,
+                    attachment.filename,
+                    attachment.data,
+                    attachment.content_type || attachment.mime_type
                 );
-                
-                console.log(`[JS] Downloaded plain attachment: ${attachment.filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
             }
             
         } catch (error) {
@@ -8903,7 +8931,7 @@ ${attachmentsHtml}
     }
 
     // Download all attachments from sent email as ZIP
-    async downloadAllSentAttachments(emailId) {
+    async downloadAllSentAttachments(emailId, action = 'download') {
         try {
             console.log(`[JS] Downloading all attachments from sent email ${emailId} as ZIP`);
             
@@ -9019,11 +9047,9 @@ ${attachmentsHtml}
             
             console.log(`[JS] Creating ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
             
-            // Save as ZIP
-            const zipPath = await TauriService.saveAttachmentsAsZip(zipFilename, attachmentsForZip);
-            
-            console.log(`[JS] Successfully created ZIP file: ${zipPath}`);
-            window.notificationService.showSuccess(`All attachments saved to: ${zipPath}`);
+            // Deliver as ZIP (save or share)
+            console.log(`[JS] Delivering ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
+            await this._deliverZip(action, zipFilename, attachmentsForZip);
             
         } catch (error) {
             console.error('[JS] Failed to download all attachments:', error);
@@ -9032,7 +9058,36 @@ ${attachmentsHtml}
     }
 
     // Download attachment from inbox email
-    async downloadInboxAttachment(emailId, attachmentId, encryptedFilename = null) {
+    // The share sheet only exists on mobile (Android/iOS); desktop just saves.
+    _isMobilePlatform() {
+        return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+    }
+
+    // Deliver a single file: save to Downloads, or (action === 'share') open the
+    // mobile share sheet. Shows the appropriate toast.
+    async _deliverFile(action, filename, dataB64, mime, label) {
+        const mimeType = mime || 'application/octet-stream';
+        if (action === 'share') {
+            await TauriService.shareAttachmentToDisk(filename, dataB64, mimeType);
+            window.notificationService.showSuccess('Opening share sheet…');
+        } else {
+            const dest = await TauriService.saveAttachmentToDisk(filename, dataB64, mimeType);
+            window.notificationService.showSuccess(`${label || 'Attachment'} saved to: ${dest}`);
+        }
+    }
+
+    // Deliver a ZIP of all attachments: save to Downloads, or share.
+    async _deliverZip(action, zipFilename, attachmentsForZip) {
+        if (action === 'share') {
+            await TauriService.shareAttachmentsAsZip(zipFilename, attachmentsForZip);
+            window.notificationService.showSuccess('Opening share sheet…');
+        } else {
+            const dest = await TauriService.saveAttachmentsAsZip(zipFilename, attachmentsForZip);
+            window.notificationService.showSuccess(`All attachments saved to: ${dest}`);
+        }
+    }
+
+    async downloadInboxAttachment(emailId, attachmentId, encryptedFilename = null, action = 'download') {
         try {
             console.log(`[JS] Downloading attachment ${attachmentId} from inbox email ${emailId}`);
             
@@ -9049,13 +9104,13 @@ ${attachmentsHtml}
             // If in raw mode and attachment is encrypted, download the raw encrypted data
             if (isRawMode && attachment.encryption_method === 'manifest_aes') {
                 console.log(`[JS] Raw mode detected, downloading encrypted attachment: ${attachment.filename}`);
-                const filePath = await TauriService.saveAttachmentToDisk(
+                await this._deliverFile(
+                    action,
                     encryptedFilename || attachment.filename,
                     attachment.data,
-                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                    attachment.content_type || attachment.mime_type,
+                    'Raw attachment'
                 );
-                console.log(`[JS] Downloaded raw encrypted attachment: ${attachment.filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Raw attachment saved to: ${filePath}`);
                 return;
             }
             
@@ -9118,26 +9173,22 @@ ${attachmentsHtml}
                     opaqueId
                 );
 
-                // Save decrypted attachment to disk using Tauri
-                const filePath = await TauriService.saveAttachmentToDisk(
+                // Deliver decrypted attachment (save or share)
+                await this._deliverFile(
+                    action,
                     decryptedAttachment.filename,
                     decryptedAttachment.dataB64,
-                    decryptedAttachment.contentType || 'application/octet-stream'
+                    decryptedAttachment.contentType
                 );
-                
-                console.log(`[JS] Downloaded decrypted attachment: ${attachmentMeta.orig_filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
-                
+
             } else {
-                // Plain attachment - save directly to disk using Tauri
-                const filePath = await TauriService.saveAttachmentToDisk(
-                    attachment.filename, 
-                    attachment.data, 
-                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                // Plain attachment - deliver directly (save or share)
+                await this._deliverFile(
+                    action,
+                    attachment.filename,
+                    attachment.data,
+                    attachment.content_type || attachment.mime_type
                 );
-                
-                console.log(`[JS] Downloaded plain attachment: ${attachment.filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
             }
             
         } catch (error) {
@@ -9147,7 +9198,7 @@ ${attachmentsHtml}
     }
 
     // Download all attachments from inbox email as ZIP
-    async downloadAllInboxAttachments(emailId) {
+    async downloadAllInboxAttachments(emailId, action = 'download') {
         try {
             console.log(`[JS] Downloading all attachments from inbox email ${emailId} as ZIP`);
             
@@ -9281,11 +9332,9 @@ ${attachmentsHtml}
             
             console.log(`[JS] Creating ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
             
-            // Save as ZIP
-            const zipPath = await TauriService.saveAttachmentsAsZip(zipFilename, attachmentsForZip);
-            
-            console.log(`[JS] Successfully created ZIP file: ${zipPath}`);
-            window.notificationService.showSuccess(`All attachments saved to: ${zipPath}`);
+            // Deliver as ZIP (save or share)
+            console.log(`[JS] Delivering ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
+            await this._deliverZip(action, zipFilename, attachmentsForZip);
             
         } catch (error) {
             console.error('[JS] Failed to download all attachments:', error);

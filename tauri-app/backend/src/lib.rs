@@ -3764,54 +3764,403 @@ fn db_delete_attachment(attachment_id: i64, state: tauri::State<AppState>) -> Re
     db.delete_attachment(attachment_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn save_attachment_to_disk(filename: String, data: String, _mime_type: String) -> Result<String, String> {
-    println!("[RUST] save_attachment_to_disk called for filename: {}", filename);
-    
-    use base64::{Engine as _, engine::general_purpose};
-    
-    // Get user's Downloads directory
+/// Android file saving.
+///
+/// The `dirs` crate has no Android implementation — `dirs::download_dir()`
+/// returns `None` in the Tauri Android process, so the desktop "write to the
+/// Downloads folder" path simply fails. Modern Android (scoped storage, API
+/// 29+) also forbids writing to the public Downloads folder by a raw path.
+///
+/// Instead we write the bytes to the app's private cache dir (always writable,
+/// no permission required) and hand the file to Android's share/save chooser
+/// via a FileProvider content URI. The user picks the destination (Downloads,
+/// Drive, another app). This reuses the same JNI-dispatch pattern as
+/// `keychain.rs` (`tauri::wry::prelude::dispatch` + `find_class`).
+#[cfg(target_os = "android")]
+mod android_share {
+    use jni::objects::{JObject, JString, JValue};
+    use jni::JNIEnv;
+    use std::sync::mpsc;
+
+    /// If a Java exception is pending, dump it to logcat and clear it so the
+    /// next JNI call doesn't immediately fail.
+    fn drain_exception(env: &mut JNIEnv) {
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_describe();
+            let _ = env.exception_clear();
+        }
+    }
+
+    /// `ContentValues.put(key, value)` for String values.
+    fn put_str(env: &mut JNIEnv, values: &JObject, key: &str, val: &str) -> Result<(), String> {
+        let k = env.new_string(key).map_err(|e| e.to_string())?;
+        let v = env.new_string(val).map_err(|e| e.to_string())?;
+        env.call_method(
+            values,
+            "put",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(&k), JValue::Object(&v)],
+        )
+        .map_err(|e| { drain_exception(env); format!("ContentValues.put({}): {}", key, e) })?;
+        Ok(())
+    }
+
+    /// Fetch the app cache directory and package name from the Activity context.
+    fn cache_dir_and_pkg() -> Result<(String, String), String> {
+        let (tx, rx) = mpsc::channel::<Result<(String, String), String>>();
+        tauri::wry::prelude::dispatch(move |env, activity, _webview| {
+            let result = (|| -> Result<(String, String), String> {
+                let cache = env
+                    .call_method(activity, "getCacheDir", "()Ljava/io/File;", &[])
+                    .and_then(|v| v.l())
+                    .map_err(|e| { drain_exception(env); format!("getCacheDir failed: {}", e) })?;
+                let path_obj = env
+                    .call_method(&cache, "getAbsolutePath", "()Ljava/lang/String;", &[])
+                    .and_then(|v| v.l())
+                    .map_err(|e| format!("getAbsolutePath failed: {}", e))?;
+                let jpath: JString = path_obj.into();
+                let path: String = env
+                    .get_string(&jpath)
+                    .map_err(|e| format!("read cache path: {}", e))?
+                    .into();
+                let pkg_obj = env
+                    .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])
+                    .and_then(|v| v.l())
+                    .map_err(|e| format!("getPackageName failed: {}", e))?;
+                let jpkg: JString = pkg_obj.into();
+                let pkg: String = env
+                    .get_string(&jpkg)
+                    .map_err(|e| format!("read package name: {}", e))?
+                    .into();
+                Ok((path, pkg))
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .map_err(|e| format!("cache_dir dispatch channel closed: {}", e))?
+    }
+
+    /// Build an ACTION_SEND chooser for `path` and launch it.
+    fn launch_chooser(path: String, pkg: String, mime: String) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        tauri::wry::prelude::dispatch(move |env, activity, _webview| {
+            let result = (|| -> Result<(), String> {
+                // File file = new File(path)
+                let jpath = env.new_string(&path).map_err(|e| e.to_string())?;
+                let file = env
+                    .new_object("java/io/File", "(Ljava/lang/String;)V", &[JValue::Object(&jpath)])
+                    .map_err(|e| { drain_exception(env); format!("new File failed: {}", e) })?;
+
+                // Uri uri = FileProvider.getUriForFile(activity, "<pkg>.fileprovider", file)
+                // FileProvider is an androidx (app) class, so resolve it through the
+                // activity classloader rather than env.find_class.
+                let authority = format!("{}.fileprovider", pkg);
+                let jauth = env.new_string(&authority).map_err(|e| e.to_string())?;
+                let fp_class = tauri::wry::prelude::find_class(
+                    env,
+                    activity,
+                    "androidx.core.content.FileProvider".to_string(),
+                )
+                .map_err(|e| { drain_exception(env); format!("find FileProvider failed: {}", e) })?;
+                let uri = env
+                    .call_static_method(
+                        &fp_class,
+                        "getUriForFile",
+                        "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;",
+                        &[JValue::Object(activity), JValue::Object(&jauth), JValue::Object(&file)],
+                    )
+                    .and_then(|v| v.l())
+                    .map_err(|e| { drain_exception(env); format!("getUriForFile failed: {}", e) })?;
+
+                // Intent intent = new Intent(Intent.ACTION_SEND)
+                let action = env
+                    .new_string("android.intent.action.SEND")
+                    .map_err(|e| e.to_string())?;
+                let intent = env
+                    .new_object("android/content/Intent", "(Ljava/lang/String;)V", &[JValue::Object(&action)])
+                    .map_err(|e| format!("new Intent failed: {}", e))?;
+
+                // intent.setType(mime)
+                let jmime = env.new_string(&mime).map_err(|e| e.to_string())?;
+                env.call_method(&intent, "setType", "(Ljava/lang/String;)Landroid/content/Intent;", &[JValue::Object(&jmime)])
+                    .map_err(|e| format!("setType failed: {}", e))?;
+
+                // intent.putExtra(Intent.EXTRA_STREAM, uri)
+                let extra = env
+                    .new_string("android.intent.extra.STREAM")
+                    .map_err(|e| e.to_string())?;
+                env.call_method(
+                    &intent,
+                    "putExtra",
+                    "(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;",
+                    &[JValue::Object(&extra), JValue::Object(&uri)],
+                )
+                .map_err(|e| format!("putExtra failed: {}", e))?;
+
+                // intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(1)])
+                    .map_err(|e| format!("addFlags failed: {}", e))?;
+
+                // Intent chooser = Intent.createChooser(intent, "Save attachment")
+                let title = env.new_string("Save attachment").map_err(|e| e.to_string())?;
+                let chooser = env
+                    .call_static_method(
+                        "android/content/Intent",
+                        "createChooser",
+                        "(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;",
+                        &[JValue::Object(&intent), JValue::Object(&title)],
+                    )
+                    .and_then(|v| v.l())
+                    .map_err(|e| format!("createChooser failed: {}", e))?;
+
+                // chooser.addFlags(FLAG_ACTIVITY_NEW_TASK)
+                env.call_method(&chooser, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(0x1000_0000)])
+                    .map_err(|e| format!("chooser addFlags failed: {}", e))?;
+
+                // activity.startActivity(chooser)
+                env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&chooser)])
+                    .map_err(|e| { drain_exception(env); format!("startActivity failed: {}", e) })?;
+                Ok(())
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .map_err(|e| format!("chooser dispatch channel closed: {}", e))?
+    }
+
+    /// Write `bytes` to a private cache file and present Android's share/save
+    /// chooser so the user can store it wherever they like.
+    pub fn share_bytes(filename: &str, mime: &str, bytes: &[u8]) -> Result<(), String> {
+        let (cache, pkg) = cache_dir_and_pkg()?;
+
+        // Keep a flat filename inside a dedicated cache subdir (covered by the
+        // FileProvider <cache-path> entry in file_paths.xml).
+        let safe = filename.rsplit('/').next().unwrap_or(filename);
+        let safe = if safe.is_empty() { "attachment" } else { safe };
+        let dir = std::path::Path::new(&cache).join("shared_attachments");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create cache dir: {}", e))?;
+        let path = dir.join(safe);
+        std::fs::write(&path, bytes).map_err(|e| format!("write cache file: {}", e))?;
+
+        let mime = if mime.is_empty() { "application/octet-stream" } else { mime };
+        launch_chooser(path.to_string_lossy().to_string(), pkg, mime.to_string())
+    }
+
+    /// Save `bytes` straight into the device's public Downloads folder.
+    ///
+    /// On API 29+ this uses MediaStore (no permission required; the file shows
+    /// up in the Downloads app / Files). On older devices (24–28) where
+    /// `MediaStore.Downloads` doesn't exist, it falls back to the app's external
+    /// files `Download/` dir, which is always writable without a permission and
+    /// is reachable through file managers.
+    pub fn save_to_downloads(filename: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
+        let filename = {
+            let f = filename.rsplit('/').next().unwrap_or(filename);
+            if f.is_empty() { "attachment".to_string() } else { f.to_string() }
+        };
+        let mime = if mime.is_empty() { "application/octet-stream".to_string() } else { mime.to_string() };
+        let data = bytes.to_vec();
+
+        let (tx, rx) = mpsc::channel::<Result<String, String>>();
+        tauri::wry::prelude::dispatch(move |env, activity, _webview| {
+            let result = (|| -> Result<String, String> {
+                let sdk_int = env
+                    .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
+                    .and_then(|v| v.i())
+                    .map_err(|e| { drain_exception(env); format!("read SDK_INT: {}", e) })?;
+
+                // Downloads directory name (e.g. "Download").
+                let dir_obj = env
+                    .get_static_field("android/os/Environment", "DIRECTORY_DOWNLOADS", "Ljava/lang/String;")
+                    .and_then(|v| v.l())
+                    .map_err(|e| { drain_exception(env); format!("DIRECTORY_DOWNLOADS: {}", e) })?;
+
+                if sdk_int >= 29 {
+                    let dir_jstr: JString = dir_obj.into();
+                    let dir_name: String = env
+                        .get_string(&dir_jstr)
+                        .map_err(|e| format!("read DIRECTORY_DOWNLOADS: {}", e))?
+                        .into();
+
+                    // ContentValues describing the new Downloads entry.
+                    let values = env
+                        .new_object("android/content/ContentValues", "()V", &[])
+                        .map_err(|e| { drain_exception(env); format!("new ContentValues: {}", e) })?;
+                    put_str(env, &values, "_display_name", &filename)?;
+                    put_str(env, &values, "mime_type", &mime)?;
+                    put_str(env, &values, "relative_path", &dir_name)?;
+
+                    // Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+                    let collection = env
+                        .get_static_field(
+                            "android/provider/MediaStore$Downloads",
+                            "EXTERNAL_CONTENT_URI",
+                            "Landroid/net/Uri;",
+                        )
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("EXTERNAL_CONTENT_URI: {}", e) })?;
+
+                    // ContentResolver resolver = activity.getContentResolver();
+                    let resolver = env
+                        .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("getContentResolver: {}", e) })?;
+
+                    // Uri item = resolver.insert(collection, values);
+                    let item = env
+                        .call_method(
+                            &resolver,
+                            "insert",
+                            "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
+                            &[JValue::Object(&collection), JValue::Object(&values)],
+                        )
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("MediaStore insert: {}", e) })?;
+                    if item.is_null() {
+                        return Err("MediaStore insert returned null".to_string());
+                    }
+
+                    // OutputStream os = resolver.openOutputStream(item);
+                    let os = env
+                        .call_method(
+                            &resolver,
+                            "openOutputStream",
+                            "(Landroid/net/Uri;)Ljava/io/OutputStream;",
+                            &[JValue::Object(&item)],
+                        )
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("openOutputStream: {}", e) })?;
+                    if os.is_null() {
+                        return Err("openOutputStream returned null".to_string());
+                    }
+
+                    // os.write(bytes); os.flush(); os.close();
+                    let arr = env.byte_array_from_slice(&data).map_err(|e| format!("byte array: {}", e))?;
+                    env.call_method(&os, "write", "([B)V", &[JValue::Object(&arr)])
+                        .map_err(|e| { drain_exception(env); format!("OutputStream.write: {}", e) })?;
+                    let _ = env.call_method(&os, "flush", "()V", &[]);
+                    let _ = env.call_method(&os, "close", "()V", &[]);
+
+                    Ok(format!("{}/{}", dir_name, filename))
+                } else {
+                    // Pre-29: app external files Download dir (no permission needed).
+                    let ext = env
+                        .call_method(
+                            activity,
+                            "getExternalFilesDir",
+                            "(Ljava/lang/String;)Ljava/io/File;",
+                            &[JValue::Object(&dir_obj)],
+                        )
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("getExternalFilesDir: {}", e) })?;
+                    if ext.is_null() {
+                        return Err("external files dir unavailable".to_string());
+                    }
+                    let path_obj = env
+                        .call_method(&ext, "getAbsolutePath", "()Ljava/lang/String;", &[])
+                        .and_then(|v| v.l())
+                        .map_err(|e| format!("getAbsolutePath: {}", e))?;
+                    let path_jstr: JString = path_obj.into();
+                    let dir_path: String = env
+                        .get_string(&path_jstr)
+                        .map_err(|e| format!("read external dir: {}", e))?
+                        .into();
+                    std::fs::create_dir_all(&dir_path).map_err(|e| format!("create dir: {}", e))?;
+                    let path = std::path::Path::new(&dir_path).join(&filename);
+                    std::fs::write(&path, &data).map_err(|e| format!("write file: {}", e))?;
+                    Ok(path.to_string_lossy().to_string())
+                }
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .map_err(|e| format!("save_to_downloads dispatch channel closed: {}", e))?
+    }
+}
+
+/// Desktop: write `bytes` to the user's Downloads directory, appending a
+/// `(n)` suffix if a file of that name already exists. Returns the full path.
+#[cfg(not(target_os = "android"))]
+fn desktop_save_to_downloads(filename: &str, bytes: &[u8]) -> Result<String, String> {
     let downloads_dir = dirs::download_dir()
         .ok_or_else(|| "Could not find Downloads directory".to_string())?;
-    
-    // Create full path for the file
-    let mut file_path = downloads_dir.join(&filename);
-    
-    // If file exists, add a number to make it unique
+
+    let mut file_path = downloads_dir.join(filename);
     let mut counter = 1;
     while file_path.exists() {
-        let stem = std::path::Path::new(&filename)
+        let stem = std::path::Path::new(filename)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(&filename);
-        let extension = std::path::Path::new(&filename)
+            .unwrap_or(filename);
+        let extension = std::path::Path::new(filename)
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        
+
         let new_filename = if extension.is_empty() {
             format!("{} ({})", stem, counter)
         } else {
             format!("{} ({}).{}", stem, counter, extension)
         };
-        
+
         file_path = downloads_dir.join(new_filename);
         counter += 1;
     }
-    
-    // Decode base64 data
+
+    std::fs::write(&file_path, bytes)
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+
+    let path_str = file_path.to_string_lossy().to_string();
+    println!("[RUST] Successfully saved to: {}", path_str);
+    Ok(path_str)
+}
+
+#[tauri::command]
+async fn save_attachment_to_disk(filename: String, data: String, _mime_type: String) -> Result<String, String> {
+    println!("[RUST] save_attachment_to_disk called for filename: {}", filename);
+
+    use base64::{Engine as _, engine::general_purpose};
+
     let decoded_data = general_purpose::STANDARD
         .decode(&data)
         .map_err(|e| format!("Failed to decode base64 data: {}", e))?;
-    
-    // Write file to disk
-    std::fs::write(&file_path, decoded_data)
-        .map_err(|e| format!("Failed to write file: {}", e))?;
-    
-    let path_str = file_path.to_string_lossy().to_string();
-    println!("[RUST] Successfully saved attachment to: {}", path_str);
-    
-    Ok(path_str)
+
+    // Android: save straight into the public Downloads folder.
+    #[cfg(target_os = "android")]
+    {
+        return android_share::save_to_downloads(&filename, &_mime_type, &decoded_data);
+    }
+
+    // Desktop: write to the user's Downloads directory.
+    #[cfg(not(target_os = "android"))]
+    {
+        return desktop_save_to_downloads(&filename, &decoded_data);
+    }
+}
+
+/// Like `save_attachment_to_disk`, but on Android it opens the share sheet so
+/// the user can send the file to another app instead of saving it. On desktop
+/// there's no share sheet, so it falls back to saving in Downloads.
+#[tauri::command]
+async fn share_attachment_to_disk(filename: String, data: String, _mime_type: String) -> Result<String, String> {
+    println!("[RUST] share_attachment_to_disk called for filename: {}", filename);
+
+    use base64::{Engine as _, engine::general_purpose};
+
+    let decoded_data = general_purpose::STANDARD
+        .decode(&data)
+        .map_err(|e| format!("Failed to decode base64 data: {}", e))?;
+
+    #[cfg(target_os = "android")]
+    {
+        android_share::share_bytes(&filename, &_mime_type, &decoded_data)?;
+        return Ok("the app you choose".to_string());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        return desktop_save_to_downloads(&filename, &decoded_data);
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -3824,60 +4173,70 @@ struct AttachmentForZip {
 async fn save_attachments_as_zip(zip_filename: String, attachments: Vec<AttachmentForZip>) -> Result<String, String> {
     println!("[RUST] save_attachments_as_zip called with {} attachments", attachments.len());
     
+    let zip_bytes = build_zip(attachments)?;
+
+    // Android: save straight into the public Downloads folder.
+    #[cfg(target_os = "android")]
+    {
+        return android_share::save_to_downloads(&zip_filename, "application/zip", &zip_bytes);
+    }
+
+    // Desktop: write to the user's Downloads directory.
+    #[cfg(not(target_os = "android"))]
+    {
+        return desktop_save_to_downloads(&zip_filename, &zip_bytes);
+    }
+}
+
+/// Build a ZIP archive of the given attachments in memory.
+fn build_zip(attachments: Vec<AttachmentForZip>) -> Result<Vec<u8>, String> {
     use std::io::Write;
     use base64::{Engine as _, engine::general_purpose};
-    
-    // Get user's Downloads directory
-    let downloads_dir = dirs::download_dir()
-        .ok_or_else(|| "Could not find Downloads directory".to_string())?;
-    
-    // Create unique ZIP filename
-    let mut zip_path = downloads_dir.join(&zip_filename);
-    let mut counter = 1;
-    while zip_path.exists() {
-        let stem = std::path::Path::new(&zip_filename)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&zip_filename);
-        let new_filename = format!("{} ({}).zip", stem, counter);
-        zip_path = downloads_dir.join(new_filename);
-        counter += 1;
+
+    let mut zip_bytes: Vec<u8> = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut zip_bytes);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o755);
+
+        for attachment in attachments {
+            println!("[RUST] Adding to ZIP: {}", attachment.filename);
+
+            let decoded_data = general_purpose::STANDARD
+                .decode(&attachment.data)
+                .map_err(|e| format!("Failed to decode base64 data for {}: {}", attachment.filename, e))?;
+
+            zip.start_file(&attachment.filename, options)
+                .map_err(|e| format!("Failed to start file in ZIP: {}", e))?;
+            zip.write_all(&decoded_data)
+                .map_err(|e| format!("Failed to write file data to ZIP: {}", e))?;
+        }
+
+        zip.finish()
+            .map_err(|e| format!("Failed to finish ZIP file: {}", e))?;
     }
-    
-    // Create ZIP file
-    let zip_file = std::fs::File::create(&zip_path)
-        .map_err(|e| format!("Failed to create ZIP file: {}", e))?;
-    
-    let mut zip = zip::ZipWriter::new(zip_file);
-    let options = zip::write::FileOptions::<()>::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .unix_permissions(0o755);
-    
-    // Add each attachment to the ZIP
-    for attachment in attachments {
-        println!("[RUST] Adding to ZIP: {}", attachment.filename);
-        
-        // Decode base64 data
-        let decoded_data = general_purpose::STANDARD
-            .decode(&attachment.data)
-            .map_err(|e| format!("Failed to decode base64 data for {}: {}", attachment.filename, e))?;
-        
-        // Add file to ZIP
-        zip.start_file(&attachment.filename, options)
-            .map_err(|e| format!("Failed to start file in ZIP: {}", e))?;
-        
-        zip.write_all(&decoded_data)
-            .map_err(|e| format!("Failed to write file data to ZIP: {}", e))?;
+    Ok(zip_bytes)
+}
+
+/// Like `save_attachments_as_zip`, but on Android it opens the share sheet.
+#[tauri::command]
+async fn share_attachments_as_zip(zip_filename: String, attachments: Vec<AttachmentForZip>) -> Result<String, String> {
+    println!("[RUST] share_attachments_as_zip called with {} attachments", attachments.len());
+
+    let zip_bytes = build_zip(attachments)?;
+
+    #[cfg(target_os = "android")]
+    {
+        android_share::share_bytes(&zip_filename, "application/zip", &zip_bytes)?;
+        return Ok("the app you choose".to_string());
     }
-    
-    // Finish ZIP file
-    zip.finish()
-        .map_err(|e| format!("Failed to finish ZIP file: {}", e))?;
-    
-    let path_str = zip_path.to_string_lossy().to_string();
-    println!("[RUST] Successfully created ZIP file: {}", path_str);
-    
-    Ok(path_str)
+
+    #[cfg(not(target_os = "android"))]
+    {
+        return desktop_save_to_downloads(&zip_filename, &zip_bytes);
+    }
 }
 
 #[tauri::command]
@@ -7203,6 +7562,8 @@ pub fn run() {
         db_delete_attachment,
         save_attachment_to_disk,
         save_attachments_as_zip,
+        share_attachment_to_disk,
+        share_attachments_as_zip,
         db_save_email_with_attachments,
         db_save_setting,
         db_get_setting,

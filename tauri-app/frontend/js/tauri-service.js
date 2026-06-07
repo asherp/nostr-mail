@@ -656,6 +656,12 @@ const TauriService = {
     saveAttachmentsAsZip: async function(zipFilename, attachments) {
         return await this.invoke('save_attachments_as_zip', { zipFilename, attachments });
     },
+    shareAttachmentToDisk: async function(filename, data, mimeType) {
+        return await this.invoke('share_attachment_to_disk', { filename, data, mimeType });
+    },
+    shareAttachmentsAsZip: async function(zipFilename, attachments) {
+        return await this.invoke('share_attachments_as_zip', { zipFilename, attachments });
+    },
     findEmailsByMessageId: async function(messageId) {
         return await this.invoke('db_find_emails_by_message_id', { messageId });
     },

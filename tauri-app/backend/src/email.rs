@@ -5360,8 +5360,9 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     let max_scan = lookup_max_scan(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
     let spam_rescue = lookup_spam_rescue(db, active_pubkey);
+    let auto_move_nostr = lookup_auto_move_nostr(db, active_pubkey);
     let rescue_target = lookup_spam_rescue_target(db, active_pubkey);
-    debug_log!("[RUST] sync: spam_rescue={}, rescue_target='{}'", spam_rescue, rescue_target);
+    debug_log!("[RUST] sync: spam_rescue={}, auto_move_nostr={}, rescue_target='{}'", spam_rescue, auto_move_nostr, rescue_target);
 
     // Folders to scan. Default (empty/None) = provider-aware list from
     // `default_inbox_folders`. Multiple folders may be supplied to scan in a
@@ -5403,9 +5404,9 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         .filter(|f| !is_spam_folder_name(f))
         .collect();
 
-    // With spam rescue on, ensure the rescue target is in the scan set so moved
-    // messages land in the local DB during this same pass.
-    if spam_rescue && !folders.iter().any(|f| f.eq_ignore_ascii_case(&rescue_target)) {
+    // With spam rescue or inbox auto-filing on, ensure the destination folder is
+    // in the scan set so moved messages land in the local DB during this same pass.
+    if (spam_rescue || auto_move_nostr) && !folders.iter().any(|f| f.eq_ignore_ascii_case(&rescue_target)) {
         folders.push(rescue_target.clone());
     }
 
@@ -5435,6 +5436,24 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     } else {
         extend_with_spam_folders(&mut session, &mut folders);
     }
+
+    // Auto-file: move nostr mail out of the regular inbox folders into the
+    // destination folder before scanning, so it consolidates there and the scan
+    // below imports it from a single place (no duplicate — dedup is by
+    // Message-ID). Spam folders are excluded: when rescue is off the user wants
+    // spam visible in the inbox, and when on, spam is handled above.
+    if auto_move_nostr {
+        let sources: Vec<String> = folders
+            .iter()
+            .filter(|f| !f.eq_ignore_ascii_case(&rescue_target) && !is_spam_folder_name(f))
+            .cloned()
+            .collect();
+        let moved = auto_file_nostr_from_inbox(&mut session, &sources, &rescue_target);
+        if moved > 0 {
+            println!("[RUST] sync_nostr_emails_to_db: auto-filed {} nostr message(s) to '{}'", moved, rescue_target);
+        }
+    }
+
     println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
     for f in &folders {
         let target_count = lookup_folder_count(db, active_pubkey, f);
@@ -6661,6 +6680,16 @@ pub(crate) fn lookup_spam_rescue(db: &Database, pubkey: &str) -> bool {
     true
 }
 
+/// Read `auto_move_nostr` for the active pubkey, defaulting to true. When on,
+/// each sync moves nostr mail found in the regular inbox folders into the
+/// rescue/nostr-mail folder, consolidating all nostr mail in one place.
+pub(crate) fn lookup_auto_move_nostr(db: &Database, pubkey: &str) -> bool {
+    if let Ok(Some(value)) = db.get_setting(pubkey, "auto_move_nostr") {
+        return value != "false";
+    }
+    true
+}
+
 /// Read the folder spam-rescued nostr mail should be moved into, defaulting to
 /// `nostr-mail`. Blank/whitespace settings fall back to the default.
 pub(crate) fn lookup_spam_rescue_target(db: &Database, pubkey: &str) -> String {
@@ -6805,80 +6834,116 @@ fn rescue_nostr_emails_from_spam(
 
     let mut moved_total = 0usize;
     for folder in spam_folders {
-        if folder.eq_ignore_ascii_case(target_folder) {
-            continue;
-        }
-        if session.select(&folder).is_err() {
-            continue;
-        }
+        moved_total += move_nostr_from_folder(session, &folder, target_folder, unseen_only);
+    }
+    moved_total
+}
 
-        // Cheap server-side narrowing to candidate UIDs: messages that are
-        // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor
-        // block (encrypted, signed, signature, or seal). With `unseen_only` the
-        // search is gated by UNSEEN so a message the user read and deliberately
-        // filed into spam is left alone; the catch-up run drops that gate. BODY
-        // search support varies by server, so we re-confirm each candidate by
-        // fetching it and checking the transport auth gate.
-        let guard = if unseen_only { "UNSEEN " } else { "" };
-        let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for q in &[
-            "HEADER X-Nostr-Pubkey \"\"",
-            "HEADER X-Nostr-Sig \"\"",
-            "BODY \"BEGIN NOSTR NIP-\"",
-            "BODY \"BEGIN NOSTR SIGNED\"",
-            "BODY \"BEGIN NOSTR SIGNATURE\"",
-            "BODY \"BEGIN NOSTR SEAL\"",
-        ] {
-            let query = format!("{}{}", guard, q);
-            if let Ok(found) = session.uid_search(&query) {
-                candidates.extend(found);
+/// Scan one folder for nostr mail and move it into `target_folder`. Returns the
+/// number of messages moved. No-op if `folder` is the target itself or can't be
+/// selected. Shared by spam rescue and inbox auto-filing.
+///
+/// `unseen_only` gates the candidate search on UNSEEN — spam rescue sets it so a
+/// message the user read and deliberately filed into spam (the app marks such
+/// mail \Seen, replicated server-side to every device) is left alone. Inbox
+/// auto-filing clears it: there's no "leave it here" intent for ordinary inbox
+/// nostr mail, and once moved a message is gone from the source so it can't be
+/// re-moved.
+fn move_nostr_from_folder(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    folder: &str,
+    target_folder: &str,
+    unseen_only: bool,
+) -> usize {
+    if folder.eq_ignore_ascii_case(target_folder) {
+        return 0;
+    }
+    if session.select(folder).is_err() {
+        return 0;
+    }
+
+    // Cheap server-side narrowing to candidate UIDs: messages that are
+    // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor block
+    // (encrypted, signed, signature, or seal). BODY search support varies by
+    // server, so we re-confirm each candidate by fetching it and checking the
+    // transport auth gate.
+    let guard = if unseen_only { "UNSEEN " } else { "" };
+    let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for q in &[
+        "HEADER X-Nostr-Pubkey \"\"",
+        "HEADER X-Nostr-Sig \"\"",
+        "BODY \"BEGIN NOSTR NIP-\"",
+        "BODY \"BEGIN NOSTR SIGNED\"",
+        "BODY \"BEGIN NOSTR SIGNATURE\"",
+        "BODY \"BEGIN NOSTR SEAL\"",
+    ] {
+        let query = format!("{}{}", guard, q);
+        if let Ok(found) = session.uid_search(&query) {
+            candidates.extend(found);
+        }
+    }
+    debug_log!("[RUST] move_nostr_from_folder: folder '{}' nostr candidate UIDs = {}", folder, candidates.len());
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let mut to_move: Vec<u32> = Vec::new();
+    let uids: Vec<u32> = candidates.into_iter().collect();
+    for chunk in uids.chunks(500) {
+        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        // BODY.PEEK[] (not RFC822) so confirming a candidate doesn't set the
+        // \Seen flag — moved messages keep their read state. The response key is
+        // still BODY[], so msg.body() works unchanged.
+        let messages = match session.uid_fetch(&uid_list, "(UID BODY.PEEK[])") {
+            Ok(m) => m,
+            Err(e) => {
+                debug_log!("[RUST] move_nostr_from_folder: fetch in '{}' failed: {}", folder, e);
+                continue;
             }
-        }
-        debug_log!("[RUST] rescue: folder '{}' nostr candidate UIDs = {}", folder, candidates.len());
-        if candidates.is_empty() {
-            continue;
-        }
-
-        // UIDs that pass the eligibility gate. No ledger: in the normal run a
-        // deliberate move-to-spam is respected because the app marks such mail
-        // \Seen, so it never appears in the UNSEEN candidate set above.
-        let mut to_move: Vec<u32> = Vec::new();
-        let uids: Vec<u32> = candidates.into_iter().collect();
-        for chunk in uids.chunks(500) {
-            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-            // BODY.PEEK[] (not RFC822) so confirming a candidate doesn't set the
-            // \Seen flag — rescued messages must stay unread on the server. The
-            // response key is still BODY[], so msg.body() works unchanged.
-            let messages = match session.uid_fetch(&uid_list, "(UID BODY.PEEK[])") {
-                Ok(m) => m,
-                Err(e) => {
-                    debug_log!("[RUST] rescue_nostr_emails_from_spam: fetch in '{}' failed: {}", folder, e);
-                    continue;
+        };
+        for msg in messages.iter() {
+            if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
+                if should_rescue_message(body) {
+                    to_move.push(uid);
+                } else {
+                    debug_log!("[RUST] move_nostr_from_folder: uid {} in '{}' not eligible (missing nostr marker or transport auth failed)", uid, folder);
                 }
-            };
-            for msg in messages.iter() {
-                if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
-                    if should_rescue_message(body) {
-                        to_move.push(uid);
-                    } else {
-                        debug_log!("[RUST] rescue: uid {} in '{}' not eligible (missing nostr marker or transport auth failed)", uid, folder);
-                    }
-                }
             }
         }
+    }
 
-        if to_move.is_empty() {
-            continue;
+    if to_move.is_empty() {
+        return 0;
+    }
+    let uid_set = to_move.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    match move_uids_to_folder(session, &uid_set, target_folder) {
+        Ok(_) => {
+            debug_log!("[RUST] move_nostr_from_folder: moved {} message(s) from '{}' to '{}'",
+                to_move.len(), folder, target_folder);
+            to_move.len()
         }
-        let uid_set = to_move.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        match move_uids_to_folder(session, &uid_set, target_folder) {
-            Ok(_) => {
-                debug_log!("[RUST] rescue_nostr_emails_from_spam: moved {} message(s) from '{}' to '{}'",
-                    to_move.len(), folder, target_folder);
-                moved_total += to_move.len();
-            }
-            Err(e) => debug_log!("[RUST] rescue_nostr_emails_from_spam: move from '{}' failed: {}", folder, e),
+        Err(e) => {
+            debug_log!("[RUST] move_nostr_from_folder: move from '{}' failed: {}", folder, e);
+            0
         }
+    }
+}
+
+/// Move nostr mail out of the regular inbox folders into `target_folder`, so it
+/// consolidates in the dedicated nostr folder the user reads from. Mirrors spam
+/// rescue but over the given inbox folders, never gating on \Seen. Spam folders
+/// must be excluded by the caller — they're handled by spam rescue. Returns the
+/// number of messages moved; per-folder failures are logged and skipped.
+fn auto_file_nostr_from_inbox(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    source_folders: &[String],
+    target_folder: &str,
+) -> usize {
+    // Make sure the destination exists before we start moving into it.
+    let _ = session.create(target_folder);
+    let mut moved_total = 0usize;
+    for folder in source_folders {
+        moved_total += move_nostr_from_folder(session, folder, target_folder, /* unseen_only */ false);
     }
     moved_total
 }

@@ -107,6 +107,7 @@ class DOMManager {
             'require-signature-preference': this.getElement('require-signature-preference'),
             'spam-rescue-preference': this.getElement('spam-rescue-preference'),
             'spam-rescue-target-preference': this.getElement('spam-rescue-target-preference'),
+            'auto-move-nostr-preference': this.getElement('auto-move-nostr-preference'),
             'hide-undecryptable-emails-preference': this.getElement('hide-undecryptable-emails-preference'),
             'automatically-encrypt-preference': this.getElement('automatically-encrypt-preference'),
             'automatically-sign-preference': this.getElement('automatically-sign-preference'),

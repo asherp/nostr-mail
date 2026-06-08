@@ -5437,15 +5437,15 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         extend_with_spam_folders(&mut session, &mut folders);
     }
 
-    // Auto-file: move nostr mail out of the regular inbox folders into the
-    // destination folder before scanning, so it consolidates there and the scan
-    // below imports it from a single place (no duplicate — dedup is by
-    // Message-ID). Spam folders are excluded: when rescue is off the user wants
-    // spam visible in the inbox, and when on, spam is handled above.
-    if auto_move_nostr {
+    // Auto-file: move nostr mail out of the INBOX into the destination folder
+    // before scanning, so it consolidates there and the scan below imports it
+    // from a single place (no duplicate — dedup is by Message-ID). Scoped to
+    // INBOX only; other folders (Archive, spam, the destination itself) are
+    // left untouched.
+    if auto_move_nostr && !rescue_target.eq_ignore_ascii_case("INBOX") {
         let sources: Vec<String> = folders
             .iter()
-            .filter(|f| !f.eq_ignore_ascii_case(&rescue_target) && !is_spam_folder_name(f))
+            .filter(|f| f.eq_ignore_ascii_case("INBOX"))
             .cloned()
             .collect();
         let moved = auto_file_nostr_from_inbox(&mut session, &sources, &rescue_target);

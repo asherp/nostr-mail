@@ -4180,6 +4180,42 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_folder_count_explicit_override_wins() {
+        let json = r#"{"nostr-mail": 800, "INBOX": 25}"#;
+        assert_eq!(resolve_folder_count("nostr-mail", Some(json), 50), 800);
+        assert_eq!(resolve_folder_count("INBOX", Some(json), 50), 25);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_dense_default_for_nostr_mail() {
+        // No override map → nostr-mail gets the deep dense default, not the global.
+        assert_eq!(resolve_folder_count("nostr-mail", None, 50), DEFAULT_DENSE_COUNT);
+        // Case-insensitive on the well-known dense folder name.
+        assert_eq!(resolve_folder_count("Nostr-Mail", None, 50), DEFAULT_DENSE_COUNT);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_global_default_for_other_folders() {
+        assert_eq!(resolve_folder_count("INBOX", None, 50), 50);
+        assert_eq!(resolve_folder_count("Archive", None, 77), 77);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_malformed_json_falls_back() {
+        // Garbage / wrong-typed JSON is ignored, not fatal.
+        assert_eq!(resolve_folder_count("INBOX", Some("not json"), 50), 50);
+        assert_eq!(resolve_folder_count("nostr-mail", Some("{\"nostr-mail\": -3}"), 50), DEFAULT_DENSE_COUNT);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_override_for_unlisted_folder() {
+        // A map that doesn't mention this folder → fall through to the defaults.
+        let json = r#"{"Archive": 10}"#;
+        assert_eq!(resolve_folder_count("INBOX", Some(json), 50), 50);
+        assert_eq!(resolve_folder_count("nostr-mail", Some(json), 50), DEFAULT_DENSE_COUNT);
+    }
+
+    #[test]
     fn test_email_config_creation() {
         let config = make_config();
         assert_eq!(config.email_address, "sender@example.com");
@@ -6529,6 +6565,65 @@ fn lookup_sync_cutoff_days(db: &Database, pubkey: &str) -> i64 {
         }
     }
     30
+}
+
+/// Default number of nostr matches to pull when bootstrapping a folder, when
+/// the user hasn't set `sync_initial_count`.
+const DEFAULT_INITIAL_COUNT: usize = 50;
+/// Default bootstrap depth for the dedicated dense `nostr-mail` folder, where
+/// (nearly) every message is nostr mail so a deep count is cheap and accurate.
+/// Overridable per-folder via `sync_folder_counts`.
+const DEFAULT_DENSE_COUNT: usize = 500;
+/// Default cap on raw messages examined per folder bootstrap. Bounds the cost
+/// on sparse mixed folders (e.g. a busy INBOX) where the target match count
+/// would otherwise force an unbounded backward walk.
+const DEFAULT_MAX_SCAN: usize = 2000;
+
+/// Pure resolution of a folder's bootstrap count. An explicit override in the
+/// user's `sync_folder_counts` map wins; otherwise the dedicated dense
+/// `nostr-mail` folder defaults deep while every other folder uses the global
+/// `sync_initial_count`. Factored out for unit testing without a `Database`.
+fn resolve_folder_count(folder: &str, folder_counts_json: Option<&str>, initial_count: usize) -> usize {
+    if let Some(json) = folder_counts_json {
+        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, usize>>(json) {
+            if let Some(n) = map.get(folder) {
+                return *n;
+            }
+        }
+    }
+    if folder.eq_ignore_ascii_case("nostr-mail") {
+        return DEFAULT_DENSE_COUNT;
+    }
+    initial_count
+}
+
+/// Global per-folder bootstrap target (nostr matches), defaulting to
+/// `DEFAULT_INITIAL_COUNT`. Per-pubkey preference, like the cutoff above.
+fn lookup_initial_count(db: &Database, pubkey: &str) -> usize {
+    db.get_setting(pubkey, "sync_initial_count")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_INITIAL_COUNT)
+}
+
+/// Cap on raw messages examined per folder bootstrap, defaulting to
+/// `DEFAULT_MAX_SCAN`.
+#[allow(dead_code)] // wired into bootstrap in a later step
+fn lookup_max_scan(db: &Database, pubkey: &str) -> usize {
+    db.get_setting(pubkey, "sync_max_scan")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_SCAN)
+}
+
+/// Per-folder bootstrap count for the active pubkey: per-folder override →
+/// dense-folder default → global `sync_initial_count`.
+#[allow(dead_code)] // wired into bootstrap in a later step
+fn lookup_folder_count(db: &Database, pubkey: &str, folder: &str) -> usize {
+    let json = db.get_setting(pubkey, "sync_folder_counts").ok().flatten();
+    resolve_folder_count(folder, json.as_deref(), lookup_initial_count(db, pubkey))
 }
 
 /// Read `require_signature` for the active pubkey, defaulting to true.

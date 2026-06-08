@@ -4139,6 +4139,47 @@ mod tests {
     }
 
     #[test]
+    fn test_next_back_batch_first_iter_takes_newest() {
+        // 100 candidates, want 5 matches, generous budget → fetch the newest 5
+        // (the tail of the ascending list).
+        assert_eq!(next_back_batch(0, 100, 0, 5, 50), Some((95, 100)));
+    }
+
+    #[test]
+    fn test_next_back_batch_respects_remaining_target() {
+        // Already have 2 of 5 matches after scanning 5 → take 3 more from the tail.
+        assert_eq!(next_back_batch(5, 100, 2, 5, 50), Some((92, 95)));
+    }
+
+    #[test]
+    fn test_next_back_batch_stops_at_target() {
+        assert_eq!(next_back_batch(10, 100, 5, 5, 50), None);
+    }
+
+    #[test]
+    fn test_next_back_batch_stops_at_budget() {
+        // Hit the scan budget before finding enough matches.
+        assert_eq!(next_back_batch(50, 10_000, 0, 100, 50), None);
+    }
+
+    #[test]
+    fn test_next_back_batch_stops_when_exhausted() {
+        assert_eq!(next_back_batch(3, 3, 0, 5, 50), None);
+    }
+
+    #[test]
+    fn test_next_back_batch_clamps_to_remaining_candidates() {
+        // Only 2 candidates total, target wants 5 → take just the 2.
+        assert_eq!(next_back_batch(0, 2, 0, 5, 50), Some((0, 2)));
+    }
+
+    #[test]
+    fn test_next_back_batch_clamps_to_remaining_budget() {
+        // 3 budget slots left, target wants 10 → take 3 from the tail.
+        assert_eq!(next_back_batch(47, 1000, 0, 10, 50), Some((950, 953)));
+    }
+
+    #[test]
     fn test_email_config_creation() {
         let config = make_config();
         assert_eq!(config.email_address, "sender@example.com");
@@ -6120,6 +6161,89 @@ struct FetchOlderResult {
     hit_bottom: bool,
 }
 
+/// Result of `walk_back_collecting`: the nostr emails found, the lowest UID we
+/// actually touched (the caller turns this into the new floor), how many UIDs
+/// were scanned, and whether the candidate list was fully exhausted.
+struct CountWalk {
+    emails: Vec<RawNostrEmail>,
+    lowest_scanned: u32,
+    scanned: usize,
+    hit_bottom: bool,
+}
+
+/// Pure per-iteration decision for the backward count-walk: given how many
+/// UIDs we've scanned so far (`scanned`), the total candidate count (`total`),
+/// the matches accumulated (`matches_so_far`), the match target and the scan
+/// budget, return the `[start, end)` slice of the ascending candidate list to
+/// fetch next — newest UIDs are at the tail, so we walk from the end inward.
+/// Returns `None` when the walk should stop (target met, budget spent, or list
+/// exhausted). Factored out of `walk_back_collecting` so the boundary logic is
+/// unit-testable without a live IMAP session.
+fn next_back_batch(
+    scanned: usize,
+    total: usize,
+    matches_so_far: usize,
+    target_count: usize,
+    max_scan: usize,
+) -> Option<(usize, usize)> {
+    if scanned >= total || matches_so_far >= target_count || scanned >= max_scan {
+        return None;
+    }
+    let remaining_target = target_count.saturating_sub(matches_so_far);
+    let remaining_budget = max_scan.saturating_sub(scanned);
+    let remaining_candidates = total - scanned;
+    let take = remaining_target.max(1).min(remaining_budget).min(remaining_candidates);
+    let end = total - scanned;
+    let start = end - take;
+    Some((start, end))
+}
+
+/// Walk a pre-sorted (ascending) UID list newest→oldest, fetching bodies in
+/// batches and running `parse_fn`, until either `target_count` nostr matches
+/// accumulate, `max_scan` UIDs have been examined, or the list is exhausted.
+///
+/// `floor_init` seeds `lowest_scanned` so a no-op call never raises the floor.
+/// Shared by `fetch_older_in_folder` (and, later, the count-based bootstrap):
+/// the only thing that differs between callers is which candidate UIDs they
+/// feed in. BODY.PEEK[] keeps reads from setting \Seen; FLAGS lets us seed
+/// local read state for newly-imported rows.
+fn walk_back_collecting<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    config: &EmailConfig,
+    uids_sorted: &[u32],
+    floor_init: u32,
+    target_count: usize,
+    max_scan: usize,
+    parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
+) -> anyhow::Result<CountWalk> {
+    let mut emails: Vec<RawNostrEmail> = Vec::new();
+    let mut scanned: usize = 0;
+    let mut lowest_scanned: u32 = floor_init;
+
+    while let Some((start, end)) =
+        next_back_batch(scanned, uids_sorted.len(), emails.len(), target_count, max_scan)
+    {
+        let batch = &uids_sorted[start..end];
+        let uid_list = batch.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
+        for msg in msgs.iter() {
+            if let Some(uid) = msg.uid {
+                if uid < lowest_scanned { lowest_scanned = uid; }
+            }
+            if let Some(body) = msg.body() {
+                if let Some(mut parsed) = parse_fn(body, config) {
+                    parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
+                    emails.push(parsed);
+                }
+            }
+        }
+        scanned += end - start;
+    }
+
+    let hit_bottom = scanned >= uids_sorted.len();
+    Ok(CountWalk { emails, lowest_scanned, scanned, hit_bottom })
+}
+
 /// Pull older messages from one folder, walking UIDs backward.
 ///
 /// Requires a prior forward sync (folder_sync_state row must exist). Backfills
@@ -6205,54 +6329,24 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
     let target_count = page_size.max(1);
     let max_scan = target_count.max(MIN_SCAN_PER_CALL);
 
-    let mut emails: Vec<RawNostrEmail> = Vec::new();
-    let mut scanned: usize = 0;
-    // Initialize to floor_uid so we never raise the floor on a no-op call.
-    let mut lowest_scanned: u32 = floor_uid;
+    // Walk newest-to-oldest, fetching bodies in batches, stopping when we have
+    // enough matches or hit the per-call cap. `floor_uid` seeds the lowest-UID
+    // tracker so a no-op call never raises the floor.
+    let walk = walk_back_collecting(session, config, &uids, floor_uid, target_count, max_scan, parse_fn)?;
 
-    // Walk newest-to-oldest, fetching up to `page_size` bodies per IMAP
-    // batch, stopping when we have enough matches or hit the per-call cap.
-    while scanned < uids.len() && emails.len() < target_count && scanned < max_scan {
-        let remaining_target = target_count.saturating_sub(emails.len());
-        let remaining_budget = max_scan.saturating_sub(scanned);
-        let remaining_candidates = uids.len() - scanned;
-        let take = remaining_target.max(1).min(remaining_budget).min(remaining_candidates);
-        let end = uids.len() - scanned;
-        let start = end - take;
-        let batch = &uids[start..end];
-
-        let uid_list = batch.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        // BODY.PEEK[] so paging older mail doesn't *set* \Seen; FLAGS so we can
-        // read it and seed local read state for newly-imported rows.
-        let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
-        for msg in msgs.iter() {
-            if let Some(uid) = msg.uid {
-                if uid < lowest_scanned { lowest_scanned = uid; }
-            }
-            if let Some(body) = msg.body() {
-                if let Some(mut parsed) = parse_fn(body, config) {
-                    parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
-                    emails.push(parsed);
-                }
-            }
-        }
-        scanned += take;
-    }
-
-    let hit_bottom = scanned >= uids.len();
     // When we've truly hit bottom, set floor to 1 so the next call
     // short-circuits. Otherwise lower it to the lowest UID we touched.
-    let returned_floor = if hit_bottom { 1 } else { lowest_scanned };
+    let returned_floor = if walk.hit_bottom { 1 } else { walk.lowest_scanned };
 
     debug_log!(
         "[RUST] fetch_older_in_folder: '{}' scanned {}/{} UIDs, found {} nostr match(es), hit_bottom={}, new_floor={}",
-        folder_name, scanned, uids.len(), emails.len(), hit_bottom, returned_floor
+        folder_name, walk.scanned, uids.len(), walk.emails.len(), walk.hit_bottom, returned_floor
     );
 
     Ok(FetchOlderResult {
-        emails,
+        emails: walk.emails,
         new_floor_uid: Some(returned_floor),
-        hit_bottom,
+        hit_bottom: walk.hit_bottom,
     })
 }
 

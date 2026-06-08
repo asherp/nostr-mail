@@ -6680,14 +6680,16 @@ pub(crate) fn lookup_spam_rescue(db: &Database, pubkey: &str) -> bool {
     true
 }
 
-/// Read `auto_move_nostr` for the active pubkey, defaulting to true. When on,
-/// each sync moves nostr mail found in the regular inbox folders into the
-/// rescue/nostr-mail folder, consolidating all nostr mail in one place.
+/// Read `auto_move_nostr` for the active pubkey, defaulting to false (opt-in).
+/// When on, each sync moves nostr mail found in the regular inbox folders into
+/// the rescue/nostr-mail folder, consolidating all nostr mail in one place.
+/// Off by default because it mutates the user's mailbox server-side (visible in
+/// every other mail client), so it's surfaced as an explicit opt-in.
 pub(crate) fn lookup_auto_move_nostr(db: &Database, pubkey: &str) -> bool {
     if let Ok(Some(value)) = db.get_setting(pubkey, "auto_move_nostr") {
-        return value != "false";
+        return value == "true";
     }
-    true
+    false
 }
 
 /// Read the folder spam-rescued nostr mail should be moved into, defaulting to

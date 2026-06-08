@@ -5998,7 +5998,17 @@ NostrMailApp.prototype.initializeSettingsAccordion = function() {
 document.addEventListener('DOMContentLoaded', () => {
     window.domManager = new DOMManager();
     console.log('🌐 DOM loaded - Initializing NostrMail interface...');
-    
+
+    // Show the real app version from the Tauri bundle (single source of truth:
+    // tauri.conf.json), so the sidebar label never drifts on a version bump.
+    const versionEl = document.getElementById('app-version');
+    if (versionEl) {
+        window.__TAURI__?.app?.getVersion()
+            .then(v => { versionEl.textContent = `v${v}`; })
+            .catch(() => { /* non-Tauri / web preview: leave blank */ });
+    }
+
+
     // Set initial dark mode from localStorage
     const darkPref = localStorage.getItem('darkMode');
     window.app.setDarkMode(darkPref === '1');

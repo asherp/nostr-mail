@@ -5256,9 +5256,10 @@ fn get_default_inbox_folders(imap_host: String) -> Vec<String> {
 }
 
 /// Clear the UID-based sync watermark for one folder so the next sync
-/// re-bootstraps from `sync_cutoff_days`. Useful for recovering older messages
-/// that were skipped (e.g. by Gmail IMAP search-index lag) and as a manual
-/// "force resync" hook for debugging.
+/// re-bootstraps using the per-folder message count (`sync_initial_count` /
+/// `sync_folder_counts`). Useful for recovering older messages that were
+/// skipped (e.g. by Gmail IMAP search-index lag), applying a changed count
+/// depth, and as a manual "force resync" hook for debugging.
 #[tauri::command]
 async fn reset_folder_sync_state(
     email_address: String,

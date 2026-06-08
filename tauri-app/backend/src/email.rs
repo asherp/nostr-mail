@@ -6068,9 +6068,13 @@ struct UidSyncResult {
     had_existing_state: bool,
 }
 
-/// Build the IMAP SEARCH query for a bootstrap (no stored watermark, or
-/// UIDVALIDITY changed). Uses `SINCE <date> UID 1:*` so the server filters by
-/// INTERNALDATE — independent of Gmail's full-text index — and returns UIDs.
+/// Legacy-only: build a date-windowed `SINCE <date> UID 1:*` SEARCH (filters by
+/// INTERNALDATE, independent of Gmail's full-text index). Forward-sync bootstrap
+/// and gap-fill are now count-based and no longer call this. It survives solely
+/// as `fetch_older`'s floor-backfill for installs that have a `folder_sync_state`
+/// row predating the `min_seen_uid` column — a cheap way (one SEARCH, no body
+/// fetches) to seed an approximate floor so backward paging can start. New
+/// installs always record a floor at bootstrap, so they never reach this.
 fn build_bootstrap_query(sync_cutoff_days: i64) -> String {
     if sync_cutoff_days <= 0 {
         "UID 1:*".to_string()
@@ -6300,9 +6304,10 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
 
 /// Pull older messages from one folder, walking UIDs backward.
 ///
-/// Requires a prior forward sync (folder_sync_state row must exist). Backfills
-/// `min_seen_uid` on the first call by replaying the bootstrap UID SEARCH —
-/// that gives us a deterministic floor instead of guessing.
+/// Requires a prior forward sync (folder_sync_state row must exist). The floor
+/// (`min_seen_uid`) is normally recorded at bootstrap. Only legacy installs
+/// whose row predates the `min_seen_uid` column hit the backfill branch, which
+/// seeds an approximate floor via the date-windowed SEARCH (`build_bootstrap_query`).
 ///
 /// Walks newest-to-oldest from `min_seen_uid - 1`, fetching full bodies and
 /// running `parse_fn`. Stops when either:
@@ -6565,7 +6570,10 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     Ok(GapFillResult { emails, examined })
 }
 
-/// Read `sync_cutoff_days` for the active pubkey, defaulting to 30.
+/// Legacy-only: read `sync_cutoff_days` for the active pubkey, defaulting to 30.
+/// The settings UI no longer writes this key (replaced by per-folder counts);
+/// it now feeds only `fetch_older`'s legacy floor-backfill (see
+/// `build_bootstrap_query`), where the 30-day default is a fine approximation.
 /// Read directly from the active pubkey's settings — no email-based reverse
 /// lookup. Sharing an email address across multiple identities used to make
 /// this return the first matching pubkey's value, which was rarely the active

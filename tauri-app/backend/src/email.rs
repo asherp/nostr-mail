@@ -4139,6 +4139,83 @@ mod tests {
     }
 
     #[test]
+    fn test_next_back_batch_first_iter_takes_newest() {
+        // 100 candidates, want 5 matches, generous budget → fetch the newest 5
+        // (the tail of the ascending list).
+        assert_eq!(next_back_batch(0, 100, 0, 5, 50), Some((95, 100)));
+    }
+
+    #[test]
+    fn test_next_back_batch_respects_remaining_target() {
+        // Already have 2 of 5 matches after scanning 5 → take 3 more from the tail.
+        assert_eq!(next_back_batch(5, 100, 2, 5, 50), Some((92, 95)));
+    }
+
+    #[test]
+    fn test_next_back_batch_stops_at_target() {
+        assert_eq!(next_back_batch(10, 100, 5, 5, 50), None);
+    }
+
+    #[test]
+    fn test_next_back_batch_stops_at_budget() {
+        // Hit the scan budget before finding enough matches.
+        assert_eq!(next_back_batch(50, 10_000, 0, 100, 50), None);
+    }
+
+    #[test]
+    fn test_next_back_batch_stops_when_exhausted() {
+        assert_eq!(next_back_batch(3, 3, 0, 5, 50), None);
+    }
+
+    #[test]
+    fn test_next_back_batch_clamps_to_remaining_candidates() {
+        // Only 2 candidates total, target wants 5 → take just the 2.
+        assert_eq!(next_back_batch(0, 2, 0, 5, 50), Some((0, 2)));
+    }
+
+    #[test]
+    fn test_next_back_batch_clamps_to_remaining_budget() {
+        // 3 budget slots left, target wants 10 → take 3 from the tail.
+        assert_eq!(next_back_batch(47, 1000, 0, 10, 50), Some((950, 953)));
+    }
+
+    #[test]
+    fn test_resolve_folder_count_explicit_override_wins() {
+        let json = r#"{"nostr-mail": 800, "INBOX": 25}"#;
+        assert_eq!(resolve_folder_count("nostr-mail", Some(json), 50), 800);
+        assert_eq!(resolve_folder_count("INBOX", Some(json), 50), 25);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_dense_default_for_nostr_mail() {
+        // No override map → nostr-mail gets the deep dense default, not the global.
+        assert_eq!(resolve_folder_count("nostr-mail", None, 50), DEFAULT_DENSE_COUNT);
+        // Case-insensitive on the well-known dense folder name.
+        assert_eq!(resolve_folder_count("Nostr-Mail", None, 50), DEFAULT_DENSE_COUNT);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_global_default_for_other_folders() {
+        assert_eq!(resolve_folder_count("INBOX", None, 50), 50);
+        assert_eq!(resolve_folder_count("Archive", None, 77), 77);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_malformed_json_falls_back() {
+        // Garbage / wrong-typed JSON is ignored, not fatal.
+        assert_eq!(resolve_folder_count("INBOX", Some("not json"), 50), 50);
+        assert_eq!(resolve_folder_count("nostr-mail", Some("{\"nostr-mail\": -3}"), 50), DEFAULT_DENSE_COUNT);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_override_for_unlisted_folder() {
+        // A map that doesn't mention this folder → fall through to the defaults.
+        let json = r#"{"Archive": 10}"#;
+        assert_eq!(resolve_folder_count("INBOX", Some(json), 50), 50);
+        assert_eq!(resolve_folder_count("nostr-mail", Some(json), 50), DEFAULT_DENSE_COUNT);
+    }
+
+    #[test]
     fn test_email_config_creation() {
         let config = make_config();
         assert_eq!(config.email_address, "sender@example.com");
@@ -5109,6 +5186,15 @@ nitela\n\
 /// rows. Shared between forward sync and fetch-older. Updates existing rows
 /// in place (preserving read state and attachments); new rows get fresh
 /// attachment extraction.
+///
+/// With `require_signature` true, unsigned / invalid-signature mail is dropped
+/// (not stored) — the user has opted into a signed-only inbox. This is *not*
+/// permanent loss: turning the setting off makes the next sync re-fetch and
+/// persist what was skipped. Forward sync picks up new unsigned mail
+/// automatically, fetch-older recovers it below the floor as the user scrolls,
+/// and `gap_fill_in_folder` re-scans the already-synced range (see its
+/// `recover_dropped` handling) so previously-dropped messages reappear on the
+/// next Refresh.
 fn persist_inbox_raw_emails(
     raw_emails: Vec<RawNostrEmail>,
     db: &Database,
@@ -5117,7 +5203,8 @@ fn persist_inbox_raw_emails(
     let mut emails = raw_emails;
     // Filter transport-unauthenticated.
     emails.retain(|email| !matches!(email.transport_auth_verified, Some(false)));
-    // Enforce signature requirement.
+    // Enforce signature requirement: drop nostr mail that claims a sender but
+    // isn't validly signed. Recoverable — see the doc comment above.
     if require_signature {
         emails.retain(|email| {
             if email.sender_pubkey.is_some() {
@@ -5270,11 +5357,12 @@ pub async fn refresh_inbox_emails_to_db(config: &EmailConfig, folders_arg: Optio
 
 async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
     let account_key = config.email_address.trim().to_lowercase();
-    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
+    let max_scan = lookup_max_scan(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
     let spam_rescue = lookup_spam_rescue(db, active_pubkey);
+    let auto_move_nostr = lookup_auto_move_nostr(db, active_pubkey);
     let rescue_target = lookup_spam_rescue_target(db, active_pubkey);
-    debug_log!("[RUST] sync: spam_rescue={}, rescue_target='{}'", spam_rescue, rescue_target);
+    debug_log!("[RUST] sync: spam_rescue={}, auto_move_nostr={}, rescue_target='{}'", spam_rescue, auto_move_nostr, rescue_target);
 
     // Folders to scan. Default (empty/None) = provider-aware list from
     // `default_inbox_folders`. Multiple folders may be supplied to scan in a
@@ -5316,15 +5404,15 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         .filter(|f| !is_spam_folder_name(f))
         .collect();
 
-    // With spam rescue on, ensure the rescue target is in the scan set so moved
-    // messages land in the local DB during this same pass.
-    if spam_rescue && !folders.iter().any(|f| f.eq_ignore_ascii_case(&rescue_target)) {
+    // With spam rescue or inbox auto-filing on, ensure the destination folder is
+    // in the scan set so moved messages land in the local DB during this same pass.
+    if (spam_rescue || auto_move_nostr) && !folders.iter().any(|f| f.eq_ignore_ascii_case(&rescue_target)) {
         folders.push(rescue_target.clone());
     }
 
     println!(
-        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, sync_cutoff_days={} (bootstrap only)",
-        account_key, folders, sync_cutoff_days
+        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, max_scan={}",
+        account_key, folders, max_scan
     );
 
     // Per-folder watermark updates, applied AFTER all per-message DB saves succeed.
@@ -5348,9 +5436,28 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     } else {
         extend_with_spam_folders(&mut session, &mut folders);
     }
+
+    // Auto-file: move nostr mail out of the INBOX into the destination folder
+    // before scanning, so it consolidates there and the scan below imports it
+    // from a single place (no duplicate — dedup is by Message-ID). Scoped to
+    // INBOX only; other folders (Archive, spam, the destination itself) are
+    // left untouched.
+    if auto_move_nostr && !rescue_target.eq_ignore_ascii_case("INBOX") {
+        let sources: Vec<String> = folders
+            .iter()
+            .filter(|f| f.eq_ignore_ascii_case("INBOX"))
+            .cloned()
+            .collect();
+        let moved = auto_file_nostr_from_inbox(&mut session, &sources, &rescue_target);
+        if moved > 0 {
+            println!("[RUST] sync_nostr_emails_to_db: auto-filed {} nostr message(s) to '{}'", moved, rescue_target);
+        }
+    }
+
     println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
     for f in &folders {
-        match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+        let target_count = lookup_folder_count(db, active_pubkey, f);
+        match uid_sync_folder(&mut session, config, db, &account_key, f, target_count, max_scan,
                               parse_nostr_email_from_imap_body) {
             Ok(r) => {
                 if r.max_uid > 0 || !r.had_existing_state {
@@ -5366,8 +5473,11 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
             Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
         }
         if include_gap_fill {
-            match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                      parse_nostr_email_from_imap_body) {
+            // recover_dropped = !require_signature: when the user has lifted the
+            // signed-only filter, gap-fill re-scans the full synced range to
+            // bring back mail that was dropped while the filter was on.
+            match gap_fill_in_folder(&mut session, config, db, &account_key, f,
+                                      !require_signature, parse_nostr_email_from_imap_body) {
                 Ok(r) => {
                     raw_nostr_emails.extend(r.emails);
                     if let Some((uidv, lo, hi)) = r.examined {
@@ -5558,8 +5668,8 @@ pub async fn fetch_older_sent_emails_to_db(
     }
     imap_pool::checkin(&target, session);
 
-    // Sent emails skip the require_signature filter — see the forward sync
-    // path for the same exception.
+    // Sent emails skip the require_signature filter — you authored them, so
+    // they're always kept regardless of the inbox signature policy.
     let new_count = persist_inbox_raw_emails(raw_emails, db, /* require_signature */ false)?;
 
     for (folder_name, new_floor) in pending_floors {
@@ -5597,7 +5707,7 @@ pub async fn refresh_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str
 async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
     debug_log!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
     let account_key = config.email_address.trim().to_lowercase();
-    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
+    let max_scan = lookup_max_scan(db, active_pubkey);
 
     // See sync_nostr_emails_to_db for the meaning of the 4-tuple.
     let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
@@ -5612,7 +5722,8 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
     let sent_folder = discover_sent_mailbox(&mut session)?
         .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
     for f in [sent_folder.as_str(), "nostr-mail"] {
-        match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+        let target_count = lookup_folder_count(db, active_pubkey, f);
+        match uid_sync_folder(&mut session, config, db, &account_key, f, target_count, max_scan,
                               parse_nostr_sent_email_from_imap_body) {
             Ok(r) => {
                 if r.max_uid > 0 || !r.had_existing_state {
@@ -5628,8 +5739,9 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
             Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
         }
         if include_gap_fill {
-            match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                      parse_nostr_sent_email_from_imap_body) {
+            // Sent mail is never dropped, so it never needs recovery scanning.
+            match gap_fill_in_folder(&mut session, config, db, &account_key, f,
+                                      /* recover_dropped */ false, parse_nostr_sent_email_from_imap_body) {
                 Ok(r) => {
                     raw_sent_emails.extend(r.emails);
                     if let Some((uidv, lo, hi)) = r.examined {
@@ -5975,9 +6087,13 @@ struct UidSyncResult {
     had_existing_state: bool,
 }
 
-/// Build the IMAP SEARCH query for a bootstrap (no stored watermark, or
-/// UIDVALIDITY changed). Uses `SINCE <date> UID 1:*` so the server filters by
-/// INTERNALDATE — independent of Gmail's full-text index — and returns UIDs.
+/// Legacy-only: build a date-windowed `SINCE <date> UID 1:*` SEARCH (filters by
+/// INTERNALDATE, independent of Gmail's full-text index). Forward-sync bootstrap
+/// and gap-fill are now count-based and no longer call this. It survives solely
+/// as `fetch_older`'s floor-backfill for installs that have a `folder_sync_state`
+/// row predating the `min_seen_uid` column — a cheap way (one SEARCH, no body
+/// fetches) to seed an approximate floor so backward paging can start. New
+/// installs always record a floor at bootstrap, so they never reach this.
 fn build_bootstrap_query(sync_cutoff_days: i64) -> String {
     if sync_cutoff_days <= 0 {
         "UID 1:*".to_string()
@@ -5989,15 +6105,18 @@ fn build_bootstrap_query(sync_cutoff_days: i64) -> String {
     }
 }
 
-/// UID-based incremental sync of one IMAP folder.
+/// UID-based sync of one IMAP folder.
 ///
 /// Workflow:
 /// 1. SELECT folder, read mailbox UIDVALIDITY.
 /// 2. Compare to stored `folder_sync_state`.
-/// 3. On match: `UID SEARCH UID <last_seen+1>:*` (incremental).
-///    On mismatch / no row: `UID SEARCH SINCE <today-cutoff> UID 1:*` (bootstrap).
-/// 4. UID FETCH the matched UIDs in batches of 500.
-/// 5. Run `parse_fn` on each body; collect.
+/// 3. On match (incremental): `UID SEARCH UID <last_seen+1>:*`, fetch every new
+///    UID. New mail is always taken in full — the count only bounds history.
+///    On mismatch / no row (bootstrap): `UID SEARCH 1:*`, then walk newest→oldest
+///    via `walk_back_collecting` until `target_count` nostr matches accumulate or
+///    `max_scan` raw messages have been examined. The folder watermark
+///    (`max_uid`) is the true newest UID even when we body-fetch far fewer.
+/// 4. Run `parse_fn` on each fetched body; collect.
 ///
 /// The caller is responsible for persisting parsed emails AND updating
 /// `folder_sync_state` after a successful save — that way a partial-failure
@@ -6008,7 +6127,8 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
     db: &Database,
     account_key: &str,
     folder_name: &str,
-    sync_cutoff_days: i64,
+    target_count: usize,
+    max_scan: usize,
     parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
 ) -> anyhow::Result<UidSyncResult> {
     let mb = session.select(folder_name)?;
@@ -6017,77 +6137,84 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
 
     let stored = db.get_folder_sync_state(account_key, folder_name)?;
     let had_existing_state = stored.is_some();
+    let incremental = matches!(&stored, Some(s) if s.uid_validity == uid_validity);
 
-    let query = match &stored {
-        Some(s) if s.uid_validity == uid_validity => {
-            let next = s.last_seen_uid.saturating_add(1);
-            format!("UID {}:*", next)
+    // ---- Incremental path: take ALL new mail above the watermark ----
+    if incremental {
+        let next = stored.as_ref().unwrap().last_seen_uid.saturating_add(1);
+        let query = format!("UID {}:*", next);
+        debug_log!("[RUST] uid_sync_folder: '{}' UID SEARCH {}", folder_name, query);
+        let uid_set = session.uid_search(&query)?;
+        if uid_set.is_empty() {
+            return Ok(UidSyncResult {
+                emails: vec![], uid_validity, max_uid: 0, min_uid: 0, had_existing_state,
+            });
         }
-        Some(s) => {
-            println!(
-                "[RUST] uid_sync_folder: UIDVALIDITY changed for '{}' ({} -> {}), bootstrapping",
-                folder_name, s.uid_validity, uid_validity
-            );
-            build_bootstrap_query(sync_cutoff_days)
-        }
-        None => {
-            println!(
-                "[RUST] uid_sync_folder: no stored state for '{}', bootstrapping (cutoff {} days)",
-                folder_name, sync_cutoff_days
-            );
-            build_bootstrap_query(sync_cutoff_days)
-        }
-    };
+        let mut uids: Vec<u32> = uid_set.into_iter().collect();
+        uids.sort_unstable();
+        let min_uid = uids.first().copied().unwrap_or(0);
+        debug_log!("[RUST] uid_sync_folder: '{}' matched {} new UIDs (min {}, max {})",
+            folder_name, uids.len(), min_uid, uids.last().copied().unwrap_or(0));
 
-    debug_log!("[RUST] uid_sync_folder: '{}' UID SEARCH {}", folder_name, query);
-    let uid_set = session.uid_search(&query)?;
+        // Chunk into ~500-UID batches to stay well under Gmail's ~8KB IMAP line limit.
+        const FETCH_BATCH: usize = 500;
+        let mut emails: Vec<RawNostrEmail> = Vec::new();
+        let mut max_uid: u32 = 0;
+        for chunk in uids.chunks(FETCH_BATCH) {
+            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            // BODY.PEEK[] (not RFC822) so reading a message body never *sets* \Seen.
+            // FLAGS lets us read the server's \Seen and seed local read state.
+            let messages = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
+            for msg in messages.iter() {
+                if let Some(uid) = msg.uid {
+                    if uid > max_uid { max_uid = uid; }
+                }
+                if let Some(body) = msg.body() {
+                    if let Some(mut parsed) = parse_fn(body, config) {
+                        parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
+                        emails.push(parsed);
+                    }
+                }
+            }
+        }
+        return Ok(UidSyncResult { emails, uid_validity, max_uid, min_uid, had_existing_state });
+    }
+
+    // ---- Bootstrap path: count-based backward walk from the newest UID ----
+    // Triggered when there's no stored state, or UIDVALIDITY changed (UIDs were
+    // reassigned, so prior watermarks are meaningless and we re-bootstrap).
+    if let Some(s) = &stored {
+        println!("[RUST] uid_sync_folder: UIDVALIDITY changed for '{}' ({} -> {}), re-bootstrapping",
+            folder_name, s.uid_validity, uid_validity);
+    } else {
+        println!("[RUST] uid_sync_folder: no stored state for '{}', bootstrapping", folder_name);
+    }
+
+    let uid_set = session.uid_search("UID 1:*")?;
     if uid_set.is_empty() {
         return Ok(UidSyncResult {
-            emails: vec![],
-            uid_validity,
-            max_uid: 0,
-            min_uid: 0,
-            had_existing_state,
+            emails: vec![], uid_validity, max_uid: 0, min_uid: 0, had_existing_state,
         });
     }
-
     let mut uids: Vec<u32> = uid_set.into_iter().collect();
     uids.sort_unstable();
-    let min_uid = uids.first().copied().unwrap_or(0);
-    debug_log!("[RUST] uid_sync_folder: '{}' matched {} UIDs (min {}, max {})",
-        folder_name, uids.len(), min_uid, uids.last().copied().unwrap_or(0));
+    // The true newest UID becomes the watermark even though we body-fetch only
+    // the count window below it — forward sync then resumes from here.
+    let watermark = uids.last().copied().unwrap_or(0);
+    let target = target_count.max(1);
+    println!("[RUST] uid_sync_folder: '{}' bootstrap — {} UIDs in folder, target {} match(es), max_scan {}",
+        folder_name, uids.len(), target, max_scan);
 
-    // Chunk into ~500-UID batches to stay well under Gmail's ~8KB IMAP line limit.
-    const FETCH_BATCH: usize = 500;
-    let mut emails: Vec<RawNostrEmail> = Vec::new();
-    let mut max_uid: u32 = 0;
-    for chunk in uids.chunks(FETCH_BATCH) {
-        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        // BODY.PEEK[] (not RFC822) so reading a message body never *sets* \Seen.
-        // We additionally request FLAGS so we can *read* the server's \Seen flag
-        // and seed local read state from it (import read-elsewhere on first
-        // sync). Response key is still BODY[], so msg.body() works unchanged.
-        let messages = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
-        for msg in messages.iter() {
-            if let Some(uid) = msg.uid {
-                if uid > max_uid {
-                    max_uid = uid;
-                }
-            }
-            if let Some(body) = msg.body() {
-                if let Some(mut parsed) = parse_fn(body, config) {
-                    parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
-                    emails.push(parsed);
-                }
-            }
-        }
-    }
+    // Seed `lowest_scanned` at the watermark so a no-op walk never claims to
+    // have scanned below it; the walk lowers it to the oldest UID it touches,
+    // which becomes the bootstrap floor (min_seen_uid).
+    let walk = walk_back_collecting(session, config, &uids, watermark, target, max_scan, parse_fn)?;
 
     Ok(UidSyncResult {
-        emails,
+        emails: walk.emails,
         uid_validity,
-        max_uid,
-        min_uid,
+        max_uid: watermark,
+        min_uid: walk.lowest_scanned,
         had_existing_state,
     })
 }
@@ -6106,11 +6233,100 @@ struct FetchOlderResult {
     hit_bottom: bool,
 }
 
+/// Result of `walk_back_collecting`: the nostr emails found, the lowest UID we
+/// actually touched (the caller turns this into the new floor), how many UIDs
+/// were scanned, and whether the candidate list was fully exhausted.
+struct CountWalk {
+    emails: Vec<RawNostrEmail>,
+    lowest_scanned: u32,
+    scanned: usize,
+    hit_bottom: bool,
+}
+
+/// Pure per-iteration decision for the backward count-walk: given how many
+/// UIDs we've scanned so far (`scanned`), the total candidate count (`total`),
+/// the matches accumulated (`matches_so_far`), the match target and the scan
+/// budget, return the `[start, end)` slice of the ascending candidate list to
+/// fetch next — newest UIDs are at the tail, so we walk from the end inward.
+/// Returns `None` when the walk should stop (target met, budget spent, or list
+/// exhausted). Factored out of `walk_back_collecting` so the boundary logic is
+/// unit-testable without a live IMAP session.
+fn next_back_batch(
+    scanned: usize,
+    total: usize,
+    matches_so_far: usize,
+    target_count: usize,
+    max_scan: usize,
+) -> Option<(usize, usize)> {
+    if scanned >= total || matches_so_far >= target_count || scanned >= max_scan {
+        return None;
+    }
+    let remaining_target = target_count.saturating_sub(matches_so_far);
+    let remaining_budget = max_scan.saturating_sub(scanned);
+    let remaining_candidates = total - scanned;
+    let take = remaining_target.max(1).min(remaining_budget).min(remaining_candidates);
+    let end = total - scanned;
+    let start = end - take;
+    Some((start, end))
+}
+
+/// Walk a pre-sorted (ascending) UID list newest→oldest, fetching bodies in
+/// batches and running `parse_fn`, until either `target_count` nostr matches
+/// accumulate, `max_scan` UIDs have been examined, or the list is exhausted.
+///
+/// `floor_init` seeds `lowest_scanned` so a no-op call never raises the floor.
+/// Shared by `fetch_older_in_folder` (and, later, the count-based bootstrap):
+/// the only thing that differs between callers is which candidate UIDs they
+/// feed in. BODY.PEEK[] keeps reads from setting \Seen; FLAGS lets us seed
+/// local read state for newly-imported rows.
+fn walk_back_collecting<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    config: &EmailConfig,
+    uids_sorted: &[u32],
+    floor_init: u32,
+    target_count: usize,
+    max_scan: usize,
+    parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
+) -> anyhow::Result<CountWalk> {
+    let mut emails: Vec<RawNostrEmail> = Vec::new();
+    let mut scanned: usize = 0;
+    let mut lowest_scanned: u32 = floor_init;
+
+    // Cap each UID FETCH line at ~500 UIDs to stay under Gmail's ~8KB IMAP line
+    // limit. `take` can be large on bootstrap (a deep count target), so split
+    // the slice even though a single batch is logically one walk step.
+    const FETCH_BATCH: usize = 500;
+    while let Some((start, end)) =
+        next_back_batch(scanned, uids_sorted.len(), emails.len(), target_count, max_scan)
+    {
+        for chunk in uids_sorted[start..end].chunks(FETCH_BATCH) {
+            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
+            for msg in msgs.iter() {
+                if let Some(uid) = msg.uid {
+                    if uid < lowest_scanned { lowest_scanned = uid; }
+                }
+                if let Some(body) = msg.body() {
+                    if let Some(mut parsed) = parse_fn(body, config) {
+                        parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
+                        emails.push(parsed);
+                    }
+                }
+            }
+        }
+        scanned += end - start;
+    }
+
+    let hit_bottom = scanned >= uids_sorted.len();
+    Ok(CountWalk { emails, lowest_scanned, scanned, hit_bottom })
+}
+
 /// Pull older messages from one folder, walking UIDs backward.
 ///
-/// Requires a prior forward sync (folder_sync_state row must exist). Backfills
-/// `min_seen_uid` on the first call by replaying the bootstrap UID SEARCH —
-/// that gives us a deterministic floor instead of guessing.
+/// Requires a prior forward sync (folder_sync_state row must exist). The floor
+/// (`min_seen_uid`) is normally recorded at bootstrap. Only legacy installs
+/// whose row predates the `min_seen_uid` column hit the backfill branch, which
+/// seeds an approximate floor via the date-windowed SEARCH (`build_bootstrap_query`).
 ///
 /// Walks newest-to-oldest from `min_seen_uid - 1`, fetching full bodies and
 /// running `parse_fn`. Stops when either:
@@ -6191,54 +6407,24 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
     let target_count = page_size.max(1);
     let max_scan = target_count.max(MIN_SCAN_PER_CALL);
 
-    let mut emails: Vec<RawNostrEmail> = Vec::new();
-    let mut scanned: usize = 0;
-    // Initialize to floor_uid so we never raise the floor on a no-op call.
-    let mut lowest_scanned: u32 = floor_uid;
+    // Walk newest-to-oldest, fetching bodies in batches, stopping when we have
+    // enough matches or hit the per-call cap. `floor_uid` seeds the lowest-UID
+    // tracker so a no-op call never raises the floor.
+    let walk = walk_back_collecting(session, config, &uids, floor_uid, target_count, max_scan, parse_fn)?;
 
-    // Walk newest-to-oldest, fetching up to `page_size` bodies per IMAP
-    // batch, stopping when we have enough matches or hit the per-call cap.
-    while scanned < uids.len() && emails.len() < target_count && scanned < max_scan {
-        let remaining_target = target_count.saturating_sub(emails.len());
-        let remaining_budget = max_scan.saturating_sub(scanned);
-        let remaining_candidates = uids.len() - scanned;
-        let take = remaining_target.max(1).min(remaining_budget).min(remaining_candidates);
-        let end = uids.len() - scanned;
-        let start = end - take;
-        let batch = &uids[start..end];
-
-        let uid_list = batch.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        // BODY.PEEK[] so paging older mail doesn't *set* \Seen; FLAGS so we can
-        // read it and seed local read state for newly-imported rows.
-        let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
-        for msg in msgs.iter() {
-            if let Some(uid) = msg.uid {
-                if uid < lowest_scanned { lowest_scanned = uid; }
-            }
-            if let Some(body) = msg.body() {
-                if let Some(mut parsed) = parse_fn(body, config) {
-                    parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
-                    emails.push(parsed);
-                }
-            }
-        }
-        scanned += take;
-    }
-
-    let hit_bottom = scanned >= uids.len();
     // When we've truly hit bottom, set floor to 1 so the next call
     // short-circuits. Otherwise lower it to the lowest UID we touched.
-    let returned_floor = if hit_bottom { 1 } else { lowest_scanned };
+    let returned_floor = if walk.hit_bottom { 1 } else { walk.lowest_scanned };
 
     debug_log!(
         "[RUST] fetch_older_in_folder: '{}' scanned {}/{} UIDs, found {} nostr match(es), hit_bottom={}, new_floor={}",
-        folder_name, scanned, uids.len(), emails.len(), hit_bottom, returned_floor
+        folder_name, walk.scanned, uids.len(), walk.emails.len(), walk.hit_bottom, returned_floor
     );
 
     Ok(FetchOlderResult {
-        emails,
+        emails: walk.emails,
         new_floor_uid: Some(returned_floor),
-        hit_bottom,
+        hit_bottom: walk.hit_bottom,
     })
 }
 
@@ -6278,7 +6464,7 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     db: &Database,
     account_key: &str,
     folder_name: &str,
-    sync_cutoff_days: i64,
+    recover_dropped: bool,
     parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
 ) -> anyhow::Result<GapFillResult> {
     let mb = session.select(folder_name)?;
@@ -6293,48 +6479,57 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
         _ => return Ok(GapFillResult::empty()),
     };
 
-    let claimed: Vec<u32> = session.uid_search(&build_bootstrap_query(sync_cutoff_days))?
-        .into_iter()
-        .collect();
-    if claimed.is_empty() {
-        return Ok(GapFillResult::empty());
-    }
-
-    // If we don't yet have a floor (legacy install), opportunistically backfill
-    // it from this SINCE result — same as fetch_older does — so the [floor,
-    // last_seen] range is well-defined.
+    // Resolve the floor (lower bound of the synced range). A legacy install may
+    // have a watermark but no recorded floor; we can't honestly define
+    // [floor, last_seen] without one (guessing the folder minimum would claim
+    // everything down to UID 1 is synced), so skip gap-fill until the floor is
+    // established by a re-bootstrap or by fetch_older on scroll.
     let floor = match stored.min_seen_uid {
         Some(v) => v,
         None => {
-            let m = claimed.iter().copied().min().unwrap_or(0);
-            if m > 0 {
-                if let Err(e) = db.set_folder_min_seen_uid(account_key, folder_name, m) {
-                    debug_log!("[RUST] gap_fill: failed to backfill min_seen_uid for '{}': {}", folder_name, e);
-                }
-            }
-            m
+            debug_log!("[RUST] gap_fill: '{}' has no min_seen_uid yet, skipping until a floor is established", folder_name);
+            return Ok(GapFillResult::empty());
         }
     };
+    if floor == 0 || stored.last_seen_uid < floor {
+        return Ok(GapFillResult::empty());
+    }
 
     // The window we'll report as gap-examined to the caller (committed only
     // after a successful persist). Covers the full scanned range even when no
     // gaps are found, so a future pass can skip it.
     let examined = Some((uid_validity, floor, stored.last_seen_uid));
 
-    // Candidates: UIDs the server returned that fall inside our scanned range.
+    // Candidates: UIDs inside our synced range [floor, last_seen] to (re)check.
     // Below `floor` is fetch_older territory; above `last_seen_uid` is forward
-    // sync territory. Both have their own paths and shouldn't be re-touched
-    // here. Also skip UIDs already inside the previously-examined range
-    // [gap_examined_min, gap_examined_max] — their nostr-ness was already
-    // determined (message bodies are immutable), so re-fetching them is wasted
-    // work. This is what stops every refresh from re-downloading all the
-    // non-nostr mail in the window.
+    // sync territory. Both have their own paths and shouldn't be re-touched here.
+    // We always scan the full range by UID (no date window) — the count-based
+    // bootstrap keeps [floor, last_seen] bounded, and the ENVELOPE pass below is
+    // cheap (no bodies until a genuine gap is found).
+    //
+    // Steady state (recover_dropped = false): skip the already-examined
+    // sub-range [gap_examined_min, gap_examined_max] — those UIDs' nostr-ness
+    // was already determined (bodies are immutable), so re-checking them is
+    // wasted work. This is what stops every refresh from re-examining the whole
+    // window.
+    //
+    // Recovery (recover_dropped = true): the user just lifted the signed-only
+    // filter, so mail we previously dropped must come back. Those drops can sit
+    // anywhere in [floor, last_seen], so we ignore the examined marker and
+    // re-check the full range. Once the drops are re-persisted, the ENVELOPE
+    // re-scan finds nothing new while the filter stays off.
     let already_examined = |uid: u32| match (stored.gap_examined_min_uid, stored.gap_examined_max_uid) {
         (Some(lo), Some(hi)) => uid >= lo && uid <= hi,
         _ => false,
     };
-    let candidates: Vec<u32> = claimed.into_iter()
-        .filter(|uid| *uid >= floor && *uid <= stored.last_seen_uid && !already_examined(*uid))
+    let candidates: Vec<u32> = session
+        .uid_search(&format!("UID {}:{}", floor, stored.last_seen_uid))?
+        .into_iter()
+        .filter(|uid| {
+            *uid >= floor
+                && *uid <= stored.last_seen_uid
+                && (recover_dropped || !already_examined(*uid))
+        })
         .collect();
     if candidates.is_empty() {
         return Ok(GapFillResult { emails: Vec::new(), examined });
@@ -6394,7 +6589,10 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     Ok(GapFillResult { emails, examined })
 }
 
-/// Read `sync_cutoff_days` for the active pubkey, defaulting to 30.
+/// Legacy-only: read `sync_cutoff_days` for the active pubkey, defaulting to 30.
+/// The settings UI no longer writes this key (replaced by per-folder counts);
+/// it now feeds only `fetch_older`'s legacy floor-backfill (see
+/// `build_bootstrap_query`), where the 30-day default is a fine approximation.
 /// Read directly from the active pubkey's settings — no email-based reverse
 /// lookup. Sharing an email address across multiple identities used to make
 /// this return the first matching pubkey's value, which was rarely the active
@@ -6406,6 +6604,63 @@ fn lookup_sync_cutoff_days(db: &Database, pubkey: &str) -> i64 {
         }
     }
     30
+}
+
+/// Default number of nostr matches to pull when bootstrapping a folder, when
+/// the user hasn't set `sync_initial_count`.
+const DEFAULT_INITIAL_COUNT: usize = 50;
+/// Default bootstrap depth for the dedicated dense `nostr-mail` folder, where
+/// (nearly) every message is nostr mail so a deep count is cheap and accurate.
+/// Overridable per-folder via `sync_folder_counts`.
+const DEFAULT_DENSE_COUNT: usize = 500;
+/// Default cap on raw messages examined per folder bootstrap. Bounds the cost
+/// on sparse mixed folders (e.g. a busy INBOX) where the target match count
+/// would otherwise force an unbounded backward walk.
+const DEFAULT_MAX_SCAN: usize = 2000;
+
+/// Pure resolution of a folder's bootstrap count. An explicit override in the
+/// user's `sync_folder_counts` map wins; otherwise the dedicated dense
+/// `nostr-mail` folder defaults deep while every other folder uses the global
+/// `sync_initial_count`. Factored out for unit testing without a `Database`.
+fn resolve_folder_count(folder: &str, folder_counts_json: Option<&str>, initial_count: usize) -> usize {
+    if let Some(json) = folder_counts_json {
+        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, usize>>(json) {
+            if let Some(n) = map.get(folder) {
+                return *n;
+            }
+        }
+    }
+    if folder.eq_ignore_ascii_case("nostr-mail") {
+        return DEFAULT_DENSE_COUNT;
+    }
+    initial_count
+}
+
+/// Global per-folder bootstrap target (nostr matches), defaulting to
+/// `DEFAULT_INITIAL_COUNT`. Per-pubkey preference, like the cutoff above.
+fn lookup_initial_count(db: &Database, pubkey: &str) -> usize {
+    db.get_setting(pubkey, "sync_initial_count")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_INITIAL_COUNT)
+}
+
+/// Cap on raw messages examined per folder bootstrap, defaulting to
+/// `DEFAULT_MAX_SCAN`.
+fn lookup_max_scan(db: &Database, pubkey: &str) -> usize {
+    db.get_setting(pubkey, "sync_max_scan")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_SCAN)
+}
+
+/// Per-folder bootstrap count for the active pubkey: per-folder override →
+/// dense-folder default → global `sync_initial_count`.
+fn lookup_folder_count(db: &Database, pubkey: &str, folder: &str) -> usize {
+    let json = db.get_setting(pubkey, "sync_folder_counts").ok().flatten();
+    resolve_folder_count(folder, json.as_deref(), lookup_initial_count(db, pubkey))
 }
 
 /// Read `require_signature` for the active pubkey, defaulting to true.
@@ -6423,6 +6678,18 @@ pub(crate) fn lookup_spam_rescue(db: &Database, pubkey: &str) -> bool {
         return value != "false";
     }
     true
+}
+
+/// Read `auto_move_nostr` for the active pubkey, defaulting to false (opt-in).
+/// When on, each sync moves nostr mail found in the regular inbox folders into
+/// the rescue/nostr-mail folder, consolidating all nostr mail in one place.
+/// Off by default because it mutates the user's mailbox server-side (visible in
+/// every other mail client), so it's surfaced as an explicit opt-in.
+pub(crate) fn lookup_auto_move_nostr(db: &Database, pubkey: &str) -> bool {
+    if let Ok(Some(value)) = db.get_setting(pubkey, "auto_move_nostr") {
+        return value == "true";
+    }
+    false
 }
 
 /// Read the folder spam-rescued nostr mail should be moved into, defaulting to
@@ -6569,80 +6836,116 @@ fn rescue_nostr_emails_from_spam(
 
     let mut moved_total = 0usize;
     for folder in spam_folders {
-        if folder.eq_ignore_ascii_case(target_folder) {
-            continue;
-        }
-        if session.select(&folder).is_err() {
-            continue;
-        }
+        moved_total += move_nostr_from_folder(session, &folder, target_folder, unseen_only);
+    }
+    moved_total
+}
 
-        // Cheap server-side narrowing to candidate UIDs: messages that are
-        // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor
-        // block (encrypted, signed, signature, or seal). With `unseen_only` the
-        // search is gated by UNSEEN so a message the user read and deliberately
-        // filed into spam is left alone; the catch-up run drops that gate. BODY
-        // search support varies by server, so we re-confirm each candidate by
-        // fetching it and checking the transport auth gate.
-        let guard = if unseen_only { "UNSEEN " } else { "" };
-        let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for q in &[
-            "HEADER X-Nostr-Pubkey \"\"",
-            "HEADER X-Nostr-Sig \"\"",
-            "BODY \"BEGIN NOSTR NIP-\"",
-            "BODY \"BEGIN NOSTR SIGNED\"",
-            "BODY \"BEGIN NOSTR SIGNATURE\"",
-            "BODY \"BEGIN NOSTR SEAL\"",
-        ] {
-            let query = format!("{}{}", guard, q);
-            if let Ok(found) = session.uid_search(&query) {
-                candidates.extend(found);
+/// Scan one folder for nostr mail and move it into `target_folder`. Returns the
+/// number of messages moved. No-op if `folder` is the target itself or can't be
+/// selected. Shared by spam rescue and inbox auto-filing.
+///
+/// `unseen_only` gates the candidate search on UNSEEN — spam rescue sets it so a
+/// message the user read and deliberately filed into spam (the app marks such
+/// mail \Seen, replicated server-side to every device) is left alone. Inbox
+/// auto-filing clears it: there's no "leave it here" intent for ordinary inbox
+/// nostr mail, and once moved a message is gone from the source so it can't be
+/// re-moved.
+fn move_nostr_from_folder(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    folder: &str,
+    target_folder: &str,
+    unseen_only: bool,
+) -> usize {
+    if folder.eq_ignore_ascii_case(target_folder) {
+        return 0;
+    }
+    if session.select(folder).is_err() {
+        return 0;
+    }
+
+    // Cheap server-side narrowing to candidate UIDs: messages that are
+    // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor block
+    // (encrypted, signed, signature, or seal). BODY search support varies by
+    // server, so we re-confirm each candidate by fetching it and checking the
+    // transport auth gate.
+    let guard = if unseen_only { "UNSEEN " } else { "" };
+    let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for q in &[
+        "HEADER X-Nostr-Pubkey \"\"",
+        "HEADER X-Nostr-Sig \"\"",
+        "BODY \"BEGIN NOSTR NIP-\"",
+        "BODY \"BEGIN NOSTR SIGNED\"",
+        "BODY \"BEGIN NOSTR SIGNATURE\"",
+        "BODY \"BEGIN NOSTR SEAL\"",
+    ] {
+        let query = format!("{}{}", guard, q);
+        if let Ok(found) = session.uid_search(&query) {
+            candidates.extend(found);
+        }
+    }
+    debug_log!("[RUST] move_nostr_from_folder: folder '{}' nostr candidate UIDs = {}", folder, candidates.len());
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let mut to_move: Vec<u32> = Vec::new();
+    let uids: Vec<u32> = candidates.into_iter().collect();
+    for chunk in uids.chunks(500) {
+        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        // BODY.PEEK[] (not RFC822) so confirming a candidate doesn't set the
+        // \Seen flag — moved messages keep their read state. The response key is
+        // still BODY[], so msg.body() works unchanged.
+        let messages = match session.uid_fetch(&uid_list, "(UID BODY.PEEK[])") {
+            Ok(m) => m,
+            Err(e) => {
+                debug_log!("[RUST] move_nostr_from_folder: fetch in '{}' failed: {}", folder, e);
+                continue;
             }
-        }
-        debug_log!("[RUST] rescue: folder '{}' nostr candidate UIDs = {}", folder, candidates.len());
-        if candidates.is_empty() {
-            continue;
-        }
-
-        // UIDs that pass the eligibility gate. No ledger: in the normal run a
-        // deliberate move-to-spam is respected because the app marks such mail
-        // \Seen, so it never appears in the UNSEEN candidate set above.
-        let mut to_move: Vec<u32> = Vec::new();
-        let uids: Vec<u32> = candidates.into_iter().collect();
-        for chunk in uids.chunks(500) {
-            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-            // BODY.PEEK[] (not RFC822) so confirming a candidate doesn't set the
-            // \Seen flag — rescued messages must stay unread on the server. The
-            // response key is still BODY[], so msg.body() works unchanged.
-            let messages = match session.uid_fetch(&uid_list, "(UID BODY.PEEK[])") {
-                Ok(m) => m,
-                Err(e) => {
-                    debug_log!("[RUST] rescue_nostr_emails_from_spam: fetch in '{}' failed: {}", folder, e);
-                    continue;
+        };
+        for msg in messages.iter() {
+            if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
+                if should_rescue_message(body) {
+                    to_move.push(uid);
+                } else {
+                    debug_log!("[RUST] move_nostr_from_folder: uid {} in '{}' not eligible (missing nostr marker or transport auth failed)", uid, folder);
                 }
-            };
-            for msg in messages.iter() {
-                if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
-                    if should_rescue_message(body) {
-                        to_move.push(uid);
-                    } else {
-                        debug_log!("[RUST] rescue: uid {} in '{}' not eligible (missing nostr marker or transport auth failed)", uid, folder);
-                    }
-                }
             }
         }
+    }
 
-        if to_move.is_empty() {
-            continue;
+    if to_move.is_empty() {
+        return 0;
+    }
+    let uid_set = to_move.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    match move_uids_to_folder(session, &uid_set, target_folder) {
+        Ok(_) => {
+            debug_log!("[RUST] move_nostr_from_folder: moved {} message(s) from '{}' to '{}'",
+                to_move.len(), folder, target_folder);
+            to_move.len()
         }
-        let uid_set = to_move.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        match move_uids_to_folder(session, &uid_set, target_folder) {
-            Ok(_) => {
-                debug_log!("[RUST] rescue_nostr_emails_from_spam: moved {} message(s) from '{}' to '{}'",
-                    to_move.len(), folder, target_folder);
-                moved_total += to_move.len();
-            }
-            Err(e) => debug_log!("[RUST] rescue_nostr_emails_from_spam: move from '{}' failed: {}", folder, e),
+        Err(e) => {
+            debug_log!("[RUST] move_nostr_from_folder: move from '{}' failed: {}", folder, e);
+            0
         }
+    }
+}
+
+/// Move nostr mail out of the regular inbox folders into `target_folder`, so it
+/// consolidates in the dedicated nostr folder the user reads from. Mirrors spam
+/// rescue but over the given inbox folders, never gating on \Seen. Spam folders
+/// must be excluded by the caller — they're handled by spam rescue. Returns the
+/// number of messages moved; per-folder failures are logged and skipped.
+fn auto_file_nostr_from_inbox(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    source_folders: &[String],
+    target_folder: &str,
+) -> usize {
+    // Make sure the destination exists before we start moving into it.
+    let _ = session.create(target_folder);
+    let mut moved_total = 0usize;
+    for folder in source_folders {
+        moved_total += move_nostr_from_folder(session, folder, target_folder, /* unseen_only */ false);
     }
     moved_total
 }

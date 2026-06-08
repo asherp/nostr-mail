@@ -4285,7 +4285,7 @@ class EmailService {
                             // Run decryption and signature verification in parallel (they're independent)
                             console.log('[JS] Calling backend decrypt_email_body + verifyAllSignatures in parallel...');
                             const [result, allSigs] = await Promise.all([
-                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, null, email.message_id || null),
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, email.recipient_pubkey || null, email.message_id || null),
                                 TauriService.verifyAllSignatures(emailBody).catch(e => {
                                     console.warn('[JS] Signature verification error:', e);
                                     return [];
@@ -4412,7 +4412,7 @@ class EmailService {
                                         const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                                         const decryptResult = await TauriService.decryptEmailBody(
                                             email.body, email.subject || '',
-                                            senderPubkey, null, email.message_id || null
+                                            senderPubkey, email.recipient_pubkey || null, email.message_id || null
                                         );
                                         if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
                                             manifestResult = {
@@ -9136,12 +9136,14 @@ ${attachmentsHtml}
                     return;
                 }
 
-                // Use backend to decrypt manifest and get attachment keys
+                // Use backend to decrypt manifest and get attachment keys. Pass BOTH
+                // pubkeys so the backend can pick the non-self counterparty — this email
+                // may be one we authored (sender == us) that also appears in the inbox.
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for attachment...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    senderPubkey, null,
+                    senderPubkey, email.recipient_pubkey || null,
                     email.message_id || null
                 );
 
@@ -9232,12 +9234,14 @@ ${attachmentsHtml}
                     return;
                 }
 
-                // Use backend to decrypt manifest and get attachment keys
+                // Use backend to decrypt manifest and get attachment keys. Pass BOTH
+                // pubkeys so the backend can pick the non-self counterparty (this email
+                // may be one we authored that also appears in the inbox).
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for ZIP...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    senderPubkey, null,
+                    senderPubkey, email.recipient_pubkey || null,
                     email.message_id || null
                 );
 

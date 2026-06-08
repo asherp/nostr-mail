@@ -3296,9 +3296,28 @@ pub fn decrypt_email_body_pipeline(
     };
     let derive_pk_ms = perf_derive.elapsed().as_millis();
 
-    // Determine fallback pubkey (the other party's pubkey for decryption)
-    let fallback = sender_pubkey
-        .or(recipient_pubkey)
+    // Determine fallback pubkey (the other party's pubkey for decryption).
+    // Prefer whichever provided pubkey is NOT the user's own: when you view your
+    // OWN sent mail from the inbox, sender_pubkey is your key, and using it would
+    // trip the self-DH guard in determine_decrypt_pubkey. The real counterparty is
+    // then the recipient. Picking the non-self candidate makes decryption work
+    // regardless of which folder (inbox/sent) the caller routed through.
+    let normalize_hex = |p: &str| -> String {
+        if p.starts_with("npub1") {
+            nostr_sdk::prelude::PublicKey::parse(p)
+                .map(|k| k.to_hex())
+                .unwrap_or_else(|_| p.to_string())
+        } else {
+            p.to_string()
+        }
+    };
+    let candidates: [Option<&str>; 2] = [sender_pubkey, recipient_pubkey];
+    let fallback = candidates
+        .iter()
+        .flatten()
+        .copied()
+        .find(|c| normalize_hex(c) != user_pubkey_hex)
+        .or_else(|| candidates.iter().flatten().copied().next())
         .unwrap_or("");
 
     // Walk the armor tree, decrypt each level

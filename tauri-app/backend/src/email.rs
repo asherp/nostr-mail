@@ -5357,7 +5357,6 @@ pub async fn refresh_inbox_emails_to_db(config: &EmailConfig, folders_arg: Optio
 
 async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
     let account_key = config.email_address.trim().to_lowercase();
-    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
     let max_scan = lookup_max_scan(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
     let spam_rescue = lookup_spam_rescue(db, active_pubkey);
@@ -5411,8 +5410,8 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     }
 
     println!(
-        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, sync_cutoff_days={} (bootstrap only)",
-        account_key, folders, sync_cutoff_days
+        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, max_scan={}",
+        account_key, folders, max_scan
     );
 
     // Per-folder watermark updates, applied AFTER all per-message DB saves succeed.
@@ -5458,7 +5457,7 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
             // recover_dropped = !require_signature: when the user has lifted the
             // signed-only filter, gap-fill re-scans the full synced range to
             // bring back mail that was dropped while the filter was on.
-            match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+            match gap_fill_in_folder(&mut session, config, db, &account_key, f,
                                       !require_signature, parse_nostr_email_from_imap_body) {
                 Ok(r) => {
                     raw_nostr_emails.extend(r.emails);
@@ -5689,7 +5688,6 @@ pub async fn refresh_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str
 async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
     debug_log!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
     let account_key = config.email_address.trim().to_lowercase();
-    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
     let max_scan = lookup_max_scan(db, active_pubkey);
 
     // See sync_nostr_emails_to_db for the meaning of the 4-tuple.
@@ -5723,7 +5721,7 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
         }
         if include_gap_fill {
             // Sent mail is never dropped, so it never needs recovery scanning.
-            match gap_fill_in_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
+            match gap_fill_in_folder(&mut session, config, db, &account_key, f,
                                       /* recover_dropped */ false, parse_nostr_sent_email_from_imap_body) {
                 Ok(r) => {
                     raw_sent_emails.extend(r.emails);
@@ -6442,7 +6440,6 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     db: &Database,
     account_key: &str,
     folder_name: &str,
-    sync_cutoff_days: i64,
     recover_dropped: bool,
     parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
 ) -> anyhow::Result<GapFillResult> {
@@ -6458,20 +6455,16 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
         _ => return Ok(GapFillResult::empty()),
     };
 
-    // Resolve the floor (lower bound of the synced range). For legacy installs
-    // without a stored floor, backfill it from the date-windowed SEARCH — same
-    // as fetch_older does — so [floor, last_seen] is well-defined.
+    // Resolve the floor (lower bound of the synced range). A legacy install may
+    // have a watermark but no recorded floor; we can't honestly define
+    // [floor, last_seen] without one (guessing the folder minimum would claim
+    // everything down to UID 1 is synced), so skip gap-fill until the floor is
+    // established by a re-bootstrap or by fetch_older on scroll.
     let floor = match stored.min_seen_uid {
         Some(v) => v,
         None => {
-            let since = session.uid_search(&build_bootstrap_query(sync_cutoff_days))?;
-            let m = since.into_iter().min().unwrap_or(0);
-            if m > 0 {
-                if let Err(e) = db.set_folder_min_seen_uid(account_key, folder_name, m) {
-                    debug_log!("[RUST] gap_fill: failed to backfill min_seen_uid for '{}': {}", folder_name, e);
-                }
-            }
-            m
+            debug_log!("[RUST] gap_fill: '{}' has no min_seen_uid yet, skipping until a floor is established", folder_name);
+            return Ok(GapFillResult::empty());
         }
     };
     if floor == 0 || stored.last_seen_uid < floor {
@@ -6486,35 +6479,34 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     // Candidates: UIDs inside our synced range [floor, last_seen] to (re)check.
     // Below `floor` is fetch_older territory; above `last_seen_uid` is forward
     // sync territory. Both have their own paths and shouldn't be re-touched here.
+    // We always scan the full range by UID (no date window) — the count-based
+    // bootstrap keeps [floor, last_seen] bounded, and the ENVELOPE pass below is
+    // cheap (no bodies until a genuine gap is found).
     //
-    // Steady state (recover_dropped = false): only UIDs the date-windowed
-    // bootstrap SEARCH returns, skipping the already-examined sub-range
-    // [gap_examined_min, gap_examined_max] — their nostr-ness was already
-    // determined (bodies are immutable). This is what stops every refresh from
-    // re-downloading all the non-nostr mail in the window.
+    // Steady state (recover_dropped = false): skip the already-examined
+    // sub-range [gap_examined_min, gap_examined_max] — those UIDs' nostr-ness
+    // was already determined (bodies are immutable), so re-checking them is
+    // wasted work. This is what stops every refresh from re-examining the whole
+    // window.
     //
     // Recovery (recover_dropped = true): the user just lifted the signed-only
     // filter, so mail we previously dropped must come back. Those drops can sit
-    // anywhere in [floor, last_seen] and may now be older than the date window,
-    // so we scan the *full* range by UID and ignore the examined marker. The
-    // ENVELOPE pass below is cheap (no bodies until a genuine gap is found);
-    // once the drops are re-persisted, only the ENVELOPE re-scan recurs while
-    // the filter stays off.
+    // anywhere in [floor, last_seen], so we ignore the examined marker and
+    // re-check the full range. Once the drops are re-persisted, the ENVELOPE
+    // re-scan finds nothing new while the filter stays off.
     let already_examined = |uid: u32| match (stored.gap_examined_min_uid, stored.gap_examined_max_uid) {
         (Some(lo), Some(hi)) => uid >= lo && uid <= hi,
         _ => false,
     };
-    let candidates: Vec<u32> = if recover_dropped {
-        session.uid_search(&format!("UID {}:{}", floor, stored.last_seen_uid))?
-            .into_iter()
-            .filter(|uid| *uid >= floor && *uid <= stored.last_seen_uid)
-            .collect()
-    } else {
-        session.uid_search(&build_bootstrap_query(sync_cutoff_days))?
-            .into_iter()
-            .filter(|uid| *uid >= floor && *uid <= stored.last_seen_uid && !already_examined(*uid))
-            .collect()
-    };
+    let candidates: Vec<u32> = session
+        .uid_search(&format!("UID {}:{}", floor, stored.last_seen_uid))?
+        .into_iter()
+        .filter(|uid| {
+            *uid >= floor
+                && *uid <= stored.last_seen_uid
+                && (recover_dropped || !already_examined(*uid))
+        })
+        .collect();
     if candidates.is_empty() {
         return Ok(GapFillResult { emails: Vec::new(), examined });
     }

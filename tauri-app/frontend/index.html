@@ -698,6 +698,16 @@
 
                                 <li class="toggle-settings-item">
                                     <div class="toggle-setting">
+                                        <label for="auto-move-nostr-preference">Auto-file Nostr Mail</label>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="auto-move-nostr-preference" checked>
+                                        </label>
+                                    </div>
+                                    <small class="form-text text-muted">On each sync, automatically move Nostr-encrypted messages found in your Inbox into your rescue folder, consolidating all Nostr mail in one place. Only the Inbox is affected. Uses the same destination as Spam Rescue above.</small>
+                                </li>
+
+                                <li class="toggle-settings-item">
+                                    <div class="toggle-setting">
                                         <label for="hide-undecryptable-emails-preference">Hide Undecryptable Emails</label>
                                         <label class="toggle-switch">
                                             <input type="checkbox" id="hide-undecryptable-emails-preference" checked>
@@ -769,9 +779,15 @@
                         </div>
                         
                         <div class="form-group">
-                            <label for="sync-cutoff-days">Sync Cutoff (Days):</label>
-                            <input type="number" id="sync-cutoff-days" placeholder="30" min="1" max="36500" value="30">
-                            <small class="form-text text-muted">How far back in time to sync emails when setting up on a new device. Default: 30 days. Set to 0 to sync all emails.</small>
+                            <label for="sync-initial-count">Messages to Load Per Folder:</label>
+                            <input type="number" id="sync-initial-count" placeholder="50" min="1" max="100000" value="50">
+                            <small class="form-text text-muted">How many nostr emails to load per folder on first sync. The dedicated <code>nostr-mail</code> folder loads deeper by default. Scroll up to load more. Default: 50.</small>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="sync-max-scan">Max Messages to Scan (mixed folders):</label>
+                            <input type="number" id="sync-max-scan" placeholder="2000" min="50" max="1000000" value="2000">
+                            <small class="form-text text-muted">Upper bound on raw messages examined per folder when finding nostr mail. Caps the cost on sparse folders like a busy INBOX. Default: 2000.</small>
                         </div>
                         
                         <div class="form-group">

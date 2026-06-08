@@ -269,11 +269,13 @@ NostrMailApp.prototype.loadSettings = async function() {
                         use_tls: dbSettings.use_tls === 'true',
                         email_filter: dbSettings.email_filter || 'nostr',
                         send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                        sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 30, // Default to 30 days
+                        sync_initial_count: parseInt(dbSettings.sync_initial_count) || 50, // Messages to load per folder
+                        sync_max_scan: parseInt(dbSettings.sync_max_scan) || 2000, // Raw-message scan cap for sparse folders
                         emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                         inbox_folder: dbSettings.inbox_folder || '',
                         require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
                         spam_rescue: dbSettings.spam_rescue !== 'false', // Default to true (on by default)
+                        auto_move_nostr: dbSettings.auto_move_nostr !== 'false', // Default to true (on by default)
                         spam_rescue_target: dbSettings.spam_rescue_target || 'nostr-mail',
                         hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                         automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
@@ -328,11 +330,13 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
         use_tls: true,
         email_filter: 'nostr',
         send_matching_dm: true,
-        sync_cutoff_days: 30,
+        sync_initial_count: 50,
+        sync_max_scan: 2000,
         emails_per_page: 50,
         inbox_folder: '',
         require_signature: true,
         spam_rescue: true,
+        auto_move_nostr: true,
         spam_rescue_target: 'nostr-mail',
         glossia_encoding_body: 'latin',
         glossia_encoding_signature: 'latin',
@@ -379,11 +383,13 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         use_tls: true,
         email_filter: 'nostr',
         send_matching_dm: true,
-        sync_cutoff_days: 30, // Default to 30 days (matching loadSettingsForPubkey)
+        sync_initial_count: 50, // Messages to load per folder (matching loadSettingsForPubkey)
+        sync_max_scan: 2000, // Raw-message scan cap for sparse folders
         emails_per_page: 50,
         inbox_folder: '',
         require_signature: true,
         spam_rescue: true,
+        auto_move_nostr: true,
         spam_rescue_target: 'nostr-mail',
         hide_undecryptable_emails: true,
         automatically_encrypt: true,
@@ -443,11 +449,13 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 use_tls: dbSettings.use_tls === 'true',
                 email_filter: dbSettings.email_filter || 'nostr',
                 send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 30, // Default to 30 days
+                sync_initial_count: parseInt(dbSettings.sync_initial_count) || 50, // Messages to load per folder
+                sync_max_scan: parseInt(dbSettings.sync_max_scan) || 2000, // Raw-message scan cap for sparse folders
                 emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                 inbox_folder: dbSettings.inbox_folder || '',
                 require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
                 spam_rescue: dbSettings.spam_rescue !== 'false', // Default to true (on by default)
+                auto_move_nostr: dbSettings.auto_move_nostr !== 'false', // Default to true (on by default)
                 spam_rescue_target: dbSettings.spam_rescue_target || 'nostr-mail',
                 hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                 automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
@@ -3107,11 +3115,13 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 use_tls: (loadedSettings && loadedSettings.use_tls !== undefined) ? loadedSettings.use_tls : (domManager.get('use-tls')?.checked || false),
                 email_filter: (loadedSettings && loadedSettings.email_filter) ? loadedSettings.email_filter : (domManager.getValue('emailFilterPreference') || 'nostr'),
                 send_matching_dm: (loadedSettings && loadedSettings.send_matching_dm !== undefined) ? loadedSettings.send_matching_dm : (domManager.get('send-matching-dm-preference')?.checked !== false),
-                sync_cutoff_days: (loadedSettings && loadedSettings.sync_cutoff_days) ? loadedSettings.sync_cutoff_days : (parseInt(domManager.getValue('syncCutoffDays')) || 30),
+                sync_initial_count: (loadedSettings && loadedSettings.sync_initial_count) ? loadedSettings.sync_initial_count : (parseInt(domManager.getValue('syncInitialCount')) || 50),
+                sync_max_scan: (loadedSettings && loadedSettings.sync_max_scan) ? loadedSettings.sync_max_scan : (parseInt(domManager.getValue('syncMaxScan')) || 2000),
                 emails_per_page: (loadedSettings && loadedSettings.emails_per_page) ? loadedSettings.emails_per_page : (parseInt(domManager.getValue('emailsPerPage')) || 50),
                 inbox_folder: (loadedSettings && loadedSettings.inbox_folder !== undefined) ? loadedSettings.inbox_folder : readInboxFolderSelection(),
                 require_signature: (loadedSettings && loadedSettings.require_signature !== undefined) ? loadedSettings.require_signature : (domManager.get('require-signature-preference')?.checked !== false),
                 spam_rescue: (loadedSettings && loadedSettings.spam_rescue !== undefined) ? loadedSettings.spam_rescue : (domManager.get('spam-rescue-preference')?.checked !== false),
+                auto_move_nostr: (loadedSettings && loadedSettings.auto_move_nostr !== undefined) ? loadedSettings.auto_move_nostr : (domManager.get('auto-move-nostr-preference')?.checked !== false),
                 spam_rescue_target: (loadedSettings && loadedSettings.spam_rescue_target !== undefined) ? loadedSettings.spam_rescue_target : ((domManager.get('spam-rescue-target-preference')?.value || '').trim() || 'nostr-mail'),
                 hide_undecryptable_emails: (loadedSettings && loadedSettings.hide_undecryptable_emails !== undefined) ? loadedSettings.hide_undecryptable_emails : (domManager.get('hide-undecryptable-emails-preference')?.checked !== false),
                 automatically_encrypt: (loadedSettings && loadedSettings.automatically_encrypt !== undefined) ? loadedSettings.automatically_encrypt : (domManager.get('automatically-encrypt-preference')?.checked !== false),
@@ -3148,11 +3158,13 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 use_tls: domManager.get('use-tls')?.checked || false,
                 email_filter: domManager.getValue('emailFilterPreference') || 'nostr',
                 send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false, // Default to true
-                sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 30, // Default to 30 days
+                sync_initial_count: parseInt(domManager.getValue('syncInitialCount')) || 50, // Messages to load per folder
+                sync_max_scan: parseInt(domManager.getValue('syncMaxScan')) || 2000, // Raw-message scan cap for sparse folders
                 emails_per_page: parseInt(domManager.getValue('emailsPerPage')) || 50, // Default to 50
                 inbox_folder: readInboxFolderSelection(),
                 require_signature: domManager.get('require-signature-preference')?.checked !== false, // Default to true
                 spam_rescue: domManager.get('spam-rescue-preference')?.checked !== false, // Default to true (on by default)
+                auto_move_nostr: domManager.get('auto-move-nostr-preference')?.checked !== false, // Default to true (on by default)
                 spam_rescue_target: (domManager.get('spam-rescue-target-preference')?.value || '').trim() || 'nostr-mail',
                 hide_undecryptable_emails: domManager.get('hide-undecryptable-emails-preference')?.checked !== false, // Default to true
                 automatically_encrypt: autoEncryptEnabled,
@@ -3195,11 +3207,13 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('use_tls', settings.use_tls.toString());
             settingsMap.set('email_filter', settings.email_filter);
             settingsMap.set('send_matching_dm', settings.send_matching_dm.toString());
-            settingsMap.set('sync_cutoff_days', settings.sync_cutoff_days.toString());
+            settingsMap.set('sync_initial_count', settings.sync_initial_count.toString());
+            settingsMap.set('sync_max_scan', settings.sync_max_scan.toString());
             settingsMap.set('emails_per_page', settings.emails_per_page.toString());
             settingsMap.set('inbox_folder', settings.inbox_folder || '');
             settingsMap.set('require_signature', settings.require_signature.toString());
             settingsMap.set('spam_rescue', (settings.spam_rescue !== false).toString());
+            settingsMap.set('auto_move_nostr', (settings.auto_move_nostr !== false).toString());
             settingsMap.set('spam_rescue_target', settings.spam_rescue_target || 'nostr-mail');
             settingsMap.set('hide_undecryptable_emails', (settings.hide_undecryptable_emails || false).toString());
             settingsMap.set('automatically_encrypt', (settings.automatically_encrypt !== undefined ? settings.automatically_encrypt : true).toString());
@@ -3305,6 +3319,7 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'require-signature-preference',
         'spam-rescue-preference',
         'spam-rescue-target-preference',
+        'auto-move-nostr-preference',
         'hide-undecryptable-emails-preference',
         'automatically-encrypt-preference',
         'automatically-sign-preference',
@@ -3312,7 +3327,8 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'include-pubkey-header-preference',
         'include-sig-header-preference',
         'include-recipient-header-preference',
-        'syncCutoffDays',
+        'syncInitialCount',
+        'syncMaxScan',
         'emailsPerPage',
         'inboxFolderPreference',
         'glossiaEncodingBody',
@@ -3580,7 +3596,8 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.setValue('imapPort', settings.imap_port || '');
         domManager.get('use-tls').checked = settings.use_tls || false;
         domManager.setValue('emailFilterPreference', settings.email_filter || 'nostr');
-        domManager.setValue('syncCutoffDays', settings.sync_cutoff_days || 30);
+        domManager.setValue('syncInitialCount', settings.sync_initial_count || 50);
+        domManager.setValue('syncMaxScan', settings.sync_max_scan || 2000);
         domManager.setValue('emailsPerPage', settings.emails_per_page || 50);
         // Inbox folders: the <option> list is per-account (driven by the
         // active user's IMAP server). Seed Tom Select with the persisted
@@ -3630,6 +3647,12 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
             spamRescuePref.checked = settings.spam_rescue !== false;
         }
         this.populateSpamRescueTargetOptions(settings);
+
+        // Set auto-file Nostr mail preference (default to true if not set)
+        const autoMoveNostrPref = domManager.get('auto-move-nostr-preference');
+        if (autoMoveNostrPref) {
+            autoMoveNostrPref.checked = settings.auto_move_nostr !== false;
+        }
 
         // Set hide undecryptable emails preference (default to true if not set)
         const hideUndecryptablePref = domManager.get('hide-undecryptable-emails-preference');

@@ -5667,7 +5667,13 @@ pub async fn fetch_older_sent_emails_to_db(
     let mut session = imap_pool::checkout(&target)?;
     let sent_folder = discover_sent_mailbox(&mut session)?
         .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
-    for f in [sent_folder.as_str(), "nostr-mail"] {
+    // Sent pass walks only the real Sent folder. `nostr-mail` is already
+    // covered by the inbox/nostr pass (verify_transport = true); scanning it
+    // again here adds no coverage (send is SMTP-only, nothing APPENDs to it),
+    // wastes body fetches, and lets both passes fight over its
+    // folder_sync_state watermark. Sent-vs-Inbox is decided at query time by
+    // from_address, not by which folder a row came from.
+    for f in [sent_folder.as_str()] {
         let scan_window = lookup_folder_count(db, active_pubkey, f);
         match fetch_older_in_folder(&mut session, config, db, &account_key, f,
                                      scan_window, sync_cutoff_days,
@@ -5743,7 +5749,13 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
     let mut session = imap_pool::checkout(&target)?;
     let sent_folder = discover_sent_mailbox(&mut session)?
         .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
-    for f in [sent_folder.as_str(), "nostr-mail"] {
+    // Sent pass walks only the real Sent folder. `nostr-mail` is already
+    // covered by the inbox/nostr pass (verify_transport = true); scanning it
+    // again here adds no coverage (send is SMTP-only, nothing APPENDs to it),
+    // wastes body fetches, and lets both passes fight over its
+    // folder_sync_state watermark. Sent-vs-Inbox is decided at query time by
+    // from_address, not by which folder a row came from.
+    for f in [sent_folder.as_str()] {
         // Scan a window of `count` messages per folder (see sync_nostr_emails_to_db).
         let count = lookup_folder_count(db, active_pubkey, f);
         match uid_sync_folder(&mut session, config, db, &account_key, f, count, count,

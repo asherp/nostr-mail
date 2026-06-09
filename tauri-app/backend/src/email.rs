@@ -5357,7 +5357,6 @@ pub async fn refresh_inbox_emails_to_db(config: &EmailConfig, folders_arg: Optio
 
 async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
     let account_key = config.email_address.trim().to_lowercase();
-    let max_scan = lookup_max_scan(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
     let spam_rescue = lookup_spam_rescue(db, active_pubkey);
     let auto_move_nostr = lookup_auto_move_nostr(db, active_pubkey);
@@ -5411,8 +5410,8 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     }
 
     println!(
-        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, max_scan={}",
-        account_key, folders, max_scan
+        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}",
+        account_key, folders
     );
 
     // Per-folder watermark updates, applied AFTER all per-message DB saves succeed.
@@ -5456,8 +5455,12 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
 
     println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
     for f in &folders {
-        let target_count = lookup_folder_count(db, active_pubkey, f);
-        match uid_sync_folder(&mut session, config, db, &account_key, f, target_count, max_scan,
+        // Bootstrap scans a window of `count` messages per folder ("Messages to
+        // Load Per Folder" / per-folder override), surfacing the nostr mail in
+        // it — same scan-window model as the scroll. Passing `count` as both the
+        // match target and the scan cap means the window is examined in full.
+        let count = lookup_folder_count(db, active_pubkey, f);
+        match uid_sync_folder(&mut session, config, db, &account_key, f, count, count,
                               parse_nostr_email_from_imap_body) {
             Ok(r) => {
                 if r.max_uid > 0 || !r.had_existing_state {
@@ -5546,6 +5549,11 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
 pub struct FetchOlderSummary {
     pub new_count: usize,
     pub hit_bottom: bool,
+    // INTERNALDATE of the oldest message scanned across all folders this call
+    // (the minimum over each folder's oldest-touched message). Serialized as an
+    // RFC3339 string for the UI; None when nothing was scanned. Lets the list
+    // status show how far back a "no matches in this batch" scan reached.
+    pub oldest_scanned: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Backward UID pagination for the inbox. Walks UIDs back per folder past
@@ -5561,6 +5569,7 @@ pub async fn fetch_older_inbox_emails_to_db(
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
     let require_signature = lookup_require_signature(db, active_pubkey);
+    let _ = page_size; // display page; scan window is the per-folder count below
 
     let folders: Vec<String> = match folder {
         Some(f) if !f.is_empty() => vec![f.to_string()],
@@ -5580,16 +5589,24 @@ pub async fn fetch_older_inbox_emails_to_db(
     // as "not exhausted" — the caller may want to retry.
     let mut any_folder_scanned = false;
     let mut all_folders_exhausted = true;
+    let mut oldest_scanned: Option<chrono::DateTime<chrono::Utc>> = None;
 
     let target = ImapTarget::from_config(config);
     let mut session = imap_pool::checkout(&target)?;
     for f in &folders {
+        // Same per-folder count the bootstrap uses ("Messages to Load Per
+        // Folder" / per-folder override): each scroll scans that many messages
+        // in this folder, surfacing the nostr mail found.
+        let scan_window = lookup_folder_count(db, active_pubkey, f);
         match fetch_older_in_folder(&mut session, config, db, &account_key, f,
-                                     page_size, sync_cutoff_days,
+                                     scan_window, sync_cutoff_days,
                                      parse_nostr_email_from_imap_body) {
             Ok(r) => {
                 any_folder_scanned = true;
                 if !r.hit_bottom { all_folders_exhausted = false; }
+                if let Some(d) = r.oldest_scanned {
+                    if oldest_scanned.map_or(true, |cur| d < cur) { oldest_scanned = Some(d); }
+                }
                 if let Some(new_floor) = r.new_floor_uid {
                     pending_floors.push((f.clone(), new_floor));
                 }
@@ -5624,7 +5641,7 @@ pub async fn fetch_older_inbox_emails_to_db(
         "[RUST] fetch_older_inbox_emails_to_db: completed, {} new emails saved, hit_bottom={}",
         new_count, hit_bottom
     );
-    Ok(FetchOlderSummary { new_count, hit_bottom })
+    Ok(FetchOlderSummary { new_count, hit_bottom, oldest_scanned })
 }
 
 /// Backward UID pagination for the sent folder. See `fetch_older_inbox_emails_to_db`.
@@ -5636,6 +5653,7 @@ pub async fn fetch_older_sent_emails_to_db(
 ) -> anyhow::Result<FetchOlderSummary> {
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
+    let _ = page_size; // display page; scan window is the per-folder count below
 
     let is_gmail = config.imap_host.contains("gmail.com");
 
@@ -5643,18 +5661,23 @@ pub async fn fetch_older_sent_emails_to_db(
     let mut raw_emails: Vec<RawNostrEmail> = Vec::new();
     let mut any_folder_scanned = false;
     let mut all_folders_exhausted = true;
+    let mut oldest_scanned: Option<chrono::DateTime<chrono::Utc>> = None;
 
     let target = ImapTarget::from_config(config);
     let mut session = imap_pool::checkout(&target)?;
     let sent_folder = discover_sent_mailbox(&mut session)?
         .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
     for f in [sent_folder.as_str(), "nostr-mail"] {
+        let scan_window = lookup_folder_count(db, active_pubkey, f);
         match fetch_older_in_folder(&mut session, config, db, &account_key, f,
-                                     page_size, sync_cutoff_days,
+                                     scan_window, sync_cutoff_days,
                                      parse_nostr_sent_email_from_imap_body) {
             Ok(r) => {
                 any_folder_scanned = true;
                 if !r.hit_bottom { all_folders_exhausted = false; }
+                if let Some(d) = r.oldest_scanned {
+                    if oldest_scanned.map_or(true, |cur| d < cur) { oldest_scanned = Some(d); }
+                }
                 if let Some(new_floor) = r.new_floor_uid {
                     pending_floors.push((f.to_string(), new_floor));
                 }
@@ -5691,7 +5714,7 @@ pub async fn fetch_older_sent_emails_to_db(
         "[RUST] fetch_older_sent_emails_to_db: completed, {} new emails saved, hit_bottom={}",
         new_count, hit_bottom
     );
-    Ok(FetchOlderSummary { new_count, hit_bottom })
+    Ok(FetchOlderSummary { new_count, hit_bottom, oldest_scanned })
 }
 
 pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
@@ -5707,7 +5730,6 @@ pub async fn refresh_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str
 async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
     debug_log!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
     let account_key = config.email_address.trim().to_lowercase();
-    let max_scan = lookup_max_scan(db, active_pubkey);
 
     // See sync_nostr_emails_to_db for the meaning of the 4-tuple.
     let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
@@ -5722,8 +5744,9 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
     let sent_folder = discover_sent_mailbox(&mut session)?
         .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
     for f in [sent_folder.as_str(), "nostr-mail"] {
-        let target_count = lookup_folder_count(db, active_pubkey, f);
-        match uid_sync_folder(&mut session, config, db, &account_key, f, target_count, max_scan,
+        // Scan a window of `count` messages per folder (see sync_nostr_emails_to_db).
+        let count = lookup_folder_count(db, active_pubkey, f);
+        match uid_sync_folder(&mut session, config, db, &account_key, f, count, count,
                               parse_nostr_sent_email_from_imap_body) {
             Ok(r) => {
                 if r.max_uid > 0 || !r.had_existing_state {
@@ -6231,6 +6254,9 @@ struct FetchOlderResult {
     // "real bottom of the folder" from "we exhausted this call's scan budget
     // and there might still be more older nostr mail further down".
     hit_bottom: bool,
+    // INTERNALDATE of the oldest message scanned in this folder this call.
+    // None when nothing was fetched (early return / empty candidate set).
+    oldest_scanned: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Result of `walk_back_collecting`: the nostr emails found, the lowest UID we
@@ -6241,6 +6267,11 @@ struct CountWalk {
     lowest_scanned: u32,
     scanned: usize,
     hit_bottom: bool,
+    // INTERNALDATE of the oldest message touched during the walk (server
+    // arrival time of the lowest-UID candidate, nostr or not). Surfaced so the
+    // UI can tell the user how far back a "no matches in this batch" scan
+    // reached. None when no message was fetched.
+    oldest_scanned: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Pure per-iteration decision for the backward count-walk: given how many
@@ -6291,6 +6322,7 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
     let mut emails: Vec<RawNostrEmail> = Vec::new();
     let mut scanned: usize = 0;
     let mut lowest_scanned: u32 = floor_init;
+    let mut oldest_scanned: Option<chrono::DateTime<chrono::Utc>> = None;
 
     // Cap each UID FETCH line at ~500 UIDs to stay under Gmail's ~8KB IMAP line
     // limit. `take` can be large on bootstrap (a deep count target), so split
@@ -6301,10 +6333,16 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
     {
         for chunk in uids_sorted[start..end].chunks(FETCH_BATCH) {
             let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-            let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
+            let msgs = session.uid_fetch(&uid_list, "(UID FLAGS INTERNALDATE BODY.PEEK[])")?;
             for msg in msgs.iter() {
                 if let Some(uid) = msg.uid {
                     if uid < lowest_scanned { lowest_scanned = uid; }
+                }
+                if let Some(d) = msg.internal_date() {
+                    let d_utc = d.with_timezone(&chrono::Utc);
+                    if oldest_scanned.map_or(true, |cur| d_utc < cur) {
+                        oldest_scanned = Some(d_utc);
+                    }
                 }
                 if let Some(body) = msg.body() {
                     if let Some(mut parsed) = parse_fn(body, config) {
@@ -6318,7 +6356,47 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
     }
 
     let hit_bottom = scanned >= uids_sorted.len();
-    Ok(CountWalk { emails, lowest_scanned, scanned, hit_bottom })
+    Ok(CountWalk { emails, lowest_scanned, scanned, hit_bottom, oldest_scanned })
+}
+
+/// Enumerate a bounded window of existing UIDs just below `floor_uid`, large
+/// enough to hold at least `want` of them, without scanning the whole folder.
+///
+/// The naive `UID SEARCH UID 1:floor-1` returns every UID below the floor —
+/// 100k+ on a large Gmail INBOX — only for the caller to scan the newest
+/// `want`. Instead we search a numeric window `[lo, floor-1]` and widen it
+/// (doubling the span) until it contains `>= want` existing UIDs or `lo` hits
+/// UID 1. UID gaps from deletions mean the numeric span must exceed `want`;
+/// dense folders satisfy it in a single small SEARCH, sparse ones take a few
+/// cheap round-trips (their total message count is low, so each result is tiny).
+///
+/// Returns the candidate UIDs sorted ascending and whether the window reached
+/// UID 1 (i.e. there is nothing older than the returned set — the caller uses
+/// this to decide `hit_bottom`). The set may be smaller than `want` only when
+/// the window bottomed out at UID 1.
+fn search_uid_window_below<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    floor_uid: u32,
+    want: usize,
+) -> anyhow::Result<(Vec<u32>, bool)> {
+    // Caller guarantees floor_uid > 1, so hi >= 1.
+    let hi = floor_uid.saturating_sub(1);
+    // Initial numeric span ~2x the desired count leaves headroom for moderate
+    // deletion gaps; doubling handles sparser folders.
+    let mut span: u32 = (want as u32).saturating_mul(2).max(64);
+    loop {
+        let lo = hi.saturating_sub(span.saturating_sub(1)).max(1);
+        let reached_bottom = lo == 1;
+        let set = session.uid_search(format!("UID {}:{}", lo, hi))?;
+        if set.len() >= want || reached_bottom {
+            let mut uids: Vec<u32> = set.into_iter().collect();
+            uids.sort_unstable();
+            return Ok((uids, reached_bottom));
+        }
+        // Not enough yet and room remains below the window — widen and retry.
+        // Saturating so the final pass forces lo down to UID 1.
+        span = span.checked_mul(2).unwrap_or(u32::MAX);
+    }
 }
 
 /// Pull older messages from one folder, walking UIDs backward.
@@ -6329,21 +6407,19 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
 /// seeds an approximate floor via the date-windowed SEARCH (`build_bootstrap_query`).
 ///
 /// Walks newest-to-oldest from `min_seen_uid - 1`, fetching full bodies and
-/// running `parse_fn`. Stops when either:
-///   * `page_size` nostr matches have accumulated, OR
-///   * `max(page_size, MIN_SCAN_PER_CALL)` UIDs have been scanned, OR
-///   * the candidate set is exhausted (`hit_bottom = true`).
-///
-/// Scanning more than `page_size` matters when the folder is mostly non-nostr
-/// mail — common for Sent. Without it, one batch of non-matches looks like
-/// "bottom hit" and the UI gives up prematurely.
+/// running `parse_fn`. One call examines a fixed window of `scan_window` raw
+/// messages — the per-folder count (`sync_initial_count` / per-folder override),
+/// the same value the bootstrap uses — surfacing every nostr match in it, and
+/// stops when either `scan_window` messages have been examined OR the folder is
+/// exhausted to UID 1 (`hit_bottom = true`). There is no early exit on a match
+/// count: each scroll digs a fixed depth and the next picks up below.
 fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     config: &EmailConfig,
     db: &Database,
     account_key: &str,
     folder_name: &str,
-    page_size: usize,
+    scan_window: usize,
     sync_cutoff_days: i64,
     parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
 ) -> anyhow::Result<FetchOlderResult> {
@@ -6355,14 +6431,14 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
         Some(s) => s,
         None => {
             debug_log!("[RUST] fetch_older_in_folder: '{}' has no sync state, run forward sync first", folder_name);
-            return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false });
+            return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false, oldest_scanned: None });
         }
     };
 
     if stored.uid_validity != uid_validity {
         debug_log!("[RUST] fetch_older_in_folder: '{}' UIDVALIDITY changed ({} -> {}), aborting backward fetch",
             folder_name, stored.uid_validity, uid_validity);
-        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false });
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false, oldest_scanned: None });
     }
 
     let floor_uid = match stored.min_seen_uid {
@@ -6373,7 +6449,7 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
                 folder_name, bootstrap_query);
             let set = session.uid_search(&bootstrap_query)?;
             if set.is_empty() {
-                return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false });
+                return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false, oldest_scanned: None });
             }
             let backfilled_min = set.into_iter().min().unwrap_or(0);
             db.set_folder_min_seen_uid(account_key, folder_name, backfilled_min)?;
@@ -6382,49 +6458,56 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
     };
 
     if floor_uid <= 1 {
-        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: true });
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: true, oldest_scanned: None });
     }
 
-    let query = format!("UID 1:{}", floor_uid - 1);
-    debug_log!("[RUST] fetch_older_in_folder: '{}' UID SEARCH {}", folder_name, query);
-    let uid_set = session.uid_search(&query)?;
-    if uid_set.is_empty() {
-        // Server has nothing below the floor — mark bottom so subsequent
-        // calls short-circuit (floor moves to 1, hit_bottom signals UI).
-        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: Some(1), hit_bottom: true });
+    // One scroll examines a fixed window of `scan_window` raw messages per
+    // folder (the per-folder count, same as the bootstrap), surfacing every
+    // nostr match in it — no early exit on a match count. Next scroll continues
+    // below.
+    let scan_window = scan_window.max(1);
+
+    // Enumerate only a bounded UID window just below the floor instead of the
+    // entire history (`UID 1:floor-1`), which on a large INBOX returns 100k+
+    // UIDs every scroll just to scan the newest `scan_window`. The window
+    // expands until it holds at least `scan_window` existing UIDs or reaches UID 1.
+    let (uids, window_reached_bottom) = search_uid_window_below(session, floor_uid, scan_window)?;
+    debug_log!(
+        "[RUST] fetch_older_in_folder: '{}' windowed search below {} -> {} candidate UID(s), reached_bottom={}",
+        folder_name, floor_uid, uids.len(), window_reached_bottom
+    );
+    if uids.is_empty() {
+        // The window walked all the way to UID 1 with nothing below the floor —
+        // true bottom. Floor moves to 1 so subsequent calls short-circuit.
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: Some(1), hit_bottom: true, oldest_scanned: None });
     }
 
-    let mut uids: Vec<u32> = uid_set.into_iter().collect();
-    uids.sort_unstable();
+    // Walk newest-to-oldest, fetching bodies in batches. Passing `scan_window`
+    // as both the match target and the scan cap makes the match-count stop
+    // condition unreachable (matches <= scanned), so the walk always examines
+    // the full window unless the folder bottoms out first. `floor_uid` seeds the
+    // lowest-UID tracker so a no-op call never raises the floor.
+    let walk = walk_back_collecting(session, config, &uids, floor_uid, scan_window, scan_window, parse_fn)?;
 
-    // Per-call scan budget. `page_size` of 5 with a folder dominated by
-    // non-nostr mail would otherwise terminate at the first batch of misses.
-    // Keep this generous enough to walk through the common pattern of a few
-    // non-nostr in between nostr matches, but small enough that one scroll
-    // trigger doesn't pull megabytes of unrelated bodies. 50 hits a
-    // reasonable middle.
-    const MIN_SCAN_PER_CALL: usize = 50;
-    let target_count = page_size.max(1);
-    let max_scan = target_count.max(MIN_SCAN_PER_CALL);
-
-    // Walk newest-to-oldest, fetching bodies in batches, stopping when we have
-    // enough matches or hit the per-call cap. `floor_uid` seeds the lowest-UID
-    // tracker so a no-op call never raises the floor.
-    let walk = walk_back_collecting(session, config, &uids, floor_uid, target_count, max_scan, parse_fn)?;
-
-    // When we've truly hit bottom, set floor to 1 so the next call
-    // short-circuits. Otherwise lower it to the lowest UID we touched.
-    let returned_floor = if walk.hit_bottom { 1 } else { walk.lowest_scanned };
+    // True bottom only when the search window reached UID 1 AND the walk
+    // consumed every candidate in it (didn't stop early on its scan budget).
+    // `walk.hit_bottom` alone now means only "exhausted this window", so it must
+    // be gated by `window_reached_bottom`.
+    let hit_bottom = window_reached_bottom && walk.hit_bottom;
+    // On true bottom set floor to 1 so the next call short-circuits; otherwise
+    // lower it to the lowest UID we touched.
+    let returned_floor = if hit_bottom { 1 } else { walk.lowest_scanned };
 
     debug_log!(
-        "[RUST] fetch_older_in_folder: '{}' scanned {}/{} UIDs, found {} nostr match(es), hit_bottom={}, new_floor={}",
-        folder_name, walk.scanned, uids.len(), walk.emails.len(), walk.hit_bottom, returned_floor
+        "[RUST] fetch_older_in_folder: '{}' scanned {}/{} windowed UIDs, found {} nostr match(es), hit_bottom={}, new_floor={}",
+        folder_name, walk.scanned, uids.len(), walk.emails.len(), hit_bottom, returned_floor
     );
 
     Ok(FetchOlderResult {
         emails: walk.emails,
         new_floor_uid: Some(returned_floor),
-        hit_bottom: walk.hit_bottom,
+        hit_bottom,
+        oldest_scanned: walk.oldest_scanned,
     })
 }
 
@@ -6613,10 +6696,6 @@ const DEFAULT_INITIAL_COUNT: usize = 50;
 /// (nearly) every message is nostr mail so a deep count is cheap and accurate.
 /// Overridable per-folder via `sync_folder_counts`.
 const DEFAULT_DENSE_COUNT: usize = 500;
-/// Default cap on raw messages examined per folder bootstrap. Bounds the cost
-/// on sparse mixed folders (e.g. a busy INBOX) where the target match count
-/// would otherwise force an unbounded backward walk.
-const DEFAULT_MAX_SCAN: usize = 2000;
 
 /// Pure resolution of a folder's bootstrap count. An explicit override in the
 /// user's `sync_folder_counts` map wins; otherwise the dedicated dense
@@ -6646,18 +6725,10 @@ fn lookup_initial_count(db: &Database, pubkey: &str) -> usize {
         .unwrap_or(DEFAULT_INITIAL_COUNT)
 }
 
-/// Cap on raw messages examined per folder bootstrap, defaulting to
-/// `DEFAULT_MAX_SCAN`.
-fn lookup_max_scan(db: &Database, pubkey: &str) -> usize {
-    db.get_setting(pubkey, "sync_max_scan")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_SCAN)
-}
-
-/// Per-folder bootstrap count for the active pubkey: per-folder override →
-/// dense-folder default → global `sync_initial_count`.
+/// Per-folder scan window for the active pubkey: per-folder override →
+/// dense-folder default → global `sync_initial_count`. Used by both the initial
+/// bootstrap and each "load older" scroll — both scan this many messages in the
+/// folder and surface the nostr mail found.
 fn lookup_folder_count(db: &Database, pubkey: &str, folder: &str) -> usize {
     let json = db.get_setting(pubkey, "sync_folder_counts").ok().flatten();
     resolve_folder_count(folder, json.as_deref(), lookup_initial_count(db, pubkey))

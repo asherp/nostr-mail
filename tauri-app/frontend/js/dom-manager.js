@@ -116,7 +116,6 @@ class DOMManager {
             'include-sig-header-preference': this.getElement('include-sig-header-preference'),
             'include-recipient-header-preference': this.getElement('include-recipient-header-preference'),
             syncInitialCount: this.getElement('sync-initial-count'),
-            syncMaxScan: this.getElement('sync-max-scan'),
             emailsPerPage: this.getElement('emails-per-page'),
             inboxFolderPreference: this.getElement('inbox-folder-preference'),
             testEmailConnectionBtn: this.getElement('test-email-connection-btn'),

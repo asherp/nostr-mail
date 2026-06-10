@@ -6375,15 +6375,53 @@ fn next_back_batch(
     Some((start, end))
 }
 
-/// Walk a pre-sorted (ascending) UID list newest→oldest, fetching bodies in
-/// batches and running `parse_fn`, until either `target_count` nostr matches
-/// accumulate, `max_scan` UIDs have been examined, or the list is exhausted.
+/// Server-side narrow: of the existing UIDs in `[lo, hi]`, which carry a nostr
+/// marker? Mirrors the detection gate in `parse_nostr_email_from_imap_body_inner`
+/// (an `X-Nostr-Pubkey` header OR a `BEGIN NOSTR NIP-` armor block — the `NIP-`
+/// prefix covers every NIP-04/44 ENCRYPTED MESSAGE/BODY variant the gate checks)
+/// but lets the IMAP server filter so non-nostr bodies are never downloaded.
+///
+/// One combined `SEARCH` (range AND (header OR body-marker)). A weak server BODY
+/// index could under-return armor-only mail; the caller's local parse still
+/// re-confirms every hit, so over-returning is harmless. Returns the matching
+/// UIDs (unordered).
+fn search_nostr_uids_in_range<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    lo: u32,
+    hi: u32,
+) -> anyhow::Result<std::collections::HashSet<u32>> {
+    let query = format!(
+        "UID {}:{} OR HEADER X-Nostr-Pubkey \"\" BODY \"BEGIN NOSTR NIP-\"",
+        lo, hi
+    );
+    let set = session.uid_search(&query)?;
+    Ok(set.into_iter().collect())
+}
+
+/// Examine the newest `max_scan` UIDs of a pre-sorted (ascending) candidate
+/// list, returning the nostr matches among them.
+///
+/// Rather than download every body in the window and parse it locally (~50ms
+/// per message of pure network on a dense INBOX — most of it non-nostr mail we
+/// immediately discard), we let the IMAP server do the filtering: one
+/// `SEARCH` narrows the window to UIDs that carry a nostr marker, and we
+/// BODY.PEEK[] only those (usually 0–2). The local `parse_fn` still re-confirms
+/// each candidate, so an over-returning server is harmless. The trade-off is a
+/// server with a weak BODY index could miss an armor-only message (no
+/// `X-Nostr-Pubkey` header) — acceptable on Gmail, the primary target. See
+/// `search_nostr_uids_in_range`.
+///
+/// Floor/scan-depth bookkeeping (`lowest_scanned`, `oldest_scanned`, `scanned`)
+/// covers the WHOLE examined window, independent of which bodies were fetched:
+/// the lowest window UID lowers the floor, and a cheap INTERNALDATE-only fetch
+/// (no bodies) over the window gives the scan-depth date. `target_count` is now
+/// only a window-size hint — the match-count early-exit is retired (every
+/// caller passes target == max_scan; see PR #88: "each scroll digs a fixed
+/// depth"), so the full window is always examined.
 ///
 /// `floor_init` seeds `lowest_scanned` so a no-op call never raises the floor.
-/// Shared by `fetch_older_in_folder` (and, later, the count-based bootstrap):
-/// the only thing that differs between callers is which candidate UIDs they
-/// feed in. BODY.PEEK[] keeps reads from setting \Seen; FLAGS lets us seed
-/// local read state for newly-imported rows.
+/// BODY.PEEK[] keeps reads from setting \Seen; FLAGS lets us seed local read
+/// state for newly-imported rows.
 fn walk_back_collecting<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     config: &EmailConfig,
@@ -6394,38 +6432,66 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
     parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
 ) -> anyhow::Result<CountWalk> {
     let mut emails: Vec<RawNostrEmail> = Vec::new();
-    let mut scanned: usize = 0;
     let mut lowest_scanned: u32 = floor_init;
     let mut oldest_scanned: Option<chrono::DateTime<chrono::Utc>> = None;
-    // IMAP body-download time vs in-process parse time, summed across batches
-    // (see uid_sync_folder). Drives the [RUST-PERF] line so a slow backward
-    // walk can be pinned on the network or the CPU.
-    let mut fetch_ms: u128 = 0;
-    let mut parse_ms: u128 = 0;
 
-    // Cap each UID FETCH line at ~500 UIDs to stay under Gmail's ~8KB IMAP line
-    // limit. `take` can be large on bootstrap (a deep count target), so split
-    // the slice even though a single batch is logically one walk step.
-    const FETCH_BATCH: usize = 500;
+    // Enumerate the examined window — the newest `max_scan` candidate UIDs —
+    // reusing the (unit-tested) boundary logic. Passing matches=0 keeps the
+    // retired match-count early-exit from truncating enumeration; with
+    // target == max_scan this yields exactly the newest `max_scan` UIDs.
+    let mut window: Vec<u32> = Vec::new();
+    let mut scanned: usize = 0;
     while let Some((start, end)) =
-        next_back_batch(scanned, uids_sorted.len(), emails.len(), target_count, max_scan)
+        next_back_batch(scanned, uids_sorted.len(), 0, target_count, max_scan)
     {
-        for chunk in uids_sorted[start..end].chunks(FETCH_BATCH) {
+        window.extend_from_slice(&uids_sorted[start..end]);
+        scanned += end - start;
+    }
+    window.sort_unstable();
+
+    // Cap each UID FETCH line at ~500 UIDs to stay under Gmail's ~8KB IMAP line limit.
+    const FETCH_BATCH: usize = 500;
+    if let (Some(&win_min), Some(&win_max)) = (window.first(), window.last()) {
+        // Phase timings for the [RUST-PERF] line: the cheap window meta + nostr
+        // SEARCH vs the (now tiny) candidate body download vs local parse.
+        let mut fetch_ms: u128 = 0;
+        let mut parse_ms: u128 = 0;
+        // The lowest examined UID lowers the floor regardless of nostr matches.
+        if win_min < lowest_scanned { lowest_scanned = win_min; }
+
+        // Scan-depth date: INTERNALDATE-only fetch over the whole window. No
+        // bodies, so this stays tiny even at 500. Min over the window matches
+        // the old per-fetched-message minimum.
+        let t_meta = std::time::Instant::now();
+        for chunk in window.chunks(FETCH_BATCH) {
+            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            if let Ok(msgs) = session.uid_fetch(&uid_list, "(UID INTERNALDATE)") {
+                for msg in msgs.iter() {
+                    if let Some(d) = msg.internal_date() {
+                        let d_utc = d.with_timezone(&chrono::Utc);
+                        if oldest_scanned.map_or(true, |cur| d_utc < cur) {
+                            oldest_scanned = Some(d_utc);
+                        }
+                    }
+                }
+            }
+        }
+        // Server-side narrow: which window UIDs are nostr mail? Intersect with
+        // the window (the range SEARCH may include UIDs the window excludes).
+        let candidates = search_nostr_uids_in_range(session, win_min, win_max)?;
+        let meta_ms = t_meta.elapsed().as_millis();
+        let win_set: std::collections::HashSet<u32> = window.iter().copied().collect();
+        let mut cand: Vec<u32> = candidates.into_iter().filter(|u| win_set.contains(u)).collect();
+        cand.sort_unstable();
+
+        // Body-fetch ONLY the nostr candidates.
+        for chunk in cand.chunks(FETCH_BATCH) {
             let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
             let t_fetch = std::time::Instant::now();
-            let msgs = session.uid_fetch(&uid_list, "(UID FLAGS INTERNALDATE BODY.PEEK[])")?;
+            let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
             fetch_ms += t_fetch.elapsed().as_millis();
             let t_parse = std::time::Instant::now();
             for msg in msgs.iter() {
-                if let Some(uid) = msg.uid {
-                    if uid < lowest_scanned { lowest_scanned = uid; }
-                }
-                if let Some(d) = msg.internal_date() {
-                    let d_utc = d.with_timezone(&chrono::Utc);
-                    if oldest_scanned.map_or(true, |cur| d_utc < cur) {
-                        oldest_scanned = Some(d_utc);
-                    }
-                }
                 if let Some(body) = msg.body() {
                     if let Some(mut parsed) = parse_fn(body, config) {
                         parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
@@ -6435,12 +6501,11 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
             }
             parse_ms += t_parse.elapsed().as_millis();
         }
-        scanned += end - start;
+        debug_log!("[RUST-PERF] walk_back_collecting: meta+search={}ms, body_fetch={}ms, parse={}ms ({} examined, {} nostr-candidate, {} match)",
+            meta_ms, fetch_ms, parse_ms, scanned, cand.len(), emails.len());
     }
 
     let hit_bottom = scanned >= uids_sorted.len();
-    debug_log!("[RUST-PERF] walk_back_collecting: fetch={}ms, parse={}ms ({} scanned, {} match)",
-        fetch_ms, parse_ms, scanned, emails.len());
     Ok(CountWalk { emails, lowest_scanned, scanned, hit_bottom, oldest_scanned })
 }
 

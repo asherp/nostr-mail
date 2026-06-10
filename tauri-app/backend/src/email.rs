@@ -6738,9 +6738,16 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     // Candidates: UIDs inside our synced range [floor, last_seen] to (re)check.
     // Below `floor` is fetch_older territory; above `last_seen_uid` is forward
     // sync territory. Both have their own paths and shouldn't be re-touched here.
-    // We always scan the full range by UID (no date window) — the count-based
-    // bootstrap keeps [floor, last_seen] bounded, and the ENVELOPE pass below is
-    // cheap (no bodies until a genuine gap is found).
+    //
+    // Candidates are NOT every UID in [floor, last_seen] — that's the whole
+    // inbox, and since only nostr mail is ever stored, every non-nostr message
+    // (the vast majority) would look "missing" and get body-fetched. A deeply
+    // scrolled floor made this catastrophic: an 11k-wide range meant ~11k bogus
+    // gaps and an 11k-body download. Instead we ask the server for just the
+    // nostr-marked UIDs in the range (same prefilter as the scroll/bootstrap
+    // walk; see `search_nostr_uids_in_range`) and only those can be gaps. The
+    // examined marker below still covers the full range — the SEARCH examined
+    // all of it, just cheaply.
     //
     // Steady state (recover_dropped = false): skip the already-examined
     // sub-range [gap_examined_min, gap_examined_max] — those UIDs' nostr-ness
@@ -6757,8 +6764,24 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
         (Some(lo), Some(hi)) => uid >= lo && uid <= hi,
         _ => false,
     };
-    let candidates: Vec<u32> = session
-        .uid_search(&format!("UID {}:{}", floor, stored.last_seen_uid))?
+
+    // Steady-state short-circuit: if the filter is unchanged and the examined
+    // marker already covers the whole [floor, last_seen] range, every candidate
+    // would be filtered out below — skip the range-wide SEARCH entirely (it
+    // scans every message in the range server-side, multi-second on a deeply
+    // scrolled inbox). Re-commit the same marker so nothing regresses.
+    if !recover_dropped {
+        if let (Some(lo), Some(hi)) = (stored.gap_examined_min_uid, stored.gap_examined_max_uid) {
+            if lo <= floor && hi >= stored.last_seen_uid {
+                debug_log!("[RUST-PERF] gap_fill_in_folder '{}': skipped — [{}, {}] already examined",
+                    folder_name, floor, stored.last_seen_uid);
+                return Ok(GapFillResult { emails: Vec::new(), examined });
+            }
+        }
+    }
+
+    let t_search = std::time::Instant::now();
+    let mut candidates: Vec<u32> = search_nostr_uids_in_range(session, floor, stored.last_seen_uid)?
         .into_iter()
         .filter(|uid| {
             *uid >= floor
@@ -6766,7 +6789,11 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
                 && (recover_dropped || !already_examined(*uid))
         })
         .collect();
+    candidates.sort_unstable();
+    let search_ms = t_search.elapsed().as_millis();
     if candidates.is_empty() {
+        debug_log!("[RUST-PERF] gap_fill_in_folder '{}': nostr_search={}ms, 0 nostr candidates in [{}, {}]",
+            folder_name, search_ms, floor, stored.last_seen_uid);
         return Ok(GapFillResult { emails: Vec::new(), examined });
     }
 
@@ -6776,6 +6803,7 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     // gaps and pulled in the next step.
     const FETCH_BATCH: usize = 500;
     let mut missing: Vec<u32> = Vec::new();
+    let t_env = std::time::Instant::now();
     for chunk in candidates.chunks(FETCH_BATCH) {
         let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
         let msgs = session.uid_fetch(&uid_list, "(UID ENVELOPE)")?;
@@ -6798,7 +6826,10 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
         }
     }
 
+    let env_ms = t_env.elapsed().as_millis();
     if missing.is_empty() {
+        debug_log!("[RUST-PERF] gap_fill_in_folder '{}': nostr_search={}ms, envelope+lookup={}ms ({} nostr candidates, 0 missing)",
+            folder_name, search_ms, env_ms, candidates.len());
         return Ok(GapFillResult { emails: Vec::new(), examined });
     }
     println!(
@@ -6807,6 +6838,7 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
     );
 
     let mut emails: Vec<RawNostrEmail> = Vec::new();
+    let t_body = std::time::Instant::now();
     for chunk in missing.chunks(FETCH_BATCH) {
         let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
         // BODY.PEEK[] so gap-fill backfill doesn't *set* \Seen; FLAGS so we can
@@ -6821,6 +6853,8 @@ fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
             }
         }
     }
+    debug_log!("[RUST-PERF] gap_fill_in_folder '{}': nostr_search={}ms, envelope+lookup={}ms, body_fetch={}ms ({} nostr candidates, {} missing, {} match)",
+        folder_name, search_ms, env_ms, t_body.elapsed().as_millis(), candidates.len(), missing.len(), emails.len());
     Ok(GapFillResult { emails, examined })
 }
 

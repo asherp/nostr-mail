@@ -46,14 +46,7 @@ class Utils {
                    background: ${isDark ? '#232946' : '#fff'}; }
             img { max-width: 100%; height: auto; }
             a { color: ${isDark ? '#93c5fd' : '#2563eb'}; }
-            blockquote { cursor: default; position: relative; }
-            blockquote::before {
-                content: '';
-                position: absolute;
-                left: 0; top: 0; bottom: 0;
-                width: 12px;
-                cursor: pointer;
-            }
+            blockquote { cursor: pointer; position: relative; }
             blockquote.collapsed > *:not(.collapse-hint) { display: none; }
             .collapse-hint {
                 font-size: 0.8em; color: ${isDark ? '#9ca3af' : '#6b7280'};
@@ -94,9 +87,11 @@ class Utils {
                 bq.insertBefore(hint, bq.firstChild);
                 if (startCollapsed) bq.classList.add('collapsed');
                 bq.addEventListener('click', (e) => {
-                    // Only toggle when clicking on the left quote bar (within 12px of left edge)
-                    const rect = bq.getBoundingClientRect();
-                    if (e.clientX - rect.left > 12) return;
+                    // Clicking anywhere on the quoted row toggles it (issue #62).
+                    // Skip links, and let the innermost blockquote handle nested
+                    // clicks so an outer quote doesn't also toggle.
+                    if (e.target.closest('a')) return;
+                    if (e.target.closest('blockquote') !== bq) return;
                     e.stopPropagation();
                     const collapsed = bq.classList.toggle('collapsed');
                     hint.style.display = collapsed ? '' : 'none';

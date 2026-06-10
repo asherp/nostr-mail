@@ -73,12 +73,12 @@ pub fn decrypt_message(private_key: &str, public_key: &str, encrypted_message: &
     // Try NIP-44 first (newer standard)
     match nip44::decrypt(&secret_key, &public_key, encrypted_message) {
         Ok(decrypted) => {
-            println!("[CRYPTO] Successfully decrypted with NIP-44");
+            crate::debug_log!("[CRYPTO] Successfully decrypted with NIP-44");
             return Ok(decrypted);
         }
         Err(e) => {
             let msg = format!("{:?}", e);
-            println!("[CRYPTO] NIP-44 decryption failed: {}, trying NIP-04", msg);
+            crate::debug_log!("[CRYPTO] NIP-44 decryption failed: {}, trying NIP-04", msg);
             nip44_err = Some(msg);
         }
     }
@@ -86,12 +86,12 @@ pub fn decrypt_message(private_key: &str, public_key: &str, encrypted_message: &
     // Try NIP-04 format: base64(encrypted_content)?iv=base64(iv)
     match nip04::decrypt(&secret_key, &public_key, encrypted_message) {
         Ok(decrypted) => {
-            println!("[CRYPTO] Successfully decrypted with NIP-04");
+            crate::debug_log!("[CRYPTO] Successfully decrypted with NIP-04");
             return Ok(decrypted);
         }
         Err(e) => {
             let msg = format!("{:?}", e);
-            println!("[CRYPTO] NIP-04 decryption also failed: {}", msg);
+            crate::debug_log!("[CRYPTO] NIP-04 decryption also failed: {}", msg);
             nip04_err = Some(msg);
         }
     }

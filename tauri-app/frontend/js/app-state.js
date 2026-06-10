@@ -13,7 +13,6 @@ class AppState {
         this.dmMessages = {};
         this.selectedDmContact = null;
         this.selectedContact = null;
-        this.nprivKey = null;
         this.relays = [];
         this.contacts_total = null;
         this.lastLoadedPubkey = null;
@@ -142,14 +141,6 @@ class AppState {
 
     clearViewingProfilePubkey() {
         this.viewingProfilePubkey = null;
-    }
-
-    setNprivKey(nprivKey) {
-        this.nprivKey = nprivKey;
-    }
-
-    getNprivKey() {
-        return this.nprivKey;
     }
 
     // Relay management

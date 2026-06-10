@@ -292,6 +292,9 @@ const TauriService = {
     listImapFolders: async function(emailConfig) {
         return await this.invoke('list_imap_folders', { emailConfig });
     },
+    findMessageFolder: async function(emailConfig, messageId, candidateFolders) {
+        return await this.invoke('find_message_folder', { emailConfig, messageId, candidateFolders });
+    },
     fetchImage: async function(url) {
         return await this.invoke('fetch_image', { url });
     },
@@ -385,20 +388,20 @@ const TauriService = {
     initDatabase: async function() {
         return await this.invoke('init_database');
     },
-    syncNostrEmails: async function(folder = null) {
+    syncNostrEmails: async function(folders = null) {
         const settings = window.appState?.getSettings();
         const keypair = window.appState?.getKeypair();
-        
+
         if (!settings || !keypair) {
             throw new Error('Settings or keypair not available');
         }
-        
+
         // Ensure use_tls is explicitly set - default to true if not set
         // Most modern email servers require TLS, and the backend enforces it
-        const useTls = settings.use_tls !== undefined && settings.use_tls !== null 
-            ? settings.use_tls 
+        const useTls = settings.use_tls !== undefined && settings.use_tls !== null
+            ? settings.use_tls
             : true; // Default to true for security
-        
+
         const emailConfig = {
             email_address: settings.email_address,
             password: settings.password,
@@ -409,8 +412,67 @@ const TauriService = {
             use_tls: useTls,
             private_key: null
         };
-        
-        return await this.invoke('sync_nostr_emails', { config: emailConfig, folder });
+
+        // Accept array, newline-delimited string, single string, or null.
+        // Backend expects Option<Vec<String>>; null/empty means "use defaults".
+        let foldersArg = null;
+        if (Array.isArray(folders)) {
+            foldersArg = folders.map(f => (f || '').trim()).filter(Boolean);
+            if (foldersArg.length === 0) foldersArg = null;
+        } else if (typeof folders === 'string' && folders.length > 0) {
+            foldersArg = folders.split('\n').map(f => f.trim()).filter(Boolean);
+            if (foldersArg.length === 0) foldersArg = null;
+        }
+
+        return await this.invoke('sync_nostr_emails', { config: emailConfig, folders: foldersArg });
+    },
+
+    /* Start the backend IMAP IDLE watcher for the active account. The backend
+       emits `imap-new-mail` when the INBOX changes; app.js listens and runs a
+       normal sync. No-op (resolves) when settings/keypair aren't ready yet. */
+    startImapIdle: async function() {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair || !settings.email_address || !settings.imap_host) {
+            return; // not configured; nothing to watch
+        }
+
+        const useTls = settings.use_tls !== undefined && settings.use_tls !== null
+            ? settings.use_tls
+            : true;
+
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+            private_key: null
+        };
+
+        return await this.invoke('start_imap_idle', { emailConfig });
+    },
+
+    /* Stop the backend IMAP IDLE watcher and drop pooled connections. */
+    stopImapIdle: async function() {
+        return await this.invoke('stop_imap_idle');
+    },
+
+    /* Provider-aware default folder list for the inbox-folder placeholder.
+       Mirrors the backend's `default_inbox_folders` — the source of truth for
+       what gets scanned when the user has nothing selected. The backend also
+       appends any server folder whose name contains "spam" at sync time;
+       that expansion isn't visible here since it needs a live connection. */
+    getDefaultInboxFolders: async function(imapHost) {
+        if (!imapHost) return [];
+        try {
+            return await this.invoke('get_default_inbox_folders', { imapHost });
+        } catch (err) {
+            console.warn('[TAURI] get_default_inbox_folders failed:', err);
+            return [];
+        }
     },
 
     syncSentEmails: async function() {
@@ -433,6 +495,88 @@ const TauriService = {
         };
         
         return await this.invoke('sync_sent_emails', { config: emailConfig });
+    },
+
+    refreshInboxEmails: async function(folders = null) {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        const useTls = settings.use_tls !== undefined && settings.use_tls !== null
+            ? settings.use_tls
+            : true;
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+            private_key: null
+        };
+        return await this.invoke('refresh_inbox_emails', { config: emailConfig, folders });
+    },
+
+    refreshSentEmails: async function() {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: settings.use_tls,
+            private_key: null
+        };
+        return await this.invoke('refresh_sent_emails', { config: emailConfig });
+    },
+
+    fetchOlderInboxEmails: async function(pageSize = 50, folder = null) {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        const useTls = settings.use_tls !== undefined && settings.use_tls !== null
+            ? settings.use_tls
+            : true;
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+            private_key: null
+        };
+        return await this.invoke('fetch_older_inbox_emails', { config: emailConfig, folder, pageSize });
+    },
+
+    fetchOlderSentEmails: async function(pageSize = 50) {
+        const settings = window.appState?.getSettings();
+        const keypair = window.appState?.getKeypair();
+        if (!settings || !keypair) {
+            throw new Error('Settings or keypair not available');
+        }
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: settings.use_tls,
+            private_key: null
+        };
+        return await this.invoke('fetch_older_sent_emails', { config: emailConfig, pageSize });
     },
 
     syncAllEmails: async function() {
@@ -512,6 +656,12 @@ const TauriService = {
     saveAttachmentsAsZip: async function(zipFilename, attachments) {
         return await this.invoke('save_attachments_as_zip', { zipFilename, attachments });
     },
+    shareAttachmentToDisk: async function(filename, data, mimeType) {
+        return await this.invoke('share_attachment_to_disk', { filename, data, mimeType });
+    },
+    shareAttachmentsAsZip: async function(zipFilename, attachments) {
+        return await this.invoke('share_attachments_as_zip', { zipFilename, attachments });
+    },
     findEmailsByMessageId: async function(messageId) {
         return await this.invoke('db_find_emails_by_message_id', { messageId });
     },
@@ -552,6 +702,16 @@ const TauriService = {
 
     deleteInboxEmail: async function(messageId, deleteFromServer, userEmail) {
         return await this.invoke('db_delete_inbox_email', { messageId, deleteFromServer, userEmail });
+    },
+
+    moveInboxEmail: async function(messageId, targetFolder, userEmail) {
+        return await this.invoke('move_inbox_email', { messageId, targetFolder, userEmail });
+    },
+
+    // One-time catch-up rescue when the user first enables spam rescue: moves
+    // ALL nostr mail (read + unread) out of spam and returns how many moved.
+    rescueSpamNow: async function() {
+        return await this.invoke('rescue_spam_now', {});
     },
 
     markAsRead: async function(messageId) {
@@ -629,16 +789,17 @@ const TauriService = {
         return await this.invoke('parse_armor_message', { armorText });
     },
 
-    decryptEmailBody: async function(armorText, subject, senderPubkey, recipientPubkey) {
+    decryptEmailBody: async function(armorText, subject, senderPubkey, recipientPubkey, messageId) {
         return await this.invoke('decrypt_email_body', {
             armorText, subject,
             senderPubkey: senderPubkey || null,
             recipientPubkey: recipientPubkey || null,
+            messageId: messageId || null,
         });
     },
 
     // Batch decrypt multiple email bodies in a single IPC call.
-    // `emails` is an array of { id, armorText, subject, senderPubkey, recipientPubkey }.
+    // `emails` is an array of { id, armorText, subject, senderPubkey, recipientPubkey, messageId? }.
     // Returns an array of { id, result, error } in the same order.
     decryptEmailBodiesBatch: async function(emails) {
         return await this.invoke('decrypt_email_bodies_batch', { emails });

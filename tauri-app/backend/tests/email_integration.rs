@@ -525,6 +525,143 @@ async fn nip04_legacy_decrypt() {
     assert_eq!(decrypted, plaintext);
 }
 
+/// Unsigned NIP-04 armor (no inline SIGNATURE block) sent with an X-Nostr-Sig
+/// transport header. decrypt_email_body_pipeline MUST reject when raw_headers
+/// is None (per NIP-04 MAC requirement) and MUST decrypt when raw_headers are
+/// supplied, by treating X-Nostr-Sig as the authentication MAC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip04_header_sig_fallback_unlocks_decrypt() {
+    let mock = spawn_mock_email().await;
+    let (alice_nsec, alice_npub, _) = test_keypair(1);
+    let (bob_nsec, bob_npub, _) = test_keypair(2);
+
+    let alice_config = email_config(
+        "alice@test.local",
+        "password-alice",
+        &alice_nsec,
+        mock.smtp_addr,
+        mock.imap_addr,
+    );
+
+    let plaintext = "Header-sig fallback should let me through.";
+    let ciphertext = crypto::encrypt_message(&alice_nsec, &bob_npub, plaintext, Some("nip04"))
+        .expect("nip04 encrypt");
+
+    // No inline SIGNATURE block — only the encrypted body armor.
+    let armored_body = format!(
+        "-----BEGIN NOSTR NIP-04 ENCRYPTED BODY-----\n{}\n-----END NOSTR MESSAGE-----",
+        ciphertext
+    );
+
+    email::send_email(
+        &alice_config,
+        "bob@test.local",
+        "nip04 header sig fallback",
+        &armored_body,
+        Some(&alice_npub),
+        None,
+        None,
+        None,
+        None,
+        None,
+        true, // include X-Nostr-Pubkey
+        true, // include X-Nostr-Sig
+        Some(&bob_npub),
+        true,
+    )
+    .await
+    .expect("send_email");
+
+    let inbox = mock.store.get_mailbox_emails("INBOX").await;
+    let delivered = &inbox[0];
+    let raw_headers = raw_headers_from_store(delivered);
+
+    // Sanity: the message we're testing really has X-Nostr-Sig but no inline sig.
+    assert!(
+        email::extract_nostr_sig_from_headers(&raw_headers).is_some(),
+        "precondition: X-Nostr-Sig must be present"
+    );
+    assert!(
+        !delivered.body.contains("BEGIN NOSTR SIGNATURE"),
+        "precondition: armor must NOT contain inline SIGNATURE block"
+    );
+
+    // Without raw_headers: pipeline rejects with the unsigned-message error.
+    let without_headers = email::decrypt_email_body_pipeline(
+        &bob_nsec,
+        &delivered.body,
+        &delivered.subject,
+        Some(&alice_npub),
+        Some(&bob_npub),
+        None,
+        true,
+        false,
+    )
+    .expect("pipeline returns Ok even on signature rejection");
+    assert!(
+        !without_headers.success,
+        "must reject unsigned NIP-04 when no header sig is available"
+    );
+    let err = without_headers
+        .block_results
+        .last()
+        .and_then(|b| b.error.clone())
+        .unwrap_or_default();
+    assert!(
+        err.contains("no signature") || err.contains("Require Signatures"),
+        "rejection error should explain the cause, got: {}",
+        err
+    );
+
+    // With raw_headers: header sig verifies, body decrypts to plaintext.
+    let with_headers = email::decrypt_email_body_pipeline(
+        &bob_nsec,
+        &delivered.body,
+        &delivered.subject,
+        Some(&alice_npub),
+        Some(&bob_npub),
+        Some(&raw_headers),
+        true,
+        false,
+    )
+    .expect("pipeline returns Ok when header sig verifies");
+    assert!(
+        with_headers.success,
+        "header sig fallback must unlock decrypt, error={:?}",
+        with_headers.error
+    );
+    assert_eq!(
+        with_headers.body.trim(),
+        plaintext,
+        "decrypted plaintext must round-trip"
+    );
+
+    // require_signature = false: the user opted into reading unauthenticated
+    // mail, so the same unsigned NIP-04 message decrypts even with no header sig
+    // available. This is the "Require Signatures" off path.
+    let unsigned_allowed = email::decrypt_email_body_pipeline(
+        &bob_nsec,
+        &delivered.body,
+        &delivered.subject,
+        Some(&alice_npub),
+        Some(&bob_npub),
+        None,
+        false, // require_signature off
+        false,
+    )
+    .expect("pipeline returns Ok with require_signature off");
+    assert!(
+        unsigned_allowed.success,
+        "unsigned NIP-04 must decrypt when Require Signatures is off, error={:?}",
+        unsigned_allowed.error
+    );
+    assert_eq!(
+        unsigned_allowed.body.trim(),
+        plaintext,
+        "decrypted plaintext must round-trip on the require_signature-off path"
+    );
+}
+
 /// Multipart text+html lettre → mailparse round-trip. The encrypted ENCRYPTED
 /// BODY armor lives in the text/plain part; the html part is a separate MIME
 /// section. Confirms both reach the receive side intact.
@@ -835,6 +972,9 @@ async fn sent_mail_decrypts_via_recipient_header_without_dm() {
         &delivered.subject,
         None,
         Some(&recipient_from_header),
+        None,
+        true,
+        false,
     )
     .expect("decrypt_email_body_pipeline");
 
@@ -924,6 +1064,9 @@ async fn sent_mail_undecryptable_without_any_counterparty_hint() {
         &delivered.subject,
         None,
         None,
+        None,
+        true,
+        false,
     )
     .expect("decrypt_email_body_pipeline returns Ok even when content can't be decrypted");
 
@@ -2114,6 +2257,9 @@ async fn nip44_reply_preserves_nested_encrypted_armor() {
         &reply.subject,
         Some(&bob_npub),
         Some(&alice_npub),
+        None,
+        true,
+        false,
     )
     .expect("decrypt_email_body_pipeline");
     assert!(decrypt.success, "decrypt must succeed: {:?}", decrypt.error);
@@ -2332,6 +2478,9 @@ async fn nip44_three_level_reply_chain() {
         &delivered.subject,
         Some(&alice_npub),
         Some(&bob_npub),
+        None,
+        true,
+        false,
     )
     .expect("decrypt pipeline");
     assert!(decrypt.success, "decrypt failed: {:?}", decrypt.error);
@@ -2360,4 +2509,287 @@ async fn nip44_three_level_reply_chain() {
             pt
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Attachment / manifest_aes tests (see WorkLog / PR investigation).
+// User-reported: composing an encrypted email with an attachment shows
+// "inline signature invalid" in the preview, and the recipient cannot
+// decrypt the body. The decrypt failure also reproduces in v1.0.6, so
+// it's a pre-existing issue in the attachment encryption flow — there's
+// currently zero integration-test coverage for attachments. These tests
+// pin the contract for that flow.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Reproduce the JS compose-with-attachment encrypt+sign+verify pipeline
+/// in pure Rust, end-to-end:
+///   1. Build a manifest JSON the way email-service.js does for an email
+///      with one attachment (manifest = {body:{ciphertext,...}, attachments:[{...}]}).
+///   2. NIP-44-encrypt the manifest under the recipient's pubkey.
+///   3. Glossia-encode the resulting ciphertext using the latin/body dialect
+///      (matches the auto-encode step after manifest encryption).
+///   4. Wrap in ASCII armor → produces what the user sees in the compose box.
+///   5. Walk the armor with `parse_armor_components`, grab the inner body
+///      text, and feed it through the same `decode_armor_section` byte-
+///      derivation the JS sign path uses (`signComposedBody` →
+///      `extractSignableBytes` for the !has-delimiters branch).
+///   6. Sign those bytes with the sender's nsec.
+///   7. Build the final armored body with an inline SIGNATURE block, again
+///      mimicking `buildPlainBody`'s output shape.
+///   8. Call `verify_email_signature_inline` on the final armor — this is
+///      what the preview's `verifyAllSignatures` invokes for inline sig
+///      verification.
+///
+/// FINDING: this test **passes**, which proves the Rust sign/verify pipeline
+/// is symmetric for an encrypted-manifest body. So the user-reported
+/// "inline signature invalid" in the JS compose preview must originate in
+/// the JS-side handoff, not in extract_signable_bytes / decode_armor_section
+/// / verify_email_signature_inline. Candidates to investigate next:
+///   - `buildPlainBody` in email-service.js: does the body it produces,
+///     when re-parsed, yield an `inner_body_text` byte-identical to the
+///     `bodyValue` that `signComposedBody` passed to `extractSignableBytes`?
+///   - `armorCiphertext` after manifest encrypt: line-wrapping or trailing
+///     whitespace differences vs. what `parse_armor_components` later
+///     extracts as `body_text`.
+///   - `encryptEmailFieldsInMemory` in the preview path: it always uses
+///     simple direct NIP encrypt and never the manifest path, so the
+///     `previewBody` it produces differs structurally from the auto-encrypt
+///     send-flow body. If the preview verifies inline sig on a stale
+///     DOM body (auto-signed earlier via manifest_aes path), the sig is
+///     over different bytes than the preview's `previewBody`.
+///
+/// Keep this test passing as a regression guard for the symmetric case.
+#[tokio::test]
+async fn manifest_attachment_compose_inline_sig_verifies() {
+    let (alice_nsec, alice_npub, _) = test_keypair(1);
+    let (_bob_nsec, bob_npub, _) = test_keypair(2);
+
+    // Wordlist tree for sig encoding (matches the JS glossia sig encode path)
+    let words = glossia::load_payload_words_for_wordlist("latin", "default")
+        .expect("load latin wordlist");
+    let tree = glossia::WordlistTree::new(words);
+
+    // Step 1: build manifest matching email-service.js:6377-6443.
+    // We use synthetic AES key/sha values (test doesn't decrypt the manifest;
+    // the bug under test is on the sig path, not manifest validation).
+    let manifest = serde_json::json!({
+        "body": {
+            "ciphertext": general_purpose::STANDARD.encode(b"synthetic-aes-encrypted-body"),
+            "cipher_sha256": "0".repeat(64),
+            "cipher_size": 28,
+            "key_wrap": general_purpose::STANDARD.encode([0u8; 32]),
+        },
+        "attachments": [
+            {
+                "id": "a1",
+                "orig_filename": "hello.txt",
+                "orig_mime": "text/plain",
+                "cipher_sha256": "0".repeat(64),
+                "cipher_size": 16,
+                "key_wrap": general_purpose::STANDARD.encode([1u8; 32]),
+            }
+        ]
+    });
+    let manifest_json = serde_json::to_string(&manifest).unwrap();
+
+    // Step 2: NIP-44 encrypt the manifest under bob's pubkey.
+    let manifest_ct = nip44_encrypt(&alice_nsec, &bob_npub, &manifest_json);
+
+    // Step 3: glossia-encode the ciphertext into latin words.
+    let manifest_glossia = glossia_encode_latin_body(&manifest_ct);
+
+    // Step 4: wrap in ASCII armor — this is the body in the DOM right
+    // before `signComposedBody` runs.
+    let pre_sign_armor = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n{manifest_glossia}\n----- END NOSTR MESSAGE -----"
+    );
+
+    // Step 5: simulate signComposedBody's byte derivation.
+    // JS parses the armor, grabs armorParts.bodyText, then calls
+    // extractSignableBytes(bodyText, is_armored=true, ...). With no delimiters
+    // in the inner body, extract_signable_bytes routes through decode_armor_section.
+    let parsed = email::parse_armor_components(&pre_sign_armor)
+        .expect("parse pre-sign armor");
+    let inner_body_text = parsed.body_text.clone();
+    let signable_bytes = email::decode_armor_section(&inner_body_text)
+        .expect("decode_armor_section on inner body");
+
+    // Step 6: sign.
+    let sig_hex = crypto::sign_data_bytes(&alice_nsec, &signable_bytes).expect("sign");
+    let pubkey_hex = npub_to_hex(&alice_npub);
+    let mut combined = Vec::with_capacity(96);
+    combined.extend_from_slice(&hex_decode(&sig_hex));
+    combined.extend_from_slice(&hex_decode(&pubkey_hex));
+    let sig_block_body = glossia::codec::encode_base_n(&combined, &tree, "bitpack_fixed")
+        .expect("bitpack_fixed encode signature")
+        .join(" ");
+
+    // Step 7: build the final armored body matching buildPlainBody's shape.
+    let final_armor = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+         {manifest_glossia}\n\
+         ----- BEGIN NOSTR SIGNATURE -----\n\
+         {sig_block_body}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+
+    // Step 8: verify_email_signature_inline — the function the preview's
+    // verifyAllSignatures invokes per nesting level (via the recursive
+    // verify_all_sigs walker).
+    let result = email::verify_email_signature_inline(&final_armor);
+
+    // If this fails (Some(false)), the sign and verify paths disagree on
+    // what bytes the signature covers, which would explain the user's
+    // "inline signature invalid" preview report. Diagnostic dump in that
+    // case so we can compare the canonical byte streams.
+    if result != Some(true) {
+        // Pull what verify thinks the canonical bytes are.
+        let verify_bytes = email::extract_ciphertext_binary(&final_armor);
+        eprintln!(
+            "[BUG] sign_bytes.len={} verify_bytes.len={} match={}",
+            signable_bytes.len(),
+            verify_bytes.len(),
+            signable_bytes == verify_bytes
+        );
+        eprintln!("[BUG] sign_bytes head: {:?}", &signable_bytes[..signable_bytes.len().min(32)]);
+        eprintln!("[BUG] verify_bytes head: {:?}", &verify_bytes[..verify_bytes.len().min(32)]);
+    }
+
+    assert_eq!(
+        result,
+        Some(true),
+        "manifest-encrypted body should round-trip sign+verify; \
+         if this fails, the JS preview's 'inline signature invalid' \
+         message reproduces in pure Rust and the bug is on the Rust side"
+    );
+}
+
+/// Same setup as `manifest_attachment_compose_inline_sig_verifies`, but the
+/// SIGNATURE block uses the **exact format the JS default path emits**
+/// instead of the synthetic combined-bitpack-96 format from the previous
+/// test.
+///
+/// In email-service.js the default settings are
+/// `glossia_encoding_signature: 'latin'` and `glossia_encoding_pubkey: ''`
+/// (empty). With those settings `encodeSigPubkey` takes the
+/// metaPubkey-is-falsy branch (glossia-service.js:178-182):
+///   encodedSig    = encodeSignature(sigHex, 'latin')
+///                 = glossia_encode_raw_base_n(sigHex, 'latin', 'default', '')
+///                   ⇒ bitpack_fixed latin words, joined by spaces.
+///   encodedPubkey = npub-encoded pubkey (no glossia)
+/// `buildPlainBody` then writes them as TWO LINES inside the SIGNATURE
+/// block — the latin words on one line, the npub on the next.
+///
+/// Phase 2 of `decode_sig_and_pubkey` (email.rs:1652) is what's supposed
+/// to recover this: split lines, decode last as pubkey, rest as signature.
+/// If THIS test fails while the previous (combined-bitpack) one passes,
+/// the bug is in Phase 2 — either the line-splitting, the pubkey decode,
+/// or the signature decode for the bare bitpack_fixed-words shape.
+#[tokio::test]
+async fn manifest_attachment_default_jsformat_inline_sig_verifies() {
+    let (alice_nsec, alice_npub, _) = test_keypair(1);
+    let (_bob_nsec, bob_npub, _) = test_keypair(2);
+
+    // (a) Build manifest matching email-service.js:6377-6443
+    let manifest = serde_json::json!({
+        "body": {
+            "ciphertext": general_purpose::STANDARD.encode(b"synthetic-aes-encrypted-body"),
+            "cipher_sha256": "0".repeat(64),
+            "cipher_size": 28,
+            "key_wrap": general_purpose::STANDARD.encode([0u8; 32]),
+        },
+        "attachments": [{
+            "id": "a1",
+            "orig_filename": "hello.txt",
+            "orig_mime": "text/plain",
+            "cipher_sha256": "0".repeat(64),
+            "cipher_size": 16,
+            "key_wrap": general_purpose::STANDARD.encode([1u8; 32]),
+        }]
+    });
+    let manifest_json = serde_json::to_string(&manifest).unwrap();
+
+    // (b) NIP-44 encrypt + glossia-encode the ciphertext (matches auto-encode).
+    let manifest_ct = nip44_encrypt(&alice_nsec, &bob_npub, &manifest_json);
+    let manifest_glossia = glossia_encode_latin_body(&manifest_ct);
+
+    // (c) Pre-sign armor — the DOM body shape right before signComposedBody runs.
+    let pre_sign_armor = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n{manifest_glossia}\n----- END NOSTR MESSAGE -----"
+    );
+
+    // (d) Derive signable bytes the same way signComposedBody does.
+    let parsed = email::parse_armor_components(&pre_sign_armor).expect("parse pre-sign armor");
+    let inner_body_text = parsed.body_text.clone();
+    let signable_bytes = email::decode_armor_section(&inner_body_text)
+        .expect("decode_armor_section on inner body");
+
+    // (e) Sign.
+    let sig_hex = crypto::sign_data_bytes(&alice_nsec, &signable_bytes).expect("sign");
+    let pubkey_hex = npub_to_hex(&alice_npub);
+
+    // (f) Encode the SIGNATURE block content the exact way the JS default
+    //     settings do it:
+    //       encodedSig    = bitpack_fixed(sig_bytes, 'latin/default')   ← bare words
+    //       encodedPubkey = npub of pubkey_hex                          ← bech32, no glossia
+    //     Then concatenate as two lines, matching buildPlainBody's shape.
+    let sig_bytes = hex_decode(&sig_hex);
+    let words = glossia::load_payload_words_for_wordlist("latin", "default")
+        .expect("load latin wordlist");
+    let tree = glossia::WordlistTree::new(words);
+    let encoded_sig_words = glossia::codec::encode_base_n(&sig_bytes, &tree, "bitpack_fixed")
+        .expect("bitpack_fixed encode signature")
+        .join(" ");
+    let encoded_pubkey_npub = hex_to_npub(&pubkey_hex);
+    let sig_block_body = format!("{encoded_sig_words}\n{encoded_pubkey_npub}");
+
+    // (g) Final armor with SIGNATURE block matching buildPlainBody's shape.
+    let final_armor = format!(
+        "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+         {manifest_glossia}\n\
+         ----- BEGIN NOSTR SIGNATURE -----\n\
+         {sig_block_body}\n\
+         ----- END NOSTR MESSAGE -----"
+    );
+
+    // (h) Verify — the path the preview's verifyAllSignatures uses.
+    let result = email::verify_email_signature_inline(&final_armor);
+
+    if result != Some(true) {
+        // Diagnostics: report what the decoder thinks it got from the SIGNATURE block.
+        let verify_bytes = email::extract_ciphertext_binary(&final_armor);
+        eprintln!(
+            "[BUG] sign_bytes.len={} verify_bytes.len={} match={}",
+            signable_bytes.len(),
+            verify_bytes.len(),
+            signable_bytes == verify_bytes
+        );
+        eprintln!("[BUG] expected sig_hex (first 16 chars): {}", &sig_hex[..16]);
+        eprintln!("[BUG] expected pubkey_hex (first 16 chars): {}", &pubkey_hex[..16]);
+        eprintln!("[BUG] sig block content was:\n{sig_block_body}");
+
+        // Re-parse the final armor and see what decode_sig_and_pubkey actually pulled
+        // out — that's the field that's wrong if Phase 1a/1b is firing greedily.
+        let reparsed = email::parse_armor_components(&final_armor).expect("reparse final armor");
+        eprintln!("[BUG] reparsed.signature_hex (first 16 chars): {:?}",
+            reparsed.signature_hex.as_ref().map(|s| &s[..s.len().min(16)]));
+        eprintln!("[BUG] reparsed.sig_pubkey_hex (first 16 chars): {:?}",
+            reparsed.sig_pubkey_hex.as_ref().map(|s| &s[..s.len().min(16)]));
+        eprintln!(
+            "[BUG] decoded pubkey matches expected? {}",
+            reparsed.sig_pubkey_hex.as_deref() == Some(pubkey_hex.as_str())
+        );
+        eprintln!(
+            "[BUG] decoded sig matches expected? {}",
+            reparsed.signature_hex.as_deref() == Some(sig_hex.as_str())
+        );
+    }
+
+    assert_eq!(
+        result,
+        Some(true),
+        "JS-format SIGNATURE block (bitpack_fixed latin words + npub on \
+         separate lines) should round-trip; if this fails it's the actual \
+         user-reported 'inline signature invalid' bug pinned in pure Rust"
+    );
 }

@@ -5357,6 +5357,46 @@ pub fn default_inbox_folders(imap_host: &str) -> Vec<String> {
     }
 }
 
+/// Serializes the IMAP-using sync passes. The Refresh button, the IDLE
+/// `imap-new-mail` push, and `rescue_spam_now`'s follow-up sync can otherwise
+/// fire `sync_nostr_emails_to_db` / `refresh_inbox_emails_to_db` concurrently —
+/// and auto-file's own INBOX moves re-arm IDLE, so a manual refresh reliably
+/// overlaps an IDLE-driven sync. Two heavy multi-command passes racing on
+/// pooled connections desync the `imap` 2.4.1 parser, which asserts on the
+/// mismatched command tag (client.rs:1369) and panics in `uid_search`. Holding
+/// this lock for the whole pass guarantees one IMAP sync runs at a time.
+static SYNC_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// Run a synchronous IMAP `op` against `*session`, surviving an `imap` 2.4.1
+/// parser desync.
+///
+/// The crate asserts that a tagged completion line carries the current command's
+/// tag (client.rs:1369); when a prior command's response was left half-read in
+/// the socket buffer — which Gmail can provoke during the auto-file/rescue
+/// SEARCH storm — the next command reads a stale tag and the assertion *panics*
+/// rather than returning an error. We can't reuse a session once its byte stream
+/// is misaligned, so on a caught panic the poisoned session is dropped (socket
+/// closed, never re-pooled) and replaced with a fresh connection, and `None` is
+/// returned. On success returns `Some(op_result)`.
+///
+/// `catch_unwind` relies on `panic = "unwind"` (see backend/Cargo.toml). The
+/// session is behind `&mut`, which isn't `UnwindSafe`, hence `AssertUnwindSafe`:
+/// a desynced session is always discarded here, so no torn state is observed.
+fn guarded_session_op<T>(
+    session: &mut imap_pool::ImapSession,
+    target: &ImapTarget,
+    op: impl FnOnce(&mut imap_pool::ImapSession) -> T,
+) -> anyhow::Result<Option<T>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(&mut *session))) {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => {
+            debug_log!("[RUST] guarded_session_op: imap op panicked (parser desync); dropping poisoned session and reconnecting");
+            *session = imap_pool::connect_imap(target)?;
+            Ok(None)
+        }
+    }
+}
+
 pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
     sync_nostr_emails_to_db_inner(config, folders_arg, active_pubkey, db, /* include_gap_fill = */ false).await
 }
@@ -5370,6 +5410,10 @@ pub async fn refresh_inbox_emails_to_db(config: &EmailConfig, folders_arg: Optio
 }
 
 async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
+    // Serialize: never let two sync passes touch the IMAP pool concurrently
+    // (see SYNC_LOCK). Held for the whole pass; a second caller waits its turn.
+    let _sync_guard = SYNC_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+
     let account_key = config.email_address.trim().to_lowercase();
     let require_signature = lookup_require_signature(db, active_pubkey);
     let spam_rescue = lookup_spam_rescue(db, active_pubkey);
@@ -5446,7 +5490,14 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     let checkout_ms = t_checkout.elapsed().as_millis();
     let t_moves = std::time::Instant::now();
     if spam_rescue {
-        let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, /* unseen_only = */ true);
+        // Best-effort, and panic-guarded: a SEARCH desync here must not freeze
+        // the command or poison the scan below — on panic we reconnect and skip.
+        // Bound the per-spam-folder search to the same default load window the
+        // scan uses (spam folders are small, so this rarely binds).
+        let rescue_window = lookup_initial_count(db, active_pubkey);
+        let moved = guarded_session_op(&mut session, &target, |s| {
+            rescue_nostr_emails_from_spam(s, &rescue_target, /* unseen_only = */ true, rescue_window)
+        })?.unwrap_or(0);
         if moved > 0 {
             println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
         }
@@ -5454,22 +5505,11 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         extend_with_spam_folders(&mut session, &mut folders);
     }
 
-    // Auto-file: move nostr mail out of the INBOX into the destination folder
-    // before scanning, so it consolidates there and the scan below imports it
-    // from a single place (no duplicate — dedup is by Message-ID). Scoped to
-    // INBOX only; other folders (Archive, spam, the destination itself) are
-    // left untouched.
-    if auto_move_nostr && !rescue_target.eq_ignore_ascii_case("INBOX") {
-        let sources: Vec<String> = folders
-            .iter()
-            .filter(|f| f.eq_ignore_ascii_case("INBOX"))
-            .cloned()
-            .collect();
-        let moved = auto_file_nostr_from_inbox(&mut session, &sources, &rescue_target);
-        if moved > 0 {
-            println!("[RUST] sync_nostr_emails_to_db: auto-filed {} nostr message(s) to '{}'", moved, rescue_target);
-        }
-    }
+    // Auto-file is no longer a separate INBOX search/fetch pass. It's folded
+    // into the per-folder scan below (`auto_file_to`): the scan already fetches
+    // and identifies the recent nostr mail, so it moves exactly those UIDs into
+    // the destination — reusing one fetch, and dropping the unbounded HEADER/BODY
+    // searches that desynced the imap parser on large mailboxes.
 
     let moves_ms = t_moves.elapsed().as_millis();
 
@@ -5484,9 +5524,23 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         // it — same scan-window model as the scroll. Passing `count` as both the
         // match target and the scan cap means the window is examined in full.
         let count = lookup_folder_count(db, active_pubkey, f);
-        match uid_sync_folder(&mut session, config, db, &account_key, f, count, count,
-                              parse_nostr_email_from_imap_body) {
-            Ok(r) => {
+        // Auto-file the nostr mail found in this folder into the destination,
+        // INBOX-only (matching the prior behaviour) and never the target itself.
+        let auto_file_to = if auto_move_nostr
+            && f.eq_ignore_ascii_case("INBOX")
+            && !rescue_target.eq_ignore_ascii_case("INBOX")
+        {
+            Some(rescue_target.as_str())
+        } else {
+            None
+        };
+        // Panic-guarded like the movers: a desync mid-scan reconnects and skips
+        // this folder rather than freezing the whole command.
+        match guarded_session_op(&mut session, &target, |s| {
+            uid_sync_folder(s, config, db, &account_key, f, count, count,
+                            parse_nostr_email_from_imap_body, auto_file_to)
+        })? {
+            Some(Ok(r)) => {
                 if r.max_uid > 0 || !r.had_existing_state {
                     let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
                         Some(r.min_uid)
@@ -5497,21 +5551,25 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
                 }
                 raw_nostr_emails.extend(r.emails);
             }
-            Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
+            Some(Err(e)) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
+            None => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' scan panicked (imap desync); reconnected, skipping", f),
         }
         if include_gap_fill {
             // recover_dropped = !require_signature: when the user has lifted the
             // signed-only filter, gap-fill re-scans the full synced range to
             // bring back mail that was dropped while the filter was on.
-            match gap_fill_in_folder(&mut session, config, db, &account_key, f,
-                                      !require_signature, parse_nostr_email_from_imap_body) {
-                Ok(r) => {
+            match guarded_session_op(&mut session, &target, |s| {
+                gap_fill_in_folder(s, config, db, &account_key, f,
+                                   !require_signature, parse_nostr_email_from_imap_body)
+            })? {
+                Some(Ok(r)) => {
                     raw_nostr_emails.extend(r.emails);
                     if let Some((uidv, lo, hi)) = r.examined {
                         pending_gap_examined.push((f.clone(), uidv, lo, hi));
                     }
                 }
-                Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
+                Some(Err(e)) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
+                None => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill '{}' panicked (imap desync); reconnected, skipping", f),
             }
         }
         debug_log!("[RUST-PERF] sync_nostr: folder '{}' scan+gapfill={}ms (running total {} raw match)",
@@ -5796,7 +5854,7 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
         // Scan a window of `count` messages per folder (see sync_nostr_emails_to_db).
         let count = lookup_folder_count(db, active_pubkey, f);
         match uid_sync_folder(&mut session, config, db, &account_key, f, count, count,
-                              parse_nostr_sent_email_from_imap_body) {
+                              parse_nostr_sent_email_from_imap_body, /* auto_file_to = */ None) {
             Ok(r) => {
                 if r.max_uid > 0 || !r.had_existing_state {
                     let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
@@ -6199,6 +6257,31 @@ fn build_bootstrap_query(sync_cutoff_days: i64) -> String {
 /// The caller is responsible for persisting parsed emails AND updating
 /// `folder_sync_state` after a successful save — that way a partial-failure
 /// run can retry from the same watermark.
+/// Move the nostr UIDs a scan just identified out of the currently-selected
+/// `folder_name` into `target` (auto-file). Best-effort: empty list or
+/// `folder_name == target` is a no-op, and a move failure is logged and
+/// swallowed — the messages are already imported, so a missed move only leaves
+/// them physically in the source folder. Called at the end of a fetch pass so
+/// it never mutates the mailbox mid-fetch.
+fn move_collected<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    uids: &[u32],
+    target: &str,
+    folder_name: &str,
+) {
+    if uids.is_empty() || folder_name.eq_ignore_ascii_case(target) {
+        return;
+    }
+    let _ = session.create(target); // ensure the destination exists
+    let uid_set = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    match move_uids_to_folder(session, &uid_set, target) {
+        Ok(_) => debug_log!("[RUST] auto-file: moved {} nostr message(s) from '{}' to '{}'",
+            uids.len(), folder_name, target),
+        Err(e) => debug_log!("[RUST] auto-file: move from '{}' to '{}' failed: {}",
+            folder_name, target, e),
+    }
+}
+
 fn uid_sync_folder<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     config: &EmailConfig,
@@ -6208,6 +6291,11 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
     target_count: usize,
     max_scan: usize,
     parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
+    // When `Some(target)`, the nostr messages this scan identifies are moved out
+    // of `folder_name` into `target` (auto-file), reusing this pass's fetch —
+    // no separate search/fetch. `None` disables it (the Sent pass, the target
+    // folder itself). No-op when `folder_name == target`.
+    auto_file_to: Option<&str>,
 ) -> anyhow::Result<UidSyncResult> {
     let mb = session.select(folder_name)?;
     let uid_validity = mb.uid_validity
@@ -6241,6 +6329,7 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
         // Chunk into ~500-UID batches to stay well under Gmail's ~8KB IMAP line limit.
         const FETCH_BATCH: usize = 500;
         let mut emails: Vec<RawNostrEmail> = Vec::new();
+        let mut matched_uids: Vec<u32> = Vec::new();
         let mut max_uid: u32 = 0;
         // IMAP body-download time vs in-process parse time, summed across
         // batches. Surfaced via [RUST-PERF] so a slow sync can be attributed
@@ -6262,6 +6351,9 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
                 if let Some(body) = msg.body() {
                     if let Some(mut parsed) = parse_fn(body, config) {
                         parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
+                        if auto_file_to.is_some() {
+                            if let Some(uid) = msg.uid { matched_uids.push(uid); }
+                        }
                         emails.push(parsed);
                     }
                 }
@@ -6270,6 +6362,9 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
         }
         debug_log!("[RUST-PERF] uid_sync_folder '{}' incremental: search={}ms, fetch={}ms, parse={}ms ({} UIDs, {} match)",
             folder_name, search_ms, fetch_ms, parse_ms, uids.len(), emails.len());
+        if let Some(tgt) = auto_file_to {
+            move_collected(session, &matched_uids, tgt, folder_name);
+        }
         return Ok(UidSyncResult { emails, uid_validity, max_uid, min_uid, had_existing_state });
     }
 
@@ -6307,6 +6402,10 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
     // which becomes the bootstrap floor (min_seen_uid).
     let walk = walk_back_collecting(session, config, &uids, watermark, target, max_scan, parse_fn)?;
 
+    if let Some(tgt) = auto_file_to {
+        move_collected(session, &walk.matched_uids, tgt, folder_name);
+    }
+
     Ok(UidSyncResult {
         emails: walk.emails,
         uid_validity,
@@ -6338,6 +6437,10 @@ struct FetchOlderResult {
 /// were scanned, and whether the candidate list was fully exhausted.
 struct CountWalk {
     emails: Vec<RawNostrEmail>,
+    // UIDs of the messages that parsed as nostr mail, in the source folder.
+    // Used by auto-file to move exactly what was imported, reusing this walk's
+    // fetch instead of a second search/fetch pass.
+    matched_uids: Vec<u32>,
     lowest_scanned: u32,
     scanned: usize,
     hit_bottom: bool,
@@ -6432,6 +6535,7 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
     parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
 ) -> anyhow::Result<CountWalk> {
     let mut emails: Vec<RawNostrEmail> = Vec::new();
+    let mut matched_uids: Vec<u32> = Vec::new();
     let mut lowest_scanned: u32 = floor_init;
     let mut oldest_scanned: Option<chrono::DateTime<chrono::Utc>> = None;
 
@@ -6494,6 +6598,9 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
                 if let Some(body) = msg.body() {
                     if let Some(mut parsed) = parse_fn(body, config) {
                         parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
+                        if let Some(uid) = msg.uid {
+                            matched_uids.push(uid);
+                        }
                         emails.push(parsed);
                     }
                 }
@@ -6505,7 +6612,7 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
     }
 
     let hit_bottom = scanned >= uids_sorted.len();
-    Ok(CountWalk { emails, lowest_scanned, scanned, hit_bottom, oldest_scanned })
+    Ok(CountWalk { emails, matched_uids, lowest_scanned, scanned, hit_bottom, oldest_scanned })
 }
 
 /// Enumerate a bounded window of existing UIDs just below `floor_uid`, large
@@ -6903,7 +7010,7 @@ fn resolve_folder_count(folder: &str, folder_counts_json: Option<&str>, initial_
 
 /// Global per-folder bootstrap target (nostr matches), defaulting to
 /// `DEFAULT_INITIAL_COUNT`. Per-pubkey preference, like the cutoff above.
-fn lookup_initial_count(db: &Database, pubkey: &str) -> usize {
+pub(crate) fn lookup_initial_count(db: &Database, pubkey: &str) -> usize {
     db.get_setting(pubkey, "sync_initial_count")
         .ok()
         .flatten()
@@ -7082,6 +7189,7 @@ fn rescue_nostr_emails_from_spam(
     session: &mut imap::Session<impl std::io::Read + std::io::Write>,
     target_folder: &str,
     unseen_only: bool,
+    window: usize,
 ) -> usize {
     let spam_folders = list_spam_folders(session);
     debug_log!("[RUST] rescue: spam folders found = {:?}, target = '{}', unseen_only = {}", spam_folders, target_folder, unseen_only);
@@ -7093,7 +7201,7 @@ fn rescue_nostr_emails_from_spam(
 
     let mut moved_total = 0usize;
     for folder in spam_folders {
-        moved_total += move_nostr_from_folder(session, &folder, target_folder, unseen_only);
+        moved_total += move_nostr_from_folder(session, &folder, target_folder, unseen_only, window);
     }
     moved_total
 }
@@ -7113,13 +7221,33 @@ fn move_nostr_from_folder(
     folder: &str,
     target_folder: &str,
     unseen_only: bool,
+    window: usize,
 ) -> usize {
     if folder.eq_ignore_ascii_case(target_folder) {
         return 0;
     }
-    if session.select(folder).is_err() {
-        return 0;
-    }
+    let mailbox = match session.select(folder) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+
+    // Bound the content searches to the SAME recent window the scan/scroll uses
+    // (`window` = lookup_folder_count, the per-folder "Messages to Load Per
+    // Folder" setting), so auto-file/rescue examine exactly the span the user
+    // loads — no separate magic constant. An unbounded HEADER/BODY search over a
+    // huge Gmail folder (e.g. a 149k-message INBOX) otherwise exceeds the pool's
+    // 30s socket read timeout, and the timed-out search's late-arriving response
+    // desyncs the `imap` 2.4.1 parser into a stale-tag panic (see memory
+    // imap-search-desync-crash). The UID-arithmetic window over-approximates the
+    // message count when UIDs are sparse, which is fine for bounding. Small
+    // folders (exists <= window) search in full.
+    let window = window.max(1) as u32;
+    let uid_scope = match mailbox.uid_next {
+        Some(next) if mailbox.exists > window && next > window => {
+            format!("UID {}:* ", next - window)
+        }
+        _ => String::new(),
+    };
 
     // Cheap server-side narrowing to candidate UIDs: messages that are
     // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor block
@@ -7136,9 +7264,17 @@ fn move_nostr_from_folder(
         "BODY \"BEGIN NOSTR SIGNATURE\"",
         "BODY \"BEGIN NOSTR SEAL\"",
     ] {
-        let query = format!("{}{}", guard, q);
-        if let Ok(found) = session.uid_search(&query) {
-            candidates.extend(found);
+        let query = format!("{}{}{}", guard, uid_scope, q);
+        match session.uid_search(&query) {
+            Ok(found) => candidates.extend(found),
+            // A failed search (commonly a read timeout on a slow query) can
+            // leave the connection mid-response. Stop issuing more commands on
+            // it — continuing would read the stale response and desync the
+            // parser. The caller's guarded_session_op drops the session.
+            Err(e) => {
+                debug_log!("[RUST] move_nostr_from_folder: search '{}' in '{}' failed: {} — stopping to avoid desync", query, folder, e);
+                break;
+            }
         }
     }
     debug_log!("[RUST] move_nostr_from_folder: folder '{}' nostr candidate UIDs = {}", folder, candidates.len());
@@ -7188,35 +7324,16 @@ fn move_nostr_from_folder(
     }
 }
 
-/// Move nostr mail out of the regular inbox folders into `target_folder`, so it
-/// consolidates in the dedicated nostr folder the user reads from. Mirrors spam
-/// rescue but over the given inbox folders, never gating on \Seen. Spam folders
-/// must be excluded by the caller — they're handled by spam rescue. Returns the
-/// number of messages moved; per-folder failures are logged and skipped.
-fn auto_file_nostr_from_inbox(
-    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
-    source_folders: &[String],
-    target_folder: &str,
-) -> usize {
-    // Make sure the destination exists before we start moving into it.
-    let _ = session.create(target_folder);
-    let mut moved_total = 0usize;
-    for folder in source_folders {
-        moved_total += move_nostr_from_folder(session, folder, target_folder, /* unseen_only */ false);
-    }
-    moved_total
-}
-
 /// One-time "catch-up" rescue invoked when the user first switches spam rescue
 /// ON. Opens an IMAP session and runs `rescue_nostr_emails_from_spam` with the
 /// \Seen guard dropped, so already-read nostr mail sitting in spam (which the
 /// per-sync rescue intentionally skips) is moved into `target_folder` too.
 /// Returns the number of messages moved. The caller is expected to sync
 /// afterwards so the moved messages land in the local DB.
-pub async fn rescue_spam_now(config: &EmailConfig, target_folder: &str) -> anyhow::Result<usize> {
+pub async fn rescue_spam_now(config: &EmailConfig, target_folder: &str, window: usize) -> anyhow::Result<usize> {
     let target = ImapTarget::from_config(config);
     let moved = imap_pool::with_session(&target, |session| {
-        Ok(rescue_nostr_emails_from_spam(session, target_folder, /* unseen_only = */ false))
+        Ok(rescue_nostr_emails_from_spam(session, target_folder, /* unseen_only = */ false, window))
     })?;
     Ok(moved)
 }

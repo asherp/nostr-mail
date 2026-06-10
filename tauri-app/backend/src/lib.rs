@@ -6943,7 +6943,11 @@ async fn rescue_spam_now(state: tauri::State<'_, AppState>) -> Result<usize, Str
         };
 
         let target = crate::email::lookup_spam_rescue_target(&db, &active_pubkey);
-        let moved = crate::email::rescue_spam_now(&email_config, &target)
+        // Same default load window the scan uses; bounds the per-spam-folder
+        // search so it can't run unbounded over a huge folder (see email.rs
+        // move_nostr_from_folder / memory imap-search-desync-crash).
+        let window = crate::email::lookup_initial_count(&db, &active_pubkey);
+        let moved = crate::email::rescue_spam_now(&email_config, &target, window)
             .await
             .map_err(|e| e.to_string())?;
 

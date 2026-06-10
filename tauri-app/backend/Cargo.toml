@@ -97,4 +97,9 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# panic = "unwind" (the default) is deliberate: the `imap` 2.4.1 crate enforces
+# protocol invariants with assert_eq! (e.g. client.rs:1369 tag check). Under
+# `panic = "abort"` a desynced pooled connection turned that assertion into a
+# SIGABRT that killed the whole app. With unwind, tokio catches the panic at the
+# task boundary — the offending sync fails and logs, the bad session is dropped
+# (not re-pooled), and the app keeps running.

@@ -5215,12 +5215,22 @@ fn persist_inbox_raw_emails(
         });
     }
 
+    // DB-lookup time vs DB-write time, plus insert/update split, so a slow
+    // persist phase ([RUST-PERF] sync_nostr) can be attributed. This loop is
+    // pure SQLite I/O — decryption is on-demand at read time, not here.
+    let candidate_count = emails.len();
+    let mut lookup_ms: u128 = 0;
+    let mut write_ms: u128 = 0;
+    let mut update_count = 0usize;
     let mut new_count = 0;
     for email in emails {
+        let t_lookup = std::time::Instant::now();
         let existing_email = db
             .get_email(&email.message_id)
             .map_err(|e| anyhow::anyhow!("Failed to check email {} in DB: {}", email.message_id, e))?;
+        lookup_ms += t_lookup.elapsed().as_millis();
 
+        let t_write = std::time::Instant::now();
         if let Some(existing_email) = existing_email {
             let updated_email = DbEmail {
                 id: existing_email.id,
@@ -5249,6 +5259,7 @@ fn persist_inbox_raw_emails(
                 thread_id: None,
             };
             db.save_email(&updated_email)?;
+            update_count += 1;
         } else {
             let db_email = DbEmail {
                 id: None,
@@ -5284,7 +5295,10 @@ fn persist_inbox_raw_emails(
             persist_attachments_for_email(db, &email, email_id);
             new_count += 1;
         }
+        write_ms += t_write.elapsed().as_millis();
     }
+    debug_log!("[RUST-PERF] persist_inbox_raw_emails: {} candidates, lookup={}ms, write={}ms ({} new, {} updated)",
+        candidate_count, lookup_ms, write_ms, new_count, update_count);
     Ok(new_count)
 }
 
@@ -5425,8 +5439,12 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
     let mut pending_gap_examined: Vec<(String, u32, u32, u32)> = Vec::new();
     let mut raw_nostr_emails: Vec<RawNostrEmail> = Vec::new();
 
+    let t_total = std::time::Instant::now();
     let target = ImapTarget::from_config(config);
+    let t_checkout = std::time::Instant::now();
     let mut session = imap_pool::checkout(&target)?;
+    let checkout_ms = t_checkout.elapsed().as_millis();
+    let t_moves = std::time::Instant::now();
     if spam_rescue {
         let moved = rescue_nostr_emails_from_spam(&mut session, &rescue_target, /* unseen_only = */ true);
         if moved > 0 {
@@ -5453,8 +5471,14 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         }
     }
 
+    let moves_ms = t_moves.elapsed().as_millis();
+
     println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
+    // Per-folder scan time, accumulated so the [RUST-PERF] summary can show
+    // which folder (or the persist/move phase) dominates a slow sync.
+    let t_scan = std::time::Instant::now();
     for f in &folders {
+        let t_folder = std::time::Instant::now();
         // Bootstrap scans a window of `count` messages per folder ("Messages to
         // Load Per Folder" / per-folder override), surfacing the nostr mail in
         // it — same scan-window model as the scroll. Passing `count` as both the
@@ -5490,10 +5514,17 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
                 Err(e) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
             }
         }
+        debug_log!("[RUST-PERF] sync_nostr: folder '{}' scan+gapfill={}ms (running total {} raw match)",
+            f, t_folder.elapsed().as_millis(), raw_nostr_emails.len());
     }
+    let scan_ms = t_scan.elapsed().as_millis();
     imap_pool::checkin(&target, session);
 
+    let raw_match_count = raw_nostr_emails.len();
+    let t_persist = std::time::Instant::now();
     let new_count = persist_inbox_raw_emails(raw_nostr_emails, db, require_signature)?;
+    let persist_ms = t_persist.elapsed().as_millis();
+    let t_commit = std::time::Instant::now();
 
     // Commit per-folder UID watermarks now that the DB writes have all succeeded.
     // A partial-batch failure earlier returned Err and we never reach here, so
@@ -5535,7 +5566,11 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         }
     }
 
+    let commit_ms = t_commit.elapsed().as_millis();
     debug_log!("[RUST] sync_nostr_emails_to_db: Completed sync, {} new emails saved", new_count);
+    debug_log!("[RUST-PERF] sync_nostr TOTAL={}ms = checkout={}ms + moves={}ms + scan={}ms + persist={}ms + commit={}ms ({} folders, {} raw match, {} new, gap_fill={})",
+        t_total.elapsed().as_millis(), checkout_ms, moves_ms, scan_ms, persist_ms, commit_ms,
+        folders.len(), raw_match_count, new_count, include_gap_fill);
     Ok(new_count)
 }
 
@@ -5735,6 +5770,7 @@ pub async fn refresh_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str
 
 async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
     debug_log!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
+    let t_total = std::time::Instant::now();
     let account_key = config.email_address.trim().to_lowercase();
 
     // See sync_nostr_emails_to_db for the meaning of the 4-tuple.
@@ -5755,6 +5791,7 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
     // wastes body fetches, and lets both passes fight over its
     // folder_sync_state watermark. Sent-vs-Inbox is decided at query time by
     // from_address, not by which folder a row came from.
+    let t_scan = std::time::Instant::now();
     for f in [sent_folder.as_str()] {
         // Scan a window of `count` messages per folder (see sync_nostr_emails_to_db).
         let count = lookup_folder_count(db, active_pubkey, f);
@@ -5787,10 +5824,13 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
             }
         }
     }
+    let scan_ms = t_scan.elapsed().as_millis();
     imap_pool::checkin(&target, session);
 
     debug_log!("[RUST] sync_sent_emails_to_db: Fetched {} emails from IMAP", raw_sent_emails.len());
 
+    let raw_match_count = raw_sent_emails.len();
+    let t_persist = std::time::Instant::now();
     let mut new_count = 0;
     debug_log!("[RUST] sync_sent_emails_to_db: Processing {} emails for saving", raw_sent_emails.len());
     for (idx, email) in raw_sent_emails.iter().enumerate() {
@@ -5950,6 +5990,7 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
             }
         }
     }
+    let persist_ms = t_persist.elapsed().as_millis();
     // Commit per-folder UID watermarks after all per-message DB writes succeeded.
     for (folder_name, uid_validity, max_uid, bootstrap_min) in pending_state {
         if let Err(e) = db.set_folder_sync_state(&account_key, &folder_name, uid_validity, max_uid) {
@@ -5986,6 +6027,8 @@ async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str,
     }
 
     debug_log!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved", new_count);
+    debug_log!("[RUST-PERF] sync_sent TOTAL={}ms = scan={}ms + persist={}ms (folder '{}', {} raw match, {} new, gap_fill={})",
+        t_total.elapsed().as_millis(), scan_ms, persist_ms, sent_folder, raw_match_count, new_count, include_gap_fill);
     Ok(new_count)
 }
 
@@ -6179,8 +6222,12 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
         let next = stored.as_ref().unwrap().last_seen_uid.saturating_add(1);
         let query = format!("UID {}:*", next);
         debug_log!("[RUST] uid_sync_folder: '{}' UID SEARCH {}", folder_name, query);
+        let t_search = std::time::Instant::now();
         let uid_set = session.uid_search(&query)?;
+        let search_ms = t_search.elapsed().as_millis();
         if uid_set.is_empty() {
+            debug_log!("[RUST-PERF] uid_sync_folder '{}' incremental: search={}ms, 0 new UIDs",
+                folder_name, search_ms);
             return Ok(UidSyncResult {
                 emails: vec![], uid_validity, max_uid: 0, min_uid: 0, had_existing_state,
             });
@@ -6195,11 +6242,19 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
         const FETCH_BATCH: usize = 500;
         let mut emails: Vec<RawNostrEmail> = Vec::new();
         let mut max_uid: u32 = 0;
+        // IMAP body-download time vs in-process parse time, summed across
+        // batches. Surfaced via [RUST-PERF] so a slow sync can be attributed
+        // to the network (fetch) or the CPU (parse/detection).
+        let mut fetch_ms: u128 = 0;
+        let mut parse_ms: u128 = 0;
         for chunk in uids.chunks(FETCH_BATCH) {
             let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
             // BODY.PEEK[] (not RFC822) so reading a message body never *sets* \Seen.
             // FLAGS lets us read the server's \Seen and seed local read state.
+            let t_fetch = std::time::Instant::now();
             let messages = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
+            fetch_ms += t_fetch.elapsed().as_millis();
+            let t_parse = std::time::Instant::now();
             for msg in messages.iter() {
                 if let Some(uid) = msg.uid {
                     if uid > max_uid { max_uid = uid; }
@@ -6211,7 +6266,10 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
                     }
                 }
             }
+            parse_ms += t_parse.elapsed().as_millis();
         }
+        debug_log!("[RUST-PERF] uid_sync_folder '{}' incremental: search={}ms, fetch={}ms, parse={}ms ({} UIDs, {} match)",
+            folder_name, search_ms, fetch_ms, parse_ms, uids.len(), emails.len());
         return Ok(UidSyncResult { emails, uid_validity, max_uid, min_uid, had_existing_state });
     }
 
@@ -6225,7 +6283,9 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
         println!("[RUST] uid_sync_folder: no stored state for '{}', bootstrapping", folder_name);
     }
 
+    let t_search = std::time::Instant::now();
     let uid_set = session.uid_search("UID 1:*")?;
+    let search_ms = t_search.elapsed().as_millis();
     if uid_set.is_empty() {
         return Ok(UidSyncResult {
             emails: vec![], uid_validity, max_uid: 0, min_uid: 0, had_existing_state,
@@ -6239,6 +6299,8 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
     let target = target_count.max(1);
     println!("[RUST] uid_sync_folder: '{}' bootstrap — {} UIDs in folder, target {} match(es), max_scan {}",
         folder_name, uids.len(), target, max_scan);
+    debug_log!("[RUST-PERF] uid_sync_folder '{}' bootstrap: search(UID 1:*)={}ms ({} UIDs)",
+        folder_name, search_ms, uids.len());
 
     // Seed `lowest_scanned` at the watermark so a no-op walk never claims to
     // have scanned below it; the walk lowers it to the oldest UID it touches,
@@ -6335,6 +6397,11 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
     let mut scanned: usize = 0;
     let mut lowest_scanned: u32 = floor_init;
     let mut oldest_scanned: Option<chrono::DateTime<chrono::Utc>> = None;
+    // IMAP body-download time vs in-process parse time, summed across batches
+    // (see uid_sync_folder). Drives the [RUST-PERF] line so a slow backward
+    // walk can be pinned on the network or the CPU.
+    let mut fetch_ms: u128 = 0;
+    let mut parse_ms: u128 = 0;
 
     // Cap each UID FETCH line at ~500 UIDs to stay under Gmail's ~8KB IMAP line
     // limit. `take` can be large on bootstrap (a deep count target), so split
@@ -6345,7 +6412,10 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
     {
         for chunk in uids_sorted[start..end].chunks(FETCH_BATCH) {
             let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            let t_fetch = std::time::Instant::now();
             let msgs = session.uid_fetch(&uid_list, "(UID FLAGS INTERNALDATE BODY.PEEK[])")?;
+            fetch_ms += t_fetch.elapsed().as_millis();
+            let t_parse = std::time::Instant::now();
             for msg in msgs.iter() {
                 if let Some(uid) = msg.uid {
                     if uid < lowest_scanned { lowest_scanned = uid; }
@@ -6363,11 +6433,14 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
                     }
                 }
             }
+            parse_ms += t_parse.elapsed().as_millis();
         }
         scanned += end - start;
     }
 
     let hit_bottom = scanned >= uids_sorted.len();
+    debug_log!("[RUST-PERF] walk_back_collecting: fetch={}ms, parse={}ms ({} scanned, {} match)",
+        fetch_ms, parse_ms, scanned, emails.len());
     Ok(CountWalk { emails, lowest_scanned, scanned, hit_bottom, oldest_scanned })
 }
 
@@ -6483,11 +6556,14 @@ fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
     // entire history (`UID 1:floor-1`), which on a large INBOX returns 100k+
     // UIDs every scroll just to scan the newest `scan_window`. The window
     // expands until it holds at least `scan_window` existing UIDs or reaches UID 1.
+    let t_window = std::time::Instant::now();
     let (uids, window_reached_bottom) = search_uid_window_below(session, floor_uid, scan_window)?;
     debug_log!(
         "[RUST] fetch_older_in_folder: '{}' windowed search below {} -> {} candidate UID(s), reached_bottom={}",
         folder_name, floor_uid, uids.len(), window_reached_bottom
     );
+    debug_log!("[RUST-PERF] fetch_older_in_folder '{}': window_search={}ms ({} candidates, floor {})",
+        folder_name, t_window.elapsed().as_millis(), uids.len(), floor_uid);
     if uids.is_empty() {
         // The window walked all the way to UID 1 with nothing below the floor —
         // true bottom. Floor moves to 1 so subsequent calls short-circuit.

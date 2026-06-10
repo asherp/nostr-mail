@@ -269,8 +269,7 @@ NostrMailApp.prototype.loadSettings = async function() {
                         use_tls: dbSettings.use_tls === 'true',
                         email_filter: dbSettings.email_filter || 'nostr',
                         send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                        sync_initial_count: parseInt(dbSettings.sync_initial_count) || 50, // Messages to load per folder
-                        sync_max_scan: parseInt(dbSettings.sync_max_scan) || 2000, // Raw-message scan cap for sparse folders
+                        sync_initial_count: parseInt(dbSettings.sync_initial_count) || 50, // Messages scanned per folder
                         emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                         inbox_folder: dbSettings.inbox_folder || '',
                         require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
@@ -331,7 +330,6 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
         email_filter: 'nostr',
         send_matching_dm: true,
         sync_initial_count: 50,
-        sync_max_scan: 2000,
         emails_per_page: 50,
         inbox_folder: '',
         require_signature: true,
@@ -383,8 +381,7 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         use_tls: true,
         email_filter: 'nostr',
         send_matching_dm: true,
-        sync_initial_count: 50, // Messages to load per folder (matching loadSettingsForPubkey)
-        sync_max_scan: 2000, // Raw-message scan cap for sparse folders
+        sync_initial_count: 50, // Messages scanned per folder (matching loadSettingsForPubkey)
         emails_per_page: 50,
         inbox_folder: '',
         require_signature: true,
@@ -449,8 +446,7 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 use_tls: dbSettings.use_tls === 'true',
                 email_filter: dbSettings.email_filter || 'nostr',
                 send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                sync_initial_count: parseInt(dbSettings.sync_initial_count) || 50, // Messages to load per folder
-                sync_max_scan: parseInt(dbSettings.sync_max_scan) || 2000, // Raw-message scan cap for sparse folders
+                sync_initial_count: parseInt(dbSettings.sync_initial_count) || 50, // Messages scanned per folder
                 emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                 inbox_folder: dbSettings.inbox_folder || '',
                 require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
@@ -3116,7 +3112,6 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 email_filter: (loadedSettings && loadedSettings.email_filter) ? loadedSettings.email_filter : (domManager.getValue('emailFilterPreference') || 'nostr'),
                 send_matching_dm: (loadedSettings && loadedSettings.send_matching_dm !== undefined) ? loadedSettings.send_matching_dm : (domManager.get('send-matching-dm-preference')?.checked !== false),
                 sync_initial_count: (loadedSettings && loadedSettings.sync_initial_count) ? loadedSettings.sync_initial_count : (parseInt(domManager.getValue('syncInitialCount')) || 50),
-                sync_max_scan: (loadedSettings && loadedSettings.sync_max_scan) ? loadedSettings.sync_max_scan : (parseInt(domManager.getValue('syncMaxScan')) || 2000),
                 emails_per_page: (loadedSettings && loadedSettings.emails_per_page) ? loadedSettings.emails_per_page : (parseInt(domManager.getValue('emailsPerPage')) || 50),
                 inbox_folder: (loadedSettings && loadedSettings.inbox_folder !== undefined) ? loadedSettings.inbox_folder : readInboxFolderSelection(),
                 require_signature: (loadedSettings && loadedSettings.require_signature !== undefined) ? loadedSettings.require_signature : (domManager.get('require-signature-preference')?.checked !== false),
@@ -3158,8 +3153,7 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 use_tls: domManager.get('use-tls')?.checked || false,
                 email_filter: domManager.getValue('emailFilterPreference') || 'nostr',
                 send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false, // Default to true
-                sync_initial_count: parseInt(domManager.getValue('syncInitialCount')) || 50, // Messages to load per folder
-                sync_max_scan: parseInt(domManager.getValue('syncMaxScan')) || 2000, // Raw-message scan cap for sparse folders
+                sync_initial_count: parseInt(domManager.getValue('syncInitialCount')) || 50, // Messages scanned per folder
                 emails_per_page: parseInt(domManager.getValue('emailsPerPage')) || 50, // Default to 50
                 inbox_folder: readInboxFolderSelection(),
                 require_signature: domManager.get('require-signature-preference')?.checked !== false, // Default to true
@@ -3208,7 +3202,6 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('email_filter', settings.email_filter);
             settingsMap.set('send_matching_dm', settings.send_matching_dm.toString());
             settingsMap.set('sync_initial_count', settings.sync_initial_count.toString());
-            settingsMap.set('sync_max_scan', settings.sync_max_scan.toString());
             settingsMap.set('emails_per_page', settings.emails_per_page.toString());
             settingsMap.set('inbox_folder', settings.inbox_folder || '');
             settingsMap.set('require_signature', settings.require_signature.toString());
@@ -3328,7 +3321,6 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'include-sig-header-preference',
         'include-recipient-header-preference',
         'syncInitialCount',
-        'syncMaxScan',
         'emailsPerPage',
         'inboxFolderPreference',
         'glossiaEncodingBody',
@@ -3597,7 +3589,6 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.get('use-tls').checked = settings.use_tls || false;
         domManager.setValue('emailFilterPreference', settings.email_filter || 'nostr');
         domManager.setValue('syncInitialCount', settings.sync_initial_count || 50);
-        domManager.setValue('syncMaxScan', settings.sync_max_scan || 2000);
         domManager.setValue('emailsPerPage', settings.emails_per_page || 50);
         // Inbox folders: the <option> list is per-account (driven by the
         // active user's IMAP server). Seed Tom Select with the persisted

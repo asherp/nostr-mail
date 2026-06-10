@@ -1505,7 +1505,7 @@ impl Database {
                     subject_hash = COALESCE(?, subject_hash),
                     signature_valid = COALESCE(?, signature_valid),
                     signature_source = COALESCE(?, signature_source),
-                    transport_auth_verified = ?,
+                    transport_auth_verified = COALESCE(?, transport_auth_verified),
                     in_reply_to = ?, references_ = ?, thread_id = ?
                 WHERE id = ?",
                 params![

@@ -3029,15 +3029,18 @@ class EmailService {
             // rather than declaring the server empty.
             const newCount = result?.new_count ?? 0;
             const hitBottom = result?.hit_bottom === true;
-            console.log(`[JS] Infinite scroll: fetch_older_inbox_emails newCount=${newCount}, hitBottom=${hitBottom}`);
+            const oldest = this._formatScanDate(result?.oldest_scanned);
+            console.log(`[JS] Infinite scroll: fetch_older_inbox_emails newCount=${newCount}, hitBottom=${hitBottom}, oldest=${result?.oldest_scanned ?? 'n/a'}`);
             if (newCount > 0) {
                 this.inboxHasMoreInDb = true;
                 this.inboxServerFetchTried = false;
                 await this.loadEmails('', true);
             } else if (hitBottom) {
-                this._setListStatus('email-list', 'No older emails on server');
+                const back = oldest ? ` (oldest ${oldest})` : '';
+                this._setListStatus('email-list', `No older emails on server${back}`);
             } else {
-                this._setListStatus('email-list', 'No nostr matches in this batch — scroll for more');
+                const back = oldest ? ` back to ${oldest}` : ' in this batch';
+                this._setListStatus('email-list', `No nostr matches${back} — scroll for more`);
                 this.inboxServerFetchTried = false;
             }
         } catch (e) {
@@ -3053,21 +3056,38 @@ class EmailService {
             const result = await TauriService.fetchOlderSentEmails(pageSize);
             const newCount = result?.new_count ?? 0;
             const hitBottom = result?.hit_bottom === true;
-            console.log(`[JS] Infinite scroll: fetch_older_sent_emails newCount=${newCount}, hitBottom=${hitBottom}`);
+            const oldest = this._formatScanDate(result?.oldest_scanned);
+            console.log(`[JS] Infinite scroll: fetch_older_sent_emails newCount=${newCount}, hitBottom=${hitBottom}, oldest=${result?.oldest_scanned ?? 'n/a'}`);
             if (newCount > 0) {
                 this.sentHasMoreInDb = true;
                 this.sentServerFetchTried = false;
                 await this.loadSentEmails('', true);
             } else if (hitBottom) {
-                this._setListStatus('sent-list', 'No older emails on server');
+                const back = oldest ? ` (oldest ${oldest})` : '';
+                this._setListStatus('sent-list', `No older emails on server${back}`);
             } else {
-                this._setListStatus('sent-list', 'No nostr matches in this batch — scroll for more');
+                const back = oldest ? ` back to ${oldest}` : ' in this batch';
+                this._setListStatus('sent-list', `No nostr matches${back} — scroll for more`);
                 this.sentServerFetchTried = false;
             }
         } catch (e) {
             console.error('[JS] Infinite scroll sent server fetch failed:', e);
             this._setListStatus('sent-list', 'Failed to fetch older emails');
         }
+    }
+
+    // Format a backend `oldest_scanned` value (RFC3339 string from the server's
+    // INTERNALDATE, or null) as a local YYYY-MM-DD date for the scroll status.
+    // Tells the user how far back a "no matches in this batch" scan reached.
+    // Returns '' when the input is missing or unparseable.
+    _formatScanDate(isoString) {
+        if (!isoString) return '';
+        const d = new Date(isoString);
+        if (isNaN(d.getTime())) return '';
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}`;
     }
 
     _setListStatus(listId, htmlMessage) {

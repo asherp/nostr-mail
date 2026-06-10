@@ -352,6 +352,40 @@ Since email clients strip `<style>` tags and external stylesheets, all styling M
    - For NIP-44: signature verification is recommended but not required (NIP-44 provides its own authentication via HMAC)
 8. **Decrypt** if encrypted, using recipient's private key and sender's pubkey
 
-## 9. Versioning
+## 9. Spam Rescue & Folder Handling
+
+Providers routinely misclassify Nostr-encrypted mail as spam (opaque bodies, armor blocks). Spam rescue is a client behavior that recovers it. Spam/junk/bulk folders are **never** part of the inbox folder selection; how their contents are handled is decided per sync by the `spam_rescue` setting (default ON):
+
+| `spam_rescue` | Spam folders scanned? | Behavior |
+|---------------|-----------------------|----------|
+| **ON** | No | Authenticated Nostr mail is **moved** out of spam into the rescue target folder (default `nostr-mail`), which is part of the synced set, so it surfaces in the inbox. Spam stays out of the inbox's read-state (`\Seen`) bookkeeping. |
+| **OFF** | Yes | Spam folders are scanned so misfiled Nostr mail still **appears** in the inbox, but nothing is moved — it stays in spam and is eventually auto-purged by the provider. |
+
+### 9.1 Rescue eligibility (stateless)
+
+A message in a spam folder is rescued **⟺** it is `UNSEEN` **AND** is authenticated Nostr mail — it carries a Nostr marker (`X-Nostr-Pubkey`/`X-Nostr-Sig` header, or a `BEGIN NOSTR …` armor block) **and** passes transport authentication (SPF/DKIM/alignment). Transport-failing mail is left in spam, matching the inbox's existing enforcement.
+
+The rescue decision is derived entirely from server state on every sync, so all devices compute the same answer. There is **no rescue-once ledger.**
+
+### 9.2 `\Seen` as the "leave it in spam" signal
+
+Intent is carried by the `\Seen` flag, which the IMAP server replicates to every client. The `UNSEEN` guard means a message the user has read **and deliberately filed into spam** is left alone. This is trustworthy because nothing automated ever sets `\Seen` on spam mail:
+
+- All IMAP fetches use `BODY.PEEK[]`, so reading a body never sets `\Seen`.
+- Read-state sync (`mark_inbox_email_seen_on_server`) only sets `\Seen` in non-spam inbox folders.
+- The **only** code path that sets `\Seen` within a spam folder is a deliberate move-to-spam (`move_message_to_folder`), which marks the message `\Seen` *before* moving it.
+
+### 9.3 On-enable catch-up
+
+When the user first switches spam rescue ON, a one-time catch-up (`rescue_spam_now`) runs the rescue with the `UNSEEN` guard **dropped**, so already-read Nostr mail sitting in spam — which the per-sync rescue intentionally skips — is swept out too. The user is told how many messages were moved.
+
+### 9.4 Future work: a first-class "mark as spam" action
+
+There is currently **no dedicated "mark as spam" UI.** A message can only reach a spam folder via the generic *Move to folder* picker, which already routes through `move_message_to_folder` and therefore sets `\Seen` on a spam target. When a dedicated mark-as-spam action is added:
+
+- Route it through the same `move_message_to_folder` → spam-folder path so it sets `\Seen`; the per-sync rescue (§9.2) will then automatically respect it as a "leave it" signal with no further changes.
+- Reconsider the on-enable catch-up (§9.3): with a real spam-filing action, the catch-up's `unseen_only = false` would *undo* a deliberate spam-filing. At that point the catch-up should likely honor `\Seen` (keep `unseen_only = true`) so it only sweeps provider-misclassified mail, not user-filed spam.
+
+## 10. Versioning
 
 This specification may be extended with additional block types in future versions. Decoders SHOULD ignore unrecognized block types rather than failing.

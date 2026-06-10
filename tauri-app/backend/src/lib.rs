@@ -6,6 +6,8 @@
 
 pub mod crypto;
 pub mod email;
+pub mod imap_pool;
+pub mod imap_idle;
 mod nostr;
 pub mod types;
 pub mod state;
@@ -19,7 +21,7 @@ use types::*;
 pub use state::{AppState, Relay};
 pub use types::{KeyPair, EmailConfig};
 use storage::{Storage, Contact, UserProfile, AppSettings, EmailDraft};
-use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation};
+use database::{Contact as DbContact, Email as DbEmail, DirectMessage as DbDirectMessage, DbRelay, DbConversation, DmConversationPreview};
 use crate::types::{EmailMessage, EmailThreadSummary, RelayStatus, RelayConnectionStatus};
 
 use nostr_sdk::Metadata;
@@ -36,6 +38,35 @@ use serde_json;
 use tauri::Emitter;
 use chrono::{DateTime, Utc};
 
+/// Returns true when NOSTR_MAIL_DEBUG is set in the environment. Gates sensitive
+/// diagnostic logs (decrypted content, ciphertext previews, decryption metadata)
+/// so they never fire in release builds. Resolved once and cached.
+pub fn debug_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NOSTR_MAIL_DEBUG").is_ok())
+}
+
+/// Crate-wide gated logging macro. Use for any line that could expose plaintext,
+/// ciphertext, or other sensitive material — it only prints when NOSTR_MAIL_DEBUG
+/// is set. NEVER log raw private key material, even gated. Available in other
+/// modules as `crate::debug_log!`.
+#[macro_export]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if $crate::debug_log_enabled() {
+            println!($($arg)*);
+        }
+    };
+}
+
+/// Expose the NOSTR_MAIL_DEBUG gate to the frontend so JS-side diagnostics can
+/// honor the same env var as the backend `debug_log!` macro. Returns whether
+/// gated logging is enabled; carries no sensitive data.
+#[tauri::command]
+fn get_debug_log_enabled() -> bool {
+    debug_log_enabled()
+}
+
 /// Resolve a private key: prefer an explicit key if provided, fall back to AppState.
 fn resolve_private_key(explicit: Option<String>, state: &AppState) -> Result<String, String> {
     if let Some(key) = explicit.filter(|k| !k.is_empty()) {
@@ -44,11 +75,43 @@ fn resolve_private_key(explicit: Option<String>, state: &AppState) -> Result<Str
     state.get_active_private_key()
 }
 
+/// Decrypt the IMAP/SMTP password stored in settings.
+///
+/// The password is encrypted-at-rest with the active account's private key (see
+/// `db_save_settings_batch`); the raw `db.get_all_settings()` returns ciphertext.
+/// Frontend-supplied `EmailConfig`s already carry the decrypted password (the UI
+/// gets it via `db_get_all_settings`, which decrypts), but any backend path that
+/// builds an `EmailConfig` directly from the DB must decrypt it here first — else
+/// IMAP login is attempted with ciphertext and fails with "Invalid credentials".
+/// Falls back to the stored value when no key is available or decryption fails,
+/// matching `db_get_all_settings`' backward-compatibility with plaintext records.
+fn decrypt_setting_password(encrypted: &str, state: &AppState) -> String {
+    if encrypted.is_empty() {
+        return String::new();
+    }
+    match state.get_active_private_key() {
+        Ok(priv_key) => crypto::decrypt_setting_value(&priv_key, encrypted)
+            .unwrap_or_else(|_| encrypted.to_string()),
+        Err(_) => encrypted.to_string(),
+    }
+}
+
 /// The active user's pubkey in bech32 (npub) form, if any. Used as the
 /// direction anchor for DM↔email pubkey backfill.
 fn active_user_npub(state: &AppState) -> Option<String> {
     state.get_current_keys()
         .and_then(|k| k.public_key().to_bech32().ok())
+}
+
+/// Read the active account's "Require Signatures" setting (defaults to true).
+/// Threaded into the decrypt pipeline so NIP-04 signature enforcement honors the
+/// user's choice instead of rejecting unverified mail unconditionally. Keyed by
+/// the same npub the inbox-sync filter uses (see email::lookup_require_signature).
+fn active_require_signature(state: &AppState) -> bool {
+    match (active_user_npub(state), state.get_database().ok()) {
+        (Some(pk), Some(db)) => email::lookup_require_signature(&db, &pk),
+        _ => true,
+    }
 }
 
 /// Best-effort: after saving a DM, fill in any matching email row's NULL
@@ -440,7 +503,7 @@ fn map_db_email_to_email_message(email: &DbEmail) -> EmailMessage {
     }
 }
 
-fn map_email_thread_to_summary(email: &DbEmail, message_count: i64, unread_count: i64) -> EmailThreadSummary {
+fn map_email_thread_to_summary(email: &DbEmail, message_count: i64, unread_count: i64, attachment_count: i64) -> EmailThreadSummary {
     let raw_headers = email.raw_headers.clone().unwrap_or_default();
     EmailThreadSummary {
         id: email.id.map(|id| id.to_string()).unwrap_or_else(|| email.message_id.clone()),
@@ -462,6 +525,7 @@ fn map_email_thread_to_summary(email: &DbEmail, message_count: i64, unread_count
         thread_id: email.thread_id.clone().unwrap_or_else(|| email.message_id.clone()),
         message_count,
         unread_count,
+        attachment_count,
     }
 }
 
@@ -1047,7 +1111,8 @@ fn generate_keypair() -> Result<KeyPair, String> {
 
 #[tauri::command]
 fn validate_private_key(private_key: String) -> Result<bool, String> {
-    println!("[RUST] validate_private_key called with: {}...", &private_key[..10.min(private_key.len())]);
+    // Never log private key material, even a prefix — on Android this lands in logcat.
+    println!("[RUST] validate_private_key called");
     crypto::validate_private_key(&private_key).map_err(|e| e.to_string())
 }
 
@@ -1148,6 +1213,10 @@ fn keychain_list_accounts(state: tauri::State<AppState>) -> Result<Vec<AccountIn
 #[tauri::command]
 fn keychain_set_active_account(public_key: String, state: tauri::State<AppState>) -> Result<(), String> {
     println!("[RUST] keychain_set_active_account called for: {}...", &public_key[..20.min(public_key.len())]);
+    // Switching the active account: tear down the previous account's IMAP IDLE
+    // watcher and pooled connections so nothing credential-bound to the old
+    // user is reused. The frontend restarts IDLE for the new account.
+    state.stop_idle_watcher();
     let private_key = state.keychain.get_key(&public_key)?
         .ok_or_else(|| format!("No key found in keychain for {}", &public_key[..20.min(public_key.len())]))?;
     let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
@@ -1174,6 +1243,8 @@ fn keychain_get_private_key(public_key: String, state: tauri::State<AppState>) -
 #[tauri::command]
 fn keychain_clear_all(state: tauri::State<AppState>) -> Result<(), String> {
     println!("[RUST] keychain_clear_all called");
+    // Logout: stop the IDLE watcher and drop all pooled IMAP connections.
+    state.stop_idle_watcher();
     state.keychain.clear_all()?;
     *state.current_private_key.lock().unwrap() = None;
     *state.current_keys.lock().unwrap() = None;
@@ -2568,6 +2639,28 @@ fn update_contact_picture_data_url(pubkey: String, picture_data_url: String) -> 
 }
 
 
+/// Start the background IMAP IDLE watcher for the active account. Replaces any
+/// previously running watcher (and clears the pool) so only the active account
+/// is ever watched. Emits `imap-new-mail` events when the INBOX changes.
+#[tauri::command]
+fn start_imap_idle(email_config: EmailConfig, app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] start_imap_idle called for: {}@{}:{}",
+        email_config.email_address, email_config.imap_host, email_config.imap_port);
+    // Stop any prior watcher + clear pooled connections before starting fresh.
+    state.stop_idle_watcher();
+    let handle = imap_idle::start(app, &email_config);
+    state.set_idle_watcher(handle);
+    Ok(())
+}
+
+/// Stop the background IMAP IDLE watcher and drop pooled connections.
+#[tauri::command]
+fn stop_imap_idle(state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] stop_imap_idle called");
+    state.stop_idle_watcher();
+    Ok(())
+}
+
 #[tauri::command]
 async fn test_imap_connection(email_config: EmailConfig) -> Result<(), String> {
     println!("[RUST] test_imap_connection called for: {}@{}:{}", 
@@ -2590,6 +2683,20 @@ async fn list_imap_folders(email_config: EmailConfig) -> Result<Vec<String>, Str
             println!("[RUST] list_imap_folders failed: {}", e);
             e.to_string()
         })
+}
+
+/// Find the IMAP folder a message currently lives in, searching `candidate_folders`
+/// in order and returning the first match (or None). Used by the move picker so the
+/// "(current)" label reflects the server, not a local guess.
+#[tauri::command]
+async fn find_message_folder(
+    email_config: EmailConfig,
+    message_id: String,
+    candidate_folders: Vec<String>,
+) -> Result<Option<String>, String> {
+    email::find_message_folder(&email_config, &message_id, candidate_folders)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2616,7 +2723,8 @@ async fn check_message_confirmation(event_id: String, relays: Vec<String>) -> Re
 
 #[tauri::command]
 fn generate_qr_code(data: String, _size: Option<u32>) -> Result<String, String> {
-    println!("[RUST] generate_qr_code called with data: '{}', length: {}", data, data.len());
+    // Never log the data: it may be an nsec (private-key QR export). Length only.
+    println!("[RUST] generate_qr_code called, data length: {}", data.len());
     let qr = match qrcode::QrCode::new(data.as_bytes()) {
         Ok(qr) => qr,
         Err(e) => {
@@ -2948,7 +3056,7 @@ async fn db_search_emails(
                             }
                             Err(e) => {
                                 println!("[RUST] Failed to parse decrypted body as JSON: {}", e);
-                                println!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
+                                crate::debug_log!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
                             }
                         }
                     }
@@ -3105,29 +3213,26 @@ fn db_get_sent_emails(limit: Option<i64>, offset: Option<i64>, user_email: Optio
 fn db_get_email_threads(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailThreadSummary>, String> {
     let db = state.get_database()?;
     let threads = db.get_email_threads(limit, offset, nostr_only, user_email.as_deref(), user_pubkey.as_deref()).map_err(|e| e.to_string())?;
-    let mapped: Vec<EmailThreadSummary> = threads.iter().map(|(email, count, unread)| {
-        map_email_thread_to_summary(email, *count, *unread)
+    let mapped: Vec<EmailThreadSummary> = threads.iter().map(|(email, count, unread, attachments)| {
+        map_email_thread_to_summary(email, *count, *unread, *attachments)
     }).collect();
     Ok(mapped)
 }
 
 #[tauri::command]
 fn db_get_sent_email_threads(limit: Option<i64>, offset: Option<i64>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailThreadSummary>, String> {
+    // user_pubkey is intentionally ignored. The previous post-filter on
+    // sender_pubkey ran AFTER the SQL LIMIT, so any thread whose rep didn't
+    // match the active pubkey shortened the returned page — which the
+    // frontend interprets via `emails.length === pageSize` as "DB exhausted"
+    // and stops paginating. get_sent_email_threads now selects the rep to
+    // be the user's own sent message (Gmail-normalized from_address match),
+    // making this filter both redundant and broken.
+    let _ = user_pubkey;
     let db = state.get_database()?;
     let threads = db.get_sent_email_threads(limit, offset, user_email.as_deref()).map_err(|e| e.to_string())?;
-    // Filter by sender_pubkey if user_pubkey is provided (same as db_get_sent_emails)
-    let filtered: Vec<_> = if let Some(ref upk) = user_pubkey {
-        threads.into_iter().filter(|(e, _, _)| {
-            match &e.sender_pubkey {
-                Some(spk) => spk == upk,
-                None => true,
-            }
-        }).collect()
-    } else {
-        threads
-    };
-    let mapped: Vec<EmailThreadSummary> = filtered.iter().map(|(email, count, unread)| {
-        map_email_thread_to_summary(email, *count, *unread)
+    let mapped: Vec<EmailThreadSummary> = threads.iter().map(|(email, count, unread, attachments)| {
+        map_email_thread_to_summary(email, *count, *unread, *attachments)
     }).collect();
     Ok(mapped)
 }
@@ -3312,7 +3417,7 @@ async fn db_search_sent_emails(
                             }
                             Err(e) => {
                                 println!("[RUST] Failed to parse decrypted body as JSON: {}", e);
-                                println!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
+                                crate::debug_log!("[RUST] Decrypted body (first 500 chars): {}", &decrypted_body.chars().take(500).collect::<String>());
                             }
                         }
                     }
@@ -3367,11 +3472,11 @@ async fn db_search_sent_emails(
         
         let matches = from_matches || to_matches || subject_matches || body_matches || attachment_matches;
         
-        // Always log search details for debugging
-        println!("[RUST] Sent email {} search for '{}': from={}, to={}, subject={}, body={}, attachments={}, is_manifest={}", 
+        // Search details — gated behind NOSTR_MAIL_DEBUG since they expose decrypted plaintext.
+        crate::debug_log!("[RUST] Sent email {} search for '{}': from={}, to={}, subject={}, body={}, attachments={}, is_manifest={}",
             email.id.unwrap_or(0), search_query, from_matches, to_matches, subject_matches, body_matches, attachment_matches, is_manifest);
-        println!("[RUST] Decrypted subject: {}", decrypted_subject.chars().take(100).collect::<String>());
-        println!("[RUST] Decrypted body (first 200 chars): {}", searchable_body.chars().take(200).collect::<String>());
+        crate::debug_log!("[RUST] Decrypted subject: {}", decrypted_subject.chars().take(100).collect::<String>());
+        crate::debug_log!("[RUST] Decrypted body (first 200 chars): {}", searchable_body.chars().take(200).collect::<String>());
         
             if matches {
                 // Skip results until we reach the offset
@@ -3436,6 +3541,44 @@ fn db_get_dms_for_conversation(user_pubkey: String, contact_pubkey: String, stat
     println!("[RUST] db_get_dms_for_conversation called");
     let db = state.get_database()?;
     db.get_dms_for_conversation(&user_pubkey, &contact_pubkey).map_err(|e| e.to_string())
+}
+
+/// Paginated conversation fetch. Returns at most `limit` messages, oldest→newest.
+/// When `before_created_at` + `before_id` are both supplied they form the cursor
+/// (the oldest message the caller already holds); only older messages are returned.
+#[tauri::command]
+fn db_get_dms_for_conversation_page(
+    user_pubkey: String,
+    contact_pubkey: String,
+    limit: i64,
+    before_created_at: Option<DateTime<Utc>>,
+    before_id: Option<i64>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<DbDirectMessage>, String> {
+    let db = state.get_database()?;
+    let before = match (before_created_at, before_id) {
+        (Some(ts), Some(id)) => Some((ts, id)),
+        _ => None,
+    };
+    db.get_dms_for_conversation_page(&user_pubkey, &contact_pubkey, limit, before)
+        .map_err(|e| e.to_string())
+}
+
+/// One-row-per-contact previews (latest still-encrypted message + count) for the
+/// DM contact list. Avoids fetching+decrypting whole conversations just to render
+/// the list.
+#[tauri::command]
+fn db_get_dm_conversation_previews(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<DmConversationPreview>, String> {
+    let db = state.get_database()?;
+    db.get_dm_conversation_previews(&user_pubkey).map_err(|e| e.to_string())
+}
+
+/// Contacts whose conversation contains at least one email-matched DM, for the
+/// envelope indicator in the contact list.
+#[tauri::command]
+fn db_get_dm_pubkeys_with_email_match(user_pubkey: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.get_database()?;
+    db.get_dm_pubkeys_with_email_match(&user_pubkey).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3621,54 +3764,403 @@ fn db_delete_attachment(attachment_id: i64, state: tauri::State<AppState>) -> Re
     db.delete_attachment(attachment_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn save_attachment_to_disk(filename: String, data: String, _mime_type: String) -> Result<String, String> {
-    println!("[RUST] save_attachment_to_disk called for filename: {}", filename);
-    
-    use base64::{Engine as _, engine::general_purpose};
-    
-    // Get user's Downloads directory
+/// Android file saving.
+///
+/// The `dirs` crate has no Android implementation — `dirs::download_dir()`
+/// returns `None` in the Tauri Android process, so the desktop "write to the
+/// Downloads folder" path simply fails. Modern Android (scoped storage, API
+/// 29+) also forbids writing to the public Downloads folder by a raw path.
+///
+/// Instead we write the bytes to the app's private cache dir (always writable,
+/// no permission required) and hand the file to Android's share/save chooser
+/// via a FileProvider content URI. The user picks the destination (Downloads,
+/// Drive, another app). This reuses the same JNI-dispatch pattern as
+/// `keychain.rs` (`tauri::wry::prelude::dispatch` + `find_class`).
+#[cfg(target_os = "android")]
+mod android_share {
+    use jni::objects::{JObject, JString, JValue};
+    use jni::JNIEnv;
+    use std::sync::mpsc;
+
+    /// If a Java exception is pending, dump it to logcat and clear it so the
+    /// next JNI call doesn't immediately fail.
+    fn drain_exception(env: &mut JNIEnv) {
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_describe();
+            let _ = env.exception_clear();
+        }
+    }
+
+    /// `ContentValues.put(key, value)` for String values.
+    fn put_str(env: &mut JNIEnv, values: &JObject, key: &str, val: &str) -> Result<(), String> {
+        let k = env.new_string(key).map_err(|e| e.to_string())?;
+        let v = env.new_string(val).map_err(|e| e.to_string())?;
+        env.call_method(
+            values,
+            "put",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(&k), JValue::Object(&v)],
+        )
+        .map_err(|e| { drain_exception(env); format!("ContentValues.put({}): {}", key, e) })?;
+        Ok(())
+    }
+
+    /// Fetch the app cache directory and package name from the Activity context.
+    fn cache_dir_and_pkg() -> Result<(String, String), String> {
+        let (tx, rx) = mpsc::channel::<Result<(String, String), String>>();
+        tauri::wry::prelude::dispatch(move |env, activity, _webview| {
+            let result = (|| -> Result<(String, String), String> {
+                let cache = env
+                    .call_method(activity, "getCacheDir", "()Ljava/io/File;", &[])
+                    .and_then(|v| v.l())
+                    .map_err(|e| { drain_exception(env); format!("getCacheDir failed: {}", e) })?;
+                let path_obj = env
+                    .call_method(&cache, "getAbsolutePath", "()Ljava/lang/String;", &[])
+                    .and_then(|v| v.l())
+                    .map_err(|e| format!("getAbsolutePath failed: {}", e))?;
+                let jpath: JString = path_obj.into();
+                let path: String = env
+                    .get_string(&jpath)
+                    .map_err(|e| format!("read cache path: {}", e))?
+                    .into();
+                let pkg_obj = env
+                    .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])
+                    .and_then(|v| v.l())
+                    .map_err(|e| format!("getPackageName failed: {}", e))?;
+                let jpkg: JString = pkg_obj.into();
+                let pkg: String = env
+                    .get_string(&jpkg)
+                    .map_err(|e| format!("read package name: {}", e))?
+                    .into();
+                Ok((path, pkg))
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .map_err(|e| format!("cache_dir dispatch channel closed: {}", e))?
+    }
+
+    /// Build an ACTION_SEND chooser for `path` and launch it.
+    fn launch_chooser(path: String, pkg: String, mime: String) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        tauri::wry::prelude::dispatch(move |env, activity, _webview| {
+            let result = (|| -> Result<(), String> {
+                // File file = new File(path)
+                let jpath = env.new_string(&path).map_err(|e| e.to_string())?;
+                let file = env
+                    .new_object("java/io/File", "(Ljava/lang/String;)V", &[JValue::Object(&jpath)])
+                    .map_err(|e| { drain_exception(env); format!("new File failed: {}", e) })?;
+
+                // Uri uri = FileProvider.getUriForFile(activity, "<pkg>.fileprovider", file)
+                // FileProvider is an androidx (app) class, so resolve it through the
+                // activity classloader rather than env.find_class.
+                let authority = format!("{}.fileprovider", pkg);
+                let jauth = env.new_string(&authority).map_err(|e| e.to_string())?;
+                let fp_class = tauri::wry::prelude::find_class(
+                    env,
+                    activity,
+                    "androidx.core.content.FileProvider".to_string(),
+                )
+                .map_err(|e| { drain_exception(env); format!("find FileProvider failed: {}", e) })?;
+                let uri = env
+                    .call_static_method(
+                        &fp_class,
+                        "getUriForFile",
+                        "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;",
+                        &[JValue::Object(activity), JValue::Object(&jauth), JValue::Object(&file)],
+                    )
+                    .and_then(|v| v.l())
+                    .map_err(|e| { drain_exception(env); format!("getUriForFile failed: {}", e) })?;
+
+                // Intent intent = new Intent(Intent.ACTION_SEND)
+                let action = env
+                    .new_string("android.intent.action.SEND")
+                    .map_err(|e| e.to_string())?;
+                let intent = env
+                    .new_object("android/content/Intent", "(Ljava/lang/String;)V", &[JValue::Object(&action)])
+                    .map_err(|e| format!("new Intent failed: {}", e))?;
+
+                // intent.setType(mime)
+                let jmime = env.new_string(&mime).map_err(|e| e.to_string())?;
+                env.call_method(&intent, "setType", "(Ljava/lang/String;)Landroid/content/Intent;", &[JValue::Object(&jmime)])
+                    .map_err(|e| format!("setType failed: {}", e))?;
+
+                // intent.putExtra(Intent.EXTRA_STREAM, uri)
+                let extra = env
+                    .new_string("android.intent.extra.STREAM")
+                    .map_err(|e| e.to_string())?;
+                env.call_method(
+                    &intent,
+                    "putExtra",
+                    "(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;",
+                    &[JValue::Object(&extra), JValue::Object(&uri)],
+                )
+                .map_err(|e| format!("putExtra failed: {}", e))?;
+
+                // intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(1)])
+                    .map_err(|e| format!("addFlags failed: {}", e))?;
+
+                // Intent chooser = Intent.createChooser(intent, "Save attachment")
+                let title = env.new_string("Save attachment").map_err(|e| e.to_string())?;
+                let chooser = env
+                    .call_static_method(
+                        "android/content/Intent",
+                        "createChooser",
+                        "(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;",
+                        &[JValue::Object(&intent), JValue::Object(&title)],
+                    )
+                    .and_then(|v| v.l())
+                    .map_err(|e| format!("createChooser failed: {}", e))?;
+
+                // chooser.addFlags(FLAG_ACTIVITY_NEW_TASK)
+                env.call_method(&chooser, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(0x1000_0000)])
+                    .map_err(|e| format!("chooser addFlags failed: {}", e))?;
+
+                // activity.startActivity(chooser)
+                env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&chooser)])
+                    .map_err(|e| { drain_exception(env); format!("startActivity failed: {}", e) })?;
+                Ok(())
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .map_err(|e| format!("chooser dispatch channel closed: {}", e))?
+    }
+
+    /// Write `bytes` to a private cache file and present Android's share/save
+    /// chooser so the user can store it wherever they like.
+    pub fn share_bytes(filename: &str, mime: &str, bytes: &[u8]) -> Result<(), String> {
+        let (cache, pkg) = cache_dir_and_pkg()?;
+
+        // Keep a flat filename inside a dedicated cache subdir (covered by the
+        // FileProvider <cache-path> entry in file_paths.xml).
+        let safe = filename.rsplit('/').next().unwrap_or(filename);
+        let safe = if safe.is_empty() { "attachment" } else { safe };
+        let dir = std::path::Path::new(&cache).join("shared_attachments");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create cache dir: {}", e))?;
+        let path = dir.join(safe);
+        std::fs::write(&path, bytes).map_err(|e| format!("write cache file: {}", e))?;
+
+        let mime = if mime.is_empty() { "application/octet-stream" } else { mime };
+        launch_chooser(path.to_string_lossy().to_string(), pkg, mime.to_string())
+    }
+
+    /// Save `bytes` straight into the device's public Downloads folder.
+    ///
+    /// On API 29+ this uses MediaStore (no permission required; the file shows
+    /// up in the Downloads app / Files). On older devices (24–28) where
+    /// `MediaStore.Downloads` doesn't exist, it falls back to the app's external
+    /// files `Download/` dir, which is always writable without a permission and
+    /// is reachable through file managers.
+    pub fn save_to_downloads(filename: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
+        let filename = {
+            let f = filename.rsplit('/').next().unwrap_or(filename);
+            if f.is_empty() { "attachment".to_string() } else { f.to_string() }
+        };
+        let mime = if mime.is_empty() { "application/octet-stream".to_string() } else { mime.to_string() };
+        let data = bytes.to_vec();
+
+        let (tx, rx) = mpsc::channel::<Result<String, String>>();
+        tauri::wry::prelude::dispatch(move |env, activity, _webview| {
+            let result = (|| -> Result<String, String> {
+                let sdk_int = env
+                    .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
+                    .and_then(|v| v.i())
+                    .map_err(|e| { drain_exception(env); format!("read SDK_INT: {}", e) })?;
+
+                // Downloads directory name (e.g. "Download").
+                let dir_obj = env
+                    .get_static_field("android/os/Environment", "DIRECTORY_DOWNLOADS", "Ljava/lang/String;")
+                    .and_then(|v| v.l())
+                    .map_err(|e| { drain_exception(env); format!("DIRECTORY_DOWNLOADS: {}", e) })?;
+
+                if sdk_int >= 29 {
+                    let dir_jstr: JString = dir_obj.into();
+                    let dir_name: String = env
+                        .get_string(&dir_jstr)
+                        .map_err(|e| format!("read DIRECTORY_DOWNLOADS: {}", e))?
+                        .into();
+
+                    // ContentValues describing the new Downloads entry.
+                    let values = env
+                        .new_object("android/content/ContentValues", "()V", &[])
+                        .map_err(|e| { drain_exception(env); format!("new ContentValues: {}", e) })?;
+                    put_str(env, &values, "_display_name", &filename)?;
+                    put_str(env, &values, "mime_type", &mime)?;
+                    put_str(env, &values, "relative_path", &dir_name)?;
+
+                    // Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+                    let collection = env
+                        .get_static_field(
+                            "android/provider/MediaStore$Downloads",
+                            "EXTERNAL_CONTENT_URI",
+                            "Landroid/net/Uri;",
+                        )
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("EXTERNAL_CONTENT_URI: {}", e) })?;
+
+                    // ContentResolver resolver = activity.getContentResolver();
+                    let resolver = env
+                        .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("getContentResolver: {}", e) })?;
+
+                    // Uri item = resolver.insert(collection, values);
+                    let item = env
+                        .call_method(
+                            &resolver,
+                            "insert",
+                            "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
+                            &[JValue::Object(&collection), JValue::Object(&values)],
+                        )
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("MediaStore insert: {}", e) })?;
+                    if item.is_null() {
+                        return Err("MediaStore insert returned null".to_string());
+                    }
+
+                    // OutputStream os = resolver.openOutputStream(item);
+                    let os = env
+                        .call_method(
+                            &resolver,
+                            "openOutputStream",
+                            "(Landroid/net/Uri;)Ljava/io/OutputStream;",
+                            &[JValue::Object(&item)],
+                        )
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("openOutputStream: {}", e) })?;
+                    if os.is_null() {
+                        return Err("openOutputStream returned null".to_string());
+                    }
+
+                    // os.write(bytes); os.flush(); os.close();
+                    let arr = env.byte_array_from_slice(&data).map_err(|e| format!("byte array: {}", e))?;
+                    env.call_method(&os, "write", "([B)V", &[JValue::Object(&arr)])
+                        .map_err(|e| { drain_exception(env); format!("OutputStream.write: {}", e) })?;
+                    let _ = env.call_method(&os, "flush", "()V", &[]);
+                    let _ = env.call_method(&os, "close", "()V", &[]);
+
+                    Ok(format!("{}/{}", dir_name, filename))
+                } else {
+                    // Pre-29: app external files Download dir (no permission needed).
+                    let ext = env
+                        .call_method(
+                            activity,
+                            "getExternalFilesDir",
+                            "(Ljava/lang/String;)Ljava/io/File;",
+                            &[JValue::Object(&dir_obj)],
+                        )
+                        .and_then(|v| v.l())
+                        .map_err(|e| { drain_exception(env); format!("getExternalFilesDir: {}", e) })?;
+                    if ext.is_null() {
+                        return Err("external files dir unavailable".to_string());
+                    }
+                    let path_obj = env
+                        .call_method(&ext, "getAbsolutePath", "()Ljava/lang/String;", &[])
+                        .and_then(|v| v.l())
+                        .map_err(|e| format!("getAbsolutePath: {}", e))?;
+                    let path_jstr: JString = path_obj.into();
+                    let dir_path: String = env
+                        .get_string(&path_jstr)
+                        .map_err(|e| format!("read external dir: {}", e))?
+                        .into();
+                    std::fs::create_dir_all(&dir_path).map_err(|e| format!("create dir: {}", e))?;
+                    let path = std::path::Path::new(&dir_path).join(&filename);
+                    std::fs::write(&path, &data).map_err(|e| format!("write file: {}", e))?;
+                    Ok(path.to_string_lossy().to_string())
+                }
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .map_err(|e| format!("save_to_downloads dispatch channel closed: {}", e))?
+    }
+}
+
+/// Desktop: write `bytes` to the user's Downloads directory, appending a
+/// `(n)` suffix if a file of that name already exists. Returns the full path.
+#[cfg(not(target_os = "android"))]
+fn desktop_save_to_downloads(filename: &str, bytes: &[u8]) -> Result<String, String> {
     let downloads_dir = dirs::download_dir()
         .ok_or_else(|| "Could not find Downloads directory".to_string())?;
-    
-    // Create full path for the file
-    let mut file_path = downloads_dir.join(&filename);
-    
-    // If file exists, add a number to make it unique
+
+    let mut file_path = downloads_dir.join(filename);
     let mut counter = 1;
     while file_path.exists() {
-        let stem = std::path::Path::new(&filename)
+        let stem = std::path::Path::new(filename)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(&filename);
-        let extension = std::path::Path::new(&filename)
+            .unwrap_or(filename);
+        let extension = std::path::Path::new(filename)
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        
+
         let new_filename = if extension.is_empty() {
             format!("{} ({})", stem, counter)
         } else {
             format!("{} ({}).{}", stem, counter, extension)
         };
-        
+
         file_path = downloads_dir.join(new_filename);
         counter += 1;
     }
-    
-    // Decode base64 data
+
+    std::fs::write(&file_path, bytes)
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+
+    let path_str = file_path.to_string_lossy().to_string();
+    println!("[RUST] Successfully saved to: {}", path_str);
+    Ok(path_str)
+}
+
+#[tauri::command]
+async fn save_attachment_to_disk(filename: String, data: String, _mime_type: String) -> Result<String, String> {
+    println!("[RUST] save_attachment_to_disk called for filename: {}", filename);
+
+    use base64::{Engine as _, engine::general_purpose};
+
     let decoded_data = general_purpose::STANDARD
         .decode(&data)
         .map_err(|e| format!("Failed to decode base64 data: {}", e))?;
-    
-    // Write file to disk
-    std::fs::write(&file_path, decoded_data)
-        .map_err(|e| format!("Failed to write file: {}", e))?;
-    
-    let path_str = file_path.to_string_lossy().to_string();
-    println!("[RUST] Successfully saved attachment to: {}", path_str);
-    
-    Ok(path_str)
+
+    // Android: save straight into the public Downloads folder.
+    #[cfg(target_os = "android")]
+    {
+        return android_share::save_to_downloads(&filename, &_mime_type, &decoded_data);
+    }
+
+    // Desktop: write to the user's Downloads directory.
+    #[cfg(not(target_os = "android"))]
+    {
+        return desktop_save_to_downloads(&filename, &decoded_data);
+    }
+}
+
+/// Like `save_attachment_to_disk`, but on Android it opens the share sheet so
+/// the user can send the file to another app instead of saving it. On desktop
+/// there's no share sheet, so it falls back to saving in Downloads.
+#[tauri::command]
+async fn share_attachment_to_disk(filename: String, data: String, _mime_type: String) -> Result<String, String> {
+    println!("[RUST] share_attachment_to_disk called for filename: {}", filename);
+
+    use base64::{Engine as _, engine::general_purpose};
+
+    let decoded_data = general_purpose::STANDARD
+        .decode(&data)
+        .map_err(|e| format!("Failed to decode base64 data: {}", e))?;
+
+    #[cfg(target_os = "android")]
+    {
+        android_share::share_bytes(&filename, &_mime_type, &decoded_data)?;
+        return Ok("the app you choose".to_string());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        return desktop_save_to_downloads(&filename, &decoded_data);
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -3681,60 +4173,70 @@ struct AttachmentForZip {
 async fn save_attachments_as_zip(zip_filename: String, attachments: Vec<AttachmentForZip>) -> Result<String, String> {
     println!("[RUST] save_attachments_as_zip called with {} attachments", attachments.len());
     
+    let zip_bytes = build_zip(attachments)?;
+
+    // Android: save straight into the public Downloads folder.
+    #[cfg(target_os = "android")]
+    {
+        return android_share::save_to_downloads(&zip_filename, "application/zip", &zip_bytes);
+    }
+
+    // Desktop: write to the user's Downloads directory.
+    #[cfg(not(target_os = "android"))]
+    {
+        return desktop_save_to_downloads(&zip_filename, &zip_bytes);
+    }
+}
+
+/// Build a ZIP archive of the given attachments in memory.
+fn build_zip(attachments: Vec<AttachmentForZip>) -> Result<Vec<u8>, String> {
     use std::io::Write;
     use base64::{Engine as _, engine::general_purpose};
-    
-    // Get user's Downloads directory
-    let downloads_dir = dirs::download_dir()
-        .ok_or_else(|| "Could not find Downloads directory".to_string())?;
-    
-    // Create unique ZIP filename
-    let mut zip_path = downloads_dir.join(&zip_filename);
-    let mut counter = 1;
-    while zip_path.exists() {
-        let stem = std::path::Path::new(&zip_filename)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&zip_filename);
-        let new_filename = format!("{} ({}).zip", stem, counter);
-        zip_path = downloads_dir.join(new_filename);
-        counter += 1;
+
+    let mut zip_bytes: Vec<u8> = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut zip_bytes);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o755);
+
+        for attachment in attachments {
+            println!("[RUST] Adding to ZIP: {}", attachment.filename);
+
+            let decoded_data = general_purpose::STANDARD
+                .decode(&attachment.data)
+                .map_err(|e| format!("Failed to decode base64 data for {}: {}", attachment.filename, e))?;
+
+            zip.start_file(&attachment.filename, options)
+                .map_err(|e| format!("Failed to start file in ZIP: {}", e))?;
+            zip.write_all(&decoded_data)
+                .map_err(|e| format!("Failed to write file data to ZIP: {}", e))?;
+        }
+
+        zip.finish()
+            .map_err(|e| format!("Failed to finish ZIP file: {}", e))?;
     }
-    
-    // Create ZIP file
-    let zip_file = std::fs::File::create(&zip_path)
-        .map_err(|e| format!("Failed to create ZIP file: {}", e))?;
-    
-    let mut zip = zip::ZipWriter::new(zip_file);
-    let options = zip::write::FileOptions::<()>::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .unix_permissions(0o755);
-    
-    // Add each attachment to the ZIP
-    for attachment in attachments {
-        println!("[RUST] Adding to ZIP: {}", attachment.filename);
-        
-        // Decode base64 data
-        let decoded_data = general_purpose::STANDARD
-            .decode(&attachment.data)
-            .map_err(|e| format!("Failed to decode base64 data for {}: {}", attachment.filename, e))?;
-        
-        // Add file to ZIP
-        zip.start_file(&attachment.filename, options)
-            .map_err(|e| format!("Failed to start file in ZIP: {}", e))?;
-        
-        zip.write_all(&decoded_data)
-            .map_err(|e| format!("Failed to write file data to ZIP: {}", e))?;
+    Ok(zip_bytes)
+}
+
+/// Like `save_attachments_as_zip`, but on Android it opens the share sheet.
+#[tauri::command]
+async fn share_attachments_as_zip(zip_filename: String, attachments: Vec<AttachmentForZip>) -> Result<String, String> {
+    println!("[RUST] share_attachments_as_zip called with {} attachments", attachments.len());
+
+    let zip_bytes = build_zip(attachments)?;
+
+    #[cfg(target_os = "android")]
+    {
+        android_share::share_bytes(&zip_filename, "application/zip", &zip_bytes)?;
+        return Ok("the app you choose".to_string());
     }
-    
-    // Finish ZIP file
-    zip.finish()
-        .map_err(|e| format!("Failed to finish ZIP file: {}", e))?;
-    
-    let path_str = zip_path.to_string_lossy().to_string();
-    println!("[RUST] Successfully created ZIP file: {}", path_str);
-    
-    Ok(path_str)
+
+    #[cfg(not(target_os = "android"))]
+    {
+        return desktop_save_to_downloads(&zip_filename, &zip_bytes);
+    }
 }
 
 #[tauri::command]
@@ -4153,15 +4655,27 @@ fn decrypt_email_body(
     subject: String,
     sender_pubkey: Option<String>,
     recipient_pubkey: Option<String>,
+    message_id: Option<String>,
     state: tauri::State<AppState>,
 ) -> Result<types::DecryptEmailResult, String> {
     let pk = resolve_private_key(private_key, &state)?;
+    // Look up raw_headers from DB by message_id so the pipeline can fall back to
+    // the X-Nostr-Sig header for NIP-04 signature verification when the inline
+    // SIGNATURE block is missing.
+    let raw_headers = message_id.as_deref().and_then(|mid| {
+        state.get_database().ok()
+            .and_then(|db| db.get_email(mid).ok().flatten())
+            .and_then(|e| e.raw_headers)
+    });
     email::decrypt_email_body_pipeline(
         &pk,
         &armor_text,
         &subject,
         sender_pubkey.as_deref(),
         recipient_pubkey.as_deref(),
+        raw_headers.as_deref(),
+        active_require_signature(&state),
+        false, // full thread: the email detail view may show quoted history
     )
 }
 
@@ -4172,16 +4686,29 @@ fn decrypt_email_bodies_batch(
     state: tauri::State<AppState>,
 ) -> Result<Vec<types::BatchDecryptResultItem>, String> {
     let pk = resolve_private_key(private_key, &state)?;
+    // Open DB once for the whole batch so each item can look up its raw_headers
+    // by message_id for NIP-04 header-sig fallback verification.
+    let db_opt = state.get_database().ok();
+    // One setting read for the whole batch — same value applies to every row.
+    let require_signature = active_require_signature(&state);
     let results = emails
         .into_iter()
         .map(|e| {
             let id = e.id.clone();
+            let raw_headers = e.message_id.as_deref().and_then(|mid| {
+                db_opt.as_ref()
+                    .and_then(|db| db.get_email(mid).ok().flatten())
+                    .and_then(|row| row.raw_headers)
+            });
             match email::decrypt_email_body_pipeline(
                 &pk,
                 &e.armor_text,
                 &e.subject,
                 e.sender_pubkey.as_deref(),
                 e.recipient_pubkey.as_deref(),
+                raw_headers.as_deref(),
+                require_signature,
+                false, // batch decrypt feeds the email list/detail; keep full thread
             ) {
                 Ok(result) => types::BatchDecryptResultItem {
                     id,
@@ -4257,7 +4784,8 @@ fn encode_bip39(ciphertext: String, language: String, wordlist: String, mode: St
     let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
         .map_err(|e| format!("Failed to load wordlist: {}", e))?;
     let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
-    let tree = glossia::WordlistTree::new(payload_words);
+    let tree = glossia::cached_payload_tree(&language, &wordlist)
+        .map_err(|e| format!("Failed to build wordlist tree: {}", e))?;
     let encoded_words = glossia::codec::encode_base_n(&raw_bytes, &tree, "bip39")
         .map_err(|e| format!("BIP39 encoding failed: {:?}", e))?;
 
@@ -4310,7 +4838,8 @@ fn decode_bip39(text: String, language: String, wordlist: String, algorithm: Str
     let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
         .map_err(|e| format!("Failed to load wordlist: {}", e))?;
     let wordlist_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
-    let tree = glossia::WordlistTree::new(payload_words);
+    let tree = glossia::cached_payload_tree(&language, &wordlist)
+        .map_err(|e| format!("Failed to build wordlist tree: {}", e))?;
 
     // 2. Filter text to extract only payload words (preserving order)
     let extracted: Vec<String> = text.split_whitespace()
@@ -4523,7 +5052,8 @@ fn glossia_encode_raw_base_n(input: String, language: String, wordlist: String, 
         // 2. Load payload wordlist and build WordlistTree
         let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
             .map_err(|e| format!("Failed to load wordlist: {}", e))?;
-        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
+        let payload_tree = glossia::cached_payload_tree(&language, &wordlist)
+            .map_err(|e| format!("Failed to build wordlist tree: {}", e))?;
 
         // 3. Encode bytes to payload words via bitpack_fixed codec
         let byte_count = bytes.len();
@@ -4651,7 +5181,8 @@ fn glossia_decode_raw_base_n(text: String, language: String, wordlist: String, e
         // 1. Load payload wordlist
         let payload_words = glossia::generator::data::load_payload_words_for_wordlist(&language, &wordlist)
             .map_err(|e| format!("Failed to load wordlist: {}", e))?;
-        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
+        let payload_tree = glossia::cached_payload_tree(&language, &wordlist)
+            .map_err(|e| format!("Failed to build wordlist tree: {}", e))?;
 
         // 2. Build payload set for filtering
         let payload_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
@@ -4708,17 +5239,27 @@ fn glossia_get_default_wordlist(language: String) -> String {
 }
 
 #[tauri::command]
-async fn sync_nostr_emails(config: EmailConfig, folder: Option<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+async fn sync_nostr_emails(config: EmailConfig, folders: Option<Vec<String>>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     let active_pubkey = active_user_npub(&state)
         .ok_or_else(|| "No active account. Please log in first.".to_string())?;
-    email::sync_nostr_emails_to_db(&config, folder.as_deref(), &active_pubkey, &db).await.map_err(|e| e.to_string())
+    email::sync_nostr_emails_to_db(&config, folders.as_deref(), &active_pubkey, &db).await.map_err(|e| e.to_string())
+}
+
+/// Return the provider-aware default folder list for the given IMAP host.
+/// The frontend uses this to render the multiselect placeholder so the user
+/// sees the same list that the backend will actually scan when nothing is
+/// selected.
+#[tauri::command]
+fn get_default_inbox_folders(imap_host: String) -> Vec<String> {
+    email::default_inbox_folders(&imap_host)
 }
 
 /// Clear the UID-based sync watermark for one folder so the next sync
-/// re-bootstraps from `sync_cutoff_days`. Useful for recovering older messages
-/// that were skipped (e.g. by Gmail IMAP search-index lag) and as a manual
-/// "force resync" hook for debugging.
+/// re-bootstraps using the per-folder message count (`sync_initial_count` /
+/// `sync_folder_counts`). Useful for recovering older messages that were
+/// skipped (e.g. by Gmail IMAP search-index lag), applying a changed count
+/// depth, and as a manual "force resync" hook for debugging.
 #[tauri::command]
 async fn reset_folder_sync_state(
     email_address: String,
@@ -4727,6 +5268,54 @@ async fn reset_folder_sync_state(
 ) -> Result<(), String> {
     let db = state.get_database().map_err(|e| e.to_string())?;
     db.clear_folder_sync_state(&email_address, &folder_name)
+        .map_err(|e| e.to_string())
+}
+
+/// Thorough refresh: forward UID delta + gap-fill within the scanned range.
+/// Maps to the Refresh button. Auto-sync on tab switch keeps using the cheap
+/// `sync_nostr_emails` (forward delta only).
+#[tauri::command]
+async fn refresh_inbox_emails(config: EmailConfig, folders: Option<Vec<String>>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::refresh_inbox_emails_to_db(&config, folders.as_deref(), &active_pubkey, &db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn refresh_sent_emails(config: EmailConfig, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::refresh_sent_emails_to_db(&config, &active_pubkey, &db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_older_inbox_emails(
+    config: EmailConfig,
+    folder: Option<String>,
+    page_size: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<email::FetchOlderSummary, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::fetch_older_inbox_emails_to_db(&config, folder.as_deref(), page_size, &active_pubkey, &db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_older_sent_emails(
+    config: EmailConfig,
+    page_size: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<email::FetchOlderSummary, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    let active_pubkey = active_user_npub(&state)
+        .ok_or_else(|| "No active account. Please log in first.".to_string())?;
+    email::fetch_older_sent_emails_to_db(&config, page_size, &active_pubkey, &db)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -5987,7 +6576,7 @@ async fn handle_live_gift_wrap(
         }
     };
 
-    let UnwrappedGift { sender, rumor } = unwrapped;
+    let UnwrappedGift { sender, mut rumor } = unwrapped;
 
     // Discover this sender's NIP-65 outbox in the background so we catch
     // their next gift wraps on whichever relays they actually publish to.
@@ -6025,13 +6614,18 @@ async fn handle_live_gift_wrap(
 
     let received_from_relay = relay_url.map(|u| u.to_string());
 
+    // Dedup on the INNER rumor's id, not the outer gift wrap. The rumor id is
+    // content-addressed (hash of pubkey+created_at+kind+tags+content per NIP-01),
+    // so two different wraps of the same rumor — same wrap from another relay,
+    // sender publishing multiple wraps with different ephemeral keys, sender's
+    // self-wrap+recipient-wrap pair — collapse to one row via the existing
+    // UNIQUE constraint on direct_messages.event_id. Mirrors Amethyst's
+    // GiftWrapEventHandler, which dedupes by the inner rumor id.
+    let dedup_event_id = rumor.id().to_hex();
+
     let dm = DbDirectMessage {
         id: None,
-        // Use the OUTER wrap's event_id for dedup (UNIQUE constraint on event_id).
-        // Same wrap delivered by multiple relays gets one row. The recipient's
-        // wrap and the sender's self-wrap have different event_ids, so both
-        // sides naturally store their own wrap.
-        event_id: event.id.to_hex(),
+        event_id: dedup_event_id,
         sender_pubkey: sender_npub.clone(),
         recipient_pubkey: recipient_npub.clone(),
         // Verbatim — preserves email-DM hash matching.
@@ -6184,7 +6778,7 @@ async fn db_delete_sent_email(message_id: String, delete_from_server: Option<boo
                 if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
                     let email_config = crate::types::EmailConfig {
                         email_address: email_addr,
-                        password: pwd,
+                        password: decrypt_setting_password(&pwd, &state),
                         smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
                         smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
                         imap_host: host,
@@ -6235,7 +6829,7 @@ async fn db_delete_inbox_email(message_id: String, delete_from_server: Option<bo
                 if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
                     let email_config = crate::types::EmailConfig {
                         email_address: email_addr,
-                        password: pwd,
+                        password: decrypt_setting_password(&pwd, &state),
                         smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
                         smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
                         imap_host: host,
@@ -6269,9 +6863,178 @@ async fn db_delete_inbox_email(message_id: String, delete_from_server: Option<bo
 }
 
 #[tauri::command]
-fn db_mark_as_read(message_id: String, state: tauri::State<AppState>) -> Result<(), String> {
+async fn move_inbox_email(message_id: String, target_folder: String, _user_email: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    println!("[RUST] move_inbox_email called for message_id: {}, target_folder: {}", message_id, target_folder);
+
+    let target_folder = target_folder.trim().to_string();
+    if target_folder.is_empty() {
+        return Err("Target folder must not be empty".to_string());
+    }
+
+    // Same active-pubkey scoping rationale as db_delete_inbox_email above.
+    let active_pubkey = active_user_npub(&state).ok_or_else(|| "No active user".to_string())?;
     let db = state.get_database()?;
-    db.mark_as_read(&message_id).map_err(|e| e.to_string())
+    let all_settings = db.get_all_settings(&active_pubkey).map_err(|e| e.to_string())?;
+
+    let email_address = all_settings.get("email_address").cloned();
+    let password = all_settings.get("password").cloned();
+    let imap_host = all_settings.get("imap_host").cloned();
+    let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+    let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+    if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+        let email_config = crate::types::EmailConfig {
+            email_address: email_addr,
+            password: decrypt_setting_password(&pwd, &state),
+            smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+            smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+            imap_host: host,
+            imap_port: port,
+            use_tls,
+            private_key: all_settings.get("nostr_private_key").cloned(),
+        };
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::email::move_inbox_email_to_folder(&email_config, &message_id, &target_folder)
+        ).await {
+            Ok(Ok(_)) => {
+                println!("[RUST] move_inbox_email: Successfully moved email on server to {}", target_folder);
+                // Drop the local copy; the next sync re-surfaces it if the target
+                // folder is part of the synced inbox folder set.
+                db.delete_inbox_email(&message_id).map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(format!("Failed to move email: {}", e)),
+            Err(_) => Err("Server move timed out after 30 seconds".to_string()),
+        }
+    } else {
+        Err("Incomplete email configuration".to_string())
+    }
+}
+
+/// One-time spam-rescue catch-up, run when the user first enables spam rescue.
+/// Moves ALL authenticated nostr mail out of spam — including already-read
+/// messages that the normal per-sync rescue (UNSEEN-only) would skip — then
+/// syncs so the moved messages appear in the inbox. Returns how many were moved
+/// so the frontend can tell the user.
+#[tauri::command]
+async fn rescue_spam_now(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let active_pubkey = active_user_npub(&state).ok_or_else(|| "No active user".to_string())?;
+    let db = state.get_database()?;
+    let all_settings = db.get_all_settings(&active_pubkey).map_err(|e| e.to_string())?;
+
+    let email_address = all_settings.get("email_address").cloned();
+    let password = all_settings.get("password").cloned();
+    let imap_host = all_settings.get("imap_host").cloned();
+    let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+    let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+    if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+        let email_config = crate::types::EmailConfig {
+            email_address: email_addr,
+            password: decrypt_setting_password(&pwd, &state),
+            smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+            smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+            imap_host: host,
+            imap_port: port,
+            use_tls,
+            private_key: all_settings.get("nostr_private_key").cloned(),
+        };
+
+        let target = crate::email::lookup_spam_rescue_target(&db, &active_pubkey);
+        // Same default load window the scan uses; bounds the per-spam-folder
+        // search so it can't run unbounded over a huge folder (see email.rs
+        // move_nostr_from_folder / memory imap-search-desync-crash).
+        let window = crate::email::lookup_initial_count(&db, &active_pubkey);
+        let moved = crate::email::rescue_spam_now(&email_config, &target, window)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Ingest the moved messages so they surface in the inbox immediately.
+        // The rescue target is part of the synced folder set whenever rescue is
+        // on, so a normal sync picks them up. Best-effort: a sync failure here
+        // doesn't undo the (already-completed) move, so just log it.
+        if let Err(e) = crate::email::sync_nostr_emails_to_db(&email_config, None, &active_pubkey, &db).await {
+            println!("[RUST] rescue_spam_now: post-rescue sync failed: {}", e);
+        }
+
+        Ok(moved)
+    } else {
+        Err("Incomplete email configuration".to_string())
+    }
+}
+
+#[tauri::command]
+async fn db_mark_as_read(message_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let db = state.get_database()?;
+
+    // Only mirror to the server on a genuine unread -> read transition, so
+    // re-opening an already-read email doesn't trigger a redundant IMAP login.
+    let was_unread = db
+        .get_email(&message_id)
+        .map_err(|e| e.to_string())?
+        .map(|e| !e.is_read)
+        .unwrap_or(false);
+
+    db.mark_as_read(&message_id).map_err(|e| e.to_string())?;
+
+    if !was_unread {
+        return Ok(());
+    }
+
+    // Best-effort: mirror read state to the IMAP server (\Seen) so other
+    // clients/devices see the message as read. Local read state is already
+    // persisted above; a server failure must not fail the command or block the
+    // UI, so this runs detached and its result is only logged. Scoped to
+    // non-spam folders inside `mark_inbox_email_seen_on_server`.
+    let active_pubkey = match active_user_npub(&state) {
+        Some(pk) => pk,
+        None => return Ok(()),
+    };
+    let all_settings = match db.get_all_settings(&active_pubkey) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+
+    let email_address = all_settings.get("email_address").cloned();
+    let password = all_settings.get("password").cloned();
+    let imap_host = all_settings.get("imap_host").cloned();
+    let imap_port = all_settings.get("imap_port").and_then(|s| s.parse::<u16>().ok());
+    let use_tls = all_settings.get("imap_use_tls").map(|s| s == "true").unwrap_or(true);
+
+    if let (Some(email_addr), Some(pwd), Some(host), Some(port)) = (email_address, password, imap_host, imap_port) {
+        let email_config = crate::types::EmailConfig {
+            email_address: email_addr,
+            password: decrypt_setting_password(&pwd, &state),
+            smtp_host: all_settings.get("smtp_host").cloned().unwrap_or_default(),
+            smtp_port: all_settings.get("smtp_port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(587),
+            imap_host: host,
+            imap_port: port,
+            use_tls,
+            private_key: all_settings.get("nostr_private_key").cloned(),
+        };
+        // Search the logged-in user's configured inbox folders (the `inbox_folder`
+        // setting, else provider defaults), with spam/junk excluded — the same
+        // source set the sync uses, not a hardcoded list.
+        let source_folders = crate::email::configured_inbox_folders_excluding_spam(
+            all_settings.get("inbox_folder").map(|s| s.as_str()),
+            &email_config.imap_host,
+        );
+        let msg_id = message_id.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                crate::email::mark_inbox_email_seen_on_server(&email_config, &msg_id, &source_folders),
+            ).await {
+                Ok(Ok(_)) => println!("[RUST] db_mark_as_read: marked {} \\Seen on server", msg_id),
+                Ok(Err(e)) => crate::debug_log!("[RUST] db_mark_as_read: server \\Seen failed for {}: {}", msg_id, e),
+                Err(_) => crate::debug_log!("[RUST] db_mark_as_read: server \\Seen timed out for {}", msg_id),
+            }
+        });
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -6307,6 +7070,16 @@ fn db_check_dm_matches_email_encrypted(dm_event_id: String, _user_pubkey: String
         },
         None => Ok(false),
     }
+}
+
+#[tauri::command]
+fn db_check_dms_match_email_encrypted_batch(
+    dm_event_ids: Vec<String>,
+    state: tauri::State<AppState>,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    let db = state.get_database().map_err(|e| e.to_string())?;
+    db.check_dms_match_email_encrypted_batch(&dm_event_ids)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -6578,10 +7351,15 @@ fn db_get_matching_email_body(dm_event_id: String, private_key: Option<String>, 
     
     // Use the unified decrypt pipeline (handles glossia, NIP-04/44, manifest, nested blocks)
     // Try each candidate pubkey until one succeeds
+    let require_signature = active_require_signature(&state);
     for pubkey in &pubkeys_to_try {
         let sender_pk = if user_received_email { Some(pubkey.as_str()) } else { None };
         let recipient_pk = if user_sent_email { Some(pubkey.as_str()) } else { Some(pubkey.as_str()) };
-        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk) {
+        // shallow=true: the DM conversation renders only the most recent message
+        // inline (the full thread is one click away via the envelope icon), so we
+        // skip decrypting quoted history the view never shows. See the pipeline's
+        // `shallow` param — it's a no-op for NIP-04.
+        match email::decrypt_email_body_pipeline(&private_key, &email.body, &email.subject, sender_pk, recipient_pk, email.raw_headers.as_deref(), require_signature, true) {
             Ok(result) if result.success => {
                 println!("[RUST] decrypt_email_body_pipeline succeeded with pubkey: {}", pubkey);
                 return Ok(Some(types::MatchingEmailBodyResult {
@@ -6657,6 +7435,7 @@ pub fn run() {
     
     let builder = builder.invoke_handler(tauri::generate_handler![
         greet,
+        get_debug_log_enabled,
         should_clear_localstorage_cache,
         generate_keypair,
         keychain_add_account,
@@ -6732,7 +7511,10 @@ pub fn run() {
         update_contact_picture_data_url,
         test_imap_connection,
         test_smtp_connection,
+        start_imap_idle,
+        stop_imap_idle,
         list_imap_folders,
+        find_message_folder,
         check_message_confirmation,
         get_default_private_key_from_config,
         generate_qr_code,
@@ -6768,6 +7550,9 @@ pub fn run() {
         db_get_all_sent_message_ids,
         db_save_dm,
         db_get_dms_for_conversation,
+        db_get_dms_for_conversation_page,
+        db_get_dm_conversation_previews,
+        db_get_dm_pubkeys_with_email_match,
         db_get_decrypted_dms_for_conversation,
         db_save_conversation,
         db_get_conversations,
@@ -6782,6 +7567,8 @@ pub fn run() {
         db_delete_attachment,
         save_attachment_to_disk,
         save_attachments_as_zip,
+        share_attachment_to_disk,
+        share_attachments_as_zip,
         db_save_email_with_attachments,
         db_save_setting,
         db_get_setting,
@@ -6811,8 +7598,13 @@ pub fn run() {
         db_get_all_relays,
         db_delete_relay,
         sync_nostr_emails,
+        get_default_inbox_folders,
         reset_folder_sync_state,
         sync_sent_emails,
+        fetch_older_inbox_emails,
+        fetch_older_sent_emails,
+        refresh_inbox_emails,
+        refresh_sent_emails,
         sync_all_emails,
         sync_direct_messages_with_network,
         sync_conversation_with_network,
@@ -6831,8 +7623,11 @@ pub fn run() {
         db_delete_draft,
         db_delete_sent_email,
         db_delete_inbox_email,
+        move_inbox_email,
+        rescue_spam_now,
         db_mark_as_read,
         db_check_dm_matches_email_encrypted,
+        db_check_dms_match_email_encrypted_batch,
         db_get_matching_email_id,
         db_get_matching_email_body,
         db_update_email_subject_hash,

@@ -12,57 +12,50 @@ use tokio::task;
 use tokio::time::timeout;
 use std::time::Duration;
 use crate::types::{TransportAuthVerdict, TransportAuthMethod};
-use std::net::TcpStream;
-#[cfg(not(target_os = "android"))]
-use native_tls::TlsConnector;
-#[cfg(target_os = "android")]
-use rustls::{ClientConfig, ClientConnection, RootCertStore, pki_types::ServerName};
-#[cfg(target_os = "android")]
-use std::sync::Arc;
+
+// Verbose [RUST] logs in the decrypt hot path are silent by default — set the
+// NOSTR_MAIL_DEBUG environment variable to any value to re-enable them for
+// diagnostics. [RUST-PERF] profiling lines are gated behind the same variable
+// (via debug_log!), so they're off in normal use and only printed when
+// NOSTR_MAIL_DEBUG is set.
+fn debug_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NOSTR_MAIL_DEBUG").is_ok())
+}
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if debug_log_enabled() {
+            println!($($arg)*);
+        }
+    };
+}
+
+// Soft cap on cache size. When a cache grows beyond this, ~25% of entries are
+// dropped (HashMap iteration order is unspecified, so this is effectively a
+// random eviction). Realistic inboxes have a few thousand unique armor bodies
+// at most; this guard exists for the pathological "100k+ encrypted messages"
+// case.
+const CACHE_MAX: usize = 10_000;
+
+fn maybe_evict<K: Clone + Eq + std::hash::Hash, V>(
+    map: &mut std::collections::HashMap<K, V>,
+) {
+    if map.len() > CACHE_MAX {
+        let drop_count = map.len() / 4;
+        let keys: Vec<K> = map.keys().take(drop_count).cloned().collect();
+        for k in keys {
+            map.remove(&k);
+        }
+    }
+}
 use uuid::Uuid;
 use base64::{Engine as _, engine::general_purpose};
 
-/// Macro to create a TLS-wrapped IMAP client connection
-/// Uses native-tls on desktop and rustls on Android
-#[cfg(not(target_os = "android"))]
-macro_rules! create_imap_tls_client {
-    ($host:expr, $addr:expr) => {{
-        let tls = TlsConnector::builder().build()?;
-        let tcp_stream = TcpStream::connect($addr)?;
-        let tls_stream: native_tls::TlsStream<TcpStream> = tls.connect($host, tcp_stream)?;
-        Ok::<imap::Client<native_tls::TlsStream<TcpStream>>, anyhow::Error>(imap::Client::new(tls_stream))
-    }};
-}
-
-#[cfg(target_os = "android")]
-macro_rules! create_imap_tls_client {
-    ($host:expr, $addr:expr) => {{
-        // Initialize rustls crypto provider if not already initialized (required for rustls 0.23+)
-        {
-            use std::sync::Once;
-            static INIT: Once = Once::new();
-            INIT.call_once(|| {
-                // Try to install default provider, but don't fail if already installed
-                let _ = rustls::crypto::ring::default_provider().install_default();
-            });
-        }
-        
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        
-        let server_name = ServerName::try_from($host.to_string())
-            .map_err(|_| anyhow::anyhow!("Invalid server name"))?;
-        
-        let tcp_stream = TcpStream::connect($addr)?;
-        let client = ClientConnection::new(Arc::new(config), server_name)?;
-        let tls_stream = rustls::StreamOwned::new(client, tcp_stream);
-        Ok::<imap::Client<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>, anyhow::Error>(imap::Client::new(tls_stream))
-    }};
-}
+// IMAP connections are established and reused through `crate::imap_pool`, which
+// owns TLS setup, socket timeouts, and warm-connection pooling for the active
+// account. See that module for the per-transport details.
+use crate::imap_pool::{self, ImapTarget};
 
 /// Decode RFC 2047 encoded header value and fix UTF-8 encoding issues
 /// mailparse should handle RFC 2047 automatically, but this fixes common UTF-8 misinterpretations
@@ -168,8 +161,8 @@ pub fn construct_email_headers(
     recipient_pubkey: Option<&str>,
     include_recipient_header: bool,
 ) -> Result<String> {
-    println!("[RUST] construct_email_headers: Constructing email headers");
-    println!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
+    debug_log!("[RUST] construct_email_headers: Constructing email headers");
+    debug_log!("[RUST] construct_email_headers: From: {}, To: {}", config.email_address, to_address);
     
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
@@ -179,7 +172,7 @@ pub fn construct_email_headers(
 
     // Add custom message ID if provided
     if let Some(msg_id) = message_id {
-        println!("[RUST] construct_email_headers: Setting message ID: {}", msg_id);
+        debug_log!("[RUST] construct_email_headers: Setting message ID: {}", msg_id);
         // Try using the builder's message_id method
         builder = builder.message_id(Some(msg_id.to_string()));
         
@@ -187,18 +180,18 @@ pub fn construct_email_headers(
         // Note: This might not work with lettre's builder pattern, but worth trying
         // builder = builder.header(("Message-ID", msg_id));
     } else {
-        println!("[RUST] construct_email_headers: No message ID provided");
+        debug_log!("[RUST] construct_email_headers: No message ID provided");
     }
 
     // Add In-Reply-To header if provided (for email threading)
     if let Some(reply_id) = in_reply_to {
-        println!("[RUST] construct_email_headers: Setting In-Reply-To: {}", reply_id);
+        debug_log!("[RUST] construct_email_headers: Setting In-Reply-To: {}", reply_id);
         builder = builder.in_reply_to(reply_id.to_string());
     }
 
     // Add References header if provided (for email threading)
     if let Some(refs) = references {
-        println!("[RUST] construct_email_headers: Setting References: {}", refs);
+        debug_log!("[RUST] construct_email_headers: Setting References: {}", refs);
         builder = builder.references(refs.to_string());
     }
 
@@ -212,10 +205,10 @@ pub fn construct_email_headers(
             match crypto::get_public_key_from_private(private_key) {
                 Ok(sender_pubkey) => {
                     if include_pubkey_header {
-                        println!("[RUST] construct_email_headers: Adding sender pubkey to headers: {}", sender_pubkey);
+                        debug_log!("[RUST] construct_email_headers: Adding sender pubkey to headers: {}", sender_pubkey);
                         builder = builder.header(XNostrPubkey(sender_pubkey));
                     } else {
-                        println!("[RUST] construct_email_headers: Skipping X-Nostr-Pubkey (disabled by user)");
+                        debug_log!("[RUST] construct_email_headers: Skipping X-Nostr-Pubkey (disabled by user)");
                     }
 
                     if include_sig_header && include_pubkey_header {
@@ -223,21 +216,21 @@ pub fn construct_email_headers(
                         let binary = extract_ciphertext_binary(body);
                         match crypto::sign_data_bytes(private_key, &binary) {
                             Ok(signature) => {
-                                println!("[RUST] construct_email_headers: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
+                                debug_log!("[RUST] construct_email_headers: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
                                 builder = builder.header(XNostrSig(signature));
                             }
                             Err(e) => {
-                                println!("[RUST] construct_email_headers: Failed to sign email body: {}", e);
+                                debug_log!("[RUST] construct_email_headers: Failed to sign email body: {}", e);
                             }
                         }
                     } else if include_sig_header && !include_pubkey_header {
-                        println!("[RUST] construct_email_headers: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
+                        debug_log!("[RUST] construct_email_headers: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
                     } else {
-                        println!("[RUST] construct_email_headers: Skipping X-Nostr-Sig (disabled by user)");
+                        debug_log!("[RUST] construct_email_headers: Skipping X-Nostr-Sig (disabled by user)");
                     }
                 }
                 Err(e) => {
-                    println!("[RUST] construct_email_headers: Failed to get public key from private key: {}", e);
+                    debug_log!("[RUST] construct_email_headers: Failed to get public key from private key: {}", e);
                 }
             }
         }
@@ -249,7 +242,7 @@ pub fn construct_email_headers(
     if include_recipient_header {
         if let Some(rp) = recipient_pubkey {
             if !rp.is_empty() {
-                println!("[RUST] construct_email_headers: Adding recipient pubkey to headers: {}", rp);
+                debug_log!("[RUST] construct_email_headers: Adding recipient pubkey to headers: {}", rp);
                 builder = builder.header(XNostrRecipient(rp.to_string()));
             }
         }
@@ -261,7 +254,7 @@ pub fn construct_email_headers(
         .body(body.to_string());
 
     let body_part: Option<MultiPart> = if let Some(html) = html_body {
-        println!("[RUST] construct_email_headers: Building multipart/alternative with HTML body");
+        debug_log!("[RUST] construct_email_headers: Building multipart/alternative with HTML body");
         let html_part = SinglePart::builder()
             .header(ContentType::TEXT_HTML)
             .body(html.to_string());
@@ -281,7 +274,7 @@ pub fn construct_email_headers(
                 builder.body(body.to_string())?
             }
         } else {
-            println!("[RUST] construct_email_headers: Building multipart email with {} attachments", attachments.len());
+            debug_log!("[RUST] construct_email_headers: Building multipart email with {} attachments", attachments.len());
 
             // Create multipart/mixed; nest alternative or plain text inside
             let mut multipart = if let Some(alt) = body_part {
@@ -294,7 +287,7 @@ pub fn construct_email_headers(
 
             // Add each attachment (for header construction, we don't need the actual data)
             for attachment in attachments {
-                println!("[RUST] construct_email_headers: Adding attachment header: {}", attachment.filename);
+                debug_log!("[RUST] construct_email_headers: Adding attachment header: {}", attachment.filename);
 
                 // Parse content type
                 let content_type = attachment.content_type.parse::<ContentType>()
@@ -321,7 +314,7 @@ pub fn construct_email_headers(
     let email_bytes = email.formatted();
     let email_string = String::from_utf8(email_bytes)?;
     
-    println!("[RUST] construct_email_headers: Full email string length: {}", email_string.len());
+    debug_log!("[RUST] construct_email_headers: Full email string length: {}", email_string.len());
     
     // Extract headers from the email string
     let lines: Vec<&str> = email_string.lines().collect();
@@ -338,19 +331,19 @@ pub fn construct_email_headers(
     }
     
     let final_headers = headers.join("\n");
-    println!("[RUST] construct_email_headers: Final headers:");
+    debug_log!("[RUST] construct_email_headers: Final headers:");
     println!("{}", final_headers);
     
     // Check if Message-ID is present in the headers
     if final_headers.to_lowercase().contains("message-id:") {
-        println!("[RUST] construct_email_headers: Message-ID found in headers");
+        debug_log!("[RUST] construct_email_headers: Message-ID found in headers");
     } else {
-        println!("[RUST] construct_email_headers: Message-ID NOT found in headers");
+        debug_log!("[RUST] construct_email_headers: Message-ID NOT found in headers");
         // If Message-ID is not present, manually add it
         if let Some(msg_id) = message_id {
-            println!("[RUST] construct_email_headers: Manually adding Message-ID: {}", msg_id);
+            debug_log!("[RUST] construct_email_headers: Manually adding Message-ID: {}", msg_id);
             let headers_with_message_id = format!("Message-ID: {}\n{}", msg_id, final_headers);
-            println!("[RUST] construct_email_headers: Headers with manually added Message-ID:");
+            debug_log!("[RUST] construct_email_headers: Headers with manually added Message-ID:");
             println!("{}", headers_with_message_id);
             return Ok(headers_with_message_id);
         }
@@ -376,10 +369,10 @@ pub async fn send_email(
     recipient_pubkey: Option<&str>,
     include_recipient_header: bool,
 ) -> Result<String> {
-    println!("[RUST] send_email: Starting email send process");
-    println!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
-    println!("[RUST] send_email: From: {}, To: {}", config.email_address, to_address);
-    println!("[RUST] send_email: Use TLS: {}", config.use_tls);
+    debug_log!("[RUST] send_email: Starting email send process");
+    debug_log!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
+    debug_log!("[RUST] send_email: From: {}, To: {}", config.email_address, to_address);
+    debug_log!("[RUST] send_email: Use TLS: {}", config.use_tls);
     
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
@@ -395,13 +388,13 @@ pub async fn send_email(
 
     // Add In-Reply-To header if provided (for email threading)
     if let Some(reply_id) = in_reply_to {
-        println!("[RUST] send_email: Setting In-Reply-To: {}", reply_id);
+        debug_log!("[RUST] send_email: Setting In-Reply-To: {}", reply_id);
         builder = builder.in_reply_to(reply_id.to_string());
     }
 
     // Add References header if provided (for email threading)
     if let Some(refs) = references {
-        println!("[RUST] send_email: Setting References: {}", refs);
+        debug_log!("[RUST] send_email: Setting References: {}", refs);
         builder = builder.references(refs.to_string());
     }
 
@@ -414,14 +407,14 @@ pub async fn send_email(
             match crypto::get_public_key_from_private(private_key) {
                 Ok(sender_pubkey) => {
                     if include_pubkey_header {
-                        println!("[RUST] send_email: Adding sender pubkey to headers: {}", sender_pubkey);
+                        debug_log!("[RUST] send_email: Adding sender pubkey to headers: {}", sender_pubkey);
                         builder = builder.header(XNostrPubkey(sender_pubkey));
                     } else {
-                        println!("[RUST] send_email: Skipping X-Nostr-Pubkey (disabled by user)");
+                        debug_log!("[RUST] send_email: Skipping X-Nostr-Pubkey (disabled by user)");
                     }
 
                     if include_sig_header && include_pubkey_header {
-                        println!("[RUST] send_email: body passed to extract_ciphertext_binary ({} chars):\n{}", body.len(), &body[..body.len().min(500)]);
+                        debug_log!("[RUST] send_email: body passed to extract_ciphertext_binary ({} chars):\n{}", body.len(), &body[..body.len().min(500)]);
                         let binary = extract_ciphertext_binary(body);
                         let binary_hash = {
                             use sha2::{Sha256, Digest};
@@ -429,24 +422,24 @@ pub async fn send_email(
                             h.update(&binary);
                             hex::encode(&h.finalize()[..8])
                         };
-                        println!("[RUST] send_email: extracted binary {} bytes, sha256_prefix: {}", binary.len(), binary_hash);
+                        debug_log!("[RUST] send_email: extracted binary {} bytes, sha256_prefix: {}", binary.len(), binary_hash);
                         match crypto::sign_data_bytes(private_key, &binary) {
                             Ok(signature) => {
-                                println!("[RUST] send_email: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
+                                debug_log!("[RUST] send_email: Signing email body (binary, {} bytes), signature length: {}", binary.len(), signature.len());
                                 builder = builder.header(XNostrSig(signature));
                             }
                             Err(e) => {
-                                println!("[RUST] send_email: Failed to sign email body: {}", e);
+                                debug_log!("[RUST] send_email: Failed to sign email body: {}", e);
                             }
                         }
                     } else if include_sig_header && !include_pubkey_header {
-                        println!("[RUST] send_email: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
+                        debug_log!("[RUST] send_email: Skipping X-Nostr-Sig because X-Nostr-Pubkey is disabled");
                     } else {
-                        println!("[RUST] send_email: Skipping X-Nostr-Sig (disabled by user)");
+                        debug_log!("[RUST] send_email: Skipping X-Nostr-Sig (disabled by user)");
                     }
                 }
                 Err(e) => {
-                    println!("[RUST] send_email: Failed to get public key from private key: {}", e);
+                    debug_log!("[RUST] send_email: Failed to get public key from private key: {}", e);
                 }
             }
         }
@@ -458,7 +451,7 @@ pub async fn send_email(
     if include_recipient_header {
         if let Some(rp) = recipient_pubkey {
             if !rp.is_empty() {
-                println!("[RUST] send_email: Adding recipient pubkey to headers: {}", rp);
+                debug_log!("[RUST] send_email: Adding recipient pubkey to headers: {}", rp);
                 builder = builder.header(XNostrRecipient(rp.to_string()));
             }
         }
@@ -470,7 +463,7 @@ pub async fn send_email(
         .body(body.to_string());
 
     let body_part: Option<MultiPart> = if let Some(html) = html_body {
-        println!("[RUST] send_email: Building multipart/alternative with HTML body");
+        debug_log!("[RUST] send_email: Building multipart/alternative with HTML body");
         let html_part = SinglePart::builder()
             .header(ContentType::TEXT_HTML)
             .body(html.to_string());
@@ -490,7 +483,7 @@ pub async fn send_email(
                 builder.body(body.to_string())?
             }
         } else {
-            println!("[RUST] send_email: Building multipart email with {} attachments", attachments.len());
+            debug_log!("[RUST] send_email: Building multipart email with {} attachments", attachments.len());
 
             // Create multipart/mixed; nest alternative or plain text inside
             let mut multipart = if let Some(alt) = body_part {
@@ -503,13 +496,13 @@ pub async fn send_email(
 
             // Add each attachment
             for attachment in attachments {
-                println!("[RUST] send_email: Adding attachment: {} ({})", attachment.filename, attachment.size);
+                debug_log!("[RUST] send_email: Adding attachment: {} ({})", attachment.filename, attachment.size);
 
                 // Decode base64 data
                 let attachment_data = match general_purpose::STANDARD.decode(&attachment.data) {
                     Ok(data) => data,
                     Err(e) => {
-                        println!("[RUST] send_email: Failed to decode base64 attachment data for {}: {}", attachment.filename, e);
+                        debug_log!("[RUST] send_email: Failed to decode base64 attachment data for {}: {}", attachment.filename, e);
                         continue;
                     }
                 };
@@ -554,14 +547,14 @@ pub async fn send_email(
 
     let mailer = mailer_builder.build();
 
-    println!("[RUST] send_email: Mailer built, attempting to send...");
+    debug_log!("[RUST] send_email: Mailer built, attempting to send...");
     
     // Run the blocking SMTP send operation in a separate thread with a 60-second timeout
     let mailer_clone = mailer.clone();
     let email_clone = email.clone();
     
     let send_future = task::spawn_blocking(move || {
-        println!("[RUST] send_email: Executing SMTP send in blocking thread");
+        debug_log!("[RUST] send_email: Executing SMTP send in blocking thread");
         mailer_clone.send(&email_clone)
     });
     
@@ -569,11 +562,11 @@ pub async fn send_email(
         Ok(join_res) => match join_res {
             Ok(send_res) => match send_res {
                 Ok(_) => {
-                    println!("[RUST] send_email: Email sent successfully");
+                    debug_log!("[RUST] send_email: Email sent successfully");
                     Ok(format!("Email sent successfully to {}", to_address))
                 }
                 Err(e) => {
-                    println!("[RUST] send_email: Failed to send email: {}", e);
+                    debug_log!("[RUST] send_email: Failed to send email: {}", e);
                     let error_msg = if e.to_string().to_lowercase().contains("authentication") {
                         "Authentication failed. For Gmail, make sure you're using an App Password, not your regular password.".to_string()
                     } else if e.to_string().to_lowercase().contains("connection") || e.to_string().to_lowercase().contains("host") {
@@ -589,12 +582,12 @@ pub async fn send_email(
                 }
             },
             Err(e) => {
-                println!("[RUST] send_email: Task join error: {}", e);
+                debug_log!("[RUST] send_email: Task join error: {}", e);
                 Err(anyhow::anyhow!("Task join error: {}", e))
             }
         },
         Err(_) => {
-            println!("[RUST] send_email: SMTP send operation timed out after 60 seconds");
+            debug_log!("[RUST] send_email: SMTP send operation timed out after 60 seconds");
             Err(anyhow::anyhow!("SMTP send operation timed out after 60 seconds. Check your internet connection and SMTP settings."))
         }
     }
@@ -611,31 +604,15 @@ pub async fn delete_sent_email_from_server(config: &EmailConfig, message_id: &st
     let use_tls = config.use_tls;
     let message_id = message_id.to_string();
 
-    println!("[RUST] delete_sent_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
+    debug_log!("[RUST] delete_sent_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
 
     // Run all blocking IMAP I/O on a dedicated thread to avoid blocking the Tokio runtime
     tokio::task::spawn_blocking(move || {
-        use std::net::TcpStream;
-        let addr = format!("{}:{}", host, port);
-        let is_gmail = host.contains("gmail.com");
-
-        let result = if use_tls {
-            let client = create_imap_tls_client!(&host, &addr)?;
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = delete_sent_email_from_session_sync(&mut session, is_gmail, &message_id);
-            let _ = session.logout();
-            println!("[RUST] delete_sent_email_from_server: Session closed");
-            result
-        } else {
-            let tcp_stream = TcpStream::connect(&addr)?;
-            let client = imap::Client::new(tcp_stream);
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = delete_sent_email_from_session_sync(&mut session, is_gmail, &message_id);
-            let _ = session.logout();
-            println!("[RUST] delete_sent_email_from_server: Session closed");
-            result
-        };
-        result
+        let target = ImapTarget { host, port, username, password, use_tls };
+        let is_gmail = target.host.contains("gmail.com");
+        imap_pool::with_session(&target, |session| {
+            delete_sent_email_from_session_sync(session, is_gmail, &message_id)
+        })
     }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
 }
 
@@ -664,13 +641,13 @@ fn extract_text_body(email: &mailparse::ParsedMail) -> Option<String> {
 /// Extract the text/html body from a parsed email (multipart/alternative).
 /// Returns None if no HTML part is found.
 fn extract_html_body(email: &mailparse::ParsedMail) -> Option<String> {
-    println!("[RUST] extract_html_body: top-level mimetype={}, subparts={}", email.ctype.mimetype, email.subparts.len());
+    debug_log!("[RUST] extract_html_body: top-level mimetype={}, subparts={}", email.ctype.mimetype, email.subparts.len());
     for (i, subpart) in email.subparts.iter().enumerate() {
         let ctype = &subpart.ctype;
-        println!("[RUST] extract_html_body: subpart[{}] mimetype={}", i, ctype.mimetype);
+        debug_log!("[RUST] extract_html_body: subpart[{}] mimetype={}", i, ctype.mimetype);
         if ctype.mimetype == "text/html" {
             let body = subpart.get_body().ok();
-            println!("[RUST] extract_html_body: found text/html, body length={}", body.as_ref().map(|b| b.len()).unwrap_or(0));
+            debug_log!("[RUST] extract_html_body: found text/html, body length={}", body.as_ref().map(|b| b.len()).unwrap_or(0));
             return body;
         }
         // Recurse into nested multipart
@@ -680,7 +657,7 @@ fn extract_html_body(email: &mailparse::ParsedMail) -> Option<String> {
             }
         }
     }
-    println!("[RUST] extract_html_body: no text/html found");
+    debug_log!("[RUST] extract_html_body: no text/html found");
     None
 }
 
@@ -698,7 +675,7 @@ fn delete_sent_email_from_session_sync(
         "Sent"
     };
     
-    println!("[RUST] delete_sent_email_from_session: Selecting sent folder: {}", sent_folder);
+    debug_log!("[RUST] delete_sent_email_from_session: Selecting sent folder: {}", sent_folder);
     
     // Try to select the sent folder, fallback to common variations
     let folder_selected = session.select(sent_folder).is_ok() || 
@@ -707,7 +684,7 @@ fn delete_sent_email_from_session_sync(
                          session.select("Sent").is_ok();
     
     if !folder_selected {
-        println!("[RUST] delete_sent_email_from_session: Could not select sent folder, aborting server deletion");
+        debug_log!("[RUST] delete_sent_email_from_session: Could not select sent folder, aborting server deletion");
         return Err(anyhow::anyhow!("Could not select sent folder"));
     }
     
@@ -733,28 +710,28 @@ fn delete_sent_email_from_session_sync(
     
     let mut matching_messages = std::collections::HashSet::new();
     for search_query in &search_queries {
-        println!("[RUST] delete_sent_email_from_session: Searching for email with query: {}", search_query);
+        debug_log!("[RUST] delete_sent_email_from_session: Searching for email with query: {}", search_query);
         match session.search(search_query) {
             Ok(results) => {
                 let result_count = results.len();
                 if !results.is_empty() {
                     matching_messages.extend(results);
-                    println!("[RUST] delete_sent_email_from_session: Found {} matching message(s) with query: {}", result_count, search_query);
+                    debug_log!("[RUST] delete_sent_email_from_session: Found {} matching message(s) with query: {}", result_count, search_query);
                     break; // Found results, no need to try other formats
                 }
             }
             Err(e) => {
-                println!("[RUST] delete_sent_email_from_session: Search query failed: {} - {}", search_query, e);
+                debug_log!("[RUST] delete_sent_email_from_session: Search query failed: {} - {}", search_query, e);
             }
         }
     }
     
     if matching_messages.is_empty() {
-        println!("[RUST] delete_sent_email_from_session: No email found with Message-ID (tried: {}, {}, {})", full_msg_id, normalized_msg_id, message_id.trim());
+        debug_log!("[RUST] delete_sent_email_from_session: No email found with Message-ID (tried: {}, {}, {})", full_msg_id, normalized_msg_id, message_id.trim());
         return Err(anyhow::anyhow!("Email not found on server"));
     }
     
-    println!("[RUST] delete_sent_email_from_session: Found {} matching message(s)", matching_messages.len());
+    debug_log!("[RUST] delete_sent_email_from_session: Found {} matching message(s)", matching_messages.len());
     
     // Get the message sequence number (should be just one)
     // Convert HashSet to Vec to get the first element
@@ -768,18 +745,18 @@ fn delete_sent_email_from_session_sync(
         "Trash"
     };
     
-    println!("[RUST] delete_sent_email_from_session: Moving message {} to trash folder: {}", message_seq, trash_folder);
+    debug_log!("[RUST] delete_sent_email_from_session: Moving message {} to trash folder: {}", message_seq, trash_folder);
     
     // Use MOVE command (mv method) to move the message to trash
     // This is supported by Gmail and other modern IMAP servers
     let message_seq_str = format!("{}", message_seq);
     match session.mv(&message_seq_str, trash_folder) {
         Ok(_) => {
-            println!("[RUST] delete_sent_email_from_session: Successfully moved email to trash using MOVE command");
+            debug_log!("[RUST] delete_sent_email_from_session: Successfully moved email to trash using MOVE command");
             return Ok(());
         }
         Err(e) => {
-            println!("[RUST] delete_sent_email_from_session: MOVE command failed: {}, trying COPY + DELETE", e);
+            debug_log!("[RUST] delete_sent_email_from_session: MOVE command failed: {}, trying COPY + DELETE", e);
         }
     }
     
@@ -788,12 +765,12 @@ fn delete_sent_email_from_session_sync(
     let copy_result = session.copy(&message_seq_str, trash_folder);
     match copy_result {
         Ok(_) => {
-            println!("[RUST] delete_sent_email_from_session: Successfully copied email to trash");
+            debug_log!("[RUST] delete_sent_email_from_session: Successfully copied email to trash");
             // Mark original as deleted
             session.store(&message_seq_str, "+FLAGS (\\Deleted)")?;
             // Expunge to actually delete
             session.expunge()?;
-            println!("[RUST] delete_sent_email_from_session: Successfully deleted email from sent folder");
+            debug_log!("[RUST] delete_sent_email_from_session: Successfully deleted email from sent folder");
             Ok(())
         }
         Err(e) => {
@@ -805,11 +782,11 @@ fn delete_sent_email_from_session_sync(
             };
             
             for alt_trash in alternative_trash_folders {
-                println!("[RUST] delete_sent_email_from_session: Trying alternative trash folder: {}", alt_trash);
+                debug_log!("[RUST] delete_sent_email_from_session: Trying alternative trash folder: {}", alt_trash);
                 if session.copy(&message_seq_str, alt_trash).is_ok() {
                     session.store(&message_seq_str, "+FLAGS (\\Deleted)")?;
                     session.expunge()?;
-                    println!("[RUST] delete_sent_email_from_session: Successfully moved email to {} using COPY", alt_trash);
+                    debug_log!("[RUST] delete_sent_email_from_session: Successfully moved email to {} using COPY", alt_trash);
                     return Ok(());
                 }
             }
@@ -828,28 +805,14 @@ pub async fn delete_inbox_email_from_server(config: &EmailConfig, message_id: &s
     let use_tls = config.use_tls;
     let message_id = message_id.to_string();
 
-    println!("[RUST] delete_inbox_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
+    debug_log!("[RUST] delete_inbox_email_from_server: Attempting to delete email with Message-ID: {}", message_id);
 
     tokio::task::spawn_blocking(move || {
-        use std::net::TcpStream;
-        let addr = format!("{}:{}", host, port);
-        let is_gmail = host.contains("gmail.com");
-
-        let result = if use_tls {
-            let client = create_imap_tls_client!(&host, &addr)?;
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = delete_email_from_folder_sync(&mut session, is_gmail, &message_id, &["INBOX", "nostr-mail"]);
-            let _ = session.logout();
-            result
-        } else {
-            let tcp_stream = TcpStream::connect(&addr)?;
-            let client = imap::Client::new(tcp_stream);
-            let mut session = client.login(&username, &password).map_err(|e| anyhow::anyhow!(e.0))?;
-            let result = delete_email_from_folder_sync(&mut session, is_gmail, &message_id, &["INBOX", "nostr-mail"]);
-            let _ = session.logout();
-            result
-        };
-        result
+        let target = ImapTarget { host, port, username, password, use_tls };
+        let is_gmail = target.host.contains("gmail.com");
+        imap_pool::with_session(&target, |session| {
+            delete_email_from_folder_sync(session, is_gmail, &message_id, &["INBOX", "nostr-mail"])
+        })
     }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
 }
 
@@ -863,7 +826,7 @@ fn delete_email_from_folder_sync(
     // Try each source folder until we find and delete the email
     let mut folder_selected = false;
     for folder in source_folders {
-        println!("[RUST] delete_email_from_folder_sync: Trying folder: {}", folder);
+        debug_log!("[RUST] delete_email_from_folder_sync: Trying folder: {}", folder);
         if session.select(folder).is_ok() {
             folder_selected = true;
 
@@ -886,7 +849,7 @@ fn delete_email_from_folder_sync(
                 if let Ok(results) = session.search(search_query) {
                     if !results.is_empty() {
                         matching_messages.extend(results);
-                        println!("[RUST] delete_email_from_folder_sync: Found {} match(es) in {} with query: {}", matching_messages.len(), folder, search_query);
+                        debug_log!("[RUST] delete_email_from_folder_sync: Found {} match(es) in {} with query: {}", matching_messages.len(), folder, search_query);
                         break;
                     }
                 }
@@ -914,11 +877,11 @@ fn move_to_trash(
     let trash_folder = if is_gmail { "[Gmail]/Trash" } else { "Trash" };
     let seq_str = format!("{}", message_seq);
 
-    println!("[RUST] move_to_trash: Moving message {} to {}", message_seq, trash_folder);
+    debug_log!("[RUST] move_to_trash: Moving message {} to {}", message_seq, trash_folder);
 
     // Try MOVE first
     if session.mv(&seq_str, trash_folder).is_ok() {
-        println!("[RUST] move_to_trash: Successfully moved via MOVE command");
+        debug_log!("[RUST] move_to_trash: Successfully moved via MOVE command");
         return Ok(());
     }
 
@@ -933,7 +896,7 @@ fn move_to_trash(
         if session.copy(&seq_str, folder).is_ok() {
             session.store(&seq_str, "+FLAGS (\\Deleted)")?;
             session.expunge()?;
-            println!("[RUST] move_to_trash: Successfully moved to {} via COPY", folder);
+            debug_log!("[RUST] move_to_trash: Successfully moved to {} via COPY", folder);
             return Ok(());
         }
     }
@@ -941,72 +904,386 @@ fn move_to_trash(
     Err(anyhow::anyhow!("Failed to move email to trash"))
 }
 
+/// Move an inbox email (identified by Message-ID) to an arbitrary IMAP folder.
+///
+/// Mirrors `delete_inbox_email_from_server`, but instead of moving the matched
+/// message to trash it moves it into `target_folder`, creating that folder if it
+/// does not already exist. The message may live anywhere (it could have been
+/// moved before), so the search spans the user's real folders rather than a fixed
+/// `INBOX`/`nostr-mail` pair; if it's already in `target_folder` the move is a
+/// no-op success.
+pub async fn move_inbox_email_to_folder(
+    config: &EmailConfig,
+    message_id: &str,
+    target_folder: &str,
+) -> Result<()> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+    let target_folder = target_folder.to_string();
+
+    debug_log!("[RUST] move_inbox_email_to_folder: Moving Message-ID {} to folder {}", message_id, target_folder);
+
+    tokio::task::spawn_blocking(move || {
+        let target = ImapTarget { host, port, username, password, use_tls };
+        imap_pool::with_session(&target, |session| {
+            let source_folders = searchable_source_folders(session, &target_folder);
+            move_email_to_folder_sync(session, &message_id, &target_folder, &source_folders)
+        })
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+/// List the folders worth searching for a message we're about to move, ordered so
+/// the cheap/likely ones come first: the target itself (to detect an already-there
+/// no-op), then INBOX and nostr-mail, then everything else. Gmail's "All Mail" is
+/// excluded — it contains every message (labels, not folders), so it would always
+/// match and make the move ambiguous. Falls back to INBOX/nostr-mail if LIST fails.
+fn searchable_source_folders(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    target_folder: &str,
+) -> Vec<String> {
+    let mut folders: Vec<String> = match session.list(Some(""), Some("*")) {
+        Ok(mailboxes) => mailboxes
+            .iter()
+            .map(|mb| mb.name().to_string())
+            .filter(|n| !n.to_lowercase().contains("all mail"))
+            .collect(),
+        Err(_) => vec!["INBOX".to_string(), "nostr-mail".to_string()],
+    };
+
+    let rank = |f: &str| -> u8 {
+        let fl = f.to_lowercase();
+        if fl == target_folder.to_lowercase() {
+            0
+        } else if fl == "inbox" {
+            1
+        } else if fl == "nostr-mail" {
+            2
+        } else {
+            3
+        }
+    };
+    // Stable sort preserves the server's order within each rank.
+    folders.sort_by_key(|f| rank(f));
+    folders
+}
+
+/// Find an email by Message-ID across `source_folders` and move it to
+/// `target_folder`. Finding it already in `target_folder` is a no-op success.
+fn move_email_to_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_id: &str,
+    target_folder: &str,
+    source_folders: &[String],
+) -> Result<()> {
+    let mut folder_selected = false;
+    for folder in source_folders {
+        debug_log!("[RUST] move_email_to_folder_sync: Trying folder: {}", folder);
+        if session.select(folder).is_ok() {
+            folder_selected = true;
+
+            let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+            let full_msg_id = if normalized_msg_id.contains('@') {
+                format!("<{}>", normalized_msg_id)
+            } else {
+                format!("<{}@nostr-mail>", normalized_msg_id)
+            };
+
+            let search_queries = vec![
+                format!("HEADER Message-ID \"{}\"", full_msg_id),
+                format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+                format!("HEADER Message-ID \"{}\"", message_id.trim()),
+            ];
+
+            let mut matching_messages = std::collections::HashSet::new();
+            for search_query in &search_queries {
+                if let Ok(results) = session.search(search_query) {
+                    if !results.is_empty() {
+                        matching_messages.extend(results);
+                        debug_log!("[RUST] move_email_to_folder_sync: Found {} match(es) in {}", matching_messages.len(), folder);
+                        break;
+                    }
+                }
+            }
+
+            if !matching_messages.is_empty() {
+                // Already in the destination — nothing to move.
+                if folder.eq_ignore_ascii_case(target_folder) {
+                    debug_log!("[RUST] move_email_to_folder_sync: Already in target {}, no-op", target_folder);
+                    return Ok(());
+                }
+                let message_seq = *matching_messages.iter().next().unwrap();
+                return move_message_to_folder(session, message_seq, target_folder);
+            }
+        }
+    }
+
+    if !folder_selected {
+        return Err(anyhow::anyhow!("Could not select any source folder"));
+    }
+    Err(anyhow::anyhow!("Email not found on server"))
+}
+
+/// Move a message (by sequence number) into `target_folder`, creating the folder
+/// if necessary. Uses the IMAP MOVE command, falling back to COPY + DELETE +
+/// EXPUNGE on servers that don't support MOVE.
+fn move_message_to_folder(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_seq: u32,
+    target_folder: &str,
+) -> Result<()> {
+    let seq_str = format!("{}", message_seq);
+
+    debug_log!("[RUST] move_message_to_folder: Moving message {} to {}", message_seq, target_folder);
+
+    // When the user deliberately files a message INTO a spam folder, mark it
+    // \Seen first. Spam rescue only pulls UNSEEN mail out of spam, so a read
+    // message sitting in spam is the user's "leave it here" signal — and because
+    // it's a server flag it's the same answer on every device. Our fetches use
+    // BODY.PEEK[] (reading a body never sets \Seen), and the read-state sync
+    // (`mark_inbox_email_seen_on_server`) only sets \Seen in non-spam inbox
+    // folders — so within spam folders this move path is the only thing that
+    // ever sets \Seen, and that flag must not be auto-cleared on spam mail.
+    // IMAP COPY/MOVE preserve flags, so setting it before the move is enough.
+    if is_spam_folder_name(target_folder) {
+        let _ = session.store(&seq_str, "+FLAGS (\\Seen)");
+    }
+
+    // Try MOVE first.
+    if session.mv(&seq_str, target_folder).is_ok() {
+        debug_log!("[RUST] move_message_to_folder: Successfully moved via MOVE command");
+        return Ok(());
+    }
+
+    // The target folder may not exist yet — create it and retry MOVE.
+    if session.create(target_folder).is_ok() {
+        debug_log!("[RUST] move_message_to_folder: Created folder {}", target_folder);
+        if session.mv(&seq_str, target_folder).is_ok() {
+            return Ok(());
+        }
+    }
+
+    // Fallback for servers without MOVE support: COPY + flag deleted + EXPUNGE.
+    if session.copy(&seq_str, target_folder).is_ok() {
+        session.store(&seq_str, "+FLAGS (\\Deleted)")?;
+        session.expunge()?;
+        debug_log!("[RUST] move_message_to_folder: Successfully moved to {} via COPY", target_folder);
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!("Failed to move email to folder {}", target_folder))
+}
+
+/// Find which of `candidate_folders` currently contains the message identified by
+/// `message_id`, returning the first match in the given order (or None if it
+/// isn't found in any). Inbox emails carry no folder field, so the server is the
+/// only source of truth for the move picker's "(current)" label once a message
+/// has been moved. Callers should order cheap/likely folders first; the search
+/// stops at the first hit.
+pub async fn find_message_folder(
+    config: &EmailConfig,
+    message_id: &str,
+    candidate_folders: Vec<String>,
+) -> Result<Option<String>> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let target = ImapTarget { host, port, username, password, use_tls };
+        imap_pool::with_session(&target, |session| {
+            find_message_folder_sync(session, &message_id, &candidate_folders)
+        })
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+fn find_message_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_id: &str,
+    candidate_folders: &[String],
+) -> Result<Option<String>> {
+    let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+    let full_msg_id = if normalized_msg_id.contains('@') {
+        format!("<{}>", normalized_msg_id)
+    } else {
+        format!("<{}@nostr-mail>", normalized_msg_id)
+    };
+    let search_queries = [
+        format!("HEADER Message-ID \"{}\"", full_msg_id),
+        format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+        format!("HEADER Message-ID \"{}\"", message_id.trim()),
+    ];
+
+    for folder in candidate_folders {
+        if session.select(folder).is_err() {
+            continue;
+        }
+        for search_query in &search_queries {
+            if let Ok(results) = session.search(search_query) {
+                if !results.is_empty() {
+                    return Ok(Some(folder.clone()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve the logged-in user's configured inbox source folders, with spam/junk
+/// folders filtered out. Mirrors how the sync chooses folders: the `inbox_folder`
+/// setting (one folder per line) when set, otherwise the provider-aware
+/// `default_inbox_folders`. Spam/junk folders are excluded because the read-state
+/// sync must not touch the `\Seen` flag inside spam folders, where that flag is
+/// reserved as the spam-rescue "user filed this here" signal.
+pub fn configured_inbox_folders_excluding_spam(
+    inbox_folder_setting: Option<&str>,
+    imap_host: &str,
+) -> Vec<String> {
+    let configured: Vec<String> = inbox_folder_setting
+        .map(|s| {
+            s.split('\n')
+                .map(|f| f.trim().to_string())
+                .filter(|f| !f.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let folders = if configured.is_empty() {
+        default_inbox_folders(imap_host)
+    } else {
+        configured
+    };
+    folders.into_iter().filter(|f| !is_spam_folder_name(f)).collect()
+}
+
+/// Mark an inbox email (identified by Message-ID) as `\Seen` on the IMAP server,
+/// so read state set in the app propagates to other clients/devices.
+///
+/// `source_folders` is the user's configured inbox folders with spam/junk
+/// excluded (see `configured_inbox_folders_excluding_spam`). Restricting the
+/// search to non-spam folders is deliberate: inside spam/junk folders the
+/// `\Seen` flag is reserved as the "user deliberately filed this here" signal
+/// that spam rescue keys off of (see `move_message_to_folder`), so the read path
+/// must never set it there.
+pub async fn mark_inbox_email_seen_on_server(
+    config: &EmailConfig,
+    message_id: &str,
+    source_folders: &[String],
+) -> Result<()> {
+    let host = config.imap_host.clone();
+    let port = config.imap_port;
+    let username = config.email_address.clone();
+    let password = config.password.clone();
+    let use_tls = config.use_tls;
+    let message_id = message_id.to_string();
+    let source_folders: Vec<String> = source_folders.to_vec();
+
+    debug_log!("[RUST] mark_inbox_email_seen_on_server: Marking Message-ID {} as \\Seen in {:?}", message_id, source_folders);
+
+    tokio::task::spawn_blocking(move || {
+        let target = ImapTarget { host, port, username, password, use_tls };
+        imap_pool::with_session(&target, |session| {
+            set_seen_in_folder_sync(session, &message_id, &source_folders)
+        })
+    }).await.map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+/// Find an email by Message-ID across `source_folders` and set its `\Seen` flag.
+/// Stops at the first folder where the message is found. Mirrors the Message-ID
+/// search used by `delete_email_from_folder_sync` / `move_email_to_folder_sync`.
+fn set_seen_in_folder_sync(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    message_id: &str,
+    source_folders: &[String],
+) -> Result<()> {
+    let mut folder_selected = false;
+    for folder in source_folders {
+        debug_log!("[RUST] set_seen_in_folder_sync: Trying folder: {}", folder);
+        if session.select(folder).is_ok() {
+            folder_selected = true;
+
+            let normalized_msg_id = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+            let full_msg_id = if normalized_msg_id.contains('@') {
+                format!("<{}>", normalized_msg_id)
+            } else {
+                format!("<{}@nostr-mail>", normalized_msg_id)
+            };
+
+            let search_queries = vec![
+                format!("HEADER Message-ID \"{}\"", full_msg_id),
+                format!("HEADER Message-ID \"{}\"", normalized_msg_id),
+                format!("HEADER Message-ID \"{}\"", message_id.trim()),
+            ];
+
+            let mut matching_messages = std::collections::HashSet::new();
+            for search_query in &search_queries {
+                if let Ok(results) = session.search(search_query) {
+                    if !results.is_empty() {
+                        matching_messages.extend(results);
+                        break;
+                    }
+                }
+            }
+
+            if !matching_messages.is_empty() {
+                let seq_list = matching_messages
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                session.store(&seq_list, "+FLAGS (\\Seen)")?;
+                debug_log!("[RUST] set_seen_in_folder_sync: marked {} message(s) \\Seen in {}", matching_messages.len(), folder);
+                return Ok(());
+            }
+        }
+    }
+
+    if !folder_selected {
+        return Err(anyhow::anyhow!("Could not select any source folder"));
+    }
+    Err(anyhow::anyhow!("Email not found on server"))
+}
+
 /// List available IMAP folders/mailboxes
 pub async fn list_imap_folders(config: &EmailConfig) -> Result<Vec<String>> {
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let use_tls = config.use_tls;
-    let addr = format!("{}:{}", host, port);
-    
-    println!("[RUST] list_imap_folders: Connecting to IMAP server: {}", addr);
-    
-    let mailboxes = if use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
+    let target = ImapTarget::from_config(config);
+    debug_log!("[RUST] list_imap_folders: Connecting to IMAP server: {}:{}", config.imap_host, config.imap_port);
+
+    let folder_names = imap_pool::with_session(&target, |session| {
         let mailboxes = session.list(Some(""), Some("*"))?;
-        session.logout()?;
-        mailboxes
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let mailboxes = session.list(Some(""), Some("*"))?;
-        session.logout()?;
-        mailboxes
-    };
-    
-    let folder_names: Vec<String> = mailboxes.iter()
-        .map(|mb| mb.name().to_string())
-        .collect();
-    
-    println!("[RUST] list_imap_folders: Found {} folders", folder_names.len());
+        Ok(mailboxes.iter().map(|mb| mb.name().to_string()).collect::<Vec<String>>())
+    })?;
+
+    debug_log!("[RUST] list_imap_folders: Found {} folders", folder_names.len());
     Ok(folder_names)
 }
 
 /// Test IMAP connection with the given config. Returns Ok(()) if successful, Err otherwise.
 pub async fn test_imap_connection(config: &EmailConfig) -> Result<()> {
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let use_tls = config.use_tls;
+    let target = ImapTarget::from_config(config);
+    debug_log!("[RUST] Testing IMAP connection to: {}:{} (TLS: {})", config.imap_host, config.imap_port, config.use_tls);
 
-    let addr = format!("{}:{}", host, port);
-    
-    println!("[RUST] Testing IMAP connection to: {}", addr);
-    println!("[RUST] Host: {}, Port: {}, Use TLS: {}", host, port, use_tls);
+    // checkout connects (or validates a warm connection), proving credentials
+    // and reachability; with_session returns it to the pool so the test also
+    // warms the pool for the next real operation.
+    imap_pool::with_session(&target, |session| {
+        session.noop().map_err(|e| anyhow::anyhow!("{}", e))
+    })?;
 
-    if use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        session.logout()?;
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        session.logout()?;
-    }
-    println!("[RUST] IMAP connection test successful");
+    debug_log!("[RUST] IMAP connection test successful");
     Ok(())
 }
 
 /// Test SMTP connection with the given config. Returns Ok(()) if successful, Err otherwise.
 pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
-    println!("[RUST] test_smtp_connection: Starting SMTP connection test");
-    println!("[RUST] test_smtp_connection: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
-    println!("[RUST] test_smtp_connection: Email: {}, Use TLS: {}", config.email_address, config.use_tls);
+    debug_log!("[RUST] test_smtp_connection: Starting SMTP connection test");
+    debug_log!("[RUST] test_smtp_connection: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
+    debug_log!("[RUST] test_smtp_connection: Email: {}, Use TLS: {}", config.email_address, config.use_tls);
     
     let creds = Credentials::new(config.email_address.clone(), config.password.clone());
 
@@ -1026,12 +1303,12 @@ pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
 
     let mailer = mailer_builder.build();
 
-    println!("[RUST] test_smtp_connection: Mailer built, testing connection...");
+    debug_log!("[RUST] test_smtp_connection: Mailer built, testing connection...");
     
     // Test the connection with a timeout
     let mailer_clone = mailer.clone();
     let test_future = task::spawn_blocking(move || {
-        println!("[RUST] test_smtp_connection: Executing connection test in blocking thread");
+        debug_log!("[RUST] test_smtp_connection: Executing connection test in blocking thread");
         mailer_clone.test_connection()
     });
     
@@ -1039,11 +1316,11 @@ pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
         Ok(join_res) => match join_res {
             Ok(test_res) => match test_res {
                 Ok(_) => {
-                    println!("[RUST] test_smtp_connection: SMTP connection test successful");
+                    debug_log!("[RUST] test_smtp_connection: SMTP connection test successful");
                     Ok(())
                 }
                 Err(e) => {
-                    println!("[RUST] test_smtp_connection: SMTP connection test failed: {}", e);
+                    debug_log!("[RUST] test_smtp_connection: SMTP connection test failed: {}", e);
                     let error_msg = if e.to_string().to_lowercase().contains("authentication") {
                         "Authentication failed. For Gmail, make sure you're using an App Password, not your regular password.".to_string()
                     } else if e.to_string().to_lowercase().contains("connection") || e.to_string().to_lowercase().contains("host") {
@@ -1059,12 +1336,12 @@ pub async fn test_smtp_connection(config: &EmailConfig) -> Result<()> {
                 }
             },
             Err(e) => {
-                println!("[RUST] test_smtp_connection: Task join error: {}", e);
+                debug_log!("[RUST] test_smtp_connection: Task join error: {}", e);
                 Err(anyhow::anyhow!("SMTP connection join error: {}", e))
             }
         },
         Err(_) => {
-            println!("[RUST] test_smtp_connection: SMTP connection test timed out after 30 seconds");
+            debug_log!("[RUST] test_smtp_connection: SMTP connection test timed out after 30 seconds");
             Err(anyhow::anyhow!("SMTP connection test timed out after 30 seconds. Check your internet connection and SMTP settings."))
         }
     }
@@ -1153,7 +1430,7 @@ fn extract_attachments_recursive(
             };
             
             attachments.push(db_attachment);
-            println!("[RUST] Extracted attachment: {} ({} bytes)", filename, attachment_data.len());
+            debug_log!("[RUST] Extracted attachment: {} ({} bytes)", filename, attachment_data.len());
         }
     }
 }
@@ -1224,7 +1501,7 @@ pub fn extract_sender_pubkey_with_armor_fallback(raw_headers: &str, body_text: &
                 if let Ok(pk) = nostr_sdk::prelude::PublicKey::from_hex(pubkey_hex) {
                     // to_bech32 is infallible for PublicKey
                     let npub = nostr_sdk::prelude::ToBech32::to_bech32(&pk).expect("bech32 encode");
-                    println!("[RUST] extract_sender_pubkey_with_armor_fallback: using verified armor pubkey {} ({})", &npub[..std::cmp::min(npub.len(), 20)], &pubkey_hex[..std::cmp::min(pubkey_hex.len(), 16)]);
+                    debug_log!("[RUST] extract_sender_pubkey_with_armor_fallback: using verified armor pubkey {} ({})", &npub[..std::cmp::min(npub.len(), 20)], &pubkey_hex[..std::cmp::min(pubkey_hex.len(), 16)]);
                     return Some(npub);
                 }
             }
@@ -1319,34 +1596,70 @@ fn extract_armor_body_content(body: &str) -> Option<&str> {
 /// `decode_from_language` path used by `try_glossia_decode_to_bytes`
 /// assumes a leading bitpack header word and is wrong for raw fixed
 /// payloads (it round-trips by luck for high-entropy inputs).
-fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<u8>> {
-    use std::collections::HashSet;
+/// The only (language, wordlist) pairs nostr-mail ever emits as `bitpack_fixed`
+/// raw payloads — Latin and English-BIP39 (see `glossia_roundtrip_to_bytes`'s
+/// encoding map and the per-field `glossia_encoding_*` settings). `detect_dialect`
+/// will otherwise also propose large *cover-word* vocabularies (e.g.
+/// `english/lemmas`, `english/ngram` — 2^17 words each) because the Latin payload
+/// words incidentally overlap them, but those are never valid payload encodings
+/// here. Probing them cost a ~50ms cold `WordlistTree` build each (the "190ms
+/// decode_sig_and_pubkey" outlier) for a tree no nostr-mail payload is encoded
+/// against. We feed this allowlist to `glossia::detect_dialect_with`, which drops
+/// non-allowed wordlists *before* its binary searches (glossia #14).
+const PAYLOAD_WORDLISTS: &[(&str, &str)] = &[("latin", "default"), ("english", "bip39")];
 
+fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<u8>> {
     let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
     if words.is_empty() {
         return None;
     }
 
-    let candidates = glossia::detect_dialect(&words);
+    let mut filter = glossia::DialectFilter::new();
+    for (language, wordlist) in PAYLOAD_WORDLISTS {
+        filter = filter.allow_wordlist(*language, *wordlist);
+    }
+    let candidates = glossia::detect_dialect_with(&words, &filter);
     if candidates.is_empty() {
         return None;
     }
 
     for cand in candidates {
-        let payload_words = match glossia::load_payload_words_for_wordlist(&cand.language, &cand.wordlist) {
-            Ok(w) => w,
+        // Shared, process-wide-cached tree (glossia #12) — built at most once per
+        // dialect across glossia's encode pipeline and our decode path. Its
+        // internal index is already lowercased, so `contains()` IS the membership
+        // check; no separate payload set is needed.
+        let payload_tree = match glossia::cached_payload_tree(&cand.language, &cand.wordlist) {
+            Ok(t) => t,
             Err(_) => continue,
         };
-        let payload_tree = glossia::WordlistTree::new(payload_words.clone());
-        let payload_set: HashSet<String> = payload_words.iter().map(|w| w.to_lowercase()).collect();
 
-        let extracted: Vec<String> = text
+        // Normalize every input token the same way (lowercase, strip leading/trailing
+        // non-alphanumerics, drop empties), then split into kept-vs-dropped against
+        // the payload wordlist. We need the unfiltered set to enforce strictness below.
+        let all_tokens: Vec<String> = text
             .split_whitespace()
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
-            .filter(|w| payload_set.contains(w.as_str()))
+            .filter(|w| !w.is_empty())
+            .collect();
+        let extracted: Vec<String> = all_tokens
+            .iter()
+            .filter(|w| payload_tree.contains(w.as_str()))
+            .cloned()
             .collect();
 
         if extracted.is_empty() {
+            continue;
+        }
+
+        // Strictness: this function is meant for pure bitpack_fixed-encoded blobs
+        // (all words from the same wordlist, no markers, no mixed content). If the
+        // payload-word filter dropped any tokens, the input isn't pure — e.g. it's
+        // a SIGNATURE block whose last line is an npub. Bail so decode_sig_and_pubkey
+        // falls through to Phase 2 (separate-line sig + pubkey) instead of padding
+        // the partial bit-stream up to expected_bytes with zeros and yielding
+        // garbage sig/pubkey bytes that crash verification with "malformed public
+        // key". See `manifest_attachment_default_jsformat_inline_sig_verifies` test.
+        if extracted.len() != all_tokens.len() {
             continue;
         }
 
@@ -1368,36 +1681,12 @@ fn try_decode_raw_base_n_fixed(text: &str, expected_bytes: usize) -> Option<Vec<
 /// Uses catch_unwind because glossia's codec can panic on malformed input
 /// (e.g. partial wordlist matches with bad padding).
 fn try_glossia_decode_to_bytes(text: &str) -> Option<Vec<u8>> {
-    let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
-    if words.is_empty() {
-        return None;
-    }
-    let best = glossia::detect_dialect_best(&words)?;
-    if best.hit_rate < 0.3 {
-        return None;
-    }
-    let text_owned = text.to_string();
-    let language = best.language.clone();
-    let wordlist = best.wordlist.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        glossia::decode_from_language(&text_owned, &language, &wordlist, false)
-    }));
-    let decoded = match result {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => {
-            println!("[RUST] try_glossia_decode_to_bytes: decode error: {:?}", e);
-            return None;
-        }
-        Err(_) => {
-            println!("[RUST] try_glossia_decode_to_bytes: glossia panicked during decode, skipping");
-            return None;
-        }
-    };
+    let cached = glossia_detect_and_decode_cached(text)?;
     // decode_from_language returns hex when bytes aren't valid UTF-8 (i.e. binary ciphertext)
-    if let Some(bytes) = glossia::hex_decode(&decoded) {
+    if let Some(bytes) = glossia::hex_decode(&cached.decoded) {
         Some(bytes)
     } else {
-        Some(decoded.into_bytes())
+        Some(cached.decoded.clone().into_bytes())
     }
 }
 
@@ -1423,7 +1712,7 @@ pub fn glossia_roundtrip_to_bytes(text: &str, encoding: &str) -> Option<Vec<u8>>
     let encoded = match result {
         Ok(Ok((encoded_text, _, _, _))) => encoded_text,
         _ => {
-            println!("[RUST] glossia_roundtrip_to_bytes: encode failed for encoding={}", encoding);
+            debug_log!("[RUST] glossia_roundtrip_to_bytes: encode failed for encoding={}", encoding);
             return None;
         }
     };
@@ -1609,34 +1898,36 @@ fn try_decode_as_signature(text: &str) -> Option<String> {
     None
 }
 
-/// Decode signature block content into (sig_hex, pubkey_hex).
-/// Three-phase detection for backward compatibility:
-///   1. Combined 96-byte (old format): glossia→96 bytes or hex 192 chars
-///   2. Blank-line split (new format): sig and pubkey separated by empty line
-///   3. Last-line heuristic: last line is npub/hex pubkey, rest is sig
+/// Decode the content of a SIGNATURE block into (sig_hex, pubkey_hex).
+///
+/// The wire format priority follows the Cap'n Proto schema
+/// (`schema/nostr_mail.capnp` lines 188-197):
+///
+/// ```text
+/// CANONICAL (current emit format — JS encodeSigPubkey with default settings):
+///   <signature: glossia-encoded or hex — 64 bytes>
+///   <pubkey:    glossia-encoded, hex, or npub (bech32) — 32 bytes>
+///
+/// LEGACY (must-also-accept, never re-emitted by this codebase):
+///   <combined 96-byte glossia or hex of sig||pubkey on a single line>
+/// ```
+///
+/// We try the canonical two-line format FIRST. Doing the legacy
+/// combined-96 attempts first is what caused the
+/// "inline signature invalid" / "malformed public key" bug fixed in
+/// `0a8b3e2`: try_decode_raw_base_n_fixed would silently consume the
+/// canonical format (dropping the npub line as a non-payload token)
+/// and zero-pad the partial bit-stream up to 96 bytes, producing a
+/// garbage sig+pubkey pair instead of letting Phase 2 fire. With this
+/// ordering Phase 2 always wins for canonical inputs, and the legacy
+/// phases are a strict fallback for older messages.
+///
+/// Returns `Some((sig_hex, pubkey_hex))` for sig (128-char hex / 64 bytes)
+/// and pubkey (64-char hex / 32 bytes), or `None` if no format matched.
 fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
-    // Phase 1a: Combined 96-byte (raw bitpack_fixed — matches frontend's
-    // glossia_encode_raw_base_n on the encode side).
-    if let Some(bytes) = try_decode_raw_base_n_fixed(content, 96) {
-        let sig_hex = hex::encode(&bytes[..64]);
-        let pubkey_hex = hex::encode(&bytes[64..]);
-        return Some((sig_hex, pubkey_hex));
-    }
-
-    // Phase 1b: Legacy combined 96-byte via decode_from_language (body-dialect).
-    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
-        if bytes.len() == 96 {
-            let sig_hex = hex::encode(&bytes[..64]);
-            let pubkey_hex = hex::encode(&bytes[64..]);
-            return Some((sig_hex, pubkey_hex));
-        }
-    }
-    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
-    if stripped.len() == 192 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Some((stripped[..128].to_string(), stripped[128..].to_string()));
-    }
-
-    // Phase 2: Default mode — glossia sig + npub/hex pubkey on last line
+    // ── Canonical: two-line sig + pubkey ────────────────────────────────
+    // Last non-empty line is the pubkey (glossia, hex, or npub); preceding
+    // lines together form the signature payload (glossia or hex).
     let lines: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     if lines.len() >= 2 {
         let last = lines[lines.len() - 1];
@@ -1646,6 +1937,29 @@ fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
                 return Some((sig, pk));
             }
         }
+    }
+
+    // ── Legacy: combined 96-byte payload ────────────────────────────────
+    // Strict bitpack_fixed: try_decode_raw_base_n_fixed rejects mixed-token
+    // inputs (since 0a8b3e2), so this only fires for genuine combined
+    // payloads now — keeping it as a safety net for old archived mail.
+    if let Some(bytes) = try_decode_raw_base_n_fixed(content, 96) {
+        let sig_hex = hex::encode(&bytes[..64]);
+        let pubkey_hex = hex::encode(&bytes[64..]);
+        return Some((sig_hex, pubkey_hex));
+    }
+    // Legacy body-dialect glossia (decode_from_language) variant.
+    if let Some(bytes) = try_glossia_decode_to_bytes(content) {
+        if bytes.len() == 96 {
+            let sig_hex = hex::encode(&bytes[..64]);
+            let pubkey_hex = hex::encode(&bytes[64..]);
+            return Some((sig_hex, pubkey_hex));
+        }
+    }
+    // Legacy raw 192-char hex (whitespace stripped).
+    let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.len() == 192 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some((stripped[..128].to_string(), stripped[128..].to_string()));
     }
 
     None
@@ -1663,22 +1977,77 @@ fn decode_sig_and_pubkey(content: &str) -> Option<(String, String)> {
 ///
 /// Returns a serde-friendly ParsedArmorMessage for Tauri JSON IPC.
 /// All serde fields are derived from reading the capnp message — nothing bypasses the schema.
+/// Process-wide cache for parse_armor_components results. Keyed by hash of the
+/// line-ending-normalized armor text — both decrypt and verify Tauri commands
+/// call into this function with the same body, and on first parse we walk the
+/// returned tree to pre-populate sub-tree entries (one per nesting level), so
+/// verify_all_signatures' recursive parse calls hit cache too. Across thread
+/// reopens the entire parse becomes a HashMap lookup.
+static PARSE_ARMOR_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, crate::types::ParsedArmorMessage>>>
+    = std::sync::OnceLock::new();
+
+fn hash_armor_text(text: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Recursively insert each nested level of the parsed tree into the cache.
+/// Each level's cache key is hash(level.quoted_armor_text), matching what a
+/// top-level parse_armor_components(quoted_armor_text) would compute.
+fn populate_parse_subtree_cache(
+    node: &crate::types::ParsedArmorMessage,
+    cache: &mut std::collections::HashMap<u64, crate::types::ParsedArmorMessage>,
+) {
+    if let (Some(quoted_text), Some(quoted_box)) = (node.quoted_armor_text.as_ref(), node.quoted.as_ref()) {
+        let key = hash_armor_text(quoted_text);
+        cache.entry(key).or_insert_with(|| (**quoted_box).clone());
+        populate_parse_subtree_cache(quoted_box, cache);
+    }
+}
+
 pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedArmorMessage> {
     use crate::nostr_mail_capnp;
 
+    // Normalize line endings up front so the cache key doesn't fragment between
+    // callers (verify_all_signatures passes raw \r\n text from the DB, decrypt_email_body_pipeline
+    // passes its own pre-normalized copy). The downstream populate_armor_from_text
+    // also normalizes, but that's a cheap no-op on already-normalized input.
+    let normalized: std::borrow::Cow<str> = if armor_text.contains("\r\n") {
+        std::borrow::Cow::Owned(armor_text.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(armor_text)
+    };
+    let cache_key = hash_armor_text(&normalized);
+
+    let cache_map = PARSE_ARMOR_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(cached) = cache_map.lock().unwrap().get(&cache_key) {
+        debug_log!("[RUST-PERF] parse_armor cache HIT key={:x} (in={}b, has_quoted={})",
+            cache_key, armor_text.len(), cached.quoted.is_some());
+        return Some(cached.clone());
+    }
+
     let preview: String = armor_text.chars().take(120).collect();
-    println!("[RUST] parse_armor_components: input length={} preview={:?}", armor_text.len(), preview);
+    debug_log!("[RUST] parse_armor_components: input length={} preview={:?}", armor_text.len(), preview);
+
+    let perf = std::time::Instant::now();
 
     // Build the capnp ArmorMessage — this is the parsing target
+    let perf_populate = std::time::Instant::now();
     let mut capnp_msg = ::capnp::message::Builder::new_default();
     let (prefix_text, raw_quoted_text) = {
         let armor_builder = capnp_msg.init_root::<nostr_mail_capnp::armor_message::Builder>();
-        populate_armor_from_text(armor_builder, armor_text)?
+        populate_armor_from_text(armor_builder, &normalized)?
     };
+    let populate_ms = perf_populate.elapsed().as_millis();
 
     // Read the capnp message → serde struct (all fields derived from capnp)
+    let perf_serde = std::time::Instant::now();
     let reader = capnp_msg.get_root_as_reader::<nostr_mail_capnp::armor_message::Reader>().ok()?;
     let mut result = armor_message_to_serde(reader);
+    let serde_ms = perf_serde.elapsed().as_millis();
     result.prefix_text = prefix_text;
     // Override quoted_armor_text with the verbatim text from the input (the capnp
     // encoded_content field only stores the inner body text, losing delimiters,
@@ -1687,9 +2056,31 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
         result.quoted_armor_text = raw_quoted_text;
     }
 
-    println!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
+    debug_log!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
         result.body_type, result.encryption_nip, result.signature_hex.is_some(),
         result.seal_pubkey_hex.is_some(), result.quoted.is_some());
+    debug_log!("[RUST-PERF] parse_armor cache MISS key={:x} compute={}ms (in={}b, has_quoted={})",
+        cache_key, perf.elapsed().as_millis(), armor_text.len(), result.quoted.is_some());
+
+    // Insert outer + each nested level under its own hash key so
+    // verify_all_signatures' recursive parse calls hit cache as well.
+    let perf_subtree = std::time::Instant::now();
+    {
+        let mut guard = cache_map.lock().unwrap();
+        maybe_evict(&mut guard);
+        guard.insert(cache_key, result.clone());
+        populate_parse_subtree_cache(&result, &mut guard);
+    }
+    let subtree_ms = perf_subtree.elapsed().as_millis();
+
+    // Sub-phase breakdown of the parse_armor cache-miss path. Lets us localize the
+    // ~500ms baseline: populate = text state machine + capnp build, serde =
+    // capnp→struct conversion (incl. NIP-04 glossia decode, deferred for NIP-44),
+    // subtree_cache = recursive clone of nested levels into the parse cache.
+    debug_log!("[RUST-PERF] parse_armor breakdown key={:x} total={}ms = populate={}ms + serde={}ms + subtree_cache={}ms (in={}b, normalized={}b, body={}b, nip={:?}, has_quoted={})",
+        cache_key, perf.elapsed().as_millis(), populate_ms, serde_ms, subtree_ms,
+        armor_text.len(), normalized.len(), result.body_text.len(),
+        result.encryption_nip, result.quoted.is_some());
 
     Some(result)
 }
@@ -1721,7 +2112,7 @@ fn populate_armor_from_text(
     let armor_start = match armor_start {
         Some(idx) => idx,
         None => {
-            println!("[RUST] populate_armor_from_text: no armor delimiter found");
+            debug_log!("[RUST] populate_armor_from_text: no armor delimiter found");
             return None;
         }
     };
@@ -1800,7 +2191,7 @@ fn populate_armor_from_text(
     }
 
     if state == "before" {
-        println!("[RUST] populate_armor_from_text: state machine never left 'before'");
+        debug_log!("[RUST] populate_armor_from_text: state machine never left 'before'");
         return None;
     }
 
@@ -1823,8 +2214,16 @@ fn populate_armor_from_text(
             nostr_mail_capnp::NipVersion::Nip44
         };
         enc.set_nip(nip_version);
-        if let Some(bytes) = decode_armor_section(&body_text) {
-            enc.set_ciphertext(&bytes);
+        // Only NIP-04 actually consumes the pre-decoded ciphertext bytes (used as
+        // the MAC payload during signature verification, see decrypt_armor_tree).
+        // NIP-44 re-runs glossia decode in decrypt_single_block on the encoded
+        // body_text and never reads enc.ciphertext, so doing the decode here
+        // wastes a full glossia detect+decode round trip per nesting level — the
+        // single biggest cost in parse_armor_components according to profiling.
+        if matches!(nip_version, nostr_mail_capnp::NipVersion::Nip04) {
+            if let Some(bytes) = decode_armor_section(&body_text) {
+                enc.set_ciphertext(&bytes);
+            }
         }
     } else if is_signed_body {
         let mut sgn = body_builder.reborrow().init_signed();
@@ -1871,7 +2270,15 @@ fn populate_armor_from_text(
         let all_content = content_lines.join("\n").trim().to_string();
         if !all_content.is_empty() {
             sig_builder.set_encoded_sig_pubkey(&all_content);
-            if let Some((sig_hex, pubkey_hex)) = decode_sig_and_pubkey(&all_content) {
+            // Time the signature-block decode in isolation. Suspected to dominate
+            // the parse "populate" phase: decode_sig_and_pubkey can build a fresh
+            // 32k-word WordlistTree per attempt (try_decode_as_pubkey /
+            // try_decode_as_signature / try_decode_raw_base_n_fixed) with no cache.
+            let perf_sig_decode = std::time::Instant::now();
+            let decoded_sig = decode_sig_and_pubkey(&all_content);
+            debug_log!("[RUST-PERF] populate: decode_sig_and_pubkey={}ms (sig_content={}b, lines={})",
+                perf_sig_decode.elapsed().as_millis(), all_content.len(), content_lines.len());
+            if let Some((sig_hex, pubkey_hex)) = decoded_sig {
                 if let Ok(sig_bytes) = hex::decode(&sig_hex) {
                     sig_builder.set_signature(&sig_bytes);
                 }
@@ -2099,6 +2506,85 @@ fn is_base64_content(content: &str) -> bool {
 /// prose was encoded with, then decodes once with that pair. Mirrors the
 /// subject path (`glossia_decode_subject`) and `try_glossia_decode_to_bytes`.
 /// The `nip_hint` is "nip04" or "nip44" from the armor BEGIN tag.
+/// Result of glossia detect + decode for a piece of armored body text.
+/// Cached process-wide by hash of the input so repeated decodes of the
+/// same text (across nesting levels, sender_extract, sig verification,
+/// thread reopen, etc.) skip both `detect_dialect_best` and
+/// `decode_from_language`.
+#[derive(Clone, Debug)]
+struct GlossiaDecodeCached {
+    language: String,
+    wordlist: String,
+    /// Output of `glossia::decode_from_language` — either UTF-8 text or
+    /// hex of the underlying bytes when the bytes weren't valid UTF-8.
+    decoded: String,
+    hit_rate: f64,
+}
+
+static GLOSSIA_DECODE_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, GlossiaDecodeCached>>>
+    = std::sync::OnceLock::new();
+
+fn hash_glossia_input(text: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Cached `detect_dialect_best` + `decode_from_language`. Pure function of the
+/// input text — the same prose always produces the same dialect + decoded
+/// output, so a process-wide cache is safe. Returns None for plaintext or
+/// non-glossia input (low hit rate / detection failure).
+fn glossia_detect_and_decode_cached(text: &str) -> Option<GlossiaDecodeCached> {
+    let key = hash_glossia_input(text);
+    let cache = GLOSSIA_DECODE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    if let Some(entry) = cache.lock().unwrap().get(&key) {
+        debug_log!("[RUST-PERF] glossia cache HIT key={:x} (in={}b, dialect={}/{}, out={}b)",
+            key, text.len(), entry.language, entry.wordlist, entry.decoded.len());
+        return Some(entry.clone());
+    }
+
+    let perf = std::time::Instant::now();
+    let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.is_empty() {
+        return None;
+    }
+    let detect_words = words.clone();
+    let best = match std::panic::catch_unwind(move || glossia::detect_dialect_best(&detect_words)) {
+        Ok(Some(b)) => b,
+        _ => return None,
+    };
+    if best.hit_rate < 0.3 {
+        return None;
+    }
+    let language = best.language.clone();
+    let wordlist = best.wordlist.clone();
+    let text_owned = text.to_string();
+    let decoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        glossia::decode_from_language(&text_owned, &language, &wordlist, false)
+    })) {
+        Ok(Ok(d)) => d,
+        _ => return None,
+    };
+    let entry = GlossiaDecodeCached {
+        language,
+        wordlist,
+        decoded,
+        hit_rate: best.hit_rate,
+    };
+    debug_log!("[RUST-PERF] glossia cache MISS key={:x} compute={}ms (in={}b, words={}, dialect={}/{}, out={}b, hit_rate={:.3})",
+        key, perf.elapsed().as_millis(), text.len(), words.len(),
+        entry.language, entry.wordlist, entry.decoded.len(), entry.hit_rate);
+    {
+        let mut guard = cache.lock().unwrap();
+        maybe_evict(&mut guard);
+        guard.insert(key, entry.clone());
+    }
+    Some(entry)
+}
+
 fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result<String, String> {
     // If already base64 or base64?iv=base64, return as-is
     if is_base64_content(encoded_content) {
@@ -2106,60 +2592,13 @@ fn glossia_decode_to_ciphertext(encoded_content: &str, nip_hint: &str) -> Result
         return Ok(stripped);
     }
 
-    // Detect dialect (language + wordlist) from the prose itself.
-    let words: Vec<String> = encoded_content.split_whitespace().map(|w| w.to_lowercase()).collect();
-    if words.is_empty() {
-        return Err("Glossia decode failed: empty input".to_string());
-    }
-    let detect_words = words.clone();
-    let detect_result = std::panic::catch_unwind(move || {
-        glossia::detect_dialect_best(&detect_words)
-    });
-    let best = match detect_result {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            return Err("Glossia decode failed: no dialect detected".to_string());
-        }
-        Err(panic_info) => {
-            let msg = panic_info.downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            return Err(format!("Glossia decode failed: detect panicked: {}", msg));
-        }
-    };
-    println!("[RUST] glossia_decode_to_ciphertext: detected dialect={:?} wordlist={:?} hit_rate={}",
-        best.language, best.wordlist, best.hit_rate);
-    if best.hit_rate < 0.3 {
-        return Err(format!(
-            "Glossia decode failed: hit_rate {} too low (<0.3)", best.hit_rate
-        ));
-    }
+    let cached = glossia_detect_and_decode_cached(encoded_content)
+        .ok_or_else(|| "Glossia decode failed: no dialect detected or hit_rate too low".to_string())?;
+    debug_log!("[RUST] glossia_decode_to_ciphertext: detected dialect={:?} wordlist={:?} hit_rate={}",
+        cached.language, cached.wordlist, cached.hit_rate);
+    debug_log!("[RUST] glossia_decode_to_ciphertext: decoded len={}", cached.decoded.len());
 
-    let text = encoded_content.to_string();
-    let language = best.language.clone();
-    let wordlist = best.wordlist.clone();
-    let decode_result = std::panic::catch_unwind(move || {
-        glossia::decode_from_language(&text, &language, &wordlist, false)
-    });
-    let decoded = match decode_result {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => {
-            return Err(format!("Glossia decode failed for {}/{}: {:?}",
-                best.language, best.wordlist, e));
-        }
-        Err(panic_info) => {
-            let msg = panic_info.downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            return Err(format!("Glossia decode failed for {}/{}: panic: {}",
-                best.language, best.wordlist, msg));
-        }
-    };
-    println!("[RUST] glossia_decode_to_ciphertext: decoded len={}", decoded.len());
-
-    glossia_postprocess(&decoded, nip_hint)
+    glossia_postprocess(&cached.decoded, nip_hint)
 }
 
 /// Glossia-decode subject (payload_only mode, hit_rate >= 0.8).
@@ -2242,80 +2681,115 @@ pub fn compute_subject_ciphertext_hash(subject: &str, body: &str) -> Option<Stri
     Some(format!("{:x}", hasher.finalize()))
 }
 
+static GLOSSIA_SUBJECT_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Option<String>>>>
+    = std::sync::OnceLock::new();
+
+fn hash_subject(subject: &str, nip_hint: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    subject.hash(&mut h);
+    nip_hint.hash(&mut h);
+    h.finish()
+}
+
 fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
-    println!("[RUST] glossia_decode_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
-    if subject.is_empty() || is_likely_encrypted_content(subject) {
-        println!("[RUST] glossia_decode_subject: empty or already encrypted, returning None");
-        return None;
+    // Subject decode tries multiple wordlists and applies nip-specific
+    // postprocess, so we memoize the final Option<String> result keyed by
+    // (subject, nip_hint). Re-opens of the same email skip the entire
+    // detect + decode + postprocess flow.
+    let key = hash_subject(subject, nip_hint);
+    let cache = GLOSSIA_SUBJECT_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(cached) = cache.lock().unwrap().get(&key) {
+        debug_log!("[RUST-PERF] glossia subject cache HIT key={:x} (in={}b, nip={})",
+            key, subject.len(), nip_hint);
+        return cached.clone();
     }
 
-    // Detect dialect with hit_rate filtering
-    let words: Vec<String> = subject.split_whitespace().map(|w| w.to_lowercase()).collect();
-    println!("[RUST] glossia_decode_subject: word_count={} words={:?}", words.len(), &words[..words.len().min(6)]);
-    if words.is_empty() {
-        return None;
-    }
-    let detect_result = std::panic::catch_unwind(move || {
-        glossia::detect_dialect_best(&words)
-    });
-    let dialect = match detect_result {
-        Ok(Some(best)) => {
-            println!("[RUST] glossia_decode_subject: detected dialect={:?} hit_rate={}", best.language, best.hit_rate);
-            if best.hit_rate >= 0.8 {
-                best.language.clone()
-            } else {
-                println!("[RUST] glossia_decode_subject: hit_rate too low (<0.8), returning None");
-                return None;
-            }
-        }
-        Ok(None) => {
-            println!("[RUST] glossia_decode_subject: no dialect detected, returning None");
+    // Compute the result via an IIFE so every (early-) return path flows into
+    // the cache insertion below without scattering insert calls everywhere.
+    let result: Option<String> = (|| -> Option<String> {
+        debug_log!("[RUST] glossia_decode_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
+        if subject.is_empty() || is_likely_encrypted_content(subject) {
+            debug_log!("[RUST] glossia_decode_subject: empty or already encrypted, returning None");
             return None;
         }
-        Err(e) => {
-            println!("[RUST] glossia_decode_subject: detect_dialect_best panicked: {:?}", e.downcast_ref::<String>());
-            return None;
-        }
-    };
 
-    // Try decoding with both "default" and "raw" wordlists, pick longest
-    let wordlists = ["default", "raw"];
-    let mut best_decoded: Option<String> = None;
-    for wl in &wordlists {
-        let text = subject.to_string();
-        let lang = dialect.clone();
-        let wl_str = wl.to_string();
-        let decode_result = std::panic::catch_unwind(move || {
-            glossia::decode_from_language(&text, &lang, &wl_str, false)
+        // Detect dialect with hit_rate filtering
+        let words: Vec<String> = subject.split_whitespace().map(|w| w.to_lowercase()).collect();
+        debug_log!("[RUST] glossia_decode_subject: word_count={} words={:?}", words.len(), &words[..words.len().min(6)]);
+        if words.is_empty() {
+            return None;
+        }
+        let detect_result = std::panic::catch_unwind(move || {
+            glossia::detect_dialect_best(&words)
         });
-        match decode_result {
-            Ok(Ok(decoded)) => {
-                println!("[RUST] glossia_decode_subject: wl={} decoded len={} preview={:?}", wl, decoded.len(), &decoded[..decoded.len().min(40)]);
-                match &best_decoded {
-                    Some(prev) if prev.len() >= decoded.len() => {}
-                    _ => { best_decoded = Some(decoded); }
+        let dialect = match detect_result {
+            Ok(Some(best)) => {
+                debug_log!("[RUST] glossia_decode_subject: detected dialect={:?} hit_rate={}", best.language, best.hit_rate);
+                if best.hit_rate >= 0.8 {
+                    best.language.clone()
+                } else {
+                    debug_log!("[RUST] glossia_decode_subject: hit_rate too low (<0.8), returning None");
+                    return None;
                 }
             }
-            Ok(Err(e)) => {
-                println!("[RUST] glossia_decode_subject: wl={} decode error: {:?}", wl, e);
+            Ok(None) => {
+                debug_log!("[RUST] glossia_decode_subject: no dialect detected, returning None");
+                return None;
             }
             Err(e) => {
-                println!("[RUST] glossia_decode_subject: wl={} decode panicked: {:?}", wl, e.downcast_ref::<String>());
+                debug_log!("[RUST] glossia_decode_subject: detect_dialect_best panicked: {:?}", e.downcast_ref::<String>());
+                return None;
+            }
+        };
+
+        // Try decoding with both "default" and "raw" wordlists, pick longest
+        let wordlists = ["default", "raw"];
+        let mut best_decoded: Option<String> = None;
+        for wl in &wordlists {
+            let text = subject.to_string();
+            let lang = dialect.clone();
+            let wl_str = wl.to_string();
+            let decode_result = std::panic::catch_unwind(move || {
+                glossia::decode_from_language(&text, &lang, &wl_str, false)
+            });
+            match decode_result {
+                Ok(Ok(decoded)) => {
+                    debug_log!("[RUST] glossia_decode_subject: wl={} decoded len={} preview={:?}", wl, decoded.len(), &decoded[..decoded.len().min(40)]);
+                    match &best_decoded {
+                        Some(prev) if prev.len() >= decoded.len() => {}
+                        _ => { best_decoded = Some(decoded); }
+                    }
+                }
+                Ok(Err(e)) => {
+                    debug_log!("[RUST] glossia_decode_subject: wl={} decode error: {:?}", wl, e);
+                }
+                Err(e) => {
+                    debug_log!("[RUST] glossia_decode_subject: wl={} decode panicked: {:?}", wl, e.downcast_ref::<String>());
+                }
             }
         }
-    }
 
-    match best_decoded {
-        Some(decoded) => {
-            let result = glossia_postprocess(&decoded, nip_hint);
-            println!("[RUST] glossia_decode_subject: postprocess result={:?}", result.as_ref().map(|s| &s[..s.len().min(40)]));
-            result.ok()
+        match best_decoded {
+            Some(decoded) => {
+                let result = glossia_postprocess(&decoded, nip_hint);
+                debug_log!("[RUST] glossia_decode_subject: postprocess result={:?}", result.as_ref().map(|s| &s[..s.len().min(40)]));
+                result.ok()
+            }
+            _ => {
+                debug_log!("[RUST] glossia_decode_subject: no successful decode from any wordlist");
+                None
+            }
         }
-        _ => {
-            println!("[RUST] glossia_decode_subject: no successful decode from any wordlist");
-            None
-        }
+    })();
+
+    {
+        let mut guard = cache.lock().unwrap();
+        maybe_evict(&mut guard);
+        guard.insert(key, result.clone());
     }
+    result
 }
 
 // ── Decrypt pipeline ─────────────────────────────────────────────────
@@ -2412,7 +2886,7 @@ fn decrypt_single_block(
 ) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
     use base64::Engine;
 
-    println!("[RUST] decrypt_single_block: type={} nip={:?} sig_pk={:?} seal_pk={:?} fallback={:?} body_preview={:?}",
+    debug_log!("[RUST] decrypt_single_block: type={} nip={:?} sig_pk={:?} seal_pk={:?} fallback={:?} body_preview={:?}",
         body_type, encryption_nip, sig_pubkey_hex.map(|s| &s[..s.len().min(16)]),
         seal_pubkey_hex.map(|s| &s[..s.len().min(16)]),
         &fallback_pubkey[..fallback_pubkey.len().min(16)],
@@ -2432,7 +2906,7 @@ fn decrypt_single_block(
         let decoded = try_glossia_decode_to_bytes(body_text)
             .and_then(|bytes| String::from_utf8(bytes).ok());
         if let Some(ref text) = decoded {
-            println!("[RUST] decrypt_single_block: glossia decoded signed/plain body, len={} preview={:?}",
+            debug_log!("[RUST] decrypt_single_block: glossia decoded signed/plain body, len={} preview={:?}",
                 text.len(), &text[..text.len().min(60)]);
         }
         block.decrypted_text = Some(decoded.unwrap_or_else(|| body_text.to_string()));
@@ -2442,26 +2916,29 @@ fn decrypt_single_block(
     let nip = encryption_nip.unwrap_or("nip44");
 
     // Step 1: Glossia-decode body text → ciphertext string
+    let perf_glossia = std::time::Instant::now();
     let ciphertext = match glossia_decode_to_ciphertext(body_text, nip) {
         Ok(ct) => {
-            println!("[RUST] decrypt_single_block: glossia decoded, ciphertext len={}", ct.len());
+            debug_log!("[RUST] decrypt_single_block: glossia decoded, ciphertext len={}", ct.len());
             ct
         }
         Err(e) => {
-            println!("[RUST] decrypt_single_block: glossia decode FAILED: {}", e);
+            debug_log!("[RUST] decrypt_single_block: glossia decode FAILED: {}", e);
             block.error = Some(format!("Glossia decode failed: {}", e));
             return (block, None);
         }
     };
+    let glossia_ms = perf_glossia.elapsed().as_millis();
+    let ciphertext_len = ciphertext.len();
 
     // Step 2: Determine which pubkey to decrypt with
     let decrypt_pubkey_hex = match determine_decrypt_pubkey(sig_pubkey_hex, seal_pubkey_hex, user_pubkey_hex, fallback_pubkey) {
         Ok(pk) => {
-            println!("[RUST] decrypt_single_block: decrypt pubkey={}", &pk[..pk.len().min(16)]);
+            debug_log!("[RUST] decrypt_single_block: decrypt pubkey={}", &pk[..pk.len().min(16)]);
             pk
         }
         Err(e) => {
-            println!("[RUST] decrypt_single_block: determine_decrypt_pubkey FAILED: {}", e);
+            debug_log!("[RUST] decrypt_single_block: determine_decrypt_pubkey FAILED: {}", e);
             block.error = Some(e);
             return (block, None);
         }
@@ -2479,17 +2956,21 @@ fn decrypt_single_block(
         }
     };
 
+    let perf_nip = std::time::Instant::now();
     let decrypted = match crate::nostr::decrypt_dm_content(private_key, &decrypt_npub, &ciphertext) {
         Ok(d) => {
-            println!("[RUST] decrypt_single_block: NIP decrypt SUCCESS, len={} preview={:?}", d.len(), &d[..d.len().min(40)]);
+            debug_log!("[RUST] decrypt_single_block: NIP decrypt SUCCESS, len={} preview={:?}", d.len(), &d[..d.len().min(40)]);
             d
         }
         Err(e) => {
-            println!("[RUST] decrypt_single_block: NIP decrypt FAILED: {}", e);
+            debug_log!("[RUST] decrypt_single_block: NIP decrypt FAILED: {}", e);
             block.error = Some(format!("NIP decrypt failed: {}", e));
             return (block, None);
         }
     };
+    let nip_decrypt_ms = perf_nip.elapsed().as_millis();
+    debug_log!("[RUST-PERF] decrypt_single_block: nip={} glossia={}ms (ct={}b) nip_decrypt={}ms (out={}b)",
+        nip, glossia_ms, ciphertext_len, nip_decrypt_ms, decrypted.len());
 
     // Step 4: Detect manifest vs legacy
     let trimmed = decrypted.trim();
@@ -2558,13 +3039,23 @@ fn decrypt_armor_tree(
     private_key: &str,
     user_pubkey_hex: &str,
     fallback_pubkey: &str,
+    raw_headers: Option<&str>,
+    // When false (user disabled "Require Signatures"), NIP-04 signature
+    // verification failures no longer block decryption — the body is decrypted
+    // anyway and the UI still surfaces the invalid/missing-signature indicator
+    // via the separate verify path. When true (default), an unverified NIP-04
+    // message is rejected before decryption (the signature is NIP-04's only MAC).
+    require_signature: bool,
+    depth: usize,
 ) -> (Vec<crate::types::DecryptedBlock>, Option<JsonManifest>) {
+    let perf_level = std::time::Instant::now();
     let mut results = Vec::new();
     let mut outer_manifest = None;
 
     // Recurse into quoted first (innermost-first ordering)
     // Propagate current level's sig/seal pubkey as fallback for inner blocks,
     // so nested blocks can identify the other party when their own sig matches the user.
+    let mut inner_ms = 0u128;
     if let Some(ref quoted) = parsed.quoted {
         let inner_fallback = if fallback_pubkey.is_empty() {
             parsed.sig_pubkey_hex.as_deref()
@@ -2573,7 +3064,13 @@ fn decrypt_armor_tree(
         } else {
             fallback_pubkey
         };
-        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback);
+        // raw_headers (X-Nostr-Sig) signs the outermost canonical body bytes, which
+        // includes nested quoted bytes by concatenation. Inner subtrees only see a
+        // slice of that signed data, so the header sig would never verify against
+        // them — pass None so inner levels rely solely on their inline signatures.
+        let perf_inner = std::time::Instant::now();
+        let (inner_results, _) = decrypt_armor_tree(quoted, private_key, user_pubkey_hex, inner_fallback, None, require_signature, depth + 1);
+        inner_ms = perf_inner.elapsed().as_millis();
         results.extend(inner_results);
     }
 
@@ -2581,80 +3078,132 @@ fn decrypt_armor_tree(
     // NIP-04 (AES-256-CBC) lacks authenticated encryption; the Schnorr signature
     // serves as the MAC. Verification MUST happen before decryption to prevent
     // padding oracle attacks.
-    if parsed.encryption_nip.as_deref() == Some("nip04") {
-        match (&parsed.signature_hex, &parsed.sig_pubkey_hex) {
-            (Some(sig_hex), Some(pubkey_hex)) => {
-                // Collect body bytes for verification — use raw decoded bytes (no NIP-04
-                // unpacking) to match extract_ciphertext_binary, which the inline
-                // signature verification uses successfully.
-                let verify_bytes = if let Some(ref b64) = parsed.body_bytes_b64 {
-                    general_purpose::STANDARD.decode(b64).unwrap_or_else(|_| parsed.body_text.as_bytes().to_vec())
-                } else {
-                    extract_ciphertext_binary(&parsed.body_text)
-                };
-                let mut all_bytes = verify_bytes;
+    let perf_sig = std::time::Instant::now();
+    let mut sig_verify_ran = false;
+    let mut sig_verify_bytes_len: usize = 0;
+    // Only enforce (and even compute) NIP-04 signature verification when the user
+    // requires signatures. With "Require Signatures" off, the user has opted into
+    // reading unauthenticated mail, so we skip the gate entirely and let decryption
+    // proceed; the missing/invalid signature still shows in the UI via the separate
+    // verify_all_signatures path.
+    if require_signature && parsed.encryption_nip.as_deref() == Some("nip04") {
+        sig_verify_ran = true;
+        // Compute the canonical signed bytes once: this level's raw decoded body
+        // concatenated with all nested quoted body bytes. Both the inline
+        // SIGNATURE block and the X-Nostr-Sig header sign these same bytes.
+        let verify_bytes = if let Some(ref b64) = parsed.body_bytes_b64 {
+            general_purpose::STANDARD.decode(b64).unwrap_or_else(|_| parsed.body_text.as_bytes().to_vec())
+        } else {
+            extract_ciphertext_binary(&parsed.body_text)
+        };
+        let mut all_bytes = verify_bytes;
 
-                // Concatenate nested quoted body bytes
-                fn collect_quoted_bytes(
-                    quoted: &Option<Box<crate::types::ParsedArmorMessage>>,
-                    buf: &mut Vec<u8>,
-                ) {
-                    if let Some(ref q) = quoted {
-                        if let Some(ref b64) = q.body_bytes_b64 {
-                            if let Ok(bytes) = general_purpose::STANDARD.decode(b64) {
-                                buf.extend_from_slice(&bytes);
-                            }
-                        }
-                        collect_quoted_bytes(&q.quoted, buf);
+        fn collect_quoted_bytes(
+            quoted: &Option<Box<crate::types::ParsedArmorMessage>>,
+            buf: &mut Vec<u8>,
+        ) {
+            if let Some(ref q) = quoted {
+                if let Some(ref b64) = q.body_bytes_b64 {
+                    if let Ok(bytes) = general_purpose::STANDARD.decode(b64) {
+                        buf.extend_from_slice(&bytes);
                     }
                 }
-                collect_quoted_bytes(&parsed.quoted, &mut all_bytes);
+                collect_quoted_bytes(&q.quoted, buf);
+            }
+        }
+        collect_quoted_bytes(&parsed.quoted, &mut all_bytes);
+        sig_verify_bytes_len = all_bytes.len();
 
-                // Step 7: Verify signature against unpacked canonical bytes
-                let verified = matches!(
+        // Primary trust path: inline SIGNATURE block inside the armor.
+        let inline_verified = match (&parsed.signature_hex, &parsed.sig_pubkey_hex) {
+            (Some(sig_hex), Some(pubkey_hex)) => {
+                let ok = matches!(
                     crate::crypto::verify_signature_bytes(pubkey_hex, sig_hex, &all_bytes),
                     Ok(true)
                 );
-
-                if verified {
-                    println!("[RUST] NIP-04 signature verified ({} bytes), proceeding to decrypt", all_bytes.len());
+                if ok {
+                    debug_log!("[RUST] NIP-04 inline signature verified ({} bytes)", all_bytes.len());
                 } else {
-                    println!("[RUST] NIP-04 signature INVALID — rejecting without decryption");
-                    results.push(crate::types::DecryptedBlock {
-                        decrypted_text: None,
-                        error: Some(
-                            "NIP-04 signature verification failed. The message was rejected \
-                             without decrypting to prevent potential ciphertext manipulation. \
-                             The message may have been tampered with in transit.".to_string()
-                        ),
-                        was_encrypted: true,
-                        profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
-                        body_type: "encrypted".to_string(),
-                    });
-                    return (results, outer_manifest);
+                    debug_log!("[RUST] NIP-04 inline signature INVALID");
                 }
+                Some(ok)
             }
-            _ => {
-                // No signature on NIP-04 message — reject
-                println!("[RUST] NIP-04 message has no signature — rejecting without decryption");
-                results.push(crate::types::DecryptedBlock {
-                    decrypted_text: None,
-                    error: Some(
-                        "This NIP-04 encrypted message has no signature. NIP-04 requires a \
-                         signature for authentication because it lacks built-in message \
-                         integrity (MAC). The message cannot be safely decrypted. The sender \
-                         may be using an older client that doesn't sign NIP-04 messages.".to_string()
-                    ),
-                    was_encrypted: true,
-                    profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
-                    body_type: "encrypted".to_string(),
-                });
-                return (results, outer_manifest);
-            }
+            _ => None,
+        };
+
+        // Fallback trust path: X-Nostr-Sig + X-Nostr-Pubkey transport headers.
+        // Only consulted at the outermost armor level (raw_headers is None for
+        // recursive calls into nested quoted blocks), because the header sig
+        // signs the full canonical body, not inner subtrees.
+        let header_verified = if inline_verified != Some(true) {
+            raw_headers.and_then(|rh| {
+                let pk = extract_nostr_pubkey_from_headers(rh)?;
+                let sig = extract_nostr_sig_from_headers(rh)?;
+                let ok = matches!(
+                    crate::crypto::verify_signature_bytes(&pk, &sig, &all_bytes),
+                    Ok(true)
+                );
+                if ok {
+                    debug_log!("[RUST] NIP-04 X-Nostr-Sig header verified ({} bytes)", all_bytes.len());
+                } else {
+                    debug_log!("[RUST] NIP-04 X-Nostr-Sig header INVALID");
+                }
+                Some(ok)
+            })
+        } else {
+            None
+        };
+
+        let verified = inline_verified == Some(true) || header_verified == Some(true);
+        if !verified {
+            let (msg, log) = match (inline_verified, header_verified) {
+                (Some(false), Some(false)) => (
+                    "NIP-04 signature verification failed (both inline SIGNATURE block and \
+                     X-Nostr-Sig header). The message was rejected without decrypting to \
+                     prevent potential ciphertext manipulation.".to_string(),
+                    "NIP-04 both inline + header sigs INVALID — rejecting"
+                ),
+                (Some(false), None) => (
+                    "NIP-04 signature verification failed. The message was rejected without \
+                     decrypting to prevent potential ciphertext manipulation. The message may \
+                     have been tampered with in transit.".to_string(),
+                    "NIP-04 inline signature INVALID, no header sig — rejecting"
+                ),
+                (None, Some(false)) => (
+                    "NIP-04 X-Nostr-Sig header verification failed. No inline SIGNATURE block \
+                     was present, and the transport-header signature did not verify. The \
+                     message was rejected without decrypting.".to_string(),
+                    "NIP-04 header sig INVALID, no inline sig — rejecting"
+                ),
+                _ => (
+                    "This NIP-04 encrypted message has no signature (neither an inline \
+                     SIGNATURE block nor an X-Nostr-Sig header). NIP-04 requires a signature \
+                     for authentication because it lacks built-in message integrity (MAC). \
+                     To opt into decrypting unsigned messages anyway, disable \"Require \
+                     Signatures\" in Settings → Advanced.".to_string(),
+                    "NIP-04 message has no signature (inline or header) — rejecting"
+                ),
+            };
+            debug_log!("[RUST] {}", log);
+            results.push(crate::types::DecryptedBlock {
+                decrypted_text: None,
+                error: Some(msg),
+                was_encrypted: true,
+                profile_name: parsed.profile_name.clone().or(parsed.display_name.clone()),
+                body_type: "encrypted".to_string(),
+            });
+            let sig_ms_reject = perf_sig.elapsed().as_millis();
+            debug_log!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block=SKIPPED(sig fail) total={}ms",
+                depth, parsed.body_text.len(), parsed.encryption_nip.as_deref(),
+                inner_ms, sig_ms_reject, sig_verify_bytes_len,
+                perf_level.elapsed().as_millis());
+            return (results, outer_manifest);
         }
     }
+    let sig_verify_ms = if sig_verify_ran { perf_sig.elapsed().as_millis() } else { 0 };
 
     // Decrypt this level
+    let perf_block = std::time::Instant::now();
     let (block, manifest) = decrypt_single_block(
         &parsed.body_text,
         &parsed.body_type,
@@ -2666,10 +3215,16 @@ fn decrypt_armor_tree(
         user_pubkey_hex,
         fallback_pubkey,
     );
+    let block_ms = perf_block.elapsed().as_millis();
     if manifest.is_some() {
         outer_manifest = manifest;
     }
     results.push(block);
+
+    debug_log!("[RUST-PERF] decrypt_armor_tree depth={} body_len={}b nip={:?} inner={}ms sig_verify={}ms (verify_bytes={}b) decrypt_block={}ms total={}ms",
+        depth, parsed.body_text.len(), parsed.encryption_nip.as_deref(),
+        inner_ms, sig_verify_ms, sig_verify_bytes_len, block_ms,
+        perf_level.elapsed().as_millis());
 
     (results, outer_manifest)
 }
@@ -2682,17 +3237,31 @@ pub fn decrypt_email_body_pipeline(
     subject: &str,
     sender_pubkey: Option<&str>,
     recipient_pubkey: Option<&str>,
+    raw_headers: Option<&str>,
+    // When false (user disabled "Require Signatures"), skip the NIP-04 signature
+    // gate so unauthenticated mail still decrypts. When true (default), an
+    // unverified NIP-04 message is rejected before decryption.
+    require_signature: bool,
+    // When true, decrypt only the most recent (outermost) message and skip the
+    // quoted thread history. DM conversation rendering uses this: the inline body
+    // shows just the latest message (the full thread is reachable via the
+    // envelope icon), so decrypting nested quoted levels is wasted work the UI
+    // discards. No-op for NIP-04, whose signature is computed over the outer body
+    // PLUS all nested quoted bytes — see the gate where `parsed.quoted` is cleared.
+    shallow: bool,
 ) -> Result<crate::types::DecryptEmailResult, String> {
-    println!("[RUST] decrypt_email_body: armor_len={} subject_len={}", armor_text.len(), subject.len());
+    let perf_total = std::time::Instant::now();
+    debug_log!("[RUST] decrypt_email_body: armor_len={} subject_len={}", armor_text.len(), subject.len());
 
     // Normalize line endings (spec section 8 step 2)
     let normalized = armor_text.replace("\r\n", "\n");
 
     // Parse armor into capnp ArmorMessage → serde struct
-    let parsed = match parse_armor_components(&normalized) {
+    let perf_parse = std::time::Instant::now();
+    let mut parsed = match parse_armor_components(&normalized) {
         Some(p) => p,
         None => {
-            println!("[RUST] decrypt_email_body: no armor found");
+            debug_log!("[RUST] decrypt_email_body: no armor found");
             return Ok(crate::types::DecryptEmailResult {
                 subject: subject.to_string(),
                 body: armor_text.to_string(),
@@ -2706,22 +3275,55 @@ pub fn decrypt_email_body_pipeline(
             });
         }
     };
+    let parse_ms = perf_parse.elapsed().as_millis();
+
+    // Shallow mode: discard the quoted subtree so decrypt_armor_tree won't
+    // recurse into thread history the caller won't display. Skipped for NIP-04,
+    // where the signature is verified over the outer body PLUS all nested quoted
+    // bytes (see decrypt_armor_tree's collect_quoted_bytes) — dropping them there
+    // would fail verification and block decryption.
+    if shallow && parsed.encryption_nip.as_deref() != Some("nip04") {
+        parsed.quoted = None;
+    }
 
     // Derive user's pubkey hex from private key
+    let perf_derive = std::time::Instant::now();
     let user_pubkey_hex = {
         let sk = nostr_sdk::prelude::SecretKey::parse(private_key)
             .map_err(|e| format!("Invalid private key: {:?}", e))?;
         let keys = nostr_sdk::prelude::Keys::new(sk);
         keys.public_key().to_hex()
     };
+    let derive_pk_ms = perf_derive.elapsed().as_millis();
 
-    // Determine fallback pubkey (the other party's pubkey for decryption)
-    let fallback = sender_pubkey
-        .or(recipient_pubkey)
+    // Determine fallback pubkey (the other party's pubkey for decryption).
+    // Prefer whichever provided pubkey is NOT the user's own: when you view your
+    // OWN sent mail from the inbox, sender_pubkey is your key, and using it would
+    // trip the self-DH guard in determine_decrypt_pubkey. The real counterparty is
+    // then the recipient. Picking the non-self candidate makes decryption work
+    // regardless of which folder (inbox/sent) the caller routed through.
+    let normalize_hex = |p: &str| -> String {
+        if p.starts_with("npub1") {
+            nostr_sdk::prelude::PublicKey::parse(p)
+                .map(|k| k.to_hex())
+                .unwrap_or_else(|_| p.to_string())
+        } else {
+            p.to_string()
+        }
+    };
+    let candidates: [Option<&str>; 2] = [sender_pubkey, recipient_pubkey];
+    let fallback = candidates
+        .iter()
+        .flatten()
+        .copied()
+        .find(|c| normalize_hex(c) != user_pubkey_hex)
+        .or_else(|| candidates.iter().flatten().copied().next())
         .unwrap_or("");
 
     // Walk the armor tree, decrypt each level
-    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback);
+    let perf_tree = std::time::Instant::now();
+    let (block_results, manifest) = decrypt_armor_tree(&parsed, private_key, &user_pubkey_hex, fallback, raw_headers, require_signature, 0);
+    let tree_ms = perf_tree.elapsed().as_millis();
 
     // Extract outermost decrypted body (last element in innermost-first array)
     let outer_block = block_results.last();
@@ -2759,6 +3361,7 @@ pub fn decrypt_email_body_pipeline(
     };
 
     // Decrypt subject — use armor's embedded pubkey as fallback when sender_pubkey wasn't provided
+    let perf_subject = std::time::Instant::now();
     let (decrypted_subject, subject_ciphertext) = if parsed.body_type == "encrypted" {
         let nip_hint = parsed.encryption_nip.as_deref().unwrap_or("nip44");
         let subject_fallback = if fallback.is_empty() {
@@ -2773,8 +3376,10 @@ pub fn decrypt_email_body_pipeline(
     } else {
         (subject.to_string(), None)
     };
+    let subject_ms = perf_subject.elapsed().as_millis();
 
     // Extract sender pubkey from outermost armor signature (for avatar fallback)
+    let perf_sender = std::time::Instant::now();
     let armor_sender_pubkey = if sender_pubkey.is_none() {
         // No header-provided pubkey — try to derive from verified armor signature
         parsed.sig_pubkey_hex.as_deref().and_then(|pk_hex| {
@@ -2792,10 +3397,14 @@ pub fn decrypt_email_body_pipeline(
     } else {
         None
     };
+    let sender_extract_ms = perf_sender.elapsed().as_millis();
 
-    println!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={} armor_sender_pubkey={:?}",
+    debug_log!("[RUST] decrypt_email_body: success={} is_manifest={} blocks={} attachments={} armor_sender_pubkey={:?}",
         success, is_manifest, block_results.len(), attachments.len(),
         armor_sender_pubkey.as_deref().map(|s: &str| &s[..std::cmp::min(s.len(), 20)]));
+    debug_log!("[RUST-PERF] decrypt_email_body_pipeline: total={}ms parse={}ms derive_pk={}ms tree={}ms subject={}ms sender_extract={}ms (armor_len={}b, levels={})",
+        perf_total.elapsed().as_millis(), parse_ms, derive_pk_ms, tree_ms, subject_ms, sender_extract_ms,
+        armor_text.len(), block_results.len());
 
     Ok(crate::types::DecryptEmailResult {
         subject: decrypted_subject,
@@ -2822,23 +3431,23 @@ fn decrypt_subject(
     fallback_pubkey: &str,
     nip_hint: &str,
 ) -> (String, Option<String>) {
-    println!("[RUST] decrypt_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
+    debug_log!("[RUST] decrypt_subject: len={} nip_hint={} preview={:?}", subject.len(), nip_hint, &subject[..subject.len().min(80)]);
     if subject.is_empty() {
-        println!("[RUST] decrypt_subject: empty subject, returning as-is");
+        debug_log!("[RUST] decrypt_subject: empty subject, returning as-is");
         return (subject.to_string(), None);
     }
 
     // Try to get ciphertext from subject
     let is_encrypted = is_likely_encrypted_content(subject);
-    println!("[RUST] decrypt_subject: is_likely_encrypted={}", is_encrypted);
+    debug_log!("[RUST] decrypt_subject: is_likely_encrypted={}", is_encrypted);
     let ciphertext = if is_encrypted {
-        println!("[RUST] decrypt_subject: using subject directly as ciphertext");
+        debug_log!("[RUST] decrypt_subject: using subject directly as ciphertext");
         subject.to_string()
     } else if let Some(decoded) = glossia_decode_subject(subject, nip_hint) {
-        println!("[RUST] decrypt_subject: glossia decoded to ciphertext len={} preview={:?}", decoded.len(), &decoded[..decoded.len().min(60)]);
+        debug_log!("[RUST] decrypt_subject: glossia decoded to ciphertext len={} preview={:?}", decoded.len(), &decoded[..decoded.len().min(60)]);
         decoded
     } else {
-        println!("[RUST] decrypt_subject: glossia decode failed, returning subject as-is");
+        debug_log!("[RUST] decrypt_subject: glossia decode failed, returning subject as-is");
         return (subject.to_string(), None);
     };
 
@@ -2846,7 +3455,7 @@ fn decrypt_subject(
 
     // Determine which pubkey to use — use fallback (other party's pubkey)
     let decrypt_pubkey = if fallback_pubkey.is_empty() {
-        println!("[RUST] decrypt_subject: no fallback pubkey, returning subject as-is");
+        debug_log!("[RUST] decrypt_subject: no fallback pubkey, returning subject as-is");
         return (subject.to_string(), subject_ciphertext);
     } else if fallback_pubkey.starts_with("npub1") {
         fallback_pubkey.to_string()
@@ -2855,20 +3464,20 @@ fn decrypt_subject(
         match nostr_sdk::prelude::PublicKey::parse(fallback_pubkey) {
             Ok(pk) => pk.to_bech32().unwrap_or_else(|_| fallback_pubkey.to_string()),
             Err(_) => {
-                println!("[RUST] decrypt_subject: failed to parse fallback pubkey {:?}", fallback_pubkey);
+                debug_log!("[RUST] decrypt_subject: failed to parse fallback pubkey {:?}", fallback_pubkey);
                 return (subject.to_string(), subject_ciphertext);
             }
         }
     };
 
-    println!("[RUST] decrypt_subject: attempting NIP decrypt with pubkey prefix={:?}", &decrypt_pubkey[..decrypt_pubkey.len().min(20)]);
+    debug_log!("[RUST] decrypt_subject: attempting NIP decrypt with pubkey prefix={:?}", &decrypt_pubkey[..decrypt_pubkey.len().min(20)]);
     match crate::nostr::decrypt_dm_content(private_key, &decrypt_pubkey, &ciphertext) {
         Ok(decrypted) => {
-            println!("[RUST] decrypt_subject: success! decrypted={:?}", &decrypted[..decrypted.len().min(60)]);
+            debug_log!("[RUST] decrypt_subject: success! decrypted={:?}", &decrypted[..decrypted.len().min(60)]);
             (decrypted, subject_ciphertext)
         }
         Err(e) => {
-            println!("[RUST] decrypt_subject: NIP decrypt failed: {:?}", e);
+            debug_log!("[RUST] decrypt_subject: NIP decrypt failed: {:?}", e);
             (subject.to_string(), subject_ciphertext)
         }
     }
@@ -2885,7 +3494,7 @@ pub fn decrypt_attachment_pipeline(
     use base64::Engine;
     use sha2::{Sha256, Digest};
 
-    println!("[RUST] decrypt_attachment: data_len={} filename={:?}", attachment_data_b64.len(), orig_filename);
+    debug_log!("[RUST] decrypt_attachment: data_len={} filename={:?}", attachment_data_b64.len(), orig_filename);
 
     let b64 = base64::engine::general_purpose::STANDARD;
 
@@ -2903,7 +3512,7 @@ pub fn decrypt_attachment_pipeline(
         hasher.update(&encrypted_data);
         let actual_hash = hex::encode(hasher.finalize());
         if actual_hash != expected_hash {
-            println!("[RUST] decrypt_attachment_pipeline: hash mismatch (expected {}, got {}) — continuing anyway", expected_hash, actual_hash);
+            debug_log!("[RUST] decrypt_attachment_pipeline: hash mismatch (expected {}, got {}) — continuing anyway", expected_hash, actual_hash);
         }
     }
 
@@ -2934,7 +3543,7 @@ pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
         if let Some(mut bytes) = decode_armor_section(&body_text) {
             if let Some(ref nested) = nested_armor {
                 let nested_bytes = extract_ciphertext_binary(nested);
-                println!("[RUST] extract_ciphertext_binary: concatenating {} outer + {} nested bytes",
+                debug_log!("[RUST] extract_ciphertext_binary: concatenating {} outer + {} nested bytes",
                     bytes.len(), nested_bytes.len());
                 bytes.extend_from_slice(&nested_bytes);
             }
@@ -2943,7 +3552,7 @@ pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
     }
 
     // Non-armored body: return UTF-8 bytes
-    println!("[RUST] extract_ciphertext_binary: plain text, {} bytes", body.len());
+    debug_log!("[RUST] extract_ciphertext_binary: plain text, {} bytes", body.len());
     body.as_bytes().to_vec()
 }
 
@@ -2954,11 +3563,11 @@ pub fn verify_email_signature(sender_pubkey: &str, signature: &str, body: &str) 
     let binary = extract_ciphertext_binary(body);
     match crypto::verify_signature_bytes(sender_pubkey, signature, &binary) {
         Ok(valid) => {
-            println!("[RUST] verify_email_signature: {} ({} bytes)", if valid { "valid" } else { "INVALID" }, binary.len());
+            debug_log!("[RUST] verify_email_signature: {} ({} bytes)", if valid { "valid" } else { "INVALID" }, binary.len());
             valid
         },
         Err(e) => {
-            println!("[RUST] verify_email_signature: error: {}", e);
+            debug_log!("[RUST] verify_email_signature: error: {}", e);
             false
         }
     }
@@ -2973,12 +3582,12 @@ pub fn verify_email_signature_inline(body: &str) -> Option<bool> {
     let binary = extract_ciphertext_binary(body);
     match crypto::verify_signature_bytes(pubkey_hex, sig_hex, &binary) {
         Ok(valid) => {
-            println!("[RUST] verify_email_signature_inline: {} ({} bytes, pubkey={}...)",
+            debug_log!("[RUST] verify_email_signature_inline: {} ({} bytes, pubkey={}...)",
                 if valid { "valid" } else { "INVALID" }, binary.len(), &pubkey_hex[..8.min(pubkey_hex.len())]);
             Some(valid)
         }
         Err(e) => {
-            println!("[RUST] verify_email_signature_inline: error: {}", e);
+            debug_log!("[RUST] verify_email_signature_inline: error: {}", e);
             Some(false)
         }
     }
@@ -2998,7 +3607,7 @@ pub fn verify_email_signature_full(body: &str, raw_headers: &str) -> (Option<boo
         }
     };
 
-    println!("[RUST] verify_email_signature_full: body={:?}, header={:?}", body_result, header_result);
+    debug_log!("[RUST] verify_email_signature_full: body={:?}, header={:?}", body_result, header_result);
 
     match (body_result, header_result) {
         (Some(true), Some(true)) => (Some(true), Some("both".to_string())),
@@ -3019,19 +3628,19 @@ pub fn verify_all_signatures_inline(body: &str) -> Vec<crate::types::SignatureVe
 fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types::SignatureVerificationResult> {
     let mut results = Vec::new();
 
-    println!("[RUST] verify_all_sigs_recursive: depth={}, body_len={}, preview={:?}",
+    debug_log!("[RUST] verify_all_sigs_recursive: depth={}, body_len={}, preview={:?}",
         depth, body.len(), &body[..80.min(body.len())]);
 
     // Parse armor at this level to get sig/pubkey and body type
     let parsed = match parse_armor_components(body) {
         Some(p) => p,
         None => {
-            println!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_components returned None", depth);
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_components returned None", depth);
             return results;
         }
     };
 
-    println!("[RUST] verify_all_sigs_recursive: depth={}, parsed: body_type={}, has_sig={}, has_pubkey={}, has_quoted={}",
+    debug_log!("[RUST] verify_all_sigs_recursive: depth={}, parsed: body_type={}, has_sig={}, has_pubkey={}, has_quoted={}",
         depth, parsed.body_type,
         parsed.signature_hex.is_some(), parsed.sig_pubkey_hex.is_some(),
         parsed.quoted.is_some());
@@ -3040,18 +3649,18 @@ fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types
     let depth_result = parse_armor_depth(body);
     match &depth_result {
         Some((_body_text, Some(ref nested_armor))) => {
-            println!("[RUST] verify_all_sigs_recursive: depth={}, found nested armor ({} bytes), recursing",
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, found nested armor ({} bytes), recursing",
                 depth, nested_armor.len());
             let inner_results = verify_all_signatures_recursive(nested_armor, depth + 1);
-            println!("[RUST] verify_all_sigs_recursive: depth={}, inner recursion returned {} results",
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, inner recursion returned {} results",
                 depth, inner_results.len());
             results.extend(inner_results);
         }
         Some((_body_text, None)) => {
-            println!("[RUST] verify_all_sigs_recursive: depth={}, no nested armor (leaf node)", depth);
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, no nested armor (leaf node)", depth);
         }
         None => {
-            println!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_depth returned None", depth);
+            debug_log!("[RUST] verify_all_sigs_recursive: depth={}, parse_armor_depth returned None", depth);
         }
     }
 
@@ -3064,13 +3673,13 @@ fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types
         let binary = extract_ciphertext_binary(body);
         let is_valid = match crate::crypto::verify_signature_bytes(pk, sig, &binary) {
             Ok(valid) => {
-                println!("[RUST] verify_all_signatures: depth={}, {} ({} bytes, pubkey={}...)",
+                debug_log!("[RUST] verify_all_signatures: depth={}, {} ({} bytes, pubkey={}...)",
                     depth, if valid { "valid" } else { "INVALID" }, binary.len(),
                     &pk[..8.min(pk.len())]);
                 valid
             }
             Err(e) => {
-                println!("[RUST] verify_all_signatures: depth={}, error: {}", depth, e);
+                debug_log!("[RUST] verify_all_signatures: depth={}, error: {}", depth, e);
                 false
             }
         };
@@ -3084,11 +3693,11 @@ fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types
             profile_name: parsed.profile_name.clone(),
         });
     } else {
-        println!("[RUST] verify_all_sigs_recursive: depth={}, no sig/pubkey at this level (sig={}, pk={})",
+        debug_log!("[RUST] verify_all_sigs_recursive: depth={}, no sig/pubkey at this level (sig={}, pk={})",
             depth, sig_hex.is_some(), pubkey_hex.is_some());
     }
 
-    println!("[RUST] verify_all_sigs_recursive: depth={}, returning {} total results", depth, results.len());
+    debug_log!("[RUST] verify_all_sigs_recursive: depth={}, returning {} total results", depth, results.len());
     results
 }
 
@@ -3116,7 +3725,7 @@ pub fn extract_message_id_from_headers(raw_headers: &str) -> Option<String> {
                 .to_string();
             
             if !msg_id_clean.is_empty() {
-                println!("[RUST] extract_message_id_from_headers: Found Message-ID: {} (cleaned: {})", msg_id, msg_id_clean);
+                debug_log!("[RUST] extract_message_id_from_headers: Found Message-ID: {} (cleaned: {})", msg_id, msg_id_clean);
                 return Some(msg_id_clean);
             }
         }
@@ -3133,13 +3742,13 @@ pub fn extract_message_id_from_headers(raw_headers: &str) -> Option<String> {
                 .trim()
                 .to_string();
             if !msg_id_clean.is_empty() {
-                println!("[RUST] extract_message_id_from_headers: Found Message-ID via mailparse: {} (cleaned: {})", msg_id, msg_id_clean);
+                debug_log!("[RUST] extract_message_id_from_headers: Found Message-ID via mailparse: {} (cleaned: {})", msg_id, msg_id_clean);
                 return Some(msg_id_clean);
             }
         }
     }
     
-    println!("[RUST] extract_message_id_from_headers: No Message-ID header found in headers ({} chars). First 200 chars: {}", 
+    debug_log!("[RUST] extract_message_id_from_headers: No Message-ID header found in headers ({} chars). First 200 chars: {}", 
         raw_headers.len(), raw_headers.chars().take(200).collect::<String>());
     None
 }
@@ -3413,7 +4022,7 @@ pub fn decrypt_nostr_email_content(config: &EmailConfig, raw_headers: &str, subj
     let private_key = match &config.private_key {
         Some(key) => key,
         None => {
-            println!("[RUST] No private key available for decryption");
+            debug_log!("[RUST] No private key available for decryption");
             return Ok((subject.to_string(), body.to_string()));
         }
     };
@@ -3423,23 +4032,23 @@ pub fn decrypt_nostr_email_content(config: &EmailConfig, raw_headers: &str, subj
     let sender_pubkey = match extract_nostr_pubkey_from_headers(raw_headers) {
         Some(pubkey) => pubkey,
         None => {
-            println!("[RUST] No X-Nostr-Pubkey header found");
+            debug_log!("[RUST] No X-Nostr-Pubkey header found");
             return Ok((subject.to_string(), body.to_string()));
         }
     };
     
-    println!("[RUST] Attempting to decrypt inbox email using sender_pubkey (shared secret: user_privkey × sender_pubkey): {}", sender_pubkey);
+    debug_log!("[RUST] Attempting to decrypt inbox email using sender_pubkey (shared secret: user_privkey × sender_pubkey): {}", sender_pubkey);
     
     // Try to decrypt subject - encrypted subjects are typically just the raw encrypted content
     // without ASCII armor, and are usually base64 encoded
     let decrypted_subject = if is_likely_encrypted_content(subject) {
         match crypto::decrypt_message(private_key, &sender_pubkey, subject) {
             Ok(decrypted) => {
-                println!("[RUST] Successfully decrypted subject");
+                debug_log!("[RUST] Successfully decrypted subject");
                 decrypted
             }
             Err(e) => {
-                println!("[RUST] Failed to decrypt subject: {}", e);
+                debug_log!("[RUST] Failed to decrypt subject: {}", e);
                 subject.to_string()
             }
         }
@@ -3463,15 +4072,15 @@ pub fn decrypt_nostr_email_content(config: &EmailConfig, raw_headers: &str, subj
         
         // Detect format for logging
         let detected_format = crypto::detect_encryption_format(&clean_body);
-        println!("[RUST] Detected encryption format: {} for email body", detected_format);
+        debug_log!("[RUST] Detected encryption format: {} for email body", detected_format);
         
         match crypto::decrypt_message(private_key, &sender_pubkey, &clean_body) {
             Ok(decrypted) => {
-                println!("[RUST] Successfully decrypted body using format: {}", detected_format);
+                debug_log!("[RUST] Successfully decrypted body using format: {}", detected_format);
                 decrypted
             }
             Err(e) => {
-                println!("[RUST] Failed to decrypt body (detected format: {}): {}", detected_format, e);
+                debug_log!("[RUST] Failed to decrypt body (detected format: {}): {}", detected_format, e);
                 body.to_string()
             }
         }
@@ -3527,6 +4136,83 @@ mod tests {
             use_tls: true,
             private_key: None,
         }
+    }
+
+    #[test]
+    fn test_next_back_batch_first_iter_takes_newest() {
+        // 100 candidates, want 5 matches, generous budget → fetch the newest 5
+        // (the tail of the ascending list).
+        assert_eq!(next_back_batch(0, 100, 0, 5, 50), Some((95, 100)));
+    }
+
+    #[test]
+    fn test_next_back_batch_respects_remaining_target() {
+        // Already have 2 of 5 matches after scanning 5 → take 3 more from the tail.
+        assert_eq!(next_back_batch(5, 100, 2, 5, 50), Some((92, 95)));
+    }
+
+    #[test]
+    fn test_next_back_batch_stops_at_target() {
+        assert_eq!(next_back_batch(10, 100, 5, 5, 50), None);
+    }
+
+    #[test]
+    fn test_next_back_batch_stops_at_budget() {
+        // Hit the scan budget before finding enough matches.
+        assert_eq!(next_back_batch(50, 10_000, 0, 100, 50), None);
+    }
+
+    #[test]
+    fn test_next_back_batch_stops_when_exhausted() {
+        assert_eq!(next_back_batch(3, 3, 0, 5, 50), None);
+    }
+
+    #[test]
+    fn test_next_back_batch_clamps_to_remaining_candidates() {
+        // Only 2 candidates total, target wants 5 → take just the 2.
+        assert_eq!(next_back_batch(0, 2, 0, 5, 50), Some((0, 2)));
+    }
+
+    #[test]
+    fn test_next_back_batch_clamps_to_remaining_budget() {
+        // 3 budget slots left, target wants 10 → take 3 from the tail.
+        assert_eq!(next_back_batch(47, 1000, 0, 10, 50), Some((950, 953)));
+    }
+
+    #[test]
+    fn test_resolve_folder_count_explicit_override_wins() {
+        let json = r#"{"nostr-mail": 800, "INBOX": 25}"#;
+        assert_eq!(resolve_folder_count("nostr-mail", Some(json), 50), 800);
+        assert_eq!(resolve_folder_count("INBOX", Some(json), 50), 25);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_dense_default_for_nostr_mail() {
+        // No override map → nostr-mail gets the deep dense default, not the global.
+        assert_eq!(resolve_folder_count("nostr-mail", None, 50), DEFAULT_DENSE_COUNT);
+        // Case-insensitive on the well-known dense folder name.
+        assert_eq!(resolve_folder_count("Nostr-Mail", None, 50), DEFAULT_DENSE_COUNT);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_global_default_for_other_folders() {
+        assert_eq!(resolve_folder_count("INBOX", None, 50), 50);
+        assert_eq!(resolve_folder_count("Archive", None, 77), 77);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_malformed_json_falls_back() {
+        // Garbage / wrong-typed JSON is ignored, not fatal.
+        assert_eq!(resolve_folder_count("INBOX", Some("not json"), 50), 50);
+        assert_eq!(resolve_folder_count("nostr-mail", Some("{\"nostr-mail\": -3}"), 50), DEFAULT_DENSE_COUNT);
+    }
+
+    #[test]
+    fn test_resolve_folder_count_override_for_unlisted_folder() {
+        // A map that doesn't mention this folder → fall through to the defaults.
+        let json = r#"{"Archive": 10}"#;
+        assert_eq!(resolve_folder_count("INBOX", Some(json), 50), 50);
+        assert_eq!(resolve_folder_count("nostr-mail", Some(json), 50), DEFAULT_DENSE_COUNT);
     }
 
     #[test]
@@ -4269,15 +4955,36 @@ nitela\n\
 
     #[test]
     fn test_parse_armor_components_body_bytes_base64() {
-        // Base64 body should decode to bytes and be returned as base64 in body_bytes_b64
-        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+        // After the NIP-44 eager-decode-skip optimization, parse_armor_components
+        // no longer populates body_bytes_b64 for NIP-44 — those pre-decoded bytes
+        // were only ever consumed by NIP-04 signature verification, and re-decoding
+        // them at parse time was the single biggest cost in the decrypt pipeline
+        // (see commit c9095f4). NIP-04 still populates the field; NIP-44 leaves it
+        // None and decrypt_single_block / extract_ciphertext_binary do the decode
+        // lazily.
+        let nip04 = "----- BEGIN NOSTR NIP-04 ENCRYPTED BODY -----\n\
             SGVsbG8gV29ybGQ=\n\
             ----- END NOSTR MESSAGE -----";
-        let result = parse_armor_components(body).expect("should parse");
-        assert!(result.body_bytes_b64.is_some());
-        // "SGVsbG8gV29ybGQ=" decodes to "Hello World"
-        let decoded = general_purpose::STANDARD.decode(result.body_bytes_b64.unwrap()).unwrap();
+        let nip04_parsed = parse_armor_components(nip04).expect("should parse nip04");
+        assert!(
+            nip04_parsed.body_bytes_b64.is_some(),
+            "NIP-04 must keep eager-decoded body_bytes_b64 (used as MAC input by sig verify)"
+        );
+        let decoded = general_purpose::STANDARD
+            .decode(nip04_parsed.body_bytes_b64.unwrap())
+            .unwrap();
         assert_eq!(std::str::from_utf8(&decoded).unwrap(), "Hello World");
+
+        let nip44 = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        let nip44_parsed = parse_armor_components(nip44).expect("should parse nip44");
+        assert!(
+            nip44_parsed.body_bytes_b64.is_none(),
+            "NIP-44 must skip the eager glossia decode at parse time — \
+             body_bytes_b64 stays None and decrypt_single_block re-decodes the \
+             body_text lazily"
+        );
     }
 
     #[test]
@@ -4330,9 +5037,15 @@ nitela\n\
 
     #[test]
     fn test_parse_armor_components_body_bytes_match_extract_ciphertext() {
-        // Critical test: verify that body_bytes_b64 decoded matches extract_ciphertext_binary
-        // for the same input (ensuring signature verification compatibility)
-        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+        // Critical contract for NIP-04 sig verification: the eager-decoded
+        // body_bytes_b64 must equal what extract_ciphertext_binary recovers
+        // lazily — otherwise the inline-sig MAC input on the parse side
+        // disagrees with what verify_email_signature_inline recomputes.
+        //
+        // For NIP-44 the eager decode is skipped (see
+        // test_parse_armor_components_body_bytes_base64), so this contract
+        // only applies to NIP-04.
+        let body = "----- BEGIN NOSTR NIP-04 ENCRYPTED BODY -----\n\
             SGVsbG8gV29ybGQ=\n\
             ----- END NOSTR MESSAGE -----";
         let parsed = parse_armor_components(body).expect("should parse");
@@ -4468,117 +5181,64 @@ nitela\n\
 }
 
 
-pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
-    let account_key = config.email_address.trim().to_lowercase();
-    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
-    let require_signature = lookup_require_signature(db, active_pubkey);
-
-    // Folders to scan. Default (empty/None) = INBOX + nostr-mail label.
-    let folders: Vec<String> = match folder {
-        Some(f) if !f.is_empty() => vec![f.to_string()],
-        _ => vec!["INBOX".to_string(), "nostr-mail".to_string()],
-    };
-
-    println!(
-        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}, sync_cutoff_days={} (bootstrap only)",
-        account_key, folders, sync_cutoff_days
-    );
-
-    // Per-folder watermark updates, applied AFTER all per-message DB saves succeed.
-    let mut pending_state: Vec<(String, u32, u32)> = Vec::new();
-    let mut raw_nostr_emails: Vec<RawNostrEmail> = Vec::new();
-
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let addr = format!("{}:{}", host, port);
-
-    if config.use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        for f in &folders {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        pending_state.push((f.clone(), r.uid_validity, r.max_uid));
-                    }
-                    raw_nostr_emails.extend(r.emails);
-                }
-                Err(e) => println!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
-            }
-        }
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        for f in &folders {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        pending_state.push((f.clone(), r.uid_validity, r.max_uid));
-                    }
-                    raw_nostr_emails.extend(r.emails);
-                }
-                Err(e) => println!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
-            }
-        }
-    }
-    
-    // Filter emails based on transport authentication - always filter out unauthenticated emails
-    raw_nostr_emails.retain(|email| {
-        if let Some(false) = email.transport_auth_verified {
-            println!("[RUST] sync_nostr_emails_to_db: Filtering out email {} - transport authentication failed", email.message_id);
-            false
-        } else {
-            true
-        }
-    });
-    
-    // Filter emails based on signature requirement
+/// Apply the standard inbox filters (transport_auth, require_signature) and
+/// persist a batch of fetched messages, returning the count of newly-inserted
+/// rows. Shared between forward sync and fetch-older. Updates existing rows
+/// in place (preserving read state and attachments); new rows get fresh
+/// attachment extraction.
+///
+/// With `require_signature` true, unsigned / invalid-signature mail is dropped
+/// (not stored) — the user has opted into a signed-only inbox. This is *not*
+/// permanent loss: turning the setting off makes the next sync re-fetch and
+/// persist what was skipped. Forward sync picks up new unsigned mail
+/// automatically, fetch-older recovers it below the floor as the user scrolls,
+/// and `gap_fill_in_folder` re-scans the already-synced range (see its
+/// `recover_dropped` handling) so previously-dropped messages reappear on the
+/// next Refresh.
+fn persist_inbox_raw_emails(
+    raw_emails: Vec<RawNostrEmail>,
+    db: &Database,
+    require_signature: bool,
+) -> anyhow::Result<usize> {
+    let mut emails = raw_emails;
+    // Filter transport-unauthenticated.
+    emails.retain(|email| !matches!(email.transport_auth_verified, Some(false)));
+    // Enforce signature requirement: drop nostr mail that claims a sender but
+    // isn't validly signed. Recoverable — see the doc comment above.
     if require_signature {
-        raw_nostr_emails.retain(|email| {
-            // If email has sender_pubkey, it must have a valid signature
+        emails.retain(|email| {
             if email.sender_pubkey.is_some() {
-                // Email has pubkey, check signature
-                if let Some(valid) = email.signature_valid {
-                    valid // Only keep if signature is valid
-                } else {
-                    false // Reject emails without signature when require_signature is true
-                }
+                matches!(email.signature_valid, Some(true))
             } else {
-                // No pubkey header, allow (not a nostr email, but we're syncing nostr emails so this shouldn't happen)
                 true
             }
         });
     }
-    // If require_signature is false, accept all emails regardless of signature
 
+    // DB-lookup time vs DB-write time, plus insert/update split, so a slow
+    // persist phase ([RUST-PERF] sync_nostr) can be attributed. This loop is
+    // pure SQLite I/O — decryption is on-demand at read time, not here.
+    let candidate_count = emails.len();
+    let mut lookup_ms: u128 = 0;
+    let mut write_ms: u128 = 0;
+    let mut update_count = 0usize;
     let mut new_count = 0;
-    for email in raw_nostr_emails {
-        // Check if already in DB by message_id
-        let existing_email = match db.get_email(&email.message_id) {
-            Ok(Some(existing)) => Some(existing),
-            Ok(None) => None,
-            Err(e) => {
-                println!("[RUST] ERROR: Failed to check if email exists: {}", e);
-                return Err(anyhow::anyhow!("Failed to check email {} in DB: {}", email.message_id, e));
-            }
-        };
-        
+    for email in emails {
+        let t_lookup = std::time::Instant::now();
+        let existing_email = db
+            .get_email(&email.message_id)
+            .map_err(|e| anyhow::anyhow!("Failed to check email {} in DB: {}", email.message_id, e))?;
+        lookup_ms += t_lookup.elapsed().as_millis();
+
+        let t_write = std::time::Instant::now();
         if let Some(existing_email) = existing_email {
-            // Email already exists - update it with IMAP data (but preserve attachments)
-            println!("[RUST] Email with message_id {} already exists (id: {:?}), updating with IMAP data (preserving attachments)", 
-                email.message_id, existing_email.id);
             let updated_email = DbEmail {
                 id: existing_email.id,
                 message_id: existing_email.message_id.clone(),
                 from_address: email.from.clone(),
                 to_address: email.to.clone(),
-                subject: email.subject.clone(), // still encrypted
-                body: email.body.clone(),       // still encrypted
+                subject: email.subject.clone(),
+                body: email.body.clone(),
                 body_plain: None,
                 body_html: email.html_body.clone(),
                 received_at: email.date,
@@ -4587,9 +5247,9 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 recipient_pubkey: email.recipient_pubkey.clone(),
                 raw_headers: Some(email.raw_headers.clone()),
                 is_draft: false,
-                is_read: existing_email.is_read, // Preserve read status
+                is_read: existing_email.is_read,
                 updated_at: Some(chrono::Utc::now()),
-                created_at: existing_email.created_at, // Preserve original creation date
+                created_at: existing_email.created_at,
                 signature_valid: email.signature_valid,
                 signature_source: email.signature_source.clone(),
                 transport_auth_verified: email.transport_auth_verified,
@@ -4599,17 +5259,15 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 thread_id: None,
             };
             db.save_email(&updated_email)?;
-            println!("[RUST] Updated existing email in DB: message_id={}", email.message_id);
+            update_count += 1;
         } else {
-            // Save raw email to DB
-            // For inbox emails, sender_pubkey comes from headers (already extracted)
             let db_email = DbEmail {
                 id: None,
                 message_id: email.message_id.clone(),
                 from_address: email.from.clone(),
                 to_address: email.to.clone(),
-                subject: email.subject.clone(), // still encrypted
-                body: email.body.clone(),       // still encrypted
+                subject: email.subject.clone(),
+                body: email.body.clone(),
                 body_plain: None,
                 body_html: email.html_body.clone(),
                 received_at: email.date,
@@ -4618,7 +5276,11 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 recipient_pubkey: email.recipient_pubkey.clone(),
                 raw_headers: Some(email.raw_headers.clone()),
                 is_draft: false,
-                is_read: false,
+                // Seed read state from the server `\Seen` flag captured at fetch
+                // time, so mail already read on another client/device imports as
+                // read. Unknown (`None`) → unread. Existing rows above keep their
+                // local read state; this only seeds the initial insert.
+                is_read: email.seen.unwrap_or(false),
                 updated_at: None,
                 created_at: chrono::Utc::now(),
                 signature_valid: email.signature_valid,
@@ -4629,153 +5291,628 @@ pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folder: Option<&str>,
                 references: None,
                 thread_id: None,
             };
-            println!("[RUST] Saving email to DB: message_id={}", email.message_id);
             let email_id = db.save_email(&db_email)?;
-            println!("[RUST] Saved email to DB: message_id={}, id={}", email.message_id, email_id);
-            
-            // Save attachments for this email
-            println!("[RUST] sync_nostr_emails_to_db: Email {} has {} attachments in RawNostrEmail", email.message_id, email.attachments.len());
-            if !email.attachments.is_empty() {
-                println!("[RUST] Saving {} attachments for email {} (id: {})", email.attachments.len(), email.message_id, email_id);
-                for mut attachment in email.attachments.iter().cloned() {
-                    attachment.email_id = email_id;
-                    println!("[RUST] Saving attachment: filename={}, size={}, encrypted={}, email_id={}",
-                        attachment.filename, attachment.size, attachment.is_encrypted, email_id);
-                    match db.save_attachment(&attachment) {
-                        Ok(att_id) => {
-                            println!("[RUST] Successfully saved attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
-                        }
-                        Err(e) => {
-                            println!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
-                        }
-                    }
-                }
-            } else {
-                println!("[RUST] sync_nostr_emails_to_db: Email {} has no attachments in RawNostrEmail, trying to extract from body", email.message_id);
-                // Try to extract attachments by parsing the raw RFC822 email body
-                if let Ok(parsed_email) = mailparse::parse_mail(email.body.as_bytes()) {
-                    let extracted_attachments = extract_attachments_from_parsed_email(&parsed_email, &email.body);
-                    if !extracted_attachments.is_empty() {
-                        println!("[RUST] Extracted {} attachments from email body for email {}", extracted_attachments.len(), email_id);
-                        for mut attachment in extracted_attachments {
-                            attachment.email_id = email_id;
-                            match db.save_attachment(&attachment) {
-                                Ok(att_id) => {
-                                    println!("[RUST] Saved extracted attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
-                                }
-                                Err(e) => {
-                                    println!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    println!("[RUST] Could not parse email body to extract attachments for email {}", email_id);
-                }
-            }
-            
+            persist_attachments_for_email(db, &email, email_id);
             new_count += 1;
         }
+        write_ms += t_write.elapsed().as_millis();
     }
+    debug_log!("[RUST-PERF] persist_inbox_raw_emails: {} candidates, lookup={}ms, write={}ms ({} new, {} updated)",
+        candidate_count, lookup_ms, write_ms, new_count, update_count);
+    Ok(new_count)
+}
+
+/// Save attachments parsed from a RawNostrEmail. Falls back to re-parsing the
+/// RFC822 body when the RawNostrEmail came in with no attachments attached
+/// (e.g. older parse paths). Errors per-attachment are logged but never abort.
+fn persist_attachments_for_email(db: &Database, email: &RawNostrEmail, email_id: i64) {
+    if !email.attachments.is_empty() {
+        for mut attachment in email.attachments.iter().cloned() {
+            attachment.email_id = email_id;
+            if let Err(e) = db.save_attachment(&attachment) {
+                debug_log!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
+            }
+        }
+        return;
+    }
+    if let Ok(parsed_email) = mailparse::parse_mail(email.body.as_bytes()) {
+        let extracted_attachments = extract_attachments_from_parsed_email(&parsed_email, &email.body);
+        for mut attachment in extracted_attachments {
+            attachment.email_id = email_id;
+            if let Err(e) = db.save_attachment(&attachment) {
+                debug_log!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
+            }
+        }
+    }
+}
+
+/// Provider-aware default folder list for inbox sync. Returned when the user
+/// hasn't picked any folders explicitly. Folders that don't exist on the
+/// server are tolerated by `uid_sync_folder` (logged and skipped), so this can
+/// include best-guess names like `Archive` without breaking anything.
+///
+/// Spam/junk folders are not in this static list. How spam is handled depends
+/// on the spam-rescue setting (decided at sync time): with rescue ON, spam is
+/// never scanned and `rescue_nostr_emails_from_spam` moves misfiled nostr mail
+/// into the rescue target; with rescue OFF, `extend_with_spam_folders` appends
+/// discovered spam folders so that mail still surfaces in the inbox.
+pub fn default_inbox_folders(imap_host: &str) -> Vec<String> {
+    let h = imap_host.to_lowercase();
+    if h.contains("gmail.com") || h.contains("googlemail.com") {
+        // Gmail: INBOX covers the Primary tab. No Archive — Gmail uses
+        // [Gmail]/All Mail for that, which would re-scan everything.
+        vec![
+            "INBOX".to_string(),
+            "nostr-mail".to_string(),
+        ]
+    } else {
+        // Generic IMAP: Archive is added because Outlook/Fastmail/etc users
+        // heavily route mail there. Missing on Yahoo etc; the sync loop logs
+        // the miss and continues.
+        vec![
+            "INBOX".to_string(),
+            "nostr-mail".to_string(),
+            "Archive".to_string(),
+        ]
+    }
+}
+
+/// Serializes the IMAP-using sync passes. The Refresh button, the IDLE
+/// `imap-new-mail` push, and `rescue_spam_now`'s follow-up sync can otherwise
+/// fire `sync_nostr_emails_to_db` / `refresh_inbox_emails_to_db` concurrently —
+/// and auto-file's own INBOX moves re-arm IDLE, so a manual refresh reliably
+/// overlaps an IDLE-driven sync. Two heavy multi-command passes racing on
+/// pooled connections desync the `imap` 2.4.1 parser, which asserts on the
+/// mismatched command tag (client.rs:1369) and panics in `uid_search`. Holding
+/// this lock for the whole pass guarantees one IMAP sync runs at a time.
+static SYNC_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// Run a synchronous IMAP `op` against `*session`, surviving an `imap` 2.4.1
+/// parser desync.
+///
+/// The crate asserts that a tagged completion line carries the current command's
+/// tag (client.rs:1369); when a prior command's response was left half-read in
+/// the socket buffer — which Gmail can provoke during the auto-file/rescue
+/// SEARCH storm — the next command reads a stale tag and the assertion *panics*
+/// rather than returning an error. We can't reuse a session once its byte stream
+/// is misaligned, so on a caught panic the poisoned session is dropped (socket
+/// closed, never re-pooled) and replaced with a fresh connection, and `None` is
+/// returned. On success returns `Some(op_result)`.
+///
+/// `catch_unwind` relies on `panic = "unwind"` (see backend/Cargo.toml). The
+/// session is behind `&mut`, which isn't `UnwindSafe`, hence `AssertUnwindSafe`:
+/// a desynced session is always discarded here, so no torn state is observed.
+fn guarded_session_op<T>(
+    session: &mut imap_pool::ImapSession,
+    target: &ImapTarget,
+    op: impl FnOnce(&mut imap_pool::ImapSession) -> T,
+) -> anyhow::Result<Option<T>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(&mut *session))) {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => {
+            debug_log!("[RUST] guarded_session_op: imap op panicked (parser desync); dropping poisoned session and reconnecting");
+            *session = imap_pool::connect_imap(target)?;
+            Ok(None)
+        }
+    }
+}
+
+pub async fn sync_nostr_emails_to_db(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+    sync_nostr_emails_to_db_inner(config, folders_arg, active_pubkey, db, /* include_gap_fill = */ false).await
+}
+
+/// Same as `sync_nostr_emails_to_db` but also runs `gap_fill_in_folder` per
+/// folder in the same IMAP session. Powers the Refresh button when the user
+/// wants a thorough check; the auto-sync path keeps the cheap forward-only
+/// behaviour.
+pub async fn refresh_inbox_emails_to_db(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+    sync_nostr_emails_to_db_inner(config, folders_arg, active_pubkey, db, /* include_gap_fill = */ true).await
+}
+
+async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option<&[String]>, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
+    // Serialize: never let two sync passes touch the IMAP pool concurrently
+    // (see SYNC_LOCK). Held for the whole pass; a second caller waits its turn.
+    let _sync_guard = SYNC_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+
+    let account_key = config.email_address.trim().to_lowercase();
+    let require_signature = lookup_require_signature(db, active_pubkey);
+    let spam_rescue = lookup_spam_rescue(db, active_pubkey);
+    let auto_move_nostr = lookup_auto_move_nostr(db, active_pubkey);
+    let rescue_target = lookup_spam_rescue_target(db, active_pubkey);
+    debug_log!("[RUST] sync: spam_rescue={}, auto_move_nostr={}, rescue_target='{}'", spam_rescue, auto_move_nostr, rescue_target);
+
+    // Folders to scan. Default (empty/None) = provider-aware list from
+    // `default_inbox_folders`. Multiple folders may be supplied to scan in a
+    // single pass; dedupe to avoid re-scanning the same folder twice if a
+    // caller passed duplicates.
+    let folders: Vec<String> = match folders_arg {
+        Some(list) => {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut out: Vec<String> = Vec::new();
+            for f in list {
+                let trimmed = f.trim();
+                if trimmed.is_empty() { continue; }
+                if seen.insert(trimmed.to_string()) {
+                    out.push(trimmed.to_string());
+                }
+            }
+            if out.is_empty() {
+                default_inbox_folders(&config.imap_host)
+            } else {
+                out
+            }
+        }
+        None => default_inbox_folders(&config.imap_host),
+    };
+
+    // Strip any spam/junk/bulk name from the base list (a default never has
+    // one; a stale persisted selection might). Whether spam gets scanned is
+    // decided below, by the spam_rescue flag — not by the saved selection:
+    //   - rescue ON  → spam is NOT scanned. Scanning it would let an in-app
+    //     read mark the message \Seen, which rescue treats as "the user filed
+    //     this here, leave it" — permanently suppressing the rescue. Rescue
+    //     instead moves eligible mail into the rescue target (added below).
+    //   - rescue OFF → discovered spam folders ARE appended to the scan set
+    //     (inside the IMAP session) so nostr mail a provider misfiled still
+    //     surfaces in the inbox. Nothing moves it, so it stays in spam and is
+    //     eventually auto-purged by the provider — which some users prefer.
+    let mut folders: Vec<String> = folders
+        .into_iter()
+        .filter(|f| !is_spam_folder_name(f))
+        .collect();
+
+    // With spam rescue or inbox auto-filing on, ensure the destination folder is
+    // in the scan set so moved messages land in the local DB during this same pass.
+    if (spam_rescue || auto_move_nostr) && !folders.iter().any(|f| f.eq_ignore_ascii_case(&rescue_target)) {
+        folders.push(rescue_target.clone());
+    }
+
+    println!(
+        "[RUST] sync_nostr_emails_to_db: account={}, folders={:?}",
+        account_key, folders
+    );
+
+    // Per-folder watermark updates, applied AFTER all per-message DB saves succeed.
+    // Tuple: (folder, uid_validity, last_seen_uid, bootstrap_min_uid).
+    // `bootstrap_min_uid` is Some only on the run that created or replaced the
+    // row — it seeds folder_sync_state.min_seen_uid so backward pagination has
+    // a defined floor. Incremental runs leave min_seen_uid alone.
+    let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
+    // Per-folder gap-fill examined windows (folder, uid_validity, floor,
+    // last_seen), committed after persist so a future pass skips them.
+    let mut pending_gap_examined: Vec<(String, u32, u32, u32)> = Vec::new();
+    let mut raw_nostr_emails: Vec<RawNostrEmail> = Vec::new();
+
+    let t_total = std::time::Instant::now();
+    let target = ImapTarget::from_config(config);
+    let t_checkout = std::time::Instant::now();
+    let mut session = imap_pool::checkout(&target)?;
+    let checkout_ms = t_checkout.elapsed().as_millis();
+    let t_moves = std::time::Instant::now();
+    if spam_rescue {
+        // Best-effort, and panic-guarded: a SEARCH desync here must not freeze
+        // the command or poison the scan below — on panic we reconnect and skip.
+        // Bound the per-spam-folder search to the same default load window the
+        // scan uses (spam folders are small, so this rarely binds).
+        let rescue_window = lookup_initial_count(db, active_pubkey);
+        let moved = guarded_session_op(&mut session, &target, |s| {
+            rescue_nostr_emails_from_spam(s, &rescue_target, /* unseen_only = */ true, rescue_window)
+        })?.unwrap_or(0);
+        if moved > 0 {
+            println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
+        }
+    } else {
+        extend_with_spam_folders(&mut session, &mut folders);
+    }
+
+    // Auto-file is no longer a separate INBOX search/fetch pass. It's folded
+    // into the per-folder scan below (`auto_file_to`): the scan already fetches
+    // and identifies the recent nostr mail, so it moves exactly those UIDs into
+    // the destination — reusing one fetch, and dropping the unbounded HEADER/BODY
+    // searches that desynced the imap parser on large mailboxes.
+
+    let moves_ms = t_moves.elapsed().as_millis();
+
+    println!("[RUST] sync_nostr_emails_to_db: folders to scan: {:?}", folders);
+    // Per-folder scan time, accumulated so the [RUST-PERF] summary can show
+    // which folder (or the persist/move phase) dominates a slow sync.
+    let t_scan = std::time::Instant::now();
+    for f in &folders {
+        let t_folder = std::time::Instant::now();
+        // Bootstrap scans a window of `count` messages per folder ("Messages to
+        // Load Per Folder" / per-folder override), surfacing the nostr mail in
+        // it — same scan-window model as the scroll. Passing `count` as both the
+        // match target and the scan cap means the window is examined in full.
+        let count = lookup_folder_count(db, active_pubkey, f);
+        // Auto-file the nostr mail found in this folder into the destination,
+        // INBOX-only (matching the prior behaviour) and never the target itself.
+        let auto_file_to = if auto_move_nostr
+            && f.eq_ignore_ascii_case("INBOX")
+            && !rescue_target.eq_ignore_ascii_case("INBOX")
+        {
+            Some(rescue_target.as_str())
+        } else {
+            None
+        };
+        // Panic-guarded like the movers: a desync mid-scan reconnects and skips
+        // this folder rather than freezing the whole command.
+        match guarded_session_op(&mut session, &target, |s| {
+            uid_sync_folder(s, config, db, &account_key, f, count, count,
+                            parse_nostr_email_from_imap_body, auto_file_to)
+        })? {
+            Some(Ok(r)) => {
+                if r.max_uid > 0 || !r.had_existing_state {
+                    let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
+                        Some(r.min_uid)
+                    } else {
+                        None
+                    };
+                    pending_state.push((f.clone(), r.uid_validity, r.max_uid, bootstrap_min));
+                }
+                raw_nostr_emails.extend(r.emails);
+            }
+            Some(Err(e)) => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' failed: {}", f, e),
+            None => debug_log!("[RUST] sync_nostr_emails_to_db: folder '{}' scan panicked (imap desync); reconnected, skipping", f),
+        }
+        if include_gap_fill {
+            // recover_dropped = !require_signature: when the user has lifted the
+            // signed-only filter, gap-fill re-scans the full synced range to
+            // bring back mail that was dropped while the filter was on.
+            match guarded_session_op(&mut session, &target, |s| {
+                gap_fill_in_folder(s, config, db, &account_key, f,
+                                   !require_signature, parse_nostr_email_from_imap_body)
+            })? {
+                Some(Ok(r)) => {
+                    raw_nostr_emails.extend(r.emails);
+                    if let Some((uidv, lo, hi)) = r.examined {
+                        pending_gap_examined.push((f.clone(), uidv, lo, hi));
+                    }
+                }
+                Some(Err(e)) => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
+                None => debug_log!("[RUST] sync_nostr_emails_to_db: gap_fill '{}' panicked (imap desync); reconnected, skipping", f),
+            }
+        }
+        debug_log!("[RUST-PERF] sync_nostr: folder '{}' scan+gapfill={}ms (running total {} raw match)",
+            f, t_folder.elapsed().as_millis(), raw_nostr_emails.len());
+    }
+    let scan_ms = t_scan.elapsed().as_millis();
+    imap_pool::checkin(&target, session);
+
+    let raw_match_count = raw_nostr_emails.len();
+    let t_persist = std::time::Instant::now();
+    let new_count = persist_inbox_raw_emails(raw_nostr_emails, db, require_signature)?;
+    let persist_ms = t_persist.elapsed().as_millis();
+    let t_commit = std::time::Instant::now();
+
     // Commit per-folder UID watermarks now that the DB writes have all succeeded.
     // A partial-batch failure earlier returned Err and we never reach here, so
     // the watermark only advances when every fetched message was persisted.
-    for (folder_name, uid_validity, max_uid) in pending_state {
+    for (folder_name, uid_validity, max_uid, bootstrap_min) in pending_state {
         if let Err(e) = db.set_folder_sync_state(&account_key, &folder_name, uid_validity, max_uid) {
             println!(
                 "[RUST] sync_nostr_emails_to_db: failed to persist folder_sync_state for '{}': {}",
                 folder_name, e
             );
+            continue;
+        }
+        println!(
+            "[RUST] sync_nostr_emails_to_db: persisted folder_sync_state for '{}' (uid_validity={}, last_seen_uid={})",
+            folder_name, uid_validity, max_uid
+        );
+        if let Some(min) = bootstrap_min {
+            if let Err(e) = db.set_folder_min_seen_uid(&account_key, &folder_name, min) {
+                println!(
+                    "[RUST] sync_nostr_emails_to_db: failed to seed min_seen_uid for '{}': {}",
+                    folder_name, e
+                );
+            } else {
+                println!(
+                    "[RUST] sync_nostr_emails_to_db: seeded min_seen_uid={} for '{}'",
+                    min, folder_name
+                );
+            }
+        }
+    }
+
+    // Commit gap-fill examined windows after the persist succeeded, so the next
+    // refresh skips this range instead of re-fetching all the (non-nostr) mail
+    // in it. Done post-persist for the same reason as the watermarks above: a
+    // persist failure must leave the range unexamined so it's rescanned.
+    for (folder_name, uid_validity, lo, hi) in pending_gap_examined {
+        if let Err(e) = db.set_folder_gap_examined(&account_key, &folder_name, uid_validity, lo, hi) {
+            debug_log!("[RUST] sync_nostr_emails_to_db: failed to record gap_examined for '{}': {}", folder_name, e);
+        }
+    }
+
+    let commit_ms = t_commit.elapsed().as_millis();
+    debug_log!("[RUST] sync_nostr_emails_to_db: Completed sync, {} new emails saved", new_count);
+    debug_log!("[RUST-PERF] sync_nostr TOTAL={}ms = checkout={}ms + moves={}ms + scan={}ms + persist={}ms + commit={}ms ({} folders, {} raw match, {} new, gap_fill={})",
+        t_total.elapsed().as_millis(), checkout_ms, moves_ms, scan_ms, persist_ms, commit_ms,
+        folders.len(), raw_match_count, new_count, include_gap_fill);
+    Ok(new_count)
+}
+
+/// Summary of one `fetch_older_*_emails_to_db` call. `new_count` is the rows
+/// newly inserted into the DB across all scanned folders. `hit_bottom` is
+/// true only when every scanned folder walked all the way to UID 1 — i.e.
+/// there's nothing older on the server to find. When false, the per-call
+/// scan budget was exhausted before reaching bottom and another call may
+/// yield more.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FetchOlderSummary {
+    pub new_count: usize,
+    pub hit_bottom: bool,
+    // INTERNALDATE of the oldest message scanned across all folders this call
+    // (the minimum over each folder's oldest-touched message). Serialized as an
+    // RFC3339 string for the UI; None when nothing was scanned. Lets the list
+    // status show how far back a "no matches in this batch" scan reached.
+    pub oldest_scanned: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Backward UID pagination for the inbox. Walks UIDs back per folder past
+/// the stored `min_seen_uid` floor, persists matches, and lowers the floor.
+/// Returns counts plus a `hit_bottom` aggregate over all folders.
+pub async fn fetch_older_inbox_emails_to_db(
+    config: &EmailConfig,
+    folder: Option<&str>,
+    page_size: usize,
+    active_pubkey: &str,
+    db: &Database,
+) -> anyhow::Result<FetchOlderSummary> {
+    let account_key = config.email_address.trim().to_lowercase();
+    let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
+    let require_signature = lookup_require_signature(db, active_pubkey);
+    let _ = page_size; // display page; scan window is the per-folder count below
+
+    let folders: Vec<String> = match folder {
+        Some(f) if !f.is_empty() => vec![f.to_string()],
+        _ => default_inbox_folders(&config.imap_host),
+    };
+
+    println!(
+        "[RUST] fetch_older_inbox_emails_to_db: account={}, folders={:?}, page_size={}",
+        account_key, folders, page_size
+    );
+
+    let mut pending_floors: Vec<(String, u32)> = Vec::new();
+    let mut raw_emails: Vec<RawNostrEmail> = Vec::new();
+    // Folder is "exhausted" iff fetch_older_in_folder reported hit_bottom
+    // for it. Overall hit_bottom = all scanned folders exhausted, AND at
+    // least one folder was scanned successfully. Folder errors are treated
+    // as "not exhausted" — the caller may want to retry.
+    let mut any_folder_scanned = false;
+    let mut all_folders_exhausted = true;
+    let mut oldest_scanned: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    let target = ImapTarget::from_config(config);
+    let mut session = imap_pool::checkout(&target)?;
+    for f in &folders {
+        // Same per-folder count the bootstrap uses ("Messages to Load Per
+        // Folder" / per-folder override): each scroll scans that many messages
+        // in this folder, surfacing the nostr mail found.
+        let scan_window = lookup_folder_count(db, active_pubkey, f);
+        match fetch_older_in_folder(&mut session, config, db, &account_key, f,
+                                     scan_window, sync_cutoff_days,
+                                     parse_nostr_email_from_imap_body) {
+            Ok(r) => {
+                any_folder_scanned = true;
+                if !r.hit_bottom { all_folders_exhausted = false; }
+                if let Some(d) = r.oldest_scanned {
+                    if oldest_scanned.map_or(true, |cur| d < cur) { oldest_scanned = Some(d); }
+                }
+                if let Some(new_floor) = r.new_floor_uid {
+                    pending_floors.push((f.clone(), new_floor));
+                }
+                raw_emails.extend(r.emails);
+            }
+            Err(e) => {
+                debug_log!("[RUST] fetch_older_inbox_emails_to_db: folder '{}' failed: {}", f, e);
+                all_folders_exhausted = false;
+            }
+        }
+    }
+    imap_pool::checkin(&target, session);
+
+    let new_count = persist_inbox_raw_emails(raw_emails, db, require_signature)?;
+
+    for (folder_name, new_floor) in pending_floors {
+        if let Err(e) = db.set_folder_min_seen_uid(&account_key, &folder_name, new_floor) {
+            println!(
+                "[RUST] fetch_older_inbox_emails_to_db: failed to lower min_seen_uid for '{}': {}",
+                folder_name, e
+            );
         } else {
             println!(
-                "[RUST] sync_nostr_emails_to_db: persisted folder_sync_state for '{}' (uid_validity={}, last_seen_uid={})",
-                folder_name, uid_validity, max_uid
+                "[RUST] fetch_older_inbox_emails_to_db: lowered min_seen_uid to {} for '{}'",
+                new_floor, folder_name
             );
         }
     }
 
-    println!("[RUST] sync_nostr_emails_to_db: Completed sync, {} new emails saved", new_count);
-    Ok(new_count)
+    let hit_bottom = any_folder_scanned && all_folders_exhausted;
+    println!(
+        "[RUST] fetch_older_inbox_emails_to_db: completed, {} new emails saved, hit_bottom={}",
+        new_count, hit_bottom
+    );
+    Ok(FetchOlderSummary { new_count, hit_bottom, oldest_scanned })
 }
 
-pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
-    println!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
+/// Backward UID pagination for the sent folder. See `fetch_older_inbox_emails_to_db`.
+pub async fn fetch_older_sent_emails_to_db(
+    config: &EmailConfig,
+    page_size: usize,
+    active_pubkey: &str,
+    db: &Database,
+) -> anyhow::Result<FetchOlderSummary> {
     let account_key = config.email_address.trim().to_lowercase();
     let sync_cutoff_days = lookup_sync_cutoff_days(db, active_pubkey);
+    let _ = page_size; // display page; scan window is the per-folder count below
 
-    let mut pending_state: Vec<(String, u32, u32)> = Vec::new();
-    let mut raw_sent_emails: Vec<RawNostrEmail> = Vec::new();
+    let is_gmail = config.imap_host.contains("gmail.com");
 
-    let host = &config.imap_host;
-    let port = config.imap_port;
-    let username = &config.email_address;
-    let password = &config.password;
-    let addr = format!("{}:{}", host, port);
-    let is_gmail = host.contains("gmail.com");
+    let mut pending_floors: Vec<(String, u32)> = Vec::new();
+    let mut raw_emails: Vec<RawNostrEmail> = Vec::new();
+    let mut any_folder_scanned = false;
+    let mut all_folders_exhausted = true;
+    let mut oldest_scanned: Option<chrono::DateTime<chrono::Utc>> = None;
 
-    if config.use_tls {
-        let client = create_imap_tls_client!(host, &addr)?;
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let sent_folder = discover_sent_mailbox(&mut session)?
-            .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
-        for f in [sent_folder.as_str(), "nostr-mail"] {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_sent_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        pending_state.push((f.to_string(), r.uid_validity, r.max_uid));
-                    }
-                    raw_sent_emails.extend(r.emails);
+    let target = ImapTarget::from_config(config);
+    let mut session = imap_pool::checkout(&target)?;
+    let sent_folder = discover_sent_mailbox(&mut session)?
+        .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
+    // Sent pass walks only the real Sent folder. `nostr-mail` is already
+    // covered by the inbox/nostr pass (verify_transport = true); scanning it
+    // again here adds no coverage (send is SMTP-only, nothing APPENDs to it),
+    // wastes body fetches, and lets both passes fight over its
+    // folder_sync_state watermark. Sent-vs-Inbox is decided at query time by
+    // from_address, not by which folder a row came from.
+    for f in [sent_folder.as_str()] {
+        let scan_window = lookup_folder_count(db, active_pubkey, f);
+        match fetch_older_in_folder(&mut session, config, db, &account_key, f,
+                                     scan_window, sync_cutoff_days,
+                                     parse_nostr_sent_email_from_imap_body) {
+            Ok(r) => {
+                any_folder_scanned = true;
+                if !r.hit_bottom { all_folders_exhausted = false; }
+                if let Some(d) = r.oldest_scanned {
+                    if oldest_scanned.map_or(true, |cur| d < cur) { oldest_scanned = Some(d); }
                 }
-                Err(e) => println!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
+                if let Some(new_floor) = r.new_floor_uid {
+                    pending_floors.push((f.to_string(), new_floor));
+                }
+                raw_emails.extend(r.emails);
             }
-        }
-    } else {
-        let tcp_stream = TcpStream::connect(&addr)?;
-        let client = imap::Client::new(tcp_stream);
-        let mut session = client.login(username, password).map_err(|e| anyhow::anyhow!(e.0))?;
-        let sent_folder = discover_sent_mailbox(&mut session)?
-            .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
-        for f in [sent_folder.as_str(), "nostr-mail"] {
-            match uid_sync_folder(&mut session, config, db, &account_key, f, sync_cutoff_days,
-                                  parse_nostr_sent_email_from_imap_body) {
-                Ok(r) => {
-                    if r.max_uid > 0 || !r.had_existing_state {
-                        pending_state.push((f.to_string(), r.uid_validity, r.max_uid));
-                    }
-                    raw_sent_emails.extend(r.emails);
-                }
-                Err(e) => println!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
+            Err(e) => {
+                debug_log!("[RUST] fetch_older_sent_emails_to_db: folder '{}' failed: {}", f, e);
+                all_folders_exhausted = false;
             }
         }
     }
+    imap_pool::checkin(&target, session);
 
-    println!("[RUST] sync_sent_emails_to_db: Fetched {} emails from IMAP", raw_sent_emails.len());
+    // Sent emails skip the require_signature filter — you authored them, so
+    // they're always kept regardless of the inbox signature policy.
+    let new_count = persist_inbox_raw_emails(raw_emails, db, /* require_signature */ false)?;
 
+    for (folder_name, new_floor) in pending_floors {
+        if let Err(e) = db.set_folder_min_seen_uid(&account_key, &folder_name, new_floor) {
+            println!(
+                "[RUST] fetch_older_sent_emails_to_db: failed to lower min_seen_uid for '{}': {}",
+                folder_name, e
+            );
+        } else {
+            println!(
+                "[RUST] fetch_older_sent_emails_to_db: lowered min_seen_uid to {} for '{}'",
+                new_floor, folder_name
+            );
+        }
+    }
+
+    let hit_bottom = any_folder_scanned && all_folders_exhausted;
+    println!(
+        "[RUST] fetch_older_sent_emails_to_db: completed, {} new emails saved, hit_bottom={}",
+        new_count, hit_bottom
+    );
+    Ok(FetchOlderSummary { new_count, hit_bottom, oldest_scanned })
+}
+
+pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+    sync_sent_emails_to_db_inner(config, active_pubkey, db, /* include_gap_fill = */ false).await
+}
+
+/// Refresh-button variant of `sync_sent_emails_to_db`: also runs a gap-fill
+/// pass per folder. See `gap_fill_in_folder` for shape.
+pub async fn refresh_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, db: &Database) -> anyhow::Result<usize> {
+    sync_sent_emails_to_db_inner(config, active_pubkey, db, /* include_gap_fill = */ true).await
+}
+
+async fn sync_sent_emails_to_db_inner(config: &EmailConfig, active_pubkey: &str, db: &Database, include_gap_fill: bool) -> anyhow::Result<usize> {
+    debug_log!("[RUST] sync_sent_emails_to_db: Starting sync for email: {}", config.email_address);
+    let t_total = std::time::Instant::now();
+    let account_key = config.email_address.trim().to_lowercase();
+
+    // See sync_nostr_emails_to_db for the meaning of the 4-tuple.
+    let mut pending_state: Vec<(String, u32, u32, Option<u32>)> = Vec::new();
+    // Per-folder gap-fill examined windows (folder, uid_validity, floor, last_seen).
+    let mut pending_gap_examined: Vec<(String, u32, u32, u32)> = Vec::new();
+    let mut raw_sent_emails: Vec<RawNostrEmail> = Vec::new();
+
+    let is_gmail = config.imap_host.contains("gmail.com");
+
+    let target = ImapTarget::from_config(config);
+    let mut session = imap_pool::checkout(&target)?;
+    let sent_folder = discover_sent_mailbox(&mut session)?
+        .unwrap_or_else(|| if is_gmail { "[Gmail]/Sent Mail".to_string() } else { "Sent".to_string() });
+    // Sent pass walks only the real Sent folder. `nostr-mail` is already
+    // covered by the inbox/nostr pass (verify_transport = true); scanning it
+    // again here adds no coverage (send is SMTP-only, nothing APPENDs to it),
+    // wastes body fetches, and lets both passes fight over its
+    // folder_sync_state watermark. Sent-vs-Inbox is decided at query time by
+    // from_address, not by which folder a row came from.
+    let t_scan = std::time::Instant::now();
+    for f in [sent_folder.as_str()] {
+        // Scan a window of `count` messages per folder (see sync_nostr_emails_to_db).
+        let count = lookup_folder_count(db, active_pubkey, f);
+        match uid_sync_folder(&mut session, config, db, &account_key, f, count, count,
+                              parse_nostr_sent_email_from_imap_body, /* auto_file_to = */ None) {
+            Ok(r) => {
+                if r.max_uid > 0 || !r.had_existing_state {
+                    let bootstrap_min = if !r.had_existing_state && r.min_uid > 0 {
+                        Some(r.min_uid)
+                    } else {
+                        None
+                    };
+                    pending_state.push((f.to_string(), r.uid_validity, r.max_uid, bootstrap_min));
+                }
+                raw_sent_emails.extend(r.emails);
+            }
+            Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: folder '{}' failed: {}", f, e),
+        }
+        if include_gap_fill {
+            // Sent mail is never dropped, so it never needs recovery scanning.
+            match gap_fill_in_folder(&mut session, config, db, &account_key, f,
+                                      /* recover_dropped */ false, parse_nostr_sent_email_from_imap_body) {
+                Ok(r) => {
+                    raw_sent_emails.extend(r.emails);
+                    if let Some((uidv, lo, hi)) = r.examined {
+                        pending_gap_examined.push((f.to_string(), uidv, lo, hi));
+                    }
+                }
+                Err(e) => debug_log!("[RUST] sync_sent_emails_to_db: gap_fill folder '{}' failed: {}", f, e),
+            }
+        }
+    }
+    let scan_ms = t_scan.elapsed().as_millis();
+    imap_pool::checkin(&target, session);
+
+    debug_log!("[RUST] sync_sent_emails_to_db: Fetched {} emails from IMAP", raw_sent_emails.len());
+
+    let raw_match_count = raw_sent_emails.len();
+    let t_persist = std::time::Instant::now();
     let mut new_count = 0;
-    println!("[RUST] sync_sent_emails_to_db: Processing {} emails for saving", raw_sent_emails.len());
+    debug_log!("[RUST] sync_sent_emails_to_db: Processing {} emails for saving", raw_sent_emails.len());
     for (idx, email) in raw_sent_emails.iter().enumerate() {
-        println!("[RUST] sync_sent_emails_to_db: Processing email {} of {}: message_id={}, from={}, date={}", 
+        debug_log!("[RUST] sync_sent_emails_to_db: Processing email {} of {}: message_id={}, from={}, date={}", 
             idx + 1, raw_sent_emails.len(), email.message_id, email.from, email.date);
         // Skip emails that failed transport authentication
         if let Some(false) = email.transport_auth_verified {
-            println!("[RUST] sync_nostr_emails_to_db: Skipping email {} - transport authentication failed", email.message_id);
+            debug_log!("[RUST] sync_nostr_emails_to_db: Skipping email {} - transport authentication failed", email.message_id);
             continue;
         }
         
         // Check if already in DB by message_id (only check, don't save yet)
-        println!("[RUST] sync_sent_emails_to_db: Checking for existing email with message_id: {}", email.message_id);
+        debug_log!("[RUST] sync_sent_emails_to_db: Checking for existing email with message_id: {}", email.message_id);
         let existing_email = match db.get_email(&email.message_id) {
             Ok(Some(existing)) => {
-                println!("[RUST] sync_sent_emails_to_db: Found existing email in DB: id={:?}, message_id={}", existing.id, existing.message_id);
+                debug_log!("[RUST] sync_sent_emails_to_db: Found existing email in DB: id={:?}, message_id={}", existing.id, existing.message_id);
                 Some(existing)
             },
             Ok(None) => {
-                println!("[RUST] sync_sent_emails_to_db: No existing email found in DB for message_id: {}", email.message_id);
+                debug_log!("[RUST] sync_sent_emails_to_db: No existing email found in DB for message_id: {}", email.message_id);
                 None
             },
             Err(e) => {
-                println!("[RUST] ERROR: Failed to check if email exists: {}", e);
+                debug_log!("[RUST] ERROR: Failed to check if email exists: {}", e);
                 return Err(anyhow::anyhow!("Failed to check email {} in DB: {}", email.message_id, e));
             }
         };
@@ -4783,7 +5920,7 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
         if let Some(existing_email) = existing_email {
                 // Email already exists - update it with IMAP data (but preserve attachments)
                 // Only update fields that might have changed from IMAP, don't overwrite attachment data
-                println!("[RUST] Email with message_id {} already exists (id: {:?}), updating with IMAP data (preserving attachments)", 
+                debug_log!("[RUST] Email with message_id {} already exists (id: {:?}), updating with IMAP data (preserving attachments)", 
                     email.message_id, existing_email.id);
                 let updated_email = DbEmail {
                     id: existing_email.id,
@@ -4812,15 +5949,15 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                     thread_id: None,
                 };
                 match db.save_email(&updated_email) {
-                    Ok(id) => println!("[RUST] Updated existing email with IMAP data, id: {}", id),
+                    Ok(id) => debug_log!("[RUST] Updated existing email with IMAP data, id: {}", id),
                     Err(e) => {
-                        println!("[RUST] ERROR: Failed to update email {}: {}", email.message_id, e);
+                        debug_log!("[RUST] ERROR: Failed to update email {}: {}", email.message_id, e);
                         return Err(anyhow::anyhow!("Failed to update email {}: {}", email.message_id, e));
                     }
                 }
         } else {
             // New email - save raw email to DB directly without checking again
-            println!("[RUST] Email is new, inserting directly to DB (skipping redundant get_email check)");
+            debug_log!("[RUST] Email is new, inserting directly to DB (skipping redundant get_email check)");
             let db_email = DbEmail {
                 id: None,
                 message_id: email.message_id.clone(),
@@ -4847,42 +5984,42 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                 references: None,
                 thread_id: None,
             };
-            println!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}",
+            debug_log!("[RUST] Inserting new sent email to DB: message_id={}, from={}, to={}, subject_len={}, body_len={}",
                 db_email.message_id, db_email.from_address, db_email.to_address, 
                 db_email.subject.len(), db_email.body.len());
             let email_id = match db.insert_email_direct(&db_email) {
                 Ok(id) => {
-                    println!("[RUST] Successfully inserted new sent email to DB with id: {}", id);
+                    debug_log!("[RUST] Successfully inserted new sent email to DB with id: {}", id);
                     new_count += 1;
                     id
                 }
                 Err(e) => {
-                    println!("[RUST] ERROR: Failed to insert email to DB: {}", e);
+                    debug_log!("[RUST] ERROR: Failed to insert email to DB: {}", e);
                     return Err(anyhow::anyhow!("Failed to insert email {} to DB: {}", email.message_id, e));
                 }
             };
             
             // Extract and save attachments from the email body
             // Parse the email body to extract attachments (they're in encrypted form)
-            println!("[RUST] sync_sent_emails_to_db: Email {} has {} attachments in RawNostrEmail", email.message_id, email.attachments.len());
+            debug_log!("[RUST] sync_sent_emails_to_db: Email {} has {} attachments in RawNostrEmail", email.message_id, email.attachments.len());
             if !email.attachments.is_empty() {
-                println!("[RUST] Saving {} attachments for email {} (id: {})", email.attachments.len(), email.message_id, email_id);
+                debug_log!("[RUST] Saving {} attachments for email {} (id: {})", email.attachments.len(), email.message_id, email_id);
                 for mut attachment in email.attachments.iter().cloned() {
                     attachment.email_id = email_id;
-                    println!("[RUST] Saving attachment: filename={}, size={}, encrypted={}, email_id={}", 
+                    debug_log!("[RUST] Saving attachment: filename={}, size={}, encrypted={}, email_id={}", 
                         attachment.filename, attachment.size, attachment.is_encrypted, attachment.email_id);
                     match db.save_attachment(&attachment) {
                         Ok(att_id) => {
-                            println!("[RUST] Successfully saved attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
+                            debug_log!("[RUST] Successfully saved attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
                         }
                         Err(e) => {
-                            println!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
+                            debug_log!("[RUST] ERROR: Failed to save attachment {}: {}", attachment.filename, e);
                             // Don't fail the whole sync if attachment save fails
                         }
                     }
                 }
             } else {
-                println!("[RUST] sync_sent_emails_to_db: Email {} has no attachments in RawNostrEmail, trying to extract from body", email.message_id);
+                debug_log!("[RUST] sync_sent_emails_to_db: Email {} has no attachments in RawNostrEmail, trying to extract from body", email.message_id);
                 // Try to extract attachments by parsing the raw RFC822 email body
                 // The email.body might just be the text part, so we need to re-fetch the full email
                 // For now, try parsing the body - if it's multipart, we can extract attachments
@@ -4890,15 +6027,15 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                 if let Ok(parsed_email) = mailparse::parse_mail(email.body.as_bytes()) {
                     let extracted_attachments = extract_attachments_from_parsed_email(&parsed_email, &email.body);
                     if !extracted_attachments.is_empty() {
-                        println!("[RUST] Extracted {} attachments from email body for email {}", extracted_attachments.len(), email_id);
+                        debug_log!("[RUST] Extracted {} attachments from email body for email {}", extracted_attachments.len(), email_id);
                         for mut attachment in extracted_attachments {
                             attachment.email_id = email_id;
                             match db.save_attachment(&attachment) {
                                 Ok(att_id) => {
-                                    println!("[RUST] Saved extracted attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
+                                    debug_log!("[RUST] Saved extracted attachment {} (id: {}) for email {}", attachment.filename, att_id, email_id);
                                 }
                                 Err(e) => {
-                                    println!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
+                                    debug_log!("[RUST] ERROR: Failed to save extracted attachment {}: {}", attachment.filename, e);
                                 }
                             }
                         }
@@ -4906,27 +6043,50 @@ pub async fn sync_sent_emails_to_db(config: &EmailConfig, active_pubkey: &str, d
                 } else {
                     // Body is not parseable as multipart - might need to re-fetch from IMAP
                     // For now, log and continue
-                    println!("[RUST] Could not parse email body to extract attachments for email {}", email_id);
+                    debug_log!("[RUST] Could not parse email body to extract attachments for email {}", email_id);
                 }
             }
         }
     }
+    let persist_ms = t_persist.elapsed().as_millis();
     // Commit per-folder UID watermarks after all per-message DB writes succeeded.
-    for (folder_name, uid_validity, max_uid) in pending_state {
+    for (folder_name, uid_validity, max_uid, bootstrap_min) in pending_state {
         if let Err(e) = db.set_folder_sync_state(&account_key, &folder_name, uid_validity, max_uid) {
             println!(
                 "[RUST] sync_sent_emails_to_db: failed to persist folder_sync_state for '{}': {}",
                 folder_name, e
             );
-        } else {
-            println!(
-                "[RUST] sync_sent_emails_to_db: persisted folder_sync_state for '{}' (uid_validity={}, last_seen_uid={})",
-                folder_name, uid_validity, max_uid
-            );
+            continue;
+        }
+        println!(
+            "[RUST] sync_sent_emails_to_db: persisted folder_sync_state for '{}' (uid_validity={}, last_seen_uid={})",
+            folder_name, uid_validity, max_uid
+        );
+        if let Some(min) = bootstrap_min {
+            if let Err(e) = db.set_folder_min_seen_uid(&account_key, &folder_name, min) {
+                println!(
+                    "[RUST] sync_sent_emails_to_db: failed to seed min_seen_uid for '{}': {}",
+                    folder_name, e
+                );
+            } else {
+                println!(
+                    "[RUST] sync_sent_emails_to_db: seeded min_seen_uid={} for '{}'",
+                    min, folder_name
+                );
+            }
         }
     }
 
-    println!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved", new_count);
+    // Commit gap-fill examined windows post-persist (see sync_nostr_emails_to_db).
+    for (folder_name, uid_validity, lo, hi) in pending_gap_examined {
+        if let Err(e) = db.set_folder_gap_examined(&account_key, &folder_name, uid_validity, lo, hi) {
+            debug_log!("[RUST] sync_sent_emails_to_db: failed to record gap_examined for '{}': {}", folder_name, e);
+        }
+    }
+
+    debug_log!("[RUST] sync_sent_emails_to_db: Completed sync, {} new emails saved", new_count);
+    debug_log!("[RUST-PERF] sync_sent TOTAL={}ms = scan={}ms + persist={}ms (folder '{}', {} raw match, {} new, gap_fill={})",
+        t_total.elapsed().as_millis(), scan_ms, persist_ms, sent_folder, raw_match_count, new_count, include_gap_fill);
     Ok(new_count)
 }
 
@@ -4945,6 +6105,11 @@ pub struct RawNostrEmail {
     pub signature_valid: Option<bool>,
     pub signature_source: Option<String>,
     pub transport_auth_verified: Option<bool>,
+    /// Server `\Seen` flag at fetch time, when the IMAP fetch requested FLAGS.
+    /// `None` means "not known from this fetch" (parse paths don't see flags);
+    /// callers treat `None` as unread for new inserts. Set by the inbox fetch
+    /// loops so read state set on another client/device imports on first sync.
+    pub seen: Option<bool>,
 }
 
 /// Parse an IMAP RFC822 message body and return Some(RawNostrEmail) if it is a
@@ -5013,7 +6178,7 @@ fn parse_nostr_email_from_imap_body_inner(
                 reason: format!("Error verifying transport auth: {}", e),
             });
         if !verdict.transport_verified {
-            println!("[RUST] parse_nostr_email_from_imap_body: Email {} failed transport authentication: {}", message_id, verdict.reason);
+            debug_log!("[RUST] parse_nostr_email_from_imap_body: Email {} failed transport authentication: {}", message_id, verdict.reason);
             return None;
         }
         Some(true)
@@ -5036,6 +6201,9 @@ fn parse_nostr_email_from_imap_body_inner(
         signature_valid,
         signature_source,
         transport_auth_verified,
+        // Parsing only sees the message body, not IMAP flags. The fetch loop
+        // overrides this from `msg.flags()` when it requested FLAGS.
+        seen: None,
     })
 }
 
@@ -5046,12 +6214,22 @@ struct UidSyncResult {
     emails: Vec<RawNostrEmail>,
     uid_validity: u32,
     max_uid: u32,
+    // Lowest UID actually returned by the IMAP server for this sync. 0 if no
+    // UIDs matched (caller should ignore in that case). On bootstrap this is
+    // the floor of "messages we've definitely fetched"; on incremental sync
+    // it's just the lowest new UID in the delta (caller should NOT use it to
+    // lower min_seen_uid past the existing bootstrap floor).
+    min_uid: u32,
     had_existing_state: bool,
 }
 
-/// Build the IMAP SEARCH query for a bootstrap (no stored watermark, or
-/// UIDVALIDITY changed). Uses `SINCE <date> UID 1:*` so the server filters by
-/// INTERNALDATE — independent of Gmail's full-text index — and returns UIDs.
+/// Legacy-only: build a date-windowed `SINCE <date> UID 1:*` SEARCH (filters by
+/// INTERNALDATE, independent of Gmail's full-text index). Forward-sync bootstrap
+/// and gap-fill are now count-based and no longer call this. It survives solely
+/// as `fetch_older`'s floor-backfill for installs that have a `folder_sync_state`
+/// row predating the `min_seen_uid` column — a cheap way (one SEARCH, no body
+/// fetches) to seed an approximate floor so backward paging can start. New
+/// installs always record a floor at bootstrap, so they never reach this.
 fn build_bootstrap_query(sync_cutoff_days: i64) -> String {
     if sync_cutoff_days <= 0 {
         "UID 1:*".to_string()
@@ -5063,27 +6241,61 @@ fn build_bootstrap_query(sync_cutoff_days: i64) -> String {
     }
 }
 
-/// UID-based incremental sync of one IMAP folder.
+/// UID-based sync of one IMAP folder.
 ///
 /// Workflow:
 /// 1. SELECT folder, read mailbox UIDVALIDITY.
 /// 2. Compare to stored `folder_sync_state`.
-/// 3. On match: `UID SEARCH UID <last_seen+1>:*` (incremental).
-///    On mismatch / no row: `UID SEARCH SINCE <today-cutoff> UID 1:*` (bootstrap).
-/// 4. UID FETCH the matched UIDs in batches of 500.
-/// 5. Run `parse_fn` on each body; collect.
+/// 3. On match (incremental): `UID SEARCH UID <last_seen+1>:*`, fetch every new
+///    UID. New mail is always taken in full — the count only bounds history.
+///    On mismatch / no row (bootstrap): `UID SEARCH 1:*`, then walk newest→oldest
+///    via `walk_back_collecting` until `target_count` nostr matches accumulate or
+///    `max_scan` raw messages have been examined. The folder watermark
+///    (`max_uid`) is the true newest UID even when we body-fetch far fewer.
+/// 4. Run `parse_fn` on each fetched body; collect.
 ///
 /// The caller is responsible for persisting parsed emails AND updating
 /// `folder_sync_state` after a successful save — that way a partial-failure
 /// run can retry from the same watermark.
+/// Move the nostr UIDs a scan just identified out of the currently-selected
+/// `folder_name` into `target` (auto-file). Best-effort: empty list or
+/// `folder_name == target` is a no-op, and a move failure is logged and
+/// swallowed — the messages are already imported, so a missed move only leaves
+/// them physically in the source folder. Called at the end of a fetch pass so
+/// it never mutates the mailbox mid-fetch.
+fn move_collected<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    uids: &[u32],
+    target: &str,
+    folder_name: &str,
+) {
+    if uids.is_empty() || folder_name.eq_ignore_ascii_case(target) {
+        return;
+    }
+    let _ = session.create(target); // ensure the destination exists
+    let uid_set = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    match move_uids_to_folder(session, &uid_set, target) {
+        Ok(_) => debug_log!("[RUST] auto-file: moved {} nostr message(s) from '{}' to '{}'",
+            uids.len(), folder_name, target),
+        Err(e) => debug_log!("[RUST] auto-file: move from '{}' to '{}' failed: {}",
+            folder_name, target, e),
+    }
+}
+
 fn uid_sync_folder<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     config: &EmailConfig,
     db: &Database,
     account_key: &str,
     folder_name: &str,
-    sync_cutoff_days: i64,
+    target_count: usize,
+    max_scan: usize,
     parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
+    // When `Some(target)`, the nostr messages this scan identifies are moved out
+    // of `folder_name` into `target` (auto-file), reusing this pass's fetch —
+    // no separate search/fetch. `None` disables it (the Sent pass, the target
+    // folder itself). No-op when `folder_name == target`.
+    auto_file_to: Option<&str>,
 ) -> anyhow::Result<UidSyncResult> {
     let mb = session.select(folder_name)?;
     let uid_validity = mb.uid_validity
@@ -5091,74 +6303,672 @@ fn uid_sync_folder<S: std::io::Read + std::io::Write>(
 
     let stored = db.get_folder_sync_state(account_key, folder_name)?;
     let had_existing_state = stored.is_some();
+    let incremental = matches!(&stored, Some(s) if s.uid_validity == uid_validity);
 
-    let query = match &stored {
-        Some(s) if s.uid_validity == uid_validity => {
-            let next = s.last_seen_uid.saturating_add(1);
-            format!("UID {}:*", next)
+    // ---- Incremental path: take ALL new mail above the watermark ----
+    if incremental {
+        let next = stored.as_ref().unwrap().last_seen_uid.saturating_add(1);
+        let query = format!("UID {}:*", next);
+        debug_log!("[RUST] uid_sync_folder: '{}' UID SEARCH {}", folder_name, query);
+        let t_search = std::time::Instant::now();
+        let uid_set = session.uid_search(&query)?;
+        let search_ms = t_search.elapsed().as_millis();
+        if uid_set.is_empty() {
+            debug_log!("[RUST-PERF] uid_sync_folder '{}' incremental: search={}ms, 0 new UIDs",
+                folder_name, search_ms);
+            return Ok(UidSyncResult {
+                emails: vec![], uid_validity, max_uid: 0, min_uid: 0, had_existing_state,
+            });
         }
-        Some(s) => {
-            println!(
-                "[RUST] uid_sync_folder: UIDVALIDITY changed for '{}' ({} -> {}), bootstrapping",
-                folder_name, s.uid_validity, uid_validity
-            );
-            build_bootstrap_query(sync_cutoff_days)
+        let mut uids: Vec<u32> = uid_set.into_iter().collect();
+        uids.sort_unstable();
+        let min_uid = uids.first().copied().unwrap_or(0);
+        debug_log!("[RUST] uid_sync_folder: '{}' matched {} new UIDs (min {}, max {})",
+            folder_name, uids.len(), min_uid, uids.last().copied().unwrap_or(0));
+
+        // Chunk into ~500-UID batches to stay well under Gmail's ~8KB IMAP line limit.
+        const FETCH_BATCH: usize = 500;
+        let mut emails: Vec<RawNostrEmail> = Vec::new();
+        let mut matched_uids: Vec<u32> = Vec::new();
+        let mut max_uid: u32 = 0;
+        // IMAP body-download time vs in-process parse time, summed across
+        // batches. Surfaced via [RUST-PERF] so a slow sync can be attributed
+        // to the network (fetch) or the CPU (parse/detection).
+        let mut fetch_ms: u128 = 0;
+        let mut parse_ms: u128 = 0;
+        for chunk in uids.chunks(FETCH_BATCH) {
+            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            // BODY.PEEK[] (not RFC822) so reading a message body never *sets* \Seen.
+            // FLAGS lets us read the server's \Seen and seed local read state.
+            let t_fetch = std::time::Instant::now();
+            let messages = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
+            fetch_ms += t_fetch.elapsed().as_millis();
+            let t_parse = std::time::Instant::now();
+            for msg in messages.iter() {
+                if let Some(uid) = msg.uid {
+                    if uid > max_uid { max_uid = uid; }
+                }
+                if let Some(body) = msg.body() {
+                    if let Some(mut parsed) = parse_fn(body, config) {
+                        parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
+                        if auto_file_to.is_some() {
+                            if let Some(uid) = msg.uid { matched_uids.push(uid); }
+                        }
+                        emails.push(parsed);
+                    }
+                }
+            }
+            parse_ms += t_parse.elapsed().as_millis();
         }
+        debug_log!("[RUST-PERF] uid_sync_folder '{}' incremental: search={}ms, fetch={}ms, parse={}ms ({} UIDs, {} match)",
+            folder_name, search_ms, fetch_ms, parse_ms, uids.len(), emails.len());
+        if let Some(tgt) = auto_file_to {
+            move_collected(session, &matched_uids, tgt, folder_name);
+        }
+        return Ok(UidSyncResult { emails, uid_validity, max_uid, min_uid, had_existing_state });
+    }
+
+    // ---- Bootstrap path: count-based backward walk from the newest UID ----
+    // Triggered when there's no stored state, or UIDVALIDITY changed (UIDs were
+    // reassigned, so prior watermarks are meaningless and we re-bootstrap).
+    if let Some(s) = &stored {
+        println!("[RUST] uid_sync_folder: UIDVALIDITY changed for '{}' ({} -> {}), re-bootstrapping",
+            folder_name, s.uid_validity, uid_validity);
+    } else {
+        println!("[RUST] uid_sync_folder: no stored state for '{}', bootstrapping", folder_name);
+    }
+
+    let t_search = std::time::Instant::now();
+    let uid_set = session.uid_search("UID 1:*")?;
+    let search_ms = t_search.elapsed().as_millis();
+    if uid_set.is_empty() {
+        return Ok(UidSyncResult {
+            emails: vec![], uid_validity, max_uid: 0, min_uid: 0, had_existing_state,
+        });
+    }
+    let mut uids: Vec<u32> = uid_set.into_iter().collect();
+    uids.sort_unstable();
+    // The true newest UID becomes the watermark even though we body-fetch only
+    // the count window below it — forward sync then resumes from here.
+    let watermark = uids.last().copied().unwrap_or(0);
+    let target = target_count.max(1);
+    println!("[RUST] uid_sync_folder: '{}' bootstrap — {} UIDs in folder, target {} match(es), max_scan {}",
+        folder_name, uids.len(), target, max_scan);
+    debug_log!("[RUST-PERF] uid_sync_folder '{}' bootstrap: search(UID 1:*)={}ms ({} UIDs)",
+        folder_name, search_ms, uids.len());
+
+    // Seed `lowest_scanned` at the watermark so a no-op walk never claims to
+    // have scanned below it; the walk lowers it to the oldest UID it touches,
+    // which becomes the bootstrap floor (min_seen_uid).
+    let walk = walk_back_collecting(session, config, &uids, watermark, target, max_scan, parse_fn)?;
+
+    if let Some(tgt) = auto_file_to {
+        move_collected(session, &walk.matched_uids, tgt, folder_name);
+    }
+
+    Ok(UidSyncResult {
+        emails: walk.emails,
+        uid_validity,
+        max_uid: watermark,
+        min_uid: walk.lowest_scanned,
+        had_existing_state,
+    })
+}
+
+/// Result of a backward UID fetch ("load older from server"). `new_floor_uid`
+/// is the value to lower `folder_sync_state.min_seen_uid` to once the caller
+/// has persisted all parsed emails. None means "no further old messages on the
+/// server" — caller can record that we hit the bottom (we set the floor to 1).
+struct FetchOlderResult {
+    emails: Vec<RawNostrEmail>,
+    new_floor_uid: Option<u32>,
+    // True iff we walked through every candidate UID strictly below the
+    // current floor without finding more (or there were none). Distinguishes
+    // "real bottom of the folder" from "we exhausted this call's scan budget
+    // and there might still be more older nostr mail further down".
+    hit_bottom: bool,
+    // INTERNALDATE of the oldest message scanned in this folder this call.
+    // None when nothing was fetched (early return / empty candidate set).
+    oldest_scanned: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Result of `walk_back_collecting`: the nostr emails found, the lowest UID we
+/// actually touched (the caller turns this into the new floor), how many UIDs
+/// were scanned, and whether the candidate list was fully exhausted.
+struct CountWalk {
+    emails: Vec<RawNostrEmail>,
+    // UIDs of the messages that parsed as nostr mail, in the source folder.
+    // Used by auto-file to move exactly what was imported, reusing this walk's
+    // fetch instead of a second search/fetch pass.
+    matched_uids: Vec<u32>,
+    lowest_scanned: u32,
+    scanned: usize,
+    hit_bottom: bool,
+    // INTERNALDATE of the oldest message touched during the walk (server
+    // arrival time of the lowest-UID candidate, nostr or not). Surfaced so the
+    // UI can tell the user how far back a "no matches in this batch" scan
+    // reached. None when no message was fetched.
+    oldest_scanned: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Pure per-iteration decision for the backward count-walk: given how many
+/// UIDs we've scanned so far (`scanned`), the total candidate count (`total`),
+/// the matches accumulated (`matches_so_far`), the match target and the scan
+/// budget, return the `[start, end)` slice of the ascending candidate list to
+/// fetch next — newest UIDs are at the tail, so we walk from the end inward.
+/// Returns `None` when the walk should stop (target met, budget spent, or list
+/// exhausted). Factored out of `walk_back_collecting` so the boundary logic is
+/// unit-testable without a live IMAP session.
+fn next_back_batch(
+    scanned: usize,
+    total: usize,
+    matches_so_far: usize,
+    target_count: usize,
+    max_scan: usize,
+) -> Option<(usize, usize)> {
+    if scanned >= total || matches_so_far >= target_count || scanned >= max_scan {
+        return None;
+    }
+    let remaining_target = target_count.saturating_sub(matches_so_far);
+    let remaining_budget = max_scan.saturating_sub(scanned);
+    let remaining_candidates = total - scanned;
+    let take = remaining_target.max(1).min(remaining_budget).min(remaining_candidates);
+    let end = total - scanned;
+    let start = end - take;
+    Some((start, end))
+}
+
+/// Server-side narrow: of the existing UIDs in `[lo, hi]`, which carry a nostr
+/// marker? Mirrors the detection gate in `parse_nostr_email_from_imap_body_inner`
+/// (an `X-Nostr-Pubkey` header OR a `BEGIN NOSTR NIP-` armor block — the `NIP-`
+/// prefix covers every NIP-04/44 ENCRYPTED MESSAGE/BODY variant the gate checks)
+/// but lets the IMAP server filter so non-nostr bodies are never downloaded.
+///
+/// One combined `SEARCH` (range AND (header OR body-marker)). A weak server BODY
+/// index could under-return armor-only mail; the caller's local parse still
+/// re-confirms every hit, so over-returning is harmless. Returns the matching
+/// UIDs (unordered).
+fn search_nostr_uids_in_range<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    lo: u32,
+    hi: u32,
+) -> anyhow::Result<std::collections::HashSet<u32>> {
+    let query = format!(
+        "UID {}:{} OR HEADER X-Nostr-Pubkey \"\" BODY \"BEGIN NOSTR NIP-\"",
+        lo, hi
+    );
+    let set = session.uid_search(&query)?;
+    Ok(set.into_iter().collect())
+}
+
+/// Examine the newest `max_scan` UIDs of a pre-sorted (ascending) candidate
+/// list, returning the nostr matches among them.
+///
+/// Rather than download every body in the window and parse it locally (~50ms
+/// per message of pure network on a dense INBOX — most of it non-nostr mail we
+/// immediately discard), we let the IMAP server do the filtering: one
+/// `SEARCH` narrows the window to UIDs that carry a nostr marker, and we
+/// BODY.PEEK[] only those (usually 0–2). The local `parse_fn` still re-confirms
+/// each candidate, so an over-returning server is harmless. The trade-off is a
+/// server with a weak BODY index could miss an armor-only message (no
+/// `X-Nostr-Pubkey` header) — acceptable on Gmail, the primary target. See
+/// `search_nostr_uids_in_range`.
+///
+/// Floor/scan-depth bookkeeping (`lowest_scanned`, `oldest_scanned`, `scanned`)
+/// covers the WHOLE examined window, independent of which bodies were fetched:
+/// the lowest window UID lowers the floor, and a cheap INTERNALDATE-only fetch
+/// (no bodies) over the window gives the scan-depth date. `target_count` is now
+/// only a window-size hint — the match-count early-exit is retired (every
+/// caller passes target == max_scan; see PR #88: "each scroll digs a fixed
+/// depth"), so the full window is always examined.
+///
+/// `floor_init` seeds `lowest_scanned` so a no-op call never raises the floor.
+/// BODY.PEEK[] keeps reads from setting \Seen; FLAGS lets us seed local read
+/// state for newly-imported rows.
+fn walk_back_collecting<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    config: &EmailConfig,
+    uids_sorted: &[u32],
+    floor_init: u32,
+    target_count: usize,
+    max_scan: usize,
+    parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
+) -> anyhow::Result<CountWalk> {
+    let mut emails: Vec<RawNostrEmail> = Vec::new();
+    let mut matched_uids: Vec<u32> = Vec::new();
+    let mut lowest_scanned: u32 = floor_init;
+    let mut oldest_scanned: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    // Enumerate the examined window — the newest `max_scan` candidate UIDs —
+    // reusing the (unit-tested) boundary logic. Passing matches=0 keeps the
+    // retired match-count early-exit from truncating enumeration; with
+    // target == max_scan this yields exactly the newest `max_scan` UIDs.
+    let mut window: Vec<u32> = Vec::new();
+    let mut scanned: usize = 0;
+    while let Some((start, end)) =
+        next_back_batch(scanned, uids_sorted.len(), 0, target_count, max_scan)
+    {
+        window.extend_from_slice(&uids_sorted[start..end]);
+        scanned += end - start;
+    }
+    window.sort_unstable();
+
+    // Cap each UID FETCH line at ~500 UIDs to stay under Gmail's ~8KB IMAP line limit.
+    const FETCH_BATCH: usize = 500;
+    if let (Some(&win_min), Some(&win_max)) = (window.first(), window.last()) {
+        // Phase timings for the [RUST-PERF] line: the cheap window meta + nostr
+        // SEARCH vs the (now tiny) candidate body download vs local parse.
+        let mut fetch_ms: u128 = 0;
+        let mut parse_ms: u128 = 0;
+        // The lowest examined UID lowers the floor regardless of nostr matches.
+        if win_min < lowest_scanned { lowest_scanned = win_min; }
+
+        // Scan-depth date: INTERNALDATE of the single oldest window UID
+        // (`win_min`). Earlier this fetched all N dates just to take the min —
+        // wasteful at a 500 window. The floor advances by UID, so anchoring the
+        // "scanned back to <date>" indicator to the floor UID is both cheap (one
+        // tiny fetch) and consistent with how far back the floor actually moved.
+        let t_idate = std::time::Instant::now();
+        if let Ok(msgs) = session.uid_fetch(win_min.to_string(), "(UID INTERNALDATE)") {
+            for msg in msgs.iter() {
+                if let Some(d) = msg.internal_date() {
+                    oldest_scanned = Some(d.with_timezone(&chrono::Utc));
+                }
+            }
+        }
+        let idate_ms = t_idate.elapsed().as_millis();
+
+        // Server-side narrow: which window UIDs are nostr mail? Intersect with
+        // the window (the range SEARCH may include UIDs the window excludes).
+        let t_search = std::time::Instant::now();
+        let candidates = search_nostr_uids_in_range(session, win_min, win_max)?;
+        let search_ms = t_search.elapsed().as_millis();
+        let win_set: std::collections::HashSet<u32> = window.iter().copied().collect();
+        let mut cand: Vec<u32> = candidates.into_iter().filter(|u| win_set.contains(u)).collect();
+        cand.sort_unstable();
+
+        // Body-fetch ONLY the nostr candidates.
+        for chunk in cand.chunks(FETCH_BATCH) {
+            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+            let t_fetch = std::time::Instant::now();
+            let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
+            fetch_ms += t_fetch.elapsed().as_millis();
+            let t_parse = std::time::Instant::now();
+            for msg in msgs.iter() {
+                if let Some(body) = msg.body() {
+                    if let Some(mut parsed) = parse_fn(body, config) {
+                        parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
+                        if let Some(uid) = msg.uid {
+                            matched_uids.push(uid);
+                        }
+                        emails.push(parsed);
+                    }
+                }
+            }
+            parse_ms += t_parse.elapsed().as_millis();
+        }
+        debug_log!("[RUST-PERF] walk_back_collecting: idate={}ms, nostr_search={}ms, body_fetch={}ms, parse={}ms ({} examined, {} nostr-candidate, {} match)",
+            idate_ms, search_ms, fetch_ms, parse_ms, scanned, cand.len(), emails.len());
+    }
+
+    let hit_bottom = scanned >= uids_sorted.len();
+    Ok(CountWalk { emails, matched_uids, lowest_scanned, scanned, hit_bottom, oldest_scanned })
+}
+
+/// Enumerate a bounded window of existing UIDs just below `floor_uid`, large
+/// enough to hold at least `want` of them, without scanning the whole folder.
+///
+/// The naive `UID SEARCH UID 1:floor-1` returns every UID below the floor —
+/// 100k+ on a large Gmail INBOX — only for the caller to scan the newest
+/// `want`. Instead we search a numeric window `[lo, floor-1]` and widen it
+/// (doubling the span) until it contains `>= want` existing UIDs or `lo` hits
+/// UID 1. UID gaps from deletions mean the numeric span must exceed `want`;
+/// dense folders satisfy it in a single small SEARCH, sparse ones take a few
+/// cheap round-trips (their total message count is low, so each result is tiny).
+///
+/// Returns the candidate UIDs sorted ascending and whether the window reached
+/// UID 1 (i.e. there is nothing older than the returned set — the caller uses
+/// this to decide `hit_bottom`). The set may be smaller than `want` only when
+/// the window bottomed out at UID 1.
+fn search_uid_window_below<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    floor_uid: u32,
+    want: usize,
+) -> anyhow::Result<(Vec<u32>, bool)> {
+    // Caller guarantees floor_uid > 1, so hi >= 1.
+    let hi = floor_uid.saturating_sub(1);
+    // Initial numeric span ~2x the desired count leaves headroom for moderate
+    // deletion gaps; doubling handles sparser folders.
+    let mut span: u32 = (want as u32).saturating_mul(2).max(64);
+    loop {
+        let lo = hi.saturating_sub(span.saturating_sub(1)).max(1);
+        let reached_bottom = lo == 1;
+        let set = session.uid_search(format!("UID {}:{}", lo, hi))?;
+        if set.len() >= want || reached_bottom {
+            let mut uids: Vec<u32> = set.into_iter().collect();
+            uids.sort_unstable();
+            return Ok((uids, reached_bottom));
+        }
+        // Not enough yet and room remains below the window — widen and retry.
+        // Saturating so the final pass forces lo down to UID 1.
+        span = span.checked_mul(2).unwrap_or(u32::MAX);
+    }
+}
+
+/// Pull older messages from one folder, walking UIDs backward.
+///
+/// Requires a prior forward sync (folder_sync_state row must exist). The floor
+/// (`min_seen_uid`) is normally recorded at bootstrap. Only legacy installs
+/// whose row predates the `min_seen_uid` column hit the backfill branch, which
+/// seeds an approximate floor via the date-windowed SEARCH (`build_bootstrap_query`).
+///
+/// Walks newest-to-oldest from `min_seen_uid - 1`, fetching full bodies and
+/// running `parse_fn`. One call examines a fixed window of `scan_window` raw
+/// messages — the per-folder count (`sync_initial_count` / per-folder override),
+/// the same value the bootstrap uses — surfacing every nostr match in it, and
+/// stops when either `scan_window` messages have been examined OR the folder is
+/// exhausted to UID 1 (`hit_bottom = true`). There is no early exit on a match
+/// count: each scroll digs a fixed depth and the next picks up below.
+fn fetch_older_in_folder<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    config: &EmailConfig,
+    db: &Database,
+    account_key: &str,
+    folder_name: &str,
+    scan_window: usize,
+    sync_cutoff_days: i64,
+    parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
+) -> anyhow::Result<FetchOlderResult> {
+    let mb = session.select(folder_name)?;
+    let uid_validity = mb.uid_validity
+        .ok_or_else(|| anyhow::anyhow!("server did not advertise UIDVALIDITY for folder '{}'", folder_name))?;
+
+    let stored = match db.get_folder_sync_state(account_key, folder_name)? {
+        Some(s) => s,
         None => {
-            println!(
-                "[RUST] uid_sync_folder: no stored state for '{}', bootstrapping (cutoff {} days)",
-                folder_name, sync_cutoff_days
-            );
-            build_bootstrap_query(sync_cutoff_days)
+            debug_log!("[RUST] fetch_older_in_folder: '{}' has no sync state, run forward sync first", folder_name);
+            return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false, oldest_scanned: None });
         }
     };
 
-    println!("[RUST] uid_sync_folder: '{}' UID SEARCH {}", folder_name, query);
-    let uid_set = session.uid_search(&query)?;
-    if uid_set.is_empty() {
-        return Ok(UidSyncResult {
-            emails: vec![],
-            uid_validity,
-            max_uid: 0,
-            had_existing_state,
-        });
+    if stored.uid_validity != uid_validity {
+        debug_log!("[RUST] fetch_older_in_folder: '{}' UIDVALIDITY changed ({} -> {}), aborting backward fetch",
+            folder_name, stored.uid_validity, uid_validity);
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false, oldest_scanned: None });
     }
 
-    let mut uids: Vec<u32> = uid_set.into_iter().collect();
-    uids.sort_unstable();
-    println!("[RUST] uid_sync_folder: '{}' matched {} UIDs (min {}, max {})",
-        folder_name, uids.len(), uids.first().copied().unwrap_or(0), uids.last().copied().unwrap_or(0));
-
-    // Chunk into ~500-UID batches to stay well under Gmail's ~8KB IMAP line limit.
-    const FETCH_BATCH: usize = 500;
-    let mut emails: Vec<RawNostrEmail> = Vec::new();
-    let mut max_uid: u32 = 0;
-    for chunk in uids.chunks(FETCH_BATCH) {
-        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        let messages = session.uid_fetch(&uid_list, "(UID RFC822)")?;
-        for msg in messages.iter() {
-            if let Some(uid) = msg.uid {
-                if uid > max_uid {
-                    max_uid = uid;
-                }
+    let floor_uid = match stored.min_seen_uid {
+        Some(v) => v,
+        None => {
+            let bootstrap_query = build_bootstrap_query(sync_cutoff_days);
+            debug_log!("[RUST] fetch_older_in_folder: '{}' has no min_seen_uid, backfilling via '{}'",
+                folder_name, bootstrap_query);
+            let set = session.uid_search(&bootstrap_query)?;
+            if set.is_empty() {
+                return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: false, oldest_scanned: None });
             }
+            let backfilled_min = set.into_iter().min().unwrap_or(0);
+            db.set_folder_min_seen_uid(account_key, folder_name, backfilled_min)?;
+            backfilled_min
+        }
+    };
+
+    if floor_uid <= 1 {
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: None, hit_bottom: true, oldest_scanned: None });
+    }
+
+    // One scroll examines a fixed window of `scan_window` raw messages per
+    // folder (the per-folder count, same as the bootstrap), surfacing every
+    // nostr match in it — no early exit on a match count. Next scroll continues
+    // below.
+    let scan_window = scan_window.max(1);
+
+    // Enumerate only a bounded UID window just below the floor instead of the
+    // entire history (`UID 1:floor-1`), which on a large INBOX returns 100k+
+    // UIDs every scroll just to scan the newest `scan_window`. The window
+    // expands until it holds at least `scan_window` existing UIDs or reaches UID 1.
+    let t_window = std::time::Instant::now();
+    let (uids, window_reached_bottom) = search_uid_window_below(session, floor_uid, scan_window)?;
+    debug_log!(
+        "[RUST] fetch_older_in_folder: '{}' windowed search below {} -> {} candidate UID(s), reached_bottom={}",
+        folder_name, floor_uid, uids.len(), window_reached_bottom
+    );
+    debug_log!("[RUST-PERF] fetch_older_in_folder '{}': window_search={}ms ({} candidates, floor {})",
+        folder_name, t_window.elapsed().as_millis(), uids.len(), floor_uid);
+    if uids.is_empty() {
+        // The window walked all the way to UID 1 with nothing below the floor —
+        // true bottom. Floor moves to 1 so subsequent calls short-circuit.
+        return Ok(FetchOlderResult { emails: vec![], new_floor_uid: Some(1), hit_bottom: true, oldest_scanned: None });
+    }
+
+    // Walk newest-to-oldest, fetching bodies in batches. Passing `scan_window`
+    // as both the match target and the scan cap makes the match-count stop
+    // condition unreachable (matches <= scanned), so the walk always examines
+    // the full window unless the folder bottoms out first. `floor_uid` seeds the
+    // lowest-UID tracker so a no-op call never raises the floor.
+    let walk = walk_back_collecting(session, config, &uids, floor_uid, scan_window, scan_window, parse_fn)?;
+
+    // True bottom only when the search window reached UID 1 AND the walk
+    // consumed every candidate in it (didn't stop early on its scan budget).
+    // `walk.hit_bottom` alone now means only "exhausted this window", so it must
+    // be gated by `window_reached_bottom`.
+    let hit_bottom = window_reached_bottom && walk.hit_bottom;
+    // On true bottom set floor to 1 so the next call short-circuits; otherwise
+    // lower it to the lowest UID we touched.
+    let returned_floor = if hit_bottom { 1 } else { walk.lowest_scanned };
+
+    debug_log!(
+        "[RUST] fetch_older_in_folder: '{}' scanned {}/{} windowed UIDs, found {} nostr match(es), hit_bottom={}, new_floor={}",
+        folder_name, walk.scanned, uids.len(), walk.emails.len(), hit_bottom, returned_floor
+    );
+
+    Ok(FetchOlderResult {
+        emails: walk.emails,
+        new_floor_uid: Some(returned_floor),
+        hit_bottom,
+        oldest_scanned: walk.oldest_scanned,
+    })
+}
+
+/// Gap-fill scan over one folder. Looks for UIDs the server claims should be
+/// in our "scanned range" (between `min_seen_uid` and `last_seen_uid`) but
+/// whose Message-IDs aren't in the local DB — the classic Gmail-index-lag
+/// scenario where a recent message wasn't returned by the bootstrap SEARCH
+/// but is now visible to subsequent searches.
+///
+/// Caller is responsible for SELECTing the folder via prior `uid_sync_folder`;
+/// we re-SELECT here defensively to refresh UIDVALIDITY.
+///
+/// Cost shape: 1 cheap UID SEARCH, 1 batched ENVELOPE fetch (server-side
+/// parse, no body bytes), then a body fetch only for the gaps we actually
+/// find. On a healthy DB with no gaps, the body fetch is skipped entirely.
+/// Outcome of one `gap_fill_in_folder` pass.
+struct GapFillResult {
+    /// Newly-found nostr emails to persist.
+    emails: Vec<RawNostrEmail>,
+    /// The `[floor, last_seen]` window now considered fully gap-examined under
+    /// the current `uid_validity`. The caller persists it (via
+    /// `set_folder_gap_examined`) *after* a successful save, so a future pass
+    /// can skip this range. `None` when gap-fill bailed before establishing a
+    /// window (no state / UIDVALIDITY mismatch / empty search).
+    examined: Option<(u32, u32, u32)>, // (uid_validity, floor, last_seen)
+}
+
+impl GapFillResult {
+    fn empty() -> Self {
+        GapFillResult { emails: Vec::new(), examined: None }
+    }
+}
+
+fn gap_fill_in_folder<S: std::io::Read + std::io::Write>(
+    session: &mut imap::Session<S>,
+    config: &EmailConfig,
+    db: &Database,
+    account_key: &str,
+    folder_name: &str,
+    recover_dropped: bool,
+    parse_fn: fn(&[u8], &EmailConfig) -> Option<RawNostrEmail>,
+) -> anyhow::Result<GapFillResult> {
+    let mb = session.select(folder_name)?;
+    let uid_validity = mb.uid_validity
+        .ok_or_else(|| anyhow::anyhow!("server did not advertise UIDVALIDITY for folder '{}'", folder_name))?;
+
+    let stored = match db.get_folder_sync_state(account_key, folder_name)? {
+        Some(s) if s.uid_validity == uid_validity => s,
+        // No state, or UIDVALIDITY change — bail. Forward sync will set up
+        // fresh watermarks; gap-fill only makes sense once we have a stable
+        // [min, last] range to scan inside of.
+        _ => return Ok(GapFillResult::empty()),
+    };
+
+    // Resolve the floor (lower bound of the synced range). A legacy install may
+    // have a watermark but no recorded floor; we can't honestly define
+    // [floor, last_seen] without one (guessing the folder minimum would claim
+    // everything down to UID 1 is synced), so skip gap-fill until the floor is
+    // established by a re-bootstrap or by fetch_older on scroll.
+    let floor = match stored.min_seen_uid {
+        Some(v) => v,
+        None => {
+            debug_log!("[RUST] gap_fill: '{}' has no min_seen_uid yet, skipping until a floor is established", folder_name);
+            return Ok(GapFillResult::empty());
+        }
+    };
+    if floor == 0 || stored.last_seen_uid < floor {
+        return Ok(GapFillResult::empty());
+    }
+
+    // The window we'll report as gap-examined to the caller (committed only
+    // after a successful persist). Covers the full scanned range even when no
+    // gaps are found, so a future pass can skip it.
+    let examined = Some((uid_validity, floor, stored.last_seen_uid));
+
+    // Candidates: UIDs inside our synced range [floor, last_seen] to (re)check.
+    // Below `floor` is fetch_older territory; above `last_seen_uid` is forward
+    // sync territory. Both have their own paths and shouldn't be re-touched here.
+    //
+    // Candidates are NOT every UID in [floor, last_seen] — that's the whole
+    // inbox, and since only nostr mail is ever stored, every non-nostr message
+    // (the vast majority) would look "missing" and get body-fetched. A deeply
+    // scrolled floor made this catastrophic: an 11k-wide range meant ~11k bogus
+    // gaps and an 11k-body download. Instead we ask the server for just the
+    // nostr-marked UIDs in the range (same prefilter as the scroll/bootstrap
+    // walk; see `search_nostr_uids_in_range`) and only those can be gaps. The
+    // examined marker below still covers the full range — the SEARCH examined
+    // all of it, just cheaply.
+    //
+    // Steady state (recover_dropped = false): skip the already-examined
+    // sub-range [gap_examined_min, gap_examined_max] — those UIDs' nostr-ness
+    // was already determined (bodies are immutable), so re-checking them is
+    // wasted work. This is what stops every refresh from re-examining the whole
+    // window.
+    //
+    // Recovery (recover_dropped = true): the user just lifted the signed-only
+    // filter, so mail we previously dropped must come back. Those drops can sit
+    // anywhere in [floor, last_seen], so we ignore the examined marker and
+    // re-check the full range. Once the drops are re-persisted, the ENVELOPE
+    // re-scan finds nothing new while the filter stays off.
+    let already_examined = |uid: u32| match (stored.gap_examined_min_uid, stored.gap_examined_max_uid) {
+        (Some(lo), Some(hi)) => uid >= lo && uid <= hi,
+        _ => false,
+    };
+
+    // Steady-state short-circuit: if the filter is unchanged and the examined
+    // marker already covers the whole [floor, last_seen] range, every candidate
+    // would be filtered out below — skip the range-wide SEARCH entirely (it
+    // scans every message in the range server-side, multi-second on a deeply
+    // scrolled inbox). Re-commit the same marker so nothing regresses.
+    if !recover_dropped {
+        if let (Some(lo), Some(hi)) = (stored.gap_examined_min_uid, stored.gap_examined_max_uid) {
+            if lo <= floor && hi >= stored.last_seen_uid {
+                debug_log!("[RUST-PERF] gap_fill_in_folder '{}': skipped — [{}, {}] already examined",
+                    folder_name, floor, stored.last_seen_uid);
+                return Ok(GapFillResult { emails: Vec::new(), examined });
+            }
+        }
+    }
+
+    let t_search = std::time::Instant::now();
+    let mut candidates: Vec<u32> = search_nostr_uids_in_range(session, floor, stored.last_seen_uid)?
+        .into_iter()
+        .filter(|uid| {
+            *uid >= floor
+                && *uid <= stored.last_seen_uid
+                && (recover_dropped || !already_examined(*uid))
+        })
+        .collect();
+    candidates.sort_unstable();
+    let search_ms = t_search.elapsed().as_millis();
+    if candidates.is_empty() {
+        debug_log!("[RUST-PERF] gap_fill_in_folder '{}': nostr_search={}ms, 0 nostr candidates in [{}, {}]",
+            folder_name, search_ms, floor, stored.last_seen_uid);
+        return Ok(GapFillResult { emails: Vec::new(), examined });
+    }
+
+    // Resolve Message-IDs via ENVELOPE (server-side parse, no body fetch) and
+    // look each up in the local DB. UIDs whose Message-ID is missing — or
+    // whose server-side ENVELOPE has no Message-ID at all — are flagged as
+    // gaps and pulled in the next step.
+    const FETCH_BATCH: usize = 500;
+    let mut missing: Vec<u32> = Vec::new();
+    let t_env = std::time::Instant::now();
+    for chunk in candidates.chunks(FETCH_BATCH) {
+        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let msgs = session.uid_fetch(&uid_list, "(UID ENVELOPE)")?;
+        for msg in msgs.iter() {
+            let uid = match msg.uid { Some(u) => u, None => continue };
+            let mid = match msg.envelope().and_then(|e| e.message_id.clone()) {
+                Some(bytes) => std::str::from_utf8(&bytes).unwrap_or("").to_string(),
+                None => { missing.push(uid); continue; }
+            };
+            let mid = mid.trim().trim_start_matches('<').trim_end_matches('>').trim().to_string();
+            if mid.is_empty() {
+                missing.push(uid);
+                continue;
+            }
+            match db.get_email(&mid) {
+                Ok(Some(_)) => continue,
+                Ok(None) => missing.push(uid),
+                Err(e) => debug_log!("[RUST] gap_fill: get_email({}) failed: {}", mid, e),
+            }
+        }
+    }
+
+    let env_ms = t_env.elapsed().as_millis();
+    if missing.is_empty() {
+        debug_log!("[RUST-PERF] gap_fill_in_folder '{}': nostr_search={}ms, envelope+lookup={}ms ({} nostr candidates, 0 missing)",
+            folder_name, search_ms, env_ms, candidates.len());
+        return Ok(GapFillResult { emails: Vec::new(), examined });
+    }
+    println!(
+        "[RUST] gap_fill_in_folder: '{}' found {} missing UID(s) within [{}, {}]",
+        folder_name, missing.len(), floor, stored.last_seen_uid
+    );
+
+    let mut emails: Vec<RawNostrEmail> = Vec::new();
+    let t_body = std::time::Instant::now();
+    for chunk in missing.chunks(FETCH_BATCH) {
+        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        // BODY.PEEK[] so gap-fill backfill doesn't *set* \Seen; FLAGS so we can
+        // read it and seed local read state for newly-imported rows.
+        let msgs = session.uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[])")?;
+        for msg in msgs.iter() {
             if let Some(body) = msg.body() {
-                if let Some(parsed) = parse_fn(body, config) {
+                if let Some(mut parsed) = parse_fn(body, config) {
+                    parsed.seen = Some(msg.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)));
                     emails.push(parsed);
                 }
             }
         }
     }
-
-    Ok(UidSyncResult {
-        emails,
-        uid_validity,
-        max_uid,
-        had_existing_state,
-    })
+    debug_log!("[RUST-PERF] gap_fill_in_folder '{}': nostr_search={}ms, envelope+lookup={}ms, body_fetch={}ms ({} nostr candidates, {} missing, {} match)",
+        folder_name, search_ms, env_ms, t_body.elapsed().as_millis(), candidates.len(), missing.len(), emails.len());
+    Ok(GapFillResult { emails, examined })
 }
 
-/// Read `sync_cutoff_days` for the active pubkey, defaulting to 30.
+/// Legacy-only: read `sync_cutoff_days` for the active pubkey, defaulting to 30.
+/// The settings UI no longer writes this key (replaced by per-folder counts);
+/// it now feeds only `fetch_older`'s legacy floor-backfill (see
+/// `build_bootstrap_query`), where the 30-day default is a fine approximation.
 /// Read directly from the active pubkey's settings — no email-based reverse
 /// lookup. Sharing an email address across multiple identities used to make
 /// this return the first matching pubkey's value, which was rarely the active
@@ -5172,16 +6982,362 @@ fn lookup_sync_cutoff_days(db: &Database, pubkey: &str) -> i64 {
     30
 }
 
+/// Default number of nostr matches to pull when bootstrapping a folder, when
+/// the user hasn't set `sync_initial_count`.
+const DEFAULT_INITIAL_COUNT: usize = 50;
+/// Default bootstrap depth for the dedicated dense `nostr-mail` folder, where
+/// (nearly) every message is nostr mail so a deep count is cheap and accurate.
+/// Overridable per-folder via `sync_folder_counts`.
+const DEFAULT_DENSE_COUNT: usize = 500;
+
+/// Pure resolution of a folder's bootstrap count. An explicit override in the
+/// user's `sync_folder_counts` map wins; otherwise the dedicated dense
+/// `nostr-mail` folder defaults deep while every other folder uses the global
+/// `sync_initial_count`. Factored out for unit testing without a `Database`.
+fn resolve_folder_count(folder: &str, folder_counts_json: Option<&str>, initial_count: usize) -> usize {
+    if let Some(json) = folder_counts_json {
+        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, usize>>(json) {
+            if let Some(n) = map.get(folder) {
+                return *n;
+            }
+        }
+    }
+    if folder.eq_ignore_ascii_case("nostr-mail") {
+        return DEFAULT_DENSE_COUNT;
+    }
+    initial_count
+}
+
+/// Global per-folder bootstrap target (nostr matches), defaulting to
+/// `DEFAULT_INITIAL_COUNT`. Per-pubkey preference, like the cutoff above.
+pub(crate) fn lookup_initial_count(db: &Database, pubkey: &str) -> usize {
+    db.get_setting(pubkey, "sync_initial_count")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_INITIAL_COUNT)
+}
+
+/// Per-folder scan window for the active pubkey: per-folder override →
+/// dense-folder default → global `sync_initial_count`. Used by both the initial
+/// bootstrap and each "load older" scroll — both scan this many messages in the
+/// folder and surface the nostr mail found.
+fn lookup_folder_count(db: &Database, pubkey: &str, folder: &str) -> usize {
+    let json = db.get_setting(pubkey, "sync_folder_counts").ok().flatten();
+    resolve_folder_count(folder, json.as_deref(), lookup_initial_count(db, pubkey))
+}
+
 /// Read `require_signature` for the active pubkey, defaulting to true.
-fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
+pub(crate) fn lookup_require_signature(db: &Database, pubkey: &str) -> bool {
     if let Ok(Some(value)) = db.get_setting(pubkey, "require_signature") {
         return value == "true";
     }
     true
 }
 
-/// Discover sent mailbox name using IMAP LIST command
-/// Returns the actual mailbox name found, or None if no sent mailbox exists
+/// Read `spam_rescue` for the active pubkey, defaulting to true (on by default).
+/// Only an explicit "false" disables it; absent/blank settings stay on.
+pub(crate) fn lookup_spam_rescue(db: &Database, pubkey: &str) -> bool {
+    if let Ok(Some(value)) = db.get_setting(pubkey, "spam_rescue") {
+        return value != "false";
+    }
+    true
+}
+
+/// Read `auto_move_nostr` for the active pubkey, defaulting to false (opt-in).
+/// When on, each sync moves nostr mail found in the regular inbox folders into
+/// the rescue/nostr-mail folder, consolidating all nostr mail in one place.
+/// Off by default because it mutates the user's mailbox server-side (visible in
+/// every other mail client), so it's surfaced as an explicit opt-in.
+pub(crate) fn lookup_auto_move_nostr(db: &Database, pubkey: &str) -> bool {
+    if let Ok(Some(value)) = db.get_setting(pubkey, "auto_move_nostr") {
+        return value == "true";
+    }
+    false
+}
+
+/// Read the folder spam-rescued nostr mail should be moved into, defaulting to
+/// `nostr-mail`. Blank/whitespace settings fall back to the default.
+pub(crate) fn lookup_spam_rescue_target(db: &Database, pubkey: &str) -> String {
+    if let Ok(Some(value)) = db.get_setting(pubkey, "spam_rescue_target") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "nostr-mail".to_string()
+}
+
+/// True if a mailbox name looks like a provider spam/junk/bulk folder
+/// (case-insensitive). Catches `[Gmail]/Spam`, Outlook's `Junk Email`,
+/// Fastmail's `Junk`, Yahoo's `Bulk Mail`, etc.
+fn is_spam_folder_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("spam") || lower.contains("junk") || lower.contains("bulk")
+}
+
+fn list_spam_folders(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+) -> Vec<String> {
+    let mailboxes = match session.list(Some(""), Some("*")) {
+        Ok(m) => m,
+        Err(e) => {
+            debug_log!("[RUST] list_spam_folders: LIST failed: {}", e);
+            return Vec::new();
+        }
+    };
+    mailboxes
+        .iter()
+        .map(|mb| mb.name().to_string())
+        .filter(|name| is_spam_folder_name(name))
+        .collect()
+}
+
+/// Append discovered spam/junk/bulk server folders to `folders` (deduped).
+/// Called only when spam rescue is OFF, so nostr mail a provider misfiled into
+/// spam still surfaces in the inbox view. (With rescue ON we never scan spam —
+/// rescue moves eligible mail into the rescue target instead, and scanning spam
+/// would let an in-app read mark it \Seen and suppress its rescue.) LIST
+/// failures are non-fatal: the sync proceeds with the unexpanded folder set.
+fn extend_with_spam_folders(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    folders: &mut Vec<String>,
+) {
+    for name in list_spam_folders(session) {
+        if folders.iter().any(|f| f.eq_ignore_ascii_case(&name)) { continue; }
+        debug_log!("[RUST] extend_with_spam_folders: adding {}", name);
+        folders.push(name);
+    }
+}
+
+/// Decide whether a message sitting in a spam folder should be rescued.
+///
+/// A message qualifies when BOTH hold:
+/// 1. It carries a nostr marker — an `X-Nostr-Pubkey` or `X-Nostr-Sig` header,
+///    or an inline `BEGIN NOSTR ...` armor block (encrypted body, signed body,
+///    signature, or seal).
+/// 2. It passes transport authentication (SPF/DKIM/alignment).
+///
+/// Transport auth is required because the rest of the inbox enforces it: a
+/// message that fails it would be moved out of spam yet still get filtered from
+/// the inbox, stranding it where the user can't see it. Mail that fails SPF/DKIM
+/// is therefore deliberately left in spam — only authenticated nostr mail that
+/// the provider misfiled gets rescued.
+fn should_rescue_message(raw_body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(raw_body);
+    let has_nostr_marker = text.contains("X-Nostr-Pubkey:")
+        || text.contains("X-Nostr-Sig:")
+        || text.contains("BEGIN NOSTR NIP-")
+        || text.contains("BEGIN NOSTR SIGNED")
+        || text.contains("BEGIN NOSTR SIGNATURE")
+        || text.contains("BEGIN NOSTR SEAL");
+    if !has_nostr_marker {
+        debug_log!("[RUST] rescue: should_rescue_message=false (no nostr marker)");
+        return false;
+    }
+    match verify_transport_authentication(Some(raw_body), None) {
+        Ok(verdict) => {
+            if !verdict.transport_verified {
+                debug_log!("[RUST] rescue: should_rescue_message=false (has marker, transport auth NOT verified)");
+            }
+            verdict.transport_verified
+        }
+        Err(e) => {
+            debug_log!("[RUST] rescue: should_rescue_message=false (transport auth check errored: {})", e);
+            false
+        }
+    }
+}
+
+/// Move a UID set into `target_folder`, creating the folder if needed. Uses the
+/// IMAP UID MOVE command, falling back to UID COPY + flag-deleted + EXPUNGE on
+/// servers without MOVE. UID-based so source sequence renumbering during the
+/// operation can't misaddress messages.
+fn move_uids_to_folder(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    uid_set: &str,
+    target_folder: &str,
+) -> Result<()> {
+    if session.uid_mv(uid_set, target_folder).is_ok() {
+        return Ok(());
+    }
+    // Target may not exist yet — create and retry.
+    if session.create(target_folder).is_ok() && session.uid_mv(uid_set, target_folder).is_ok() {
+        return Ok(());
+    }
+    if session.uid_copy(uid_set, target_folder).is_ok() {
+        session.uid_store(uid_set, "+FLAGS (\\Deleted)")?;
+        session.expunge()?;
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("Failed to move UIDs {} to folder {}", uid_set, target_folder))
+}
+
+/// Scan every spam/junk/bulk folder and move nostr messages out of them into
+/// `target_folder`, so providers' misclassified encrypted mail stays reachable.
+/// Returns the number of messages moved. Per-folder failures are logged and
+/// skipped — rescue is best-effort and never aborts the surrounding sync.
+///
+/// When `unseen_only` is true (the normal per-sync rescue) only UNSEEN mail is
+/// considered: there is no rescue-once ledger — to keep a message in spam, the
+/// user (via the app's move-to-spam) marks it \Seen, which the server
+/// replicates to every device, so the UNSEEN guard alone encodes intent
+/// identically on all clients. When false (the one-time catch-up run when a
+/// user first enables rescue) the \Seen guard is dropped so already-read nostr
+/// mail sitting in spam — which the normal run would skip — is swept out too.
+fn rescue_nostr_emails_from_spam(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    target_folder: &str,
+    unseen_only: bool,
+    window: usize,
+) -> usize {
+    let spam_folders = list_spam_folders(session);
+    debug_log!("[RUST] rescue: spam folders found = {:?}, target = '{}', unseen_only = {}", spam_folders, target_folder, unseen_only);
+    if spam_folders.is_empty() {
+        return 0;
+    }
+    // Make sure the destination exists before we start moving into it.
+    let _ = session.create(target_folder);
+
+    let mut moved_total = 0usize;
+    for folder in spam_folders {
+        moved_total += move_nostr_from_folder(session, &folder, target_folder, unseen_only, window);
+    }
+    moved_total
+}
+
+/// Scan one folder for nostr mail and move it into `target_folder`. Returns the
+/// number of messages moved. No-op if `folder` is the target itself or can't be
+/// selected. Shared by spam rescue and inbox auto-filing.
+///
+/// `unseen_only` gates the candidate search on UNSEEN — spam rescue sets it so a
+/// message the user read and deliberately filed into spam (the app marks such
+/// mail \Seen, replicated server-side to every device) is left alone. Inbox
+/// auto-filing clears it: there's no "leave it here" intent for ordinary inbox
+/// nostr mail, and once moved a message is gone from the source so it can't be
+/// re-moved.
+fn move_nostr_from_folder(
+    session: &mut imap::Session<impl std::io::Read + std::io::Write>,
+    folder: &str,
+    target_folder: &str,
+    unseen_only: bool,
+    window: usize,
+) -> usize {
+    if folder.eq_ignore_ascii_case(target_folder) {
+        return 0;
+    }
+    let mailbox = match session.select(folder) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+
+    // Bound the content searches to the SAME recent window the scan/scroll uses
+    // (`window` = lookup_folder_count, the per-folder "Messages to Load Per
+    // Folder" setting), so auto-file/rescue examine exactly the span the user
+    // loads — no separate magic constant. An unbounded HEADER/BODY search over a
+    // huge Gmail folder (e.g. a 149k-message INBOX) otherwise exceeds the pool's
+    // 30s socket read timeout, and the timed-out search's late-arriving response
+    // desyncs the `imap` 2.4.1 parser into a stale-tag panic (see memory
+    // imap-search-desync-crash). The UID-arithmetic window over-approximates the
+    // message count when UIDs are sparse, which is fine for bounding. Small
+    // folders (exists <= window) search in full.
+    let window = window.max(1) as u32;
+    let uid_scope = match mailbox.uid_next {
+        Some(next) if mailbox.exists > window && next > window => {
+            format!("UID {}:* ", next - window)
+        }
+        _ => String::new(),
+    };
+
+    // Cheap server-side narrowing to candidate UIDs: messages that are
+    // header-marked (X-Nostr-Pubkey / X-Nostr-Sig) or carry a nostr armor block
+    // (encrypted, signed, signature, or seal). BODY search support varies by
+    // server, so we re-confirm each candidate by fetching it and checking the
+    // transport auth gate.
+    let guard = if unseen_only { "UNSEEN " } else { "" };
+    let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for q in &[
+        "HEADER X-Nostr-Pubkey \"\"",
+        "HEADER X-Nostr-Sig \"\"",
+        "BODY \"BEGIN NOSTR NIP-\"",
+        "BODY \"BEGIN NOSTR SIGNED\"",
+        "BODY \"BEGIN NOSTR SIGNATURE\"",
+        "BODY \"BEGIN NOSTR SEAL\"",
+    ] {
+        let query = format!("{}{}{}", guard, uid_scope, q);
+        match session.uid_search(&query) {
+            Ok(found) => candidates.extend(found),
+            // A failed search (commonly a read timeout on a slow query) can
+            // leave the connection mid-response. Stop issuing more commands on
+            // it — continuing would read the stale response and desync the
+            // parser. The caller's guarded_session_op drops the session.
+            Err(e) => {
+                debug_log!("[RUST] move_nostr_from_folder: search '{}' in '{}' failed: {} — stopping to avoid desync", query, folder, e);
+                break;
+            }
+        }
+    }
+    debug_log!("[RUST] move_nostr_from_folder: folder '{}' nostr candidate UIDs = {}", folder, candidates.len());
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let mut to_move: Vec<u32> = Vec::new();
+    let uids: Vec<u32> = candidates.into_iter().collect();
+    for chunk in uids.chunks(500) {
+        let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        // BODY.PEEK[] (not RFC822) so confirming a candidate doesn't set the
+        // \Seen flag — moved messages keep their read state. The response key is
+        // still BODY[], so msg.body() works unchanged.
+        let messages = match session.uid_fetch(&uid_list, "(UID BODY.PEEK[])") {
+            Ok(m) => m,
+            Err(e) => {
+                debug_log!("[RUST] move_nostr_from_folder: fetch in '{}' failed: {}", folder, e);
+                continue;
+            }
+        };
+        for msg in messages.iter() {
+            if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
+                if should_rescue_message(body) {
+                    to_move.push(uid);
+                } else {
+                    debug_log!("[RUST] move_nostr_from_folder: uid {} in '{}' not eligible (missing nostr marker or transport auth failed)", uid, folder);
+                }
+            }
+        }
+    }
+
+    if to_move.is_empty() {
+        return 0;
+    }
+    let uid_set = to_move.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    match move_uids_to_folder(session, &uid_set, target_folder) {
+        Ok(_) => {
+            debug_log!("[RUST] move_nostr_from_folder: moved {} message(s) from '{}' to '{}'",
+                to_move.len(), folder, target_folder);
+            to_move.len()
+        }
+        Err(e) => {
+            debug_log!("[RUST] move_nostr_from_folder: move from '{}' failed: {}", folder, e);
+            0
+        }
+    }
+}
+
+/// One-time "catch-up" rescue invoked when the user first switches spam rescue
+/// ON. Opens an IMAP session and runs `rescue_nostr_emails_from_spam` with the
+/// \Seen guard dropped, so already-read nostr mail sitting in spam (which the
+/// per-sync rescue intentionally skips) is moved into `target_folder` too.
+/// Returns the number of messages moved. The caller is expected to sync
+/// afterwards so the moved messages land in the local DB.
+pub async fn rescue_spam_now(config: &EmailConfig, target_folder: &str, window: usize) -> anyhow::Result<usize> {
+    let target = ImapTarget::from_config(config);
+    let moved = imap_pool::with_session(&target, |session| {
+        Ok(rescue_nostr_emails_from_spam(session, target_folder, /* unseen_only = */ false, window))
+    })?;
+    Ok(moved)
+}
+
 fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::io::Write>) -> anyhow::Result<Option<String>> {
     // Use LIST to get all mailboxes
     let mailboxes = session.list(Some(""), Some("*"))?;
@@ -5190,7 +7346,7 @@ fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::i
     for mailbox in mailboxes.iter() {
         let mailbox_name = mailbox.name().to_lowercase();
         if mailbox_name == "[gmail]/sent mail" {
-            println!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
+            debug_log!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
             return Ok(Some(mailbox.name().to_string()));
         }
     }
@@ -5208,12 +7364,88 @@ fn discover_sent_mailbox(session: &mut imap::Session<impl std::io::Read + std::i
         // Check if this mailbox matches any sent pattern
         for pattern in &sent_patterns {
             if mailbox_name.contains(pattern) {
-                println!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
+                debug_log!("[RUST] discover_sent_mailbox: Found sent mailbox: {}", mailbox.name());
                 return Ok(Some(mailbox.name().to_string()));
             }
         }
     }
     
-    println!("[RUST] discover_sent_mailbox: No sent mailbox found");
+    debug_log!("[RUST] discover_sent_mailbox: No sent mailbox found");
     Ok(None)
+}
+
+#[cfg(test)]
+mod decode_perf_bench {
+    //! Opt-level isolation harness for the glossia signature-block decode path.
+    //!
+    //! Times `decode_sig_and_pubkey` — the function profiled as the dominant cost
+    //! in `parse_armor` (the `[RUST-PERF] populate: decode_sig_and_pubkey` line).
+    //! Run under a speed profile to tell whether residual decode cost is
+    //! algorithmic or just opt-level=0 codegen overhead:
+    //!
+    //! ```sh
+    //! CARGO_PROFILE_RELEASE_OPT_LEVEL=3 CARGO_PROFILE_RELEASE_LTO=false \
+    //!   cargo test --release --lib decode_sig_and_pubkey_timing -- --ignored --nocapture
+    //! ```
+    //!
+    //! `--lib` (no backend bins) sidesteps the glossia cdylib+rlib output-filename
+    //! collision (cargo #6313) that breaks `cargo test --release` on the bin graph.
+    //! `#[ignore]` keeps it out of normal test sweeps.
+
+    /// Encode raw bytes into bare Latin payload words via the same bitpack_fixed
+    /// codec the app's `glossia_encode_raw_base_n` (lib.rs) uses on the encode side.
+    fn encode_latin(bytes: &[u8]) -> String {
+        let wordlist = glossia::generator::data::default_wordlist("latin");
+        let payload_words = glossia::generator::data::load_payload_words_for_wordlist("latin", wordlist)
+            .expect("load latin payload wordlist");
+        let tree = glossia::WordlistTree::new(payload_words);
+        let words = glossia::codec::encode_base_n(bytes, &tree, "bitpack_fixed")
+            .expect("encode_base_n");
+        words.join(" ")
+    }
+
+    fn percentile(sorted_us: &[u128], p: f64) -> u128 {
+        if sorted_us.is_empty() { return 0; }
+        let idx = ((sorted_us.len() as f64 - 1.0) * p).round() as usize;
+        sorted_us[idx]
+    }
+
+    #[test]
+    #[ignore]
+    fn decode_sig_and_pubkey_timing() {
+        // Deterministic 64-byte signature + 32-byte pubkey (no RNG needed).
+        let sig_bytes: Vec<u8> = (0..64u16).map(|i| (i.wrapping_mul(37) ^ 0xA5) as u8).collect();
+        let pubkey_bytes: Vec<u8> = (0..32u16).map(|i| (i.wrapping_mul(53) ^ 0x3C) as u8).collect();
+
+        // Canonical two-line SIGNATURE block: glossia sig line(s) then pubkey line.
+        let content = format!("{}\n{}", encode_latin(&sig_bytes), encode_latin(&pubkey_bytes));
+        let sig_hex = hex::encode(&sig_bytes);
+        let pubkey_hex = hex::encode(&pubkey_bytes);
+
+        // Cold call — first decode for this dialect builds the cached WordlistTree
+        // + payload HashSet (the ~497ms cold build in the debug-profile profiling).
+        let t0 = std::time::Instant::now();
+        let cold = super::decode_sig_and_pubkey(&content);
+        let cold_us = t0.elapsed().as_micros();
+        assert_eq!(cold, Some((sig_hex.clone(), pubkey_hex.clone())),
+            "decode must round-trip the encoded sig+pubkey (else we're timing an early bail, not real work)");
+
+        // Warm calls — steady state with the cache populated.
+        const N: usize = 100;
+        let mut warm_us: Vec<u128> = Vec::with_capacity(N);
+        for _ in 0..N {
+            let t = std::time::Instant::now();
+            let r = super::decode_sig_and_pubkey(&content);
+            warm_us.push(t.elapsed().as_micros());
+            assert!(r.is_some());
+        }
+        warm_us.sort_unstable();
+        let sum: u128 = warm_us.iter().sum();
+
+        println!("[BENCH] decode_sig_and_pubkey  cold={}us ({:.2}ms)", cold_us, cold_us as f64 / 1000.0);
+        println!("[BENCH] decode_sig_and_pubkey  warm n={} min={}us p50={}us p90={}us p99={}us mean={:.1}us ({:.3}ms)",
+            N, warm_us[0], percentile(&warm_us, 0.50), percentile(&warm_us, 0.90),
+            percentile(&warm_us, 0.99), sum as f64 / N as f64, (sum as f64 / N as f64) / 1000.0);
+        println!("[BENCH] sig block: {} chars, {} words", content.len(), content.split_whitespace().count());
+    }
 }

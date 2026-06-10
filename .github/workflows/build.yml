@@ -20,6 +20,10 @@ on:
           - macos
           - android
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 

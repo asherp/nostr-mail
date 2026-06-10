@@ -12,6 +12,27 @@ try {
     tauriFs = undefined;
 }
 
+// Settings cached in localStorage are NON-SECRET preferences only. Secrets — the
+// nostr private key and the email account password — must never be written to
+// localStorage in plaintext. The private key lives only in the backend keychain;
+// the password is stored encrypted at rest in the DB (crypto::encrypt_setting_value,
+// keyed off the user's own private key) and decrypted backend-side on read.
+const SENSITIVE_SETTINGS_KEYS = ['password', 'npriv_key'];
+
+function sanitizeSettingsForCache(settings) {
+    if (!settings || typeof settings !== 'object') return settings;
+    const clean = { ...settings };
+    for (const key of SENSITIVE_SETTINGS_KEYS) {
+        delete clean[key];
+    }
+    return clean;
+}
+
+// Persist the non-secret settings cache to localStorage with secrets stripped.
+function persistSettingsCache(settings) {
+    localStorage.setItem('nostr_mail_settings', JSON.stringify(sanitizeSettingsForCache(settings)));
+}
+
 function NostrMailApp() {
     this.initialized = false;
     this.mobileNavState = 'navbar'; // 'navbar' or 'page'
@@ -108,6 +129,27 @@ NostrMailApp.prototype.init = async function() {
             console.error('[APP] Keychain migration failed:', e);
         }
         localStorage.setItem('nostr_mail_keychain_migrated', 'true');
+    }
+
+    // Scrub any secrets (private key, email password) left in the cached settings
+    // by older app versions. The private key lives only in the backend keychain and
+    // the password is encrypted at rest in the DB — neither belongs in localStorage.
+    // Runs unconditionally (outside the one-time migration guard) so already-migrated
+    // installs still get cleaned.
+    try {
+        const rawSettings = localStorage.getItem('nostr_mail_settings');
+        if (rawSettings) {
+            const parsedSettings = JSON.parse(rawSettings);
+            const sanitized = sanitizeSettingsForCache(parsedSettings);
+            if (JSON.stringify(sanitized) !== rawSettings) {
+                localStorage.setItem('nostr_mail_settings', JSON.stringify(sanitized));
+                console.log('[APP] Removed stale secrets from cached settings');
+            }
+        }
+    } catch (e) {
+        // Corrupt cache: drop it entirely rather than risk keeping secrets around.
+        console.warn('[APP] Could not parse cached settings during secret scrub, clearing:', e);
+        localStorage.removeItem('nostr_mail_settings');
     }
 
     try {
@@ -227,10 +269,13 @@ NostrMailApp.prototype.loadSettings = async function() {
                         use_tls: dbSettings.use_tls === 'true',
                         email_filter: dbSettings.email_filter || 'nostr',
                         send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                        sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 30, // Default to 30 days
+                        sync_initial_count: parseInt(dbSettings.sync_initial_count) || 50, // Messages scanned per folder
                         emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                         inbox_folder: dbSettings.inbox_folder || '',
                         require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
+                        spam_rescue: dbSettings.spam_rescue !== 'false', // Default to true (on by default)
+                        auto_move_nostr: dbSettings.auto_move_nostr === 'true', // Default to false (opt-in)
+                        spam_rescue_target: dbSettings.spam_rescue_target || 'nostr-mail',
                         hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                         automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                         automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
@@ -242,8 +287,8 @@ NostrMailApp.prototype.loadSettings = async function() {
                     appState.setSettings(settings);
                     this.populateSettingsForm();
                     this.updateComposeButtons();
-                    // Also update localStorage as backup
-                    localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
+                    // Also update localStorage as backup (secrets stripped)
+                    persistSettingsCache(settings);
                     return;
                 }
             } catch (error) {
@@ -274,7 +319,6 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
     
     // Define default settings
     const defaultSettings = {
-        npriv_key: '',
         encryption_algorithm: 'nip44',
         email_address: '',
         password: '',
@@ -285,10 +329,13 @@ NostrMailApp.prototype.resetSettingsToDefaults = async function() {
         use_tls: true,
         email_filter: 'nostr',
         send_matching_dm: true,
-        sync_cutoff_days: 30,
+        sync_initial_count: 50,
         emails_per_page: 50,
         inbox_folder: '',
         require_signature: true,
+        spam_rescue: true,
+        auto_move_nostr: false,
+        spam_rescue_target: 'nostr-mail',
         glossia_encoding_body: 'latin',
         glossia_encoding_signature: 'latin',
         glossia_encoding_pubkey: 'latin'
@@ -334,10 +381,13 @@ NostrMailApp.prototype.resetSettingsToDefaultsForPubkey = function(pubkey) {
         use_tls: true,
         email_filter: 'nostr',
         send_matching_dm: true,
-        sync_cutoff_days: 30, // Default to 30 days (matching loadSettingsForPubkey)
+        sync_initial_count: 50, // Messages scanned per folder (matching loadSettingsForPubkey)
         emails_per_page: 50,
         inbox_folder: '',
         require_signature: true,
+        spam_rescue: true,
+        auto_move_nostr: false,
+        spam_rescue_target: 'nostr-mail',
         hide_undecryptable_emails: true,
         automatically_encrypt: true,
         automatically_sign: true,
@@ -396,10 +446,13 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 use_tls: dbSettings.use_tls === 'true',
                 email_filter: dbSettings.email_filter || 'nostr',
                 send_matching_dm: dbSettings.send_matching_dm !== 'false', // Default to true if not set
-                sync_cutoff_days: parseInt(dbSettings.sync_cutoff_days) || 30, // Default to 30 days
+                sync_initial_count: parseInt(dbSettings.sync_initial_count) || 50, // Messages scanned per folder
                 emails_per_page: parseInt(dbSettings.emails_per_page) || 50, // Default to 50
                 inbox_folder: dbSettings.inbox_folder || '',
                 require_signature: dbSettings.require_signature !== 'false', // Default to true if not set
+                spam_rescue: dbSettings.spam_rescue !== 'false', // Default to true (on by default)
+                auto_move_nostr: dbSettings.auto_move_nostr === 'true', // Default to false (opt-in)
+                spam_rescue_target: dbSettings.spam_rescue_target || 'nostr-mail',
                 hide_undecryptable_emails: dbSettings.hide_undecryptable_emails !== 'false', // Default to true if not set
                 automatically_encrypt: dbSettings.automatically_encrypt !== 'false', // Default to true if not set
                 automatically_sign: dbSettings.automatically_sign !== 'false', // Default to true if not set
@@ -415,13 +468,19 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
             appState.setSettings(settings);
             this.populateSettingsForm();
             this.updateComposeButtons();
-            // Update localStorage as backup
-            localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
+            // Update localStorage as backup (secrets stripped)
+            persistSettingsCache(settings);
             console.log('[APP] Settings loaded for pubkey:', pubkey);
             
             // Update last loaded pubkey tracker
             appState.setLastLoadedPubkey(pubkey);
-            
+
+            // (Re)start the IMAP IDLE watcher for this account so the inbox
+            // updates via push. The backend stops any prior account's watcher
+            // and clears its pooled connections first.
+            TauriService.startImapIdle().catch(err =>
+                console.warn('[APP] Failed to start IMAP IDLE watcher:', err));
+
             // Show toast notification that settings were loaded
             notificationService.showSuccess('Settings loaded');
         } else {
@@ -1337,9 +1396,11 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 // Show loading state immediately
                 domManager.disable('refreshInbox');
                 domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
-                // Sync and load all emails (no search filter)
+                // Refresh = forward delta + gap-fill within the scanned UID
+                // range; auto-sync on tab-switch uses the cheap forward-only
+                // path instead.
                 try {
-                    await window.emailService.syncInboxEmails();
+                    await window.emailService.refreshInboxEmails();
                     await window.emailService.loadEmails();
                     notificationService.showSuccess('Inbox synced successfully');
                 } catch (error) {
@@ -1469,11 +1530,17 @@ NostrMailApp.prototype.setupEventListeners = function() {
         const folderSelect = document.getElementById('inbox-folder-preference');
         if (folderSelect) {
             folderSelect.addEventListener('change', async () => {
-                const selectedFolder = folderSelect.value;
-                console.log('[APP] Inbox folder preference changed to:', selectedFolder);
+                const selectedFolders = Array.from(folderSelect.selectedOptions)
+                    .map(o => o.value)
+                    .filter(Boolean);
+                const joined = selectedFolders.join('\n');
+                console.log('[APP] Inbox folder preference changed to:', selectedFolders);
                 const settings = appState.getSettings() || {};
-                settings.inbox_folder = selectedFolder;
+                settings.inbox_folder = joined;
                 appState.setSettings(settings);
+                // Keep the spam-rescue target dropdown in sync with the inbox
+                // folder selection (its options are derived from it, minus spam).
+                this.populateSpamRescueTargetOptions(settings);
                 if (window.emailService) {
                     window.emailService.inboxOffset = 0;
                     await window.emailService.loadEmails();
@@ -1769,7 +1836,7 @@ NostrMailApp.prototype.setupEventListeners = function() {
                 refreshSent.innerHTML = '<span class="loading"></span> Syncing...';
                 
                 try {
-                    await window.emailService.syncSentEmails();
+                    await window.emailService.refreshSentEmails();
                     // loadSentEmails() will manage the button state from here
                     await window.emailService.loadSentEmails();
                     notificationService.showSuccess('Sent emails synced successfully');
@@ -1844,6 +1911,28 @@ NostrMailApp.prototype.setupLiveEventListeners = async function() {
             this.handleLiveProfileUpdate(event.payload);
         });
         
+        // Listen for IMAP IDLE push: backend detected the active account's INBOX
+        // changed. Sync + reload, guarded so overlapping pushes don't pile up.
+        this.newMailUnlisten = await window.__TAURI__.event.listen('imap-new-mail', async (event) => {
+            const account = event.payload;
+            const active = window.appState?.getSettings()?.email_address;
+            if (account && active && account !== active) {
+                return; // stale event from a previous account; ignore
+            }
+            if (this._idleSyncInFlight) return;
+            this._idleSyncInFlight = true;
+            try {
+                console.log('[APP] imap-new-mail: syncing inbox for', account);
+                if (window.emailService) {
+                    await window.emailService.syncAndReloadEmails();
+                }
+            } catch (err) {
+                console.error('[APP] imap-new-mail sync failed:', err);
+            } finally {
+                this._idleSyncInFlight = false;
+            }
+        });
+
         // Listen for relay status changes (when relays fail/disconnect)
         this.relayStatusUnlisten = await window.__TAURI__.event.listen('relay-status-changed', async (event) => {
             console.log('[APP] Relay status changed event received:', event.payload);
@@ -2019,7 +2108,12 @@ NostrMailApp.prototype.cleanupLiveEvents = async function() {
                 this.profileUnlisten();
                 this.profileUnlisten = null;
             }
-            
+
+            if (this.newMailUnlisten) {
+                this.newMailUnlisten();
+                this.newMailUnlisten = null;
+            }
+
             this.liveEventsActive = false;
             this.updateLiveEventsStatus('inactive', 'Disconnected');
             
@@ -2797,13 +2891,17 @@ NostrMailApp.prototype.switchTab = async function(tabName) {
     if (tabName === 'inbox') {
         if (window.emailService) {
             // Folder list is loaded when the Settings tab is opened. Here we
-            // just load emails using the persisted inbox_folder preference.
+            // just load emails using the persisted inbox_folder preference,
+            // then kick off a debounced background sync so newer mail shows
+            // up without the user having to press Refresh.
             window.emailService.loadEmails();
+            window.emailService.autoSyncInboxIfStale();
         }
     }
     if (tabName === 'sent') {
         if (window.emailService) {
             window.emailService.loadSentEmails();
+            window.emailService.autoSyncSentIfStale();
         }
     }
     if (tabName === 'drafts') {
@@ -2860,6 +2958,10 @@ NostrMailApp.prototype.hideModal = function() {
     try {
         const modalOverlay = domManager.get('modalOverlay');
         if (modalOverlay) modalOverlay.classList.add('hidden');
+        // Clear the body so secrets (e.g. an nsec rendered under a private-key QR)
+        // don't linger in the live DOM after the modal is dismissed.
+        const modalBody = domManager.get('modalBody');
+        if (modalBody) modalBody.innerHTML = '';
     } catch (error) {
         console.error('Error hiding modal:', error);
     }
@@ -2970,6 +3072,18 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             publicKey = currentPublicKey;
         }
         
+        // Read the inbox-folder multiselect: all selected option values joined
+        // by newlines (the in-memory and persisted shape). Newlines aren't
+        // valid in IMAP mailbox names so they're a safe delimiter.
+        const readInboxFolderSelection = () => {
+            const el = domManager.get('inboxFolderPreference');
+            if (!el) return '';
+            return Array.from(el.selectedOptions || [])
+                .map(o => o.value)
+                .filter(Boolean)
+                .join('\n');
+        };
+
         // Build settings object from form values (or use loaded settings if keypair changed)
         // If keypair changed and settings were loaded, use loaded settings from appState
         // Otherwise, use form values
@@ -2984,7 +3098,9 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             // Use loaded settings if available, otherwise use form values (which should be populated by loadSettingsForPubkey)
             // Prioritize loadedSettings but fall back to form values as they should match after populateSettingsForm()
             settings = {
-                npriv_key: nprivKey,
+                // NOTE: the private key is NOT stored here. It lives only in the
+                // backend keychain (added via profileManager.addAccount above).
+                // Persisting it in this object would leak it to localStorage.
                 encryption_algorithm: (loadedSettings && loadedSettings.encryption_algorithm) ? loadedSettings.encryption_algorithm : (domManager.getValue('encryptionAlgorithm') || 'nip44'),
                 email_address: (loadedSettings && loadedSettings.email_address) ? loadedSettings.email_address : (domManager.getValue('emailAddress') || ''),
                 password: (loadedSettings && loadedSettings.password) ? loadedSettings.password : (domManager.getValue('emailPassword') || ''),
@@ -2995,10 +3111,13 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 use_tls: (loadedSettings && loadedSettings.use_tls !== undefined) ? loadedSettings.use_tls : (domManager.get('use-tls')?.checked || false),
                 email_filter: (loadedSettings && loadedSettings.email_filter) ? loadedSettings.email_filter : (domManager.getValue('emailFilterPreference') || 'nostr'),
                 send_matching_dm: (loadedSettings && loadedSettings.send_matching_dm !== undefined) ? loadedSettings.send_matching_dm : (domManager.get('send-matching-dm-preference')?.checked !== false),
-                sync_cutoff_days: (loadedSettings && loadedSettings.sync_cutoff_days) ? loadedSettings.sync_cutoff_days : (parseInt(domManager.getValue('syncCutoffDays')) || 30),
+                sync_initial_count: (loadedSettings && loadedSettings.sync_initial_count) ? loadedSettings.sync_initial_count : (parseInt(domManager.getValue('syncInitialCount')) || 50),
                 emails_per_page: (loadedSettings && loadedSettings.emails_per_page) ? loadedSettings.emails_per_page : (parseInt(domManager.getValue('emailsPerPage')) || 50),
-                inbox_folder: (loadedSettings && loadedSettings.inbox_folder !== undefined) ? loadedSettings.inbox_folder : (domManager.getValue('inboxFolderPreference') || ''),
+                inbox_folder: (loadedSettings && loadedSettings.inbox_folder !== undefined) ? loadedSettings.inbox_folder : readInboxFolderSelection(),
                 require_signature: (loadedSettings && loadedSettings.require_signature !== undefined) ? loadedSettings.require_signature : (domManager.get('require-signature-preference')?.checked !== false),
+                spam_rescue: (loadedSettings && loadedSettings.spam_rescue !== undefined) ? loadedSettings.spam_rescue : (domManager.get('spam-rescue-preference')?.checked !== false),
+                auto_move_nostr: (loadedSettings && loadedSettings.auto_move_nostr !== undefined) ? loadedSettings.auto_move_nostr : (domManager.get('auto-move-nostr-preference')?.checked === true),
+                spam_rescue_target: (loadedSettings && loadedSettings.spam_rescue_target !== undefined) ? loadedSettings.spam_rescue_target : ((domManager.get('spam-rescue-target-preference')?.value || '').trim() || 'nostr-mail'),
                 hide_undecryptable_emails: (loadedSettings && loadedSettings.hide_undecryptable_emails !== undefined) ? loadedSettings.hide_undecryptable_emails : (domManager.get('hide-undecryptable-emails-preference')?.checked !== false),
                 automatically_encrypt: (loadedSettings && loadedSettings.automatically_encrypt !== undefined) ? loadedSettings.automatically_encrypt : (domManager.get('automatically-encrypt-preference')?.checked !== false),
                 automatically_sign: (loadedSettings && loadedSettings.automatically_sign !== undefined) ? loadedSettings.automatically_sign : (domManager.get('automatically-sign-preference')?.checked !== false),
@@ -3034,10 +3153,13 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
                 use_tls: domManager.get('use-tls')?.checked || false,
                 email_filter: domManager.getValue('emailFilterPreference') || 'nostr',
                 send_matching_dm: domManager.get('send-matching-dm-preference')?.checked !== false, // Default to true
-                sync_cutoff_days: parseInt(domManager.getValue('syncCutoffDays')) || 30, // Default to 30 days
+                sync_initial_count: parseInt(domManager.getValue('syncInitialCount')) || 50, // Messages scanned per folder
                 emails_per_page: parseInt(domManager.getValue('emailsPerPage')) || 50, // Default to 50
-                inbox_folder: domManager.getValue('inboxFolderPreference') || '',
+                inbox_folder: readInboxFolderSelection(),
                 require_signature: domManager.get('require-signature-preference')?.checked !== false, // Default to true
+                spam_rescue: domManager.get('spam-rescue-preference')?.checked !== false, // Default to true (on by default)
+                auto_move_nostr: domManager.get('auto-move-nostr-preference')?.checked === true, // Default to false (opt-in)
+                spam_rescue_target: (domManager.get('spam-rescue-target-preference')?.value || '').trim() || 'nostr-mail',
                 hide_undecryptable_emails: domManager.get('hide-undecryptable-emails-preference')?.checked !== false, // Default to true
                 automatically_encrypt: autoEncryptEnabled,
                 automatically_sign: autoSignPref?.checked !== false, // Default to true (will be true if auto-encrypt is enabled)
@@ -3051,10 +3173,10 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             };
         }
         
-        // Keep localStorage as backup
-        localStorage.setItem('nostr_mail_settings', JSON.stringify(settings));
+        // Keep localStorage as backup, with secrets stripped: the private key lives
+        // only in the backend keychain and the password is encrypted at rest in the DB.
+        persistSettingsCache(settings);
         appState.setSettings(settings);
-        appState.setNprivKey(settings.npriv_key);
         
         // Save settings to database with pubkey association (REQUIRED)
         // Settings are saved under the public key, so each keypair has its own email settings
@@ -3079,10 +3201,13 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             settingsMap.set('use_tls', settings.use_tls.toString());
             settingsMap.set('email_filter', settings.email_filter);
             settingsMap.set('send_matching_dm', settings.send_matching_dm.toString());
-            settingsMap.set('sync_cutoff_days', settings.sync_cutoff_days.toString());
+            settingsMap.set('sync_initial_count', settings.sync_initial_count.toString());
             settingsMap.set('emails_per_page', settings.emails_per_page.toString());
             settingsMap.set('inbox_folder', settings.inbox_folder || '');
             settingsMap.set('require_signature', settings.require_signature.toString());
+            settingsMap.set('spam_rescue', (settings.spam_rescue !== false).toString());
+            settingsMap.set('auto_move_nostr', (settings.auto_move_nostr === true).toString());
+            settingsMap.set('spam_rescue_target', settings.spam_rescue_target || 'nostr-mail');
             settingsMap.set('hide_undecryptable_emails', (settings.hide_undecryptable_emails || false).toString());
             settingsMap.set('automatically_encrypt', (settings.automatically_encrypt !== undefined ? settings.automatically_encrypt : true).toString());
             settingsMap.set('automatically_sign', (settings.automatically_sign !== undefined ? settings.automatically_sign : true).toString());
@@ -3101,7 +3226,12 @@ NostrMailApp.prototype.saveSettings = async function(showNotification = false) {
             
             // Update last loaded pubkey tracker after successful save
             appState.setLastLoadedPubkey(publicKey);
-            
+
+            // IMAP credentials/host may have changed — rebind the IDLE watcher
+            // (and drop stale pooled connections) to the new settings.
+            TauriService.startImapIdle().catch(err =>
+                console.warn('[APP] Failed to restart IMAP IDLE watcher after save:', err));
+
             // Update compose page warning if on compose tab
             if (document.querySelector('.tab-content#compose.active')) {
                 this.checkEmailSettingsForCompose();
@@ -3180,6 +3310,9 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'emailFilterPreference',
         'send-matching-dm-preference',
         'require-signature-preference',
+        'spam-rescue-preference',
+        'spam-rescue-target-preference',
+        'auto-move-nostr-preference',
         'hide-undecryptable-emails-preference',
         'automatically-encrypt-preference',
         'automatically-sign-preference',
@@ -3187,7 +3320,7 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         'include-pubkey-header-preference',
         'include-sig-header-preference',
         'include-recipient-header-preference',
-        'syncCutoffDays',
+        'syncInitialCount',
         'emailsPerPage',
         'inboxFolderPreference',
         'glossiaEncodingBody',
@@ -3208,6 +3341,40 @@ NostrMailApp.prototype.setupAutoSaveSettings = function() {
         }
     });
     
+    // Special handling: enabling Spam Rescue triggers a one-time catch-up that
+    // sweeps ALL nostr mail (read + unread) out of spam. The normal per-sync
+    // rescue only moves UNSEEN mail, so messages the user already read while
+    // they sat in spam would otherwise be stranded; this run clears them once,
+    // then reports how many were moved. Programmatic `.checked =` during form
+    // population doesn't fire 'change', so a checked=true event here is always
+    // a genuine user-initiated off→on transition.
+    const spamRescuePref = domManager.get('spam-rescue-preference');
+    if (spamRescuePref) {
+        spamRescuePref.addEventListener('change', async (e) => {
+            if (isPopulatingForm || !e.target.checked) return;
+            try {
+                // Persist spam_rescue=true first so the catch-up's post-move
+                // sync scans with rescue enabled (target folder in the set).
+                await this.saveSettings(false);
+                const moved = await TauriService.rescueSpamNow();
+                if (moved > 0) {
+                    notificationService.showSuccess(
+                        `Spam rescue: moved ${moved} message${moved === 1 ? '' : 's'} out of spam.`
+                    );
+                    if (window.emailService && typeof window.emailService.loadEmails === 'function') {
+                        window.emailService.loadEmails().catch(err =>
+                            console.warn('[APP] reload after spam rescue failed:', err));
+                    }
+                } else {
+                    notificationService.showInfo('Spam rescue: no messages needed rescuing.');
+                }
+            } catch (err) {
+                console.error('[APP] rescue_spam_now failed:', err);
+                notificationService.showError('Spam rescue failed: ' + err);
+            }
+        });
+    }
+
     // Special handling: When auto-encrypt is enabled, also enable auto-sign
     const autoEncryptPref = domManager.get('automatically-encrypt-preference');
     const autoSignPref = domManager.get('automatically-sign-preference');
@@ -3338,6 +3505,47 @@ NostrMailApp.prototype.setupEmailValidation = function() {
     }
 }
 
+// Populate the "Rescue into folder" <select> from the folders the user selected
+// for their inbox, excluding spam/junk/bulk folders (we never rescue into spam).
+// The currently-saved target is preserved as an option even if it isn't part of
+// the current inbox selection, so changing inbox folders can't silently drop it.
+NostrMailApp.prototype.populateSpamRescueTargetOptions = function(settings) {
+    const select = domManager.get('spam-rescue-target-preference');
+    if (!select) return;
+
+    settings = settings || appState.getSettings() || {};
+
+    // Prefer the live multiselect DOM selection; fall back to the persisted list.
+    let inboxFolders = (window.FolderMultiselect && window.FolderMultiselect.getSelection)
+        ? window.FolderMultiselect.getSelection()
+        : [];
+    if (!inboxFolders || inboxFolders.length === 0) {
+        inboxFolders = (settings.inbox_folder || '').split('\n').map(f => f.trim()).filter(Boolean);
+    }
+
+    const isSpammy = (name) => {
+        const lower = name.toLowerCase();
+        return lower.includes('spam') || lower.includes('junk') || lower.includes('bulk');
+    };
+
+    const options = inboxFolders.filter(f => f && !isSpammy(f));
+
+    const saved = (settings.spam_rescue_target || 'nostr-mail').trim() || 'nostr-mail';
+    // Keep the saved target selectable even if it's not in the inbox selection.
+    if (saved && !options.includes(saved)) {
+        options.unshift(saved);
+    }
+
+    select.innerHTML = '';
+    for (const folder of options) {
+        const opt = document.createElement('option');
+        opt.value = folder;
+        opt.textContent = folder;
+        select.appendChild(opt);
+    }
+    select.value = saved;
+};
+
 NostrMailApp.prototype.populateSettingsForm = async function() {
     console.log('[QR] populateSettingsForm called');
     const settings = appState.getSettings();
@@ -3380,28 +3588,31 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         domManager.setValue('imapPort', settings.imap_port || '');
         domManager.get('use-tls').checked = settings.use_tls || false;
         domManager.setValue('emailFilterPreference', settings.email_filter || 'nostr');
-        domManager.setValue('syncCutoffDays', settings.sync_cutoff_days || 30);
+        domManager.setValue('syncInitialCount', settings.sync_initial_count || 50);
         domManager.setValue('emailsPerPage', settings.emails_per_page || 50);
-        // Inbox folder: the dropdown's <option> list is per-account (driven by
-        // the active user's IMAP server). Reset it to just Default + persisted
-        // name so the value can be applied immediately, then trigger a silent
-        // background refresh to pull the live folder list for this account.
+        // Inbox folders: the <option> list is per-account (driven by the
+        // active user's IMAP server). Seed Tom Select with the persisted
+        // selections (newline-separated) so the saved value is visible
+        // immediately, then trigger a silent background refresh to pull the
+        // live folder list.
         const inboxFolderSelect = domManager.get('inboxFolderPreference');
         if (inboxFolderSelect) {
             const persistedFolder = settings.inbox_folder || '';
-            inboxFolderSelect.innerHTML = '';
-            const defaultOpt = document.createElement('option');
-            defaultOpt.value = '';
-            defaultOpt.textContent = 'Default';
-            inboxFolderSelect.appendChild(defaultOpt);
-            if (persistedFolder) {
-                const opt = document.createElement('option');
-                opt.value = persistedFolder;
-                opt.textContent = persistedFolder;
-                inboxFolderSelect.appendChild(opt);
+            const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
+            if (window.FolderMultiselect) {
+                window.FolderMultiselect.setSelectionOnly(persistedList);
+                // Reflect the backend's provider-aware defaults in the
+                // placeholder so the user can see what "no selection" will
+                // sync. Spam/junk/bulk folders are intentionally excluded —
+                // misfiled nostr mail is recovered by spam rescue instead.
+                TauriService.getDefaultInboxFolders(settings.imap_host).then(defaults => {
+                    if (defaults && defaults.length > 0) {
+                        window.FolderMultiselect.setPlaceholder(
+                            `Default (${defaults.join(', ')})`
+                        );
+                    }
+                }).catch(() => { /* placeholder stays at the initial value */ });
             }
-            inboxFolderSelect.value = persistedFolder;
-            inboxFolderSelect.disabled = false;
             if (window.emailService) {
                 window.emailService.listImapFolders({ silent: true }).catch(err => {
                     console.warn('[APP] Background folder refresh failed:', err);
@@ -3420,7 +3631,20 @@ NostrMailApp.prototype.populateSettingsForm = async function() {
         if (requireSignaturePref) {
             requireSignaturePref.checked = settings.require_signature !== false;
         }
-        
+
+        // Set spam rescue preference (default to false — opt-in) and target folder
+        const spamRescuePref = domManager.get('spam-rescue-preference');
+        if (spamRescuePref) {
+            spamRescuePref.checked = settings.spam_rescue !== false;
+        }
+        this.populateSpamRescueTargetOptions(settings);
+
+        // Set auto-file Nostr mail preference (default to false — opt-in)
+        const autoMoveNostrPref = domManager.get('auto-move-nostr-preference');
+        if (autoMoveNostrPref) {
+            autoMoveNostrPref.checked = settings.auto_move_nostr === true;
+        }
+
         // Set hide undecryptable emails preference (default to true if not set)
         const hideUndecryptablePref = domManager.get('hide-undecryptable-emails-preference');
         if (hideUndecryptablePref) {
@@ -3513,8 +3737,19 @@ NostrMailApp.prototype.setupQrCodeEventListeners = function() {
         qrNprivBtn.parentNode.replaceChild(newQrNprivBtn, qrNprivBtn);
         newQrNprivBtn.addEventListener('click', async () => {
             const value = nprivKeyInput.value;
-            console.log('[QR] Private key QR button clicked. Value:', value);
+            // Never log the value: it is the nsec/npriv private key.
+            console.log('[QR] Private key QR button clicked');
             if (!value) return;
+            // Require explicit confirmation before rendering the secret: a private-key
+            // QR grants full account control to anyone who can see it.
+            const confirmed = await notificationService.showConfirmation(
+                'This QR code contains your PRIVATE KEY. Anyone who scans, photographs, or screenshots it gains full control of your account — they can read your messages and impersonate you. Only reveal it somewhere completely private, and never share or send the image. Continue?',
+                '⚠️ Reveal Private Key?'
+            );
+            if (!confirmed) {
+                console.log('[QR] Private key QR reveal cancelled by user');
+                return;
+            }
             try {
                 const dataUrl = await TauriService.generateQrCode(value);
                 showQrModal('Private Key QR Code', dataUrl, value);
@@ -3673,8 +3908,9 @@ NostrMailApp.prototype.scanPrivateKeyQRCode = async function() {
                     aspectRatio: 1.0
                 },
                 (decodedText, decodedResult) => {
-                    console.log('[QR] QR code scanned:', decodedText);
-                    
+                    // Never log decodedText: a scanned private-key QR is an nsec/npriv.
+                    console.log('[QR] QR code scanned');
+
                     // Validate the scanned text is a private key
                     const scannedKey = decodedText.trim();
                     if (!scannedKey.startsWith('npriv1') && !scannedKey.startsWith('nsec1')) {
@@ -5776,7 +6012,17 @@ NostrMailApp.prototype.initializeSettingsAccordion = function() {
 document.addEventListener('DOMContentLoaded', () => {
     window.domManager = new DOMManager();
     console.log('🌐 DOM loaded - Initializing NostrMail interface...');
-    
+
+    // Show the real app version from the Tauri bundle (single source of truth:
+    // tauri.conf.json), so the sidebar label never drifts on a version bump.
+    const versionEl = document.getElementById('app-version');
+    if (versionEl) {
+        window.__TAURI__?.app?.getVersion()
+            .then(v => { versionEl.textContent = `v${v}`; })
+            .catch(() => { /* non-Tauri / web preview: leave blank */ });
+    }
+
+
     // Set initial dark mode from localStorage
     const darkPref = localStorage.getItem('darkMode');
     window.app.setDarkMode(darkPref === '1');

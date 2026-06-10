@@ -92,6 +92,18 @@ pub struct DbConversation {
     pub cached_at: DateTime<Utc>,
 }
 
+/// One-row-per-contact summary for the DM contact list. Carries just the
+/// latest message (still encrypted) plus a total count, so the contact list
+/// can render without fetching+decrypting every message of every conversation.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DmConversationPreview {
+    pub contact_pubkey: String,
+    pub last_event_id: String,
+    pub last_content: String,
+    pub last_created_at: DateTime<Utc>,
+    pub message_count: i64,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserSettings {
@@ -151,6 +163,18 @@ pub struct Attachment {
 pub struct FolderSyncState {
     pub uid_validity: u32,
     pub last_seen_uid: u32,
+    // Lowest UID we've fetched for this folder. None on legacy rows that
+    // predate the backward-pagination feature; populated by the next
+    // forward sync (bootstrap fills it from the SINCE-cutoff range) or by
+    // the first fetch_older call.
+    pub min_seen_uid: Option<u32>,
+    // Contiguous UID range gap-fill has already examined (under the current
+    // uid_validity). gap_fill_in_folder skips UIDs inside [min, max] so the
+    // expensive ENVELOPE + body re-fetch of already-seen (non-nostr) mail only
+    // happens once. None = nothing examined yet (full scan). Reset to None when
+    // uid_validity changes. Always written together.
+    pub gap_examined_min_uid: Option<u32>,
+    pub gap_examined_max_uid: Option<u32>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -496,6 +520,16 @@ impl Database {
 
         // Migrate: Add folder_sync_state table for UID-based incremental IMAP sync.
         Self::migrate_add_folder_sync_state_table(&conn)?;
+        // Migrate: Add min_seen_uid column to folder_sync_state for backward
+        // pagination ("fetch older from server").
+        Self::migrate_add_min_seen_uid_column(&conn)?;
+        // Migrate: Add gap_examined_{min,max}_uid columns so gap-fill examines
+        // each UID at most once instead of rescanning the whole window.
+        Self::migrate_add_gap_examined_columns(&conn)?;
+
+        // Migrate: One-shot cleanup of duplicate DM rows that slipped past the
+        // old outer-wrap-id dedup. Safe to run on every startup (idempotent).
+        Self::migrate_collapse_dm_rumor_duplicates(&conn)?;
 
         // Create indexes for better performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_pubkey ON contacts(pubkey)", [])?;
@@ -723,6 +757,39 @@ impl Database {
                 "ALTER TABLE direct_messages ADD COLUMN received_from_relay TEXT",
                 [],
             )?;
+        }
+
+        Ok(())
+    }
+
+    /// One-shot: collapse legacy duplicate DM rows that the pre-rumor-id dedup
+    /// allowed in. Two gift wraps of the same NIP-17 rumor have different outer
+    /// event_ids, so they bypassed the UNIQUE constraint on event_id. Group by
+    /// the logical key (sender, recipient, created_at, content_hash) and keep
+    /// the row with the smallest received_at per group; delete the rest.
+    /// Idempotent: a clean DB has no groups with COUNT > 1, so this is a no-op.
+    fn migrate_collapse_dm_rumor_duplicates(conn: &Connection) -> Result<()> {
+        let deleted = conn.execute(
+            "DELETE FROM direct_messages
+             WHERE id IN (
+                 SELECT id FROM direct_messages dm
+                 WHERE EXISTS (
+                     SELECT 1 FROM direct_messages keeper
+                     WHERE keeper.sender_pubkey = dm.sender_pubkey
+                       AND keeper.recipient_pubkey = dm.recipient_pubkey
+                       AND keeper.created_at = dm.created_at
+                       AND COALESCE(keeper.content_hash, '') = COALESCE(dm.content_hash, '')
+                       AND (
+                           keeper.received_at < dm.received_at
+                           OR (keeper.received_at = dm.received_at AND keeper.id < dm.id)
+                       )
+                 )
+             )",
+            [],
+        )?;
+
+        if deleted > 0 {
+            println!("[DB] Collapsed {} duplicate DM row(s) from pre-rumor-id dedup", deleted);
         }
 
         Ok(())
@@ -970,6 +1037,51 @@ impl Database {
                 "CREATE INDEX IF NOT EXISTS idx_folder_sync_state_pubkey ON folder_sync_state(pubkey)",
                 [],
             )?;
+        }
+        Ok(())
+    }
+
+    /// Migration: Add min_seen_uid column to folder_sync_state.
+    fn migrate_add_min_seen_uid_column(conn: &Connection) -> Result<()> {
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(folder_sync_state)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for r in rows {
+                if r? == "min_seen_uid" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_column {
+            println!("[DB] Adding min_seen_uid column to folder_sync_state");
+            conn.execute(
+                "ALTER TABLE folder_sync_state ADD COLUMN min_seen_uid INTEGER",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Migration: Add gap_examined_{min,max}_uid columns to folder_sync_state.
+    /// These track the contiguous UID range gap-fill has already examined so it
+    /// doesn't re-fetch already-seen (non-nostr) messages on every refresh.
+    fn migrate_add_gap_examined_columns(conn: &Connection) -> Result<()> {
+        let existing: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(folder_sync_state)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for col in ["gap_examined_min_uid", "gap_examined_max_uid"] {
+            if !existing.contains(col) {
+                println!("[DB] Adding {} column to folder_sync_state", col);
+                conn.execute(
+                    &format!("ALTER TABLE folder_sync_state ADD COLUMN {} INTEGER", col),
+                    [],
+                )?;
+            }
         }
         Ok(())
     }
@@ -1393,7 +1505,7 @@ impl Database {
                     subject_hash = COALESCE(?, subject_hash),
                     signature_valid = COALESCE(?, signature_valid),
                     signature_source = COALESCE(?, signature_source),
-                    transport_auth_verified = ?,
+                    transport_auth_verified = COALESCE(?, transport_auth_verified),
                     in_reply_to = ?, references_ = ?, thread_id = ?
                 WHERE id = ?",
                 params![
@@ -1532,12 +1644,15 @@ impl Database {
     }
 
     pub fn get_email(&self, message_id: &str) -> Result<Option<Email>> {
-        println!("[DB] get_email: Checking for message_id={}", message_id);
+        // These traces fire once per message during sync/gap-fill (one call per
+        // server Message-ID in the scanned window), so they're gated behind
+        // NOSTR_MAIL_DEBUG via debug_log! rather than unconditional println!.
+        crate::debug_log!("[DB] get_email: Checking for message_id={}", message_id);
         let conn = self.conn.lock().unwrap();
-        println!("[DB] get_email: Acquired database lock");
+        crate::debug_log!("[DB] get_email: Acquired database lock");
         // Normalize message_id for comparison
         let normalized_id = Self::normalize_message_id(message_id);
-        println!("[DB] get_email: Normalized message_id={}", normalized_id);
+        crate::debug_log!("[DB] get_email: Normalized message_id={}", normalized_id);
         
         // Use SQL query with normalization to find matching email efficiently
         // SQLite's TRIM and REPLACE can handle the normalization
@@ -1548,7 +1663,7 @@ impl Database {
              WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) = ?
              ORDER BY received_at DESC"
         )?;
-        println!("[DB] get_email: Prepared optimized query with normalization");
+        crate::debug_log!("[DB] get_email: Prepared optimized query with normalization");
         
         let mut rows = stmt.query(params![normalized_id])?;
         
@@ -1580,11 +1695,11 @@ impl Database {
                 references: row.get(21)?,
                 thread_id: row.get(22)?,
             };
-            println!("[DB] get_email: Found matching email, id={:?}", email.id);
+            crate::debug_log!("[DB] get_email: Found matching email, id={:?}", email.id);
             return Ok(Some(email));
         }
-        
-        println!("[DB] get_email: No matching email found");
+
+        crate::debug_log!("[DB] get_email: No matching email found");
         Ok(None)
     }
 
@@ -1788,7 +1903,7 @@ impl Database {
     /// Get inbox emails grouped by thread. Returns one row per thread (the most recent email)
     /// plus message_count and unread_count for that thread.
     /// Counts ALL emails in a thread (including sent replies) so threads span inbox/sent.
-    pub fn get_email_threads(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>, user_pubkey: Option<&str>) -> Result<Vec<(Email, i64, i64)>> {
+    pub fn get_email_threads(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>, user_pubkey: Option<&str>) -> Result<Vec<(Email, i64, i64, i64)>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.unwrap_or(50);
         let offset = offset.unwrap_or(0);
@@ -1864,7 +1979,8 @@ impl Database {
                    received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
                    is_draft, is_read, updated_at, created_at, signature_valid, signature_source,
                    transport_auth_verified, in_reply_to, references_, thread_id,
-                   message_count, unread_count
+                   message_count, unread_count,
+                   (SELECT COUNT(*) FROM attachments WHERE email_id = ranked.id) AS attachment_count
             FROM ranked WHERE rn = 1
             ORDER BY thread_last_activity DESC
             LIMIT ? OFFSET ?",
@@ -1911,69 +2027,92 @@ impl Database {
             };
             let message_count: i64 = row.get(23)?;
             let unread_count: i64 = row.get(24)?;
-            Ok((email, message_count, unread_count))
+            let attachment_count: i64 = row.get(25)?;
+            Ok((email, message_count, unread_count, attachment_count))
         })?;
         rows.collect()
     }
 
     /// Get sent emails grouped by thread.
     /// Counts ALL emails in a thread (including received messages) so threads span inbox/sent.
-    pub fn get_sent_email_threads(&self, limit: Option<i64>, offset: Option<i64>, user_email: Option<&str>) -> Result<Vec<(Email, i64, i64)>> {
+    pub fn get_sent_email_threads(&self, limit: Option<i64>, offset: Option<i64>, user_email: Option<&str>) -> Result<Vec<(Email, i64, i64, i64)>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.unwrap_or(50);
         let offset = offset.unwrap_or(0);
 
-        // Build WHERE clauses for identifying which threads belong to the sent view
-        let mut filter_clauses = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        filter_clauses.push("is_draft = 0".to_string());
-
-        if let Some(email) = user_email {
-            let normalized_user_email = Self::normalize_gmail_address(email);
-            let user_email_lower = email.trim().to_lowercase();
-
-            if email.contains("@gmail.com") {
-                let user_email_no_plus = if let Some(plus_pos) = user_email_lower.find('+') {
-                    if let Some(at_pos) = user_email_lower.find('@') {
-                        format!("{}@{}", &user_email_lower[..plus_pos], &user_email_lower[at_pos+1..])
+        // SQL fragment that matches `from_address` to the active user, with
+        // Gmail dot/+alias normalization. Reused in two places (the
+        // view_threads filter and the per-thread rep ranking CASE), so we
+        // build it once and push its params twice — first for the filter,
+        // then for the CASE.
+        let (user_addr_match_sql, user_addr_match_params): (String, Vec<String>) = match user_email {
+            Some(email) => {
+                let user_email_lower = email.trim().to_lowercase();
+                if email.contains("@gmail.com") {
+                    let normalized_user_email = Self::normalize_gmail_address(email);
+                    let user_email_no_plus = if let Some(plus_pos) = user_email_lower.find('+') {
+                        if let Some(at_pos) = user_email_lower.find('@') {
+                            format!("{}@{}", &user_email_lower[..plus_pos], &user_email_lower[at_pos+1..])
+                        } else {
+                            user_email_lower.clone()
+                        }
                     } else {
                         user_email_lower.clone()
-                    }
+                    };
+                    let normalized_user_email_no_plus = Self::normalize_gmail_address(&user_email_no_plus);
+                    let sql =
+                        "(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR \
+                         (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ? OR \
+                         (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ?)".to_string();
+                    (sql, vec![user_email_lower, normalized_user_email, normalized_user_email_no_plus])
                 } else {
-                    user_email_lower.clone()
-                };
-                let normalized_user_email_no_plus = Self::normalize_gmail_address(&user_email_no_plus);
+                    ("LOWER(TRIM(from_address)) = LOWER(TRIM(?))".to_string(), vec![user_email_lower])
+                }
+            }
+            None => (String::new(), vec![]),
+        };
 
-                filter_clauses.push(
-                    "(LOWER(TRIM(from_address)) = LOWER(TRIM(?)) OR \
-                     (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ? OR \
-                     (REPLACE(SUBSTR(LOWER(TRIM(from_address)), 1, CASE WHEN INSTR(LOWER(TRIM(from_address)), '+') > 0 THEN INSTR(LOWER(TRIM(from_address)), '+') - 1 ELSE INSTR(LOWER(TRIM(from_address)), '@') - 1 END), '.', '') || '@gmail.com') = ?)".to_string()
-                );
-                params.push(Box::new(user_email_lower.clone()));
-                params.push(Box::new(normalized_user_email.clone()));
-                params.push(Box::new(normalized_user_email_no_plus.clone()));
-            } else {
-                filter_clauses.push("LOWER(TRIM(from_address)) = LOWER(TRIM(?))".to_string());
-                params.push(Box::new(user_email_lower));
+        let mut filter_clauses = vec!["is_draft = 0".to_string()];
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !user_addr_match_sql.is_empty() {
+            filter_clauses.push(user_addr_match_sql.clone());
+            for p in &user_addr_match_params {
+                params.push(Box::new(p.clone()));
             }
         }
 
-        let filter_sql = if filter_clauses.is_empty() {
-            String::new()
+        let filter_sql = format!("WHERE {}", filter_clauses.join(" AND "));
+
+        // Per-thread rep selection. Prefer the user's own sent message
+        // (the `from_address` match used by view_threads) over received
+        // replies, then most recent. Mirror of the inbox rule that prefers
+        // non-sent reps. Without this, a Sent thread can be represented by
+        // a received reply from the user's *other* account — its
+        // sender_pubkey doesn't match the active account, the row gets
+        // filtered downstream, and the whole thread vanishes from Sent.
+        let rep_rank_expr = if !user_addr_match_sql.is_empty() {
+            format!("CASE WHEN {} THEN 0 ELSE 1 END,", user_addr_match_sql)
         } else {
-            format!("WHERE {}", filter_clauses.join(" AND "))
+            String::new()
         };
 
-        // Two-phase query: find sent thread_ids, then rank ALL emails in those threads
+        // Two-phase query: find sent thread_ids, then rank ALL emails in those threads.
+        // Final ORDER BY uses `thread_last_activity` (MAX received_at per thread)
+        // so threads sort by latest activity even when the rep is an older
+        // user-sent message.
         let query = format!(
             "WITH view_threads AS (
                 SELECT DISTINCT COALESCE(thread_id, message_id) AS tid
                 FROM emails
-                {}
+                {filter_sql}
             ),
             ranked AS (
                 SELECT e.*,
-                    ROW_NUMBER() OVER (PARTITION BY COALESCE(e.thread_id, e.message_id) ORDER BY e.received_at DESC, e.id DESC) AS rn,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(e.thread_id, e.message_id)
+                        ORDER BY {rep_rank_expr} e.received_at DESC, e.id DESC
+                    ) AS rn,
+                    MAX(e.received_at) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS thread_last_activity,
                     COUNT(*) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS message_count,
                     SUM(CASE WHEN e.is_read = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY COALESCE(e.thread_id, e.message_id)) AS unread_count
                 FROM emails e
@@ -1984,12 +2123,21 @@ impl Database {
                    received_at, is_nostr_encrypted, sender_pubkey, recipient_pubkey, raw_headers,
                    is_draft, is_read, updated_at, created_at, signature_valid, signature_source,
                    transport_auth_verified, in_reply_to, references_, thread_id,
-                   message_count, unread_count
+                   message_count, unread_count,
+                   (SELECT COUNT(*) FROM attachments WHERE email_id = ranked.id) AS attachment_count
             FROM ranked WHERE rn = 1
-            ORDER BY received_at DESC
+            ORDER BY thread_last_activity DESC
             LIMIT ? OFFSET ?",
-            filter_sql
         );
+        // Param order must match placeholders in the SQL string:
+        //   1) view_threads filter (user_addr_match)               — already pushed
+        //   2) ranked CTE rep-rank CASE (same SQL, same params)    — pushed here
+        //   3) LIMIT, OFFSET                                       — pushed last
+        if !user_addr_match_sql.is_empty() {
+            for p in &user_addr_match_params {
+                params.push(Box::new(p.clone()));
+            }
+        }
         params.push(Box::new(limit));
         params.push(Box::new(offset));
 
@@ -2023,7 +2171,8 @@ impl Database {
             };
             let message_count: i64 = row.get(23)?;
             let unread_count: i64 = row.get(24)?;
-            Ok((email, message_count, unread_count))
+            let attachment_count: i64 = row.get(25)?;
+            Ok((email, message_count, unread_count, attachment_count))
         })?;
         rows.collect()
     }
@@ -2229,7 +2378,7 @@ impl Database {
     pub fn get_folder_sync_state(&self, pubkey: &str, folder: &str) -> Result<Option<FolderSyncState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT uid_validity, last_seen_uid, updated_at
+            "SELECT uid_validity, last_seen_uid, min_seen_uid, gap_examined_min_uid, gap_examined_max_uid, updated_at
              FROM folder_sync_state
              WHERE pubkey = ? AND folder_name = ?",
         )?;
@@ -2237,17 +2386,26 @@ impl Database {
         if let Some(row) = rows.next()? {
             let uid_validity: i64 = row.get(0)?;
             let last_seen_uid: i64 = row.get(1)?;
+            let min_seen_uid: Option<i64> = row.get(2)?;
+            let gap_examined_min_uid: Option<i64> = row.get(3)?;
+            let gap_examined_max_uid: Option<i64> = row.get(4)?;
             Ok(Some(FolderSyncState {
                 uid_validity: uid_validity as u32,
                 last_seen_uid: last_seen_uid as u32,
-                updated_at: row.get(2)?,
+                min_seen_uid: min_seen_uid.map(|v| v as u32),
+                gap_examined_min_uid: gap_examined_min_uid.map(|v| v as u32),
+                gap_examined_max_uid: gap_examined_max_uid.map(|v| v as u32),
+                updated_at: row.get(5)?,
             }))
         } else {
             Ok(None)
         }
     }
 
-    /// Upsert the UID-based sync watermark for one (account, folder).
+    /// Upsert the forward watermark (uid_validity, last_seen_uid) for one
+    /// (account, folder). Does NOT touch `min_seen_uid` — that's owned by
+    /// `set_folder_min_seen_uid`, since it only changes on bootstrap or
+    /// during a backward (fetch-older) pull.
     pub fn set_folder_sync_state(
         &self,
         pubkey: &str,
@@ -2263,13 +2421,84 @@ impl Database {
              ON CONFLICT(pubkey, folder_name) DO UPDATE SET
                  uid_validity = excluded.uid_validity,
                  last_seen_uid = excluded.last_seen_uid,
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at,
+                 -- A UIDVALIDITY change renumbers messages, so previously
+                 -- examined UIDs are meaningless: clear the gap-fill range.
+                 -- Same uid_validity preserves it.
+                 gap_examined_min_uid = CASE WHEN folder_sync_state.uid_validity <> excluded.uid_validity
+                     THEN NULL ELSE folder_sync_state.gap_examined_min_uid END,
+                 gap_examined_max_uid = CASE WHEN folder_sync_state.uid_validity <> excluded.uid_validity
+                     THEN NULL ELSE folder_sync_state.gap_examined_max_uid END",
             params![
                 pubkey.trim().to_lowercase(),
                 folder,
                 uid_validity as i64,
                 last_seen_uid as i64,
                 now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record the contiguous UID range gap-fill has examined for one (account,
+    /// folder), under `uid_validity`. Stored as [min(existing, lo), max(existing,
+    /// hi)] so the range only grows (matching the always-growing [floor,
+    /// last_seen] scan window). No-op unless the row exists and its stored
+    /// uid_validity still matches — guards against a UIDVALIDITY change between
+    /// the gap-fill scan and this post-persist commit.
+    pub fn set_folder_gap_examined(
+        &self,
+        pubkey: &str,
+        folder: &str,
+        uid_validity: u32,
+        lo: u32,
+        hi: u32,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "UPDATE folder_sync_state
+             SET gap_examined_min_uid = MIN(COALESCE(gap_examined_min_uid, ?), ?),
+                 gap_examined_max_uid = MAX(COALESCE(gap_examined_max_uid, ?), ?),
+                 updated_at = ?
+             WHERE pubkey = ? AND folder_name = ? AND uid_validity = ?",
+            params![
+                lo as i64,
+                lo as i64,
+                hi as i64,
+                hi as i64,
+                now,
+                pubkey.trim().to_lowercase(),
+                folder,
+                uid_validity as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Lower `min_seen_uid` for one (account, folder). Only writes if the row
+    /// exists (a forward sync should have created it) and the new value is
+    /// strictly smaller than the current value — or the current value is NULL.
+    /// Backward-only: never raises the floor.
+    pub fn set_folder_min_seen_uid(
+        &self,
+        pubkey: &str,
+        folder: &str,
+        new_min: u32,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "UPDATE folder_sync_state
+             SET min_seen_uid = ?, updated_at = ?
+             WHERE pubkey = ? AND folder_name = ?
+               AND (min_seen_uid IS NULL OR min_seen_uid > ?)",
+            params![
+                new_min as i64,
+                now,
+                pubkey.trim().to_lowercase(),
+                folder,
+                new_min as i64,
             ],
         )?;
         Ok(())
@@ -2307,16 +2536,48 @@ impl Database {
             )?;
             id
         } else {
-            let _id = conn.execute(
-                "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash, email_message_id, received_from_relay)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
-                    dm.created_at, dm.received_at, content_hash, dm.email_message_id,
-                    dm.received_from_relay
-                ],
-            )?;
-            conn.last_insert_rowid()
+            // Logical-key dedup, not just UNIQUE(event_id). Two NIP-17 wraps of
+            // the same rumor — another relay's copy, the sender's
+            // self-wrap+recipient-wrap pair, an ephemeral-key re-wrap — share
+            // (sender, recipient, created_at, content) but carry different outer
+            // event_ids. Worse, across the rumor-id upgrade a *legacy* row holds
+            // the old outer-wrap id while new deliveries compute the inner rumor
+            // id, so the two never collide on event_id and re-duplicate on every
+            // re-delivery. Collapse on the content-addressed logical key here,
+            // mirroring migrate_collapse_dm_rumor_duplicates, so upgraded users
+            // stop accumulating dups between restarts.
+            let existing_id: Option<i64> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM direct_messages
+                     WHERE sender_pubkey = ? AND recipient_pubkey = ?
+                       AND created_at = ? AND COALESCE(content_hash, '') = ?
+                     ORDER BY received_at, id LIMIT 1"
+                )?;
+                let mut rows = stmt.query(params![
+                    dm.sender_pubkey, dm.recipient_pubkey, dm.created_at, content_hash
+                ])?;
+                match rows.next()? {
+                    Some(row) => Some(row.get(0)?),
+                    None => None,
+                }
+            };
+
+            if let Some(id) = existing_id {
+                // Already have this rumor under another wrap/event_id. Skip the
+                // insert and keep the existing row.
+                id
+            } else {
+                conn.execute(
+                    "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash, email_message_id, received_from_relay)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        dm.event_id, dm.sender_pubkey, dm.recipient_pubkey, dm.content,
+                        dm.created_at, dm.received_at, content_hash, dm.email_message_id,
+                        dm.received_from_relay
+                    ],
+                )?;
+                conn.last_insert_rowid()
+            }
         };
         
         // Update conversation metadata for both sender and recipient
@@ -2334,14 +2595,25 @@ impl Database {
         let mut conversations_to_update = std::collections::HashSet::new();
         
         for dm in dms {
-            // Check if this event_id already exists
-            let mut stmt = conn.prepare("SELECT 1 FROM direct_messages WHERE event_id = ? LIMIT 1")?;
-            let mut rows = stmt.query(params![dm.event_id])?;
+            // Compute hash for DM content
+            let content_hash = Self::compute_content_hash(&dm.content);
+            // Dedup on the content-addressed logical key, not just event_id:
+            // legacy outer-wrap ids and new inner-rumor ids never collide, so an
+            // event_id-only check lets the same rumor in twice. See save_dm.
+            let mut stmt = conn.prepare(
+                "SELECT 1 FROM direct_messages
+                 WHERE event_id = ?
+                    OR (sender_pubkey = ? AND recipient_pubkey = ?
+                        AND created_at = ? AND COALESCE(content_hash, '') = ?)
+                 LIMIT 1"
+            )?;
+            let mut rows = stmt.query(params![
+                dm.event_id,
+                dm.sender_pubkey, dm.recipient_pubkey, dm.created_at, content_hash
+            ])?;
             if rows.next()?.is_some() {
                 continue; // Skip if already exists
             }
-            // Compute hash for DM content
-            let content_hash = Self::compute_content_hash(&dm.content);
             conn.execute(
                 "INSERT INTO direct_messages (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash, email_message_id, received_from_relay)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2390,6 +2662,136 @@ impl Database {
         })?;
 
         rows.collect()
+    }
+
+    /// Paginated fetch of a conversation, newest-first internally but returned
+    /// oldest→newest (ASC) so callers can append a page directly.
+    ///
+    /// Fetches at most `limit` messages. When `before` is `Some((created_at, id))`
+    /// only messages strictly older than that cursor are returned — the cursor is
+    /// the oldest message currently held by the caller. The `(created_at, id)` pair
+    /// is used as a compound key so messages sharing a `created_at` (second-
+    /// granularity) page cleanly without gaps or duplicates.
+    pub fn get_dms_for_conversation_page(
+        &self,
+        user_pubkey: &str,
+        contact_pubkey: &str,
+        limit: i64,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<DirectMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<DirectMessage> {
+            Ok(DirectMessage {
+                id: Some(row.get(0)?),
+                event_id: row.get(1)?,
+                sender_pubkey: row.get(2)?,
+                recipient_pubkey: row.get(3)?,
+                content: row.get(4)?,
+                created_at: row.get(5)?,
+                received_at: row.get(6)?,
+                email_message_id: row.get(7)?,
+                received_from_relay: row.get(8)?,
+            })
+        };
+
+        let mut messages: Vec<DirectMessage> = match before {
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, email_message_id, received_from_relay
+                     FROM direct_messages
+                     WHERE (sender_pubkey = ?1 AND recipient_pubkey = ?2) OR (sender_pubkey = ?2 AND recipient_pubkey = ?1)
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?3"
+                )?;
+                let rows = stmt.query_map(params![user_pubkey, contact_pubkey, limit], map_row)?;
+                rows.collect::<Result<Vec<_>>>()?
+            }
+            Some((cursor_created_at, cursor_id)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, email_message_id, received_from_relay
+                     FROM direct_messages
+                     WHERE ((sender_pubkey = ?1 AND recipient_pubkey = ?2) OR (sender_pubkey = ?2 AND recipient_pubkey = ?1))
+                       AND (created_at < ?3 OR (created_at = ?3 AND id < ?4))
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?5"
+                )?;
+                let rows = stmt.query_map(
+                    params![user_pubkey, contact_pubkey, cursor_created_at, cursor_id, limit],
+                    map_row,
+                )?;
+                rows.collect::<Result<Vec<_>>>()?
+            }
+        };
+
+        // Query is newest-first for the LIMIT to grab the most recent page;
+        // flip to chronological order for rendering.
+        messages.reverse();
+        Ok(messages)
+    }
+
+    /// One row per contact: the latest message (still encrypted) and a total
+    /// message count, ordered most-recent-conversation first. Lets the contact
+    /// list render without fetching+decrypting entire conversations.
+    pub fn get_dm_conversation_previews(&self, user_pubkey: &str) -> Result<Vec<DmConversationPreview>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT contact_pubkey, event_id, content, created_at, msg_count FROM (
+               SELECT
+                 CASE WHEN sender_pubkey = ?1 THEN recipient_pubkey ELSE sender_pubkey END AS contact_pubkey,
+                 event_id, content, created_at, id,
+                 COUNT(*) OVER (
+                   PARTITION BY CASE WHEN sender_pubkey = ?1 THEN recipient_pubkey ELSE sender_pubkey END
+                 ) AS msg_count,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY CASE WHEN sender_pubkey = ?1 THEN recipient_pubkey ELSE sender_pubkey END
+                   ORDER BY created_at DESC, id DESC
+                 ) AS rn
+               FROM direct_messages
+               WHERE sender_pubkey = ?1 OR recipient_pubkey = ?1
+             )
+             WHERE rn = 1 AND contact_pubkey != ''
+             ORDER BY created_at DESC"
+        )?;
+        let rows = stmt.query_map(params![user_pubkey], |row| {
+            Ok(DmConversationPreview {
+                contact_pubkey: row.get(0)?,
+                last_event_id: row.get(1)?,
+                last_content: row.get(2)?,
+                last_created_at: row.get(3)?,
+                message_count: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Contacts whose conversation contains at least one DM that matches a stored
+    /// email. Mirrors `db_check_dm_matches_email_encrypted`: a match is either a
+    /// NIP-17 message-id link (dm.email_message_id ↔ emails.message_id) or the
+    /// content-hash fallback (dm.content_hash ↔ emails.subject_hash). Computed in
+    /// one query so the contact list doesn't probe every message individually.
+    pub fn get_dm_pubkeys_with_email_match(&self, user_pubkey: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT contact_pubkey FROM (
+               SELECT CASE WHEN dm.sender_pubkey = ?1 THEN dm.recipient_pubkey ELSE dm.sender_pubkey END AS contact_pubkey
+               FROM direct_messages dm
+               WHERE (dm.sender_pubkey = ?1 OR dm.recipient_pubkey = ?1)
+                 AND (
+                   (dm.email_message_id IS NOT NULL AND dm.email_message_id != ''
+                    AND EXISTS (SELECT 1 FROM emails e WHERE e.message_id = dm.email_message_id))
+                   OR
+                   (dm.content_hash IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM emails e WHERE e.subject_hash = dm.content_hash AND e.is_nostr_encrypted = 1))
+                 )
+             )
+             WHERE contact_pubkey != ''"
+        )?;
+        let rows = stmt.query_map(params![user_pubkey], |row| row.get(0))?;
+        let mut pubkeys = Vec::new();
+        for row in rows {
+            pubkeys.push(row?);
+        }
+        Ok(pubkeys)
     }
 
     // Returns the latest created_at timestamp from direct_messages, or None if no messages exist
@@ -2578,6 +2980,164 @@ impl Database {
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
+    }
+
+    /// Batched version of the single-event DM↔email match check.
+    /// Returns a map from event_id -> has_match. Mirrors the semantics of
+    /// `db_check_dm_matches_email_encrypted`: prefer the NIP-17 message-id
+    /// rumor-tag exact link, fall back to subject_hash matching.
+    /// Holds the DB lock once and issues at most three SQL statements
+    /// regardless of how many event_ids are passed in.
+    pub fn check_dms_match_email_encrypted_batch(
+        &self,
+        event_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        use std::collections::HashMap;
+
+        let mut result: HashMap<String, bool> = HashMap::new();
+        if event_ids.is_empty() {
+            return Ok(result);
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // 1. Pull all (event_id, email_message_id, content_hash, content) rows for the
+        //    requested DMs in one query.
+        struct DmRow {
+            event_id: String,
+            email_message_id: Option<String>,
+            content_hash: Option<String>,
+            content: String,
+        }
+        let placeholders = event_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT event_id, email_message_id, content_hash, content
+             FROM direct_messages WHERE event_id IN ({})",
+            placeholders
+        );
+        let params: Vec<Box<dyn rusqlite::ToSql>> = event_ids
+            .iter()
+            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        let rows: Vec<DmRow> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let iter = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(DmRow {
+                    event_id: row.get(0)?,
+                    email_message_id: row.get(1)?,
+                    content_hash: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in iter {
+                out.push(r?);
+            }
+            out
+        };
+
+        // 2. Compute and persist any missing content_hashes so subject_hash matching
+        //    can run uniformly below (mirrors the lazy-fill in the single-event path).
+        let mut filled_hash: HashMap<String, String> = HashMap::new();
+        for row in &rows {
+            if row.content_hash.is_none() {
+                let hash = Self::compute_content_hash(&row.content);
+                conn.execute(
+                    "UPDATE direct_messages SET content_hash = ? WHERE event_id = ?",
+                    params![hash, row.event_id],
+                )?;
+                filled_hash.insert(row.event_id.clone(), hash);
+            }
+        }
+
+        for row in &rows {
+            result.entry(row.event_id.clone()).or_insert(false);
+        }
+        for ev in event_ids {
+            result.entry(ev.clone()).or_insert(false);
+        }
+
+        // 3. Pass 1 — NIP-17 message-id matches.
+        let mut mid_to_events: HashMap<String, Vec<String>> = HashMap::new();
+        for row in &rows {
+            if let Some(mid) = &row.email_message_id {
+                if !mid.is_empty() {
+                    let normalized = Self::normalize_message_id(mid);
+                    mid_to_events.entry(normalized).or_default().push(row.event_id.clone());
+                }
+            }
+        }
+        if !mid_to_events.is_empty() {
+            let mids: Vec<&String> = mid_to_events.keys().collect();
+            let placeholders = mids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) AS normalized_id
+                 FROM emails
+                 WHERE TRIM(REPLACE(REPLACE(message_id, '<', ''), '>', '')) IN ({})
+                   AND is_nostr_encrypted = 1",
+                placeholders
+            );
+            let mid_params: Vec<Box<dyn rusqlite::ToSql>> = mids
+                .iter()
+                .map(|s| Box::new((*s).clone()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let iter = stmt.query_map(rusqlite::params_from_iter(mid_params.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for r in iter {
+                if let Ok(mid) = r {
+                    if let Some(evs) = mid_to_events.get(&mid) {
+                        for ev in evs {
+                            result.insert(ev.clone(), true);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Pass 2 — subject_hash fallback for any DMs not yet matched.
+        let mut hash_to_events: HashMap<String, Vec<String>> = HashMap::new();
+        for row in &rows {
+            if result.get(&row.event_id).copied().unwrap_or(false) {
+                continue;
+            }
+            let hash = row
+                .content_hash
+                .clone()
+                .or_else(|| filled_hash.get(&row.event_id).cloned());
+            if let Some(hash) = hash {
+                hash_to_events.entry(hash).or_default().push(row.event_id.clone());
+            }
+        }
+        if !hash_to_events.is_empty() {
+            let hashes: Vec<&String> = hash_to_events.keys().collect();
+            let placeholders = hashes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT subject_hash FROM emails
+                 WHERE subject_hash IN ({}) AND is_nostr_encrypted = 1",
+                placeholders
+            );
+            let hash_params: Vec<Box<dyn rusqlite::ToSql>> = hashes
+                .iter()
+                .map(|s| Box::new((*s).clone()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let iter = stmt.query_map(rusqlite::params_from_iter(hash_params.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for r in iter {
+                if let Ok(h) = r {
+                    if let Some(evs) = hash_to_events.get(&h) {
+                        for ev in evs {
+                            result.insert(ev.clone(), true);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     pub fn get_email_by_id(&self, id: i64) -> Result<Option<Email>> {
@@ -4541,17 +5101,114 @@ mod tests {
     #[test]
     fn test_save_dm_batch() {
         let (db, _dir) = create_test_db();
-        let dms = vec![
-            make_dm("batch_ev1", "alice", "bob"),
-            make_dm("batch_ev2", "alice", "bob"),
-            make_dm("batch_ev3", "bob", "alice"),
-        ];
+        // Distinct content per row: two messages sharing sender, recipient,
+        // created_at and content are the same content-addressed rumor, so the
+        // dedup would (correctly) collapse them. Give each a unique body.
+        let mut a = make_dm("batch_ev1", "alice", "bob");
+        a.content = "first".to_string();
+        let mut b = make_dm("batch_ev2", "alice", "bob");
+        b.content = "second".to_string();
+        let mut c = make_dm("batch_ev3", "bob", "alice");
+        c.content = "third".to_string();
+        let dms = vec![a, b, c];
         let inserted = db.save_dm_batch(&dms).unwrap();
         assert_eq!(inserted, 3);
 
         // Inserting the same batch again should skip all (idempotent)
         let inserted_again = db.save_dm_batch(&dms).unwrap();
         assert_eq!(inserted_again, 0);
+    }
+
+    #[test]
+    fn test_save_dm_dedups_legacy_outer_id_vs_rumor_id() {
+        // Reproduces the upgrade scenario: a legacy row stored under the old
+        // outer-wrap event_id, then the same rumor re-delivered under the new
+        // inner-rumor event_id. They never collide on event_id, so without
+        // logical-key dedup the second insert would create a duplicate row.
+        let (db, _dir) = create_test_db();
+        let when = Utc::now();
+
+        let legacy = DirectMessage {
+            id: None,
+            event_id: "outer_wrap_id".to_string(),
+            sender_pubkey: "alice".to_string(),
+            recipient_pubkey: "bob".to_string(),
+            content: "Re: testing attachment".to_string(),
+            created_at: when,
+            received_at: when,
+            email_message_id: None,
+            received_from_relay: None,
+        };
+        let id1 = db.save_dm(&legacy).unwrap();
+
+        // Same rumor, different (content-addressed) event_id, arriving later.
+        let rewrap = DirectMessage {
+            id: None,
+            event_id: "inner_rumor_id".to_string(),
+            received_at: when + chrono::Duration::minutes(15),
+            received_from_relay: Some("wss://relay.primal.net".to_string()),
+            ..legacy.clone()
+        };
+        let id2 = db.save_dm(&rewrap).unwrap();
+
+        // No new row; the existing legacy row is returned and kept.
+        assert_eq!(id2, id1);
+        let count: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM direct_messages WHERE sender_pubkey = 'alice' AND recipient_pubkey = 'bob'",
+                [],
+                |r| r.get(0),
+            ).unwrap()
+        };
+        assert_eq!(count, 1);
+
+        // A genuinely different message (different content) still inserts.
+        let other = DirectMessage {
+            id: None,
+            event_id: "another_rumor".to_string(),
+            content: "different body".to_string(),
+            ..legacy.clone()
+        };
+        let id3 = db.save_dm(&other).unwrap();
+        assert_ne!(id3, id1);
+    }
+
+    #[test]
+    fn test_migrate_collapse_dm_rumor_duplicates() {
+        let (db, _dir) = create_test_db();
+        let conn = db.conn.lock().unwrap();
+
+        let base = Utc::now();
+        // Two DMs that share the same logical key (sender, recipient, created_at,
+        // content) but have different event_ids — what two NIP-17 wraps of one
+        // rumor look like on disk under the old dedup scheme.
+        conn.execute(
+            "INSERT INTO direct_messages
+                (event_id, sender_pubkey, recipient_pubkey, content, created_at, received_at, content_hash)
+             VALUES
+                ('wrap_outer_A', 'alice', 'bob', 'hi', ?, ?, 'h1'),
+                ('wrap_outer_B', 'alice', 'bob', 'hi', ?, ?, 'h1'),
+                ('unrelated',    'carol', 'dave', 'yo', ?, ?, 'h2')",
+            params![base, base, base, base + chrono::Duration::seconds(30), base, base],
+        ).unwrap();
+        drop(conn);
+
+        // The migration is private; reach it via re-running init_tables-style
+        // call by invoking the function directly through a fresh lock.
+        let conn = db.conn.lock().unwrap();
+        Database::migrate_collapse_dm_rumor_duplicates(&conn).unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT event_id FROM direct_messages ORDER BY event_id"
+        ).unwrap();
+        let remaining: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Keeper has the smaller received_at (wrap_outer_A); B is collapsed.
+        assert_eq!(remaining, vec!["unrelated".to_string(), "wrap_outer_A".to_string()]);
     }
 
     #[test]
@@ -5284,6 +5941,111 @@ mod tests {
 
         // Clearing a non-existent row is a no-op.
         db.clear_folder_sync_state("alice@example.com", "INBOX").unwrap();
+    }
+
+    #[test]
+    fn test_folder_min_seen_uid_starts_null() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, None);
+    }
+
+    #[test]
+    fn test_folder_min_seen_uid_only_lowers() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+
+        // Initial: NULL -> 50 succeeds.
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 50).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, Some(50));
+
+        // 30 < 50: lowers.
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 30).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, Some(30));
+
+        // 40 > 30: no-op (floor stays at 30).
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 40).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.min_seen_uid, Some(30));
+    }
+
+    #[test]
+    fn test_folder_min_seen_uid_requires_existing_row() {
+        let (db, _dir) = create_test_db();
+        // No row yet. set_folder_min_seen_uid is UPDATE-only — silent no-op.
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 50).unwrap();
+        assert!(db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_folder_sync_state_preserves_min_on_forward_update() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+        db.set_folder_min_seen_uid("alice@example.com", "INBOX", 25).unwrap();
+
+        // Forward sync advances last_seen_uid but should not touch min_seen_uid.
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 200).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.last_seen_uid, 200);
+        assert_eq!(got.min_seen_uid, Some(25));
+    }
+
+    #[test]
+    fn test_folder_gap_examined_records_and_only_grows() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+
+        // Unset on a fresh row.
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, None);
+        assert_eq!(got.gap_examined_max_uid, None);
+
+        // First recorded window.
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 1, 30, 80).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, Some(30));
+        assert_eq!(got.gap_examined_max_uid, Some(80));
+
+        // A wider window grows the range in both directions.
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 1, 20, 100).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, Some(20));
+        assert_eq!(got.gap_examined_max_uid, Some(100));
+
+        // A narrower window never shrinks it.
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 1, 50, 60).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, Some(20));
+        assert_eq!(got.gap_examined_max_uid, Some(100));
+    }
+
+    #[test]
+    fn test_folder_gap_examined_reset_on_uidvalidity_change() {
+        let (db, _dir) = create_test_db();
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 100).unwrap();
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 1, 20, 100).unwrap();
+
+        // Forward sync with the SAME uid_validity preserves the examined range.
+        db.set_folder_sync_state("alice@example.com", "INBOX", 1, 150).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, Some(20));
+        assert_eq!(got.gap_examined_max_uid, Some(100));
+
+        // A UIDVALIDITY change clears it — the old UIDs are meaningless now.
+        db.set_folder_sync_state("alice@example.com", "INBOX", 2, 10).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, None);
+        assert_eq!(got.gap_examined_max_uid, None);
+
+        // set_folder_gap_examined is a no-op when the passed uid_validity does
+        // not match the stored row (guards against a mid-flight change).
+        db.set_folder_gap_examined("alice@example.com", "INBOX", 99, 5, 9).unwrap();
+        let got = db.get_folder_sync_state("alice@example.com", "INBOX").unwrap().unwrap();
+        assert_eq!(got.gap_examined_min_uid, None);
+        assert_eq!(got.gap_examined_max_uid, None);
     }
 
     // =====================

@@ -1,3 +1,116 @@
+# Release Notes - v1.0.8
+
+## Overview
+
+v1.0.8 is a large performance, sync, and security release. The IMAP layer was rebuilt around a warm connection pool with IDLE push and aggressive timeouts, inbox history now syncs by message count instead of a fragile date cutoff, and the decrypt/render path was parallelized and cached so threads paint progressively instead of blocking on a full batch. Alongside the speedups, private keys and email passwords no longer touch the frontend at all, spam handling became provider-aware, and a class of IMAP parser crashes on refresh was fixed.
+
+## What's New
+
+### ⚡ Faster, More Reliable IMAP Sync
+- New IMAP connection pool with per-operation timeouts and **IDLE push** for near-instant new-mail delivery on the active account
+- Inbox history now syncs by **message count** (`sync_initial_count` / `sync_max_scan`, configurable per folder) instead of a date cutoff that silently clipped older mail
+- Backward UID pagination ("fetch older") with **infinite scroll** replaces the old Load More buttons on inbox and sent
+- Scroll and bootstrap windows are prefiltered **server-side** instead of fetching every message body, and date-fetch on scroll was cut to a single UID
+- Gap-fill now examines each UID once and watermarks it, instead of rescanning the whole inbox on every refresh; the **Refresh** button fills gaps and tab switches auto-sync new mail
+- Multiple IMAP folders can be selected for inbox refresh, with provider-aware default folders
+
+### 🚀 Faster Decryption & Rendering
+- Thread email decryption is **parallelized**; inbox, sent, and thread cards render **progressively** as each message finishes instead of waiting for the whole batch
+- Process-wide caches for glossia detect/decode, armor parsing, and subject decode; eager glossia decode skipped for NIP-44
+- Attachments lazy-load with an `attachment_count` badge rather than being fetched up front
+- Glossia submodule bumped for a cached wordlist tree, speeding up DM and email decoding
+- "Decrypting…" placeholders and skeleton rows show on encrypted content until decryption completes
+
+### 🗂️ Smarter Spam & Folder Handling
+- Provider-aware default inbox folders; `*spam*`/`*junk*`/`*bulk*` folders auto-discovered and kept **out of** the main inbox
+- Automated **spam rescue** for nostr mail, gated on transport auth and using `\Seen` as intent
+- New **"Move to folder"** action for inbox emails and in the conversation view, with robust server-truth folder moves
+- **"Auto-file Nostr Mail"** setting (default **off**, opt-in), scoped to INBOX only
+- Read state now syncs with the IMAP `\Seen` flag in both directions
+
+### 📎 Attachments
+- Fixed Android attachment downloads; added **Download** and **Share** buttons
+- Fixed inbox attachment download for self-authored mail
+- Attachments render inline inside thread/conversation cards
+
+## What's Fixed
+
+### 🐛 IMAP Parser Desync Crash
+- Fixed a parser desync that could crash the app on inbox refresh
+- Fixed `gap_fill` treating the entire non-nostr inbox as recoverable gaps
+- `require_signature` drops are now recoverable when the setting is toggled off
+
+### 🔒 Security Hardening
+- Private keys are **no longer persisted to the frontend** — they live only in the OS-native keychain
+- Email passwords are **no longer written to `localStorage`**
+- Removed private-key QR logging; revealing the private-key QR now requires explicit confirmation
+- Verbose `[RUST]` / `[RUST-PERF]` and `get_email` logging gated behind `NOSTR_MAIL_DEBUG`
+
+### 💬 Direct Messages
+- NIP-17 DMs deduplicated by rumor id, with legacy duplicates collapsed and content-addressed dedup at insert time
+- Conversation loading paginated with lighter contact-list previews
+
+### 🎨 UI
+- Sidebar shows the **real bundle version** instead of a hardcoded string
+- "Unsigned" badge for messages with no signature; clearer "Require Signatures" / "Hide Unverified" help text
+- Tom Select-based folder multiselect with palette-matched pills
+- Dropped redundant email labels for known contacts in conversation cards
+
+### 🛠️ Build & CI
+- Staging pushes build all platforms; concurrency groups cancel superseded runs
+- Android build scoped to the `android` branch and release tags; fixed Android build for imap 3.x
+
+## Upgrade Notes
+
+- The new count-based sync supersedes the old date cutoff. If older mail was previously clipped, it becomes reachable again via infinite scroll / Refresh on this version
+- "Auto-file Nostr Mail" defaults to **off** — enable it in settings if you want nostr mail filed automatically
+- Existing installs keep their database on upgrade (Android `-r` reinstall / desktop in-place update)
+
+---
+
+# Release Notes - v1.0.7
+
+## Overview
+
+v1.0.7 hardens **identity & decryption** in the email pipeline, brings the **Android build pipeline back to green**, expands the **integration test surface**, and continues mobile UX polish. Signed-email identity is now anchored to a Nostr pubkey rather than the `From:` header, and decryption no longer depends on relay lookups for sent-folder messages.
+
+## What's New
+
+### 🔐 Identity & Encryption
+- **Pubkey-bound identity** – signed emails are now bound to the Nostr pubkey, not the `From:` header, eliminating spoofing via header rewrites
+- **Relay-free decryption anchor** – new `X-Nostr-Recipient` header lets the client decrypt sent-folder copies without round-tripping a relay
+- **Signature header toggles** – `X-Nostr-Pubkey` / `X-Nostr-Sig` headers can be enabled/disabled independently; header signing restored
+- **DM ↔ email anchoring** fixed for NIP-04, and avatars locked to pubkey so identity is consistent across both surfaces
+- **Removed brittle email-address → pubkey resolution** in favor of DM-anchored retrofit
+
+### 📱 Mobile & UX Polish
+- **Per-pubkey settings scope** – switching keys now correctly swaps the active settings profile
+- **Inbox folder picker moved to Settings** for a cleaner detail view
+- **Tightened mobile layout** for Settings and email views
+- **Sent-side body rendering** fixed (thread `bodyId` is now scoped by source)
+- Delete-UX repositioned for better one-handed use
+
+### 🤖 Android
+- **CI restored** – fixed `--apk` flag usage for tauri-cli 2.11 and bumped CI to tauri-cli **2.11.1** for `debugApplicationIdSuffix` support
+- **Debug & release builds coexist** in separate sandboxes, no more reinstall conflicts
+- Stopped tracking the generated Android frontend assets snapshot – regenerated at build time
+- Non-Android CI jobs skipped on the `android` branch
+
+### 🧪 Tests
+- New `email_integration.rs` suite covering the full email pipeline
+- Headless integration test for the default-settings email pipeline
+- NIP-04, multipart, and non-ASCII subject coverage + dedicated `backend-tests` CI workflow
+- Glossia-body and in-body `SIGNATURE` block roundtrip tests
+- Sent-folder decryption via `X-Nostr-Recipient` header
+- Reply-quoting preserves nested signatures + encryption
+- Raw `bitpack_fixed` decoder + signature/threading tests
+
+### 🧹 Cleanup
+- Removed the legacy `bip39-encode/` crate (subsumed by glossia)
+- Dropped tracked generated Android assets
+
+---
+
 # Release Notes - v1.0.6
 
 ## Overview

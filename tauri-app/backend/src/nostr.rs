@@ -905,7 +905,7 @@ pub async fn fetch_conversations(
             
             let decrypted_content = match decrypt_dm_content(private_key, sender_pubkey, &event.content) {
                 Ok(content) => {
-                    println!("[NOSTR] Successfully decrypted message: {}", content);
+                    crate::debug_log!("[NOSTR] Successfully decrypted message: {}", content);
                     content
                 },
                 Err(e) => {
@@ -1011,12 +1011,12 @@ pub async fn fetch_conversation_messages(
         
         println!("[NOSTR] Attempting to decrypt conversation message from {} to {}", 
             sender_pubkey, keys.public_key().to_bech32().unwrap_or_default());
-        println!("[NOSTR] Encrypted content: {}", &event.content[..event.content.len().min(100)]);
-        println!("[NOSTR] Content length: {}, starts with: {}", event.content.len(), &event.content[..event.content.len().min(10)]);
-        
+        crate::debug_log!("[NOSTR] Encrypted content: {}", &event.content[..event.content.len().min(100)]);
+        crate::debug_log!("[NOSTR] Content length: {}, starts with: {}", event.content.len(), &event.content[..event.content.len().min(10)]);
+
         let decrypted_content = match decrypt_dm_content(private_key, sender_pubkey, &event.content) {
             Ok(content) => {
-                println!("[NOSTR] Successfully decrypted conversation message: {}", content);
+                crate::debug_log!("[NOSTR] Successfully decrypted conversation message: {}", content);
                 content
             },
             Err(e) => {

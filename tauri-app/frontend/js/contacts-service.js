@@ -2382,9 +2382,8 @@ class ContactsService {
                 window.notificationService.hideLoading(loadingNotification);
                 if (unfollowedPubkeys.length > 0) {
                     window.notificationService.showInfo(`${unfollowedPubkeys.length} contacts converted to private (no longer in public follow list)`);
-                } else {
-                    window.notificationService.showInfo('No new contacts found in your follow list');
                 }
+                // No toast when there are simply no new contacts to add (issue #62).
             }
         } catch (error) {
             console.error('Failed to load contacts from network:', error);
@@ -2661,7 +2660,7 @@ class ContactsService {
                 }
                 
                 // Update contact detail if this contact is currently selected
-                const selectedContact = this.getSelectedContact();
+                const selectedContact = window.appState.getSelectedContact();
                 if (selectedContact && selectedContact.pubkey === pubkey) {
                     this.renderContactDetail(contact);
                 }

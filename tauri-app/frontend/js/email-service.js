@@ -40,6 +40,25 @@ class EmailService {
         this.sentSearchOffset = 0; // Track pagination offset for sent search results
         this.searchHasMore = false; // Track if there are more search results
         this.sentSearchHasMore = false; // Track if there are more sent search results
+        // Infinite scroll state. `hasMoreInDb` is true when the last DB page was
+        // full (so another DB fetch is worth trying). `loadingMore` is a
+        // re-entrancy guard for the scroll handler. `serverFetchTried` flips
+        // true after we've hit the server once for the current exhaustion;
+        // it resets when the server returns new rows or on a fresh refresh.
+        this.inboxHasMoreInDb = true;
+        this.inboxLoadingMore = false;
+        this.inboxServerFetchTried = false;
+        this.sentHasMoreInDb = true;
+        this.sentLoadingMore = false;
+        this.sentServerFetchTried = false;
+        this._infiniteScrollInited = false;
+        // Auto-sync bookkeeping. `_lastInboxSyncAt` / `_lastSentSyncAt` are
+        // refreshed after any successful sync (auto or manual) so the
+        // tab-switch auto-sync backs off when the user just refreshed.
+        this._lastInboxSyncAt = 0;
+        this._lastSentSyncAt = 0;
+        this._inboxAutoSyncInFlight = false;
+        this._sentAutoSyncInFlight = false;
         this._htmlBody = null; // HTML alternative body for multipart emails
         this._plainBody = null; // BIP39-armored plaintext body for text/plain MIME part
         this._quotedOriginalArmor = null; // Original message armor to append as quote in replies
@@ -195,7 +214,11 @@ class EmailService {
         const from = Utils.escapeHtml(senderInfo.fromAddress);
         const unknownBadge = this._renderUnknownContactBadge(senderInfo);
         if (senderInfo.hasSignature) {
-            const showSecondary = senderInfo.fromAddress
+            // For known contacts show only the nostr identity name — not the email
+            // address (issue #62). Unknown signers still surface the From: address,
+            // but there identityName already equals fromAddress so nothing is duplicated.
+            const showSecondary = !senderInfo.contact
+                && senderInfo.fromAddress
                 && senderInfo.identityName !== senderInfo.fromAddress;
             const secondary = showSecondary
                 ? ` <span class="email-sender-secondary">&lt;${from}&gt;</span>`
@@ -236,6 +259,91 @@ class EmailService {
         const pk = Utils.escapeHtml(senderInfo.senderPubkey);
         const npub = Utils.escapeHtml(this._pubkeyToNpub(senderInfo.senderPubkey));
         return `<div class="email-header-row"><span class="email-header-label">Profile:</span> <span class="email-header-value email-profile-npub"><code>${npub}</code><button type="button" class="view-profile-chip view-profile-btn" data-pubkey="${pk}" title="View Nostr profile"><i class="fas fa-id-badge"></i> View Profile</button></span></div>`;
+    }
+
+    // Build the per-card attachments HTML for a message inside the thread view.
+    // Returns an empty string when the message has no attachments. Resolves opaque
+    // .dat filenames back to their original names via the manifest metadata when
+    // available (passed in by the caller from the decrypt result). Uses the
+    // existing inbox/sent download routines based on `source`.
+    async _buildThreadCardAttachmentsHtml(email, manifestAttachments, source) {
+        const emailIdInt = parseInt(email.id);
+        if (isNaN(emailIdInt)) return '';
+        let attachments;
+        try {
+            attachments = await TauriService.getAttachmentsForEmail(emailIdInt);
+        } catch (e) {
+            console.warn(`[JS] Thread card attachment fetch failed for email ${email.id}:`, e);
+            return '';
+        }
+        if (!attachments || attachments.length === 0) return '';
+
+        const byOpaqueId = (manifestAttachments && manifestAttachments.length > 0)
+            ? new Map(manifestAttachments.map(a => [a.id || a.opaqueId, a]))
+            : null;
+
+        const items = attachments.map(att => {
+            const opaqueId = (att.filename || '').replace(/\.dat$/, '');
+            const manifest = byOpaqueId ? byOpaqueId.get(opaqueId) : null;
+            const displayName = (manifest && (manifest.origFilename || manifest.orig_filename)) || att.filename;
+            const displaySize = (manifest && (manifest.origSize || manifest.orig_size)) || att.size;
+            return { att, displayName, displaySize };
+        });
+
+        const isSent = source === 'sent';
+        const isMobile = this._isMobilePlatform();
+        const downloadAllFn = isSent ? 'downloadAllSentAttachments' : 'downloadAllInboxAttachments';
+        const itemsHtml = items.map(({ att, displayName, displaySize }) => {
+            const sizeFormatted = (displaySize / 1024).toFixed(2) + ' KB';
+            const escapedFilename = Utils.escapeHtml(att.filename || '');
+            const escapedName = Utils.escapeHtml(displayName);
+            // Common call prefix; download appends ")", share appends ", 'share')".
+            const callPrefix = isSent
+                ? `window.emailService.downloadSentAttachment(${email.id}, ${att.id}`
+                : `window.emailService.downloadInboxAttachment(${email.id}, ${att.id}, '${escapedFilename}'`;
+            const shareBtn = isMobile
+                ? `<button class="btn btn-sm btn-outline-secondary" onclick="${callPrefix}, 'share')" title="Share ${escapedName}" aria-label="Share ${escapedName}" style="margin-left:5px;">
+                        <i class="fas fa-share-alt"></i>
+                    </button>`
+                : '';
+            return `
+                <div class="attachment-item" style="display:flex;justify-content:space-between;align-items:center;padding:10px;border:1px solid #ddd;border-radius:4px;margin:5px 0;">
+                    <div class="attachment-info" style="display:flex;align-items:center;">
+                        <i class="fas fa-file" style="margin-right:10px;"></i>
+                        <div>
+                            <div class="attachment-name" style="font-weight:bold;">${escapedName}</div>
+                            <div class="attachment-meta" style="font-size:0.9em;color:#666;">${sizeFormatted}</div>
+                        </div>
+                    </div>
+                    <div class="attachment-actions" style="display:flex;align-items:center;">
+                        <button class="btn btn-sm btn-outline-primary" onclick="${callPrefix})" title="Download ${escapedName}" aria-label="Download ${escapedName}">
+                            <i class="fas fa-download"></i>
+                        </button>
+                        ${shareBtn}
+                    </div>
+                </div>`;
+        }).join('');
+
+        // Only offer "Download All" when there's more than one attachment —
+        // with a single file the per-item buttons already cover it (issue #62).
+        const downloadAllHtml = items.length > 1
+            ? `<button class="btn btn-sm btn-outline-success" onclick="window.emailService.${downloadAllFn}(${email.id})" title="Download all attachments as ZIP" aria-label="Download all attachments">
+                        <i class="fas fa-download"></i>${isMobile ? '' : ' Download All'}
+                    </button>` +
+              (isMobile
+                ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.${downloadAllFn}(${email.id}, 'share')" title="Share all attachments as ZIP" aria-label="Share all attachments" style="margin-left:5px;">
+                        <i class="fas fa-share-alt"></i>
+                    </button>`
+                : '')
+            : '';
+        return `
+            <div class="email-attachments" style="margin:15px 0;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <h4 style="margin:0;">Attachments (${items.length})</h4>
+                    ${downloadAllHtml}
+                </div>
+                <div class="attachment-list">${itemsHtml}</div>
+            </div>`;
     }
 
     // Open the Nostr profile (kind:0) for the given pubkey using the standard
@@ -1087,6 +1195,15 @@ class EmailService {
             if (fresh.sender_pubkey && !email.sender_pubkey) {
                 email.sender_pubkey = fresh.sender_pubkey;
                 changed = true;
+            }
+            // (B) A newly-anchored pubkey can flip an earlier "could not decrypt"
+            // into a success. Drop any cached preview for this row so the next
+            // render re-decrypts with the fresh anchor instead of showing a stale
+            // miss. _previewCache is never otherwise cleared, so without this the
+            // failure would stick for the whole session.
+            if (changed && email.id != null) {
+                this._previewCache.delete(`inbox-${email.id}`);
+                this._previewCache.delete(`sent-${email.id}`);
             }
             return changed;
         } catch (e) {
@@ -2309,7 +2426,7 @@ class EmailService {
             <div style="margin-bottom:1em;font-size:0.95em;line-height:1.8;">
                 <div><strong>From:</strong> ${fromAddr} ${headerBadge}</div>
                 <div><strong>To:</strong> ${toAddr}</div>
-                <div><strong>Subject:</strong> ${subject}</div>
+                <div><strong>Subject:</strong> <span id="preview-subject-text">${subject}</span></div>
             </div>
             <hr style="border:none;border-top:1px solid #ccc;margin:0 0 1em;">`;
 
@@ -2400,7 +2517,7 @@ class EmailService {
                 } catch (e) {
                     console.warn('[JS] Preview pre-decrypt failed:', e);
                 }
-                Utils.renderHtmlBodyInIframe('preview-html-body', htmlToRender, { decryptedTexts: decryptResults });
+                Utils.renderHtmlBodyInIframe('preview-html-body', htmlToRender, { decryptedTexts: decryptResults, startDecrypted: true });
             };
             renderHtmlWithSigBadge();
         } else if (hasHtml) {
@@ -2417,6 +2534,49 @@ class EmailService {
                 modal.querySelector(`.preview-tab-panel[data-panel="${tab.dataset.tab}"]`).classList.add('active');
             });
         });
+
+        // Subject lock/unlock toggle (issue #62): when the composed subject is
+        // encrypted, show it decrypted first with an unlock icon and let the user
+        // toggle back to the ciphertext — mirroring the body decrypt toggle.
+        const rawSubject = domManager.getValue('subject') || '';
+        (async () => {
+            try {
+                // The subject may be raw NIP ciphertext OR glossia-encoded prose
+                // (default encoding is glossia latin, which looks like plain words
+                // and is indistinguishable from a real subject without decoding).
+                // isLikelyEncryptedContent only recognizes the base64 layer, so we
+                // also attempt a glossia decode — mirroring the sent-mail detection
+                // at _loadSentEmailDetail. The backend decrypt_subject re-decodes
+                // glossia internally, so rawSubject can be passed through as-is.
+                const looksEncrypted = (window.Utils && window.Utils.isLikelyEncryptedContent(rawSubject))
+                    || !!(await this.decodeGlossiaSubject(rawSubject));
+                if (looksEncrypted) {
+                    const pubkey = this.selectedNostrContact?.pubkey;
+                    if (!pubkey || !appState.hasKeypair()) return;
+                    const bodyForDecrypt = plainBody || this._plainBody || domManager.getValue('messageBody') || '';
+                    const res = await TauriService.decryptEmailBody(bodyForDecrypt, rawSubject, pubkey, null);
+                    const decryptedSubject = res && res.subject;
+                    if (!decryptedSubject || decryptedSubject === rawSubject) return;
+                    const span = document.getElementById('preview-subject-text');
+                    if (!span) return;
+                    const lock = document.createElement('i');
+                    lock.className = 'fas fa-lock-open';
+                    lock.style.cssText = 'cursor:pointer;margin-left:0.5em;opacity:0.7;';
+                    lock.title = 'Click to show encrypted';
+                    let isDecrypted = true;
+                    span.textContent = decryptedSubject; // decrypted view first (issue #62)
+                    lock.addEventListener('click', () => {
+                        isDecrypted = !isDecrypted;
+                        span.textContent = isDecrypted ? decryptedSubject : rawSubject;
+                        lock.className = isDecrypted ? 'fas fa-lock-open' : 'fas fa-lock';
+                        lock.title = isDecrypted ? 'Click to show encrypted' : 'Click to decrypt';
+                    });
+                    span.insertAdjacentElement('afterend', lock);
+                }
+            } catch (e) {
+                console.warn('[JS] Preview subject decrypt toggle failed:', e);
+            }
+        })();
     }
 
     async sendEncryptedEmail(emailConfig, contact, subject, body, messageId, toAddress) {
@@ -2565,7 +2725,7 @@ class EmailService {
                     const hash = this._subjectCiphertext
                         ? await this.hashStringSHA256(this._subjectCiphertext)
                         : null;
-                    await window.__TAURI__.core.invoke('db_save_sent_email_stub', {
+                    const savedEmailId = await window.__TAURI__.core.invoke('db_save_sent_email_stub', {
                         messageId,
                         fromAddress: emailConfig.email_address,
                         toAddress: recipientEmail,
@@ -2578,7 +2738,37 @@ class EmailService {
                         inReplyTo: this._replyToMessageId || null,
                         references: this._replyReferences || null,
                     });
-                    console.log('[JS] Saved sent-email stub for message_id:', messageId);
+                    console.log('[JS] Saved sent-email stub for message_id:', messageId, 'id:', savedEmailId);
+
+                    // Persist attachment rows linked to the just-saved email so
+                    // the sent list's attachment_count subquery returns the right
+                    // number immediately (without waiting for an IMAP sync of the
+                    // Sent folder to bring the attachments back from the server).
+                    if (savedEmailId && Array.isArray(attachmentData) && attachmentData.length > 0) {
+                        const nowIso = new Date().toISOString();
+                        for (const att of attachmentData) {
+                            try {
+                                await TauriService.saveAttachment({
+                                    id: null,
+                                    email_id: savedEmailId,
+                                    filename: att.filename,
+                                    content_type: att.content_type,
+                                    data: att.data,
+                                    size: att.size,
+                                    is_encrypted: att.is_encrypted,
+                                    encryption_method: att.encryption_method,
+                                    algorithm: att.algorithm,
+                                    original_filename: att.original_filename,
+                                    original_type: att.original_type,
+                                    original_size: att.original_size,
+                                    created_at: nowIso,
+                                });
+                            } catch (attErr) {
+                                console.warn('[JS] Failed to save attachment row for sent email:', attErr);
+                            }
+                        }
+                        console.log(`[JS] Saved ${attachmentData.length} attachment row(s) for sent email id=${savedEmailId}`);
+                    }
                 } catch (e) {
                     console.warn('[JS] Failed to save sent-email stub:', e);
                 }
@@ -2602,15 +2792,12 @@ class EmailService {
             if (!append) {
                 // Reset offset when loading fresh (not appending)
                 this.inboxOffset = 0;
+                this.inboxHasMoreInDb = true;
+                this.inboxServerFetchTried = false;
                 domManager.disable('refreshInbox');
                 domManager.setHTML('refreshInbox', '<span class="loading"></span> Loading...');
             } else {
-                // Show loading state on Load More button
-                const loadMoreBtn = document.getElementById('load-more-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = true;
-                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
-                }
+                this._setListStatus('email-list', 'Loading more...');
             }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
@@ -2636,52 +2823,10 @@ class EmailService {
             console.log('[JS] Email filter preference:', emailFilter, 'nostrOnly:', nostrOnly);
             console.log('[JS] Loading emails with offset:', this.inboxOffset, 'pageSize:', pageSize);
             const emails = await TauriService.getDbEmailThreads(pageSize, this.inboxOffset, nostrOnly, userEmail, userPubkey);
-            
-            // Load attachments for each email in parallel with timeout
-            console.log(`[JS] Loading attachments for ${emails.length} inbox emails`);
-            const attachmentPromises = emails.map(async (email) => {
-                try {
-                    // Convert email.id to integer - it might be a string
-                    const emailIdInt = parseInt(email.id);
-                    if (isNaN(emailIdInt)) {
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
-                        // Try to get email by message_id to get the real database ID
-                        if (email.message_id) {
-                            try {
-                                const emailData = await TauriService.getDbEmail(email.message_id);
-                                if (emailData && emailData.id) {
-                                    const realId = parseInt(emailData.id);
-                                    if (!isNaN(realId)) {
-                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
-                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
-                                        return;
-                                    }
-                                }
-                            } catch (e) {
-                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
-                            }
-                        }
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
-                        email.attachments = [];
-                        return;
-                    }
-                    
-                    const timeoutPromise = new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
-                    );
-                    email.attachments = await Promise.race([
-                        TauriService.getAttachmentsForEmail(emailIdInt),
-                        timeoutPromise
-                    ]);
-                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
-                } catch (error) {
-                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
-                    email.attachments = [];
-                }
-            });
-            
-            await Promise.all(attachmentPromises);
-            
+
+            // Attachments are no longer prefetched per-email here. The thread query already
+            // returns `attachment_count` (cheap COUNT(*) subquery) which the list badge uses;
+            // full attachment metadata is lazy-loaded by showEmailDetail when the user clicks in.
             let appendFrom = 0;
             if (append) {
                 // Append new emails to existing ones
@@ -2695,9 +2840,9 @@ class EmailService {
 
             // Update offset for next load
             this.inboxOffset += emails.length;
+            this.inboxHasMoreInDb = emails.length === pageSize;
 
-            // Show Load More button if we got a full page of results
-            this.renderEmails(emails.length === pageSize, appendFrom);
+            this.renderEmails(this.inboxHasMoreInDb, appendFrom);
         } catch (error) {
             console.error('Failed to load emails:', error);
             notificationService.showError('Failed to load emails: ' + error);
@@ -2706,11 +2851,7 @@ class EmailService {
                 domManager.enable('refreshInbox');
                 domManager.setHTML('refreshInbox', '<i class="fas fa-sync"></i> Refresh');
             } else {
-                const loadMoreBtn = document.getElementById('load-more-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = false;
-                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                }
+                this._removeListStatus('email-list');
             }
         }
     }
@@ -2748,15 +2889,12 @@ class EmailService {
             if (!append) {
                 // Reset offset when loading fresh (not appending)
                 this.sentOffset = 0;
+                this.sentHasMoreInDb = true;
+                this.sentServerFetchTried = false;
                 domManager.disable('refreshSent');
                 domManager.setHTML('refreshSent', '<span class="loading"></span> Loading...');
             } else {
-                // Show loading state on Load More button
-                const loadMoreBtn = document.getElementById('load-more-sent-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = true;
-                    loadMoreBtn.innerHTML = '<span class="loading"></span> Loading...';
-                }
+                this._setListStatus('sent-list', 'Loading more...');
             }
             const settings = appState.getSettings();
             const keypair = appState.getKeypair();
@@ -2767,51 +2905,10 @@ class EmailService {
             // Fetch sent emails (where user is sender)
             const userPubkey = keypair ? keypair.public_key : null;
             let emails = await TauriService.getDbSentEmailThreads(pageSize, this.sentOffset, userEmail, userPubkey);
-            
-            // Load attachments for each email in parallel with timeout
-            console.log(`[JS] Loading attachments for ${emails.length} sent emails`);
-            const attachmentPromises = emails.map(async (email) => {
-                try {
-                    // Convert email.id to integer - it might be a string
-                    const emailIdInt = parseInt(email.id);
-                    if (isNaN(emailIdInt)) {
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID, trying to get email by message_id to load attachments`);
-                        // Try to get email by message_id to get the real database ID
-                        if (email.message_id) {
-                            try {
-                                const emailData = await TauriService.getDbEmail(email.message_id);
-                                if (emailData && emailData.id) {
-                                    const realId = parseInt(emailData.id);
-                                    if (!isNaN(realId)) {
-                                        email.attachments = await TauriService.getAttachmentsForEmail(realId);
-                                        console.log(`[JS] Email ${email.id} (message_id: ${email.message_id}, DB ID: ${realId}) has ${email.attachments.length} attachments`);
-                                        return;
-                                    }
-                                }
-                            } catch (e) {
-                                console.error(`[JS] Failed to get email by message_id ${email.message_id}:`, e);
-                            }
-                        }
-                        console.warn(`[JS] Email ${email.id} has non-numeric ID and couldn't resolve, cannot load attachments`);
-                        email.attachments = [];
-                        return;
-                    }
-                    
-                    const timeoutPromise = new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Attachment load timeout')), 5000)
-                    );
-                    email.attachments = await Promise.race([
-                        TauriService.getAttachmentsForEmail(emailIdInt),
-                        timeoutPromise
-                    ]);
-                    console.log(`[JS] Email ${email.id} (DB ID: ${emailIdInt}) has ${email.attachments.length} attachments:`, email.attachments);
-                } catch (error) {
-                    console.error(`[JS] Failed to load attachments for email ${email.id}:`, error);
-                    email.attachments = [];
-                }
-            });
-            await Promise.allSettled(attachmentPromises);
-            
+
+            // Attachments are no longer prefetched per-email here. The thread query already
+            // returns `attachment_count` (cheap COUNT(*) subquery) which the list badge uses;
+            // full attachment metadata is lazy-loaded by the sent detail view when the user clicks in.
             let appendFrom = 0;
             if (append) {
                 // Append new emails to existing ones
@@ -2825,9 +2922,9 @@ class EmailService {
 
             // Update offset for next load
             this.sentOffset += emails.length;
+            this.sentHasMoreInDb = emails.length === pageSize;
 
-            // Show Load More button if we got a full page of results
-            this.renderSentEmails(emails.length === pageSize, appendFrom);
+            this.renderSentEmails(this.sentHasMoreInDb, appendFrom);
         } catch (error) {
             console.error('Failed to load sent emails:', error);
             notificationService.showError('Failed to load sent emails: ' + error);
@@ -2836,11 +2933,7 @@ class EmailService {
                 domManager.enable('refreshSent');
                 domManager.setHTML('refreshSent', '<i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>');
             } else {
-                const loadMoreBtn = document.getElementById('load-more-sent-emails');
-                if (loadMoreBtn) {
-                    loadMoreBtn.disabled = false;
-                    loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                }
+                this._removeListStatus('sent-list');
             }
         }
     }
@@ -2848,6 +2941,175 @@ class EmailService {
     // Load more sent emails (pagination)
     async loadMoreSentEmails() {
         await this.loadSentEmails('', true);
+    }
+
+    // ── Infinite scroll ──────────────────────────────────────────────────
+    // Replaces the old "Load More" buttons. Loads the next DB page when the
+    // user scrolls within `_INFINITE_SCROLL_THRESHOLD_PX` of the bottom; when
+    // the DB is exhausted, falls through to a single server sync and tries
+    // the DB again.
+
+    _initInfiniteScroll() {
+        if (this._infiniteScrollInited) return;
+        const emailList = document.getElementById('email-list');
+        const sentList = document.getElementById('sent-list');
+        if (!emailList && !sentList) return;
+        this._infiniteScrollInited = true;
+        if (emailList) {
+            emailList.addEventListener('scroll', () => this._onListScroll('inbox'), { passive: true });
+        }
+        if (sentList) {
+            sentList.addEventListener('scroll', () => this._onListScroll('sent'), { passive: true });
+        }
+    }
+
+    _onListScroll(kind) {
+        const listEl = document.getElementById(kind === 'inbox' ? 'email-list' : 'sent-list');
+        if (!listEl) return;
+        const thresholdPx = 300;
+        const distanceFromBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
+        if (distanceFromBottom > thresholdPx) return;
+        this._tryLoadMore(kind);
+    }
+
+    // After a render, if the list isn't tall enough to scroll but more pages
+    // are available, pull the next page so the viewport always fills up.
+    // Guarded by `loadingMore` so it can't recurse infinitely.
+    _maybeFillViewport(kind) {
+        const listEl = document.getElementById(kind === 'inbox' ? 'email-list' : 'sent-list');
+        if (!listEl) return;
+        if (listEl.scrollHeight <= listEl.clientHeight + 8) {
+            this._tryLoadMore(kind);
+        }
+    }
+
+    _tryLoadMore(kind) {
+        if (kind === 'inbox') {
+            if (this.inboxLoadingMore) return;
+            const inSearch = (domManager.getValue('emailSearch')?.trim() || '') !== '';
+            if (this.inboxHasMoreInDb || (inSearch && this.searchHasMore)) {
+                this.inboxLoadingMore = true;
+                this.loadMoreEmails().finally(() => {
+                    this.inboxLoadingMore = false;
+                });
+            } else if (!inSearch && !this.inboxServerFetchTried) {
+                this.inboxServerFetchTried = true;
+                this.inboxLoadingMore = true;
+                this._fetchInboxFromServerAndAppend().finally(() => {
+                    this.inboxLoadingMore = false;
+                });
+            }
+        } else {
+            if (this.sentLoadingMore) return;
+            const inSearch = (domManager.getValue('sentSearch')?.trim() || '') !== '';
+            if (this.sentHasMoreInDb || (inSearch && this.sentSearchHasMore)) {
+                this.sentLoadingMore = true;
+                this.loadMoreSentEmails().finally(() => {
+                    this.sentLoadingMore = false;
+                });
+            } else if (!inSearch && !this.sentServerFetchTried) {
+                this.sentServerFetchTried = true;
+                this.sentLoadingMore = true;
+                this._fetchSentFromServerAndAppend().finally(() => {
+                    this.sentLoadingMore = false;
+                });
+            }
+        }
+    }
+
+    async _fetchInboxFromServerAndAppend() {
+        this._setListStatus('email-list', '<i class="fas fa-cloud-download-alt"></i> Fetching older emails from server...');
+        try {
+            const pageSize = (appState.getSettings()?.emails_per_page) || 50;
+            const result = await TauriService.fetchOlderInboxEmails(pageSize);
+            // Backend returns { new_count, hit_bottom }. `hit_bottom = false`
+            // means the per-call scan budget was exhausted before reaching
+            // the bottom of the folder — typically because non-nostr mail
+            // dominated the scanned range. Tell the user to scroll again
+            // rather than declaring the server empty.
+            const newCount = result?.new_count ?? 0;
+            const hitBottom = result?.hit_bottom === true;
+            const oldest = this._formatScanDate(result?.oldest_scanned);
+            console.log(`[JS] Infinite scroll: fetch_older_inbox_emails newCount=${newCount}, hitBottom=${hitBottom}, oldest=${result?.oldest_scanned ?? 'n/a'}`);
+            if (newCount > 0) {
+                this.inboxHasMoreInDb = true;
+                this.inboxServerFetchTried = false;
+                await this.loadEmails('', true);
+            } else if (hitBottom) {
+                const back = oldest ? ` (oldest ${oldest})` : '';
+                this._setListStatus('email-list', `No older emails on server${back}`);
+            } else {
+                const back = oldest ? ` back to ${oldest}` : ' in this batch';
+                this._setListStatus('email-list', `No nostr matches${back} — scroll for more`);
+                this.inboxServerFetchTried = false;
+            }
+        } catch (e) {
+            console.error('[JS] Infinite scroll inbox server fetch failed:', e);
+            this._setListStatus('email-list', 'Failed to fetch older emails');
+        }
+    }
+
+    async _fetchSentFromServerAndAppend() {
+        this._setListStatus('sent-list', '<i class="fas fa-cloud-download-alt"></i> Fetching older emails from server...');
+        try {
+            const pageSize = (appState.getSettings()?.emails_per_page) || 50;
+            const result = await TauriService.fetchOlderSentEmails(pageSize);
+            const newCount = result?.new_count ?? 0;
+            const hitBottom = result?.hit_bottom === true;
+            const oldest = this._formatScanDate(result?.oldest_scanned);
+            console.log(`[JS] Infinite scroll: fetch_older_sent_emails newCount=${newCount}, hitBottom=${hitBottom}, oldest=${result?.oldest_scanned ?? 'n/a'}`);
+            if (newCount > 0) {
+                this.sentHasMoreInDb = true;
+                this.sentServerFetchTried = false;
+                await this.loadSentEmails('', true);
+            } else if (hitBottom) {
+                const back = oldest ? ` (oldest ${oldest})` : '';
+                this._setListStatus('sent-list', `No older emails on server${back}`);
+            } else {
+                const back = oldest ? ` back to ${oldest}` : ' in this batch';
+                this._setListStatus('sent-list', `No nostr matches${back} — scroll for more`);
+                this.sentServerFetchTried = false;
+            }
+        } catch (e) {
+            console.error('[JS] Infinite scroll sent server fetch failed:', e);
+            this._setListStatus('sent-list', 'Failed to fetch older emails');
+        }
+    }
+
+    // Format a backend `oldest_scanned` value (RFC3339 string from the server's
+    // INTERNALDATE, or null) as a local YYYY-MM-DD date for the scroll status.
+    // Tells the user how far back a "no matches in this batch" scan reached.
+    // Returns '' when the input is missing or unparseable.
+    _formatScanDate(isoString) {
+        if (!isoString) return '';
+        const d = new Date(isoString);
+        if (isNaN(d.getTime())) return '';
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}`;
+    }
+
+    _setListStatus(listId, htmlMessage) {
+        const list = document.getElementById(listId);
+        if (!list) return;
+        let status = list.querySelector('.infinite-scroll-status');
+        if (!status) {
+            status = document.createElement('div');
+            status.className = 'infinite-scroll-status text-center text-muted';
+            status.style.cssText = 'padding: 15px; font-size: 0.9em;';
+            list.appendChild(status);
+        } else {
+            list.appendChild(status); // ensure it stays at the bottom
+        }
+        status.innerHTML = htmlMessage;
+    }
+
+    _removeListStatus(listId) {
+        const list = document.getElementById(listId);
+        if (!list) return;
+        const status = list.querySelector('.infinite-scroll-status');
+        if (status) status.remove();
     }
 
     // Sync and reload emails
@@ -2868,10 +3130,14 @@ class EmailService {
     async syncInboxEmails() {
         try {
             const settings = appState.getSettings() || {};
-            const selectedFolder = settings.inbox_folder ? settings.inbox_folder : null;
-            console.log(`[JS] Syncing inbox emails from folder: ${selectedFolder || 'Default (INBOX + nostr-mail)'}`);
+            const folderList = (settings.inbox_folder || '')
+                .split('\n')
+                .map(f => f.trim())
+                .filter(Boolean);
+            const selectedFolders = folderList.length > 0 ? folderList : null;
+            console.log(`[JS] Syncing inbox emails from folders: ${selectedFolders ? selectedFolders.join(', ') : 'Default (INBOX + nostr-mail)'}`);
 
-            const newCount = await TauriService.syncNostrEmails(selectedFolder);
+            const newCount = await TauriService.syncNostrEmails(selectedFolders);
             console.log(`[JS] Synced ${newCount} new inbox emails from network`);
             return newCount;
         } catch (error) {
@@ -2910,6 +3176,109 @@ class EmailService {
             // Ensure we throw an Error object with a proper message
             const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
             throw new Error(errorMessage);
+        }
+    }
+
+    // ── Manual Refresh: forward delta + gap-fill scan ────────────────────
+    // The Refresh button calls these. They walk the same UID range as the
+    // normal sync but additionally re-check the [min_seen, last_seen] band
+    // for any UIDs whose Message-ID isn't in the local DB — the classic
+    // Gmail-index-lag recovery path.
+
+    async refreshInboxEmails() {
+        try {
+            const settings = appState.getSettings() || {};
+            const folderList = (settings.inbox_folder || '')
+                .split('\n')
+                .map(f => f.trim())
+                .filter(Boolean);
+            const selectedFolders = folderList.length > 0 ? folderList : null;
+            console.log(`[JS] Refreshing inbox (forward + gap-fill) from folders: ${selectedFolders ? selectedFolders.join(', ') : 'Default'}`);
+            const newCount = await TauriService.refreshInboxEmails(selectedFolders);
+            console.log(`[JS] Refreshed inbox: ${newCount} new email(s)`);
+            this._lastInboxSyncAt = Date.now();
+            return newCount;
+        } catch (error) {
+            console.error('[JS] Error in refreshInboxEmails:', error);
+            throw error;
+        }
+    }
+
+    async refreshSentEmails() {
+        try {
+            const newCount = await TauriService.refreshSentEmails();
+            console.log(`[JS] Refreshed sent: ${newCount} new email(s)`);
+            this._lastSentSyncAt = Date.now();
+            // Same DM-pubkey backfill that syncSentEmails runs.
+            try {
+                const updated = await window.__TAURI__.core.invoke('db_backfill_email_pubkeys');
+                if (updated > 0) {
+                    console.log(`[JS] Backfilled pubkeys on ${updated} email(s) via matching DMs`);
+                }
+            } catch (e) {
+                console.warn('[JS] db_backfill_email_pubkeys after sent refresh failed:', e);
+            }
+            return newCount;
+        } catch (error) {
+            console.error('[JS] Error in refreshSentEmails:', error);
+            const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
+            throw new Error(errorMessage);
+        }
+    }
+
+    // ── Auto-sync on tab switch ──────────────────────────────────────────
+    // Called by the tab-switch handler after the local DB load. Fires the
+    // cheap forward-delta sync in the background; reloads the visible list
+    // if new emails came in. Debounced so rapid switching doesn't hammer the
+    // server, and guarded against re-entry so the manual Refresh path can't
+    // race with an in-flight auto-sync.
+
+    static AUTO_SYNC_INTERVAL_MS = 30_000;
+
+    async autoSyncInboxIfStale() {
+        if (!appState.hasEmailSettingsConfigured()) return 0;
+        if (this._inboxAutoSyncInFlight) return 0;
+        if (Date.now() - this._lastInboxSyncAt < EmailService.AUTO_SYNC_INTERVAL_MS) {
+            return 0;
+        }
+        this._inboxAutoSyncInFlight = true;
+        try {
+            const newCount = await this.syncInboxEmails();
+            this._lastInboxSyncAt = Date.now();
+            if (newCount > 0) {
+                // New mail arrived since our DB snapshot — re-render from the
+                // top so the user sees it. `loadEmails()` with append=false
+                // also resets the infinite-scroll watermarks.
+                await this.loadEmails();
+            }
+            return newCount;
+        } catch (e) {
+            console.warn('[JS] autoSyncInboxIfStale failed:', e);
+            return 0;
+        } finally {
+            this._inboxAutoSyncInFlight = false;
+        }
+    }
+
+    async autoSyncSentIfStale() {
+        if (!appState.hasSettings()) return 0;
+        if (this._sentAutoSyncInFlight) return 0;
+        if (Date.now() - this._lastSentSyncAt < EmailService.AUTO_SYNC_INTERVAL_MS) {
+            return 0;
+        }
+        this._sentAutoSyncInFlight = true;
+        try {
+            const newCount = await this.syncSentEmails();
+            this._lastSentSyncAt = Date.now();
+            if (newCount > 0) {
+                await this.loadSentEmails();
+            }
+            return newCount;
+        } catch (e) {
+            console.warn('[JS] autoSyncSentIfStale failed:', e);
+            return 0;
+        } finally {
+            this._sentAutoSyncInFlight = false;
         }
     }
 
@@ -3116,12 +3485,16 @@ class EmailService {
     async renderEmails(showLoadMore = false, appendFrom = 0) {
         const emailList = domManager.get('emailList');
         if (!emailList) return;
+        this._initInfiniteScroll();
         try {
-            // Remove existing Load More button if it exists
+            // Remove any legacy Load More button (now replaced by infinite scroll)
             const existingLoadMoreBtn = document.getElementById('load-more-emails');
             if (existingLoadMoreBtn) {
                 existingLoadMoreBtn.remove();
             }
+            // Drop any inline status row before re-rendering; the scroll
+            // handler will re-add one when it next kicks off a load.
+            this._removeListStatus('email-list');
 
             // Get all emails from state
             const allEmails = appState.getEmails();
@@ -3155,6 +3528,28 @@ class EmailService {
                 }
                 return true;
             });
+
+            // Paint skeleton placeholders synchronously so users see structure
+            // (sender, subject, date, attachment badge) the moment the SQL fetch
+            // returns, instead of staring at a blank list until batch decryption
+            // and per-row rendering finish. Each placeholder is replaced in-place
+            // when its full render resolves, so order matches server order.
+            const placeholders = filteredEmails.map(email => {
+                const ph = this.renderInboxEmailItemBasic(email);
+                emailList.appendChild(ph);
+                return ph;
+            });
+
+            // Yield to the browser so it paints the skeletons before we move on.
+            // Without this, a warm preview cache lets the full replacement run to
+            // completion in the same JS turn as the appendChild loop, and the
+            // browser never paints the intermediate "skeleton-only" state.
+            // Double-rAF is the standard idiom: the first rAF callback runs
+            // *before* the next paint, the second runs after it, so by the time
+            // the second resolves the skeleton paint has definitely committed.
+            await new Promise(resolve =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve))
+            );
 
             // Batch-decrypt uncached encrypted emails in a single IPC call
             const uncachedEncrypted = filteredEmails.filter(email => {
@@ -3194,6 +3589,7 @@ class EmailService {
                                 subject: email.subject,
                                 senderPubkey: null,
                                 recipientPubkey,
+                                messageId: email.message_id || null,
                             };
                         }
                         return {
@@ -3202,6 +3598,7 @@ class EmailService {
                             subject: email.subject,
                             senderPubkey: email.sender_pubkey || email.nostr_pubkey || null,
                             recipientPubkey: null,
+                            messageId: email.message_id || null,
                         };
                     });
                     console.log(`[JS] Batch decrypting ${batchInput.length} inbox emails in one IPC call`);
@@ -3225,14 +3622,14 @@ class EmailService {
                                 previewSubject: item.result.subject,
                                 showSubject: true,
                             });
-                        } else {
-                            // Cache the failure too so we don't re-attempt
-                            this._previewCache.set(`inbox-${item.id}`, {
-                                previewText: 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.',
-                                previewSubject: email ? email.subject : '',
-                                showSubject: false,
-                            });
                         }
+                        // (A) Deliberately do NOT cache decrypt failures. A miss
+                        // here is often transient — the retrofit/backfill below can
+                        // anchor a sender/recipient pubkey that makes the very next
+                        // render succeed. Caching the failure (which is never
+                        // invalidated) is what made the inbox show a permanent
+                        // "could not decrypt" for messages that decrypt fine on
+                        // click. The per-row renderInboxEmailItem pass re-attempts.
                         // Side effects fire regardless of full-decrypt success:
                         // subject_ciphertext is produced as long as glossia decode
                         // worked, which is enough to self-heal recipient_pubkey for
@@ -3267,7 +3664,7 @@ class EmailService {
                                 const senderPubkey = isSent ? null : (email.sender_pubkey || email.nostr_pubkey || null);
                                 const recipientPubkey = isSent ? (email.recipient_pubkey || null) : null;
                                 const retry = await TauriService.decryptEmailBody(
-                                    email.body, email.subject, senderPubkey, recipientPubkey
+                                    email.body, email.subject, senderPubkey, recipientPubkey, email.message_id || null
                                 );
                                 if (retry && retry.success) {
                                     let previewText = Utils.escapeHtml(retry.body.substring(0, 100));
@@ -3289,34 +3686,40 @@ class EmailService {
                 }
             }
 
-            // Process emails in parallel (decryption will hit cache from batch above)
-            const emailPromises = filteredEmails
-                .map(async (email) => {
-                    try {
-                        // Add timeout to prevent hanging on decryption
-                        const timeoutPromise = new Promise((_, reject) =>
-                            setTimeout(() => reject(new Error('Decryption timeout')), 5000)
-                        );
-                        const renderPromise = this.renderInboxEmailItem(email);
-                        return await Promise.race([renderPromise, timeoutPromise]);
-                    } catch (error) {
-                        console.error(`[JS] Error rendering inbox email ${email.id}:`, error);
-                        // Return a basic email item even if rendering fails
-                        return this.renderInboxEmailItemBasic(email);
+            // Replace each placeholder with its full render as soon as that render
+            // resolves. Decryption will mostly hit the cache populated by the batch
+            // above, so this is fast; rows that need extra work upgrade in place
+            // without blocking the rest of the list.
+            const replacementResults = await Promise.allSettled(filteredEmails.map(async (email, idx) => {
+                const placeholder = placeholders[idx];
+                try {
+                    const timeoutPromise = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Decryption timeout')), 5000)
+                    );
+                    const fullElement = await Promise.race([
+                        this.renderInboxEmailItem(email),
+                        timeoutPromise
+                    ]);
+                    if (!placeholder || placeholder.parentNode !== emailList) return false;
+                    if (fullElement) {
+                        emailList.replaceChild(fullElement, placeholder);
+                        return true;
                     }
-                });
-
-            // Wait for all emails to be rendered (with timeout protection)
-            const renderedItems = await Promise.allSettled(emailPromises);
-
-            // Add all successfully rendered items to the list (filter out null results)
-            let renderedCount = 0;
-            for (const result of renderedItems) {
-                if (result.status === 'fulfilled' && result.value) {
-                    emailList.appendChild(result.value);
-                    renderedCount++;
+                    // renderInboxEmailItem returns null when hide_undecryptable is on
+                    // and the row failed to decrypt — drop the placeholder entirely.
+                    emailList.removeChild(placeholder);
+                    return false;
+                } catch (error) {
+                    console.error(`[JS] Error rendering inbox email ${email.id}:`, error);
+                    // Leave the skeleton placeholder visible so the user still sees the row.
+                    return !!(placeholder && placeholder.parentNode === emailList);
                 }
-            }
+            }));
+
+            const renderedCount = replacementResults.reduce(
+                (n, r) => n + (r.status === 'fulfilled' && r.value ? 1 : 0),
+                0
+            );
 
             // Show message if no emails were rendered (only on full render, not append)
             if (renderedCount === 0 && appendFrom <= 0) {
@@ -3333,18 +3736,15 @@ class EmailService {
                 return;
             }
 
-            // Add Load More button if there might be more emails
-            if (showLoadMore) {
-                const loadMoreBtn = document.createElement('button');
-                loadMoreBtn.id = 'load-more-emails';
-                loadMoreBtn.className = 'btn btn-secondary';
-                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
-                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                loadMoreBtn.addEventListener('click', () => this.loadMoreEmails());
-                emailList.appendChild(loadMoreBtn);
-            }
+            // If the rendered list is shorter than the viewport, auto-pull
+            // the next page (DB or server, whichever applies) so the user
+            // doesn't have to manually trigger a scroll on a list that has
+            // nowhere to scroll. Called unconditionally — `_maybeFillViewport`
+            // no-ops when the list is already scrollable, and `_tryLoadMore`
+            // no-ops when there's nothing left to fetch.
+            queueMicrotask(() => this._maybeFillViewport('inbox'));
 
-            console.log(`[JS] renderEmails: Successfully rendered ${renderedItems.filter(r => r.status === 'fulfilled').length} emails`);
+            console.log(`[JS] renderEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
             console.error('Error rendering emails:', error);
         }
@@ -3418,7 +3818,8 @@ class EmailService {
                         }
                         const result = await TauriService.decryptEmailBody(
                             email.body, email.subject,
-                            senderPubkey, recipientPubkey
+                            senderPubkey, recipientPubkey,
+                            email.message_id || null
                         );
                         if (result.success) {
                             previewSubject = result.subject;
@@ -3458,8 +3859,21 @@ class EmailService {
                 showSubject = true;
             }
 
-            // Cache the result for future re-renders
-            this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
+            // Cache the result for future re-renders — but (A) never cache a
+            // decrypt failure. A miss here is often transient: the row's
+            // sender/recipient pubkey gets backfilled after this attempt and the
+            // next render succeeds. Caching the failure (never invalidated) is
+            // what pinned a permanent "could not decrypt" on messages that
+            // decrypt fine on click. The failure strings mirror the isDecryptable
+            // check below — note showSubject is initialized differently across the
+            // inbox/sent renderers, so we classify on previewText, not showSubject.
+            const decryptFailed =
+                previewText.includes('Unable to decrypt') ||
+                previewText.includes('could not decrypt') ||
+                previewText.includes('Could not decrypt');
+            if (!decryptFailed) {
+                this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
+            }
         }
 
         // Check if email is decryptable (for filtering)
@@ -3477,8 +3891,12 @@ class EmailService {
             return null;
         }
 
-        // Add attachment indicator (same style as sent emails)
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        // Add attachment indicator (same style as sent emails).
+        // Prefer attachment_count from the thread query (cheap COUNT(*) subquery).
+        // Fall back to email.attachments.length when an older code path has already populated it.
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
         const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
@@ -3489,6 +3907,9 @@ class EmailService {
             signatureIndicator = `<span class="signature-indicator verified" title="Verified Nostr signature${sigSource}"><i class="fas fa-pen"></i> Signature Verified</span>`;
         } else if (email.signature_valid === false) {
             signatureIndicator = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Invalid Nostr signature"><i class="fas fa-pen"></i> Signature Invalid</span>`;
+        } else {
+            // No signature at all — softer "Unsigned" warning, distinct from invalid.
+            signatureIndicator = `<span class="signature-indicator missing" title="No Nostr signature"><i class="fas fa-exclamation-triangle"></i> Unsigned</span>`;
         }
 
         // Add transport authentication indicator
@@ -3602,13 +4023,23 @@ class EmailService {
             dateDisplay = emailDate.toLocaleDateString();
         }
 
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
         const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
         // Resolve sender identity (strict pubkey match when signed — see _resolveSender)
         const senderInfo = this._resolveSender(email);
         const senderLine = this._renderSenderLine(senderInfo, '');
+
+        // For encrypted emails the stored subject is either ciphertext or a
+        // placeholder string; either way it isn't meaningful to display while
+        // we wait for decryption. Substitute a clear "Decrypting…" hint for
+        // the subject and blank the preview until the full render lands.
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
+        const previewText = isEncrypted ? '' : 'Loading...';
 
         emailElement.innerHTML = `
             <img class="${senderInfo.avatarClass}" src="${senderInfo.avatarSrc}" alt="${Utils.escapeHtml(senderInfo.identityName)}'s avatar" onerror="this.onerror=null;this.src='${senderInfo.defaultAvatar}';this.className='contact-avatar';">
@@ -3617,8 +4048,8 @@ class EmailService {
                     <div class="email-sender email-list-strong">${senderLine} ${attachmentIndicator}</div>
                     <div class="email-date">${dateDisplay}</div>
                 </div>
-                <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
-                <div class="email-preview">Loading...</div>
+                <div class="email-subject email-list-strong">${subjectText}</div>
+                <div class="email-preview">${previewText}</div>
             </div>
         `;
 
@@ -3874,7 +4305,7 @@ class EmailService {
                             // Run decryption and signature verification in parallel (they're independent)
                             console.log('[JS] Calling backend decrypt_email_body + verifyAllSignatures in parallel...');
                             const [result, allSigs] = await Promise.all([
-                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, null),
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, email.recipient_pubkey || null, email.message_id || null),
                                 TauriService.verifyAllSignatures(emailBody).catch(e => {
                                     console.warn('[JS] Signature verification error:', e);
                                     return [];
@@ -3955,14 +4386,28 @@ class EmailService {
                     })();
                 }
                 const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {
-                    // Render attachments - decrypt metadata for display
-                    console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
-                    
-                    // Ensure attachments array exists
-                    if (!email.attachments || !Array.isArray(email.attachments)) {
-                        console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
-                        email.attachments = [];
+                    // Render attachments - decrypt metadata for display.
+                    // Attachments are no longer prefetched during list load; lazy-load them here
+                    // when the detail view actually needs them. attachment_count from the thread
+                    // query gives a fast path to skip the IPC call entirely when there are none.
+                    if (!Array.isArray(email.attachments)) {
+                        if (email.attachment_count === 0) {
+                            email.attachments = [];
+                        } else {
+                            const emailIdInt = parseInt(email.id);
+                            if (!isNaN(emailIdInt)) {
+                                try {
+                                    email.attachments = await TauriService.getAttachmentsForEmail(emailIdInt);
+                                } catch (err) {
+                                    console.error(`[JS] Failed to lazy-load attachments for email ${email.id}:`, err);
+                                    email.attachments = [];
+                                }
+                            } else {
+                                email.attachments = [];
+                            }
+                        }
                     }
+                    console.log(`[JS] Rendering detail for inbox email ${email.id}, attachments:`, email.attachments);
                     
                     let attachmentsHtml = '';
                     if (email.attachments && email.attachments.length > 0) {
@@ -3987,7 +4432,7 @@ class EmailService {
                                         const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                                         const decryptResult = await TauriService.decryptEmailBody(
                                             email.body, email.subject || '',
-                                            senderPubkey, null
+                                            senderPubkey, email.recipient_pubkey || null, email.message_id || null
                                         );
                                         if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
                                             manifestResult = {
@@ -4068,9 +4513,14 @@ class EmailService {
                         <div class="email-attachments" id="inbox-email-attachments" style="margin: 15px 0;">
                             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                                 <h4>Attachments (${attachmentDisplayData.length})</h4>
-                                <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllInboxAttachments(${email.id})" title="Download all attachments as ZIP">
-                                    <i class="fas fa-download"></i> Download All
-                                </button>
+                                ${attachmentDisplayData.length > 1 ? `<div class="attachment-actions" style="display: flex; align-items: center; gap: 5px;">
+                                    <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllInboxAttachments(${email.id})" title="Download all attachments as ZIP" aria-label="Download all attachments">
+                                        <i class="fas fa-download"></i>${window.emailService._isMobilePlatform() ? '' : ' Download All'}
+                                    </button>
+                                    ${window.emailService._isMobilePlatform() ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.downloadAllInboxAttachments(${email.id}, 'share')" title="Share all attachments as ZIP" aria-label="Share all attachments">
+                                        <i class="fas fa-share-alt"></i>
+                                    </button>` : ''}
+                                </div>` : ''}
                             </div>
                             <div class="attachment-list">
                                 ${attachmentDisplayData.map(attachment => {
@@ -4098,10 +4548,13 @@ class EmailService {
                                                 </div>
                                             </div>
                                         </div>
-                                        <div class="attachment-actions">
-                                            <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadInboxAttachment(${email.id}, ${attachment.id}, '${Utils.escapeHtml(encryptedFilename)}')">
-                                                <i class="fas fa-download"></i> Download
+                                        <div class="attachment-actions" style="display: flex; align-items: center; gap: 5px;">
+                                            <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadInboxAttachment(${email.id}, ${attachment.id}, '${Utils.escapeHtml(encryptedFilename)}')" title="Download" aria-label="Download">
+                                                <i class="fas fa-download"></i>${window.emailService._isMobilePlatform() ? '' : ' Download'}
                                             </button>
+                                            ${window.emailService._isMobilePlatform() ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.downloadInboxAttachment(${email.id}, ${attachment.id}, '${Utils.escapeHtml(encryptedFilename)}', 'share')" title="Share" aria-label="Share">
+                                                <i class="fas fa-share-alt"></i>
+                                            </button>` : ''}
                                         </div>
                                     </div>`;
                                 }).join('')}
@@ -4125,6 +4578,11 @@ class EmailService {
                     } else if (email.signature_valid === false) {
                         signatureIcon = `<span class="signature-indicator invalid" data-message-id="${Utils.escapeHtml(email.message_id || email.id)}" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
                         securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
+                    } else {
+                        // No signature at all (signature_valid null/undefined, no inline sig).
+                        // Softer "Unsigned" warning — distinct from a present-but-bad signature.
+                        signatureIcon = `<span class="signature-indicator missing" title="No signature"><i class="fas fa-exclamation-triangle"></i></span>`;
+                        securityRows += `<div class="security-row missing"><i class="fas fa-exclamation-triangle"></i> Unsigned</div>`;
                     }
                     if (email.transport_auth_verified === true) {
                         securityRows += `<div class="security-row verified"><i class="fas fa-envelope"></i> Email Transport Verified</div>`;
@@ -4136,6 +4594,7 @@ class EmailService {
                     const defaultAvatar = senderInfo.defaultAvatar;
                     const senderName = senderInfo.identityName;
                     const fromAddressLabel = senderInfo.hasSignature
+                        && !senderInfo.contact
                         && senderInfo.fromAddress
                         && senderInfo.identityName !== senderInfo.fromAddress
                         ? `<span class="email-sender-secondary">&lt;${Utils.escapeHtml(senderInfo.fromAddress)}&gt;</span>`
@@ -4204,6 +4663,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+<button class="thread-menu-item thread-move-action">Move to folder</button>
 <button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
@@ -4295,6 +4755,17 @@ ${attachmentsHtml}
                         inboxDeleteBtn.addEventListener('click', async () => {
                             inboxMoreDropdown.classList.remove('open');
                             const ok = await this._deleteEmailFromDetail(email.message_id || email.id, 'inbox');
+                            if (!ok) return;
+                            this.showEmailList();
+                            await this.loadEmails();
+                        });
+                    }
+
+                    const inboxMoveBtn = emailDetailContent.querySelector('.thread-move-action');
+                    if (inboxMoveBtn) {
+                        inboxMoveBtn.addEventListener('click', async () => {
+                            inboxMoreDropdown.classList.remove('open');
+                            const ok = await this._moveEmailFromDetail(email.message_id || email.id);
                             if (!ok) return;
                             this.showEmailList();
                             await this.loadEmails();
@@ -4583,6 +5054,14 @@ ${attachmentsHtml}
                 threadContent.innerHTML = '<div class="thread-loading"><i class="fas fa-spinner fa-spin"></i> Loading conversation...</div>';
             }
 
+            // Force the browser to paint the view switch + loading spinner before
+            // we kick off the SQL fetch. Without this, the click handler chains
+            // straight into the await below and the user sees the email list
+            // until the whole thread has been fetched and rendered.
+            await new Promise(resolve =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve))
+            );
+
             // Resolve active account email up front so we can scope the thread query to it
             // (prevents cross-account contamination when multiple accounts share this DB).
             const settings = appState.getSettings();
@@ -4610,21 +5089,88 @@ ${attachmentsHtml}
             // Render messages using same per-email decrypt as single email views
             const keypair = appState.getKeypair();
             const defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
-            let threadSubjectText = threadEmails[0].subject;
+            // For encrypted threads the stored subject of the first message is
+            // ciphertext / a placeholder, so start with "Decrypting…" until a
+            // per-message task lands a real decrypted subject. Cleartext threads
+            // just keep their stored subject as the default.
+            const firstHasArmor = !!(threadEmails[0].body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(threadEmails[0].body));
+            const decryptingPlaceholder = 'Decrypting…';
+            let threadSubjectText = firstHasArmor ? decryptingPlaceholder : threadEmails[0].subject;
             let lastDecryptedSubject = null;
             let lastDecryptedBody = null;
 
             if (threadContent) {
                 threadContent.innerHTML = '';
-                for (const email of threadEmails) {
+
+                // Paint a skeleton card per message so the user sees the
+                // structure of the conversation immediately (sender + date,
+                // with a "Decrypting…" snippet). Each skeleton is replaced
+                // in place once the parallel decrypt + render below produces
+                // the full card for it.
+                const skeletons = threadEmails.map((email, idx) => {
+                    const skel = document.createElement('div');
+                    const isLast = idx === threadEmails.length - 1;
+                    skel.className = `email-detail-card thread-skeleton${isLast ? '' : ' collapsed'}`;
+                    const timeAgo = Utils.formatTimeAgo(new Date(email.date));
+                    const fromLabel = Utils.escapeHtml(email.from || email.from_address || '');
+                    skel.innerHTML = `
+<div class="email-sender-header">
+<div class="email-sender-row">
+<img class="email-sender-avatar" src="${defaultAvatar}" alt="">
+<div class="email-sender-info">
+<div class="email-sender-name-row">
+<div class="email-sender-name">${fromLabel}</div>
+<span class="email-body-snippet">Decrypting…</span>
+<div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
+</div>
+</div>
+</div>
+</div>
+                    `;
+                    threadContent.appendChild(skel);
+                    return skel;
+                });
+
+                // Default the thread title to the first message's stored subject
+                // so the user has a meaningful header from the moment the view
+                // appears. Per-message tasks below may overwrite this as soon as
+                // any decrypted subject differs from the stored one.
+                if (threadSubject) threadSubject.textContent = threadSubjectText;
+
+                // Yield so the skeletons commit to a paint before we start
+                // the decrypt work below (which can otherwise complete in a
+                // single JS turn on warm caches and skip the skeleton frame).
+                await new Promise(resolve =>
+                    requestAnimationFrame(() => requestAnimationFrame(resolve))
+                );
+
+                // Stream cards into place as each message's decrypt finishes,
+                // instead of waiting for the whole batch. Each per-message task
+                // decrypts, builds its card, and replaces its own skeleton.
+                // Shared state (thread subject, last-decrypted reply target) is
+                // updated under index-ordering rules so out-of-order completion
+                // doesn't produce inconsistent results: lower-index decrypts
+                // win the thread subject, only the final message updates the
+                // reply-target snapshot.
+                let earliestDecryptedSubjectIdx = Infinity;
+                const lastIdx = threadEmails.length - 1;
+
+                const taskStartAll = performance.now();
+                await Promise.allSettled(threadEmails.map(async (email, idx) => {
+                    const taskStart = performance.now();
                     const isSent = email._isSentByUser;
                     const emailBody = email.body || '';
+                    const bodyBytes = emailBody.length;
                     const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
 
                     let displayBody = emailBody;
                     let displaySubject = email.subject;
                     let sigResults = null;
                     let blockDecryptResults = null;
+                    // Manifest attachment metadata captured from the decrypt result
+                    // so the per-card attachment renderer can resolve opaque .dat
+                    // filenames back to their original names + sizes.
+                    let manifestAttachmentsForCard = null;
 
                     if (encryptedMatch && keypair) {
                         // Determine correct pubkey: sender for received, recipient for sent
@@ -4641,7 +5187,7 @@ ${attachmentsHtml}
 
                         try {
                             const [result, allSigs] = await Promise.all([
-                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey),
+                                TauriService.decryptEmailBody(emailBody, email.subject, senderPubkey, recipientPubkey, email.message_id || null),
                                 TauriService.verifyAllSignatures(emailBody).catch(e => {
                                     console.warn('[JS] Thread sig verify error:', e);
                                     return [];
@@ -4658,6 +5204,10 @@ ${attachmentsHtml}
                                     if (b.error) return { error: b.error };
                                     return null;
                                 });
+                            }
+
+                            if (result.isManifest && Array.isArray(result.attachments) && result.attachments.length > 0) {
+                                manifestAttachmentsForCard = result.attachments;
                             }
 
                             // Backfill sender_pubkey from armor if missing
@@ -4686,11 +5236,24 @@ ${attachmentsHtml}
                         }
                     }
 
-                    // Track thread subject from first successful decrypt
-                    if (displaySubject && displaySubject !== email.subject && threadSubjectText === threadEmails[0].subject) {
+                    const tDecryptDone = performance.now();
+
+                    // Update thread subject — first message in order whose
+                    // decrypted subject differs from the stored one wins.
+                    if (displaySubject && displaySubject !== email.subject && idx < earliestDecryptedSubjectIdx) {
+                        earliestDecryptedSubjectIdx = idx;
                         threadSubjectText = displaySubject;
+                        if (threadSubject) threadSubject.textContent = threadSubjectText;
                     }
 
+                    // Track reply target — only meaningful for the most recent
+                    // message; other tasks shouldn't overwrite it.
+                    if (idx === lastIdx) {
+                        lastDecryptedSubject = displaySubject;
+                        lastDecryptedBody = displayBody;
+                    }
+
+                    // ===== Build and mount the full card =====
                     // Resolve contact for avatar. For received messages we use
                     // strict pubkey-only matching via _resolveSender (anti-spoofing).
                     // For sent messages the "sender" is the local user, so email-fallback is fine.
@@ -4714,6 +5277,7 @@ ${attachmentsHtml}
                         isUnknownSigner = senderInfo.isUnknownSigner;
                         unknownSignerPubkey = senderInfo.senderPubkey;
                         if (senderInfo.hasSignature
+                            && !senderInfo.contact
                             && senderInfo.fromAddress
                             && senderInfo.identityName !== senderInfo.fromAddress) {
                             fromAddressLabelThread = `<span class="email-sender-secondary">&lt;${Utils.escapeHtml(senderInfo.fromAddress)}&gt;</span>`;
@@ -4746,6 +5310,10 @@ ${attachmentsHtml}
                     } else if (email.signature_valid === false) {
                         signatureIcon = `<span class="signature-indicator invalid" title="Signature Invalid"><i class="fas fa-times-circle"></i></span>`;
                         securityRows += `<div class="security-row invalid"><i class="fas fa-times-circle"></i> Signature Invalid</div>`;
+                    } else {
+                        // No signature at all — softer "Unsigned" warning (see detail card).
+                        signatureIcon = `<span class="signature-indicator missing" title="No signature"><i class="fas fa-exclamation-triangle"></i></span>`;
+                        securityRows += `<div class="security-row missing"><i class="fas fa-exclamation-triangle"></i> Unsigned</div>`;
                     }
 
                     // Suppress green inline sig icon for unknown signers; the
@@ -4773,6 +5341,25 @@ ${attachmentsHtml}
                     // iframe rendering (renderHtmlBodyInIframe) into the wrong
                     // card and leave the sent-side body empty.
                     const bodyId = `${prefix}-thread-body-${email.id}`;
+
+                    // Build the per-card attachments section. This is the only
+                    // path the thread view has for surfacing attachments — without
+                    // it, an earlier message with an attachment looks bare once
+                    // the conversation has more than one card (which is why the
+                    // user couldn't see attachments on the first email after
+                    // replying). Fetch in parallel with the other card work.
+                    const attachmentsHtml = await this._buildThreadCardAttachmentsHtml(
+                        email, manifestAttachmentsForCard, source
+                    );
+                    // When the card is collapsed we hide the full download section and
+                    // surface just a paperclip indicator in the header instead (issue #62).
+                    const threadAttachmentCount = typeof email.attachment_count === 'number'
+                        ? email.attachment_count
+                        : (email.attachments ? email.attachments.length : 0);
+                    const collapsedAttachmentIndicator = attachmentsHtml
+                        ? `<span class="thread-attachment-indicator" title="Has attachments">📎${threadAttachmentCount > 0 ? ' ' + threadAttachmentCount : ''}</span>`
+                        : '';
+
                     const cardDiv = document.createElement('div');
                     cardDiv.className = 'email-detail-card';
                     cardDiv.innerHTML = `
@@ -4786,6 +5373,7 @@ ${signatureIcon}
 ${unknownBadgeThread}
 ${fromAddressLabelThread}
 ${transportAuthIcon}
+${collapsedAttachmentIndicator}
 <span class="email-body-snippet">${snippet}</span>
 <div class="email-sender-time">${Utils.escapeHtml(timeAgo)}</div>
 </div>
@@ -4806,6 +5394,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 <button class="thread-action-btn thread-more-btn" title="More"><i class="fas fa-ellipsis-v"></i></button>
 <div class="thread-more-dropdown">
 <button class="thread-menu-item thread-raw-toggle">Show Raw</button>
+${source === 'inbox' ? '<button class="thread-menu-item thread-move-action">Move to folder</button>' : ''}
 <button class="thread-menu-item thread-delete-action">Delete</button>
 </div>
 </div>
@@ -4814,9 +5403,17 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 </div>
 <pre class="email-raw-content" style="display:none">${Utils.escapeHtml(email.raw_headers || '')}</pre>
 <div class="email-detail-body" id="${bodyId}">${email.html_body ? '' : Utils.escapeHtml(displayBody).replace(/\n/g, '<br>')}</div>
+${attachmentsHtml}
 <pre class="email-raw-content email-raw-body" style="display:none">${Utils.escapeHtml(email.raw_body || '')}${email.html_body ? '\n\n--- text/html ---\n\n' + Utils.escapeHtml(email.html_body) : ''}</pre>
                     `;
-                    threadContent.appendChild(cardDiv);
+                    // Swap the skeleton placeholder for the fully rendered card.
+                    // If the skeleton was already removed (defensive), fall back to append.
+                    const skeleton = skeletons[idx];
+                    if (skeleton && skeleton.parentNode === threadContent) {
+                        threadContent.replaceChild(cardDiv, skeleton);
+                    } else {
+                        threadContent.appendChild(cardDiv);
+                    }
 
                     // Collapse all cards except the last (most recent)
                     const isLastEmail = (email === threadEmails[threadEmails.length - 1]);
@@ -4900,6 +5497,21 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                             }
                         });
                     }
+                    const moveCardBtn = cardDiv.querySelector('.thread-move-action');
+                    if (moveCardBtn) {
+                        moveCardBtn.addEventListener('click', async () => {
+                            moreDropdown.classList.remove('open');
+                            const messageId = email.message_id || email.id;
+                            const ok = await this._moveEmailFromDetail(messageId);
+                            if (!ok) return;
+                            cardDiv.remove();
+                            const remaining = threadContent.querySelectorAll('.email-detail-card').length;
+                            if (remaining === 0) {
+                                this.showEmailList();
+                                await this.loadEmails();
+                            }
+                        });
+                    }
 
                     // Post-render: same steps as single email detail view
                     if (email.html_body) {
@@ -4916,9 +5528,25 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                         this.verifyAndAnnotateSignatureBlocks(displayBody, bodyId);
                     }
 
-                    // Track last email's decrypted content for reply button
-                    lastDecryptedSubject = displaySubject;
-                    lastDecryptedBody = displayBody;
+                    const tEnd = performance.now();
+                    console.log(
+                        `[THREAD-PERF] msg ${idx + 1}/${threadEmails.length} ` +
+                        `(body=${bodyBytes}b, encrypted=${!!encryptedMatch}): ` +
+                        `decrypt+verify=${(tDecryptDone - taskStart).toFixed(1)}ms, ` +
+                        `mount+post=${(tEnd - tDecryptDone).toFixed(1)}ms, ` +
+                        `total=${(tEnd - taskStart).toFixed(1)}ms ` +
+                        `(landed at ${(tEnd - taskStartAll).toFixed(1)}ms)`
+                    );
+                }));
+                console.log(`[THREAD-PERF] all ${threadEmails.length} messages settled in ${(performance.now() - taskStartAll).toFixed(1)}ms`);
+
+                // If we showed the "Decrypting…" placeholder but no per-message
+                // task ever produced a decrypted subject (e.g. all decrypts
+                // failed), fall back to the stored subject so the title doesn't
+                // stay stuck on the placeholder.
+                if (earliestDecryptedSubjectIdx === Infinity && threadSubjectText === decryptingPlaceholder) {
+                    threadSubjectText = threadEmails[0].subject;
+                    if (threadSubject) threadSubject.textContent = threadSubjectText;
                 }
 
                 // Close menus on outside click
@@ -4928,10 +5556,6 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 
                 // Scroll to bottom (most recent message)
                 threadContent.scrollTop = threadContent.scrollHeight;
-            }
-
-            if (threadSubject) {
-                threadSubject.textContent = threadSubjectText;
             }
 
             // Mark unread emails as read (fire-and-forget)
@@ -5122,6 +5746,75 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         }
     }
 
+    // Prompt for a destination folder and move a single inbox email there on the
+    // server. Returns true if the move succeeded so the caller can refresh the UI.
+    async _moveEmailFromDetail(messageId) {
+        const settings = appState.getSettings() || {};
+        const userEmail = settings.email_address || null;
+
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host || '',
+            smtp_port: settings.smtp_port || 587,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port || 993,
+            use_tls: settings.use_tls !== false,
+        };
+
+        // Fetch the current server folder list to populate the picker. Failure is
+        // non-fatal — the user can still type a new folder name.
+        let folders = [];
+        try {
+            folders = (await TauriService.listImapFolders(emailConfig)) || [];
+        } catch (error) {
+            console.warn('[JS] Could not list folders for move picker:', error);
+        }
+
+        // Resolve the message's ACTUAL current folder from the server so the
+        // picker's "(current)" label is correct even after a prior move (inbox
+        // emails carry no per-email folder). Check inbox folders first (cheap,
+        // common case), then the rest; fall back to the inbox heuristic if the
+        // server can't be reached or the message isn't found.
+        const inboxFolders = (settings.inbox_folder || '')
+            .split('\n')
+            .map(s => s.trim())
+            .filter(Boolean);
+        if (inboxFolders.length === 0) inboxFolders.push('INBOX');
+        let currentFolder = inboxFolders[0];
+        try {
+            // Gmail's "All Mail"/"Important"/"Starred" are label views that match
+            // virtually every message, so excluding them keeps the resolved folder
+            // a real storage location.
+            const isVirtual = f => /all mail|important|starred/i.test(f);
+            const seen = new Set(inboxFolders.map(f => f.toLowerCase()));
+            const ordered = [
+                ...inboxFolders,
+                ...folders.filter(f => !seen.has(f.toLowerCase()) && !isVirtual(f)),
+            ];
+            const actual = await TauriService.findMessageFolder(emailConfig, messageId, ordered);
+            if (actual) currentFolder = actual;
+        } catch (error) {
+            console.warn('[JS] Could not resolve current folder for move picker:', error);
+        }
+
+        const target = await notificationService.showFolderPicker(folders, 'Move to folder', currentFolder);
+        if (!target) return false;
+
+        const loading = notificationService.showLoading('Moving email...');
+        try {
+            await TauriService.moveInboxEmail(messageId, target, userEmail);
+            notificationService.hideLoading(loading);
+            notificationService.showSuccess(`Email moved to "${target}".`);
+            return true;
+        } catch (error) {
+            notificationService.hideLoading(loading);
+            console.error('[JS] Error moving email:', error);
+            notificationService.showError('Failed to move email: ' + error);
+            return false;
+        }
+    }
+
     async deleteDraft(messageId) {
         try {
             await TauriService.deleteDraft(messageId);
@@ -5289,15 +5982,16 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             });
 
             // Preserve the currently-saved selection so we can re-apply it after
-            // repopulating the <option>s. Prefer the persisted setting over the
-            // current DOM value (DOM may be empty if this fires before
-            // populateSettingsForm runs).
+            // repopulating the <option>s. Prefer current DOM selections; fall
+            // back to the persisted setting (DOM may be empty if this fires
+            // before populateSettingsForm runs).
             const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
-            const previousValue = selectElement ? (selectElement.value || persistedFolder) : persistedFolder;
+            const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
+            const domSelected = window.FolderMultiselect ? window.FolderMultiselect.getSelection() : [];
+            const previousSelection = domSelected.length > 0 ? domSelected : persistedList;
 
-            if (selectElement) {
-                selectElement.disabled = true;
-                selectElement.innerHTML = '<option disabled>Loading folders...</option>';
+            if (window.FolderMultiselect) {
+                window.FolderMultiselect.setLoading();
             }
 
             const emailConfig = {
@@ -5319,35 +6013,50 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 
             const folders = await TauriService.listImapFolders(emailConfig);
 
-            if (selectElement) {
-                selectElement.innerHTML = '';
-                if (folders && folders.length > 0) {
-                    const allOption = document.createElement('option');
-                    allOption.value = '';
-                    allOption.textContent = 'Default';
-                    selectElement.appendChild(allOption);
+            if (window.FolderMultiselect) {
+                // Spam/junk/bulk folders are never inbox folders — the backend
+                // recovers misfiled nostr mail via spam rescue instead. Keep
+                // them out of the option list entirely so they can't be picked
+                // (and aren't shown as selected from a stale persisted value).
+                const isSpammy = (name) => {
+                    const lower = name.toLowerCase();
+                    return lower.includes('spam') || lower.includes('junk') || lower.includes('bulk');
+                };
+                const filteredFolders = (folders || []).filter(folder =>
+                    folder.toLowerCase() !== 'sent' && !isSpammy(folder)
+                );
+                // Only keep prior selections that still exist on the server.
+                const filteredSet = new Set(filteredFolders);
+                let restoreSelection = previousSelection.filter(name => filteredSet.has(name));
 
-                    const filteredFolders = folders.filter(folder =>
-                        folder.toLowerCase() !== 'sent'
-                    );
-
-                    filteredFolders.forEach(folder => {
-                        const option = document.createElement('option');
-                        option.value = folder;
-                        option.textContent = folder;
-                        selectElement.appendChild(option);
-                    });
-                    selectElement.disabled = false;
-
-                    if (previousValue && Array.from(selectElement.options).some(o => o.value === previousValue)) {
-                        selectElement.value = previousValue;
+                // No usable saved selection? Pre-select the provider-aware
+                // defaults so users SEE what will be synced as pills (rather
+                // than as ghosted placeholder text). Mirrors the backend's
+                // `default_inbox_folders`. setOptions calls setValue with
+                // silent=true so this doesn't trigger autosave — the user's
+                // persisted "" stays "" until they actively change something.
+                if (restoreSelection.length === 0) {
+                    const settings = appState.getSettings() || {};
+                    let staticDefaults = [];
+                    try {
+                        staticDefaults = await TauriService.getDefaultInboxFolders(settings.imap_host || '');
+                    } catch (e) {
+                        console.warn('[EMAIL-SERVICE] getDefaultInboxFolders failed:', e);
                     }
-                } else {
-                    const option = document.createElement('option');
-                    option.disabled = true;
-                    option.textContent = 'No folders found';
-                    selectElement.appendChild(option);
+                    const effective = new Set();
+                    for (const name of (staticDefaults || [])) {
+                        if (filteredSet.has(name)) effective.add(name);
+                    }
+                    restoreSelection = Array.from(effective);
                 }
+
+                window.FolderMultiselect.setOptions(filteredFolders, restoreSelection);
+            }
+
+            // The spam-rescue target dropdown derives its options from the inbox
+            // folder selection, so refresh it once the live folder list lands.
+            if (window.app && typeof window.app.populateSpamRescueTargetOptions === 'function') {
+                window.app.populateSpamRescueTargetOptions();
             }
 
             console.log(`[EMAIL-SERVICE] Loaded ${folders?.length || 0} folders`);
@@ -5356,29 +6065,16 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             console.error('Failed to list IMAP folders:', error);
             if (!silent) notificationService.showError('Failed to list IMAP folders: ' + error);
 
-            const selectElement = document.getElementById('inbox-folder-preference');
-            if (selectElement) {
+            if (window.FolderMultiselect) {
                 if (silent) {
                     // Background refresh failed (network down, wrong creds, account
-                    // mid-switch). Leave the dropdown in a usable state with just
-                    // "Default" + the persisted folder name so the user isn't blocked.
+                    // mid-switch). Leave the dropdown in a usable state with the
+                    // persisted folder names so the user isn't blocked.
                     const persistedFolder = (appState.getSettings() || {}).inbox_folder || '';
-                    selectElement.innerHTML = '';
-                    selectElement.disabled = false;
-                    const defaultOpt = document.createElement('option');
-                    defaultOpt.value = '';
-                    defaultOpt.textContent = 'Default';
-                    selectElement.appendChild(defaultOpt);
-                    if (persistedFolder) {
-                        const opt = document.createElement('option');
-                        opt.value = persistedFolder;
-                        opt.textContent = persistedFolder;
-                        selectElement.appendChild(opt);
-                        selectElement.value = persistedFolder;
-                    }
+                    const persistedList = persistedFolder.split('\n').map(f => f.trim()).filter(Boolean);
+                    window.FolderMultiselect.setSelectionOnly(persistedList);
                 } else {
-                    selectElement.disabled = true;
-                    selectElement.innerHTML = '<option disabled>Failed to load folders</option>';
+                    window.FolderMultiselect.setLoading();
                 }
             }
         }
@@ -5386,6 +6082,12 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
 
     getSelectedFolder() {
         return (appState.getSettings() || {}).inbox_folder || null;
+    }
+
+    getSelectedFolders() {
+        const raw = (appState.getSettings() || {}).inbox_folder || '';
+        const list = raw.split('\n').map(f => f.trim()).filter(Boolean);
+        return list.length > 0 ? list : null;
     }
 
     // Handle email provider selection
@@ -6581,12 +7283,14 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             console.error('[JS] renderSentEmails: sentList element not found');
             return;
         }
+        this._initInfiniteScroll();
         try {
-            // Remove existing Load More button if it exists
+            // Remove any legacy Load More button (now replaced by infinite scroll)
             const existingLoadMoreBtn = document.getElementById('load-more-sent-emails');
             if (existingLoadMoreBtn) {
                 existingLoadMoreBtn.remove();
             }
+            this._removeListStatus('sent-list');
 
             // Get all emails from state
             const allEmails = appState.getSentEmails();
@@ -6613,6 +7317,27 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             // setting is for protecting against unverified inbound senders and does not
             // apply here. Always show your own sent mail.
             const filteredEmails = emails;
+
+            // Paint skeleton placeholders synchronously so users see structure
+            // (recipient, subject, date, attachment badge) the moment the SQL fetch
+            // returns. Each placeholder is replaced in-place when its full render
+            // resolves, preserving server order.
+            const placeholders = filteredEmails.map(email => {
+                const ph = this.renderSentEmailItemBasic(email);
+                sentList.appendChild(ph);
+                return ph;
+            });
+
+            // Yield to the browser so it paints the skeletons before we move on.
+            // Without this, a warm preview cache lets the full replacement run to
+            // completion in the same JS turn as the appendChild loop, and the
+            // browser never paints the intermediate "skeleton-only" state.
+            // Double-rAF is the standard idiom: the first rAF callback runs
+            // *before* the next paint, the second runs after it, so by the time
+            // the second resolves the skeleton paint has definitely committed.
+            await new Promise(resolve =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve))
+            );
 
             // Batch-decrypt uncached encrypted sent emails, resolving pubkeys from contact index
             const uncachedEncrypted = filteredEmails.filter(email => {
@@ -6641,6 +7366,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                             subject: email.subject,
                             senderPubkey: null,
                             recipientPubkey,
+                            messageId: email.message_id || null,
                         };
                     });
                     console.log(`[JS] Batch decrypting ${batchInput.length} sent emails in one IPC call`);
@@ -6667,13 +7393,12 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 this._saveRecipientPubkeyToDb(email, email.recipient_pubkey)
                                     .catch(e => console.warn('[JS] Failed to backfill recipient_pubkey:', e));
                             }
-                        } else {
-                            this._previewCache.set(`sent-${item.id}`, {
-                                previewText: 'Could not decrypt',
-                                previewSubject: email ? email.subject : '',
-                                showSubject: true,
-                            });
                         }
+                        // (A) Do NOT cache decrypt failures — the retrofit below
+                        // may anchor recipient_pubkey and make the next render
+                        // succeed. A cached miss is never invalidated, so it would
+                        // otherwise pin a permanent "Could not decrypt" on a row
+                        // that decrypts fine once backfilled.
                         // Retrofit subject_hash whenever the backend produced a
                         // glossia-decoded ciphertext — even on full-decrypt failure.
                         // This breaks the catch-22 where missing recipient_pubkey
@@ -6692,7 +7417,7 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 const changed = await retrofitPromise;
                                 if (!changed || !email.recipient_pubkey) return;
                                 const retry = await TauriService.decryptEmailBody(
-                                    email.body, email.subject, null, email.recipient_pubkey
+                                    email.body, email.subject, null, email.recipient_pubkey, email.message_id || null
                                 );
                                 if (retry && retry.success) {
                                     let previewText = Utils.escapeHtml(retry.body.substring(0, 100));
@@ -6713,34 +7438,40 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 }
             }
 
-            // Process emails in parallel (decryption will hit cache from batch above)
-            const emailPromises = filteredEmails
-                .map(async (email) => {
+            // Replace each placeholder with its full render as soon as that render
+            // resolves. Decryption will mostly hit the cache populated by the batch
+            // above, so this is fast; rows that need extra work upgrade in place
+            // without blocking the rest of the list.
+            const replacementResults = await Promise.allSettled(filteredEmails.map(async (email, idx) => {
+                const placeholder = placeholders[idx];
                 try {
-                    // Add timeout to prevent hanging on decryption
                     const timeoutPromise = new Promise((_, reject) =>
                         setTimeout(() => reject(new Error('Decryption timeout')), 5000)
                     );
-                    const renderPromise = this.renderSentEmailItem(email);
-                    return await Promise.race([renderPromise, timeoutPromise]);
+                    const fullElement = await Promise.race([
+                        this.renderSentEmailItem(email),
+                        timeoutPromise
+                    ]);
+                    if (!placeholder || placeholder.parentNode !== sentList) return false;
+                    if (fullElement) {
+                        sentList.replaceChild(fullElement, placeholder);
+                        return true;
+                    }
+                    // renderSentEmailItem returns null when hide_undecryptable is on
+                    // and the row failed to decrypt — drop the placeholder entirely.
+                    sentList.removeChild(placeholder);
+                    return false;
                 } catch (error) {
                     console.error(`[JS] Error rendering email ${email.id}:`, error);
-                    // Return a basic email item even if rendering fails
-                    return this.renderSentEmailItemBasic(email);
+                    // Leave the skeleton placeholder visible so the user still sees the row.
+                    return !!(placeholder && placeholder.parentNode === sentList);
                 }
-            });
-            
-            // Wait for all emails to be rendered (with timeout protection)
-            const renderedItems = await Promise.allSettled(emailPromises);
-            
-            // Add all successfully rendered items to the list (filter out null results)
-            let renderedCount = 0;
-            for (const result of renderedItems) {
-                if (result.status === 'fulfilled' && result.value) {
-                    sentList.appendChild(result.value);
-                    renderedCount++;
-                }
-            }
+            }));
+
+            const renderedCount = replacementResults.reduce(
+                (n, r) => n + (r.status === 'fulfilled' && r.value ? 1 : 0),
+                0
+            );
             
             // Show message if no emails were rendered (only on full render, not append)
             if (renderedCount === 0 && appendFrom <= 0) {
@@ -6754,18 +7485,11 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 return;
             }
             
-            // Add Load More button if there might be more emails
-            if (showLoadMore) {
-                const loadMoreBtn = document.createElement('button');
-                loadMoreBtn.id = 'load-more-sent-emails';
-                loadMoreBtn.className = 'btn btn-secondary';
-                loadMoreBtn.style.cssText = 'width: 100%; margin-top: 15px; padding: 12px;';
-                loadMoreBtn.innerHTML = '<i class="fas fa-chevron-down"></i> Load More';
-                loadMoreBtn.addEventListener('click', () => this.loadMoreSentEmails());
-                sentList.appendChild(loadMoreBtn);
-            }
-            
-            console.log(`[JS] renderSentEmails: Successfully rendered ${renderedItems.filter(r => r.status === 'fulfilled').length} emails`);
+            // See renderEmails — auto-fill the viewport when the rendered
+            // list is too short to scroll. Unconditional; guarded internally.
+            queueMicrotask(() => this._maybeFillViewport('sent'));
+
+            console.log(`[JS] renderSentEmails: Successfully rendered ${renderedCount} emails`);
         } catch (error) {
             console.error('[JS] Error in renderSentEmails:', error);
             sentList.innerHTML = '<div class="text-center text-muted">Error loading sent emails</div>';
@@ -6813,15 +7537,18 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 const keypair = appState.getKeypair();
                 if (!keypair) {
                     previewText = 'Unable to decrypt: no keypair';
+                    showSubject = false; // don't show the encrypted subject (issue #62)
                 } else {
                     const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                     if (!recipientPubkey) {
                         previewText = 'Could not decrypt';
+                        showSubject = false; // don't show the encrypted subject (issue #62)
                     } else {
                         try {
                             const result = await TauriService.decryptEmailBody(
                                 email.body, email.subject,
-                                null, recipientPubkey
+                                null, recipientPubkey,
+                                email.message_id || null
                             );
                             if (result.success) {
                                 previewSubject = result.subject;
@@ -6830,11 +7557,13 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 showSubject = true;
                             } else {
                                 previewText = 'Could not decrypt';
+                                showSubject = false; // don't show the encrypted subject (issue #62)
                             }
                             this._retrofitSubjectHashAndBackfill(email, result.subjectCiphertext);
                         } catch (e) {
                             console.error('[JS] Backend decrypt failed for sent preview:', e);
                             previewText = 'Could not decrypt';
+                            showSubject = false; // don't show the encrypted subject (issue #62)
                         }
                     }
                 }
@@ -6850,8 +7579,21 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 showSubject = true;
             }
 
-            // Cache the result for future re-renders
-            this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
+            // Cache the result for future re-renders — but (A) never cache a
+            // decrypt failure. A miss here is often transient: the row's
+            // sender/recipient pubkey gets backfilled after this attempt and the
+            // next render succeeds. Caching the failure (never invalidated) is
+            // what pinned a permanent "could not decrypt" on messages that
+            // decrypt fine on click. The failure strings mirror the isDecryptable
+            // check below — note showSubject is initialized differently across the
+            // inbox/sent renderers, so we classify on previewText, not showSubject.
+            const decryptFailed =
+                previewText.includes('Unable to decrypt') ||
+                previewText.includes('could not decrypt') ||
+                previewText.includes('Could not decrypt');
+            if (!decryptFailed) {
+                this._previewCache.set(cacheKey, { previewText, previewSubject, showSubject });
+            }
         }
 
         // Check if email is decryptable (for filtering)
@@ -6868,10 +7610,15 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         if (hideUndecryptable && !isDecryptable) {
             return null;
         }
-        
-        // Add attachment indicator
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
-        const attachmentIndicator = attachmentCount > 0 ? 
+
+        // Add attachment indicator — prefer attachment_count from the thread query
+        // (cheap COUNT(*) subquery) since the sent list no longer prefetches full
+        // attachment metadata. Fall back to email.attachments.length for any code
+        // path that has already populated the array.
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
+        const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
         // Add signature verification indicator
@@ -7000,8 +7747,10 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             dateDisplay = emailDate.toLocaleDateString();
         }
         
-        const attachmentCount = email.attachments ? email.attachments.length : 0;
-        const attachmentIndicator = attachmentCount > 0 ? 
+        const attachmentCount = typeof email.attachment_count === 'number'
+            ? email.attachment_count
+            : (email.attachments ? email.attachments.length : 0);
+        const attachmentIndicator = attachmentCount > 0 ?
             `<span class="attachment-indicator" title="${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}">📎 ${attachmentCount}</span>` : '';
 
         // Strict pubkey-bound lookup when recipient_pubkey is set, otherwise
@@ -7023,6 +7772,16 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
             avatarSrc = recipientContact.picture;
         }
 
+        // For encrypted sent emails the stored subject is ciphertext / a
+        // placeholder and the body is armor — show "Decrypting…" on the
+        // subject and blank the preview until the full render replaces
+        // this skeleton. Cleartext sent emails keep their body snippet.
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
+        const previewText = isEncrypted
+            ? ''
+            : Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '');
+
         emailElement.innerHTML = `
             <img class="${avatarClass}" src="${avatarSrc}" alt="${Utils.escapeHtml(email.to)}'s avatar" onerror="this.onerror=null;this.src='${defaultAvatar}';this.className='contact-avatar';">
             <div class="email-content">
@@ -7030,8 +7789,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                     <div class="email-sender email-list-strong">To: ${Utils.escapeHtml(email.to)} ${attachmentIndicator}</div>
                     <div class="email-date">${dateDisplay}</div>
                 </div>
-                <div class="email-subject email-list-strong">${Utils.escapeHtml(email.subject)}</div>
-                <div class="email-preview">${Utils.escapeHtml(email.body ? email.body.substring(0, 100) : '')}</div>
+                <div class="email-subject email-list-strong">${subjectText}</div>
+                <div class="email-preview">${previewText}</div>
             </div>
         `;
         emailElement.addEventListener('click', () => {
@@ -7362,17 +8121,29 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
         
         // Define updateDetail function first (before it's called)
         const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {
-            // Render attachments - decrypt metadata for display
-            console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
-            console.log(`[JS] Email object:`, email);
-            console.log(`[JS] email.html_body present:`, !!email.html_body, `length:`, email.html_body ? email.html_body.length : 0);
-            console.log(`[JS] Email.attachments type:`, typeof email.attachments, Array.isArray(email.attachments));
-            
-            // Ensure attachments array exists
-            if (!email.attachments || !Array.isArray(email.attachments)) {
-                console.warn(`[JS] Email ${email.id} has no attachments array, initializing empty array`);
-                email.attachments = [];
+            // Render attachments - decrypt metadata for display.
+            // Attachments are no longer prefetched during list load; lazy-load them here
+            // when the detail view actually needs them. attachment_count from the thread
+            // query gives a fast path to skip the IPC call entirely when there are none.
+            if (!Array.isArray(email.attachments)) {
+                if (email.attachment_count === 0) {
+                    email.attachments = [];
+                } else {
+                    const emailIdInt = parseInt(email.id);
+                    if (!isNaN(emailIdInt)) {
+                        try {
+                            email.attachments = await TauriService.getAttachmentsForEmail(emailIdInt);
+                        } catch (err) {
+                            console.error(`[JS] Failed to lazy-load attachments for sent email ${email.id}:`, err);
+                            email.attachments = [];
+                        }
+                    } else {
+                        email.attachments = [];
+                    }
+                }
             }
+            console.log(`[JS] Rendering detail for email ${email.id}, attachments:`, email.attachments);
+            console.log(`[JS] email.html_body present:`, !!email.html_body, `length:`, email.html_body ? email.html_body.length : 0);
             
             // Log attachment details for debugging
             if (email.attachments && email.attachments.length > 0) {
@@ -7425,7 +8196,8 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                                 const decryptResult = await TauriService.decryptEmailBody(
                                     email.body, email.subject || '',
-                                    null, recipientPubkey
+                                    null, recipientPubkey,
+                                    email.message_id || null
                                 );
                                 if (decryptResult.isManifest && decryptResult.attachments && decryptResult.attachments.length > 0) {
                                     manifestResult = {
@@ -7525,9 +8297,14 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                 <div class="email-attachments" id="sent-email-attachments" style="margin: 15px 0;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                         <h4>Attachments (${attachmentDisplayData.length})</h4>
-                        <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllSentAttachments(${email.id})" title="Download all attachments as ZIP">
-                            <i class="fas fa-download"></i> Download All
-                        </button>
+                        ${attachmentDisplayData.length > 1 ? `<div class="attachment-actions" style="display: flex; align-items: center; gap: 5px;">
+                            <button class="btn btn-sm btn-outline-success" onclick="window.emailService.downloadAllSentAttachments(${email.id})" title="Download all attachments as ZIP" aria-label="Download all attachments">
+                                <i class="fas fa-download"></i>${window.emailService._isMobilePlatform() ? '' : ' Download All'}
+                            </button>
+                            ${window.emailService._isMobilePlatform() ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.downloadAllSentAttachments(${email.id}, 'share')" title="Share all attachments as ZIP" aria-label="Share all attachments">
+                                <i class="fas fa-share-alt"></i>
+                            </button>` : ''}
+                        </div>` : ''}
                     </div>
                     <div class="attachment-list">
                         ${attachmentDisplayData.map(attachment => {
@@ -7554,10 +8331,13 @@ ${securityRows ? `<hr><div class="email-security-info">${securityRows}</div>` : 
                                         </div>
                                     </div>
                                 </div>
-                                <div class="attachment-actions">
-                                    <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadSentAttachment(${email.id}, ${attachment.id})">
-                                        <i class="fas fa-download"></i> Download
+                                <div class="attachment-actions" style="display: flex; align-items: center; gap: 5px;">
+                                    <button class="btn btn-sm btn-outline-primary" onclick="window.emailService.downloadSentAttachment(${email.id}, ${attachment.id})" title="Download" aria-label="Download">
+                                        <i class="fas fa-download"></i>${window.emailService._isMobilePlatform() ? '' : ' Download'}
                                     </button>
+                                    ${window.emailService._isMobilePlatform() ? `<button class="btn btn-sm btn-outline-secondary" onclick="window.emailService.downloadSentAttachment(${email.id}, ${attachment.id}, 'share')" title="Share" aria-label="Share">
+                                        <i class="fas fa-share-alt"></i>
+                                    </button>` : ''}
                                 </div>
                             </div>`;
                         }).join('')}
@@ -7834,7 +8614,7 @@ ${attachmentsHtml}
                         // Run decryption and signature verification in parallel (they're independent)
                         console.log('[JS] Calling backend decrypt_email_body + verifyAllSignatures for sent email in parallel...');
                         const [result, allSigs] = await Promise.all([
-                            TauriService.decryptEmailBody(email.body, email.subject, null, recipientPubkey),
+                            TauriService.decryptEmailBody(email.body, email.subject, null, recipientPubkey, email.message_id || null),
                             TauriService.verifyAllSignatures(email.body).catch(e => {
                                 console.warn('[JS] Signature verification error:', e);
                                 return [];
@@ -7980,7 +8760,8 @@ ${attachmentsHtml}
 
             const result = await TauriService.decryptEmailBody(
                 email.body, email.subject || '',
-                null, recipientPubkey
+                null, recipientPubkey,
+                email.message_id || null
             );
 
             // Retrofit happens whether or not the body decrypted — the subject
@@ -8075,7 +8856,7 @@ ${attachmentsHtml}
     }
 
     // Download attachment from sent email
-    async downloadSentAttachment(emailId, attachmentId) {
+    async downloadSentAttachment(emailId, attachmentId, action = 'download') {
         try {
             console.log(`[JS] Downloading attachment ${attachmentId} from sent email ${emailId}`);
             console.log(`[JS] EmailId type: ${typeof emailId}, AttachmentId type: ${typeof attachmentId}`);
@@ -8113,7 +8894,8 @@ ${attachmentsHtml}
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for sent attachment...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    null, recipientPubkey
+                    null, recipientPubkey,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8144,26 +8926,22 @@ ${attachmentsHtml}
                     opaqueId
                 );
 
-                // Save decrypted attachment to disk using Tauri
-                const filePath = await TauriService.saveAttachmentToDisk(
+                // Deliver decrypted attachment (save or share)
+                await this._deliverFile(
+                    action,
                     decryptedAttachment.filename,
                     decryptedAttachment.dataB64,
-                    decryptedAttachment.contentType || 'application/octet-stream'
+                    decryptedAttachment.contentType
                 );
 
-                console.log(`[JS] Downloaded decrypted attachment: ${decryptedAttachment.filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
-                
             } else {
-                // Plain attachment - save directly to disk using Tauri
-                const filePath = await TauriService.saveAttachmentToDisk(
-                    attachment.filename, 
-                    attachment.data, 
-                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                // Plain attachment - deliver directly (save or share)
+                await this._deliverFile(
+                    action,
+                    attachment.filename,
+                    attachment.data,
+                    attachment.content_type || attachment.mime_type
                 );
-                
-                console.log(`[JS] Downloaded plain attachment: ${attachment.filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
             }
             
         } catch (error) {
@@ -8173,7 +8951,7 @@ ${attachmentsHtml}
     }
 
     // Download all attachments from sent email as ZIP
-    async downloadAllSentAttachments(emailId) {
+    async downloadAllSentAttachments(emailId, action = 'download') {
         try {
             console.log(`[JS] Downloading all attachments from sent email ${emailId} as ZIP`);
             
@@ -8209,7 +8987,8 @@ ${attachmentsHtml}
                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    null, recipientPubkey
+                    null, recipientPubkey,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8288,11 +9067,9 @@ ${attachmentsHtml}
             
             console.log(`[JS] Creating ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
             
-            // Save as ZIP
-            const zipPath = await TauriService.saveAttachmentsAsZip(zipFilename, attachmentsForZip);
-            
-            console.log(`[JS] Successfully created ZIP file: ${zipPath}`);
-            window.notificationService.showSuccess(`All attachments saved to: ${zipPath}`);
+            // Deliver as ZIP (save or share)
+            console.log(`[JS] Delivering ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
+            await this._deliverZip(action, zipFilename, attachmentsForZip);
             
         } catch (error) {
             console.error('[JS] Failed to download all attachments:', error);
@@ -8301,7 +9078,36 @@ ${attachmentsHtml}
     }
 
     // Download attachment from inbox email
-    async downloadInboxAttachment(emailId, attachmentId, encryptedFilename = null) {
+    // The share sheet only exists on mobile (Android/iOS); desktop just saves.
+    _isMobilePlatform() {
+        return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+    }
+
+    // Deliver a single file: save to Downloads, or (action === 'share') open the
+    // mobile share sheet. Shows the appropriate toast.
+    async _deliverFile(action, filename, dataB64, mime, label) {
+        const mimeType = mime || 'application/octet-stream';
+        if (action === 'share') {
+            await TauriService.shareAttachmentToDisk(filename, dataB64, mimeType);
+            window.notificationService.showSuccess('Opening share sheet…');
+        } else {
+            const dest = await TauriService.saveAttachmentToDisk(filename, dataB64, mimeType);
+            window.notificationService.showSuccess(`${label || 'Attachment'} saved to: ${dest}`);
+        }
+    }
+
+    // Deliver a ZIP of all attachments: save to Downloads, or share.
+    async _deliverZip(action, zipFilename, attachmentsForZip) {
+        if (action === 'share') {
+            await TauriService.shareAttachmentsAsZip(zipFilename, attachmentsForZip);
+            window.notificationService.showSuccess('Opening share sheet…');
+        } else {
+            const dest = await TauriService.saveAttachmentsAsZip(zipFilename, attachmentsForZip);
+            window.notificationService.showSuccess(`All attachments saved to: ${dest}`);
+        }
+    }
+
+    async downloadInboxAttachment(emailId, attachmentId, encryptedFilename = null, action = 'download') {
         try {
             console.log(`[JS] Downloading attachment ${attachmentId} from inbox email ${emailId}`);
             
@@ -8318,13 +9124,13 @@ ${attachmentsHtml}
             // If in raw mode and attachment is encrypted, download the raw encrypted data
             if (isRawMode && attachment.encryption_method === 'manifest_aes') {
                 console.log(`[JS] Raw mode detected, downloading encrypted attachment: ${attachment.filename}`);
-                const filePath = await TauriService.saveAttachmentToDisk(
+                await this._deliverFile(
+                    action,
                     encryptedFilename || attachment.filename,
                     attachment.data,
-                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                    attachment.content_type || attachment.mime_type,
+                    'Raw attachment'
                 );
-                console.log(`[JS] Downloaded raw encrypted attachment: ${attachment.filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Raw attachment saved to: ${filePath}`);
                 return;
             }
             
@@ -8350,12 +9156,15 @@ ${attachmentsHtml}
                     return;
                 }
 
-                // Use backend to decrypt manifest and get attachment keys
+                // Use backend to decrypt manifest and get attachment keys. Pass BOTH
+                // pubkeys so the backend can pick the non-self counterparty — this email
+                // may be one we authored (sender == us) that also appears in the inbox.
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for attachment...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    senderPubkey, null
+                    senderPubkey, email.recipient_pubkey || null,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8386,26 +9195,22 @@ ${attachmentsHtml}
                     opaqueId
                 );
 
-                // Save decrypted attachment to disk using Tauri
-                const filePath = await TauriService.saveAttachmentToDisk(
+                // Deliver decrypted attachment (save or share)
+                await this._deliverFile(
+                    action,
                     decryptedAttachment.filename,
                     decryptedAttachment.dataB64,
-                    decryptedAttachment.contentType || 'application/octet-stream'
+                    decryptedAttachment.contentType
                 );
-                
-                console.log(`[JS] Downloaded decrypted attachment: ${attachmentMeta.orig_filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
-                
+
             } else {
-                // Plain attachment - save directly to disk using Tauri
-                const filePath = await TauriService.saveAttachmentToDisk(
-                    attachment.filename, 
-                    attachment.data, 
-                    attachment.content_type || attachment.mime_type || 'application/octet-stream'
+                // Plain attachment - deliver directly (save or share)
+                await this._deliverFile(
+                    action,
+                    attachment.filename,
+                    attachment.data,
+                    attachment.content_type || attachment.mime_type
                 );
-                
-                console.log(`[JS] Downloaded plain attachment: ${attachment.filename} to ${filePath}`);
-                window.notificationService.showSuccess(`Attachment saved to: ${filePath}`);
             }
             
         } catch (error) {
@@ -8415,7 +9220,7 @@ ${attachmentsHtml}
     }
 
     // Download all attachments from inbox email as ZIP
-    async downloadAllInboxAttachments(emailId) {
+    async downloadAllInboxAttachments(emailId, action = 'download') {
         try {
             console.log(`[JS] Downloading all attachments from inbox email ${emailId} as ZIP`);
             
@@ -8449,12 +9254,15 @@ ${attachmentsHtml}
                     return;
                 }
 
-                // Use backend to decrypt manifest and get attachment keys
+                // Use backend to decrypt manifest and get attachment keys. Pass BOTH
+                // pubkeys so the backend can pick the non-self counterparty (this email
+                // may be one we authored that also appears in the inbox).
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey;
                 console.log('[JS] Using backend decrypt_email_body to extract manifest for ZIP...');
                 const decryptResult = await TauriService.decryptEmailBody(
                     email.body, email.subject || '',
-                    senderPubkey, null
+                    senderPubkey, email.recipient_pubkey || null,
+                    email.message_id || null
                 );
 
                 if (!decryptResult.isManifest || !decryptResult.attachments || decryptResult.attachments.length === 0) {
@@ -8548,11 +9356,9 @@ ${attachmentsHtml}
             
             console.log(`[JS] Creating ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
             
-            // Save as ZIP
-            const zipPath = await TauriService.saveAttachmentsAsZip(zipFilename, attachmentsForZip);
-            
-            console.log(`[JS] Successfully created ZIP file: ${zipPath}`);
-            window.notificationService.showSuccess(`All attachments saved to: ${zipPath}`);
+            // Deliver as ZIP (save or share)
+            console.log(`[JS] Delivering ZIP file: ${zipFilename} with ${attachmentsForZip.length} files`);
+            await this._deliverZip(action, zipFilename, attachmentsForZip);
             
         } catch (error) {
             console.error('[JS] Failed to download all attachments:', error);
@@ -8809,7 +9615,8 @@ ${attachmentsHtml}
                     const recipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey || draft.sender_pubkey;
                     const result = await TauriService.decryptEmailBody(
                         draft.body, draft.subject || '',
-                        recipientPubkey, null
+                        recipientPubkey, null,
+                        draft.message_id || null
                     );
                     if (result.success) {
                         previewSubject = result.subject || draft.subject;
@@ -9234,7 +10041,8 @@ ${attachmentsHtml}
                             const recipientPubkey = draftRecipientPubkey;
                             const result = await TauriService.decryptEmailBody(
                                 draft.body, draft.subject || '',
-                                recipientPubkey, null
+                                recipientPubkey, null,
+                                draft.message_id || null
                             );
                             if (result.success) {
                                 decryptedSubject = result.subject || draft.subject;

@@ -6459,27 +6459,26 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
         // The lowest examined UID lowers the floor regardless of nostr matches.
         if win_min < lowest_scanned { lowest_scanned = win_min; }
 
-        // Scan-depth date: INTERNALDATE-only fetch over the whole window. No
-        // bodies, so this stays tiny even at 500. Min over the window matches
-        // the old per-fetched-message minimum.
-        let t_meta = std::time::Instant::now();
-        for chunk in window.chunks(FETCH_BATCH) {
-            let uid_list = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-            if let Ok(msgs) = session.uid_fetch(&uid_list, "(UID INTERNALDATE)") {
-                for msg in msgs.iter() {
-                    if let Some(d) = msg.internal_date() {
-                        let d_utc = d.with_timezone(&chrono::Utc);
-                        if oldest_scanned.map_or(true, |cur| d_utc < cur) {
-                            oldest_scanned = Some(d_utc);
-                        }
-                    }
+        // Scan-depth date: INTERNALDATE of the single oldest window UID
+        // (`win_min`). Earlier this fetched all N dates just to take the min —
+        // wasteful at a 500 window. The floor advances by UID, so anchoring the
+        // "scanned back to <date>" indicator to the floor UID is both cheap (one
+        // tiny fetch) and consistent with how far back the floor actually moved.
+        let t_idate = std::time::Instant::now();
+        if let Ok(msgs) = session.uid_fetch(win_min.to_string(), "(UID INTERNALDATE)") {
+            for msg in msgs.iter() {
+                if let Some(d) = msg.internal_date() {
+                    oldest_scanned = Some(d.with_timezone(&chrono::Utc));
                 }
             }
         }
+        let idate_ms = t_idate.elapsed().as_millis();
+
         // Server-side narrow: which window UIDs are nostr mail? Intersect with
         // the window (the range SEARCH may include UIDs the window excludes).
+        let t_search = std::time::Instant::now();
         let candidates = search_nostr_uids_in_range(session, win_min, win_max)?;
-        let meta_ms = t_meta.elapsed().as_millis();
+        let search_ms = t_search.elapsed().as_millis();
         let win_set: std::collections::HashSet<u32> = window.iter().copied().collect();
         let mut cand: Vec<u32> = candidates.into_iter().filter(|u| win_set.contains(u)).collect();
         cand.sort_unstable();
@@ -6501,8 +6500,8 @@ fn walk_back_collecting<S: std::io::Read + std::io::Write>(
             }
             parse_ms += t_parse.elapsed().as_millis();
         }
-        debug_log!("[RUST-PERF] walk_back_collecting: meta+search={}ms, body_fetch={}ms, parse={}ms ({} examined, {} nostr-candidate, {} match)",
-            meta_ms, fetch_ms, parse_ms, scanned, cand.len(), emails.len());
+        debug_log!("[RUST-PERF] walk_back_collecting: idate={}ms, nostr_search={}ms, body_fetch={}ms, parse={}ms ({} examined, {} nostr-candidate, {} match)",
+            idate_ms, search_ms, fetch_ms, parse_ms, scanned, cand.len(), emails.len());
     }
 
     let hit_bottom = scanned >= uids_sorted.len();

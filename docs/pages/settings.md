@@ -2,6 +2,8 @@
 
 The Settings page configures all application settings.
 
+![The Settings page](../assets/screenshots/settings.png)
+
 ## Purpose
 
 Configure email, Nostr, relays, and application preferences.
@@ -86,14 +88,17 @@ See the [Glossia Encoding](../glossia.md) guide for details.
 
 - Choose "Nostr Emails Only" (encrypted, signed, or from Nostr contacts) or "All Emails"
 
-#### Inbox Folder
+#### Inbox Folders
 
-- Choose which IMAP folder to scan for new mail. "Default" scans INBOX + the `nostr-mail` folder. The folder list loads from your IMAP server.
+- Choose which IMAP folder(s) to scan for new mail. This is a multi-select — pick one or more folders, or leave it empty to use provider-aware defaults: INBOX, the `nostr-mail` folder, and (on non-Gmail providers) Archive. The folder list loads from your IMAP server.
+- Spam/junk folders are never scanned as part of the inbox selection; misfiled Nostr mail is handled separately by **Spam Rescue** (see below).
 
 #### Email Preferences
 
 - **Send Matching DM**: Automatically send a DM with the same subject when emailing Nostr contacts
-- **Require Signatures**: Only accept emails with valid signatures
+- **Require Signatures**: Permanently reject incoming emails that claim a Nostr pubkey but whose signature fails to verify (likely forged or tampered) — these are never saved. Plain emails with no Nostr signature are still accepted.
+- **Spam Rescue**: On each sync, automatically move authenticated Nostr-encrypted messages out of your Spam/Junk folder into the rescue folder (encrypted bodies are often misflagged as spam). Use **Rescue into folder** to pick the destination (default `nostr-mail`). When this is **off**, spam folders are still scanned so misfiled Nostr mail continues to appear in your inbox, but nothing is moved — it stays in spam and is eventually auto-purged by your provider. Either way, mail that fails transport authentication (SPF/DKIM) is left in spam. See the [Nostr-Mail Spec](../nostr-mail-spec.md#9-spam-rescue-folder-handling) for the exact behavior.
+- **Auto-file Nostr Mail**: On each sync, move Nostr-encrypted messages found in your Inbox into the rescue folder, consolidating all Nostr mail in one place. Off by default; only the Inbox is affected and it uses the same destination as Spam Rescue.
 - **Hide Undecryptable Emails**: Hide emails that can't be decrypted with your key
 - **Automatically Encrypt**: Encrypt outgoing emails when composing
 - **Automatically Sign**: Sign outgoing emails with your Nostr key
@@ -106,7 +111,7 @@ See [Encryption & Signing](../encryption.md#x-nostr-email-headers) for more on t
 
 #### Sync Settings
 
-- **Sync Cutoff (Days)**: How far back to sync emails on a new device (default: 30 days; set to 0 to sync all)
+- **Messages Scanned Per Folder**: How many messages to scan per folder — both on first sync and each time you scroll to load older mail — surfacing any Nostr mail found. The dedicated `nostr-mail` folder scans deeper by default. (default: 50)
 - **Emails Per Page**: Number of emails per page in the inbox (default: 50, range 10–500)
 
 ### Appearance

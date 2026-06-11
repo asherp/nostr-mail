@@ -2,6 +2,8 @@
 
 The Sent page displays all emails you've sent.
 
+![The Sent page](../assets/screenshots/sent.png)
+
 ## Purpose
 
 View and manage sent email history.

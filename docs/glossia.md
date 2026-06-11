@@ -1,6 +1,6 @@
 # Glossia Encoding
 
-Glossia encodes encrypted ciphertext as **human-readable natural-language text** so that encrypted email survives the normal email lifecycle — forwarding, inline replies, and `>` quoting — without being mangled. The encoded message is sent as ordinary `text/plain`, so no email server, filter, or client needs to know anything special about it.
+Glossia encodes encrypted ciphertext as **human-readable natural-language text** so that encrypted email survives the normal email lifecycle — forwarding, inline replies, and `>` quoting — without being mangled. The encoded payload lives in the email's `text/plain` part — the source of truth — so no email server, filter, or client needs to know anything special about it. nostr-mail also includes a `text/html` rendering aid alongside it (a standard `multipart/alternative`), but that part is purely cosmetic: the `text/plain` glossia content is self-sufficient and is what survives email chains.
 
 This page covers how to use Glossia in nostr-mail. For the reasoning behind the design, see [Glossia Design Philosophy](glossia-design.md) and the [Nostr-Mail Protocol Specification](nostr-mail-spec.md).
 

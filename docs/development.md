@@ -51,7 +51,7 @@ cd tauri-app
 cargo tauri build
 ```
 
-The built application will be in `backend/src-tauri/target/release/`
+The built application will be in `backend/target/release/` (installers under `backend/target/release/bundle/`).
 
 ### Build Targets
 

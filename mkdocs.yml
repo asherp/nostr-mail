@@ -53,6 +53,9 @@ theme:
       icon: material/brightness-4
       name: Switch to light mode
 
+exclude_docs: |
+  assets/screenshots/README.md
+
 plugins:
   - search
 markdown_extensions:
@@ -67,6 +70,11 @@ markdown_extensions:
   - markdown_include.include:
       base_path: docs
   - codehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   # - mkautodoc
 
 extra_javascript: 

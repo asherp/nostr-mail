@@ -2,6 +2,8 @@
 
 The Profile page manages your Nostr profile.
 
+![The Profile page](../assets/screenshots/profile.png)
+
 ## Purpose
 
 Create and update your Nostr profile metadata.

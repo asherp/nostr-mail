@@ -2,6 +2,8 @@
 
 nostr-mail supports **multiple Nostr accounts** on a single install. Your private keys are stored in the operating system's secure keychain rather than in the browser, and you can switch between identities from the account switcher in the sidebar.
 
+![The account switcher](../assets/screenshots/accounts.png)
+
 ## Purpose
 
 Create, import, and switch between Nostr identities, and understand how your private keys are protected.
@@ -53,5 +55,5 @@ In **Settings → Nostr Settings**, each key field has helper buttons:
 
 - Treat your `nsec`/`npriv` like a password manager master key — never paste it into untrusted sites.
 - Use separate accounts to keep personal and public identities apart; each has isolated contacts and settings.
-- When moving to a new device, import the same private key to regain access to your encrypted history (subject to the [sync cutoff](settings.md#sync-settings)).
+- When moving to a new device, import the same private key to regain access to your encrypted history (subject to how many [messages are scanned per folder](settings.md#sync-settings)).
 - Removing an account from the switcher deletes its key from the keychain on this device — make sure you have a backup first.

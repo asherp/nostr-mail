@@ -2,6 +2,8 @@
 
 The Direct Messages page (the **Messages** tab) manages Nostr direct message conversations.
 
+![The Direct Messages page](../assets/screenshots/direct-messages.png)
+
 ## Purpose
 
 Send and receive encrypted direct messages via the Nostr protocol.
@@ -41,7 +43,7 @@ Send and receive encrypted direct messages via the Nostr protocol.
 
 ## Configuration Options
 
-- **Encryption Algorithm**: Choose NIP-44 (recommended) or NIP-04 in Settings → Nostr Settings → Encryption Algorithm
+- **Encryption Algorithm**: Choose NIP-44 (recommended) or NIP-04 in Settings → Advanced → Encryption Algorithm
 - **Relays**: Configure relays in Settings → Relay Settings
 
 ## Tips and Best Practices

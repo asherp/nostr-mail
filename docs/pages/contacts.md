@@ -2,6 +2,8 @@
 
 The Contacts page displays and manages your Nostr contacts.
 
+![The Contacts page](../assets/screenshots/contacts.png)
+
 ## Purpose
 
 View, search, and interact with your Nostr contacts.
@@ -13,8 +15,7 @@ View, search, and interact with your Nostr contacts.
 - **Contact Actions**: Send emails, DMs, or copy public keys
 - **Privacy Management**: Change contact privacy status via profile view
 - **Search**: Search contacts by name
-- **Add Contacts**: Manually add contacts by public key
-- **Export Contacts**: Export contact list as npub list
+- **Add Contacts**: Manually add contacts by public key (npub) or QR scan
 - **Progressive Loading**: Images load progressively for better performance
 
 ## Usage Instructions
@@ -48,11 +49,7 @@ View, search, and interact with your Nostr contacts.
 - Enter a public key (npub format) or scan QR code
 - Contact will be added to your list
 
-### 6. Export Contacts
-
-- Click "Export Contacts" to download a list of all npubs
-
-### 7. Refresh
+### 6. Refresh
 
 - Click "Refresh" to sync contacts from published kind 3 (follow list) events on Nostr relays
 - Contacts found in your published follow list are marked as public
@@ -85,7 +82,6 @@ Privacy status can only be changed when viewing a contact's profile:
 - Profile pictures are cached locally for offline access
 - Only contacts with email addresses appear in the Compose page dropdown
 - Use search to quickly find specific contacts
-- Export contacts to backup your contact list
 - Manually add contacts that aren't in your follow list
 - Ensure relays are configured correctly for contact sync to work properly
 - Contacts sync prioritizes published kind 3 events from relays

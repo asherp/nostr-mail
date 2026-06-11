@@ -12,7 +12,7 @@ nostr-mail uses the same Nostr keypairs (nsec/npriv format) that you use with ot
 1. In Amethyst, navigate to your account settings
 2. Copy your private key (nsec format)
 3. In nostr-mail, go to Settings → Nostr Settings
-4. Paste your private key in the "Import Keypair" field
+4. Paste your private key in the "Private Key" field
 5. Your profile and contacts will sync automatically
 
 ### Damus

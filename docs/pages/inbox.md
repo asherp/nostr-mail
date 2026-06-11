@@ -2,6 +2,8 @@
 
 The Inbox page displays all received emails, with filtering and decryption capabilities.
 
+![The Inbox page](../assets/screenshots/inbox.png)
+
 ## Purpose
 
 View, search, and decrypt received emails from your IMAP server.
@@ -52,6 +54,8 @@ View, search, and decrypt received emails from your IMAP server.
 ## Configuration Options
 
 - **Email Filter**: Choose "Nostr Emails Only" or "All Emails" in Settings → Advanced → Inbox Filter
+- **Inbox Folders**: Choose which IMAP folders are scanned in Settings → Advanced → Inbox Folders (defaults to INBOX, `nostr-mail`, and Archive on non-Gmail providers)
+- **Spam Rescue / Auto-file**: Settings → Advanced → Email Preferences can pull Nostr mail out of Spam and consolidate it into the `nostr-mail` folder so it reliably surfaces here
 - **Hide Undecryptable**: Enable in Settings → Advanced → Hide Undecryptable Emails
 - **Require Signatures**: Enable in Settings → Advanced → Require Signatures
 - **Hide Unverified**: Enable in Settings → Advanced → Hide Unverified

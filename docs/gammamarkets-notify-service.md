@@ -6,11 +6,33 @@
 
 ## 1. Problem
 
-The [GammaMarkets](https://github.com/GammaMarkets) market spec extends NIP-99 into
-a full e-commerce protocol, and [nostr.boutique](https://nostr.boutique) storefronts
-are deployed as **nsites** — static websites whose files live on Blossom servers,
-addressed by a `kind:34128` path→hash map on relays
-([nsite / NIP PR #1538](https://github.com/nostr-protocol/nips/pull/1538)).
+### 1.1 Background: how GammaMarkets works
+
+[GammaMarkets](https://github.com/GammaMarkets) is a collective + specification for
+interoperable, decentralized e-commerce on Nostr (co-developed by Shopstr, Cypher, Plebeian,
+and Conduit). Its [market-spec](https://github.com/GammaMarkets/market-spec) extends
+[NIP-99](https://github.com/nostr-protocol/nips/blob/master/99.md) classified listings into a
+full commerce protocol, with [TypeScript/Zod
+validators](https://github.com/GammaMarkets/nostr-commerce-schema) for each event type. In
+short:
+
+- **Catalog** — merchants publish public, replaceable events: product listings (`kind:30402`),
+  collections (`kind:30405`), shipping options (`kind:30406`), and reviews (`kind:31555`).
+  Tags carry price, stock, images, shipping refs, etc.
+- **Transactions** — buyer↔merchant communication runs over **NIP-17 gift-wrapped DMs**: a
+  single order kind (`kind:16`) with a `type` tag drives the lifecycle (1 = order created,
+  2 = payment request, 3 = status update, 4 = shipping update), plus `kind:17` payment
+  receipts and `kind:14` general order chat.
+- **Payments** — Lightning, eCash, Bitcoin, or fiat; merchant preferences are advertised via
+  `kind:0` and NIP-89.
+- **Storefronts** — [nostr.boutique](https://nostr.boutique) publishes shops as **nsites**:
+  static sites whose files live on Blossom servers, mapped by a `kind:34128` path→hash event
+  on relays ([nsite / NIP PR #1538](https://github.com/nostr-protocol/nips/pull/1538)).
+
+The pieces relevant here: orders and receipts are **already NIP-17 DMs**, and storefronts are
+**static client-side sites**. Both shape the notification design below.
+
+### 1.2 Why a service is needed
 
 An nsite is **pure client-side**: it runs only browser JavaScript (`fetch`, relay
 websockets, a NIP-07 signer). It has **no server**, holds **no secrets**, and cannot

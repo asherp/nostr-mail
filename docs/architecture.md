@@ -1,5 +1,49 @@
 # Architecture
 
+## System Overview
+
+nostr-mail is a Tauri application: a vanilla-JavaScript frontend talks to a Rust
+backend over Tauri's IPC bridge, and the backend owns all I/O — email transport,
+Nostr relays, the OS keychain, and the local SQLite database. The frontend never
+touches the network or secrets directly; every privileged operation is a Tauri
+command.
+
+```mermaid
+flowchart TD
+    subgraph FE["Frontend — vanilla JS (no build step)"]
+        UI["index.html<br/>views &amp; tabs"]
+        APP["app.js / app-state.js<br/>UI logic &amp; state"]
+        SVC["Service modules<br/>email · dm · contacts · crypto · glossia · profile"]
+        TS["tauri-service.js<br/>IPC client"]
+        UI --- APP
+        APP --- SVC
+        SVC --- TS
+    end
+
+    TS -->|"invoke() Tauri commands"| LIB
+
+    subgraph BE["Backend — Rust"]
+        LIB["lib.rs<br/>command handlers + invoke_handler"]
+        EMAIL["email.rs<br/>SMTP send · IMAP fetch/sync · IDLE"]
+        NOSTR["nostr.rs<br/>DMs · profiles · relays · subscriptions"]
+        CRYPTO["crypto.rs<br/>NIP-44/04 · NIP-17 · glossia · signing"]
+        DB["database.rs<br/>SQLite operations"]
+        KC["keychain.rs<br/>private-key vault"]
+        STATE["state.rs<br/>shared app state (clients, caches)"]
+        LIB --- EMAIL
+        LIB --- NOSTR
+        LIB --- CRYPTO
+        LIB --- DB
+        LIB --- KC
+        LIB --- STATE
+    end
+
+    EMAIL -->|"IMAP / SMTP over TLS"| MAIL[("Email servers")]
+    NOSTR -->|"WebSocket (wss)"| RELAYS[("Nostr relays")]
+    DB --> SQLITE[("SQLite<br/>local DB")]
+    KC --> VAULT[("OS keychain<br/>/ Android Keystore")]
+```
+
 ## Project Structure
 
 ```

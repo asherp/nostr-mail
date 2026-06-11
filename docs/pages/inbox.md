@@ -2,6 +2,8 @@
 
 The Inbox page displays all received emails, with filtering and decryption capabilities.
 
+![The Inbox page](../assets/screenshots/inbox.png)
+
 ## Purpose
 
 View, search, and decrypt received emails from your IMAP server.

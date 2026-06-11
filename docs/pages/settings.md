@@ -2,6 +2,8 @@
 
 The Settings page configures all application settings.
 
+![The Settings page](../assets/screenshots/settings.png)
+
 ## Purpose
 
 Configure email, Nostr, relays, and application preferences.

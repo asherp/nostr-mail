@@ -2,6 +2,8 @@
 
 nostr-mail supports **multiple Nostr accounts** on a single install. Your private keys are stored in the operating system's secure keychain rather than in the browser, and you can switch between identities from the account switcher in the sidebar.
 
+![The account switcher](../assets/screenshots/accounts.png)
+
 ## Purpose
 
 Create, import, and switch between Nostr identities, and understand how your private keys are protected.

@@ -2,6 +2,8 @@
 
 The Compose page is where you create and send encrypted emails.
 
+![The Compose page](../assets/screenshots/compose.png)
+
 ## Purpose
 
 Compose and send encrypted emails to recipients, with optional Nostr direct message notifications.

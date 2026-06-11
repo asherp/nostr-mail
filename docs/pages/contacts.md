@@ -2,6 +2,8 @@
 
 The Contacts page displays and manages your Nostr contacts.
 
+![The Contacts page](../assets/screenshots/contacts.png)
+
 ## Purpose
 
 View, search, and interact with your Nostr contacts.

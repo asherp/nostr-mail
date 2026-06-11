@@ -2,6 +2,8 @@
 
 The Direct Messages page (the **Messages** tab) manages Nostr direct message conversations.
 
+![The Direct Messages page](../assets/screenshots/direct-messages.png)
+
 ## Purpose
 
 Send and receive encrypted direct messages via the Nostr protocol.

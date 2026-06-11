@@ -2,6 +2,8 @@
 
 The Drafts page manages saved email drafts.
 
+![The Drafts page](../assets/screenshots/drafts.png)
+
 ## Purpose
 
 View, edit, and manage saved email drafts.

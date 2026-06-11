@@ -59,13 +59,29 @@ and calls `send_email`** — plus auth and a service identity key.
 The endpoint an nsite (or any GammaMarkets backend) codes against. Framework-agnostic:
 the storefront only needs `fetch`.
 
-### Request
+### Authentication (NIP-98)
+
+The caller authenticates each request with a **[NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md)
+HTTP-Auth** token rather than a shared API key. This is essential because an nsite is static
+and **cannot hold a secret** — anything baked into the page is public. With NIP-98 the
+storefront's own Nostr key signs each call, and the service learns *which npub* is calling
+without any shared secret shipping in the static JS.
+
+The nsite obtains the signature in-browser via **[NIP-07](https://nips.nostr.com/7)**
+(`window.nostr.signEvent`) — provided by the visitor's signer extension (nos2x, Alby,
+Nostrame) or a NIP-46 remote signer. nsites can use NIP-07 because they are ordinary browser
+pages; the nsite hosting protocol (kind 34128) is not involved.
 
 ```
 POST /notify
-Authorization: Bearer <API_KEY>
+Authorization: Nostr <base64(kind:27235 event)>   // NIP-98: tags u, method, payload=sha256(body)
 Content-Type: application/json
 ```
+
+The service verifies: kind `27235`, timestamp within ~60s, `u` matches the request URL,
+`method` matches, and `payload` matches `SHA-256(body)`. The signing pubkey is the
+authenticated caller. The service MAY additionally require that caller to be an authorized
+storefront (allowlist) and/or rate-limit per pubkey.
 
 ```jsonc
 {
@@ -103,8 +119,11 @@ Content-Type: application/json
 
 ### Behavior
 
-1. **Authenticate** the `Authorization` bearer token. Reject otherwise (`401`).
-2. **Resolve recipient**: use `recipient_email` if present; else fetch the recipient's
+1. **Authenticate** the NIP-98 token (kind/timestamp/url/method/payload). Reject otherwise
+   (`401`). Optionally check the signing pubkey against an authorized-storefront allowlist.
+2. **Resolve recipient**: use `recipient_email` if present; else consult the private
+   `npub → email` mapping learned from a `reply-to-email` opt-in DM (see §5.1); else fall back
+   to the recipient's
    `kind:0` over `relays` and read the `email` field. If neither yields an address →
    `422 no_email_for_npub`.
 3. **Compose**:
@@ -134,18 +153,33 @@ Content-Type: application/json
 ### nsite integration (the entire client side)
 
 ```js
-await fetch("https://notify.example.com/notify", {
+const url = "https://notify.example.com/notify";
+const body = JSON.stringify({
+  recipient_npub: merchantNpub,
+  type: "order_new",
+  mode: "plaintext",
+  order: { id: orderId, amount_sats: total, item_count: items.length,
+           marketplace_url: orderUrl },
+});
+
+// NIP-98 token, signed by the storefront key via the visitor's NIP-07 signer.
+const authEvent = await window.nostr.signEvent({
+  kind: 27235,
+  created_at: Math.floor(Date.now() / 1000),
+  content: "",
+  tags: [["u", url], ["method", "POST"], ["payload", await sha256Hex(body)]],
+});
+const token = btoa(JSON.stringify(authEvent));
+
+await fetch(url, {
   method: "POST",
-  headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
-  body: JSON.stringify({
-    recipient_npub: merchantNpub,
-    type: "order_new",
-    mode: "plaintext",
-    order: { id: orderId, amount_sats: total, item_count: items.length,
-             marketplace_url: orderUrl },
-  }),
+  headers: { "Content-Type": "application/json", Authorization: `Nostr ${token}` },
+  body,
 });
 ```
+
+No secret ships in the static page — the signer holds the key, and the service verifies the
+signature.
 
 ## 5. Plaintext vs. encrypted
 
@@ -160,17 +194,41 @@ await fetch("https://notify.example.com/notify", {
 Operator config selects the default; callers may request a stronger/weaker mode per call,
 bounded by an operator-set maximum.
 
+### 5.1 Consent & signup via `reply-to-email` DM
+
+The cleanest way for a user to **opt into** notifications is the nostr-mail spec's proposed
+[private email exchange via DM](nostr-mail-spec.md#11-proposed-extension-draft-private-email-address-exchange-via-dm).
+The subscriber sends **one NIP-17 gift-wrapped DM** to the merchant/service pubkey carrying a
+`reply-to-email` tag with purpose `notify`:
+
+```jsonc
+{ "kind": 14,
+  "tags": [["p", "<service_pubkey>"], ["reply-to-email", "alice@example.com", "notify"]],
+  "content": "Subscribe me to order notifications." }
+```
+
+That single message **proves the subscriber's identity** (the NIP-17 seal is signed by their
+real key), **grants consent**, and **privately delivers the address** — so the service never
+needs the address in a public `kind:0`, and never emails an npub that did not ask for it.
+
+This dovetails with §4 resolution: the service prefers a `reply-to-email` mapping learned from
+an authenticated opt-in DM over the public-profile fallback. The same signature primitive (a
+Nostr key signing a structured event) authenticates both signup (the DM seal) and each send
+(the NIP-98 token).
+
 ## 6. Open decisions (for the GammaMarkets operator)
 
 1. **Who hosts it?** A GammaMarkets-operated service (one SMTP sender, server-to-server)
    vs. per-merchant self-host. Determines trust + deliverability (SPF/DKIM on the sender
    domain).
-2. **Auth & anti-abuse.** The endpoint is reachable from public nsite JS. Options:
-   per-storefront API key, rate limiting per `recipient_npub`, and/or requiring a signed
-   NIP-98 HTTP-Auth event from the storefront key so the service can verify the caller
-   is the merchant. **Recommended:** NIP-98 + per-key rate limit.
-3. **Opt-in / consent.** Only email npubs that advertise an `email` in `kind:0` and have
-   opted into notifications (e.g. a profile/preferences tag), to avoid unsolicited mail.
+2. **Auth & anti-abuse.** The endpoint is reachable from public nsite JS, which **cannot
+   hold a secret** — so a baked-in API key is out. Use **NIP-98 HTTP-Auth** (§4): the
+   storefront key signs each call via the visitor's NIP-07 signer, and the service verifies
+   the signature. Layer per-pubkey rate limiting and an optional authorized-storefront
+   allowlist on top. **Recommended:** NIP-98 + per-pubkey rate limit.
+3. **Opt-in / consent.** Prefer the `reply-to-email` opt-in DM (§5.1) as the consent record —
+   an authenticated, private subscription. Fall back to public `kind:0` `email` only if the
+   operator allows it. Never email an npub that has neither opted in nor published an address.
 4. **Service identity key.** Required for encrypted mode; also defines the `From:` Nostr
    identity recipients see. Provision and document its npub.
 5. **Deliverability.** A shared sender domain needs SPF/DKIM/DMARC; otherwise nudges land
@@ -180,18 +238,19 @@ bounded by an operator-set maximum.
 
 Phase 1 — **Plaintext notify microservice**
 - Add `POST /notify` to `bin/http_server.rs` (or a dedicated `bin/notify_server.rs`).
-- Bearer/API-key auth + per-key rate limit.
+- **NIP-98** token verification + per-pubkey rate limit.
 - npub→email resolution via existing `fetch_profile`.
 - Templates per `type`; call `send_email` (plaintext, no encryption).
-- Dockerfile + config (SMTP creds, API keys, default relays) via env.
+- Dockerfile + config (SMTP creds, authorized-storefront allowlist, default relays) via env.
 
-Phase 2 — **Encrypted mode**
-- Service identity key config.
-- NIP-44 encryption of `details` via `crypto.rs`; set `recipient_pubkey` +
-  `include_*_header` on `send_email`.
+Phase 2 — **Consent & encrypted mode**
+- `reply-to-email` opt-in DM ingestion (§5.1): read the tag on unwrapped gift wraps, store the
+  private `npub → email` mapping, prefer it over public `kind:0`.
+- Service identity key config; NIP-44 encryption of `details` via `crypto.rs`; set
+  `recipient_pubkey` + `include_*_header` on `send_email`.
 
-Phase 3 — **Hardening / consent**
-- NIP-98 caller verification, opt-in preference check, observability, abuse controls.
+Phase 3 — **Hardening**
+- Authorized-storefront allowlist, observability, abuse controls, deliverability (SPF/DKIM).
 
 Phase 4 (optional) — **Option B bridge**
 - Always-on relay subscription for `kind:16/17` commerce events → reuse the same notify

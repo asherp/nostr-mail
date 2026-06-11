@@ -389,3 +389,85 @@ There is currently **no dedicated "mark as spam" UI.** A message can only reach 
 ## 10. Versioning
 
 This specification may be extended with additional block types in future versions. Decoders SHOULD ignore unrecognized block types rather than failing.
+
+## 11. Proposed Extension (Draft): Private Email Address Exchange via DM
+
+> **Status:** Non-normative draft. This section is a proposal and is **not** part of the
+> stable protocol yet. Implementations MAY support it; decoders MUST ignore an unrecognized
+> `reply-to-email` tag rather than failing.
+
+### 11.1 Motivation
+
+Today, nostr-mail discovers a recipient's email address from their **public** `kind:0`
+profile `email` field. This is convenient but has two drawbacks: the address is **public**
+(harvestable, permanent), and publishing it is **all-or-nothing** — there is no way to share
+an address with one counterparty only.
+
+This extension lets a user communicate an email address **privately, with consent, and
+authenticated**, by carrying it inside a NIP-17 gift-wrapped direct message instead of (or in
+addition to) the public profile. A NIP-17 DM provides all three properties at once:
+
+| Property | Source |
+|----------|--------|
+| **Private** | the rumor is NIP-44 encrypted; the address never appears in a public event |
+| **Authenticated** | the NIP-17 **seal (kind 13) is signed by the sender's real key**, so the recipient cryptographically verifies who shared the address |
+| **Consent-based** | the address is revealed only to the npub the sender chose to DM |
+
+### 11.2 The `reply-to-email` tag
+
+A sender MAY include one or more `reply-to-email` tags in the **inner rumor** (NIP-17
+`kind:14` chat message) before sealing (`kind:13`) and gift-wrapping (`kind:1059`, NIP-59):
+
+```jsonc
+{
+  "kind": 14,
+  "tags": [
+    ["p", "<recipient_pubkey>"],
+    ["reply-to-email", "alice@example.com"],            // address only
+    ["reply-to-email", "bob@work.example.com", "notify"] // address + purpose hint (optional)
+  ],
+  "content": "..."        // human-readable message (MAY be empty)
+}
+```
+
+**Tag format:** `["reply-to-email", <address>, <purpose?>]`
+
+- `<address>` — an RFC 5322 email address the sender authorizes as a delivery/reply channel
+  for communication with this recipient.
+- `<purpose>` (optional) — a free-form hint such as `notify`, `reply`, or `orders`, scoping
+  how the address should be used. Absent ⇒ general reply/delivery channel.
+
+A message MAY carry multiple `reply-to-email` tags (e.g. different addresses for different
+purposes). The recipient SHOULD treat the most recent authenticated DM as authoritative.
+
+### 11.3 Recipient behavior
+
+On unwrapping a gift-wrapped DM, a recipient that supports this extension:
+
+1. Verifies the seal signature (NIP-17) to authenticate the sender pubkey.
+2. Reads any `reply-to-email` tags and stores a **private, consent-gated**
+   `sender_pubkey → email` mapping, scoped by `<purpose>` if present.
+3. Uses that mapping — in preference to the public `kind:0` `email` — when this extension's
+   consumer (e.g. an email-notification service, or the Compose flow) needs an address for
+   that pubkey.
+
+The mapping is **private to the recipient** and MUST NOT be re-published to a public event.
+Revocation is achieved by sending a newer authenticated DM (e.g. with an empty address, or
+omitting the tag), which the recipient treats as authoritative per §11.2.
+
+### 11.4 Relationship to transport headers
+
+This extension governs **discovery** of an address (how a recipient learns it), not message
+transport. Once an address is known, ordinary nostr-mail email (Sections 2–6) is used, and
+the existing `X-Nostr-Recipient` transport header continues to bind a sent email to its
+intended Nostr recipient. The two are complementary: `reply-to-email` is the consented,
+private *channel announcement*; `X-Nostr-Recipient` is the per-message *binding*.
+
+### 11.5 Use case: notification opt-in
+
+This extension makes notification **signup** a single authenticated message. A user subscribes
+to a merchant's or service's email notifications by sending **one gift-wrapped DM** carrying a
+`reply-to-email` tag with purpose `notify`. That message simultaneously proves the
+subscriber's identity (seal signature), grants consent, and privately delivers the address —
+with no public `kind:0` email required. See
+[GammaMarkets Notify Service](gammamarkets-notify-service.md) for an application of this flow.

@@ -43,7 +43,7 @@ NIP-44 is a modern encryption standard for Nostr that provides:
 
 ## Configuration
 
-You can select the encryption algorithm in Settings → Nostr Settings → Encryption Algorithm:
+You can select the encryption algorithm in Settings → Advanced → Encryption Algorithm:
 - **NIP-44 (Recommended)**: Modern, secure encryption standard
 - **NIP-04 (Legacy)**: Older encryption standard with known issues
 

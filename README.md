@@ -346,11 +346,11 @@ Send and receive encrypted direct messages via the Nostr protocol.
    - Click "Refresh" to reload conversations from relays
 
 #### Configuration Options
-- **Encryption Algorithm**: Choose NIP-44 (recommended) or NIP-04 in Settings → Nostr Settings → Encryption Algorithm
+- **Encryption Algorithm**: Choose NIP-44 (recommended) or NIP-04 in Settings → Advanced → Encryption Algorithm
 - **Relays**: Configure relays in Settings → Relay Settings
 
 #### Tips and Best Practices
-- DMs are encrypted end-to-end using NIP-44
+- DMs are sent as NIP-17 gift-wrapped messages (kind 1059), which hide metadata from relays, with automatic NIP-04 fallback for recipients who haven't published a NIP-17 inbox
 - Conversations are automatically synced from configured relays
 - DMs matching email subjects are marked for easy identification
 - Use DMs for quick Nostr-native communication
@@ -367,8 +367,7 @@ View, search, and interact with your Nostr contacts.
 - **Profile Details**: View complete contact profiles with metadata
 - **Contact Actions**: Send emails, DMs, or copy public keys
 - **Search**: Search contacts by name
-- **Add Contacts**: Manually add contacts by public key
-- **Export Contacts**: Export contact list as npub list
+- **Add Contacts**: Manually add contacts by public key (npub) or QR scan
 - **Progressive Loading**: Images load progressively for better performance
 
 #### Usage Instructions
@@ -397,10 +396,7 @@ View, search, and interact with your Nostr contacts.
    - Enter a public key (npub format) or scan QR code
    - Contact will be added to your list
 
-6. **Export Contacts**:
-   - Click "Export Contacts" to download a list of all npubs
-
-7. **Refresh**:
+6. **Refresh**:
    - Click "Refresh" to reload contacts from Nostr relays
 
 #### Tips and Best Practices
@@ -460,10 +456,10 @@ The Settings page configures all application settings.
 Configure email, Nostr, relays, and application preferences.
 
 #### Key Features
-- **Nostr Settings**: Keypair management, encryption algorithm selection
+- **Nostr Settings**: Account login (import or generate a key)
 - **Email Settings**: SMTP and IMAP configuration
 - **Relay Settings**: Add, remove, and manage Nostr relays
-- **Advanced Settings**: Email preferences, filtering, sync options
+- **Advanced Settings**: Encryption algorithm, Glossia encoding, inbox filtering, email preferences, sync options
 - **Appearance**: Dark mode toggle
 
 #### Usage Instructions
@@ -472,14 +468,11 @@ Configure email, Nostr, relays, and application preferences.
 
 1. **Private Key Management**:
    - Enter your nsec/npriv key or generate a new one
-   - Toggle visibility, copy, or show QR code
+   - Toggle visibility, copy, show a QR code, or scan a QR code from another device
    - Public key (npub) is automatically derived
+   - Keys are stored in the OS secure keychain. Multiple accounts are supported via the account switcher in the sidebar.
 
-2. **Encryption Algorithm**:
-   - Select "NIP-44 (Recommended)" or "NIP-04 (Legacy)"
-   - NIP-44 is the modern, secure standard
-
-3. **Generate Keypair**:
+2. **Generate Keypair**:
    - Click "Generate New Keypair" to create a new keypair
    - Save your private key securely!
 
@@ -511,19 +504,32 @@ Configure email, Nostr, relays, and application preferences.
 
 ##### Advanced Settings
 
-1. **Inbox Filter**:
+1. **Encryption Algorithm**:
+   - Select "NIP-44 (Recommended)" or "NIP-04 (Legacy)"
+   - NIP-44 is the modern, secure standard; incoming mail is decrypted with either scheme automatically
+
+2. **Glossia Encoding**:
+   - Independently choose the encoding (Latin, English – BIP39, or Base64/npub) for the Ciphertext, Signature, and Pubkey components so encrypted mail survives forwarding and reply quoting
+
+3. **Inbox Filter**:
    - Choose "Nostr Emails Only" or "All Emails"
 
-2. **Email Preferences**:
+4. **Inbox Folders**:
+   - Multi-select which IMAP folders to scan. Leave empty for provider-aware defaults (INBOX, `nostr-mail`, and Archive on non-Gmail providers)
+
+5. **Email Preferences**:
    - **Send Matching DM**: Automatically send DM when emailing Nostr contacts
-   - **Require Signatures**: Only accept emails with valid signatures
+   - **Require Signatures**: Reject incoming emails that claim a Nostr pubkey but fail signature verification (plain unsigned emails are still accepted)
+   - **Spam Rescue**: Move Nostr-encrypted mail out of Spam/Junk into a rescue folder (default `nostr-mail`) on each sync
+   - **Auto-file Nostr Mail**: Consolidate Nostr-encrypted mail from the Inbox into the rescue folder (off by default)
    - **Hide Undecryptable Emails**: Hide emails that can't be decrypted
    - **Automatically Encrypt**: Encrypt all outgoing emails
    - **Automatically Sign**: Sign all outgoing emails
    - **Hide Unverified**: Hide messages without verified signatures
+   - **Include X-Nostr-Pubkey / X-Nostr-Sig / X-Nostr-Recipient**: Attach cryptographic metadata as email headers
 
-3. **Sync Settings**:
-   - **Sync Cutoff**: How far back to sync emails (default: 365 days)
+6. **Sync Settings**:
+   - **Messages Scanned Per Folder**: How many messages to scan per folder, on first sync and when scrolling for older mail (default: 50)
    - **Emails Per Page**: Number of emails per page (default: 50)
 
 ##### Appearance
@@ -617,7 +623,7 @@ cd tauri-app
 cargo tauri build
 ```
 
-The built application will be in `backend/src-tauri/target/release/`
+The built application will be in `backend/target/release/` (installers under `backend/target/release/bundle/`).
 
 ### Running Frontend in Browser (Development Mode)
 

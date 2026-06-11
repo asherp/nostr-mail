@@ -94,7 +94,7 @@ cargo tauri dev
 # Build the application
 cargo tauri build
 
-# The built application will be in src-tauri/target/release/
+# The built application will be in backend/target/release/ (installers under backend/target/release/bundle/)
 ```
 
 ### Running Frontend in Browser (Development Mode)

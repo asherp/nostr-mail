@@ -41,7 +41,7 @@ Send and receive encrypted direct messages via the Nostr protocol.
 
 ## Configuration Options
 
-- **Encryption Algorithm**: Choose NIP-44 (recommended) or NIP-04 in Settings → Nostr Settings → Encryption Algorithm
+- **Encryption Algorithm**: Choose NIP-44 (recommended) or NIP-04 in Settings → Advanced → Encryption Algorithm
 - **Relays**: Configure relays in Settings → Relay Settings
 
 ## Tips and Best Practices

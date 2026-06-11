@@ -31,6 +31,7 @@ Nostr-mail aims to improve privacy for the average person by bridging the gap be
 - **Email Preview**: View email list with sender, subject, and preview text
 - **Email Details**: Full email viewing with formatted content
 - **Attachment Support**: Encrypt and send file attachments using hybrid encryption
+- **Spam Rescue**: Automatically move Nostr-encrypted mail that providers misclassify as spam back into your inbox, with optional auto-filing into a dedicated `nostr-mail` folder
 
 ### 🔐 Nostr Integration
 - **Multi-Account Key Management**: Generate and manage multiple Nostr keypairs, stored in the OS secure keychain, with an account switcher

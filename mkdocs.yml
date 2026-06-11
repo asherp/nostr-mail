@@ -29,6 +29,7 @@ nav:
   - Development: development.md
 - Protocol & Specification:
   - Nostr-Mail Spec: nostr-mail-spec.md
+  - GammaMarkets Notify Service: gammamarkets-notify-service.md
   - Glossia Design: glossia-design.md
   - Related Work: related_work.md
 - Legacy Documentation:

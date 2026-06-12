@@ -39,6 +39,18 @@ jobs:
         # Build MkDocs with site_url pointing to /docs/
         mkdocs build --site-dir _site_docs
 
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Build slide deck
+      run: |
+        # Slidev deck served under /slides/; --base rewrites asset URLs
+        cd slides
+        npm ci
+        npx slidev build --base /slides/ --out dist
+
     - name: Assemble final site
       run: |
         mkdir -p _site/docs _site/assets
@@ -52,6 +64,8 @@ jobs:
         cp tauri-app/frontend/assets/nostr-mail-logo-white.png _site/assets/
         # MkDocs docs under /docs/
         cp -r _site_docs/* _site/docs/
+        # Slidev deck under /slides/
+        cp -r slides/dist _site/slides
         # NIP-05 identity: serve /.well-known/nostr.json at the apex domain.
         # .nojekyll keeps GitHub Pages from stripping the dotfile directory.
         touch _site/.nojekyll

@@ -32,7 +32,8 @@ pub const ROLE_SELF: &str = "self";
 /// A single entry in a `RECIPIENTS` block: `<role> <pubkey> <wrapped-cek> [<email>]`
 /// (spec Section 10.2). `pubkey` and `wrapped_cek` are retained exactly as they
 /// appear on the wire (hex/npub for the key, base64 NIP-44 payload for the CEK).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Recipient {
     /// `signer` | `viewer` | `self`, or an unknown future token (lowercased).
     pub role: String,
@@ -66,7 +67,8 @@ impl Recipient {
 /// A `CONSENT` block: a signatory's binding consent to document `H`
 /// (spec Section 11.3). The block carries no signature of its own — the level's
 /// existing SIGNATURE binds it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Consent {
     /// The document hash `H` being consented to, hex (64 chars).
     pub agreement_hash: String,

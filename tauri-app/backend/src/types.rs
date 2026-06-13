@@ -274,6 +274,18 @@ pub struct ParsedArmorMessage {
     pub quoted_armor_text: Option<String>,
     /// Decoded body bytes as base64 (for signature verification without re-decoding)
     pub body_bytes_b64: Option<String>,
+    /// Parsed RECIPIENTS block entries for this level (spec §10.2). Non-empty
+    /// marks the multi-recipient envelope (CEK) decryption path. Populated
+    /// outside the capnp schema, like `prefix_text`/`quoted_armor_text`.
+    #[serde(default)]
+    pub recipients: Vec<crate::agreement::Recipient>,
+    /// Raw RECIPIENTS block body, retained verbatim so the canonical form (and
+    /// thus the document hash `H`) can be recomputed (spec §4.2, §11.3.1).
+    #[serde(default)]
+    pub recipients_text: Option<String>,
+    /// Parsed CONSENT block for this level, if any (spec §11.3).
+    #[serde(default)]
+    pub consent: Option<crate::agreement::Consent>,
 }
 
 /// Per-signature verification result (one per nesting level in the armor chain).

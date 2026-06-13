@@ -2157,6 +2157,11 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
         result.quoted_armor_text = raw_quoted_text;
     }
 
+    // Attach RECIPIENTS/CONSENT (spec §§10–11) per level. These live outside the
+    // capnp schema, so they're parsed from the raw armor text and attached here,
+    // before caching, so cached subtrees carry them too.
+    attach_agreement_blocks(&mut result, &normalized);
+
     debug_log!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
         result.body_type, result.encryption_nip, result.signature_hex.is_some(),
         result.seal_pubkey_hex.is_some(), result.quoted.is_some());
@@ -2184,6 +2189,24 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
         result.encryption_nip, result.quoted.is_some());
 
     Some(result)
+}
+
+/// Attach each level's RECIPIENTS/CONSENT blocks (spec §§10–11) to an already
+/// parsed `ParsedArmorMessage`, walking the raw armor with `split_armor_level`
+/// in lock-step with the parsed `quoted` chain. These blocks live outside the
+/// capnp schema, mirroring how `prefix_text`/`quoted_armor_text` are populated.
+fn attach_agreement_blocks(result: &mut crate::types::ParsedArmorMessage, raw_armor: &str) {
+    if let Some(parts) = split_armor_level(raw_armor) {
+        result.recipients = parts.recipients_text.as_deref()
+            .map(crate::agreement::parse_recipients_block)
+            .unwrap_or_default();
+        result.recipients_text = parts.recipients_text.clone();
+        result.consent = parts.consent_text.as_deref()
+            .and_then(crate::agreement::parse_consent_block);
+        if let (Some(quoted), Some(nested)) = (result.quoted.as_mut(), parts.nested_armor.as_ref()) {
+            attach_agreement_blocks(quoted, nested);
+        }
+    }
 }
 
 /// Populate a capnp ArmorMessage builder from armor text.
@@ -2600,6 +2623,11 @@ fn armor_message_to_serde(reader: crate::nostr_mail_capnp::armor_message::Reader
         quoted,
         quoted_armor_text,
         body_bytes_b64,
+        // RECIPIENTS/CONSENT live outside the capnp schema; attached by
+        // attach_agreement_blocks in parse_armor_components after this conversion.
+        recipients: Vec::new(),
+        recipients_text: None,
+        consent: None,
     }
 }
 
@@ -3030,6 +3058,9 @@ fn decrypt_single_block(
     private_key: &str,
     user_pubkey_hex: &str,
     fallback_pubkey: &str,
+    // RECIPIENTS stanzas for this level (spec §10). Non-empty selects the
+    // multi-recipient envelope (CEK) path instead of pairwise NIP decryption.
+    recipients: &[crate::agreement::Recipient],
 ) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
     use base64::Engine;
 
@@ -3057,6 +3088,63 @@ fn decrypt_single_block(
                 text.len(), &text[..text.len().min(60)]);
         }
         block.decrypted_text = Some(decoded.unwrap_or_else(|| body_text.to_string()));
+        return (block, None);
+    }
+
+    // Multi-recipient envelope path (spec §10): selected by the presence of a
+    // RECIPIENTS block, not a special body tag. Find the reader's stanza,
+    // NIP-44-unwrap the per-message CEK against the sender's pubkey, then
+    // AES-256-GCM-decrypt the body.
+    if !recipients.is_empty() {
+        let me = crate::agreement::normalize_pubkey_hex(user_pubkey_hex)
+            .unwrap_or_else(|| user_pubkey_hex.to_string());
+        // The sender (who wrapped the CEK) is the message author: SIGNATURE,
+        // then SEAL, then the fallback (other-party) pubkey.
+        let sender_pub = match sig_pubkey_hex.or(seal_pubkey_hex)
+            .map(|s| s.to_string())
+            .or_else(|| (!fallback_pubkey.is_empty()).then(|| fallback_pubkey.to_string()))
+        {
+            Some(p) => p,
+            None => {
+                block.error = Some("Envelope message has no sender pubkey for CEK unwrap".to_string());
+                return (block, None);
+            }
+        };
+        let stanza = recipients.iter().find(|r| {
+            crate::agreement::normalize_pubkey_hex(&r.pubkey).as_deref() == Some(me.as_str())
+        });
+        let stanza = match stanza {
+            Some(s) => s,
+            None => {
+                // Expected when reading a level predating the reader's addition
+                // to the thread (spec §10.8).
+                block.error = Some("Not a recipient of this message level (no matching RECIPIENTS stanza)".to_string());
+                return (block, None);
+            }
+        };
+        let cek = match crate::crypto::unwrap_cek(private_key, &sender_pub, &stanza.wrapped_cek) {
+            Ok(c) => c,
+            Err(e) => {
+                block.error = Some(format!("Envelope CEK unwrap failed: {}", e));
+                return (block, None);
+            }
+        };
+        let ciphertext = match decode_armor_section(body_text) {
+            Some(b) => b,
+            None => {
+                block.error = Some("Envelope body decode failed".to_string());
+                return (block, None);
+            }
+        };
+        match crate::crypto::aes_gcm_decrypt_raw(&cek, &ciphertext) {
+            Ok(pt) => {
+                debug_log!("[RUST] decrypt_single_block: envelope decrypt SUCCESS, {} bytes", pt.len());
+                block.decrypted_text = Some(String::from_utf8_lossy(&pt).into_owned());
+            }
+            Err(e) => {
+                block.error = Some(format!("Envelope AES-GCM decrypt failed: {}", e));
+            }
+        }
         return (block, None);
     }
 
@@ -3361,6 +3449,7 @@ fn decrypt_armor_tree(
         private_key,
         user_pubkey_hex,
         fallback_pubkey,
+        &parsed.recipients,
     );
     let block_ms = perf_block.elapsed().as_millis();
     if manifest.is_some() {
@@ -5531,6 +5620,88 @@ nitela\n\
     }
 
     // =============================================
+    // Multi-recipient envelope decryption (spec §10, §8 step 8)
+    // =============================================
+
+    #[test]
+    fn test_envelope_decrypts_for_recipient_and_self() {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // To: signer
+        let carol = crypto::generate_keypair().unwrap();  // Cc: viewer
+        let plaintext = "This Mutual NDA is entered into as of 2026-06-13.";
+
+        let recips = vec![
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.com".into()) },
+            AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: carol.public_key.clone(), email: Some("carol@example.org".into()) },
+        ];
+        let armor = encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
+            "Alice", plaintext.as_bytes(), &recips, false,
+        ).unwrap();
+
+        // Bob (signer) recovers the body.
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "recipient decrypt failed: {:?}", r.error);
+        assert_eq!(r.body, plaintext);
+
+        // Carol (viewer) also recovers the body — role is workflow, not access.
+        let r = decrypt_email_body_pipeline(
+            &carol.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "viewer decrypt failed: {:?}", r.error);
+        assert_eq!(r.body, plaintext);
+
+        // Alice's own Sent copy decrypts via her self stanza.
+        let r = decrypt_email_body_pipeline(
+            &alice.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "self decrypt failed: {:?}", r.error);
+        assert_eq!(r.body, plaintext);
+    }
+
+    #[test]
+    fn test_envelope_non_recipient_cannot_decrypt() {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let mallory = crypto::generate_keypair().unwrap(); // not a recipient
+
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: None,
+        }];
+        let armor = encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, None, "Alice", b"secret terms", &recips, false,
+        ).unwrap();
+
+        let r = decrypt_email_body_pipeline(
+            &mallory.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(!r.success, "a non-recipient must not decrypt the envelope");
+    }
+
+    #[test]
+    fn test_parse_armor_components_exposes_recipients_and_consent() {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.com".into()),
+        }];
+        let armor = encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, Some("alice@x.example"), "Alice", b"terms", &recips, true,
+        ).unwrap();
+
+        let parsed = parse_armor_components(&armor).expect("parses");
+        // Recipients (incl. self) and the originator's consent are surfaced on the struct.
+        assert_eq!(parsed.recipients.len(), 2);
+        assert!(parsed.recipients.iter().any(|r| r.is_signer() && r.email.as_deref() == Some("bob@example.com")));
+        assert!(parsed.consent.is_some(), "originator consent surfaced");
+    }
+
+    // =============================================
     // parse_armor_components tests
     // =============================================
 
@@ -5897,6 +6068,7 @@ nitela\n\
             "plain",
             None, None, None, None,
             "nsec1fake", "aabb", "",
+            &[],
         );
         assert!(!block.was_encrypted);
         assert_eq!(block.decrypted_text.as_deref(), Some("Hello world"));

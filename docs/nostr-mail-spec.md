@@ -1,7 +1,7 @@
 # Nostr-Mail Protocol Specification
 
-**Version:** 0.2.0-draft
-**Date:** 2026-03-26
+**Version:** 0.3.0-draft
+**Date:** 2026-06-13
 
 ## 1. Overview
 
@@ -19,8 +19,11 @@ All Nostr-Mail content is enclosed in ASCII armor blocks using `-----` delimiter
 | `BEGIN NOSTR SIGNED BODY` | Signed plaintext | Plaintext body content |
 | `BEGIN NOSTR SIGNATURE` | Proof of authorship + identity | Schnorr signature (64 bytes) followed by sender's pubkey (32 bytes) |
 | `BEGIN NOSTR SEAL` | Identity declaration | Sender's Nostr public key (unsigned messages only) |
+| `BEGIN NOSTR HYBRID ENCRYPTED BODY` | Multi-recipient encrypted content | AES-256-GCM ciphertext under a per-message Content Encryption Key (CEK) |
+| `BEGIN NOSTR RECIPIENTS` | Recipient key-wrap + roles | Per-recipient NIP-44-wrapped CEK, pubkey, and role |
 | `END NOSTR MESSAGE` | Closing tag | Terminates the outermost block |
 | `END NOSTR SEAL` | Closing tag | Terminates standalone seal blocks |
+| `END NOSTR RECIPIENTS` | Closing tag | Terminates a standalone recipients block |
 
 The encryption type is embedded directly in the BEGIN tag (e.g., `BEGIN NOSTR NIP-44 ENCRYPTED BODY`), keeping the format self-describing without metadata lines.
 
@@ -193,6 +196,60 @@ For reply chains, nesting increases with each level. Signatures close in innermo
 
 Decoders MUST also accept armor block delimiters preceded by `> ` quote prefixes, since email clients may add quote prefixes when forwarding or replying. Glossia decoders naturally ignore quote prefixes as non-payload words.
 
+### 3.6 Multi-Recipient (Group-Encrypted)
+
+When a message has more than one cryptographic recipient — for example multiple `To:` signatories and/or `Cc:` viewers — the body cannot be encrypted with a single pairwise NIP-44 shared secret, because each recipient derives a different secret. Instead the body is encrypted **once** under a random Content Encryption Key (CEK), and the CEK is wrapped to each recipient with NIP-44. This is the same hybrid construction already used for attachments (AES-256 for payload, NIP-44 for the key), generalized to N recipients. The envelope mechanics are normative in Section 10.
+
+```
+----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----
+<AES-256-GCM ciphertext under CEK, base64 or glossia-encoded>
+----- BEGIN NOSTR RECIPIENTS -----
+signer <pubkey-1> <NIP-44-wrapped CEK>
+signer <pubkey-2> <NIP-44-wrapped CEK>
+viewer <pubkey-3> <NIP-44-wrapped CEK>
+self   <sender-pubkey> <NIP-44-wrapped CEK>
+----- BEGIN NOSTR SIGNATURE -----
+@ProfileName
+<signature: glossia-encoded or hex (64 bytes)>
+<pubkey: glossia-encoded, hex, or npub>
+----- END NOSTR MESSAGE -----
+```
+
+Each RECIPIENTS entry is a single line of three space-separated tokens: `<role> <pubkey> <wrapped-cek>` (see Section 10.2). The sender's own `self` stanza makes the Sent copy decryptable on any device, mirroring the "wrap twice" behavior of NIP-17 DMs.
+
+A multi-recipient message SHOULD be signed; the SIGNATURE then covers both the body and the recipients block (Section 4.2), making the membership and role set tamper-evident. An unsigned multi-recipient message MAY instead carry a SEAL block to supply the sender's pubkey for CEK unwrapping, but in that case the role set is unauthenticated and MUST NOT be relied upon to designate required signatories.
+
+#### 3.6.1 Multi-Recipient Reply
+
+Each encrypted level in a reply chain has its own independent CEK, and therefore its own RECIPIENTS block. The recipients block is **not** inherited from an enclosing or enclosed level. This both is cryptographically required (a single block cannot hand out different per-level CEKs) and records the recipient/role set as it stood at each point in the thread.
+
+```
+----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----
+<reply ciphertext under CEK_reply>
+----- BEGIN NOSTR RECIPIENTS -----
+signer <pubkey-1> <CEK_reply wrapped to pubkey-1>
+signer <pubkey-2> <CEK_reply wrapped to pubkey-2>
+self   <reply-author-pubkey> <CEK_reply wrapped to self>
+----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----
+<original ciphertext under CEK_orig>
+----- BEGIN NOSTR RECIPIENTS -----
+signer <pubkey-1> <CEK_orig wrapped to pubkey-1>
+signer <pubkey-2> <CEK_orig wrapped to pubkey-2>
+self   <original-author-pubkey> <CEK_orig wrapped to self>
+----- BEGIN NOSTR SIGNATURE -----
+@OriginalAuthor
+<original signature (64 bytes)>              ← signs: decode(original) || recipients(original)
+<original author pubkey (32 bytes)>
+----- END NOSTR MESSAGE -----
+----- BEGIN NOSTR SIGNATURE -----
+@ReplyAuthor
+<reply signature (64 bytes)>                 ← signs: level(reply) || level(original)
+<reply author pubkey (32 bytes)>
+----- END NOSTR MESSAGE -----
+```
+
+Single-recipient messages are unaffected and continue to use the pairwise `BEGIN NOSTR NIP-44 ENCRYPTED BODY` format with no RECIPIENTS block (Section 10.5).
+
 ## 4. Composable Signing Model
 
 Signing is user-controlled for NIP-44 messages and can be applied at any stage to the current body bytes. **For NIP-04 messages, signing is mandatory** — encoders MUST produce a SIGNATURE block, and decoders MUST reject NIP-04 messages without one (see Section 4.1).
@@ -222,6 +279,24 @@ The Schnorr signature over `SHA-256(ciphertext_bytes)` serves as the authenticat
 **Decode-time requirement**: Decoders MUST verify the signature **before** attempting NIP-04 decryption. If the signature is missing or invalid, the decoder MUST reject the message without decrypting. This verify-then-decrypt ordering is critical — if decryption errors (including padding errors) are surfaced before signature verification, the padding oracle window remains open.
 
 NIP-44 messages are exempt from this requirement because NIP-44 uses ChaCha20 (no padding) with HMAC-SHA256 authentication built in.
+
+### 4.2 Signature Coverage of the Recipients Block
+
+For multi-recipient messages (Section 3.6), the signature MUST cover the RECIPIENTS block in addition to the body, so that the membership list and per-recipient roles cannot be altered without invalidating the signature. The per-level signing contribution becomes:
+
+```
+level(L) = decode(body_L) || canonical(recipients_L)
+```
+
+where `decode(body_L)` is the level's decoded body bytes (as in Section 4) and `canonical(recipients_L)` is the **canonicalized recipients block**: the lines between `BEGIN NOSTR RECIPIENTS` and the following delimiter, each stripped of trailing whitespace and any `> ` quote prefix, joined with `\n`, with no trailing newline. If a level has no RECIPIENTS block, `canonical(recipients_L)` is the empty string and this reduces to the Section 4 model.
+
+The signing target for a level (and its nested levels) is then:
+
+```
+SHA-256( level(L) || level(L-1) || … || level(1) )
+```
+
+This preserves the flat-concatenation, chain-of-custody property of Section 3.5: tampering with any level's body **or** its recipient/role set invalidates that level's signature and every signature above it.
 
 ## 5. Content Encoding (Glossia)
 
@@ -253,6 +328,7 @@ The following custom MIME headers are included for backwards compatibility and f
 |--------|-------|---------|
 | `X-Nostr-Pubkey` | hex or npub (bech32) pubkey | Sender identification |
 | `X-Nostr-Sig` | hex-encoded signature | Message authentication |
+| `X-Nostr-Agreement` | identifier (optional) | Marks an agreement/signing thread for fast IMAP filtering (Section 11.2); non-authoritative |
 
 Decoders MUST accept both hex-encoded and npub (bech32-encoded, `npub1...`) formats for `X-Nostr-Pubkey`. Encoders MAY produce either format.
 
@@ -331,6 +407,21 @@ Since email clients strip `<style>` tags and external stylesheets, all styling M
 - **Signature heading**: `margin: 0 0 0.5em; color: #666; font-size: 0.9em;`
 - **HR separator**: `border: none; border-top: 1px solid #ccc; margin: 1.5em 0;`
 
+### 6.3 Transport Recipients (To / Cc)
+
+The email `To:` and `Cc:` headers carry the transport recipients. For multi-recipient messages, nostr-mail assigns a default cryptographic role from the header a recipient appears in:
+
+| Header | Default role | Meaning |
+|--------|--------------|---------|
+| `To:` | `signer` | Participant expected to sign (a signatory) |
+| `Cc:` | `viewer` | Participant granted read access but not expected to sign |
+
+Both `To:` and `Cc:` recipients receive a NIP-44-wrapped CEK and can decrypt the body — the distinction is one of **role, not access** (a viewer can read the agreement, just isn't asked to sign it). Encoders MUST include a wrapped-CEK stanza in the RECIPIENTS block for every `To:` and `Cc:` recipient (plus a `self` stanza for the sender).
+
+Because email headers are spoofable and may be rewritten on forward (Section 7), the authoritative role for each recipient is the `role` token inside the signed RECIPIENTS block, **not** the header. The headers are a transport convenience and a mirror for non-Nostr-Mail clients. Where the two disagree, decoders MUST trust the signed RECIPIENTS block.
+
+`Bcc:` recipients, if supported, MUST NOT appear in the RECIPIENTS block of the copy sent to other recipients (doing so would disclose the blind recipient); each Bcc recipient instead receives a separately addressed copy.
+
 ## 7. Identity Model
 
 | Layer | Source | Trust Level |
@@ -347,10 +438,14 @@ Since email clients strip `<style>` tags and external stylesheets, all styling M
 4. **Detect** content encoding: base64 (no spaces) vs Glossia (word patterns)
 5. **Decode** content: base64 decode or Glossia transcode -> bytes
 6. **Unpack** NIP-04 if applicable (bitpacked binary -> `base64?iv=base64`)
-7. **Verify** signatures against `SHA-256(decoded_body_bytes)` using the pubkey from the SIGNATURE block
+7. **Verify** signatures against the per-level signing target using the pubkey from the SIGNATURE block
+   - Single-recipient / plaintext: `SHA-256(decoded_body_bytes)` (Section 4)
+   - Multi-recipient (RECIPIENTS block present): include the canonicalized recipients block per Section 4.2
    - For NIP-04: signature MUST be present and MUST verify. If the signature is missing or invalid, the decoder MUST reject the message **without proceeding to step 8** (see Section 4.1)
-   - For NIP-44: signature verification is recommended but not required (NIP-44 provides its own authentication via HMAC)
-8. **Decrypt** if encrypted, using recipient's private key and sender's pubkey
+   - For NIP-44 / hybrid: signature verification is recommended but not required (NIP-44 and AES-256-GCM provide their own authentication via HMAC / GCM tag)
+8. **Decrypt** if encrypted:
+   - **Pairwise** (`NIP-04`/`NIP-44 ENCRYPTED BODY`, no RECIPIENTS): use the recipient's private key and the sender's pubkey
+   - **Multi-recipient** (`HYBRID ENCRYPTED BODY` + RECIPIENTS): locate the stanza whose pubkey matches the reader's own pubkey, NIP-44-unwrap the CEK using the reader's private key and the sender's pubkey, then AES-256-GCM-decrypt the body with the CEK. If no stanza matches the reader's pubkey, the reader is not a recipient of that level and cannot decrypt it (this is expected for levels predating the reader's addition to the thread — see Section 10.8)
 
 ## 9. Spam Rescue & Folder Handling
 
@@ -386,6 +481,127 @@ There is currently **no dedicated "mark as spam" UI.** A message can only reach 
 - Route it through the same `move_message_to_folder` → spam-folder path so it sets `\Seen`; the per-sync rescue (§9.2) will then automatically respect it as a "leave it" signal with no further changes.
 - Reconsider the on-enable catch-up (§9.3): with a real spam-filing action, the catch-up's `unseen_only = false` would *undo* a deliberate spam-filing. At that point the catch-up should likely honor `\Seen` (keep `unseen_only = true`) so it only sweeps provider-misclassified mail, not user-filed spam.
 
-## 10. Versioning
+## 10. Multi-Recipient Encryption (Group Encryption)
 
-This specification may be extended with additional block types in future versions. Decoders SHOULD ignore unrecognized block types rather than failing.
+NIP-44 is pairwise: a ciphertext encrypted with the shared secret of `(senderPriv, recipientPub)` can only be opened by that one recipient (and the sender). To deliver one message to N recipients, nostr-mail uses **envelope encryption** — the same hybrid construction already used for attachments (random AES-256 key for the payload, NIP-44 to wrap the key), generalized from one recipient to many.
+
+### 10.1 Envelope Scheme
+
+```
+1. Generate a random 256-bit Content Encryption Key (CEK).
+2. Encrypt the body ONCE with AES-256-GCM under the CEK            → one HYBRID ENCRYPTED BODY
+   (attachments are encrypted under the same CEK, as today).
+3. For each pubkey P in { To ∪ Cc ∪ sender-self }:
+       wrapped[P] = NIP44_encrypt(CEK, senderPriv, P)             → one RECIPIENTS stanza per P
+4. Emit: [HYBRID ENCRYPTED BODY] + [RECIPIENTS block] + optional [SIGNATURE]
+```
+
+To read the message, a recipient locates the stanza addressed to their own pubkey, NIP-44-unwraps the CEK with their private key and the sender's pubkey, then AES-256-GCM-decrypts the body. The body ciphertext is produced once regardless of recipient count; only the 32-byte CEK is wrapped per recipient.
+
+The sender's pubkey (needed to unwrap the CEK) is taken from the SIGNATURE block, the SEAL block, or the `X-Nostr-Pubkey` header — a multi-recipient message MUST therefore carry one of these.
+
+### 10.2 RECIPIENTS Block Format
+
+The RECIPIENTS block contains one entry per line. Each entry is exactly three space-separated tokens:
+
+```
+<role> <pubkey> <wrapped-cek>
+```
+
+| Field | Encoding | Notes |
+|-------|----------|-------|
+| `role` | `signer` \| `viewer` \| `self` (lowercase token) | See Section 11.1. Unknown roles MUST be ignored for workflow purposes but still treated as recipients for decryption. |
+| `pubkey` | hex (64 chars) or npub (bech32, `npub1…`) | The recipient's Nostr public key. Glossia is **not** used here, to keep entries single-token and line-parseable. |
+| `wrapped-cek` | base64 (NIP-44 payload) | `NIP44_encrypt(CEK)` to `pubkey`. Glossia is not used here. |
+
+Rules:
+
+- Entries SHOULD be ordered deterministically: `To:` recipients in header order, then `Cc:` recipients in header order, then the `self` stanza last. Deterministic ordering keeps the signed canonical form stable across encoders.
+- Display names are intentionally **omitted**; clients resolve names from the Nostr social registry / profile cache by pubkey.
+- Decoders MUST tolerate additional trailing tokens on a line (forward compatibility) and MUST ignore blank lines and `> ` quote prefixes.
+
+### 10.3 Roles
+
+`signer` and `viewer` are the workflow roles (Section 11). `self` is the sender's own wrap, present so the Sent copy is decryptable on any of the sender's devices — it is neither a signatory nor a viewer and MUST be excluded from signatory-completion accounting.
+
+### 10.4 Self-Stanza
+
+Every multi-recipient message MUST include a `self` stanza wrapping the CEK to the sender's own pubkey (`NIP44_encrypt(CEK, senderPriv, senderPub)`). This mirrors the "wrap twice — once to the recipient, once to yourself" behavior of NIP-17 DMs and is what makes sent agreements readable after a fresh install or on a second device.
+
+### 10.5 Single-Recipient Gating & Backward Compatibility
+
+The envelope format is used **only** when a message has more than one cryptographic recipient (i.e. more than one of `To ∪ Cc`, excluding `self`). A message to a single recipient continues to use the pairwise `BEGIN NOSTR NIP-44 ENCRYPTED BODY` format with no RECIPIENTS block, so existing decoders are unaffected.
+
+- Encoders MUST emit the pairwise format for single-recipient messages and the hybrid format for multi-recipient messages.
+- Decoders MUST select the decryption path by block type: `HYBRID ENCRYPTED BODY` ⇒ envelope path (Section 8 step 8, multi-recipient); `NIP-44`/`NIP-04 ENCRYPTED BODY` ⇒ pairwise path.
+- NIP-04 MUST NOT be used as the body cipher for multi-recipient messages (the body cipher is always AES-256-GCM under the CEK, which is authenticated; see Section 4.1 for why unauthenticated CBC is disallowed).
+
+### 10.6 Signature Coverage
+
+When signed, the signature covers the body **and** the canonicalized RECIPIENTS block, per Section 4.2. This authenticates the membership list and each recipient's role, which is required for the agreement workflow (a `viewer` must not be silently re-labeled a `signer`, nor a signatory removed, without breaking the signature).
+
+### 10.7 Replies: Per-Level Recipients
+
+Each encrypted level in a reply chain is encrypted independently and therefore has its **own CEK and its own RECIPIENTS block** (Section 3.6.1). The recipients block is never inherited across levels — it cannot be, since one block cannot distribute multiple per-level CEKs. The common case (reply-all to the same parties) simply repeats the same membership at each level; the per-recipient overhead is one ~100-byte stanza per recipient per level, which is negligible against the body and preserves the property that every level is independently decryptable and verifiable.
+
+### 10.8 Access-Control Consequences
+
+Because each level is sealed under its own CEK wrapped only to that level's listed recipients:
+
+- A reader can decrypt a level **iff** they hold a stanza in that level's RECIPIENTS block.
+- Adding a participant at reply *k* grants them access to level *k* **and forward only**. They cannot read levels `< k`, because the replier does not hold the earlier CEKs and so cannot re-wrap them. This is a deliberate, desirable property: a party added late cannot be silently back-doored into earlier private deliberations.
+- To intentionally share history with a newly added participant, the replier (who *can* decrypt the levels they received) MAY re-wrap each historical CEK to the new pubkey and add the corresponding stanzas — this MUST be an explicit "include history" action, never automatic.
+- Encoders MUST NOT re-encrypt nested historical bodies under a new CEK, as that would discard the original per-level ciphertext and its independent signature, breaking chain-of-custody verification.
+
+### 10.9 Privacy Considerations
+
+The RECIPIENTS block lists each participant's pubkey in the (cleartext) `text/plain` body, so relays/mail servers that see the message learn the participant set. This is no worse than the `To:`/`Cc:` headers, which already expose the email addresses, but it is strictly less private than NIP-59 gift wrap, which hides recipients behind an ephemeral key. A future version MAY define a metadata-private mode that omits pubkey labels and requires readers to trial-decrypt each stanza (as the `age` format does); this is out of scope for v0.3.
+
+## 11. Recipient Roles & Agreement Workflow
+
+This section defines how multi-recipient messages support DocuSign-style agreements: a document distributed to signatories and viewers, signed in rounds, and independently verifiable from the resulting email thread.
+
+### 11.1 Signatory vs Viewer Semantics
+
+| Role | Can decrypt | Expected to sign | Default header |
+|------|-------------|------------------|----------------|
+| `signer` | Yes | Yes | `To:` |
+| `viewer` | Yes | No | `Cc:` |
+| `self` | Yes (sender) | n/a | — |
+
+The role is a **workflow** attribute, not an access attribute — every role can read the agreement. A client uses the role only to decide whether it expects a signature reply from that participant and to compute completion status.
+
+### 11.2 Agreement (Contract) Message
+
+An agreement is initiated as a signed multi-recipient message:
+
+- **Body**: the agreement cover text / terms, in a signed `HYBRID ENCRYPTED BODY`.
+- **Attachment(s)**: the contract document(s), encrypted under the same CEK (existing hybrid-attachment path).
+- **RECIPIENTS**: a `signer` stanza for each required signatory, a `viewer` stanza for each viewer, and the `self` stanza.
+- **SIGNATURE**: the originator's signature, covering body + recipients (Section 4.2), which fixes the set of required signatories and the exact document bytes.
+
+Clients MAY include an `X-Nostr-Agreement` MIME header (boolean/identifier) to let IMAP filtering surface agreement threads without decrypting bodies. The authoritative agreement state always comes from the signed armor blocks, not the header.
+
+### 11.3 Signing Round
+
+A signatory signs by **replying** to the agreement thread (Section 3.5 / 3.6.1):
+
+- The reply nests the prior message unchanged and adds the signatory's SIGNATURE, which — per Section 4.2 / 3.5.0 — covers `level(reply) || level(prior) || …`, i.e. the signatory's own content plus the full nested history including the original document bytes.
+- A signatory's reply therefore cryptographically binds **their identity to the exact agreement and to every signature already in the thread**, giving an ordered, tamper-evident chain of custody.
+- Reply-all preserves the `signer`/`viewer` roles from the prior level so the membership is carried forward (subject to the access rules of Section 10.8).
+
+### 11.4 Completion & Status
+
+An agreement is **complete** when, for every `signer` pubkey declared in the originating message's RECIPIENTS block, the thread contains a valid SIGNATURE from that pubkey over a level that includes the original document bytes. Clients:
+
+- SHOULD compute "M of N signed" by intersecting the declared signatory set with the set of verified signer pubkeys present in the thread.
+- MAY use the `X-Nostr-Sig` / `X-Nostr-Pubkey` headers (Section 6.1) for a fast, decrypt-free progress estimate, but MUST confirm completion against verified in-body signatures.
+- SHOULD NOT count `viewer` or `self` pubkeys toward completion.
+
+### 11.5 Verification
+
+A completed agreement is verifiable offline and without any nostr-mail or SIGit server: a verifier walks the thread, and for each level checks the SIGNATURE against `SHA-256(level(L) || … || level(1))` (Section 4.2) using the pubkey in the SIGNATURE block. If every required signatory's signature verifies over a level covering the original document bytes, the agreement is valid and attributable to those Nostr identities. Tampering with the document, the recipient/role set, or any prior signature invalidates the affected signature and every signature above it.
+
+## 12. Versioning
+
+This specification may be extended with additional block types in future versions. Decoders SHOULD ignore unrecognized block types rather than failing. Unknown `role` tokens in a RECIPIENTS block (Section 10.2) MUST be treated as recipients for decryption while being ignored for workflow accounting, so that future roles do not break older clients.

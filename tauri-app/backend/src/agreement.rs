@@ -256,7 +256,8 @@ pub fn level_signing_bytes(
 }
 
 /// Agreement completion summary (spec Section 11.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgreementStatus {
     /// Number of required signatories with a verified consent over `H`.
     pub m: usize,
@@ -268,6 +269,11 @@ pub struct AgreementStatus {
     pub required_signers: Vec<String>,
     /// The subset of required signatories that have consented, normalized to hex.
     pub consented_signers: Vec<String>,
+    /// The agreement's document hash `H` (hex), set when computed over a thread
+    /// (Section 11.3.1). Empty for the bare [`compute_completion`] primitive,
+    /// which is given the signatory sets directly and does not see the document.
+    #[serde(default)]
+    pub document_hash: String,
 }
 
 /// A proven email↔npub binding (issue #102): the `pubkey` is demonstrably
@@ -321,6 +327,7 @@ pub fn compute_completion(required: &[String], consented: &[String]) -> Agreemen
         complete: n > 0 && m == n,
         required_signers,
         consented_signers,
+        document_hash: String::new(),
     }
 }
 

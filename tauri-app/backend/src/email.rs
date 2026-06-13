@@ -3951,6 +3951,111 @@ pub fn verify_email_binding(thread: &str, my_pubkey: &str) -> Vec<crate::agreeme
     out
 }
 
+/// One armor level's agreement-relevant content, for thread-wide accounting.
+struct ThreadLevel {
+    depth: usize,
+    body_text: String,
+    /// Raw RECIPIENTS block body (needed verbatim to recompute the canonical
+    /// form for the document hash `H`), plus the parsed entries.
+    recipients_text: Option<String>,
+    recipients: Vec<crate::agreement::Recipient>,
+    consent: Option<crate::agreement::Consent>,
+}
+
+/// Recursively collect each level's body / RECIPIENTS / CONSENT (0 = outermost),
+/// using the same `split_armor_level` walk as signing so depths line up with
+/// [`verify_all_signatures_inline`].
+fn collect_thread_levels(armor: &str, depth: usize, out: &mut Vec<ThreadLevel>) {
+    if let Some(parts) = split_armor_level(armor) {
+        out.push(ThreadLevel {
+            depth,
+            body_text: parts.body_text.clone(),
+            recipients: parts.recipients_text.as_deref()
+                .map(crate::agreement::parse_recipients_block)
+                .unwrap_or_default(),
+            recipients_text: parts.recipients_text.clone(),
+            consent: parts.consent_text.as_deref()
+                .and_then(crate::agreement::parse_consent_block),
+        });
+        if let Some(nested) = parts.nested_armor {
+            collect_thread_levels(&nested, depth + 1, out);
+        }
+    }
+}
+
+/// Compute an agreement's "M of N signed" status from a self-contained thread
+/// (spec Section 11.5), offline and server-free.
+///
+/// Returns `None` when the thread is not an agreement (its originating level has
+/// no RECIPIENTS block). Otherwise:
+///   * the **originating** (innermost) level fixes the document hash
+///     `H = SHA-256(decode(body₁) || canonical(recipients₁))` (Section 11.3.1)
+///     and the required signatory set — its `signer` stanzas, plus the
+///     originator iff the originating level itself carries a CONSENT block
+///     (Section 11.2);
+///   * a signatory counts as consented only via a CONSENT block over this `H`
+///     whose `signer` equals that level's **verified** SIGNATURE pubkey
+///     (Sections 11.3, 11.5) — a signed comment without consent never counts.
+pub fn verify_agreement_status(thread: &str) -> Option<crate::agreement::AgreementStatus> {
+    let mut levels: Vec<ThreadLevel> = Vec::new();
+    collect_thread_levels(thread, 0, &mut levels);
+
+    // The originating message is the innermost (deepest) level.
+    let orig = levels.iter().max_by_key(|l| l.depth)?;
+    let orig_recipients_text = orig.recipients_text.as_deref()?; // not an agreement otherwise
+
+    // Per-level verified signer pubkey (hex), keyed by depth.
+    let sigs = verify_all_signatures_inline(thread);
+    let signer_at = |depth: usize| -> Option<(String, bool)> {
+        sigs.iter().find(|s| s.depth == depth).and_then(|s| {
+            s.pubkey_hex.as_deref()
+                .and_then(crate::agreement::normalize_pubkey_hex)
+                .map(|h| (h, s.is_valid))
+        })
+    };
+
+    // H over the originating body + canonicalized recipients (excludes consent).
+    let body_bytes = decode_armor_section(&orig.body_text)?;
+    let canon_recipients = crate::agreement::canonicalize_block(orig_recipients_text);
+    let h = hex::encode(crate::agreement::document_hash(&body_bytes, &canon_recipients));
+
+    // Required signatories: originating `signer` stanzas (+ originator if the
+    // originating level itself consented).
+    let mut required: Vec<String> = orig.recipients.iter()
+        .filter(|r| r.is_signer())
+        .map(|r| r.pubkey.clone())
+        .collect();
+    if orig.consent.is_some() {
+        if let Some((orig_signer, _valid)) = signer_at(orig.depth) {
+            required.push(orig_signer);
+        }
+    }
+
+    // Consents: a CONSENT over H, whose signer matches that level's *verified*
+    // signature pubkey.
+    let mut consented: Vec<String> = Vec::new();
+    for level in &levels {
+        let consent = match &level.consent { Some(c) => c, None => continue };
+        if !consent.agreement_hash.eq_ignore_ascii_case(&h) {
+            continue;
+        }
+        let (signer_hex, valid) = match signer_at(level.depth) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !valid {
+            continue; // consent bound by an invalid signature does not count
+        }
+        if crate::agreement::normalize_pubkey_hex(&consent.signer).as_deref() == Some(signer_hex.as_str()) {
+            consented.push(signer_hex);
+        }
+    }
+
+    let mut status = crate::agreement::compute_completion(&required, &consented);
+    status.document_hash = h;
+    Some(status)
+}
+
 /// Extract message ID from email headers
 pub fn extract_message_id_from_headers(raw_headers: &str) -> Option<String> {
     // Try multiple patterns to find Message-ID
@@ -5331,6 +5436,98 @@ nitela\n\
         let challenge = issue_challenge(&alice, &bob.public_key, "bob@example.com");
         let reply = build_signed_reply(&bob, &challenge);
         assert!(verify_email_binding(&reply, &bob.public_key).is_empty());
+    }
+
+    // =============================================
+    // Agreement completion status (spec §11.5)
+    // =============================================
+
+    /// Alice originates an agreement she's also a signatory of (she consents),
+    /// with Bob as the other required signer.
+    fn originate_agreement(alice: &crate::types::KeyPair, bob_pub: &str) -> String {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob_pub.to_string(), email: None,
+        }];
+        encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, None, "Alice",
+            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true,
+        ).unwrap()
+    }
+
+    /// Read the document hash H out of a message's CONSENT block.
+    fn hash_from_consent(armor: &str) -> String {
+        let body: String = armor.lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR CONSENT")).skip(1)
+            .take_while(|l| !l.contains("BEGIN NOSTR")).collect::<Vec<_>>().join("\n");
+        crate::agreement::parse_consent_block(&body).unwrap().agreement_hash
+    }
+
+    /// Build a consenting reply: nests the prior message, adds the responder's
+    /// CONSENT over H, signed over the §4.2 chain target.
+    fn build_consent_reply(responder: &crate::types::KeyPair, prior_armor: &str, h: &str) -> String {
+        let responder_hex = crate::agreement::normalize_pubkey_hex(&responder.public_key).unwrap();
+        let reply_b64 = general_purpose::STANDARD.encode(b"I agree to the terms.");
+        let template = format!(
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n\
+            ----- BEGIN NOSTR CONSENT -----\nagreement {}\nsigner    {}\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n@Responder\nSIGPLACEHOLDER\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            reply_b64, h, responder_hex, prior_armor, responder_hex
+        );
+        let bytes = extract_ciphertext_binary(&template);
+        let sig = crypto::sign_data_bytes(&responder.private_key, &bytes).unwrap();
+        template.replace("SIGPLACEHOLDER", &sig)
+    }
+
+    #[test]
+    fn test_agreement_status_complete_when_all_consent() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let agreement = originate_agreement(&alice, &bob.public_key);
+        let h = hash_from_consent(&agreement);
+        let reply = build_consent_reply(&bob, &agreement, &h);
+
+        let status = verify_agreement_status(&reply).expect("is an agreement");
+        assert_eq!((status.m, status.n), (2, 2), "originator + signer both consented");
+        assert!(status.complete);
+        assert_eq!(status.document_hash, h);
+    }
+
+    #[test]
+    fn test_agreement_status_comment_does_not_count() {
+        // Bob replies without a CONSENT block (a comment): only Alice has consented.
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let agreement = originate_agreement(&alice, &bob.public_key);
+        let reply = build_signed_reply(&bob, &agreement); // no consent block
+
+        let status = verify_agreement_status(&reply).expect("is an agreement");
+        assert_eq!((status.m, status.n), (1, 2), "comment without consent is not counted");
+        assert!(!status.complete);
+    }
+
+    #[test]
+    fn test_agreement_status_tampered_consent_hash_not_counted() {
+        // Bob consents to the wrong document hash → his consent must not count.
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let agreement = originate_agreement(&alice, &bob.public_key);
+        let wrong_h = "00".repeat(32);
+        let reply = build_consent_reply(&bob, &agreement, &wrong_h);
+
+        let status = verify_agreement_status(&reply).expect("is an agreement");
+        assert_eq!((status.m, status.n), (1, 2), "consent over the wrong H is ignored");
+        assert!(!status.complete);
+    }
+
+    #[test]
+    fn test_agreement_status_none_for_non_agreement() {
+        // A plain pairwise message (no RECIPIENTS block) is not an agreement.
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        assert!(verify_agreement_status(body).is_none());
     }
 
     // =============================================

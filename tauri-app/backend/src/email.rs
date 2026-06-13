@@ -1753,64 +1753,141 @@ pub fn decode_armor_section(content: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// Parse armor structure with depth counting, separating outermost body from nested armor.
-/// Returns (body_text, nested_armor) where nested_armor has one level of "> " prefix stripped.
-/// Handles both non-quoted nested armor (reply chains) and > quoted nested armor.
-fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
+/// The constituent parts of a single armor level, separated from the body's
+/// armor region. Per spec Section 11.3.2 the on-wire order within a level is
+/// body → RECIPIENTS → CONSENT → nested(inner) → SIGNATURE stack.
+struct ArmorLevelParts {
+    /// The level's body content (ciphertext / encoded plaintext), with the
+    /// RECIPIENTS and CONSENT blocks removed.
+    body_text: String,
+    /// Raw RECIPIENTS block body (the lines between its BEGIN and the following
+    /// delimiter), if present (spec Section 10.2).
+    recipients_text: Option<String>,
+    /// Raw CONSENT block body, if present (spec Section 11.3).
+    consent_text: Option<String>,
+    /// The nested (quoted) inner armor, with one level of `> ` prefix stripped,
+    /// ready for recursive parsing. `None` for a leaf level.
+    nested_armor: Option<String>,
+}
+
+fn level_is_begin_body(l: &str) -> bool {
+    let t = l.trim().trim_matches('-').trim();
+    t.starts_with("BEGIN NOSTR NIP-")
+        || t.starts_with("BEGIN NOSTR SIGNED")
+        || t.starts_with("BEGIN NOSTR HYBRID")
+}
+fn level_is_begin_recipients(l: &str) -> bool {
+    l.trim().trim_matches('-').trim() == "BEGIN NOSTR RECIPIENTS"
+}
+fn level_is_begin_consent(l: &str) -> bool {
+    l.trim().trim_matches('-').trim() == "BEGIN NOSTR CONSENT"
+}
+fn level_is_begin_sig_or_seal(l: &str) -> bool {
+    let t = l.trim().trim_matches('-').trim();
+    t == "BEGIN NOSTR SIGNATURE" || t == "BEGIN NOSTR SEAL"
+}
+fn level_is_end_recipients(l: &str) -> bool {
+    l.trim().trim_matches('-').trim() == "END NOSTR RECIPIENTS"
+}
+fn level_is_end_consent(l: &str) -> bool {
+    l.trim().trim_matches('-').trim() == "END NOSTR CONSENT"
+}
+/// A message-closing END (`END NOSTR MESSAGE`, legacy `END NOSTR NIP-XX …`, or
+/// `END NOSTR SEAL`) — but NOT the standalone RECIPIENTS/CONSENT terminators,
+/// which must not affect nesting depth.
+fn level_is_end_message(l: &str) -> bool {
+    let t = l.trim().trim_matches('-').trim();
+    t.starts_with("END NOSTR") && t != "END NOSTR RECIPIENTS" && t != "END NOSTR CONSENT"
+}
+
+/// Split one armor level into its body, RECIPIENTS, CONSENT, and nested-armor
+/// parts (spec Sections 10–11). This is the shared primitive behind
+/// [`parse_armor_depth`] and [`extract_ciphertext_binary`]; both must agree on
+/// what counts as "the body" so that signing and verification stay consistent.
+///
+/// Existing single-recipient / plaintext messages carry no RECIPIENTS or CONSENT
+/// blocks, so `recipients_text`/`consent_text` are `None` and `body_text` is
+/// byte-identical to the legacy behavior.
+fn split_armor_level(body: &str) -> Option<ArmorLevelParts> {
     let body = body.replace("\r\n", "\n");
     let lines: Vec<&str> = body.lines().collect();
 
-    let contains_begin_body = |l: &str| {
-        l.contains("BEGIN NOSTR NIP-") || l.contains("BEGIN NOSTR SIGNED")
-    };
-    let contains_sig_seal = |l: &str| {
-        l.contains("BEGIN NOSTR SIGNATURE") || l.contains("BEGIN NOSTR SEAL")
-    };
-    let contains_end = |l: &str| l.contains("END NOSTR");
-
+    #[derive(PartialEq)]
+    enum S { Before, Body, Recipients, Consent, Nested }
+    let mut state = S::Before;
     let mut depth: i32 = 0;
-    let mut in_body = false;
-    let mut in_nested = false;
     let mut body_lines: Vec<&str> = Vec::new();
+    let mut recipients_lines: Vec<&str> = Vec::new();
+    let mut consent_lines: Vec<&str> = Vec::new();
     let mut nested_lines: Vec<&str> = Vec::new();
 
     for line in &lines {
-        if !in_body && !in_nested {
-            if contains_begin_body(line) {
-                depth = 1;
-                in_body = true;
+        match state {
+            S::Before => {
+                if level_is_begin_body(line) {
+                    depth = 1;
+                    state = S::Body;
+                }
             }
-            continue;
-        }
-
-        if in_body {
-            if contains_begin_body(line) {
-                depth += 1;
-                in_nested = true;
-                in_body = false;
+            S::Body => {
+                if level_is_begin_body(line) {
+                    depth = 2;
+                    state = S::Nested;
+                    nested_lines.push(line);
+                } else if level_is_begin_recipients(line) {
+                    state = S::Recipients;
+                } else if level_is_begin_consent(line) {
+                    state = S::Consent;
+                } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
+                    break;
+                } else {
+                    body_lines.push(line);
+                }
+            }
+            S::Recipients => {
+                if level_is_begin_body(line) {
+                    depth = 2;
+                    state = S::Nested;
+                    nested_lines.push(line);
+                } else if level_is_begin_consent(line) {
+                    state = S::Consent;
+                } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
+                    break;
+                } else if level_is_end_recipients(line) {
+                    state = S::Body;
+                } else {
+                    recipients_lines.push(line);
+                }
+            }
+            S::Consent => {
+                if level_is_begin_body(line) {
+                    depth = 2;
+                    state = S::Nested;
+                    nested_lines.push(line);
+                } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
+                    break;
+                } else if level_is_end_consent(line) {
+                    state = S::Body;
+                } else {
+                    consent_lines.push(line);
+                }
+            }
+            S::Nested => {
                 nested_lines.push(line);
-                continue;
-            }
-            if depth == 1 && (contains_sig_seal(line) || contains_end(line)) {
-                break;
-            }
-            body_lines.push(line);
-            continue;
-        }
-
-        if in_nested {
-            nested_lines.push(line);
-            if contains_begin_body(line) {
-                depth += 1;
-            }
-            if contains_end(line) {
-                depth -= 1;
-                if depth == 1 {
-                    in_nested = false;
-                    in_body = true;
+                if level_is_begin_body(line) {
+                    depth += 1;
+                } else if level_is_end_message(line) {
+                    depth -= 1;
+                    if depth == 1 {
+                        state = S::Body;
+                    }
                 }
             }
         }
+    }
+
+    if state == S::Before {
+        return None;
     }
 
     let body_text = body_lines.join("\n").trim().to_string();
@@ -1818,7 +1895,16 @@ fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
         return None;
     }
 
-    let nested = if nested_lines.is_empty() {
+    let join_opt = |v: &[&str]| -> Option<String> {
+        if v.is_empty() {
+            None
+        } else {
+            let s = v.join("\n").trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+    };
+
+    let nested_armor = if nested_lines.is_empty() {
         None
     } else {
         let stripped: Vec<&str> = nested_lines.iter().map(|l| {
@@ -1826,10 +1912,25 @@ fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
             else if *l == ">" { "" }
             else { *l }
         }).collect();
-        Some(stripped.join("\n").trim().to_string())
+        let s = stripped.join("\n").trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
     };
 
-    Some((body_text, nested))
+    Some(ArmorLevelParts {
+        body_text,
+        recipients_text: join_opt(&recipients_lines),
+        consent_text: join_opt(&consent_lines),
+        nested_armor,
+    })
+}
+
+/// Parse armor structure with depth counting, separating outermost body from nested armor.
+/// Returns (body_text, nested_armor) where nested_armor has one level of "> " prefix stripped.
+/// Handles both non-quoted nested armor (reply chains) and > quoted nested armor.
+/// RECIPIENTS / CONSENT blocks (spec Sections 10–11) are excluded from `body_text`.
+fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
+    let parts = split_armor_level(body)?;
+    Some((parts.body_text, parts.nested_armor))
 }
 
 /// Decode a combined 96-byte signature+pubkey block.
@@ -2120,10 +2221,9 @@ fn populate_armor_from_text(
     // ── Phase A: Line extraction (state machine) ──
     let lines: Vec<&str> = normalized[armor_start..].lines().collect();
 
-    let is_begin_body = |l: &str| -> bool {
-        let t = l.trim().trim_matches('-').trim();
-        t.starts_with("BEGIN NOSTR NIP-") || t.starts_with("BEGIN NOSTR SIGNED")
-    };
+    let is_begin_body = |l: &str| -> bool { level_is_begin_body(l) };
+    let is_begin_recipients = |l: &str| -> bool { level_is_begin_recipients(l) };
+    let is_begin_consent = |l: &str| -> bool { level_is_begin_consent(l) };
     let is_begin_sig = |l: &str| -> bool {
         let t = l.trim().trim_matches('-').trim();
         t == "BEGIN NOSTR SIGNATURE"
@@ -2132,10 +2232,9 @@ fn populate_armor_from_text(
         let t = l.trim().trim_matches('-').trim();
         t == "BEGIN NOSTR SEAL"
     };
-    let is_end = |l: &str| -> bool {
-        let t = l.trim().trim_matches('-').trim();
-        t.starts_with("END NOSTR")
-    };
+    // Message-closing END only — RECIPIENTS/CONSENT standalone terminators must
+    // not affect nesting depth (spec Sections 10.2, 11.3).
+    let is_end = |l: &str| -> bool { level_is_end_message(l) };
 
     let mut depth: i32 = 0;
     let mut state = "before";
@@ -2144,6 +2243,11 @@ fn populate_armor_from_text(
     let mut quoted_armor_lines: Vec<&str> = Vec::new();
     let mut sig_lines: Vec<&str> = Vec::new();
     let mut seal_lines: Vec<&str> = Vec::new();
+    // RECIPIENTS / CONSENT block bodies (spec Sections 10–11). Captured here so
+    // body_text stays clean; serde exposure / capnp storage follows in a later
+    // phase.
+    let mut recipients_lines: Vec<&str> = Vec::new();
+    let mut consent_lines: Vec<&str> = Vec::new();
 
     for line in &lines {
         match state {
@@ -2159,6 +2263,10 @@ fn populate_armor_from_text(
                     depth += 1;
                     state = "quoted";
                     quoted_armor_lines.push(line);
+                } else if is_begin_recipients(line) && depth == 1 {
+                    state = "recipients";
+                } else if is_begin_consent(line) && depth == 1 {
+                    state = "consent";
                 } else if is_begin_sig(line) && depth == 1 {
                     state = "sig";
                 } else if is_begin_seal(line) && depth == 1 {
@@ -2167,6 +2275,42 @@ fn populate_armor_from_text(
                     state = "done";
                 } else {
                     body_lines.push(line);
+                }
+            }
+            "recipients" => {
+                if is_begin_body(line) {
+                    depth += 1;
+                    state = "quoted";
+                    quoted_armor_lines.push(line);
+                } else if is_begin_consent(line) && depth == 1 {
+                    state = "consent";
+                } else if is_begin_sig(line) && depth == 1 {
+                    state = "sig";
+                } else if is_begin_seal(line) && depth == 1 {
+                    state = "seal";
+                } else if level_is_end_recipients(line) {
+                    state = "body";
+                } else if is_end(line) && depth == 1 {
+                    state = "done";
+                } else {
+                    recipients_lines.push(line);
+                }
+            }
+            "consent" => {
+                if is_begin_body(line) {
+                    depth += 1;
+                    state = "quoted";
+                    quoted_armor_lines.push(line);
+                } else if is_begin_sig(line) && depth == 1 {
+                    state = "sig";
+                } else if is_begin_seal(line) && depth == 1 {
+                    state = "seal";
+                } else if level_is_end_consent(line) {
+                    state = "body";
+                } else if is_end(line) && depth == 1 {
+                    state = "done";
+                } else {
+                    consent_lines.push(line);
                 }
             }
             "quoted" => {
@@ -2189,6 +2333,9 @@ fn populate_armor_from_text(
             _ => {}
         }
     }
+    // Keep the captured blocks observable to the compiler until serde/capnp
+    // wiring lands; deliberately unused for now.
+    let _ = (&recipients_lines, &consent_lines);
 
     if state == "before" {
         debug_log!("[RUST] populate_armor_from_text: state machine never left 'before'");
@@ -3538,12 +3685,25 @@ pub fn decrypt_attachment_pipeline(
 /// decoded bytes from all levels (matching the JS signing behavior).
 /// For non-armored bodies: returns the UTF-8 bytes of the body text.
 pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
-    // Use depth-counting parser to properly handle nested reply armor
-    if let Some((body_text, nested_armor)) = parse_armor_depth(body) {
-        if let Some(mut bytes) = decode_armor_section(&body_text) {
-            if let Some(ref nested) = nested_armor {
+    // Use depth-counting parser to properly handle nested reply armor.
+    // The per-level signing contribution is body || canonical(recipients) ||
+    // canonical(consent) (spec Section 4.2); levels are concatenated outermost
+    // → innermost, matching Sections 3.5.0 / 3.6.1. For messages with no
+    // RECIPIENTS/CONSENT blocks (the common case) this reduces to decode(body)
+    // and is byte-identical to the legacy behavior.
+    if let Some(parts) = split_armor_level(body) {
+        if let Some(body_bytes) = decode_armor_section(&parts.body_text) {
+            let canon_recipients = parts.recipients_text.as_deref()
+                .map(crate::agreement::canonicalize_block)
+                .unwrap_or_default();
+            let canon_consent = parts.consent_text.as_deref()
+                .map(crate::agreement::canonicalize_block)
+                .unwrap_or_default();
+            let mut bytes = crate::agreement::level_signing_bytes(
+                &body_bytes, &canon_recipients, &canon_consent);
+            if let Some(ref nested) = parts.nested_armor {
                 let nested_bytes = extract_ciphertext_binary(nested);
-                debug_log!("[RUST] extract_ciphertext_binary: concatenating {} outer + {} nested bytes",
+                debug_log!("[RUST] extract_ciphertext_binary: concatenating {} outer (body+recipients+consent) + {} nested bytes",
                     bytes.len(), nested_bytes.len());
                 bytes.extend_from_slice(&nested_bytes);
             }
@@ -4794,6 +4954,153 @@ nitela\n\
         let result = extract_ciphertext_binary(&body);
         assert_eq!(result, original_bytes,
             "glossia body should decode correctly with combined signature block");
+    }
+
+    // =============================================
+    // Multi-recipient / agreement armor (spec §§10–11)
+    // =============================================
+
+    // hex pubkey for a generated keypair (verify_signature_bytes accepts hex/npub).
+    fn pubkey_hex(npub: &str) -> String {
+        crate::agreement::normalize_pubkey_hex(npub).expect("valid npub")
+    }
+
+    #[test]
+    fn test_split_armor_level_separates_recipients_and_consent() {
+        let body = "----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n\
+            QUJDREVG\n\
+            ----- BEGIN NOSTR RECIPIENTS -----\n\
+            signer aa bb\n\
+            self cc dd\n\
+            ----- BEGIN NOSTR CONSENT -----\n\
+            agreement deadbeef\n\
+            signer aa\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n\
+            sig pub\n\
+            ----- END NOSTR MESSAGE -----";
+        let parts = split_armor_level(body).expect("should split");
+        assert_eq!(parts.body_text, "QUJDREVG");
+        assert_eq!(parts.recipients_text.as_deref(), Some("signer aa bb\nself cc dd"));
+        assert_eq!(parts.consent_text.as_deref(), Some("agreement deadbeef\nsigner aa"));
+        assert!(parts.nested_armor.is_none());
+    }
+
+    #[test]
+    fn test_split_armor_level_no_blocks_matches_legacy_body() {
+        // A plain single-recipient message: body_text is exactly the ciphertext,
+        // and there are no recipients/consent blocks.
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8=\n\
+            ----- END NOSTR MESSAGE -----";
+        let parts = split_armor_level(body).expect("should split");
+        assert_eq!(parts.body_text, "SGVsbG8=");
+        assert!(parts.recipients_text.is_none());
+        assert!(parts.consent_text.is_none());
+        assert!(parts.nested_armor.is_none());
+    }
+
+    #[test]
+    fn test_extract_ciphertext_binary_includes_recipients_and_consent() {
+        // Section 4.2: level(L) = decode(body) || canonical(recipients) || canonical(consent)
+        let body_bytes = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let b64 = general_purpose::STANDARD.encode(&body_bytes);
+        let recipients = "signer aa bb\nself cc dd";
+        let consent = "agreement H\nsigner aa";
+        let body = format!(
+            "----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n{}\n\
+            ----- BEGIN NOSTR RECIPIENTS -----\n{}\n\
+            ----- BEGIN NOSTR CONSENT -----\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            b64, recipients, consent
+        );
+        let got = extract_ciphertext_binary(&body);
+        let expected = crate::agreement::level_signing_bytes(
+            &body_bytes,
+            &crate::agreement::canonicalize_block(recipients),
+            &crate::agreement::canonicalize_block(consent),
+        );
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_multi_recipient_signed_message_verifies_section_4_2() {
+        // Build a multi-recipient HYBRID message and sign over the Section 4.2 target,
+        // then confirm in-body verification succeeds and tampering breaks it.
+        let alice = crypto::generate_keypair().unwrap();
+        let alice_pub_hex = pubkey_hex(&alice.public_key);
+
+        let body_bytes = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let b64 = general_purpose::STANDARD.encode(&body_bytes);
+        let recipients = format!("signer {} wrapA\nself {} wrapS", alice_pub_hex, alice_pub_hex);
+
+        let signing_bytes = crate::agreement::level_signing_bytes(
+            &body_bytes,
+            &crate::agreement::canonicalize_block(&recipients),
+            "",
+        );
+        let sig_hex = crypto::sign_data_bytes(&alice.private_key, &signing_bytes).unwrap();
+
+        let body = format!(
+            "----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n{}\n\
+            ----- BEGIN NOSTR RECIPIENTS -----\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n{}\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            b64, recipients, sig_hex, alice_pub_hex
+        );
+
+        assert_eq!(verify_email_signature_inline(&body), Some(true),
+            "multi-recipient signature must verify over body+recipients");
+
+        // Tamper a recipient role (signer→viewer): the canonical recipients block
+        // changes, so the signature must no longer verify (membership is bound).
+        let tampered = body.replacen(
+            &format!("signer {} wrapA", alice_pub_hex),
+            &format!("viewer {} wrapA", alice_pub_hex),
+            1,
+        );
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false),
+            "re-labeling a signatory as viewer must invalidate the signature");
+    }
+
+    #[test]
+    fn test_agreement_consent_message_verifies_and_tamper_detected() {
+        // A signatory's consenting reply: CONSENT block bound by the level signature.
+        let alice = crypto::generate_keypair().unwrap();
+        let alice_pub_hex = pubkey_hex(&alice.public_key);
+
+        let body_bytes = b"This Mutual NDA is entered into as of 2026-06-13.".to_vec();
+        let b64 = general_purpose::STANDARD.encode(&body_bytes);
+        let recipients = format!("signer {} wrapA\nself {} wrapS", alice_pub_hex, alice_pub_hex);
+        let canon_recipients = crate::agreement::canonicalize_block(&recipients);
+
+        // H = SHA-256(body || canonical(recipients)) — excludes consent (§11.3.1).
+        let h = crate::agreement::document_hash(&body_bytes, &canon_recipients);
+        let consent = format!("agreement {}\nsigner    {}", hex::encode(h), alice_pub_hex);
+        let canon_consent = crate::agreement::canonicalize_block(&consent);
+
+        let signing_bytes = crate::agreement::level_signing_bytes(
+            &body_bytes, &canon_recipients, &canon_consent);
+        let sig_hex = crypto::sign_data_bytes(&alice.private_key, &signing_bytes).unwrap();
+
+        let body = format!(
+            "----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n{}\n\
+            ----- BEGIN NOSTR RECIPIENTS -----\n{}\n\
+            ----- BEGIN NOSTR CONSENT -----\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n{}\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            b64, recipients, consent, sig_hex, alice_pub_hex
+        );
+
+        assert_eq!(verify_email_signature_inline(&body), Some(true),
+            "consent message must verify over body+recipients+consent");
+
+        // Tamper the consented document hash → signature must fail.
+        let tampered = body.replacen(&hex::encode(h), &"00".repeat(32), 1);
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false),
+            "altering the consented document hash must invalidate the signature");
     }
 
     // =============================================

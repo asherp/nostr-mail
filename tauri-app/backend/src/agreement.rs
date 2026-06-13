@@ -13,11 +13,14 @@
 //!   * agreement completion accounting — "M of N signatories signed"
 //!     (Section 11.5).
 //!
-//! These are pure functions over already-extracted block text; the actual
+//! Most of these are pure functions over already-extracted block text; the
 //! envelope encryption/decryption uses the primitives in [`crate::crypto`]
-//! (`generate_cek`, `aes_gcm_encrypt_raw`, `wrap_cek`, `unwrap_cek`). Wiring
-//! these into the recursive armor parser/encoder lives in `email.rs`.
+//! (`generate_cek`, `aes_gcm_encrypt_raw`, `wrap_cek`, `unwrap_cek`).
+//! [`encode_hybrid_agreement`] composes them into a complete multi-recipient
+//! armor message. Wiring into the recursive armor *parser* lives in `email.rs`.
 
+use anyhow::Result;
+use base64::{engine::general_purpose, Engine as _};
 use sha2::{Digest, Sha256};
 
 /// Workflow role tokens used in a RECIPIENTS stanza (spec Section 10.2 / 11.1).
@@ -286,6 +289,122 @@ pub fn compute_completion(required: &[String], consented: &[String]) -> Agreemen
     }
 }
 
+/// A cryptographic recipient for [`encode_hybrid_agreement`]: a `To:`/`Cc:`
+/// party with a role (`signer` for `To:`, `viewer` for `Cc:`; spec Section 6.3)
+/// and their Nostr pubkey (hex or npub). The `self` stanza is added automatically
+/// by the encoder, so it MUST NOT be passed here.
+#[derive(Debug, Clone)]
+pub struct AgreementRecipientInput {
+    pub role: String,
+    pub pubkey: String,
+}
+
+/// Compose a complete multi-recipient (group-encrypted) armor message — the
+/// hybrid envelope of spec Sections 10–11.
+///
+/// The body is AES-256-GCM-encrypted once under a fresh CEK; the CEK is NIP-44
+/// wrapped to every recipient plus a trailing `self` stanza (Section 10.1, 10.4).
+/// When `originator_consents` is true, the originator is themselves a required
+/// signatory and a CONSENT block over the document hash `H` is included
+/// (Section 11.2). The SIGNATURE covers body + recipients + consent per
+/// Section 4.2, so membership, roles, and consent are all tamper-evident.
+///
+/// `recipients_in` should already be ordered `To:` (signers) then `Cc:`
+/// (viewers) to match the deterministic ordering of Section 10.2; the `self`
+/// stanza is appended last. Returns the armored `text/plain` payload.
+///
+/// This composes the *cryptographic* envelope; glossia prose encoding of the
+/// body/signature (Section 5) is applied by the caller's send pipeline if
+/// desired — here the body is emitted as base64 and the signature/pubkey as hex,
+/// both of which decoders accept.
+pub fn encode_hybrid_agreement(
+    sender_priv: &str,
+    sender_pub: &str,
+    profile_name: &str,
+    body_plaintext: &[u8],
+    recipients_in: &[AgreementRecipientInput],
+    originator_consents: bool,
+) -> Result<String> {
+    if recipients_in.is_empty() {
+        return Err(anyhow::anyhow!(
+            "encode_hybrid_agreement requires at least one recipient (use the pairwise format for single-recipient messages)"
+        ));
+    }
+    let sender_pub_hex = normalize_pubkey_hex(sender_pub)
+        .ok_or_else(|| anyhow::anyhow!("invalid sender pubkey"))?;
+
+    // 1–2. Encrypt the body once under a fresh CEK (Section 10.1 steps 1–2).
+    let cek = crate::crypto::generate_cek();
+    let ciphertext = crate::crypto::aes_gcm_encrypt_raw(&cek, body_plaintext)?;
+    let body_b64 = general_purpose::STANDARD.encode(&ciphertext);
+
+    // 3. Wrap the CEK to each recipient, then to self (Section 10.1 step 3, 10.4).
+    let mut recipients: Vec<Recipient> = Vec::with_capacity(recipients_in.len() + 1);
+    for r in recipients_in {
+        let wrapped = crate::crypto::wrap_cek(sender_priv, &r.pubkey, &cek)?;
+        recipients.push(Recipient {
+            role: r.role.to_ascii_lowercase(),
+            pubkey: r.pubkey.clone(),
+            wrapped_cek: wrapped,
+        });
+    }
+    let self_wrapped = crate::crypto::wrap_cek(sender_priv, &sender_pub_hex, &cek)?;
+    recipients.push(Recipient {
+        role: ROLE_SELF.to_string(),
+        pubkey: sender_pub_hex.clone(),
+        wrapped_cek: self_wrapped,
+    });
+
+    let recipients_body = serialize_recipients(&recipients);
+    let canon_recipients = canonicalize_block(&recipients_body);
+
+    // The signed body bytes are the decoded armor body = the ciphertext bytes
+    // (decode_armor_section base64-decodes the emitted body), matching §4/§4.2.
+    let body_decoded = &ciphertext;
+
+    // 4. Optional originator CONSENT over H (Sections 11.2, 11.3.1).
+    let (consent_body, canon_consent) = if originator_consents {
+        let h = document_hash(body_decoded, &canon_recipients);
+        let consent = Consent {
+            agreement_hash: hex::encode(h),
+            signer: sender_pub_hex.clone(),
+        };
+        let body = consent.to_block_body();
+        let canon = canonicalize_block(&body);
+        (Some(body), canon)
+    } else {
+        (None, String::new())
+    };
+
+    // 5. Sign the §4.2 per-level target: body || recipients || consent.
+    let signing_bytes = level_signing_bytes(body_decoded, &canon_recipients, &canon_consent);
+    let sig_hex = crate::crypto::sign_data_bytes(sender_priv, &signing_bytes)?;
+
+    // 6. Assemble the armor (body → RECIPIENTS → [CONSENT] → SIGNATURE; §11.3.2).
+    let mut out = String::new();
+    out.push_str("----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n");
+    out.push_str(&body_b64);
+    out.push('\n');
+    out.push_str("----- BEGIN NOSTR RECIPIENTS -----\n");
+    out.push_str(&recipients_body);
+    out.push('\n');
+    if let Some(ref cbody) = consent_body {
+        out.push_str("----- BEGIN NOSTR CONSENT -----\n");
+        out.push_str(cbody);
+        out.push('\n');
+    }
+    out.push_str("----- BEGIN NOSTR SIGNATURE -----\n");
+    out.push('@');
+    out.push_str(profile_name);
+    out.push('\n');
+    out.push_str(&sig_hex);
+    out.push('\n');
+    out.push_str(&sender_pub_hex);
+    out.push('\n');
+    out.push_str("----- END NOSTR MESSAGE -----");
+    Ok(out)
+}
+
 /// Normalize each pubkey to hex (dropping any that fail to parse) and dedup,
 /// preserving first-seen order.
 fn dedup_normalized(pubkeys: &[String]) -> Vec<String> {
@@ -500,5 +619,122 @@ mod tests {
         let status = compute_completion(&[], &[]);
         assert_eq!((status.m, status.n), (0, 0));
         assert!(!status.complete);
+    }
+
+    // ── encode_hybrid_agreement round-trips ──────────────────────────────
+
+    /// Recover the body from an encoded message as a given reader (by unwrapping
+    /// the matching RECIPIENTS stanza and AES-GCM-decrypting). Returns the bytes.
+    fn reader_recovers_body(armor: &str, reader_priv: &str, reader_pub_hex: &str, sender_pub_hex: &str) -> Vec<u8> {
+        // Extract the base64 body (line after the HYBRID BEGIN).
+        let body_b64 = armor
+            .lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR HYBRID"))
+            .nth(1)
+            .expect("body line")
+            .trim()
+            .to_string();
+        let ciphertext = general_purpose::STANDARD.decode(body_b64).expect("b64 body");
+
+        // Extract the RECIPIENTS block body.
+        let recip_body: String = armor
+            .lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR RECIPIENTS"))
+            .skip(1)
+            .take_while(|l| !l.contains("BEGIN NOSTR"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let recips = parse_recipients_block(&recip_body);
+        let stanza = recips
+            .iter()
+            .find(|r| normalize_pubkey_hex(&r.pubkey).as_deref() == Some(reader_pub_hex))
+            .expect("reader has a stanza");
+        let cek = crate::crypto::unwrap_cek(reader_priv, sender_pub_hex, &stanza.wrapped_cek).unwrap();
+        crate::crypto::aes_gcm_decrypt_raw(&cek, &ciphertext).unwrap()
+    }
+
+    #[test]
+    fn test_encode_hybrid_agreement_roundtrip_two_recipients() {
+        let sender = crate::crypto::generate_keypair().unwrap();
+        let sender_pub_hex = crate::crypto::get_public_key_from_private(&sender.private_key).unwrap();
+        let sender_pub_hex = normalize_pubkey_hex(&sender_pub_hex).unwrap();
+        let alice = crate::crypto::generate_keypair().unwrap();
+        let bob = crate::crypto::generate_keypair().unwrap();
+        let alice_hex = normalize_pubkey_hex(&alice.public_key).unwrap();
+        let bob_hex = normalize_pubkey_hex(&bob.public_key).unwrap();
+
+        let body = b"This Mutual NDA is entered into as of 2026-06-13.";
+        let recips = vec![
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone() },
+            AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: bob.public_key.clone() },
+        ];
+        let armor = encode_hybrid_agreement(
+            &sender.private_key, &sender.public_key, "Originator", body, &recips, false,
+        ).unwrap();
+
+        // Structure: hybrid body, recipients (incl. self last), no consent.
+        assert!(armor.contains("BEGIN NOSTR HYBRID ENCRYPTED BODY"));
+        assert!(armor.contains("BEGIN NOSTR RECIPIENTS"));
+        assert!(!armor.contains("BEGIN NOSTR CONSENT"));
+        let recip_body: String = armor
+            .lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR RECIPIENTS"))
+            .skip(1)
+            .take_while(|l| !l.contains("BEGIN NOSTR"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = parse_recipients_block(&recip_body);
+        assert_eq!(parsed.len(), 3, "two recipients + self");
+        assert_eq!(parsed[2].role, ROLE_SELF, "self stanza is last");
+
+        // Each party (incl. self) recovers the exact body.
+        assert_eq!(reader_recovers_body(&armor, &alice.private_key, &alice_hex, &sender_pub_hex), body);
+        assert_eq!(reader_recovers_body(&armor, &bob.private_key, &bob_hex, &sender_pub_hex), body);
+        assert_eq!(reader_recovers_body(&armor, &sender.private_key, &sender_pub_hex, &sender_pub_hex), body);
+    }
+
+    #[test]
+    fn test_encode_hybrid_agreement_with_consent_has_matching_h() {
+        let sender = crate::crypto::generate_keypair().unwrap();
+        let sender_pub_hex = normalize_pubkey_hex(
+            &crate::crypto::get_public_key_from_private(&sender.private_key).unwrap()).unwrap();
+        let alice = crate::crypto::generate_keypair().unwrap();
+
+        let body = b"terms";
+        let recips = vec![
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone() },
+        ];
+        let armor = encode_hybrid_agreement(
+            &sender.private_key, &sender.public_key, "Originator", body, &recips, true,
+        ).unwrap();
+
+        assert!(armor.contains("BEGIN NOSTR CONSENT"));
+        let consent_body: String = armor
+            .lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR CONSENT"))
+            .skip(1)
+            .take_while(|l| !l.contains("BEGIN NOSTR"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let consent = parse_consent_block(&consent_body).expect("consent parses");
+        assert_eq!(normalize_pubkey_hex(&consent.signer).unwrap(), sender_pub_hex);
+
+        // The consent's H must equal SHA-256(ciphertext || canonical(recipients)).
+        let body_b64 = armor.lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR HYBRID")).nth(1).unwrap().trim();
+        let ciphertext = general_purpose::STANDARD.decode(body_b64).unwrap();
+        let recip_body: String = armor.lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR RECIPIENTS")).skip(1)
+            .take_while(|l| !l.contains("BEGIN NOSTR")).collect::<Vec<_>>().join("\n");
+        let h = document_hash(&ciphertext, &canonicalize_block(&recip_body));
+        assert_eq!(consent.agreement_hash, hex::encode(h));
+    }
+
+    #[test]
+    fn test_encode_hybrid_agreement_rejects_empty_recipients() {
+        let sender = crate::crypto::generate_keypair().unwrap();
+        let err = encode_hybrid_agreement(
+            &sender.private_key, &sender.public_key, "X", b"x", &[], false);
+        assert!(err.is_err());
     }
 }

@@ -5103,6 +5103,37 @@ nitela\n\
             "altering the consented document hash must invalidate the signature");
     }
 
+    #[test]
+    fn test_encoded_hybrid_agreement_verifies_through_email_path() {
+        // Cross-module round-trip: the agreement encoder's output must verify
+        // through the email signature path (spec §4.2).
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
+        let sender = crypto::generate_keypair().unwrap();
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+
+        let recips = vec![
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone() },
+            AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: bob.public_key.clone() },
+        ];
+        let armor = encode_hybrid_agreement(
+            &sender.private_key, &sender.public_key, "Originator",
+            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true,
+        ).unwrap();
+
+        assert_eq!(verify_email_signature_inline(&armor), Some(true),
+            "encoder output must verify through the §4.2 email signature path");
+
+        let sigs = verify_all_signatures_inline(&armor);
+        assert_eq!(sigs.len(), 1);
+        assert!(sigs[0].is_valid);
+
+        // The parser must keep the body clean of the RECIPIENTS/CONSENT blocks.
+        let parsed = parse_armor_components(&armor).expect("parses");
+        assert!(!parsed.body_text.contains("signer "));
+        assert!(!parsed.body_text.contains("agreement "));
+    }
+
     // =============================================
     // parse_armor_components tests
     // =============================================

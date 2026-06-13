@@ -21,6 +21,7 @@
 
 use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Workflow role tokens used in a RECIPIENTS stanza (spec Section 10.2 / 11.1).
@@ -267,6 +268,27 @@ pub struct AgreementStatus {
     pub required_signers: Vec<String>,
     /// The subset of required signatories that have consented, normalized to hex.
     pub consented_signers: Vec<String>,
+}
+
+/// A proven email↔npub binding (issue #102): the `pubkey` is demonstrably
+/// controlled by a party who also demonstrated read access to `email`.
+///
+/// The proof is a self-contained thread, so this verdict is **stateless** —
+/// re-derivable from the message alone, with no outstanding-challenge store. The
+/// issuer asserted the `(pubkey, email)` pairing in a RECIPIENTS stanza of a
+/// level *they* signed; the holder of `pubkey` proved control + read access by
+/// signing an outer level that quotes (nests) that signed challenge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Binding {
+    /// The bound party's Nostr pubkey, hex — proven controlled (reply signature).
+    pub pubkey: String,
+    /// The address bound to `pubkey` — asserted by the issuer in a signed
+    /// RECIPIENTS stanza, proven by the reply's delivery/read access.
+    pub email: String,
+    /// The pubkey (hex) of the party who issued the challenge and asserted the
+    /// pairing (the verifier's own key, for an issuer-side verification).
+    pub issuer_pubkey: String,
 }
 
 /// Compute "M of N signed" completion (spec Section 11.5).

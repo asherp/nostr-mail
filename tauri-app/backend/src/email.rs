@@ -3861,6 +3861,96 @@ fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types
     results
 }
 
+/// Recursively collect each armor level's RECIPIENTS stanzas, keyed by nesting
+/// depth (0 = outermost). Uses the same `split_armor_level` walk as the signing
+/// path, so depths line up with [`verify_all_signatures_inline`].
+fn collect_level_recipients(armor: &str, depth: usize, out: &mut Vec<(usize, Vec<crate::agreement::Recipient>)>) {
+    if let Some(parts) = split_armor_level(armor) {
+        let recips = parts.recipients_text.as_deref()
+            .map(crate::agreement::parse_recipients_block)
+            .unwrap_or_default();
+        out.push((depth, recips));
+        if let Some(nested) = parts.nested_armor {
+            collect_level_recipients(&nested, depth + 1, out);
+        }
+    }
+}
+
+/// Verify email↔npub bindings provable from a single self-contained thread —
+/// **statelessly** (issue #102). There is no outstanding-challenge store: because
+/// a reply nests the issuer's own signed challenge, "I issued this" is re-derived
+/// by checking that the email-asserting level is signed by `my_pubkey`. This makes
+/// the verdict a pure function of mailbox contents, so a fresh client reconstructs
+/// all bindings by re-scanning (mirroring the stateless §9.1 spam-rescue design).
+///
+/// A binding `(R, email)` is returned iff, in the same thread:
+///   1. every signature in the chain verifies (chain integrity, §4.2); and
+///   2. some level signed by `my_pubkey` carries a RECIPIENTS stanza pairing `R`
+///      with `email` (the issuer's authenticated assertion); and
+///   3. an **outer** level (nesting that challenge) is signed by `R` — proving
+///      `R` controls the npub and received/read the challenge.
+///
+/// `my_pubkey` is the verifier's own key (hex or npub) — this is the issuer-side
+/// check; the reverse binding (when the counterparty asserted *your* address in a
+/// level they signed) is the symmetric call with their key.
+pub fn verify_email_binding(thread: &str, my_pubkey: &str) -> Vec<crate::agreement::Binding> {
+    let me = match crate::agreement::normalize_pubkey_hex(my_pubkey) {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+
+    // 1. Chain integrity: every in-thread signature must verify (§4.2). A single
+    //    broken signature (e.g. a tampered (npub,email) pairing) voids the proof.
+    let sigs = verify_all_signatures_inline(thread);
+    if sigs.is_empty() || sigs.iter().any(|s| !s.is_valid) {
+        return Vec::new();
+    }
+    let signer_at = |depth: usize| -> Option<String> {
+        sigs.iter()
+            .find(|s| s.depth == depth)
+            .and_then(|s| s.pubkey_hex.as_deref())
+            .and_then(crate::agreement::normalize_pubkey_hex)
+    };
+
+    // 2. Per-level recipient stanzas.
+    let mut levels: Vec<(usize, Vec<crate::agreement::Recipient>)> = Vec::new();
+    collect_level_recipients(thread, 0, &mut levels);
+
+    // 3. For each level I signed, each emailed recipient R who also signed an
+    //    outer (quoting) level ⇒ proven binding.
+    let mut out: Vec<crate::agreement::Binding> = Vec::new();
+    for (depth, recips) in &levels {
+        if signer_at(*depth).as_deref() != Some(me.as_str()) {
+            continue; // not a level I (the issuer) signed
+        }
+        for r in recips {
+            let email = match &r.email {
+                Some(e) => e,
+                None => continue,
+            };
+            let r_hex = match crate::agreement::normalize_pubkey_hex(&r.pubkey) {
+                Some(h) => h,
+                None => continue,
+            };
+            if r_hex == me {
+                continue; // skip the issuer's own (self) stanza
+            }
+            let replied = (0..*depth).any(|d| signer_at(d).as_deref() == Some(r_hex.as_str()));
+            if replied {
+                let binding = crate::agreement::Binding {
+                    pubkey: r_hex.clone(),
+                    email: email.clone(),
+                    issuer_pubkey: me.clone(),
+                };
+                if !out.contains(&binding) {
+                    out.push(binding);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Extract message ID from email headers
 pub fn extract_message_id_from_headers(raw_headers: &str) -> Option<String> {
     // Try multiple patterns to find Message-ID
@@ -5157,6 +5247,90 @@ nitela\n\
         let tampered = armor.replacen("alice@example.com", "attacker@evil.test", 1);
         assert_eq!(verify_email_signature_inline(&tampered), Some(false),
             "re-pairing an npub to a different email must invalidate the signature");
+    }
+
+    // =============================================
+    // Stateless email↔npub binding verification (issue #102)
+    // =============================================
+
+    /// Build Bob's signed reply nesting Alice's challenge unchanged, signing over
+    /// the §4.2 chain target (extract_ciphertext_binary ignores signature blocks,
+    /// so we can compute the target from a placeholder armor then substitute).
+    fn build_signed_reply(responder: &crate::types::KeyPair, challenge_armor: &str) -> String {
+        let responder_hex = crate::agreement::normalize_pubkey_hex(&responder.public_key).unwrap();
+        let reply_b64 = general_purpose::STANDARD.encode(b"Confirmed - same terms.");
+        let template = format!(
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n@Responder\nSIGPLACEHOLDER\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            reply_b64, challenge_armor, responder_hex
+        );
+        let bytes = extract_ciphertext_binary(&template);
+        let sig = crypto::sign_data_bytes(&responder.private_key, &bytes).unwrap();
+        template.replace("SIGPLACEHOLDER", &sig)
+    }
+
+    fn issue_challenge(alice: &crate::types::KeyPair, bob_pub: &str, bob_email: &str) -> String {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob_pub.to_string(), email: Some(bob_email.into()),
+        }];
+        encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
+            "Alice", b"Please confirm you control this address.", &recips, false,
+        ).unwrap()
+    }
+
+    #[test]
+    fn test_verify_email_binding_completed_handshake() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_hex = crate::agreement::normalize_pubkey_hex(&alice.public_key).unwrap();
+        let bob_hex = crate::agreement::normalize_pubkey_hex(&bob.public_key).unwrap();
+
+        let challenge = issue_challenge(&alice, &bob.public_key, "bob@example.com");
+        let reply = build_signed_reply(&bob, &challenge);
+
+        let bindings = verify_email_binding(&reply, &alice.public_key);
+        assert_eq!(bindings.len(), 1, "exactly one binding proven");
+        assert_eq!(bindings[0], crate::agreement::Binding {
+            pubkey: bob_hex,
+            email: "bob@example.com".into(),
+            issuer_pubkey: alice_hex,
+        });
+    }
+
+    #[test]
+    fn test_verify_email_binding_requires_a_reply() {
+        // A single inbound challenge is never a sufficient proof — no reply, no binding.
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let challenge = issue_challenge(&alice, &bob.public_key, "bob@example.com");
+        assert!(verify_email_binding(&challenge, &alice.public_key).is_empty());
+    }
+
+    #[test]
+    fn test_verify_email_binding_tampered_pairing_voids_proof() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let challenge = issue_challenge(&alice, &bob.public_key, "bob@example.com");
+        let reply = build_signed_reply(&bob, &challenge);
+
+        // Re-pair Bob's npub to an attacker mailbox inside the (signed) challenge.
+        let tampered = reply.replacen("bob@example.com", "attacker@evil.test", 1);
+        assert!(verify_email_binding(&tampered, &alice.public_key).is_empty(),
+            "a tampered (npub,email) pairing breaks the chain and yields no binding");
+    }
+
+    #[test]
+    fn test_verify_email_binding_wrong_issuer_perspective() {
+        // From Bob's perspective there is no level *he* signed asserting an email,
+        // so the same thread proves no binding for him (it's an issuer-side check).
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let challenge = issue_challenge(&alice, &bob.public_key, "bob@example.com");
+        let reply = build_signed_reply(&bob, &challenge);
+        assert!(verify_email_binding(&reply, &bob.public_key).is_empty());
     }
 
     // =============================================

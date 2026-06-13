@@ -3122,6 +3122,12 @@ fn decrypt_single_block(
                 return (block, None);
             }
         };
+        if stanza.wrapped_cek == crate::agreement::NO_CEK {
+            // Plaintext (public) agreement stanza carries no CEK; an ENCRYPTED
+            // BODY paired with such a stanza is malformed (spec §11.8).
+            block.error = Some("RECIPIENTS stanza has no CEK ('-') but the body is encrypted".to_string());
+            return (block, None);
+        }
         let cek = match crate::crypto::unwrap_cek(private_key, &sender_pub, &stanza.wrapped_cek) {
             Ok(c) => c,
             Err(e) => {
@@ -3803,6 +3809,112 @@ pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
     // Non-armored body: return UTF-8 bytes
     debug_log!("[RUST] extract_ciphertext_binary: plain text, {} bytes", body.len());
     body.as_bytes().to_vec()
+}
+
+/// Glossia-encode plaintext for a `SIGNED BODY` (spec §3.2): returns the encoded
+/// words and the canonical decoded bytes the signature is computed over (§4).
+/// Uses the english/bip39 body dialect, matching the rest of the decode path.
+fn glossia_encode_signed_body(text: &str) -> Option<(String, Vec<u8>)> {
+    let hex_input = glossia::hex_encode(text.as_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        glossia::encode_into_language(
+            &hex_input, "english", "bip39", "body",
+            None, 42, false, None, None, None, None,
+        )
+    }));
+    let encoded = match result {
+        Ok(Ok((enc, _, _, _))) => enc,
+        _ => return None,
+    };
+    let canonical = try_glossia_decode_to_bytes(&encoded)?;
+    Some((encoded, canonical))
+}
+
+/// Compose a **plaintext (public) agreement** — the unencrypted counterpart to
+/// `agreement::encode_hybrid_agreement` (spec §11.8). The terms are carried in a
+/// signed `SIGNED BODY` (readable by any client, with the plaintext also above
+/// the armor per §3.2), and the RECIPIENTS block declares the signatories/viewers
+/// with the `-` no-CEK sentinel (`agreement::NO_CEK`) since nothing is encrypted.
+///
+/// The document hash `H`, consent binding, signature coverage (§4.2), and
+/// completion accounting (§11.5) are identical to the encrypted case — they
+/// operate on the decoded body bytes regardless of cipher — so the agreement is
+/// verifiable offline by **anyone**, not just recipients. The trade-off vs the
+/// encrypted form is confidentiality: the terms and participant set are public.
+///
+/// `recipients_in` are the signatories (`signer`) and viewers (`viewer`); no
+/// `self` stanza is emitted (there is nothing to decrypt). When
+/// `originator_consents` is true the originator's CONSENT over `H` is included
+/// (the originator is then a required signatory, §11.2).
+pub fn encode_signed_agreement(
+    sender_priv: &str,
+    sender_pub: &str,
+    profile_name: &str,
+    terms_plaintext: &str,
+    recipients_in: &[crate::agreement::AgreementRecipientInput],
+    originator_consents: bool,
+) -> Result<String, String> {
+    use crate::agreement::{
+        canonicalize_block, document_hash, level_signing_bytes, serialize_recipients,
+        Consent, Recipient, NO_CEK,
+    };
+    if recipients_in.is_empty() {
+        return Err("encode_signed_agreement requires at least one signatory".to_string());
+    }
+    let sender_pub_hex = crate::agreement::normalize_pubkey_hex(sender_pub)
+        .ok_or_else(|| "invalid sender pubkey".to_string())?;
+
+    let (encoded_body, canonical_bytes) = glossia_encode_signed_body(terms_plaintext)
+        .ok_or_else(|| "glossia encode of agreement terms failed".to_string())?;
+
+    // Signatories/viewers with no key wrap (plaintext): role pubkey - [email].
+    let recipients: Vec<Recipient> = recipients_in.iter().map(|r| Recipient {
+        role: r.role.to_ascii_lowercase(),
+        pubkey: r.pubkey.clone(),
+        wrapped_cek: NO_CEK.to_string(),
+        email: r.email.clone(),
+    }).collect();
+    let recipients_body = serialize_recipients(&recipients);
+    let canon_recipients = canonicalize_block(&recipients_body);
+
+    let (consent_body, canon_consent) = if originator_consents {
+        let h = document_hash(&canonical_bytes, &canon_recipients);
+        let consent = Consent { agreement_hash: hex::encode(h), signer: sender_pub_hex.clone() };
+        let body = consent.to_block_body();
+        let canon = canonicalize_block(&body);
+        (Some(body), canon)
+    } else {
+        (None, String::new())
+    };
+
+    let signing_bytes = level_signing_bytes(&canonical_bytes, &canon_recipients, &canon_consent);
+    let sig_hex = crate::crypto::sign_data_bytes(sender_priv, &signing_bytes)
+        .map_err(|e| e.to_string())?;
+
+    let mut out = String::new();
+    // Plaintext above the armor for non-Nostr-Mail clients (spec §3.2).
+    out.push_str(terms_plaintext);
+    out.push_str("\n\n");
+    out.push_str("----- BEGIN NOSTR SIGNED BODY -----\n");
+    out.push_str(&encoded_body);
+    out.push('\n');
+    out.push_str("----- BEGIN NOSTR RECIPIENTS -----\n");
+    out.push_str(&recipients_body);
+    out.push('\n');
+    if let Some(ref c) = consent_body {
+        out.push_str("----- BEGIN NOSTR CONSENT -----\n");
+        out.push_str(c);
+        out.push('\n');
+    }
+    out.push_str("----- BEGIN NOSTR SIGNATURE -----\n@");
+    out.push_str(profile_name);
+    out.push('\n');
+    out.push_str(&sig_hex);
+    out.push('\n');
+    out.push_str(&sender_pub_hex);
+    out.push('\n');
+    out.push_str("----- END NOSTR MESSAGE -----");
+    Ok(out)
 }
 
 /// Verify email signature using binary ciphertext extraction.
@@ -5699,6 +5811,96 @@ nitela\n\
         assert_eq!(parsed.recipients.len(), 2);
         assert!(parsed.recipients.iter().any(|r| r.is_signer() && r.email.as_deref() == Some("bob@example.com")));
         assert!(parsed.consent.is_some(), "originator consent surfaced");
+    }
+
+    // =============================================
+    // Plaintext (public) agreements (spec §11.8)
+    // =============================================
+
+    fn originate_plaintext_agreement(alice: &crate::types::KeyPair, bob_pub: &str, terms: &str) -> String {
+        use crate::agreement::{AgreementRecipientInput, ROLE_SIGNER};
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob_pub.to_string(), email: None,
+        }];
+        encode_signed_agreement(&alice.private_key, &alice.public_key, "Alice", terms, &recips, true).unwrap()
+    }
+
+    fn build_plaintext_consent_reply(responder: &crate::types::KeyPair, prior_armor: &str, h: &str) -> String {
+        let responder_hex = crate::agreement::normalize_pubkey_hex(&responder.public_key).unwrap();
+        let (reply_glossia, _) = glossia_encode_signed_body("I agree to the terms.").unwrap();
+        let prior_only = &prior_armor[prior_armor.find("----- BEGIN NOSTR").unwrap()..];
+        let template = format!(
+            "I agree to the terms.\n\n----- BEGIN NOSTR SIGNED BODY -----\n{}\n\
+            ----- BEGIN NOSTR CONSENT -----\nagreement {}\nsigner    {}\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n@Responder\nSIGPLACEHOLDER\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            reply_glossia, h, responder_hex, prior_only, responder_hex
+        );
+        let bytes = extract_ciphertext_binary(&template);
+        let sig = crypto::sign_data_bytes(&responder.private_key, &bytes).unwrap();
+        template.replace("SIGPLACEHOLDER", &sig)
+    }
+
+    #[test]
+    fn test_plaintext_agreement_is_readable_signed_and_tracked() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let terms = "This public statement is agreed to by the undersigned, dated 2026-06-13.";
+        let agreement = originate_plaintext_agreement(&alice, &bob.public_key, terms);
+
+        // Terms are in the clear above the armor (readable by any client, §3.2).
+        assert!(agreement.starts_with(terms));
+        // Public agreement uses a SIGNED BODY, not an ENCRYPTED BODY.
+        assert!(agreement.contains("BEGIN NOSTR SIGNED BODY"));
+        assert!(!agreement.contains("ENCRYPTED BODY"));
+
+        // The originator's signature verifies over the §4.2 target.
+        assert_eq!(verify_email_signature_inline(&agreement), Some(true));
+
+        // Signatories are declared with the no-CEK sentinel.
+        let parsed = parse_armor_components(&agreement).expect("parses");
+        assert_eq!(parsed.recipients.len(), 1);
+        assert_eq!(parsed.recipients[0].wrapped_cek, crate::agreement::NO_CEK);
+        assert!(parsed.recipients[0].is_signer());
+
+        // Completion is tracked: originator consented, the other signatory pending.
+        let status = verify_agreement_status(&agreement).expect("is an agreement");
+        assert_eq!((status.m, status.n), (1, 2));
+        assert!(!status.complete);
+    }
+
+    #[test]
+    fn test_plaintext_agreement_completes_with_countersignature() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let terms = "We, the undersigned, commit to the following terms.";
+        let agreement = originate_plaintext_agreement(&alice, &bob.public_key, terms);
+        let h = hash_from_consent(&agreement);
+        let reply = build_plaintext_consent_reply(&bob, &agreement, &h);
+
+        // The whole plaintext signature chain verifies and completion reaches 2 of 2.
+        let sigs = verify_all_signatures_inline(&reply);
+        assert!(sigs.iter().all(|s| s.is_valid), "plaintext reply chain must verify");
+        let status = verify_agreement_status(&reply).expect("is an agreement");
+        assert_eq!((status.m, status.n), (2, 2));
+        assert!(status.complete);
+        assert_eq!(status.document_hash, h);
+    }
+
+    #[test]
+    fn test_plaintext_agreement_terms_tamper_breaks_signature() {
+        // The signed payload is the glossia SIGNED BODY (not the human-readable
+        // preface). Mutating it must break the originator's signature.
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let agreement = originate_plaintext_agreement(&alice, &bob.public_key, "Pay 100 on delivery.");
+        assert_eq!(verify_email_signature_inline(&agreement), Some(true));
+
+        let parsed = parse_armor_components(&agreement).unwrap();
+        let body = parsed.body_text;
+        let tampered = agreement.replacen(&body, &format!("{} extra", body), 1);
+        assert_ne!(tampered, agreement, "body must appear verbatim in the armor");
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false));
     }
 
     // =============================================

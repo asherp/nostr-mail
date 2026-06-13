@@ -29,6 +29,13 @@ pub const ROLE_SIGNER: &str = "signer";
 pub const ROLE_VIEWER: &str = "viewer";
 pub const ROLE_SELF: &str = "self";
 
+/// Sentinel for the `wrapped-cek` token of a **plaintext** (public) agreement's
+/// RECIPIENTS stanza (spec Section 11.8): the body is a signed `SIGNED BODY`, not
+/// encrypted, so there is no CEK to wrap. The stanza still authenticates the
+/// signatory's `(role, pubkey[, email])` under the signature; only the key-wrap
+/// is absent. Decoders MUST NOT attempt to unwrap a `-` token.
+pub const NO_CEK: &str = "-";
+
 /// A single entry in a `RECIPIENTS` block: `<role> <pubkey> <wrapped-cek> [<email>]`
 /// (spec Section 10.2). `pubkey` and `wrapped_cek` are retained exactly as they
 /// appear on the wire (hex/npub for the key, base64 NIP-44 payload for the CEK).

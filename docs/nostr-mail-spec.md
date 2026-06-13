@@ -579,7 +579,7 @@ The RECIPIENTS block contains one entry per line. Each entry is three or four sp
 |-------|----------|-------|
 | `role` | `signer` \| `viewer` \| `self` (lowercase token) | See Section 11.1. Unknown roles MUST be ignored for workflow purposes but still treated as recipients for decryption. |
 | `pubkey` | hex (64 chars) or npub (bech32, `npub1…`) | The recipient's Nostr public key. Glossia is **not** used here, to keep entries single-token and line-parseable. |
-| `wrapped-cek` | base64 (NIP-44 payload) | `NIP44_encrypt(CEK)` to `pubkey`. Glossia is not used here. |
+| `wrapped-cek` | base64 (NIP-44 payload), or `-` | `NIP44_encrypt(CEK)` to `pubkey`. Glossia is not used here. The sentinel `-` means **no key wrap** — used by plaintext (public) agreements (Section 11.8), whose `SIGNED BODY` is not encrypted; decoders MUST NOT attempt to unwrap a `-`. |
 | `email` (optional) | RFC 5322 addr-spec, no display name | The address this stanza was delivered to. Binds the recipient's `(pubkey, email)` pairing **inside** the signed block (Section 10.6), so it cannot be altered or re-paired without breaking the signature — the prerequisite for the email↔npub binding handshake (issue #102). Omitted when the recipient is known only by pubkey. |
 
 Rules:
@@ -646,7 +646,7 @@ The role is a **workflow** attribute, not an access attribute — every role can
 
 An agreement is initiated as a signed multi-recipient message:
 
-- **Body**: the agreement cover text / terms, in a signed `ENCRYPTED BODY` (the envelope is signalled by the RECIPIENTS block, not a keyword).
+- **Body**: the agreement cover text / terms, in a signed `ENCRYPTED BODY` (the envelope is signalled by the RECIPIENTS block, not a keyword) — or, for a **plaintext (public) agreement**, a signed `SIGNED BODY` with the terms in the clear (Section 11.8).
 - **Attachment(s)**: the contract document(s), encrypted under the same CEK (existing hybrid-attachment path).
 - **RECIPIENTS**: a `signer` stanza for each required signatory, a `viewer` stanza for each viewer, and the `self` stanza.
 - **CONSENT** (optional): if the originator is themselves a required signatory, they include their own CONSENT block (Section 11.3) declaring consent. The originator's `self` stanza handles only decryption access and is never counted as a consent (Section 10.3) — an originator who signs MUST do so via a CONSENT block.
@@ -727,6 +727,20 @@ This agreement model is conceptually aligned with [SIGit](https://sigit.io)'s do
 | Offline-verifiable from the encrypted zip | offline-verifiable from the email thread (Section 11.6) |
 
 The deliberate difference is transport and privacy. SIGit hides the participant set by gift-wrapping (NIP-59) metadata to ephemeral keys and storing encrypted files on Blossom; nostr-mail keeps the whole agreement in one email thread, which is more self-contained and offline-verifiable but exposes the participant set in the cleartext RECIPIENTS block (Section 10.9). A future **Nostr-only agreement transport** is planned that folds in SIGit's gift-wrap/Blossom approach for stronger metadata privacy; because the consent semantics here (`H`, per-signatory CONSENT, signature chaining) are transport-independent, that mode is expected to reuse this section's model with a different envelope. SIGit's own event-kind numbering is **not** adopted; nostr-mail consent lives in armor blocks, not relay-published Nostr events.
+
+### 11.8 Plaintext (Public) Agreements
+
+An agreement need not be confidential. A **plaintext (public) agreement** carries its terms in the clear so that anyone — not only a cryptographic recipient — can read them and verify completion offline. This suits open letters, public multi-party statements, and on-the-record contracts, where transparency is the point.
+
+A plaintext agreement is identical to the encrypted agreement (Sections 10–11) except for the body and the key-wrap:
+
+- **Body**: a signed `SIGNED BODY` (Section 3.2) instead of an `ENCRYPTED BODY`. The terms are glossia-encoded inside the armor (the signed payload) and also appear above the armor for non-Nostr-Mail clients. There is no CEK and nothing is encrypted.
+- **RECIPIENTS**: the same block declares the signatories (`signer`) and viewers (`viewer`), but each stanza's `wrapped-cek` token is the sentinel `-` (Section 10.2), since there is no CEK to wrap. The optional `email` token still binds the `(pubkey, email)` pairing (Sections 10.2, 6.3). There is **no `self` stanza** — nothing is encrypted, so the originator needs no self-wrap; the originator is identified by the SIGNATURE.
+- **CONSENT**, **document hash `H`**, **signature coverage (§4.2)**, and **completion (§11.5)** are unchanged. `H = SHA-256(decode(body₁) || canonical(recipients₁))` is computed over the *decoded* (glossia → plaintext) body bytes, so the same machinery applies regardless of cipher. A counter-signature is a `SIGNED BODY` reply that nests the prior message and adds the signatory's CONSENT (Section 11.4).
+
+Path selection is unambiguous: a `SIGNED BODY` is never decrypted (it has no ciphertext), so the `-` sentinel is never unwrapped. A decoder MUST treat an `ENCRYPTED BODY` whose stanza carries `-` as malformed.
+
+The trade-off versus the encrypted agreement is **confidentiality**: the terms and the participant set (pubkeys, and any `email` tokens) are public to anyone who sees the message. In return, the agreement is readable and its completion is verifiable by third parties who are not signatories — the same offline, self-contained verification of Section 11.6, without needing to be a recipient.
 
 ## 12. Versioning
 

@@ -391,6 +391,68 @@ pub fn aes_gcm_decrypt_raw(key_bytes: &[u8], encrypted_data: &[u8]) -> Result<Ve
         .map_err(|e| anyhow::anyhow!("AES-GCM decryption failed: {}", e))
 }
 
+/// AES-256-GCM encrypt with raw key bytes (not derived from private key).
+/// Output format: 12-byte nonce || ciphertext+tag (same layout as `aes_gcm_decrypt_raw` expects).
+pub fn aes_gcm_encrypt_raw(key_bytes: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    if key_bytes.len() != 32 {
+        return Err(anyhow::anyhow!("AES key must be 32 bytes, got {}", key_bytes.len()));
+    }
+    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher.encrypt(&nonce, plaintext)
+        .map_err(|e| anyhow::anyhow!("AES-GCM encryption failed: {}", e))?;
+    let mut combined = nonce.to_vec();
+    combined.extend_from_slice(&ciphertext);
+    Ok(combined)
+}
+
+/// Generate a random 256-bit Content Encryption Key (CEK) for the
+/// multi-recipient hybrid envelope scheme (spec Section 10.1).
+pub fn generate_cek() -> [u8; 32] {
+    use ::secp256k1::rand::RngCore;
+    let mut cek = [0u8; 32];
+    ::secp256k1::rand::rngs::OsRng.fill_bytes(&mut cek);
+    cek
+}
+
+/// Wrap a CEK to a single recipient using NIP-44 (spec Section 10.1, step 3).
+///
+/// The 32-byte CEK is hex-encoded and NIP-44 encrypted with the shared secret of
+/// `(sender_priv, recipient_pub)`. The returned string is the NIP-44 payload
+/// (base64), suitable for placement as the `wrapped-cek` token in a RECIPIENTS
+/// stanza (spec Section 10.2). Accepts bech32 or hex for both keys.
+pub fn wrap_cek(sender_priv: &str, recipient_pub: &str, cek: &[u8; 32]) -> Result<String> {
+    let secret_key = SecretKey::from_bech32(sender_priv)
+        .or_else(|_| SecretKey::from_hex(sender_priv))?;
+    let public_key = PublicKey::from_bech32(recipient_pub)
+        .or_else(|_| PublicKey::from_hex(recipient_pub))?;
+    let cek_hex = hex::encode(cek);
+    let wrapped = nip44::encrypt(&secret_key, &public_key, &cek_hex, nip44::Version::default())?;
+    Ok(wrapped)
+}
+
+/// Unwrap a CEK that was wrapped to the reader with NIP-44 (spec Section 8, step 8).
+///
+/// `reader_priv` is the reader's private key, `sender_pub` is the sender's pubkey
+/// (the same key used as the counterparty when wrapping). Returns the 32-byte CEK.
+/// Accepts bech32 or hex for both keys.
+pub fn unwrap_cek(reader_priv: &str, sender_pub: &str, wrapped_cek: &str) -> Result<[u8; 32]> {
+    let secret_key = SecretKey::from_bech32(reader_priv)
+        .or_else(|_| SecretKey::from_hex(reader_priv))?;
+    let public_key = PublicKey::from_bech32(sender_pub)
+        .or_else(|_| PublicKey::from_hex(sender_pub))?;
+    let cek_hex = nip44::decrypt(&secret_key, &public_key, wrapped_cek)?;
+    let cek_bytes = hex::decode(cek_hex.trim())
+        .map_err(|e| anyhow::anyhow!("Unwrapped CEK is not valid hex: {}", e))?;
+    if cek_bytes.len() != 32 {
+        return Err(anyhow::anyhow!("Unwrapped CEK must be 32 bytes, got {}", cek_bytes.len()));
+    }
+    let mut cek = [0u8; 32];
+    cek.copy_from_slice(&cek_bytes);
+    Ok(cek)
+}
+
 /// AES-256-GCM decrypt + remove padding.
 /// After decryption, first 4 bytes are original size (little-endian u32),
 /// followed by the original data padded to 64 KiB boundaries.
@@ -517,5 +579,91 @@ mod tests {
         // Decrypt with padding removal
         let decrypted = aes_gcm_decrypt_padded(&key_bytes, &combined).unwrap();
         assert_eq!(decrypted, original_data);
+    }
+
+    #[test]
+    fn test_aes_gcm_encrypt_decrypt_raw_roundtrip() {
+        let key_bytes = generate_cek();
+        let plaintext = b"multi-recipient body under a CEK";
+        let combined = aes_gcm_encrypt_raw(&key_bytes, plaintext).unwrap();
+        // nonce (12) + ciphertext + 16-byte GCM tag
+        assert!(combined.len() >= 12 + plaintext.len() + 16);
+        let decrypted = aes_gcm_decrypt_raw(&key_bytes, &combined).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_aes_gcm_encrypt_raw_bad_key_length() {
+        assert!(aes_gcm_encrypt_raw(&[0u8; 16], b"x").is_err());
+    }
+
+    #[test]
+    fn test_generate_cek_is_random_and_32_bytes() {
+        let a = generate_cek();
+        let b = generate_cek();
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b, "two CEKs should not collide");
+    }
+
+    #[test]
+    fn test_wrap_unwrap_cek_roundtrip() {
+        // Sender wraps the CEK to a recipient; recipient unwraps with their key + sender pubkey.
+        let sender = generate_keypair().unwrap();
+        let recipient = generate_keypair().unwrap();
+        let sender_pub = get_public_key_from_private(&sender.private_key).unwrap();
+
+        let cek = generate_cek();
+        let wrapped = wrap_cek(&sender.private_key, &recipient.public_key, &cek).unwrap();
+        let unwrapped = unwrap_cek(&recipient.private_key, &sender_pub, &wrapped).unwrap();
+        assert_eq!(unwrapped, cek);
+    }
+
+    #[test]
+    fn test_self_wrap_unwrap_cek_roundtrip() {
+        // The `self` stanza: sender wraps to their own pubkey so the Sent copy decrypts.
+        let sender = generate_keypair().unwrap();
+        let sender_pub = get_public_key_from_private(&sender.private_key).unwrap();
+
+        let cek = generate_cek();
+        let wrapped = wrap_cek(&sender.private_key, &sender.public_key, &cek).unwrap();
+        let unwrapped = unwrap_cek(&sender.private_key, &sender_pub, &wrapped).unwrap();
+        assert_eq!(unwrapped, cek);
+    }
+
+    #[test]
+    fn test_unwrap_cek_wrong_recipient_fails() {
+        let sender = generate_keypair().unwrap();
+        let recipient = generate_keypair().unwrap();
+        let intruder = generate_keypair().unwrap();
+        let sender_pub = get_public_key_from_private(&sender.private_key).unwrap();
+
+        let cek = generate_cek();
+        let wrapped = wrap_cek(&sender.private_key, &recipient.public_key, &cek).unwrap();
+        // An unintended party cannot unwrap the CEK.
+        assert!(unwrap_cek(&intruder.private_key, &sender_pub, &wrapped).is_err());
+    }
+
+    #[test]
+    fn test_full_hybrid_envelope_roundtrip() {
+        // End-to-end: encrypt body once under CEK, wrap CEK to two recipients + self,
+        // each recipient independently recovers the body (spec Section 10.1).
+        let sender = generate_keypair().unwrap();
+        let alice = generate_keypair().unwrap();
+        let bob = generate_keypair().unwrap();
+        let sender_pub = get_public_key_from_private(&sender.private_key).unwrap();
+
+        let cek = generate_cek();
+        let body = b"This Mutual NDA is entered into as of 2026-06-13.";
+        let ciphertext = aes_gcm_encrypt_raw(&cek, body).unwrap();
+
+        let wrapped_alice = wrap_cek(&sender.private_key, &alice.public_key, &cek).unwrap();
+        let wrapped_bob = wrap_cek(&sender.private_key, &bob.public_key, &cek).unwrap();
+
+        // Alice recovers the body.
+        let cek_a = unwrap_cek(&alice.private_key, &sender_pub, &wrapped_alice).unwrap();
+        assert_eq!(aes_gcm_decrypt_raw(&cek_a, &ciphertext).unwrap(), body);
+        // Bob recovers the body.
+        let cek_b = unwrap_cek(&bob.private_key, &sender_pub, &wrapped_bob).unwrap();
+        assert_eq!(aes_gcm_decrypt_raw(&cek_b, &ciphertext).unwrap(), body);
     }
 } 

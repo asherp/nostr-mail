@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 pub mod crypto;
+pub mod agreement;
 pub mod email;
 pub mod imap_pool;
 pub mod imap_idle;

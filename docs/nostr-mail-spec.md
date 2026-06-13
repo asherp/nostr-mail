@@ -1,6 +1,6 @@
 # Nostr-Mail Protocol Specification
 
-**Version:** 0.3.0-draft
+**Version:** 0.4.0-draft
 **Date:** 2026-06-13
 
 ## 1. Overview
@@ -21,9 +21,11 @@ All Nostr-Mail content is enclosed in ASCII armor blocks using `-----` delimiter
 | `BEGIN NOSTR SEAL` | Identity declaration | Sender's Nostr public key (unsigned messages only) |
 | `BEGIN NOSTR HYBRID ENCRYPTED BODY` | Multi-recipient encrypted content | AES-256-GCM ciphertext under a per-message Content Encryption Key (CEK) |
 | `BEGIN NOSTR RECIPIENTS` | Recipient key-wrap + roles | Per-recipient NIP-44-wrapped CEK, pubkey, and role |
+| `BEGIN NOSTR CONTRACT` | Explicit consent marker | A signatory's binding consent to a specific agreement (document hash + signer pubkey); see Section 11.3 |
 | `END NOSTR MESSAGE` | Closing tag | Terminates the outermost block |
 | `END NOSTR SEAL` | Closing tag | Terminates standalone seal blocks |
 | `END NOSTR RECIPIENTS` | Closing tag | Terminates a standalone recipients block |
+| `END NOSTR CONTRACT` | Closing tag | Terminates a standalone contract block |
 
 The encryption type is embedded directly in the BEGIN tag (e.g., `BEGIN NOSTR NIP-44 ENCRYPTED BODY`), keeping the format self-describing without metadata lines.
 
@@ -280,15 +282,15 @@ The Schnorr signature over `SHA-256(ciphertext_bytes)` serves as the authenticat
 
 NIP-44 messages are exempt from this requirement because NIP-44 uses ChaCha20 (no padding) with HMAC-SHA256 authentication built in.
 
-### 4.2 Signature Coverage of the Recipients Block
+### 4.2 Signature Coverage of the Recipients & Contract Blocks
 
-For multi-recipient messages (Section 3.6), the signature MUST cover the RECIPIENTS block in addition to the body, so that the membership list and per-recipient roles cannot be altered without invalidating the signature. The per-level signing contribution becomes:
+For multi-recipient messages (Section 3.6), the signature MUST cover the RECIPIENTS block — and, when present, the CONTRACT block (Section 11.3) — in addition to the body, so that the membership list, per-recipient roles, and any declared consent cannot be altered without invalidating the signature. The per-level signing contribution becomes:
 
 ```
-level(L) = decode(body_L) || canonical(recipients_L)
+level(L) = decode(body_L) || canonical(recipients_L) || canonical(contract_L)
 ```
 
-where `decode(body_L)` is the level's decoded body bytes (as in Section 4) and `canonical(recipients_L)` is the **canonicalized recipients block**: the lines between `BEGIN NOSTR RECIPIENTS` and the following delimiter, each stripped of trailing whitespace and any `> ` quote prefix, joined with `\n`, with no trailing newline. If a level has no RECIPIENTS block, `canonical(recipients_L)` is the empty string and this reduces to the Section 4 model.
+where `decode(body_L)` is the level's decoded body bytes (as in Section 4); `canonical(recipients_L)` is the **canonicalized recipients block**: the lines between `BEGIN NOSTR RECIPIENTS` and the following delimiter, each stripped of trailing whitespace and any `> ` quote prefix, joined with `\n`, with no trailing newline; and `canonical(contract_L)` is the **canonicalized contract block**, formed by the identical rule over the lines between `BEGIN NOSTR CONTRACT` and the following delimiter. The blocks are concatenated in the fixed order **body, then recipients, then contract** (Section 11.3.1). If a level has no RECIPIENTS block, `canonical(recipients_L)` is the empty string; if it has no CONTRACT block, `canonical(contract_L)` is the empty string. A level with neither reduces to the Section 4 model.
 
 The signing target for a level (and its nested levels) is then:
 
@@ -296,7 +298,7 @@ The signing target for a level (and its nested levels) is then:
 SHA-256( level(L) || level(L-1) || … || level(1) )
 ```
 
-This preserves the flat-concatenation, chain-of-custody property of Section 3.5: tampering with any level's body **or** its recipient/role set invalidates that level's signature and every signature above it.
+This preserves the flat-concatenation, chain-of-custody property of Section 3.5: tampering with any level's body, its recipient/role set, **or its declared consent** invalidates that level's signature and every signature above it.
 
 ## 5. Content Encoding (Glossia)
 
@@ -406,6 +408,67 @@ Since email clients strip `<style>` tags and external stylesheets, all styling M
 - **Signature div**: `border-left: 2px solid #ccc; padding-left: 1em; color: #888; font-style: italic; overflow-wrap: break-word;`
 - **Signature heading**: `margin: 0 0 0.5em; color: #666; font-size: 0.9em;`
 - **HR separator**: `border: none; border-top: 1px solid #ccc; margin: 1.5em 0;`
+
+#### 6.2.6 Agreement & Consent Rendering
+
+When a thread is an agreement — any level carries a CONTRACT block (Section 11.3), or the `X-Nostr-Agreement` header is set — the HTML SHOULD make the **reply-vs-consent distinction visible**, so a reader can tell a binding signature apart from an ordinary comment at a glance. These are rendering aids only: a Nostr-Mail client MUST recompute completion from the verified armor (Section 11.5), never from the rendered HTML.
+
+1. **Status banner.** At the top of the outermost `<div>`, render `M of N signatories signed` plus the short document hash `H` (Section 11.3.1). `M` and `N` come from verified CONTRACT blocks intersected with the declared signatory set, never from the header.
+2. **Consent section.** A level whose SIGNATURE is accompanied by a CONTRACT block renders its signature section as a **"✓ Signed by @Name — consents to document H"** panel, visually distinct (green accent) from a plain signature.
+3. **Plain reply / comment.** A level with a SIGNATURE but **no** CONTRACT block renders the normal muted §6.2.4 signature section, labeled with the author's role (e.g. `viewer · comment`). It MUST NOT show a consent badge.
+4. **Don't rely on colour alone.** Use the literal `✓ Signed` / `comment` text and the role token alongside any colour, so the distinction survives in clients that strip styling and for accessibility. Show the short `H` inline and the full `H` on hover/`title`, so two different documents cannot look identical at a glance.
+
+The following renders an agreement that @Alice originated and signed, @Bob counter-signed, and @Carol (a `viewer`) replied to with a comment. Newest content is outermost, per Section 6.2.3:
+
+```html
+<div>
+  <!-- Status banner -->
+  <div style="border: 1px solid #cfe8cf; border-left: 4px solid #4caf50;
+              padding: 0.5em 0.75em; color: #2e7d32; font-size: 0.9em; margin: 0 0 1em;">
+    ✓ Agreement complete — 2 of 2 signatories signed
+    <div style="color: #666; font-size: 0.85em;" title="{full H}">Document H: a1b2c3…9f</div>
+  </div>
+
+  <!-- L3: Carol's new comment (outermost = newest) -->
+  <div>Looks good to me — no changes needed on my end.</div>
+
+  <blockquote style="border-left: 2px solid #ccc; margin: 1em 0; padding: 0 1em;">
+    <!-- L2: Bob -->
+    <div>I agree to the terms as written.</div>
+
+    <blockquote style="border-left: 2px solid #ccc; margin: 1em 0; padding: 0 1em;">
+      <!-- L1: Alice's original terms -->
+      <div>This Mutual NDA is entered into as of 2026-06-13 between …</div>
+
+      <!-- Alice's CONTRACT + SIGNATURE → consent panel -->
+      <hr style="border: none; border-top: 1px solid #ccc; margin: 1.5em 0;">
+      <h4 style="margin: 0 0 0.5em; color: #2e7d32; font-size: 0.9em;">✓ Signed by @Alice</h4>
+      <div style="color: #2e7d32; font-size: 0.85em;" title="{full H}">consents to document a1b2c3…9f</div>
+      <div style="border-left: 2px solid #4caf50; padding-left: 1em; color: #888;
+                  font-style: italic; overflow-wrap: break-word;">{Alice encoded sig + pubkey}</div>
+    </blockquote>
+
+    <!-- Bob's CONTRACT + SIGNATURE → consent panel -->
+    <hr style="border: none; border-top: 1px solid #ccc; margin: 1.5em 0;">
+    <h4 style="margin: 0 0 0.5em; color: #2e7d32; font-size: 0.9em;">✓ Signed by @Bob</h4>
+    <div style="color: #2e7d32; font-size: 0.85em;" title="{full H}">consents to document a1b2c3…9f</div>
+    <div style="border-left: 2px solid #4caf50; padding-left: 1em; color: #888;
+                font-style: italic; overflow-wrap: break-word;">{Bob encoded sig + pubkey}</div>
+  </blockquote>
+
+  <!-- Carol's SIGNATURE, NO CONTRACT → plain comment (muted, not green) -->
+  <hr style="border: none; border-top: 1px solid #ccc; margin: 1.5em 0;">
+  <h4 style="margin: 0 0 0.5em; color: #666; font-size: 0.9em;">@Carol · viewer · comment</h4>
+  <div style="border-left: 2px solid #ccc; padding-left: 1em; color: #888;
+              font-style: italic; overflow-wrap: break-word;">{Carol encoded sig + pubkey}</div>
+</div>
+```
+
+Recommended additional inline styles:
+
+- **Status banner**: `border: 1px solid #cfe8cf; border-left: 4px solid #4caf50; padding: 0.5em 0.75em; color: #2e7d32; font-size: 0.9em;` (use a neutral/amber accent — e.g. `#e0a800` — while an agreement is still `M of N` with `M < N`).
+- **Consent heading**: `margin: 0 0 0.5em; color: #2e7d32; font-size: 0.9em;`
+- **Consent signature div**: same as the §6.2.5 signature div but with a green left border: `border-left: 2px solid #4caf50;`
 
 ### 6.3 Transport Recipients (To / Cc)
 
@@ -578,30 +641,71 @@ An agreement is initiated as a signed multi-recipient message:
 - **Body**: the agreement cover text / terms, in a signed `HYBRID ENCRYPTED BODY`.
 - **Attachment(s)**: the contract document(s), encrypted under the same CEK (existing hybrid-attachment path).
 - **RECIPIENTS**: a `signer` stanza for each required signatory, a `viewer` stanza for each viewer, and the `self` stanza.
-- **SIGNATURE**: the originator's signature, covering body + recipients (Section 4.2), which fixes the set of required signatories and the exact document bytes.
+- **CONTRACT** (optional): if the originator is themselves a required signatory, they include their own CONTRACT block (Section 11.3) declaring consent. The originator's `self` stanza handles only decryption access and is never counted as a consent (Section 10.3) — an originator who signs MUST do so via a CONTRACT block.
+- **SIGNATURE**: the originator's signature, covering body + recipients + any contract (Section 4.2), which fixes the set of required signatories and the exact document bytes.
+
+The originating message's body + RECIPIENTS define the **document hash** `H` that every consent in the thread refers to (Section 11.3.1).
 
 Clients MAY include an `X-Nostr-Agreement` MIME header (boolean/identifier) to let IMAP filtering surface agreement threads without decrypting bodies. The authoritative agreement state always comes from the signed armor blocks, not the header.
 
-### 11.3 Signing Round
+### 11.3 Consent (CONTRACT) Block
 
-A signatory signs by **replying** to the agreement thread (Section 3.5 / 3.6.1):
+Because every reply in a thread carries a SIGNATURE (it is how chain-of-custody works, Section 3.5.0), the mere presence of a signatory's signature over the document cannot, by itself, mean "I agree" — a signatory might be replying to negotiate, ask a question, or object. To make consent an **explicit, intentional act** rather than a side effect of replying, a signatory declares consent with a dedicated CONTRACT block. This is the armor-grammar analogue of a purpose-built signing action: a comment carries no CONTRACT block; a signature does.
 
-- The reply nests the prior message unchanged and adds the signatory's SIGNATURE, which — per Section 4.2 / 3.5.0 — covers `level(reply) || level(prior) || …`, i.e. the signatory's own content plus the full nested history including the original document bytes.
-- A signatory's reply therefore cryptographically binds **their identity to the exact agreement and to every signature already in the thread**, giving an ordered, tamper-evident chain of custody.
+A CONTRACT block contains exactly two fields, one per line:
+
+```
+----- BEGIN NOSTR CONTRACT -----
+agreement <H>
+signer    <pubkey>
+```
+
+| Field | Encoding | Meaning |
+|-------|----------|---------|
+| `agreement` | hex (64 chars) | The document hash `H` being consented to (Section 11.3.1). |
+| `signer` | hex (64 chars) or npub | The consenting party's pubkey. MUST equal the pubkey in this level's SIGNATURE block. |
+
+The CONTRACT block does **not** carry its own signature — the level's existing SIGNATURE provides the binding. Because that signature covers `level(reply) || … || level(1)` (Sections 4.2, 3.5.0) and `level(L)` now includes the CONTRACT block, the consent is bound to (a) the consenting identity, (b) the exact document `H`, and (c) the full nested history, and it cannot be stripped or altered without invalidating that signature and every signature above it. (A future version MAY define an optional self-contained variant carrying its own signature over `H`, for consents that must be verifiable in isolation from the thread; out of scope for v0.4.)
+
+Decoders MUST tolerate additional unknown lines in a CONTRACT block (forward compatibility) and MUST ignore blank lines and `> ` quote prefixes.
+
+#### 11.3.1 Document Hash `H`
+
+```
+H = SHA-256( decode(body_1) || canonical(recipients_1) )
+```
+
+`H` is computed over the **originating** level's (level 1) body and RECIPIENTS block only — it deliberately **excludes all CONTRACT blocks** (including the originator's own), so that `H` is fixed for the life of the agreement no matter how many consents accumulate, and so that the originator's level-1 CONTRACT referencing `H` is not self-referential. Note this is distinct from `level(1)` (Section 4.2), which *does* include level 1's CONTRACT block: `H` identifies the document, `level(L)` is what a level's signature covers.
+
+#### 11.3.2 Ordering
+
+Within a level, the CONTRACT block is **content**, not a trailer: it is the last block of the level's content group, in the fixed order **body → RECIPIENTS → CONTRACT**, and appears before any nested (inner) level and before the trailing SIGNATURE stack. Each level has **at most one** CONTRACT block (a level has a single author). As an agreement accumulates signatures, each consenting reply contributes its own CONTRACT block at its own level — they are never merged into one growing block, since nesting the prior message unchanged forbids mutating an inner level. The CONTRACT block at a given nesting depth is bound by the SIGNATURE at the same depth (the same body↔signature depth-pairing used throughout Section 3.5).
+
+### 11.4 Signing Round
+
+A signatory signs by **replying** to the agreement thread (Section 3.5 / 3.6.1) and including a CONTRACT block in their reply:
+
+- The reply nests the prior message unchanged, adds a CONTRACT block declaring consent to `H`, and adds the signatory's SIGNATURE, which — per Section 4.2 / 3.5.0 — covers `level(reply) || level(prior) || …`, i.e. the signatory's own content (including their CONTRACT) plus the full nested history including the original document bytes.
+- A signatory's consenting reply therefore cryptographically binds **their identity and intent to the exact agreement and to every signature already in the thread**, giving an ordered, tamper-evident chain of custody. Signing order is recoverable from nesting depth (innermost = first signer).
+- A reply **without** a CONTRACT block is a comment: authenticated and part of the chain of custody, but **not** a consent, and never counted toward completion (Section 11.5). This is how a signatory negotiates or a `viewer` comments without being mistaken for having signed.
 - Reply-all preserves the `signer`/`viewer` roles from the prior level so the membership is carried forward (subject to the access rules of Section 10.8).
 
-### 11.4 Completion & Status
+### 11.5 Completion & Status
 
-An agreement is **complete** when, for every `signer` pubkey declared in the originating message's RECIPIENTS block, the thread contains a valid SIGNATURE from that pubkey over a level that includes the original document bytes. Clients:
+An agreement is **complete** when, for every required signatory, the thread contains a valid CONTRACT block referencing the agreement's `H`, bound by a verified SIGNATURE from that signatory's pubkey. The required signatory set is the set of `signer` stanzas in the originating message's RECIPIENTS block, **plus** the originator if the originating message itself carries a CONTRACT block (Section 11.2). Clients:
 
-- SHOULD compute "M of N signed" by intersecting the declared signatory set with the set of verified signer pubkeys present in the thread.
-- MAY use the `X-Nostr-Sig` / `X-Nostr-Pubkey` headers (Section 6.1) for a fast, decrypt-free progress estimate, but MUST confirm completion against verified in-body signatures.
-- SHOULD NOT count `viewer` or `self` pubkeys toward completion.
+- SHOULD compute "M of N signed" by intersecting the required signatory set with the set of pubkeys that have a **verified CONTRACT block over `H`** in the thread.
+- MUST key completion off the presence of a verified CONTRACT block, **not** off the mere presence of a signature from a signatory — a signed comment (no CONTRACT) does not count.
+- MUST deduplicate by pubkey: a signatory who appears in multiple levels (e.g. commented, then signed) counts at most once.
+- MAY use the `X-Nostr-Sig` / `X-Nostr-Pubkey` / `X-Nostr-Agreement` headers (Section 6.1) for a fast, decrypt-free progress estimate, but MUST confirm completion against verified in-body CONTRACT blocks.
+- SHOULD NOT count `viewer` or `self` pubkeys toward completion. A `viewer` who nonetheless emits a valid CONTRACT block is not a required signatory and MUST NOT change the `N`, though clients MAY surface the extra consent informationally.
 
-### 11.5 Verification
+### 11.6 Verification
 
-A completed agreement is verifiable offline and without any nostr-mail or SIGit server: a verifier walks the thread, and for each level checks the SIGNATURE against `SHA-256(level(L) || … || level(1))` (Section 4.2) using the pubkey in the SIGNATURE block. If every required signatory's signature verifies over a level covering the original document bytes, the agreement is valid and attributable to those Nostr identities. Tampering with the document, the recipient/role set, or any prior signature invalidates the affected signature and every signature above it.
+A completed agreement is verifiable offline and without any nostr-mail or SIGit server: a verifier walks the thread and, for each level, checks the SIGNATURE against `SHA-256(level(L) || … || level(1))` (Section 4.2) using the pubkey in the SIGNATURE block, then collects the CONTRACT blocks. If, for every required signatory, a CONTRACT block over the agreement's `H` is bound by a verified signature from that signatory's pubkey, the agreement is valid and attributable to those Nostr identities. Tampering with the document, the recipient/role set, any declared consent, or any prior signature invalidates the affected signature and every signature above it.
 
 ## 12. Versioning
 
 This specification may be extended with additional block types in future versions. Decoders SHOULD ignore unrecognized block types rather than failing. Unknown `role` tokens in a RECIPIENTS block (Section 10.2) MUST be treated as recipients for decryption while being ignored for workflow accounting, so that future roles do not break older clients.
+
+The CONTRACT block (Section 11.3) is likewise backward compatible: a client that predates it ignores the unknown block and simply sees an ordinary signed reply, so message decryption and signature verification are unaffected — only the agreement-completion view (which such a client does not compute) is unavailable. Agreement-aware clients MUST tolerate unknown trailing lines within a CONTRACT block so that future consent fields do not break older clients.

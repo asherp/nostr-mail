@@ -5113,11 +5113,11 @@ nitela\n\
         let bob = crypto::generate_keypair().unwrap();
 
         let recips = vec![
-            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone() },
-            AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: bob.public_key.clone() },
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone(), email: Some("alice@example.com".into()) },
+            AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.org".into()) },
         ];
         let armor = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, "Originator",
+            &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator",
             b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true,
         ).unwrap();
 
@@ -5132,6 +5132,31 @@ nitela\n\
         let parsed = parse_armor_components(&armor).expect("parses");
         assert!(!parsed.body_text.contains("signer "));
         assert!(!parsed.body_text.contains("agreement "));
+    }
+
+    #[test]
+    fn test_bound_email_in_recipients_is_tamper_evident() {
+        // Issue #102: the (pubkey, email) pairing lives inside the signed
+        // RECIPIENTS block, so re-pairing an npub to a different address must
+        // break the originator's signature (§10.6).
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let sender = crypto::generate_keypair().unwrap();
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let recips = vec![
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone(), email: Some("alice@example.com".into()) },
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.org".into()) },
+        ];
+        let armor = encode_hybrid_agreement(
+            &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator",
+            b"terms", &recips, false,
+        ).unwrap();
+        assert_eq!(verify_email_signature_inline(&armor), Some(true));
+
+        // Swap alice's bound address to an attacker-controlled mailbox.
+        let tampered = armor.replacen("alice@example.com", "attacker@evil.test", 1);
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false),
+            "re-pairing an npub to a different email must invalidate the signature");
     }
 
     // =============================================

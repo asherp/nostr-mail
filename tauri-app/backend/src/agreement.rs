@@ -28,7 +28,7 @@ pub const ROLE_SIGNER: &str = "signer";
 pub const ROLE_VIEWER: &str = "viewer";
 pub const ROLE_SELF: &str = "self";
 
-/// A single entry in a `RECIPIENTS` block: `<role> <pubkey> <wrapped-cek>`
+/// A single entry in a `RECIPIENTS` block: `<role> <pubkey> <wrapped-cek> [<email>]`
 /// (spec Section 10.2). `pubkey` and `wrapped_cek` are retained exactly as they
 /// appear on the wire (hex/npub for the key, base64 NIP-44 payload for the CEK).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,12 +39,21 @@ pub struct Recipient {
     pub pubkey: String,
     /// `NIP44_encrypt(CEK)` to `pubkey`, base64.
     pub wrapped_cek: String,
+    /// Optional fourth token: the address this stanza was delivered to. Because
+    /// the signature covers the canonicalized RECIPIENTS block (Section 10.6),
+    /// an in-block email binds the `(pubkey, email)` pairing tamper-evidently —
+    /// the basis for the email↔npub binding handshake (issue #102).
+    pub email: Option<String>,
 }
 
 impl Recipient {
-    /// Serialize this entry as its canonical single line: `role pubkey wrapped-cek`.
+    /// Serialize this entry as its canonical line: `role pubkey wrapped-cek [email]`.
+    /// The `email` is appended as the trailing token only when present.
     pub fn to_line(&self) -> String {
-        format!("{} {} {}", self.role, self.pubkey, self.wrapped_cek)
+        match &self.email {
+            Some(email) => format!("{} {} {} {}", self.role, self.pubkey, self.wrapped_cek, email),
+            None => format!("{} {} {}", self.role, self.pubkey, self.wrapped_cek),
+        }
     }
 
     /// True for the `signer` role (a required signatory; spec Section 11.1).
@@ -108,9 +117,12 @@ pub fn canonicalize_block(block_body: &str) -> String {
 /// and the following delimiter) into entries (spec Section 10.2).
 ///
 /// Each non-blank line must have at least three space-separated tokens
-/// `<role> <pubkey> <wrapped-cek>`; additional trailing tokens are tolerated
-/// (forward compatibility) and ignored. Blank lines and `> ` quote prefixes are
-/// ignored. Malformed lines (fewer than 3 tokens) are skipped.
+/// `<role> <pubkey> <wrapped-cek>`, with an optional fourth `email` token; any
+/// further trailing tokens are tolerated (forward compatibility) and ignored.
+/// Blank lines and `> ` quote prefixes are ignored. Malformed lines (fewer than
+/// 3 tokens) are skipped. The fourth token is treated as the email only if it
+/// contains `@` — which a base64 `wrapped-cek` never does — so a non-email
+/// trailing token is not misread (spec Section 10.2).
 pub fn parse_recipients_block(block_body: &str) -> Vec<Recipient> {
     let mut out = Vec::new();
     for raw in block_body.split('\n') {
@@ -131,7 +143,8 @@ pub fn parse_recipients_block(block_body: &str) -> Vec<Recipient> {
             Some(t) => t.to_string(),
             None => continue,
         };
-        out.push(Recipient { role, pubkey, wrapped_cek });
+        let email = toks.next().filter(|t| t.contains('@')).map(|t| t.to_string());
+        out.push(Recipient { role, pubkey, wrapped_cek, email });
     }
     out
 }
@@ -297,6 +310,11 @@ pub fn compute_completion(required: &[String], consented: &[String]) -> Agreemen
 pub struct AgreementRecipientInput {
     pub role: String,
     pub pubkey: String,
+    /// The address this recipient was delivered to. When present it is written
+    /// as the stanza's fourth token, binding `(pubkey, email)` under the
+    /// signature (spec Sections 10.2, 10.6) — required for the binding handshake
+    /// (issue #102). `None` when the recipient is known only by pubkey.
+    pub email: Option<String>,
 }
 
 /// Compose a complete multi-recipient (group-encrypted) armor message — the
@@ -314,7 +332,10 @@ pub struct AgreementRecipientInput {
 ///
 /// `recipients_in` should already be ordered `To:` (signers) then `Cc:`
 /// (viewers) to match the deterministic ordering of Section 10.2; the `self`
-/// stanza is appended last. Returns the armored `text/plain` payload.
+/// stanza is appended last. Each recipient's optional `email` is written as the
+/// stanza's fourth token, binding `(pubkey, email)` under the signature; pass
+/// `sender_email` to do the same for the `self` stanza. Returns the armored
+/// `text/plain` payload.
 ///
 /// This composes the *cryptographic* envelope; glossia prose encoding of the
 /// body/signature (Section 5) is applied by the caller's send pipeline if
@@ -323,6 +344,7 @@ pub struct AgreementRecipientInput {
 pub fn encode_hybrid_agreement(
     sender_priv: &str,
     sender_pub: &str,
+    sender_email: Option<&str>,
     profile_name: &str,
     body_plaintext: &[u8],
     recipients_in: &[AgreementRecipientInput],
@@ -349,6 +371,7 @@ pub fn encode_hybrid_agreement(
             role: r.role.to_ascii_lowercase(),
             pubkey: r.pubkey.clone(),
             wrapped_cek: wrapped,
+            email: r.email.clone(),
         });
     }
     let self_wrapped = crate::crypto::wrap_cek(sender_priv, &sender_pub_hex, &cek)?;
@@ -356,6 +379,7 @@ pub fn encode_hybrid_agreement(
         role: ROLE_SELF.to_string(),
         pubkey: sender_pub_hex.clone(),
         wrapped_cek: self_wrapped,
+        email: sender_email.map(|s| s.to_string()),
     });
 
     let recipients_body = serialize_recipients(&recipients);
@@ -453,22 +477,36 @@ mod tests {
         );
         let recips = parse_recipients_block(&block);
         assert_eq!(recips.len(), 3);
-        assert_eq!(recips[0], Recipient { role: "signer".into(), pubkey: HEX_A.into(), wrapped_cek: "wrapcekA".into() });
+        assert_eq!(recips[0], Recipient { role: "signer".into(), pubkey: HEX_A.into(), wrapped_cek: "wrapcekA".into(), email: None });
         assert_eq!(recips[1].role, "viewer");
         assert_eq!(recips[2].role, "self");
+        assert!(recips.iter().all(|r| r.email.is_none()));
     }
 
     #[test]
-    fn test_parse_recipients_tolerates_extra_tokens_blanks_and_quotes() {
+    fn test_parse_recipients_email_token_and_tolerates_quotes() {
         let block = format!(
-            "> signer {} wrapcekA extratoken\n\n>> viewer {} wrapcekB\n",
+            "> signer {} wrapcekA bob@example.com\n\n>> viewer {} wrapcekB\n",
             HEX_A, HEX_B
         );
         let recips = parse_recipients_block(&block);
         assert_eq!(recips.len(), 2);
-        // Extra trailing token is ignored, not folded into wrapped_cek.
+        // The 4th token (contains '@') is captured as the bound email.
         assert_eq!(recips[0].wrapped_cek, "wrapcekA");
+        assert_eq!(recips[0].email.as_deref(), Some("bob@example.com"));
+        // A stanza without an email leaves it None.
         assert_eq!(recips[1].role, "viewer");
+        assert!(recips[1].email.is_none());
+    }
+
+    #[test]
+    fn test_parse_recipients_non_email_trailing_token_ignored() {
+        // A 4th token without '@' is a future/unknown token, not an email.
+        let block = format!("signer {} wrapcekA futurefield extra", HEX_A);
+        let recips = parse_recipients_block(&block);
+        assert_eq!(recips.len(), 1);
+        assert_eq!(recips[0].wrapped_cek, "wrapcekA");
+        assert!(recips[0].email.is_none());
     }
 
     #[test]
@@ -482,11 +520,12 @@ mod tests {
     #[test]
     fn test_serialize_recipients_roundtrip() {
         let recips = vec![
-            Recipient { role: "signer".into(), pubkey: HEX_A.into(), wrapped_cek: "cekA".into() },
-            Recipient { role: "self".into(), pubkey: HEX_B.into(), wrapped_cek: "cekS".into() },
+            Recipient { role: "signer".into(), pubkey: HEX_A.into(), wrapped_cek: "cekA".into(), email: Some("a@x.io".into()) },
+            Recipient { role: "self".into(), pubkey: HEX_B.into(), wrapped_cek: "cekS".into(), email: None },
         ];
         let body = serialize_recipients(&recips);
-        assert_eq!(body, format!("signer {} cekA\nself {} cekS", HEX_A, HEX_B));
+        // The email is the trailing token only on stanzas that carry one.
+        assert_eq!(body, format!("signer {} cekA a@x.io\nself {} cekS", HEX_A, HEX_B));
         assert_eq!(parse_recipients_block(&body), recips);
     }
 
@@ -672,11 +711,11 @@ mod tests {
 
         let body = b"This Mutual NDA is entered into as of 2026-06-13.";
         let recips = vec![
-            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone() },
-            AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: bob.public_key.clone() },
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone(), email: Some("alice@example.com".into()) },
+            AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.org".into()) },
         ];
         let armor = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, "Originator", body, &recips, false,
+            &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator", body, &recips, false,
         ).unwrap();
 
         // Structure: generic encrypted body, recipients (incl. self last), no consent.
@@ -694,6 +733,11 @@ mod tests {
         assert_eq!(parsed.len(), 3, "two recipients + self");
         assert_eq!(parsed[2].role, ROLE_SELF, "self stanza is last");
 
+        // The (pubkey, email) pairing is carried inside the signed block (§10.2/#102).
+        assert_eq!(parsed[0].email.as_deref(), Some("alice@example.com"));
+        assert_eq!(parsed[1].email.as_deref(), Some("bob@example.org"));
+        assert_eq!(parsed[2].email.as_deref(), Some("me@example.net"));
+
         // Each party (incl. self) recovers the exact body.
         assert_eq!(reader_recovers_body(&armor, &alice.private_key, &alice_hex, &sender_pub_hex), body);
         assert_eq!(reader_recovers_body(&armor, &bob.private_key, &bob_hex, &sender_pub_hex), body);
@@ -709,10 +753,10 @@ mod tests {
 
         let body = b"terms";
         let recips = vec![
-            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone() },
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone(), email: None },
         ];
         let armor = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, "Originator", body, &recips, true,
+            &sender.private_key, &sender.public_key, None, "Originator", body, &recips, true,
         ).unwrap();
 
         assert!(armor.contains("BEGIN NOSTR CONSENT"));
@@ -741,7 +785,7 @@ mod tests {
     fn test_encode_hybrid_agreement_rejects_empty_recipients() {
         let sender = crate::crypto::generate_keypair().unwrap();
         let err = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, "X", b"x", &[], false);
+            &sender.private_key, &sender.public_key, None, "X", b"x", &[], false);
         assert!(err.is_err());
     }
 }

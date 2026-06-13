@@ -485,6 +485,8 @@ Both `To:` and `Cc:` recipients receive a NIP-44-wrapped CEK and can decrypt the
 
 Because email headers are spoofable and may be rewritten on forward (Section 7), the authoritative role for each recipient is the `role` token inside the signed RECIPIENTS block, **not** the header. The headers are a transport convenience and a mirror for non-Nostr-Mail clients. Where the two disagree, decoders MUST trust the signed RECIPIENTS block.
 
+To make the `(pubkey, email)` pairing itself authenticated rather than inferred from the spoofable header order, an encoder MAY include the delivered address as the optional fourth `email` token of each stanza (Section 10.2). Because the signature covers the canonicalized RECIPIENTS block (Section 10.6), an in-block `email` binds that address to its `pubkey` tamper-evidently — this is what the email↔npub binding handshake (issue #102) relies on. When a stanza carries an `email`, decoders MUST treat the in-block value, not the header, as the authoritative pairing.
+
 `Bcc:` recipients, if supported, MUST NOT appear in the RECIPIENTS block of the copy sent to other recipients (doing so would disclose the blind recipient); each Bcc recipient instead receives a separately addressed copy.
 
 ## 7. Identity Model
@@ -567,10 +569,10 @@ The sender's pubkey (needed to unwrap the CEK) is taken from the SIGNATURE block
 
 ### 10.2 RECIPIENTS Block Format
 
-The RECIPIENTS block contains one entry per line. Each entry is exactly three space-separated tokens:
+The RECIPIENTS block contains one entry per line. Each entry is three or four space-separated tokens — the fourth (`email`) is optional:
 
 ```
-<role> <pubkey> <wrapped-cek>
+<role> <pubkey> <wrapped-cek> [<email>]
 ```
 
 | Field | Encoding | Notes |
@@ -578,11 +580,13 @@ The RECIPIENTS block contains one entry per line. Each entry is exactly three sp
 | `role` | `signer` \| `viewer` \| `self` (lowercase token) | See Section 11.1. Unknown roles MUST be ignored for workflow purposes but still treated as recipients for decryption. |
 | `pubkey` | hex (64 chars) or npub (bech32, `npub1…`) | The recipient's Nostr public key. Glossia is **not** used here, to keep entries single-token and line-parseable. |
 | `wrapped-cek` | base64 (NIP-44 payload) | `NIP44_encrypt(CEK)` to `pubkey`. Glossia is not used here. |
+| `email` (optional) | RFC 5322 addr-spec, no display name | The address this stanza was delivered to. Binds the recipient's `(pubkey, email)` pairing **inside** the signed block (Section 10.6), so it cannot be altered or re-paired without breaking the signature — the prerequisite for the email↔npub binding handshake (issue #102). Omitted when the recipient is known only by pubkey. |
 
 Rules:
 
 - Entries SHOULD be ordered deterministically: `To:` recipients in header order, then `Cc:` recipients in header order, then the `self` stanza last. Deterministic ordering keeps the signed canonical form stable across encoders.
 - Display names are intentionally **omitted**; clients resolve names from the Nostr social registry / profile cache by pubkey.
+- The optional `email` is the **fourth** token and is placed after `wrapped-cek` (not between `pubkey` and `wrapped-cek`) so that a decoder which only knows the three-token grammar still recovers `role`/`pubkey`/`wrapped-cek` and can decrypt; it simply ignores the trailing token. An email contains an `@` and is therefore unambiguous against the base64 `wrapped-cek` (which never does). Email addresses contain no spaces, so the entry stays line-parseable.
 - Decoders MUST tolerate additional trailing tokens on a line (forward compatibility) and MUST ignore blank lines and `> ` quote prefixes.
 
 ### 10.3 Roles
@@ -620,7 +624,7 @@ Because each level is sealed under its own CEK wrapped only to that level's list
 
 ### 10.9 Privacy Considerations
 
-The RECIPIENTS block lists each participant's pubkey in the (cleartext) `text/plain` body, so relays/mail servers that see the message learn the participant set. This is no worse than the `To:`/`Cc:` headers, which already expose the email addresses, but it is strictly less private than NIP-59 gift wrap, which hides recipients behind an ephemeral key. A future version MAY define a metadata-private mode that omits pubkey labels and requires readers to trial-decrypt each stanza (as the `age` format does); this is out of scope for v0.4.
+The RECIPIENTS block lists each participant's pubkey in the (cleartext) `text/plain` body, so relays/mail servers that see the message learn the participant set. When the optional `email` token (Section 10.2) is included, the block also restates the addresses — but those already appear in the `To:`/`Cc:` headers, so this discloses nothing new to the transport. Overall this is no worse than the `To:`/`Cc:` headers, which already expose the email addresses, but it is strictly less private than NIP-59 gift wrap, which hides recipients behind an ephemeral key. The metadata-private mode noted below would omit both the pubkey labels and the `email` tokens. A future version MAY define a metadata-private mode that omits pubkey labels and requires readers to trial-decrypt each stanza (as the `age` format does); this is out of scope for v0.4.
 
 A planned future direction is a **Nostr-only agreement transport** that folds in SIGit's privacy model (Section 11.7): instead of carrying the agreement in the email body, the message body and document(s) would be sealed and NIP-59 gift-wrapped to each counterparty (optionally with large files on Blossom), hiding the participant set behind ephemeral keys. The consent/chain-of-custody semantics defined here (the document hash `H`, per-signatory consent, and signature chaining) are transport-independent and would carry over unchanged; only the envelope and recipient-addressing would differ. This is out of scope for v0.4 and noted here so the consent model is not specialized to the cleartext email envelope.
 

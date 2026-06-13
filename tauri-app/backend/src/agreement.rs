@@ -29,16 +29,18 @@ pub const ROLE_SIGNER: &str = "signer";
 pub const ROLE_VIEWER: &str = "viewer";
 pub const ROLE_SELF: &str = "self";
 
-/// Sentinel for the `wrapped-cek` token of a **plaintext** (public) agreement's
-/// RECIPIENTS stanza (spec Section 11.8): the body is a signed `SIGNED BODY`, not
-/// encrypted, so there is no CEK to wrap. The stanza still authenticates the
-/// signatory's `(role, pubkey[, email])` under the signature; only the key-wrap
-/// is absent. Decoders MUST NOT attempt to unwrap a `-` token.
-pub const NO_CEK: &str = "-";
-
-/// A single entry in a `RECIPIENTS` block: `<role> <pubkey> <wrapped-cek> [<email>]`
-/// (spec Section 10.2). `pubkey` and `wrapped_cek` are retained exactly as they
-/// appear on the wire (hex/npub for the key, base64 NIP-44 payload for the CEK).
+/// A single entry in a `RECIPIENTS` block (spec Section 10.2). After the fixed
+/// `role` and `pubkey`, the remaining tokens are **optional and typed by
+/// content**, in any order:
+///
+///   * `wrapped-cek` — base64 (no `@`, no `:`): `NIP44_encrypt(CEK)` to `pubkey`
+///   * `email`       — contains `@`: the address this stanza was delivered to
+///   * `reference`   — `scheme:value` (contains `:`): pointer to out-of-band
+///                     material, e.g. a NIP-59 gift-wrapped DM (`evt:<id>`)
+///
+/// Any field may be absent: a plaintext (public) agreement omits the cek; a
+/// gift-wrap-mode stanza carries only a `reference` (cek + email travel in the
+/// referenced DM); a bare `role pubkey` stanza is workflow-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Recipient {
@@ -46,23 +48,39 @@ pub struct Recipient {
     pub role: String,
     /// Recipient's Nostr public key, hex (64 chars) or npub (bech32).
     pub pubkey: String,
-    /// `NIP44_encrypt(CEK)` to `pubkey`, base64.
-    pub wrapped_cek: String,
-    /// Optional fourth token: the address this stanza was delivered to. Because
-    /// the signature covers the canonicalized RECIPIENTS block (Section 10.6),
-    /// an in-block email binds the `(pubkey, email)` pairing tamper-evidently —
-    /// the basis for the email↔npub binding handshake (issue #102).
+    /// `NIP44_encrypt(CEK)` to `pubkey` (base64). `None` when the CEK is not
+    /// carried in the email — a plaintext agreement (no CEK) or gift-wrap mode
+    /// (the CEK travels in the referenced DM; see `reference`).
+    pub wrapped_cek: Option<String>,
+    /// The address this stanza was delivered to (contains `@`). Authenticated by
+    /// the signature (§10.6), binding `(pubkey, email)` for the handshake (#102).
+    /// `None` when not carried in the email (gift-wrap mode delivers it in the DM).
     pub email: Option<String>,
+    /// A `scheme:value` pointer to out-of-band per-recipient material — e.g. a
+    /// NIP-59 gift-wrapped DM (`evt:<id>`) carrying this recipient's CEK and/or
+    /// `(npub, email)` binding (spec §11.7 gift-wrap mode). `None` when all
+    /// material is in the email.
+    pub reference: Option<String>,
 }
 
 impl Recipient {
-    /// Serialize this entry as its canonical line: `role pubkey wrapped-cek [email]`.
-    /// The `email` is appended as the trailing token only when present.
+    /// Serialize as its canonical line: `role pubkey [cek] [email] [reference]`,
+    /// emitting only the present fields.
     pub fn to_line(&self) -> String {
-        match &self.email {
-            Some(email) => format!("{} {} {} {}", self.role, self.pubkey, self.wrapped_cek, email),
-            None => format!("{} {} {}", self.role, self.pubkey, self.wrapped_cek),
+        let mut s = format!("{} {}", self.role, self.pubkey);
+        if let Some(cek) = &self.wrapped_cek {
+            s.push(' ');
+            s.push_str(cek);
         }
+        if let Some(email) = &self.email {
+            s.push(' ');
+            s.push_str(email);
+        }
+        if let Some(reference) = &self.reference {
+            s.push(' ');
+            s.push_str(reference);
+        }
+        s
     }
 
     /// True for the `signer` role (a required signatory; spec Section 11.1).
@@ -126,13 +144,14 @@ pub fn canonicalize_block(block_body: &str) -> String {
 /// Parse a `RECIPIENTS` block body (the lines between `BEGIN NOSTR RECIPIENTS`
 /// and the following delimiter) into entries (spec Section 10.2).
 ///
-/// Each non-blank line must have at least three space-separated tokens
-/// `<role> <pubkey> <wrapped-cek>`, with an optional fourth `email` token; any
-/// further trailing tokens are tolerated (forward compatibility) and ignored.
-/// Blank lines and `> ` quote prefixes are ignored. Malformed lines (fewer than
-/// 3 tokens) are skipped. The fourth token is treated as the email only if it
-/// contains `@` — which a base64 `wrapped-cek` never does — so a non-email
-/// trailing token is not misread (spec Section 10.2).
+/// Each non-blank line is `<role> <pubkey>` followed by any subset of the typed
+/// optional tokens, in any order (spec Section 10.2): an `email` (contains `@`),
+/// a `reference` (`scheme:value`, contains `:`), and a `wrapped-cek` (base64 —
+/// neither `@` nor `:`). Classification is by content, so the cek is never
+/// confused with an email or a reference. The first token of each type wins;
+/// further unrecognized tokens are tolerated (forward compatibility) and ignored.
+/// Blank lines and `> ` quote prefixes are ignored. Lines without a `pubkey`
+/// (fewer than 2 tokens) are skipped.
 pub fn parse_recipients_block(block_body: &str) -> Vec<Recipient> {
     let mut out = Vec::new();
     for raw in block_body.split('\n') {
@@ -149,12 +168,19 @@ pub fn parse_recipients_block(block_body: &str) -> Vec<Recipient> {
             Some(t) => t.to_string(),
             None => continue,
         };
-        let wrapped_cek = match toks.next() {
-            Some(t) => t.to_string(),
-            None => continue,
-        };
-        let email = toks.next().filter(|t| t.contains('@')).map(|t| t.to_string());
-        out.push(Recipient { role, pubkey, wrapped_cek, email });
+        let mut wrapped_cek = None;
+        let mut email = None;
+        let mut reference = None;
+        for tok in toks {
+            if tok.contains('@') {
+                email.get_or_insert_with(|| tok.to_string());
+            } else if tok.contains(':') {
+                reference.get_or_insert_with(|| tok.to_string());
+            } else {
+                wrapped_cek.get_or_insert_with(|| tok.to_string());
+            }
+        }
+        out.push(Recipient { role, pubkey, wrapped_cek, email, reference });
     }
     out
 }
@@ -408,16 +434,18 @@ pub fn encode_hybrid_agreement(
         recipients.push(Recipient {
             role: r.role.to_ascii_lowercase(),
             pubkey: r.pubkey.clone(),
-            wrapped_cek: wrapped,
+            wrapped_cek: Some(wrapped),
             email: r.email.clone(),
+            reference: None,
         });
     }
     let self_wrapped = crate::crypto::wrap_cek(sender_priv, &sender_pub_hex, &cek)?;
     recipients.push(Recipient {
         role: ROLE_SELF.to_string(),
         pubkey: sender_pub_hex.clone(),
-        wrapped_cek: self_wrapped,
+        wrapped_cek: Some(self_wrapped),
         email: sender_email.map(|s| s.to_string()),
+        reference: None,
     });
 
     let recipients_body = serialize_recipients(&recipients);
@@ -515,22 +543,22 @@ mod tests {
         );
         let recips = parse_recipients_block(&block);
         assert_eq!(recips.len(), 3);
-        assert_eq!(recips[0], Recipient { role: "signer".into(), pubkey: HEX_A.into(), wrapped_cek: "wrapcekA".into(), email: None });
+        assert_eq!(recips[0], Recipient { role: "signer".into(), pubkey: HEX_A.into(), wrapped_cek: Some("wrapcekA".into()), email: None, reference: None });
         assert_eq!(recips[1].role, "viewer");
         assert_eq!(recips[2].role, "self");
-        assert!(recips.iter().all(|r| r.email.is_none()));
+        assert!(recips.iter().all(|r| r.email.is_none() && r.reference.is_none()));
     }
 
     #[test]
-    fn test_parse_recipients_email_token_and_tolerates_quotes() {
+    fn test_parse_recipients_typed_tokens_and_tolerates_quotes() {
         let block = format!(
             "> signer {} wrapcekA bob@example.com\n\n>> viewer {} wrapcekB\n",
             HEX_A, HEX_B
         );
         let recips = parse_recipients_block(&block);
         assert_eq!(recips.len(), 2);
-        // The 4th token (contains '@') is captured as the bound email.
-        assert_eq!(recips[0].wrapped_cek, "wrapcekA");
+        // base64 token → cek; '@' token → email.
+        assert_eq!(recips[0].wrapped_cek.as_deref(), Some("wrapcekA"));
         assert_eq!(recips[0].email.as_deref(), Some("bob@example.com"));
         // A stanza without an email leaves it None.
         assert_eq!(recips[1].role, "viewer");
@@ -538,18 +566,39 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_recipients_non_email_trailing_token_ignored() {
-        // A 4th token without '@' is a future/unknown token, not an email.
-        let block = format!("signer {} wrapcekA futurefield extra", HEX_A);
+    fn test_parse_recipients_classifies_by_content_any_order() {
+        // email (@), reference (scheme:value), cek (base64) — given out of order.
+        let block = format!("signer {} bob@example.com evt:deadbeef wrapcekA", HEX_A);
         let recips = parse_recipients_block(&block);
         assert_eq!(recips.len(), 1);
-        assert_eq!(recips[0].wrapped_cek, "wrapcekA");
-        assert!(recips[0].email.is_none());
+        assert_eq!(recips[0].wrapped_cek.as_deref(), Some("wrapcekA"));
+        assert_eq!(recips[0].email.as_deref(), Some("bob@example.com"));
+        assert_eq!(recips[0].reference.as_deref(), Some("evt:deadbeef"));
     }
 
     #[test]
-    fn test_parse_recipients_skips_malformed_lines() {
-        let block = format!("signer {}\njustonetoken\nsigner {} wrapcekB", HEX_A, HEX_B);
+    fn test_parse_recipients_optional_fields() {
+        // Plaintext (no cek), gift-wrap (reference only), and bare stanzas.
+        let block = format!(
+            "signer {} bob@example.com\nviewer {} evt:abc123\nself {}",
+            HEX_A, HEX_B, PK_HEX
+        );
+        let recips = parse_recipients_block(&block);
+        assert_eq!(recips.len(), 3);
+        // plaintext signatory: email, no cek
+        assert!(recips[0].wrapped_cek.is_none());
+        assert_eq!(recips[0].email.as_deref(), Some("bob@example.com"));
+        // gift-wrap stanza: reference only
+        assert!(recips[1].wrapped_cek.is_none() && recips[1].email.is_none());
+        assert_eq!(recips[1].reference.as_deref(), Some("evt:abc123"));
+        // bare workflow-only stanza
+        assert!(recips[2].wrapped_cek.is_none() && recips[2].email.is_none() && recips[2].reference.is_none());
+    }
+
+    #[test]
+    fn test_parse_recipients_skips_lines_without_pubkey() {
+        // `role pubkey` is the minimum; a lone token has no pubkey and is skipped.
+        let block = format!("justonetoken\nsigner {} wrapcekB", HEX_B);
         let recips = parse_recipients_block(&block);
         assert_eq!(recips.len(), 1);
         assert_eq!(recips[0].pubkey, HEX_B);
@@ -558,12 +607,13 @@ mod tests {
     #[test]
     fn test_serialize_recipients_roundtrip() {
         let recips = vec![
-            Recipient { role: "signer".into(), pubkey: HEX_A.into(), wrapped_cek: "cekA".into(), email: Some("a@x.io".into()) },
-            Recipient { role: "self".into(), pubkey: HEX_B.into(), wrapped_cek: "cekS".into(), email: None },
+            Recipient { role: "signer".into(), pubkey: HEX_A.into(), wrapped_cek: Some("cekA".into()), email: Some("a@x.io".into()), reference: None },
+            Recipient { role: "self".into(), pubkey: HEX_B.into(), wrapped_cek: Some("cekS".into()), email: None, reference: None },
+            Recipient { role: "viewer".into(), pubkey: PK_HEX.into(), wrapped_cek: None, email: None, reference: Some("evt:abc".into()) },
         ];
         let body = serialize_recipients(&recips);
-        // The email is the trailing token only on stanzas that carry one.
-        assert_eq!(body, format!("signer {} cekA a@x.io\nself {} cekS", HEX_A, HEX_B));
+        // Only present fields are emitted, in cek/email/reference order.
+        assert_eq!(body, format!("signer {} cekA a@x.io\nself {} cekS\nviewer {} evt:abc", HEX_A, HEX_B, PK_HEX));
         assert_eq!(parse_recipients_block(&body), recips);
     }
 
@@ -733,7 +783,7 @@ mod tests {
             .iter()
             .find(|r| normalize_pubkey_hex(&r.pubkey).as_deref() == Some(reader_pub_hex))
             .expect("reader has a stanza");
-        let cek = crate::crypto::unwrap_cek(reader_priv, sender_pub_hex, &stanza.wrapped_cek).unwrap();
+        let cek = crate::crypto::unwrap_cek(reader_priv, sender_pub_hex, stanza.wrapped_cek.as_deref().unwrap()).unwrap();
         crate::crypto::aes_gcm_decrypt_raw(&cek, &ciphertext).unwrap()
     }
 

@@ -569,25 +569,28 @@ The sender's pubkey (needed to unwrap the CEK) is taken from the SIGNATURE block
 
 ### 10.2 RECIPIENTS Block Format
 
-The RECIPIENTS block contains one entry per line. Each entry is three or four space-separated tokens — the fourth (`email`) is optional:
+The RECIPIENTS block contains one entry per line. Each entry begins with the two required tokens `role` and `pubkey`, followed by any subset of the **optional, content-typed** tokens below, in any order:
 
 ```
-<role> <pubkey> <wrapped-cek> [<email>]
+<role> <pubkey> [<wrapped-cek>] [<email>] [<reference>]
 ```
 
 | Field | Encoding | Notes |
 |-------|----------|-------|
 | `role` | `signer` \| `viewer` \| `self` (lowercase token) | See Section 11.1. Unknown roles MUST be ignored for workflow purposes but still treated as recipients for decryption. |
 | `pubkey` | hex (64 chars) or npub (bech32, `npub1…`) | The recipient's Nostr public key. Glossia is **not** used here, to keep entries single-token and line-parseable. |
-| `wrapped-cek` | base64 (NIP-44 payload), or `-` | `NIP44_encrypt(CEK)` to `pubkey`. Glossia is not used here. The sentinel `-` means **no key wrap** — used by plaintext (public) agreements (Section 11.8), whose `SIGNED BODY` is not encrypted; decoders MUST NOT attempt to unwrap a `-`. |
-| `email` (optional) | RFC 5322 addr-spec, no display name | The address this stanza was delivered to. Binds the recipient's `(pubkey, email)` pairing **inside** the signed block (Section 10.6), so it cannot be altered or re-paired without breaking the signature — the prerequisite for the email↔npub binding handshake (issue #102). Omitted when the recipient is known only by pubkey. |
+| `wrapped-cek` (optional) | base64 (NIP-44 payload) | `NIP44_encrypt(CEK)` to `pubkey`. **Absent** when the CEK is not carried in the email: a plaintext (public) agreement has no CEK at all (Section 11.8), and gift-wrap mode delivers it in the referenced DM (Section 11.7). |
+| `email` (optional) | RFC 5322 addr-spec, no display name | The address this stanza was delivered to. Binds the recipient's `(pubkey, email)` pairing **inside** the signed block (Section 10.6), so it cannot be altered or re-paired without breaking the signature — the prerequisite for the email↔npub binding handshake (issue #102). |
+| `reference` (optional) | `scheme:value` | A pointer to out-of-band per-recipient material — e.g. `evt:<gift-wrap-event-id>` for a NIP-59 gift-wrapped DM carrying this recipient's CEK and/or `(npub, email)` binding (Section 11.7). |
+
+**Tokens are typed by content, not position.** A decoder classifies each token after `pubkey` by inspection: a token containing `@` is the `email`; a token containing `:` is a `reference`; any other token is the base64 `wrapped-cek` (which never contains `@` or `:`). This makes every field independently optional and order-independent, with no sentinel or positional ambiguity. The first token of each type wins.
 
 Rules:
 
-- Entries SHOULD be ordered deterministically: `To:` recipients in header order, then `Cc:` recipients in header order, then the `self` stanza last. Deterministic ordering keeps the signed canonical form stable across encoders.
+- Entries SHOULD be ordered deterministically: `To:` recipients in header order, then `Cc:` recipients in header order, then the `self` stanza last. Within a stanza, encoders SHOULD emit fields in `wrapped-cek`, `email`, `reference` order. Deterministic ordering keeps the signed canonical form stable across encoders.
 - Display names are intentionally **omitted**; clients resolve names from the Nostr social registry / profile cache by pubkey.
-- The optional `email` is the **fourth** token and is placed after `wrapped-cek` (not between `pubkey` and `wrapped-cek`) so that a decoder which only knows the three-token grammar still recovers `role`/`pubkey`/`wrapped-cek` and can decrypt; it simply ignores the trailing token. An email contains an `@` and is therefore unambiguous against the base64 `wrapped-cek` (which never does). Email addresses contain no spaces, so the entry stays line-parseable.
-- Decoders MUST tolerate additional trailing tokens on a line (forward compatibility) and MUST ignore blank lines and `> ` quote prefixes.
+- A stanza with neither a `wrapped-cek` nor a `reference` is workflow-only (it declares a `pubkey` and `role` but carries no key material) — valid for a plaintext agreement or a participant known by pubkey alone.
+- Decoders MUST tolerate additional unrecognized tokens on a line (forward compatibility) and MUST ignore blank lines and `> ` quote prefixes. Future positional extensions SHOULD use a distinguishable `key:value` or `key=value` shape so they are never mistaken for a bare `wrapped-cek`.
 
 ### 10.3 Roles
 
@@ -726,7 +729,35 @@ This agreement model is conceptually aligned with [SIGit](https://sigit.io)'s do
 | Sign event (Kind 938) added to `docSignatures` | the CONSENT block bound by the level's signature (Section 11.3) |
 | Offline-verifiable from the encrypted zip | offline-verifiable from the email thread (Section 11.6) |
 
-The deliberate difference is transport and privacy. SIGit hides the participant set by gift-wrapping (NIP-59) metadata to ephemeral keys and storing encrypted files on Blossom; nostr-mail keeps the whole agreement in one email thread, which is more self-contained and offline-verifiable but exposes the participant set in the cleartext RECIPIENTS block (Section 10.9). A future **Nostr-only agreement transport** is planned that folds in SIGit's gift-wrap/Blossom approach for stronger metadata privacy; because the consent semantics here (`H`, per-signatory CONSENT, signature chaining) are transport-independent, that mode is expected to reuse this section's model with a different envelope. SIGit's own event-kind numbering is **not** adopted; nostr-mail consent lives in armor blocks, not relay-published Nostr events.
+The deliberate difference is transport and privacy. SIGit hides the participant set by gift-wrapping (NIP-59) metadata to ephemeral keys and storing encrypted files on Blossom; nostr-mail keeps the whole agreement in one email thread, which is more self-contained and offline-verifiable but exposes the participant set in the cleartext RECIPIENTS block (Section 10.9). The **gift-wrap mode** below folds in SIGit's gift-wrap approach for stronger metadata privacy; because the consent semantics here (`H`, per-signatory CONSENT, signature chaining) are transport-independent, that mode reuses this section's model with a different addressing channel. SIGit's own event-kind numbering is **not** adopted; nostr-mail consent lives in armor blocks, not relay-published Nostr events.
+
+#### 11.7.1 Gift-Wrap Mode (metadata-private delivery)
+
+> **Status:** designed; the wire format (the `reference` token, Section 10.2) is reserved now, but the NIP-59 delivery and DM-aware decrypt/verify paths are a later milestone.
+
+The cleartext RECIPIENTS block exposes two things to relays and mail servers that the participants may wish to keep private: the per-recipient **wrapped CEKs** and the **`(npub, email)` bindings**. Gift-wrap mode moves this sensitive per-recipient material off the email and into a **NIP-59 gift-wrapped DM**, one per recipient, leaving the email to carry the document plus a minimal, signed reference.
+
+**What moves, what stays.** The split is chosen so the *workflow* stays tamper-evident and offline-checkable while the *sensitive* material becomes private:
+
+| Stays in the signed email | Moves to the per-recipient gift wrap |
+|---|---|
+| the body (`ENCRYPTED BODY` ciphertext, or `SIGNED BODY`) | the recipient's `wrapped-cek` |
+| each recipient's `role` + `pubkey` + a `reference` token | the recipient's `(npub, email)` binding |
+| the originator's SIGNATURE (covers the above) | — |
+
+So a gift-wrap-mode stanza is `signer <pubkey> evt:<gift-wrap-id>` — role and pubkey remain in the signed block (so the required-signatory set, the document hash `H`, and completion accounting are still authenticated and computable from the email), while the CEK and the address binding travel in the referenced DM.
+
+**The reference.** The `reference` token (`evt:<event-id>`, Section 10.2) points to the gift wrap addressed to that recipient. The gift wrap's inner *rumor* SHOULD carry: the agreement reference (the email `Message-ID` and/or the document hash `H`), this recipient's `wrapped-cek` (if the body is encrypted), and the `(npub, email)` binding. The gift wrap is sealed and wrapped per NIP-59 (ephemeral outer key), so relays learn neither the sender nor the recipient.
+
+**Verification with the DM in hand.** A recipient: (1) verifies the email's signature chain and reads the signed `role`/`pubkey` set and `H` as usual (Section 11.6); (2) unwraps their gift wrap, confirms it references this `H`/`Message-ID`, and takes the CEK (to decrypt) and the `(npub, email)` binding; (3) completion is computed exactly as in Section 11.5 — the consents still live in the (email or DM) CONSENT blocks bound by signatures over `H`.
+
+**Privacy gradations.** This is the middle of three points on the privacy/self-containedness curve:
+
+1. **Cleartext (Sections 10–11):** everything in the email thread; fully self-contained and offline-verifiable by anyone; participant set, CEKs, and bindings are public.
+2. **Gift-wrap mode (this section):** CEKs and `(npub, email)` bindings are private; the **pubkey + role set is still public** in the signed email (so the document and signatory set remain tamper-evident and the agreement is still anchored in one email). Decryption and binding-verification now also require the recipient's DM.
+3. **Full metadata-private (future):** omit the RECIPIENTS block entirely; all addressing — including pubkeys — lives in gift wraps, and readers trial-decrypt (as the `age` format does). Maximum privacy, least self-contained; out of scope here.
+
+**Trade-off.** Gift-wrap mode trades the Section 11.6 property — *a third party can verify completion offline from the email alone* — for metadata privacy: a participant now needs their gift-wrapped DM (and thus a relay) to obtain the CEK and binding. The email still anchors the document, the signed signatory set, and `H`, so tampering is still detectable from the email; only the private openings require the DM. `Bcc:`-style blind participants are naturally expressible here, since a gift wrap to a recipient need not appear in any other recipient's view.
 
 ### 11.8 Plaintext (Public) Agreements
 
@@ -735,10 +766,10 @@ An agreement need not be confidential. A **plaintext (public) agreement** carrie
 A plaintext agreement is identical to the encrypted agreement (Sections 10–11) except for the body and the key-wrap:
 
 - **Body**: a signed `SIGNED BODY` (Section 3.2) instead of an `ENCRYPTED BODY`. The terms are glossia-encoded inside the armor (the signed payload) and also appear above the armor for non-Nostr-Mail clients. There is no CEK and nothing is encrypted.
-- **RECIPIENTS**: the same block declares the signatories (`signer`) and viewers (`viewer`), but each stanza's `wrapped-cek` token is the sentinel `-` (Section 10.2), since there is no CEK to wrap. The optional `email` token still binds the `(pubkey, email)` pairing (Sections 10.2, 6.3). There is **no `self` stanza** — nothing is encrypted, so the originator needs no self-wrap; the originator is identified by the SIGNATURE.
+- **RECIPIENTS**: the same block declares the signatories (`signer`) and viewers (`viewer`), but each stanza simply **omits the `wrapped-cek` token** (Section 10.2), since there is no CEK to wrap — a stanza is then `signer <pubkey> [<email>]`. The optional `email` token still binds the `(pubkey, email)` pairing (Sections 10.2, 6.3). There is **no `self` stanza** — nothing is encrypted, so the originator needs no self-wrap; the originator is identified by the SIGNATURE.
 - **CONSENT**, **document hash `H`**, **signature coverage (§4.2)**, and **completion (§11.5)** are unchanged. `H = SHA-256(decode(body₁) || canonical(recipients₁))` is computed over the *decoded* (glossia → plaintext) body bytes, so the same machinery applies regardless of cipher. A counter-signature is a `SIGNED BODY` reply that nests the prior message and adds the signatory's CONSENT (Section 11.4).
 
-Path selection is unambiguous: a `SIGNED BODY` is never decrypted (it has no ciphertext), so the `-` sentinel is never unwrapped. A decoder MUST treat an `ENCRYPTED BODY` whose stanza carries `-` as malformed.
+Path selection is unambiguous: a `SIGNED BODY` is never decrypted (it has no ciphertext), so the absent CEK is never an issue. A decoder MUST treat an `ENCRYPTED BODY` whose stanza carries no `wrapped-cek` (and no `reference`) as malformed.
 
 The trade-off versus the encrypted agreement is **confidentiality**: the terms and the participant set (pubkeys, and any `email` tokens) are public to anyone who sees the message. In return, the agreement is readable and its completion is verifiable by third parties who are not signatories — the same offline, self-contained verification of Section 11.6, without needing to be a recipient.
 

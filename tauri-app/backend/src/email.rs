@@ -3122,13 +3122,23 @@ fn decrypt_single_block(
                 return (block, None);
             }
         };
-        if stanza.wrapped_cek == crate::agreement::NO_CEK {
-            // Plaintext (public) agreement stanza carries no CEK; an ENCRYPTED
-            // BODY paired with such a stanza is malformed (spec §11.8).
-            block.error = Some("RECIPIENTS stanza has no CEK ('-') but the body is encrypted".to_string());
-            return (block, None);
-        }
-        let cek = match crate::crypto::unwrap_cek(private_key, &sender_pub, &stanza.wrapped_cek) {
+        let wrapped = match &stanza.wrapped_cek {
+            Some(w) => w,
+            None => {
+                // No CEK in the email: a plaintext (public) agreement stanza
+                // (§11.8) — malformed for an ENCRYPTED body — or gift-wrap mode
+                // (§11.7), where the CEK arrives in the referenced DM (not yet
+                // wired). Either way this body can't be decrypted from the email.
+                let why = if stanza.reference.is_some() {
+                    "CEK is delivered out-of-band (gift-wrap reference); DM delivery not yet supported"
+                } else {
+                    "RECIPIENTS stanza carries no CEK but the body is encrypted"
+                };
+                block.error = Some(why.to_string());
+                return (block, None);
+            }
+        };
+        let cek = match crate::crypto::unwrap_cek(private_key, &sender_pub, wrapped) {
             Ok(c) => c,
             Err(e) => {
                 block.error = Some(format!("Envelope CEK unwrap failed: {}", e));
@@ -3834,7 +3844,8 @@ fn glossia_encode_signed_body(text: &str) -> Option<(String, Vec<u8>)> {
 /// `agreement::encode_hybrid_agreement` (spec §11.8). The terms are carried in a
 /// signed `SIGNED BODY` (readable by any client, with the plaintext also above
 /// the armor per §3.2), and the RECIPIENTS block declares the signatories/viewers
-/// with the `-` no-CEK sentinel (`agreement::NO_CEK`) since nothing is encrypted.
+/// with no `wrapped-cek` token (`Recipient.wrapped_cek == None`) since nothing
+/// is encrypted.
 ///
 /// The document hash `H`, consent binding, signature coverage (§4.2), and
 /// completion accounting (§11.5) are identical to the encrypted case — they
@@ -3856,7 +3867,7 @@ pub fn encode_signed_agreement(
 ) -> Result<String, String> {
     use crate::agreement::{
         canonicalize_block, document_hash, level_signing_bytes, serialize_recipients,
-        Consent, Recipient, NO_CEK,
+        Consent, Recipient,
     };
     if recipients_in.is_empty() {
         return Err("encode_signed_agreement requires at least one signatory".to_string());
@@ -3867,12 +3878,13 @@ pub fn encode_signed_agreement(
     let (encoded_body, canonical_bytes) = glossia_encode_signed_body(terms_plaintext)
         .ok_or_else(|| "glossia encode of agreement terms failed".to_string())?;
 
-    // Signatories/viewers with no key wrap (plaintext): role pubkey - [email].
+    // Signatories/viewers with no key wrap (plaintext): role pubkey [email].
     let recipients: Vec<Recipient> = recipients_in.iter().map(|r| Recipient {
         role: r.role.to_ascii_lowercase(),
         pubkey: r.pubkey.clone(),
-        wrapped_cek: NO_CEK.to_string(),
+        wrapped_cek: None,
         email: r.email.clone(),
+        reference: None,
     }).collect();
     let recipients_body = serialize_recipients(&recipients);
     let canon_recipients = canonicalize_block(&recipients_body);
@@ -5857,10 +5869,10 @@ nitela\n\
         // The originator's signature verifies over the §4.2 target.
         assert_eq!(verify_email_signature_inline(&agreement), Some(true));
 
-        // Signatories are declared with the no-CEK sentinel.
+        // Signatories are declared with no CEK token.
         let parsed = parse_armor_components(&agreement).expect("parses");
         assert_eq!(parsed.recipients.len(), 1);
-        assert_eq!(parsed.recipients[0].wrapped_cek, crate::agreement::NO_CEK);
+        assert!(parsed.recipients[0].wrapped_cek.is_none());
         assert!(parsed.recipients[0].is_signer());
 
         // Completion is tracked: originator consented, the other signatory pending.

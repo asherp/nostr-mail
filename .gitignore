@@ -16,8 +16,11 @@ __pycache__/
 # Cursor IDE
 .cursor/
 
-# Claude Code
-.claude/
+# Claude Code (ignore local/transient state, but track the shared web-session hook)
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/settings.local.json
 
 # Mock relay events
 events.json

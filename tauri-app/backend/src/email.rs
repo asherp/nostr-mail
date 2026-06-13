@@ -1772,9 +1772,9 @@ struct ArmorLevelParts {
 
 fn level_is_begin_body(l: &str) -> bool {
     let t = l.trim().trim_matches('-').trim();
-    t.starts_with("BEGIN NOSTR NIP-")
+    t.starts_with("BEGIN NOSTR NIP-")            // pairwise NIP-04 / NIP-44
+        || t.starts_with("BEGIN NOSTR ENCRYPTED") // generic AES-256-GCM under a CEK (multi-recipient envelope)
         || t.starts_with("BEGIN NOSTR SIGNED")
-        || t.starts_with("BEGIN NOSTR HYBRID")
 }
 fn level_is_begin_recipients(l: &str) -> bool {
     l.trim().trim_matches('-').trim() == "BEGIN NOSTR RECIPIENTS"
@@ -4967,7 +4967,7 @@ nitela\n\
 
     #[test]
     fn test_split_armor_level_separates_recipients_and_consent() {
-        let body = "----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n\
+        let body = "----- BEGIN NOSTR ENCRYPTED BODY -----\n\
             QUJDREVG\n\
             ----- BEGIN NOSTR RECIPIENTS -----\n\
             signer aa bb\n\
@@ -5008,7 +5008,7 @@ nitela\n\
         let recipients = "signer aa bb\nself cc dd";
         let consent = "agreement H\nsigner aa";
         let body = format!(
-            "----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n{}\n\
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n\
             ----- BEGIN NOSTR RECIPIENTS -----\n{}\n\
             ----- BEGIN NOSTR CONSENT -----\n{}\n\
             ----- END NOSTR MESSAGE -----",
@@ -5025,7 +5025,7 @@ nitela\n\
 
     #[test]
     fn test_multi_recipient_signed_message_verifies_section_4_2() {
-        // Build a multi-recipient HYBRID message and sign over the Section 4.2 target,
+        // Build a multi-recipient (group-encrypted) message and sign over the Section 4.2 target,
         // then confirm in-body verification succeeds and tampering breaks it.
         let alice = crypto::generate_keypair().unwrap();
         let alice_pub_hex = pubkey_hex(&alice.public_key);
@@ -5042,7 +5042,7 @@ nitela\n\
         let sig_hex = crypto::sign_data_bytes(&alice.private_key, &signing_bytes).unwrap();
 
         let body = format!(
-            "----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n{}\n\
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n\
             ----- BEGIN NOSTR RECIPIENTS -----\n{}\n\
             ----- BEGIN NOSTR SIGNATURE -----\n\
             @Alice\n{}\n{}\n\
@@ -5085,7 +5085,7 @@ nitela\n\
         let sig_hex = crypto::sign_data_bytes(&alice.private_key, &signing_bytes).unwrap();
 
         let body = format!(
-            "----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n{}\n\
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n\
             ----- BEGIN NOSTR RECIPIENTS -----\n{}\n\
             ----- BEGIN NOSTR CONSENT -----\n{}\n\
             ----- BEGIN NOSTR SIGNATURE -----\n\

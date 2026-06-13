@@ -300,10 +300,13 @@ pub struct AgreementRecipientInput {
 }
 
 /// Compose a complete multi-recipient (group-encrypted) armor message — the
-/// hybrid envelope of spec Sections 10–11.
+/// envelope of spec Sections 10–11.
 ///
-/// The body is AES-256-GCM-encrypted once under a fresh CEK; the CEK is NIP-44
-/// wrapped to every recipient plus a trailing `self` stanza (Section 10.1, 10.4).
+/// The body is AES-256-GCM-encrypted once under a fresh CEK and emitted in a
+/// generic `ENCRYPTED BODY` block (there is no `HYBRID` keyword — the presence
+/// of the RECIPIENTS block selects the CEK-envelope path; Sections 8, 10.5).
+/// The CEK is NIP-44 wrapped to every recipient plus a trailing `self` stanza
+/// (Section 10.1, 10.4).
 /// When `originator_consents` is true, the originator is themselves a required
 /// signatory and a CONSENT block over the document hash `H` is included
 /// (Section 11.2). The SIGNATURE covers body + recipients + consent per
@@ -381,8 +384,12 @@ pub fn encode_hybrid_agreement(
     let sig_hex = crate::crypto::sign_data_bytes(sender_priv, &signing_bytes)?;
 
     // 6. Assemble the armor (body → RECIPIENTS → [CONSENT] → SIGNATURE; §11.3.2).
+    // The body uses the generic `ENCRYPTED BODY` tag (AES-256-GCM under a CEK);
+    // there is no dedicated keyword — the presence of the RECIPIENTS block is
+    // what tells a decoder to take the CEK-envelope path rather than pairwise
+    // NIP-44 (spec Sections 8, 10.5).
     let mut out = String::new();
-    out.push_str("----- BEGIN NOSTR HYBRID ENCRYPTED BODY -----\n");
+    out.push_str("----- BEGIN NOSTR ENCRYPTED BODY -----\n");
     out.push_str(&body_b64);
     out.push('\n');
     out.push_str("----- BEGIN NOSTR RECIPIENTS -----\n");
@@ -626,10 +633,10 @@ mod tests {
     /// Recover the body from an encoded message as a given reader (by unwrapping
     /// the matching RECIPIENTS stanza and AES-GCM-decrypting). Returns the bytes.
     fn reader_recovers_body(armor: &str, reader_priv: &str, reader_pub_hex: &str, sender_pub_hex: &str) -> Vec<u8> {
-        // Extract the base64 body (line after the HYBRID BEGIN).
+        // Extract the base64 body (line after the ENCRYPTED BODY BEGIN).
         let body_b64 = armor
             .lines()
-            .skip_while(|l| !l.contains("BEGIN NOSTR HYBRID"))
+            .skip_while(|l| !l.contains("BEGIN NOSTR ENCRYPTED BODY"))
             .nth(1)
             .expect("body line")
             .trim()
@@ -672,8 +679,8 @@ mod tests {
             &sender.private_key, &sender.public_key, "Originator", body, &recips, false,
         ).unwrap();
 
-        // Structure: hybrid body, recipients (incl. self last), no consent.
-        assert!(armor.contains("BEGIN NOSTR HYBRID ENCRYPTED BODY"));
+        // Structure: generic encrypted body, recipients (incl. self last), no consent.
+        assert!(armor.contains("BEGIN NOSTR ENCRYPTED BODY"));
         assert!(armor.contains("BEGIN NOSTR RECIPIENTS"));
         assert!(!armor.contains("BEGIN NOSTR CONSENT"));
         let recip_body: String = armor
@@ -721,7 +728,7 @@ mod tests {
 
         // The consent's H must equal SHA-256(ciphertext || canonical(recipients)).
         let body_b64 = armor.lines()
-            .skip_while(|l| !l.contains("BEGIN NOSTR HYBRID")).nth(1).unwrap().trim();
+            .skip_while(|l| !l.contains("BEGIN NOSTR ENCRYPTED BODY")).nth(1).unwrap().trim();
         let ciphertext = general_purpose::STANDARD.decode(body_b64).unwrap();
         let recip_body: String = armor.lines()
             .skip_while(|l| !l.contains("BEGIN NOSTR RECIPIENTS")).skip(1)

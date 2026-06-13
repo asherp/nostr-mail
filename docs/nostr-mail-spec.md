@@ -19,7 +19,7 @@ All Nostr-Mail content is enclosed in ASCII armor blocks using `-----` delimiter
 | `BEGIN NOSTR SIGNED BODY` | Signed plaintext | Plaintext body content |
 | `BEGIN NOSTR SIGNATURE` | Proof of authorship + identity | Schnorr signature (64 bytes) followed by sender's pubkey (32 bytes) |
 | `BEGIN NOSTR SEAL` | Identity declaration | Sender's Nostr public key (unsigned messages only) |
-| `BEGIN NOSTR HYBRID ENCRYPTED BODY` | Multi-recipient encrypted content | AES-256-GCM ciphertext under a per-message Content Encryption Key (CEK) |
+| `BEGIN NOSTR ENCRYPTED BODY` | Multi-recipient encrypted content | AES-256-GCM ciphertext under a per-message Content Encryption Key (CEK). Identified as the envelope (CEK) path by the accompanying RECIPIENTS block — there is no distinct keyword |
 | `BEGIN NOSTR RECIPIENTS` | Recipient key-wrap + roles | Per-recipient NIP-44-wrapped CEK, pubkey, and role |
 | `BEGIN NOSTR CONSENT` | Explicit consent marker | A signatory's binding consent to a specific agreement (document hash + signer pubkey); see Section 11.3 |
 | `END NOSTR MESSAGE` | Closing tag | Terminates the outermost block |
@@ -28,6 +28,8 @@ All Nostr-Mail content is enclosed in ASCII armor blocks using `-----` delimiter
 | `END NOSTR CONSENT` | Closing tag | Terminates a standalone consent block |
 
 The encryption type is embedded directly in the BEGIN tag (e.g., `BEGIN NOSTR NIP-44 ENCRYPTED BODY`), keeping the format self-describing without metadata lines.
+
+**No `HYBRID` keyword.** The multi-recipient envelope reuses the generic `BEGIN NOSTR ENCRYPTED BODY` tag (AES-256-GCM under a CEK) rather than a dedicated keyword. This mirrors how the existing attachment manifest rides inside an ordinary encrypted body: a decoder does not need the tag to announce the scheme. The **presence of a RECIPIENTS block** is the unambiguous signal to take the CEK-envelope decryption path (unwrap the CEK, then AES-256-GCM-decrypt) instead of the pairwise NIP-04/NIP-44 path; see Sections 8 and 10.5.
 
 ### 2.2 Legacy Tag Names (Backwards Compatibility)
 
@@ -203,7 +205,7 @@ Decoders MUST also accept armor block delimiters preceded by `> ` quote prefixes
 When a message has more than one cryptographic recipient — for example multiple `To:` signatories and/or `Cc:` viewers — the body cannot be encrypted with a single pairwise NIP-44 shared secret, because each recipient derives a different secret. Instead the body is encrypted **once** under a random Content Encryption Key (CEK), and the CEK is wrapped to each recipient with NIP-44. This is the same hybrid construction already used for attachments (AES-256 for payload, NIP-44 for the key), generalized to N recipients. The envelope mechanics are normative in Section 10.
 
 ```
------ BEGIN NOSTR HYBRID ENCRYPTED BODY -----
+----- BEGIN NOSTR ENCRYPTED BODY -----
 <AES-256-GCM ciphertext under CEK, base64 or glossia-encoded>
 ----- BEGIN NOSTR RECIPIENTS -----
 signer <pubkey-1> <NIP-44-wrapped CEK>
@@ -226,13 +228,13 @@ A multi-recipient message SHOULD be signed; the SIGNATURE then covers both the b
 Each encrypted level in a reply chain has its own independent CEK, and therefore its own RECIPIENTS block. The recipients block is **not** inherited from an enclosing or enclosed level. This both is cryptographically required (a single block cannot hand out different per-level CEKs) and records the recipient/role set as it stood at each point in the thread.
 
 ```
------ BEGIN NOSTR HYBRID ENCRYPTED BODY -----
+----- BEGIN NOSTR ENCRYPTED BODY -----
 <reply ciphertext under CEK_reply>
 ----- BEGIN NOSTR RECIPIENTS -----
 signer <pubkey-1> <CEK_reply wrapped to pubkey-1>
 signer <pubkey-2> <CEK_reply wrapped to pubkey-2>
 self   <reply-author-pubkey> <CEK_reply wrapped to self>
------ BEGIN NOSTR HYBRID ENCRYPTED BODY -----
+----- BEGIN NOSTR ENCRYPTED BODY -----
 <original ciphertext under CEK_orig>
 ----- BEGIN NOSTR RECIPIENTS -----
 signer <pubkey-1> <CEK_orig wrapped to pubkey-1>
@@ -505,10 +507,10 @@ Because email headers are spoofable and may be rewritten on forward (Section 7),
    - Single-recipient / plaintext: `SHA-256(decoded_body_bytes)` (Section 4)
    - Multi-recipient (RECIPIENTS block present): include the canonicalized recipients block per Section 4.2
    - For NIP-04: signature MUST be present and MUST verify. If the signature is missing or invalid, the decoder MUST reject the message **without proceeding to step 8** (see Section 4.1)
-   - For NIP-44 / hybrid: signature verification is recommended but not required (NIP-44 and AES-256-GCM provide their own authentication via HMAC / GCM tag)
-8. **Decrypt** if encrypted:
-   - **Pairwise** (`NIP-04`/`NIP-44 ENCRYPTED BODY`, no RECIPIENTS): use the recipient's private key and the sender's pubkey
-   - **Multi-recipient** (`HYBRID ENCRYPTED BODY` + RECIPIENTS): locate the stanza whose pubkey matches the reader's own pubkey, NIP-44-unwrap the CEK using the reader's private key and the sender's pubkey, then AES-256-GCM-decrypt the body with the CEK. If no stanza matches the reader's pubkey, the reader is not a recipient of that level and cannot decrypt it (this is expected for levels predating the reader's addition to the thread — see Section 10.8)
+   - For NIP-44 / CEK-envelope: signature verification is recommended but not required (NIP-44 and AES-256-GCM provide their own authentication via HMAC / GCM tag)
+8. **Decrypt** if encrypted. The path is selected by the **presence of a RECIPIENTS block**, not by a distinct body tag:
+   - **Pairwise** (`NIP-04`/`NIP-44 ENCRYPTED BODY`, **no** RECIPIENTS block): use the recipient's private key and the sender's pubkey
+   - **Multi-recipient** (generic `ENCRYPTED BODY` **with** a RECIPIENTS block): locate the stanza whose pubkey matches the reader's own pubkey, NIP-44-unwrap the CEK using the reader's private key and the sender's pubkey, then AES-256-GCM-decrypt the body with the CEK. If no stanza matches the reader's pubkey, the reader is not a recipient of that level and cannot decrypt it (this is expected for levels predating the reader's addition to the thread — see Section 10.8)
 
 ## 9. Spam Rescue & Folder Handling
 
@@ -552,11 +554,11 @@ NIP-44 is pairwise: a ciphertext encrypted with the shared secret of `(senderPri
 
 ```
 1. Generate a random 256-bit Content Encryption Key (CEK).
-2. Encrypt the body ONCE with AES-256-GCM under the CEK            → one HYBRID ENCRYPTED BODY
+2. Encrypt the body ONCE with AES-256-GCM under the CEK            → one ENCRYPTED BODY
    (attachments are encrypted under the same CEK, as today).
 3. For each pubkey P in { To ∪ Cc ∪ sender-self }:
        wrapped[P] = NIP44_encrypt(CEK, senderPriv, P)             → one RECIPIENTS stanza per P
-4. Emit: [HYBRID ENCRYPTED BODY] + [RECIPIENTS block] + optional [SIGNATURE]
+4. Emit: [ENCRYPTED BODY] + [RECIPIENTS block] + optional [SIGNATURE]
 ```
 
 To read the message, a recipient locates the stanza addressed to their own pubkey, NIP-44-unwraps the CEK with their private key and the sender's pubkey, then AES-256-GCM-decrypts the body. The body ciphertext is produced once regardless of recipient count; only the 32-byte CEK is wrapped per recipient.
@@ -595,8 +597,8 @@ Every multi-recipient message MUST include a `self` stanza wrapping the CEK to t
 
 The envelope format is used **only** when a message has more than one cryptographic recipient (i.e. more than one of `To ∪ Cc`, excluding `self`). A message to a single recipient continues to use the pairwise `BEGIN NOSTR NIP-44 ENCRYPTED BODY` format with no RECIPIENTS block, so existing decoders are unaffected.
 
-- Encoders MUST emit the pairwise format for single-recipient messages and the hybrid format for multi-recipient messages.
-- Decoders MUST select the decryption path by block type: `HYBRID ENCRYPTED BODY` ⇒ envelope path (Section 8 step 8, multi-recipient); `NIP-44`/`NIP-04 ENCRYPTED BODY` ⇒ pairwise path.
+- Encoders MUST emit the pairwise format for single-recipient messages and the envelope format (generic `ENCRYPTED BODY` + RECIPIENTS block) for multi-recipient messages.
+- Decoders MUST select the decryption path by the **presence of a RECIPIENTS block**: a RECIPIENTS block present ⇒ envelope (CEK) path (Section 8 step 8, multi-recipient); absent ⇒ pairwise path keyed on the `NIP-44`/`NIP-04` body tag. There is no `HYBRID` keyword.
 - NIP-04 MUST NOT be used as the body cipher for multi-recipient messages (the body cipher is always AES-256-GCM under the CEK, which is authenticated; see Section 4.1 for why unauthenticated CBC is disallowed).
 
 ### 10.6 Signature Coverage
@@ -640,7 +642,7 @@ The role is a **workflow** attribute, not an access attribute — every role can
 
 An agreement is initiated as a signed multi-recipient message:
 
-- **Body**: the agreement cover text / terms, in a signed `HYBRID ENCRYPTED BODY`.
+- **Body**: the agreement cover text / terms, in a signed `ENCRYPTED BODY` (the envelope is signalled by the RECIPIENTS block, not a keyword).
 - **Attachment(s)**: the contract document(s), encrypted under the same CEK (existing hybrid-attachment path).
 - **RECIPIENTS**: a `signer` stanza for each required signatory, a `viewer` stanza for each viewer, and the `self` stanza.
 - **CONSENT** (optional): if the originator is themselves a required signatory, they include their own CONSENT block (Section 11.3) declaring consent. The originator's `self` stanza handles only decryption access and is never counted as a consent (Section 10.3) — an originator who signs MUST do so via a CONSENT block.

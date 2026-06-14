@@ -292,8 +292,12 @@ const TauriService = {
         if (subjectEncoding != null) args.subjectEncoding = subjectEncoding;
         return await this.invoke('compose_agreement', args);
     },
-    sendAgreement: async function(emailConfig, subject, body, to, cc, encrypted, originatorConsents, profileName = null, messageId = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, glossiaEncoding = null, subjectEncoding = null) {
+    // `ccPlain` are keyless Cc emails (header-only, can't decrypt). `isAgreement`
+    // false → plain multi-recipient encrypted mail (viewer roles, no marker).
+    sendAgreement: async function(emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, isAgreement, profileName = null, messageId = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, glossiaEncoding = null, subjectEncoding = null) {
         const args = { emailConfig, subject, body, to, cc, encrypted, originatorConsents };
+        if (ccPlain != null) args.ccPlain = ccPlain;
+        if (isAgreement != null) args.isAgreement = isAgreement;
         if (profileName != null) args.profileName = profileName;
         if (messageId != null) args.messageId = messageId;
         if (inReplyTo != null) args.inReplyTo = inReplyTo;

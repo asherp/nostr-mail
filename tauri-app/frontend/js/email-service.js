@@ -2048,6 +2048,11 @@ class EmailService {
             return this.sendAgreementCompose();
         }
 
+        // Cc present: a multi-recipient (encrypted) email rather than a 1:1 send.
+        if ((this._recipientState('composeCc') || []).length > 0) {
+            return this.sendMultiRecipientEmail();
+        }
+
         const toAddress = domManager.getValue('toAddress')?.trim() || '';
         const subject = domManager.getValue('subject')?.trim() || '';
         const body = domManager.getValue('messageBody')?.trim() || '';
@@ -2298,10 +2303,13 @@ class EmailService {
             return;
         }
 
-        // To: signatories and Cc: viewers come from the pickers, each already a
-        // {email, pubkey} pair — no email→pubkey resolution needed.
-        const to = (this._toRecipients || []).map(r => ({ email: r.email, pubkey: r.pubkey }));
-        const cc = (this._ccRecipients || []).map(r => ({ email: r.email, pubkey: r.pubkey }));
+        // To: signatories (keyed) and Cc: viewers come from the pickers. Cc may
+        // include keyless viewers — they go in the Cc header only (cc_plain) and
+        // can't decrypt, but can still verify the signature (escrow/witness).
+        const to = this._recipientState('to').map(r => ({ email: r.email, pubkey: r.pubkey }));
+        const ccAll = this._recipientState('cc');
+        const cc = ccAll.filter(r => r.pubkey).map(r => ({ email: r.email, pubkey: r.pubkey }));
+        const ccPlain = ccAll.filter(r => !r.pubkey).map(r => r.email);
         if (to.length === 0) {
             notificationService.showError('Add at least one To: signatory');
             return;
@@ -2334,20 +2342,19 @@ class EmailService {
             domManager.disable('sendBtn');
             domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
             await TauriService.sendAgreement(
-                emailConfig, subject, body, to, cc, encrypted, originatorConsents,
+                emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, true,
                 profileName, messageId, this._replyToMessageId, this._replyReferences,
                 includePubkeyHeader, includeSigHeader, glossiaEncoding, null
             );
-            notificationService.showSuccess(
-                `Agreement sent to ${to.length} signatory(ies)` + (cc.length ? ` and ${cc.length} viewer(s)` : '')
-            );
+            let msg = `Agreement sent to ${to.length} signatory(ies)` + (cc.length ? ` and ${cc.length} viewer(s)` : '');
+            if (ccPlain.length) msg += ` (${ccPlain.length} keyless Cc can't read it)`;
+            notificationService.showSuccess(msg);
 
             // Reset the compose form.
             domManager.clear('toAddress');
             domManager.clear('subject');
             domManager.clear('messageBody');
-            this._toRecipients = [];
-            this._ccRecipients = [];
+            this._recipientLists = {};
             this._renderRecipientChips('to');
             this._renderRecipientChips('cc');
             this.selectedNostrContact = null;
@@ -2358,6 +2365,98 @@ class EmailService {
         } catch (error) {
             console.error('[JS] Error sending agreement:', error);
             notificationService.showError('Failed to send agreement: ' + error);
+        } finally {
+            domManager.enable('sendBtn');
+            domManager.setHTML('sendBtn', '<i class="fas fa-paper-plane"></i> Send');
+        }
+    }
+
+    // Send a plain (non-agreement) multi-recipient encrypted email: single To
+    // (must be keyed) + Cc viewers (keyed → wrapped CEK; keyless → Cc header
+    // only, can't decrypt). Reuses the envelope via send_agreement with
+    // is_agreement = false (viewer roles, no agreement marker).
+    async sendMultiRecipientEmail() {
+        if (!appState.hasSettings()) {
+            notificationService.showError('Please configure your email settings first');
+            return;
+        }
+        if (!appState.hasKeypair()) {
+            notificationService.showError('A Nostr keypair is required to send encrypted Cc mail');
+            return;
+        }
+
+        const settings = appState.getSettings();
+        const subject = domManager.getValue('subject')?.trim() || '';
+        const body = domManager.getValue('messageBody')?.trim() || '';
+        const toAddress = domManager.getValue('toAddress')?.trim() || '';
+        if (!toAddress || !subject || !body) {
+            notificationService.showError('Please fill in To, subject, and message');
+            return;
+        }
+
+        // The To recipient must be keyed (we encrypt to them). Try the explicit
+        // pubkey, the selected contact, or a contact matched by email.
+        let toPubkey = this.getRecipientPubkey();
+        if (!toPubkey) {
+            const c = appState.getContacts().find(c => c.email && c.email.toLowerCase() === toAddress.toLowerCase());
+            if (c && c.pubkey) toPubkey = c.pubkey;
+        }
+        if (!toPubkey) {
+            notificationService.showError('Cc requires the To recipient to have a Nostr key (the message is encrypted to everyone).');
+            return;
+        }
+
+        const ccAll = this._recipientState('composeCc');
+        const cc = ccAll.filter(r => r.pubkey).map(r => ({ email: r.email, pubkey: r.pubkey }));
+        const ccPlain = ccAll.filter(r => !r.pubkey).map(r => r.email);
+        const to = [{ email: toAddress, pubkey: toPubkey }];
+
+        let useTls = settings.use_tls;
+        if (settings.smtp_host === 'smtp.gmail.com' && !useTls) useTls = true;
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+        };
+
+        const keypair = appState.getKeypair();
+        let profileName = '';
+        try { profileName = window.profileManager?.getAccountDisplayName(keypair?.public_key) || ''; } catch (e) {}
+        const glossiaEncoding = settings.glossia_encoding_body || null;
+        const includePubkeyHeader = settings.include_pubkey_header !== false;
+        const includeSigHeader = settings.include_sig_header !== false;
+        const messageId = this.generateAndStoreMessageId();
+
+        try {
+            domManager.disable('sendBtn');
+            domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
+            await TauriService.sendAgreement(
+                emailConfig, subject, body, to, cc, ccPlain, /* encrypted */ true,
+                /* originatorConsents */ false, /* isAgreement */ false,
+                profileName, messageId, this._replyToMessageId, this._replyReferences,
+                includePubkeyHeader, includeSigHeader, glossiaEncoding, null
+            );
+            let msg = `Encrypted email sent to ${to.length + cc.length} recipient(s)`;
+            if (ccPlain.length) msg += ` (${ccPlain.length} Cc without a key can't read it)`;
+            notificationService.showSuccess(msg);
+
+            domManager.clear('toAddress');
+            domManager.clear('subject');
+            domManager.clear('messageBody');
+            this._recipientLists = this._recipientLists || {};
+            this._recipientLists.composeCc = [];
+            this._renderRecipientChips('composeCc');
+            this.selectedNostrContact = null;
+            try { this.clearAttachments(); } catch (e) {}
+            try { this.clearCurrentDraft(); } catch (e) {}
+            setTimeout(() => { this.syncSentEmails().catch(() => {}); }, 100);
+        } catch (error) {
+            console.error('[JS] Error sending multi-recipient email:', error);
+            notificationService.showError('Failed to send: ' + error);
         } finally {
             domManager.enable('sendBtn');
             domManager.setHTML('sendBtn', '<i class="fas fa-paper-plane"></i> Send');
@@ -2465,23 +2564,29 @@ class EmailService {
         const title = document.getElementById('compose-title');
         if (title) title.textContent = on ? 'Create Agreement' : 'Compose Email';
         // In agreement mode the To/Cc come from the in-panel pickers; hide the
-        // normal single-recipient To block.
+        // normal single-recipient To block and the normal Cc picker.
         const toGroup = document.getElementById('compose-to-group');
         if (toGroup) toGroup.style.display = on ? 'none' : '';
+        const ccGroup = document.getElementById('compose-cc-group');
+        if (ccGroup) ccGroup.style.display = on ? 'none' : '';
         if (on) {
             ['to', 'cc'].forEach(kind => {
                 this._setupRecipientPicker(kind);
                 this._populateRecipientSelect(kind);
                 this._renderRecipientChips(kind);
             });
+        } else {
+            // Normal compose: wire/populate the optional Cc picker.
+            this._setupRecipientPicker('composeCc');
+            this._populateRecipientSelect('composeCc');
+            this._renderRecipientChips('composeCc');
         }
     }
 
     // Open the compose view in agreement mode (from the Agreements tab + button).
     async startNewAgreement() {
         this._pendingAgreementCompose = true;
-        this._toRecipients = [];
-        this._ccRecipients = [];
+        this._recipientLists = { to: [], cc: [] };
         try { await (window.app && window.app.switchTab && window.app.switchTab('compose')); } catch (e) {}
         this.setAgreementMode(true);
         this._pendingAgreementCompose = false;
@@ -2491,9 +2596,9 @@ class EmailService {
     // Add one recipient at a time, from contacts or by manual email + npub.
     // `kind` is 'to' or 'cc'.
     _recipientState(kind) {
-        if (kind === 'to') { this._toRecipients = this._toRecipients || []; return this._toRecipients; }
-        this._ccRecipients = this._ccRecipients || [];
-        return this._ccRecipients;
+        this._recipientLists = this._recipientLists || {};
+        this._recipientLists[kind] = this._recipientLists[kind] || [];
+        return this._recipientLists[kind];
     }
 
     _setupRecipientPicker(kind) {
@@ -2535,13 +2640,14 @@ class EmailService {
     addRecipient(kind, email, pubkey) {
         email = (email || '').trim().toLowerCase();
         pubkey = (pubkey || '').trim();
-        const role = kind === 'to' ? 'signatory' : 'viewer';
-        if (!email || !pubkey) {
-            notificationService.showError(`A ${role} needs both an email and a Nostr pubkey`);
+        if (!email || !email.includes('@')) {
+            notificationService.showError('Enter a valid email address');
             return false;
         }
-        if (!email.includes('@')) {
-            notificationService.showError('Invalid email address');
+        // To: signatories must be keyed (encrypted to them). Cc: viewers may be
+        // keyless — they receive the message but can't decrypt it (escrow/witness).
+        if (kind === 'to' && !pubkey) {
+            notificationService.showError('A To: signatory needs a Nostr pubkey');
             return false;
         }
         const list = this._recipientState(kind);
@@ -2549,7 +2655,7 @@ class EmailService {
             notificationService.showWarning('That recipient is already added');
             return false;
         }
-        list.push({ email, pubkey });
+        list.push({ email, pubkey: pubkey || null });
         this._renderRecipientChips(kind);
         return true;
     }
@@ -2558,9 +2664,12 @@ class EmailService {
         const el = document.getElementById(`${kind}-recipients-list`);
         if (!el) return;
         const list = this._recipientState(kind);
-        el.innerHTML = list.map((r, i) =>
-            `<span class="recipient-chip" title="${Utils.escapeHtml(r.pubkey)}">${Utils.escapeHtml(r.email)}<button type="button" class="recipient-chip-remove" data-idx="${i}" aria-label="Remove ${Utils.escapeHtml(r.email)}">×</button></span>`
-        ).join('');
+        el.innerHTML = list.map((r, i) => {
+            const keyless = !r.pubkey;
+            const title = keyless ? 'No Nostr key — will receive but cannot decrypt' : Utils.escapeHtml(r.pubkey);
+            const tag = keyless ? ' <span class="recipient-chip-nokey" title="No Nostr key">(no key)</span>' : '';
+            return `<span class="recipient-chip${keyless ? ' keyless' : ''}" title="${title}">${Utils.escapeHtml(r.email)}${tag}<button type="button" class="recipient-chip-remove" data-idx="${i}" aria-label="Remove ${Utils.escapeHtml(r.email)}">×</button></span>`;
+        }).join('');
         el.querySelectorAll('.recipient-chip-remove').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();

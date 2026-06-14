@@ -2095,6 +2095,7 @@ async fn compose_agreement(
     cc: Vec<crate::types::AgreementParty>,
     encrypted: bool,
     originator_consents: bool,
+    is_agreement: Option<bool>,
     profile_name: Option<String>,
     glossia_encoding: Option<String>,
     subject_encoding: Option<String>,
@@ -2114,6 +2115,7 @@ async fn compose_agreement(
         &cc,
         encrypted,
         originator_consents,
+        is_agreement.unwrap_or(true),
         glossia_encoding.as_deref(),
         subject_encoding.as_deref(),
     )
@@ -2129,8 +2131,10 @@ async fn send_agreement(
     body: String,
     to: Vec<crate::types::AgreementParty>,
     cc: Vec<crate::types::AgreementParty>,
+    cc_plain: Option<Vec<String>>,
     encrypted: bool,
     originator_consents: bool,
+    is_agreement: Option<bool>,
     profile_name: Option<String>,
     message_id: Option<String>,
     in_reply_to: Option<String>,
@@ -2144,6 +2148,7 @@ async fn send_agreement(
     email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
     let include_pubkey = include_pubkey_header.unwrap_or(true);
     let include_sig = include_sig_header.unwrap_or(true);
+    let cc_plain = cc_plain.unwrap_or_default();
     email::send_agreement_email(
         &email_config,
         &subject,
@@ -2151,8 +2156,10 @@ async fn send_agreement(
         &body,
         &to,
         &cc,
+        &cc_plain,
         encrypted,
         originator_consents,
+        is_agreement.unwrap_or(true),
         message_id.as_deref(),
         in_reply_to.as_deref(),
         references.as_deref(),

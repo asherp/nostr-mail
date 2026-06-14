@@ -664,15 +664,20 @@ pub fn compose_agreement(
     cc: &[crate::types::AgreementParty],
     encrypted: bool,
     originator_consents: bool,
+    is_agreement: bool,
     encoding: Option<&str>,
     subject_encoding: Option<&str>,
 ) -> Result<crate::types::ComposedAgreement, String> {
     use crate::agreement::{AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
 
+    // `To:` are signatories only for an actual agreement; a plain multi-recipient
+    // email tags everyone `viewer` (read access, no signing) so it isn't surfaced
+    // as an unsigned agreement (spec §6.3, §11.1).
+    let to_role = if is_agreement { ROLE_SIGNER } else { ROLE_VIEWER };
     let mut recips: Vec<AgreementRecipientInput> = Vec::with_capacity(to.len() + cc.len());
     for p in to {
         recips.push(AgreementRecipientInput {
-            role: ROLE_SIGNER.to_string(),
+            role: to_role.to_string(),
             pubkey: p.pubkey.clone(),
             email: Some(p.email.clone()),
         });
@@ -685,7 +690,7 @@ pub fn compose_agreement(
         });
     }
     if recips.is_empty() {
-        return Err("an agreement needs at least one To: or Cc: recipient".to_string());
+        return Err("a multi-recipient message needs at least one keyed To: or Cc: recipient".to_string());
     }
 
     if encrypted {
@@ -764,8 +769,10 @@ pub async fn send_agreement_email(
     body: &str,
     to: &[crate::types::AgreementParty],
     cc: &[crate::types::AgreementParty],
+    cc_plain: &[String],
     encrypted: bool,
     originator_consents: bool,
+    is_agreement: bool,
     message_id: Option<&str>,
     in_reply_to: Option<&str>,
     references: Option<&str>,
@@ -775,12 +782,12 @@ pub async fn send_agreement_email(
     subject_encoding: Option<&str>,
 ) -> Result<String> {
     let private_key = config.private_key.as_deref()
-        .ok_or_else(|| anyhow::anyhow!("no private key configured; cannot sign the agreement"))?;
+        .ok_or_else(|| anyhow::anyhow!("no private key configured; cannot sign the message"))?;
     let sender_pub = crypto::get_public_key_from_private(private_key)
         .map_err(|e| anyhow::anyhow!("could not derive sender pubkey: {}", e))?;
 
     let composed = compose_agreement(
-        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents, encoding, subject_encoding,
+        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents, is_agreement, encoding, subject_encoding,
     ).map_err(|e| anyhow::anyhow!("{}", e))?;
     let armor = composed.armor;
 
@@ -794,6 +801,13 @@ pub async fn send_agreement_email(
     for p in cc {
         builder = builder.cc(p.email.parse()?);
     }
+    // Keyless Cc: no Nostr key, so no CEK wrap and no RECIPIENTS stanza — they
+    // appear in the Cc header only and receive the (encrypted) message without
+    // being able to decrypt it. They CAN still verify the in-body signature
+    // (useful for escrow/witness Cc).
+    for addr in cc_plain {
+        builder = builder.cc(addr.parse()?);
+    }
     if let Some(m) = message_id {
         builder = builder.message_id(Some(m.to_string()));
     }
@@ -804,8 +818,11 @@ pub async fn send_agreement_email(
         builder = builder.references(r.to_string());
     }
 
-    // Agreement marker for decrypt-free IMAP filtering (§6.1); non-authoritative.
-    builder = builder.header(XNostrAgreement("1".to_string()));
+    // Agreement marker for decrypt-free IMAP filtering (§6.1) — only for actual
+    // agreements, not plain multi-recipient mail; non-authoritative.
+    if is_agreement {
+        builder = builder.header(XNostrAgreement("1".to_string()));
+    }
 
     // X-Nostr-Pubkey / X-Nostr-Sig mirror the in-body SIGNATURE (secondary path).
     if include_pubkey_header {
@@ -821,9 +838,10 @@ pub async fn send_agreement_email(
     let email = builder.body(armor)?;
     let mailer = build_mailer(config)?;
     send_message_with_timeout(mailer, email).await?;
+    let recipient_count = to.len() + cc.len() + cc_plain.len();
     Ok(format!(
-        "Agreement sent to {} signatory(ies) and {} viewer(s)",
-        to.len(), cc.len()
+        "{} sent to {} recipient(s)",
+        if is_agreement { "Agreement" } else { "Message" }, recipient_count
     ))
 }
 
@@ -4508,6 +4526,11 @@ pub fn verify_agreement_status(thread: &str) -> Option<crate::agreement::Agreeme
     }
 
     let mut status = crate::agreement::compute_completion(&required, &consented);
+    // No required signatories ⇒ this is a plain multi-recipient message (all
+    // viewers), not an agreement.
+    if status.n == 0 {
+        return None;
+    }
     status.document_hash = h;
     Some(status)
 }
@@ -6174,7 +6197,7 @@ nitela\n\
         let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
-            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, None, None,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, true, None, None,
         ).unwrap();
         let armor = composed.armor;
 
@@ -6216,7 +6239,7 @@ nitela\n\
         let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, None, "Alice",
-            "Public Statement", "We agree to the public terms.", &to, &[], false, true, None, None,
+            "Public Statement", "We agree to the public terms.", &to, &[], false, true, true, None, None,
         ).unwrap();
         let armor = composed.armor;
 
@@ -6235,8 +6258,40 @@ nitela\n\
         let alice = crypto::generate_keypair().unwrap();
         let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
         let err = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, None, None);
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, true, None, None);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_compose_plain_multi_recipient_is_not_an_agreement() {
+        // is_agreement = false → all recipients are `viewer` (no signatories), no
+        // X-Nostr-Agreement marker, and verify_agreement_status sees no agreement —
+        // a plain encrypted CC'd email, not a pseudo-agreement.
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let carol = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
+
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "FYI", "Shared with both of you.", &to, &cc, true, false, /* is_agreement */ false, None, None,
+        ).unwrap();
+        let armor = composed.armor;
+
+        // No signatories ⇒ not surfaced as an agreement.
+        assert!(verify_agreement_status(&armor).is_none(), "plain CC'd email must not be an agreement");
+        // Both recipients still decrypt (they're viewers with a wrapped CEK).
+        let parsed = parse_armor_components(&armor).expect("parses");
+        assert!(parsed.recipients.iter().all(|r| r.role == "viewer" || r.role == "self"));
+        assert_eq!(verify_email_signature_inline(&armor), Some(true));
+        let r = decrypt_email_body_pipeline(
+            &carol.private_key, &armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success);
+        assert_eq!(r.body, "Shared with both of you.");
     }
 
     #[test]
@@ -6262,10 +6317,10 @@ nitela\n\
         // Compose the same plaintext agreement under two schemes; the encoded
         // bodies must differ, yet both verify and decrypt.
         let latin = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, Some("latin"), None,
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, Some("latin"), None,
         ).unwrap();
         let english = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, Some("english - bip39"), None,
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, Some("english - bip39"), None,
         ).unwrap();
         assert_ne!(latin.armor, english.armor, "encoding setting must change the armor body");
         assert_eq!(verify_email_signature_inline(&latin.armor), Some(true));
@@ -6284,7 +6339,7 @@ nitela\n\
         // and the recipient still recovers both.
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
-            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true,
             Some("latin"), Some("english - bip39"),
         ).unwrap();
 
@@ -6300,7 +6355,7 @@ nitela\n\
         // subject_encoding = None falls back to the body encoding.
         let fallback = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
-            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true,
             Some("latin"), None,
         ).unwrap();
         let rf = decrypt_email_body_pipeline(

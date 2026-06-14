@@ -1872,6 +1872,12 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (createAgreementBtn) {
             createAgreementBtn.addEventListener('click', () => window.emailService?.startNewAgreement());
         }
+        // Wire the optional Cc picker on the (default) compose tab now, since
+        // switchTab may not fire for the initially-active tab.
+        if (window.emailService) {
+            window.emailService._setupRecipientPicker('composeCc');
+            window.emailService._populateRecipientSelect('composeCc');
+        }
         const refreshAgreements = document.getElementById('refresh-agreements');
         if (refreshAgreements) {
             refreshAgreements.addEventListener('click', () => window.emailService?.loadAgreements());

@@ -99,6 +99,15 @@
     color: var(--text-secondary, #888);
 }
 .recipient-chip-remove:hover { color: #c0392b; }
+.recipient-chip.keyless {
+    border-style: dashed;
+    opacity: 0.85;
+}
+.recipient-chip-nokey {
+    color: var(--text-secondary, #999);
+    font-size: 0.85em;
+    font-style: italic;
+}
 
 /* ── Detail-view status banner (spec §6.2.6) ── */
 .agreement-status {

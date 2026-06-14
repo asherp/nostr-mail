@@ -144,6 +144,24 @@ impl Header for XNostrRecipient {
     }
 }
 
+/// `X-Nostr-Agreement` — a non-authoritative marker that a thread is an
+/// agreement, so IMAP can surface agreement threads without decrypting bodies
+/// (spec §6.1, §11.2). The authoritative state always comes from the armor.
+#[derive(Debug, Clone)]
+struct XNostrAgreement(String);
+
+impl Header for XNostrAgreement {
+    fn name() -> HeaderName {
+        HeaderName::new_from_ascii_str("X-Nostr-Agreement")
+    }
+    fn parse(s: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Ok(XNostrAgreement(s.to_string()))
+    }
+    fn display(&self) -> HeaderValue {
+        HeaderValue::new(Self::name(), self.0.clone())
+    }
+}
+
 /// Construct email headers without sending the email
 pub fn construct_email_headers(
     config: &EmailConfig,
@@ -591,6 +609,154 @@ pub async fn send_email(
             Err(anyhow::anyhow!("SMTP send operation timed out after 60 seconds. Check your internet connection and SMTP settings."))
         }
     }
+}
+
+/// Build an SMTP transport from the config (shared TLS/credentials setup).
+fn build_mailer(config: &EmailConfig) -> Result<SmtpTransport> {
+    let creds = Credentials::new(config.email_address.clone(), config.password.clone());
+    let mut mailer_builder = SmtpTransport::relay(&config.smtp_host)?
+        .port(config.smtp_port)
+        .credentials(creds);
+    if config.use_tls {
+        let tls_params = lettre::transport::smtp::client::TlsParameters::new(config.smtp_host.clone())?;
+        mailer_builder = mailer_builder.tls(lettre::transport::smtp::client::Tls::Required(tls_params));
+    } else {
+        mailer_builder = mailer_builder.tls(lettre::transport::smtp::client::Tls::None);
+    }
+    Ok(mailer_builder.build())
+}
+
+/// Send a built message via SMTP with the standard 60s timeout / blocking-thread
+/// handling.
+async fn send_message_with_timeout(mailer: SmtpTransport, email: Message) -> Result<()> {
+    let send_future = task::spawn_blocking(move || mailer.send(&email));
+    match timeout(Duration::from_secs(60), send_future).await {
+        Ok(Ok(Ok(_))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(anyhow::anyhow!("Failed to send email: {}", e)),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Task join error: {}", e)),
+        Err(_) => Err(anyhow::anyhow!("SMTP send operation timed out after 60 seconds")),
+    }
+}
+
+/// Build the armored `text/plain` body for an agreement (spec §§10–11).
+///
+/// `to` parties become `signer` signatories and `cc` parties become `viewer`s
+/// (spec §6.3). `encrypted` selects the multi-recipient envelope (CEK) form vs.
+/// the plaintext (public) form (§11.8). `originator_consents` includes the
+/// originator's own CONSENT over `H` (§11.2). Returns the armor string;
+/// SMTP/MIME assembly is the caller's job, so this is unit-testable.
+pub fn compose_agreement_armor(
+    private_key: &str,
+    sender_pub: &str,
+    sender_email: Option<&str>,
+    profile_name: &str,
+    body: &str,
+    to: &[crate::types::AgreementParty],
+    cc: &[crate::types::AgreementParty],
+    encrypted: bool,
+    originator_consents: bool,
+) -> Result<String, String> {
+    use crate::agreement::{AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
+
+    let mut recips: Vec<AgreementRecipientInput> = Vec::with_capacity(to.len() + cc.len());
+    for p in to {
+        recips.push(AgreementRecipientInput {
+            role: ROLE_SIGNER.to_string(),
+            pubkey: p.pubkey.clone(),
+            email: Some(p.email.clone()),
+        });
+    }
+    for p in cc {
+        recips.push(AgreementRecipientInput {
+            role: ROLE_VIEWER.to_string(),
+            pubkey: p.pubkey.clone(),
+            email: Some(p.email.clone()),
+        });
+    }
+    if recips.is_empty() {
+        return Err("an agreement needs at least one To: or Cc: recipient".to_string());
+    }
+
+    if encrypted {
+        crate::agreement::encode_hybrid_agreement(
+            private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents,
+        ).map_err(|e| e.to_string())
+    } else {
+        encode_signed_agreement(
+            private_key, sender_pub, profile_name, body, &recips, originator_consents,
+        )
+    }
+}
+
+/// Compose an agreement and send it to all signatories (`To:`) and viewers
+/// (`Cc:`) in one message (spec §6.3). Adds the `X-Nostr-Agreement` marker
+/// (§6.1) and, when enabled, the `X-Nostr-Pubkey`/`X-Nostr-Sig` headers. The
+/// body's armor already carries the authoritative SIGNATURE.
+pub async fn send_agreement_email(
+    config: &EmailConfig,
+    subject: &str,
+    profile_name: &str,
+    body: &str,
+    to: &[crate::types::AgreementParty],
+    cc: &[crate::types::AgreementParty],
+    encrypted: bool,
+    originator_consents: bool,
+    message_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+    include_pubkey_header: bool,
+    include_sig_header: bool,
+) -> Result<String> {
+    let private_key = config.private_key.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("no private key configured; cannot sign the agreement"))?;
+    let sender_pub = crypto::get_public_key_from_private(private_key)
+        .map_err(|e| anyhow::anyhow!("could not derive sender pubkey: {}", e))?;
+
+    let armor = compose_agreement_armor(
+        private_key, &sender_pub, Some(&config.email_address), profile_name, body, to, cc, encrypted, originator_consents,
+    ).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let mut builder = Message::builder()
+        .from(config.email_address.parse()?)
+        .reply_to(config.email_address.parse()?)
+        .subject(subject);
+    for p in to {
+        builder = builder.to(p.email.parse()?);
+    }
+    for p in cc {
+        builder = builder.cc(p.email.parse()?);
+    }
+    if let Some(m) = message_id {
+        builder = builder.message_id(Some(m.to_string()));
+    }
+    if let Some(r) = in_reply_to {
+        builder = builder.in_reply_to(r.to_string());
+    }
+    if let Some(r) = references {
+        builder = builder.references(r.to_string());
+    }
+
+    // Agreement marker for decrypt-free IMAP filtering (§6.1); non-authoritative.
+    builder = builder.header(XNostrAgreement("1".to_string()));
+
+    // X-Nostr-Pubkey / X-Nostr-Sig mirror the in-body SIGNATURE (secondary path).
+    if include_pubkey_header {
+        builder = builder.header(XNostrPubkey(sender_pub.clone()));
+        if include_sig_header {
+            let binary = extract_ciphertext_binary(&armor);
+            if let Ok(signature) = crypto::sign_data_bytes(private_key, &binary) {
+                builder = builder.header(XNostrSig(signature));
+            }
+        }
+    }
+
+    let email = builder.body(armor)?;
+    let mailer = build_mailer(config)?;
+    send_message_with_timeout(mailer, email).await?;
+    Ok(format!(
+        "Agreement sent to {} signatory(ies) and {} viewer(s)",
+        to.len(), cc.len()
+    ))
 }
 
 /// Delete a sent email from the IMAP server by moving it to Trash
@@ -5913,6 +6079,71 @@ nitela\n\
         let tampered = agreement.replacen(&body, &format!("{} extra", body), 1);
         assert_ne!(tampered, agreement, "body must appear verbatim in the armor");
         assert_eq!(verify_email_signature_inline(&tampered), Some(false));
+    }
+
+    // =============================================
+    // compose_agreement_armor (send-path) — To→signer, Cc→viewer (§6.3)
+    // =============================================
+
+    #[test]
+    fn test_compose_agreement_encrypted_maps_to_and_cc() {
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // To
+        let carol = crypto::generate_keypair().unwrap();  // Cc
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
+        let armor = compose_agreement_armor(
+            &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
+            "Mutual NDA terms.", &to, &cc, true, true,
+        ).unwrap();
+
+        assert_eq!(verify_email_signature_inline(&armor), Some(true));
+        let parsed = parse_armor_components(&armor).expect("parses");
+        // bob is a signer, carol a viewer, plus the sender's self stanza.
+        assert!(parsed.recipients.iter().any(|r| r.role == "signer" && r.email.as_deref() == Some("bob@example.com")));
+        assert!(parsed.recipients.iter().any(|r| r.role == "viewer" && r.email.as_deref() == Some("carol@example.org")));
+        assert!(parsed.recipients.iter().any(|r| r.role == "self"));
+        assert!(parsed.consent.is_some(), "originator consent included");
+
+        // The To: signatory can decrypt.
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success);
+        assert_eq!(r.body, "Mutual NDA terms.");
+    }
+
+    #[test]
+    fn test_compose_agreement_plaintext_is_public_and_signed() {
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let armor = compose_agreement_armor(
+            &alice.private_key, &alice_pub, None, "Alice",
+            "We agree to the public terms.", &to, &[], false, true,
+        ).unwrap();
+
+        assert!(armor.starts_with("We agree to the public terms."));
+        assert!(armor.contains("BEGIN NOSTR SIGNED BODY"));
+        assert!(!armor.contains("ENCRYPTED BODY"));
+        assert_eq!(verify_email_signature_inline(&armor), Some(true));
+        let status = verify_agreement_status(&armor).expect("is an agreement");
+        assert_eq!((status.m, status.n), (1, 2));
+    }
+
+    #[test]
+    fn test_compose_agreement_rejects_no_recipients() {
+        let alice = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let err = compose_agreement_armor(
+            &alice.private_key, &alice_pub, None, "Alice", "terms", &[], &[], true, false);
+        assert!(err.is_err());
     }
 
     // =============================================

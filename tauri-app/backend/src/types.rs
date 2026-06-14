@@ -8,6 +8,17 @@ pub struct KeyPair {
     pub public_key: String,
 }
 
+/// A party on an agreement, as supplied by the compose UI. `To:` parties become
+/// `signer` signatories and `Cc:` parties become `viewer`s (spec §6.3). The
+/// `pubkey` is hex or npub; the `email` is the transport address (and is bound
+/// inside the signed RECIPIENTS block, spec §10.2 / #102).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementParty {
+    pub email: String,
+    pub pubkey: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountInfo {
     pub public_key: String,

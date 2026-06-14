@@ -2083,6 +2083,93 @@ async fn construct_email_headers(mut email_config: EmailConfig, to_address: Stri
         .map_err(|e| e.to_string())
 }
 
+/// Build the armored body for an agreement without sending it (compose preview).
+/// `to` parties become signatories, `cc` parties become viewers (spec §6.3).
+/// `encrypted` selects the multi-recipient envelope vs the plaintext/public form.
+#[tauri::command]
+async fn compose_agreement(
+    mut email_config: EmailConfig,
+    body: String,
+    to: Vec<crate::types::AgreementParty>,
+    cc: Vec<crate::types::AgreementParty>,
+    encrypted: bool,
+    originator_consents: bool,
+    profile_name: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
+    let private_key = email_config.private_key.as_deref().unwrap();
+    let sender_pub = crypto::get_public_key_from_private(private_key).map_err(|e| e.to_string())?;
+    email::compose_agreement_armor(
+        private_key,
+        &sender_pub,
+        Some(&email_config.email_address),
+        profile_name.as_deref().unwrap_or(""),
+        &body,
+        &to,
+        &cc,
+        encrypted,
+        originator_consents,
+    )
+}
+
+/// Compose and send an agreement to all signatories (`To:`) and viewers (`Cc:`)
+/// in one message (spec §6.3). The armored body carries the authoritative
+/// SIGNATURE; an `X-Nostr-Agreement` marker enables decrypt-free IMAP filtering.
+#[tauri::command]
+async fn send_agreement(
+    mut email_config: EmailConfig,
+    subject: String,
+    body: String,
+    to: Vec<crate::types::AgreementParty>,
+    cc: Vec<crate::types::AgreementParty>,
+    encrypted: bool,
+    originator_consents: bool,
+    profile_name: Option<String>,
+    message_id: Option<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
+    include_pubkey_header: Option<bool>,
+    include_sig_header: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
+    let include_pubkey = include_pubkey_header.unwrap_or(true);
+    let include_sig = include_sig_header.unwrap_or(true);
+    email::send_agreement_email(
+        &email_config,
+        &subject,
+        profile_name.as_deref().unwrap_or(""),
+        &body,
+        &to,
+        &cc,
+        encrypted,
+        originator_consents,
+        message_id.as_deref(),
+        in_reply_to.as_deref(),
+        references.as_deref(),
+        include_pubkey,
+        include_sig,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Compute an agreement's "M of N signed" completion status from a message/thread
+/// armor (spec §11.5). Returns `None` when the armor is not an agreement.
+#[tauri::command]
+fn agreement_status(armor: String) -> Option<crate::agreement::AgreementStatus> {
+    email::verify_agreement_status(&armor)
+}
+
+/// Verify email↔npub bindings provable from a self-contained thread (issue #102),
+/// from the verifier's own pubkey's perspective. Stateless — no challenge store.
+#[tauri::command]
+fn verify_email_binding(armor: String, my_pubkey: String) -> Vec<crate::agreement::Binding> {
+    email::verify_email_binding(&armor, &my_pubkey)
+}
+
 #[tauri::command]
 async fn fetch_image(url: String) -> Result<String, String> {
     nostr::fetch_image_as_data_url(&url).await.map_err(|e| e.to_string())
@@ -7484,6 +7571,10 @@ pub fn run() {
         publish_nostr_event,
         send_email,
         construct_email_headers,
+        compose_agreement,
+        send_agreement,
+        agreement_status,
+        verify_email_binding,
         fetch_image,
         fetch_multiple_images,
         fetch_profiles,

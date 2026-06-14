@@ -2416,6 +2416,18 @@ class EmailService {
                 return `<li class="${signed ? 'signed' : 'pending'}">${signed ? '✓' : '○'} ${Utils.escapeHtml(nameFor(pk))}</li>`;
             }).join('');
 
+            // Verified email↔npub bindings provable from this thread (issue #102),
+            // from my perspective as the challenge issuer. Each is a clickable
+            // "Verified identity" badge (explained on click).
+            let bindings = [];
+            try {
+                const myPk = appState.getKeypair()?.public_key;
+                if (myPk) bindings = await TauriService.verifyEmailBinding(armorBody, myPk).catch(() => []);
+            } catch (e) { /* best-effort */ }
+            const bindingHtml = (bindings || []).map(b =>
+                `<div class="binding-indicator trust-badge" title="Click to learn what this means">🔗 Verified identity: ${Utils.escapeHtml(b.email)} ↔ ${Utils.escapeHtml(nameFor(b.pubkey))}</div>`
+            ).join('');
+
             const complete = !!status.complete;
             const titleText = complete
                 ? `Agreement complete — ${status.m} of ${status.n} signatories signed`
@@ -2427,10 +2439,31 @@ class EmailService {
                     <div class="agreement-status-title">${complete ? '✓' : '⏳'} ${Utils.escapeHtml(titleText)}</div>
                     ${shortH ? `<div class="agreement-hash" title="${Utils.escapeHtml(status.documentHash)}">Document ${Utils.escapeHtml(shortH)}</div>` : ''}
                     ${signersList ? `<ul class="agreement-signers">${signersList}</ul>` : ''}
+                    ${bindingHtml}
                 </div>`;
             container.insertAdjacentHTML('afterbegin', html);
         } catch (e) {
             console.warn('[JS] renderAgreementStatus failed:', e);
+        }
+    }
+
+    // Explain a trust badge in a modal (wired by the capture-phase click handler
+    // registered at the bottom of this file). `key` is the badge type.
+    showTrustBadgeExplanation(key) {
+        const E = {
+            'signed': ['Signed', "This message carries a valid Nostr signature from this contact's key — the content hasn't been altered since they signed it. (It verifies the key, not necessarily the email address.)"],
+            'unsigned': ['Unsigned', "No Nostr signature was found, so the sender's identity and the content's integrity can't be cryptographically verified."],
+            'email-verified': ['Email Verified', "The sending mail server passed transport authentication (DMARC/DKIM/SPF), so the From: domain isn't spoofed. This verifies the email domain — not the Nostr identity."],
+            'email-unverified': ['Email Unverified', "Transport authentication (DMARC/DKIM/SPF) failed or was absent, so the From: address may be spoofed."],
+            'binding-verified': ['Verified identity', "This contact proved control of both their Nostr key and their email address by signing a reply to a challenge (a SecureJoin-style handshake), so the email ↔ key pairing is confirmed — not just self-asserted."],
+        };
+        const [title, body] = E[key] || ['Trust badge', ''];
+        const html = `<p style="margin:0 0 1em;">${Utils.escapeHtml(body)}</p>` +
+            `<div style="text-align:right;"><button class="btn btn-secondary" onclick="window.app.hideModal()">Got it</button></div>`;
+        if (window.app && typeof window.app.showModal === 'function') {
+            window.app.showModal(title, html);
+        } else {
+            notificationService.showSuccess(`${title}: ${body}`);
         }
     }
 
@@ -10354,3 +10387,26 @@ ${attachmentsHtml}
 // Create and export a singleton instance
 window.EmailService = EmailService;
 window.emailService = new EmailService();
+
+// Click-to-explain for trust badges. Capture phase so it fires before the
+// email-row open handler and can intercept it; excludes the invalid-signature
+// badge (which keeps its own "recheck" click behavior).
+document.addEventListener('click', (e) => {
+    const el = e.target.closest(
+        '.signature-indicator.verified, .signature-indicator.missing, ' +
+        '.transport-auth-indicator.verified, .transport-auth-indicator.invalid, ' +
+        '.binding-indicator'
+    );
+    if (!el) return;
+    e.stopPropagation();
+    e.preventDefault();
+    let key;
+    if (el.classList.contains('binding-indicator')) {
+        key = 'binding-verified';
+    } else if (el.classList.contains('transport-auth-indicator')) {
+        key = el.classList.contains('verified') ? 'email-verified' : 'email-unverified';
+    } else {
+        key = el.classList.contains('verified') ? 'signed' : 'unsigned';
+    }
+    window.emailService?.showTrustBadgeExplanation(key);
+}, true);

@@ -75,3 +75,20 @@
     .agreement-status { background: rgba(76, 175, 80, 0.08); }
     .agreement-status.incomplete { background: rgba(224, 168, 0, 0.08); }
 }
+
+/* ── Trust badges: click-to-explain affordance ── */
+.signature-indicator.verified,
+.signature-indicator.missing,
+.transport-auth-indicator.verified,
+.transport-auth-indicator.invalid,
+.binding-indicator {
+    cursor: pointer;
+}
+.binding-indicator {
+    display: inline-block;
+    margin-top: 0.45em;
+    color: #2e7d32;
+    font-weight: 600;
+    font-size: 0.88em;
+}
+

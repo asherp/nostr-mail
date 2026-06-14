@@ -649,8 +649,10 @@ async fn send_message_with_timeout(mailer: SmtpTransport, email: Message) -> Res
 /// In encrypted mode the **subject is AES-256-GCM-encrypted under the same CEK
 /// as the body** and glossia-encoded, so it is readable by exactly the recipients
 /// and never leaks in cleartext; in plaintext mode the subject is returned
-/// unchanged. `encoding` is the user's Advanced glossia scheme (`None` ⇒ default).
-/// SMTP/MIME assembly is the caller's job, so this is unit-testable.
+/// unchanged. `encoding` is the user's Advanced glossia scheme for the body;
+/// `subject_encoding` is the (independent) scheme for the subject, falling back
+/// to `encoding` when `None`. SMTP/MIME assembly is the caller's job, so this is
+/// unit-testable.
 pub fn compose_agreement(
     private_key: &str,
     sender_pub: &str,
@@ -663,6 +665,7 @@ pub fn compose_agreement(
     encrypted: bool,
     originator_consents: bool,
     encoding: Option<&str>,
+    subject_encoding: Option<&str>,
 ) -> Result<crate::types::ComposedAgreement, String> {
     use crate::agreement::{AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
 
@@ -691,11 +694,12 @@ pub fn compose_agreement(
         let armor = crate::agreement::encode_hybrid_agreement_with_cek(
             &cek, private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents, encoding,
         ).map_err(|e| e.to_string())?;
-        // Glossia-encode the subject ciphertext too (same scheme as the body), so
-        // the Subject header reads as prose and survives header folding.
+        // Glossia-encode the subject ciphertext too, under its own scheme
+        // (defaulting to the body's), so the Subject header reads as prose and
+        // survives header folding.
         let subject_ct = crate::crypto::aes_gcm_encrypt_raw(&cek, subject.as_bytes())
             .map_err(|e| format!("subject encrypt failed: {}", e))?;
-        let (enc_subject, _) = glossia_encode_bytes_with(&subject_ct, encoding)
+        let (enc_subject, _) = glossia_encode_bytes_with(&subject_ct, subject_encoding.or(encoding))
             .ok_or_else(|| "subject glossia encode failed".to_string())?;
         Ok(crate::types::ComposedAgreement { armor, subject: enc_subject })
     } else {
@@ -768,6 +772,7 @@ pub async fn send_agreement_email(
     include_pubkey_header: bool,
     include_sig_header: bool,
     encoding: Option<&str>,
+    subject_encoding: Option<&str>,
 ) -> Result<String> {
     let private_key = config.private_key.as_deref()
         .ok_or_else(|| anyhow::anyhow!("no private key configured; cannot sign the agreement"))?;
@@ -775,7 +780,7 @@ pub async fn send_agreement_email(
         .map_err(|e| anyhow::anyhow!("could not derive sender pubkey: {}", e))?;
 
     let composed = compose_agreement(
-        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents, encoding,
+        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents, encoding, subject_encoding,
     ).map_err(|e| anyhow::anyhow!("{}", e))?;
     let armor = composed.armor;
 
@@ -6169,7 +6174,7 @@ nitela\n\
         let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
-            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, None,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, None, None,
         ).unwrap();
         let armor = composed.armor;
 
@@ -6211,7 +6216,7 @@ nitela\n\
         let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, None, "Alice",
-            "Public Statement", "We agree to the public terms.", &to, &[], false, true, None,
+            "Public Statement", "We agree to the public terms.", &to, &[], false, true, None, None,
         ).unwrap();
         let armor = composed.armor;
 
@@ -6230,7 +6235,7 @@ nitela\n\
         let alice = crypto::generate_keypair().unwrap();
         let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
         let err = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, None);
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, None, None);
         assert!(err.is_err());
     }
 
@@ -6257,14 +6262,51 @@ nitela\n\
         // Compose the same plaintext agreement under two schemes; the encoded
         // bodies must differ, yet both verify and decrypt.
         let latin = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, Some("latin"),
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, Some("latin"), None,
         ).unwrap();
         let english = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, Some("english - bip39"),
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, Some("english - bip39"), None,
         ).unwrap();
         assert_ne!(latin.armor, english.armor, "encoding setting must change the armor body");
         assert_eq!(verify_email_signature_inline(&latin.armor), Some(true));
         assert_eq!(verify_email_signature_inline(&english.armor), Some(true));
+    }
+
+    #[test]
+    fn test_compose_agreement_independent_subject_encoding() {
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+
+        // Body in latin, subject in english — the subject uses its own scheme,
+        // and the recipient still recovers both.
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true,
+            Some("latin"), Some("english - bip39"),
+        ).unwrap();
+
+        // Subject is encrypted (not the cleartext) and decrypts back for the recipient.
+        assert_ne!(composed.subject, "Quarterly NDA");
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &composed.armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success);
+        assert_eq!(r.body, "Mutual NDA terms.");
+        assert_eq!(r.subject, "Quarterly NDA", "subject decrypts regardless of its own scheme");
+
+        // subject_encoding = None falls back to the body encoding.
+        let fallback = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true,
+            Some("latin"), None,
+        ).unwrap();
+        let rf = decrypt_email_body_pipeline(
+            &bob.private_key, &fallback.armor, &fallback.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert_eq!(rf.subject, "Quarterly NDA");
     }
 
     #[test]

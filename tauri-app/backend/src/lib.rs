@@ -2097,6 +2097,7 @@ async fn compose_agreement(
     originator_consents: bool,
     profile_name: Option<String>,
     glossia_encoding: Option<String>,
+    subject_encoding: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::types::ComposedAgreement, String> {
     email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
@@ -2114,6 +2115,7 @@ async fn compose_agreement(
         encrypted,
         originator_consents,
         glossia_encoding.as_deref(),
+        subject_encoding.as_deref(),
     )
 }
 
@@ -2136,6 +2138,7 @@ async fn send_agreement(
     include_pubkey_header: Option<bool>,
     include_sig_header: Option<bool>,
     glossia_encoding: Option<String>,
+    subject_encoding: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
@@ -2156,6 +2159,7 @@ async fn send_agreement(
         include_pubkey,
         include_sig,
         glossia_encoding.as_deref(),
+        subject_encoding.as_deref(),
     )
     .await
     .map_err(|e| e.to_string())?;

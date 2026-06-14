@@ -1,0 +1,77 @@
+/* Agreements (CC / signature workflow) — compose options + status banner */
+
+/* ── Compose options ── */
+.agreement-compose .agreement-enable-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    cursor: pointer;
+    font-weight: 600;
+}
+.agreement-compose .agreement-enable-label input {
+    width: auto;
+    margin: 0;
+}
+.agreement-options {
+    margin-top: 0.75em;
+    padding: 0.75em 1em;
+    border: 1px solid var(--border-color, #ccc);
+    border-left: 4px solid #4caf50;
+    border-radius: 6px;
+    background: var(--surface-2, rgba(76, 175, 80, 0.04));
+}
+.agreement-options .agreement-consent-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    cursor: pointer;
+}
+.agreement-options .agreement-consent-label input {
+    width: auto;
+    margin: 0;
+}
+.agreement-hint {
+    margin: 0.6em 0 0;
+    font-size: 0.85em;
+    color: var(--text-secondary, #888);
+}
+
+/* ── Detail-view status banner (spec §6.2.6) ── */
+.agreement-status {
+    border: 1px solid #cfe8cf;
+    border-left: 4px solid #4caf50;
+    border-radius: 6px;
+    padding: 0.6em 0.85em;
+    margin: 0 0 1em;
+    color: #2e7d32;
+    font-size: 0.92em;
+}
+.agreement-status.incomplete {
+    border-color: #f0e0b8;
+    border-left-color: #e0a800;
+    color: #8a6d00;
+}
+.agreement-status .agreement-status-title {
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 0.45em;
+}
+.agreement-status .agreement-hash {
+    color: var(--text-secondary, #777);
+    font-size: 0.85em;
+    margin-top: 0.25em;
+    font-family: monospace;
+}
+.agreement-status .agreement-signers {
+    margin: 0.4em 0 0;
+    padding-left: 1.2em;
+    font-size: 0.88em;
+}
+.agreement-status .agreement-signers li.signed { color: #2e7d32; }
+.agreement-status .agreement-signers li.pending { color: var(--text-secondary, #999); }
+
+@media (prefers-color-scheme: dark) {
+    .agreement-status { background: rgba(76, 175, 80, 0.08); }
+    .agreement-status.incomplete { background: rgba(224, 168, 0, 0.08); }
+}

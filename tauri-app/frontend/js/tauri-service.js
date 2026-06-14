@@ -283,6 +283,36 @@ const TauriService = {
         }
         return await this.invoke('construct_email_headers', args);
     },
+    // ── Agreements (CC / signatures) ────────────────────────────────
+    // `to` / `cc` are arrays of { email, pubkey } (To → signer, Cc → viewer).
+    composeAgreement: async function(emailConfig, subject, body, to, cc, encrypted, originatorConsents, profileName = null, glossiaEncoding = null, subjectEncoding = null) {
+        const args = { emailConfig, subject, body, to, cc, encrypted, originatorConsents };
+        if (profileName != null) args.profileName = profileName;
+        if (glossiaEncoding != null) args.glossiaEncoding = glossiaEncoding;
+        if (subjectEncoding != null) args.subjectEncoding = subjectEncoding;
+        return await this.invoke('compose_agreement', args);
+    },
+    sendAgreement: async function(emailConfig, subject, body, to, cc, encrypted, originatorConsents, profileName = null, messageId = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, glossiaEncoding = null, subjectEncoding = null) {
+        const args = { emailConfig, subject, body, to, cc, encrypted, originatorConsents };
+        if (profileName != null) args.profileName = profileName;
+        if (messageId != null) args.messageId = messageId;
+        if (inReplyTo != null) args.inReplyTo = inReplyTo;
+        if (references != null) args.references = references;
+        if (includePubkeyHeader != null) args.includePubkeyHeader = includePubkeyHeader;
+        if (includeSigHeader != null) args.includeSigHeader = includeSigHeader;
+        if (glossiaEncoding != null) args.glossiaEncoding = glossiaEncoding;
+        if (subjectEncoding != null) args.subjectEncoding = subjectEncoding;
+        return await this.invoke('send_agreement', args);
+    },
+    // Completion status ("M of N signed") computed from a message/thread armor.
+    // Returns null when the armor is not an agreement.
+    agreementStatus: async function(armor) {
+        return await this.invoke('agreement_status', { armor });
+    },
+    // Stateless (npub, email) binding verification from a thread (issue #102).
+    verifyEmailBinding: async function(armor, myPubkey) {
+        return await this.invoke('verify_email_binding', { armor, myPubkey });
+    },
     testImapConnection: async function(emailConfig) {
         return await this.invoke('test_imap_connection', { emailConfig });
     },

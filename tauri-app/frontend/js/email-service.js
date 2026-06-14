@@ -2037,12 +2037,17 @@ class EmailService {
     async sendEmail() {
         console.log('[JS] sendEmail function called');
         console.log('[JS] appState.settings:', appState.getSettings());
-        
+
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
         }
-        
+
+        // Agreement mode: route to the multi-recipient / consent send path.
+        if (document.getElementById('agreement-enabled')?.checked) {
+            return this.sendAgreementCompose();
+        }
+
         const toAddress = domManager.getValue('toAddress')?.trim() || '';
         const subject = domManager.getValue('subject')?.trim() || '';
         const body = domManager.getValue('messageBody')?.trim() || '';
@@ -2268,6 +2273,164 @@ class EmailService {
         } finally {
             domManager.enable('sendBtn');
             domManager.setHTML('sendBtn', '<i class="fas fa-paper-plane"></i> Send');
+        }
+    }
+
+    // Compose + send an agreement: To: → signatories, Cc: → viewers (spec §6.3).
+    // Resolves each recipient email to its contact's Nostr pubkey, then sends one
+    // message to all of them via the send_agreement backend command.
+    async sendAgreementCompose() {
+        if (!appState.hasSettings()) {
+            notificationService.showError('Please configure your email settings first');
+            return;
+        }
+        if (!appState.hasKeypair()) {
+            notificationService.showError('A Nostr keypair is required to sign an agreement');
+            return;
+        }
+
+        const settings = appState.getSettings();
+        const subject = domManager.getValue('subject')?.trim() || '';
+        const body = domManager.getValue('messageBody')?.trim() || '';
+        const toRaw = domManager.getValue('toAddress')?.trim() || '';
+        const ccRaw = document.getElementById('cc-address')?.value?.trim() || '';
+
+        if (!subject || !body || !toRaw) {
+            notificationService.showError('An agreement needs a subject, a body, and at least one To: signatory');
+            return;
+        }
+
+        const splitEmails = (s) => s.split(/[,;\s]+/).map(e => e.trim().toLowerCase()).filter(Boolean);
+        const toEmails = splitEmails(toRaw);
+        const ccEmails = splitEmails(ccRaw);
+
+        // Resolve each email → contact pubkey (case-insensitive). A single To:
+        // recipient may also use the manually-entered pubkey field.
+        const contacts = appState.getContacts();
+        const manualPubkey = (document.getElementById('recipient-pubkey-value')?.value || '').trim();
+        const resolve = (email) => {
+            const c = contacts.find(c => c.email && c.email.toLowerCase() === email);
+            return (c && c.pubkey) ? c.pubkey : null;
+        };
+
+        const unresolved = [];
+        const to = [];
+        for (const email of toEmails) {
+            let pk = resolve(email);
+            if (!pk && toEmails.length === 1 && manualPubkey) pk = manualPubkey;
+            if (pk) to.push({ email, pubkey: pk }); else unresolved.push(email);
+        }
+        const cc = [];
+        for (const email of ccEmails) {
+            const pk = resolve(email);
+            if (pk) cc.push({ email, pubkey: pk }); else unresolved.push(email);
+        }
+        if (unresolved.length > 0) {
+            notificationService.showError('No known Nostr key for: ' + unresolved.join(', ') + '. Add them as contacts first.');
+            return;
+        }
+        if (to.length === 0) {
+            notificationService.showError('At least one To: signatory with a known Nostr key is required');
+            return;
+        }
+
+        const encrypted = (document.getElementById('agreement-visibility')?.value || 'encrypted') !== 'public';
+        const originatorConsents = !!document.getElementById('agreement-consent')?.checked;
+
+        let useTls = settings.use_tls;
+        if (settings.smtp_host === 'smtp.gmail.com' && !useTls) useTls = true;
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+        };
+
+        const keypair = appState.getKeypair();
+        let profileName = '';
+        try { profileName = window.profileManager?.getAccountDisplayName(keypair?.public_key) || ''; } catch (e) { /* best-effort */ }
+        const glossiaEncoding = settings.glossia_encoding_body || null;
+        const includePubkeyHeader = settings.include_pubkey_header !== false;
+        const includeSigHeader = settings.include_sig_header !== false;
+        const messageId = this.generateAndStoreMessageId();
+
+        try {
+            domManager.disable('sendBtn');
+            domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
+            await TauriService.sendAgreement(
+                emailConfig, subject, body, to, cc, encrypted, originatorConsents,
+                profileName, messageId, this._replyToMessageId, this._replyReferences,
+                includePubkeyHeader, includeSigHeader, glossiaEncoding, null
+            );
+            notificationService.showSuccess(
+                `Agreement sent to ${to.length} signatory(ies)` + (cc.length ? ` and ${cc.length} viewer(s)` : '')
+            );
+
+            // Reset the compose form.
+            domManager.clear('toAddress');
+            domManager.clear('subject');
+            domManager.clear('messageBody');
+            const ccEl = document.getElementById('cc-address'); if (ccEl) ccEl.value = '';
+            this.selectedNostrContact = null;
+            try { this.clearAttachments(); } catch (e) {}
+            try { this.clearCurrentDraft(); } catch (e) {}
+
+            setTimeout(() => { this.syncSentEmails().catch(() => {}); }, 100);
+        } catch (error) {
+            console.error('[JS] Error sending agreement:', error);
+            notificationService.showError('Failed to send agreement: ' + error);
+        } finally {
+            domManager.enable('sendBtn');
+            domManager.setHTML('sendBtn', '<i class="fas fa-paper-plane"></i> Send');
+        }
+    }
+
+    // Render the "M of N signed" agreement status banner at the top of the email
+    // detail view (spec §11.5 / §6.2.6). No-op when the message is not an agreement.
+    async renderAgreementStatus(armorBody) {
+        try {
+            const container = document.getElementById('email-detail-content');
+            if (!container || !armorBody) return;
+            const prior = container.querySelector('.agreement-status');
+            if (prior) prior.remove();
+
+            const status = await TauriService.agreementStatus(armorBody).catch(() => null);
+            if (!status || !status.n) return;
+
+            const contacts = appState.getContacts();
+            const nameFor = (hex) => {
+                const c = contacts.find(c => {
+                    if (!c.pubkey) return false;
+                    if (c.pubkey === hex) return true;
+                    try { return this._npubToHex(c.pubkey) === hex; } catch (e) { return false; }
+                });
+                return c?.name || (hex.substring(0, 8) + '…');
+            };
+
+            const consented = new Set(status.consentedSigners || []);
+            const signersList = (status.requiredSigners || []).map(pk => {
+                const signed = consented.has(pk);
+                return `<li class="${signed ? 'signed' : 'pending'}">${signed ? '✓' : '○'} ${Utils.escapeHtml(nameFor(pk))}</li>`;
+            }).join('');
+
+            const complete = !!status.complete;
+            const titleText = complete
+                ? `Agreement complete — ${status.m} of ${status.n} signatories signed`
+                : `${status.m} of ${status.n} signatories signed`;
+            const shortH = status.documentHash ? (status.documentHash.substring(0, 10) + '…') : '';
+
+            const html = `
+                <div class="agreement-status ${complete ? '' : 'incomplete'}">
+                    <div class="agreement-status-title">${complete ? '✓' : '⏳'} ${Utils.escapeHtml(titleText)}</div>
+                    ${shortH ? `<div class="agreement-hash" title="${Utils.escapeHtml(status.documentHash)}">Document ${Utils.escapeHtml(shortH)}</div>` : ''}
+                    ${signersList ? `<ul class="agreement-signers">${signersList}</ul>` : ''}
+                </div>`;
+            container.insertAdjacentHTML('afterbegin', html);
+        } catch (e) {
+            console.warn('[JS] renderAgreementStatus failed:', e);
         }
     }
 
@@ -4293,7 +4456,9 @@ class EmailService {
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
                 console.log('Sender pubkey for email:', senderPubkey);
                 // Detect encrypted body via armor regex
-                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
+                // Match pairwise (NIP-XX ENCRYPTED BODY) and the generic multi-recipient
+                // envelope (BEGIN NOSTR ENCRYPTED BODY, agreements §10) so both decrypt.
+                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY)\s*-{3,}/);
                 let decryptedSubject = email.subject;
                 let decryptedBody = emailBody;
                 const keypair = appState.getKeypair();
@@ -4362,6 +4527,7 @@ class EmailService {
                             }
 
                             await updateDetail(decryptedSubject, decryptedBody, manifestResult, result.success, sigResults, decryptResults);
+                            this.renderAgreementStatus(emailBody);
                         } catch (err) {
                             console.error('[JS] Backend decrypt_email_body error:', err);
                             await updateDetail('Unable to decrypt', 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.', null, true);
@@ -4383,6 +4549,7 @@ class EmailService {
                             displayBody = signedMsg.plaintextBody;
                         }
                         await updateDetail(decryptedSubject, displayBody, null, false, sigResults);
+                        this.renderAgreementStatus(emailBody);
                     })();
                 }
                 const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {

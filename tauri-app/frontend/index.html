@@ -25,6 +25,7 @@
     <link href="vendor/fontawesome/css/all.min.css" rel="stylesheet">
     <link href="vendor/tom-select/css/tom-select.default.min.css" rel="stylesheet">
     <link rel="stylesheet" href="styles/folder-multiselect.css">
+    <link rel="stylesheet" href="styles/agreements.css">
     <script src="vendor/html5-qrcode/html5-qrcode.min.js"></script>
     <script src="vendor/tom-select/js/tom-select.complete.min.js"></script>
     <script type="importmap">
@@ -151,7 +152,35 @@
                         <label for="message-body">Message:</label>
                         <textarea id="message-body" rows="10" placeholder="Type your message here..."></textarea>
                     </div>
-                    
+
+                    <div class="form-group agreement-compose">
+                        <label class="agreement-enable-label">
+                            <input type="checkbox" id="agreement-enabled" onchange="document.getElementById('agreement-options').style.display = this.checked ? 'block' : 'none';">
+                            <i class="fas fa-file-signature"></i> Make this an agreement (request signatures)
+                        </label>
+                        <div id="agreement-options" class="agreement-options" style="display: none;">
+                            <div class="form-group">
+                                <label for="cc-address">Cc (viewers — can read, not asked to sign):</label>
+                                <input type="text" id="cc-address" placeholder="viewer@example.com, ..." autocorrect="off" autocapitalize="off" spellcheck="false">
+                            </div>
+                            <div class="form-group">
+                                <label for="agreement-visibility">Visibility:</label>
+                                <select id="agreement-visibility" class="form-control">
+                                    <option value="encrypted">Encrypted — only recipients can read</option>
+                                    <option value="public">Public — anyone can read &amp; verify</option>
+                                </select>
+                            </div>
+                            <label class="agreement-consent-label">
+                                <input type="checkbox" id="agreement-consent" checked>
+                                I am a signatory and consent to this document
+                            </label>
+                            <p class="agreement-hint">
+                                <strong>To:</strong> recipients are asked to sign; <strong>Cc:</strong> recipients are viewers.
+                                Use commas for multiple addresses. Every recipient must be a contact with a known Nostr key.
+                            </p>
+                        </div>
+                    </div>
+
                     <input type="file" id="attachment-input" multiple accept="*/*" style="display: none;">
                     <div id="attachment-list" class="attachment-list">
                         <!-- Attachments will be displayed here -->

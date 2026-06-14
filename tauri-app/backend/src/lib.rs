@@ -2089,6 +2089,7 @@ async fn construct_email_headers(mut email_config: EmailConfig, to_address: Stri
 #[tauri::command]
 async fn compose_agreement(
     mut email_config: EmailConfig,
+    subject: String,
     body: String,
     to: Vec<crate::types::AgreementParty>,
     cc: Vec<crate::types::AgreementParty>,
@@ -2096,15 +2097,16 @@ async fn compose_agreement(
     originator_consents: bool,
     profile_name: Option<String>,
     state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<crate::types::ComposedAgreement, String> {
     email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
     let private_key = email_config.private_key.as_deref().unwrap();
     let sender_pub = crypto::get_public_key_from_private(private_key).map_err(|e| e.to_string())?;
-    email::compose_agreement_armor(
+    email::compose_agreement(
         private_key,
         &sender_pub,
         Some(&email_config.email_address),
         profile_name.as_deref().unwrap_or(""),
+        &subject,
         &body,
         &to,
         &cc,

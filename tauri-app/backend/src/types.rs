@@ -19,6 +19,17 @@ pub struct AgreementParty {
     pub pubkey: String,
 }
 
+/// Output of composing an agreement: the armored `text/plain` body and the
+/// subject to place in the header. For an encrypted (envelope) agreement the
+/// `subject` is AES-256-GCM-encrypted under the same CEK as the body; for a
+/// plaintext (public) agreement it is the cleartext subject.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposedAgreement {
+    pub armor: String,
+    pub subject: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountInfo {
     pub public_key: String,

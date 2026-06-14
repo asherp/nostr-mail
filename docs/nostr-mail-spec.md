@@ -650,6 +650,7 @@ The role is a **workflow** attribute, not an access attribute — every role can
 An agreement is initiated as a signed multi-recipient message:
 
 - **Body**: the agreement cover text / terms, in a signed `ENCRYPTED BODY` (the envelope is signalled by the RECIPIENTS block, not a keyword) — or, for a **plaintext (public) agreement**, a signed `SIGNED BODY` with the terms in the clear (Section 11.8).
+- **Subject**: for an encrypted agreement the `Subject:` header is AES-256-GCM-encrypted under the **same CEK** as the body (base64), so it is readable by exactly the recipients and never leaks in cleartext; a reader recovers it by unwrapping the CEK from their RECIPIENTS stanza. For a plaintext (public) agreement the subject is sent in the clear. The subject is metadata and is **not** covered by the signature or `H` (GCM provides its own integrity), matching the body/subject split of Section 5.
 - **Attachment(s)**: the contract document(s), encrypted under the same CEK (existing hybrid-attachment path).
 - **RECIPIENTS**: a `signer` stanza for each required signatory, a `viewer` stanza for each viewer, and the `self` stanza.
 - **CONSENT** (optional): if the originator is themselves a required signatory, they include their own CONSENT block (Section 11.3) declaring consent. The originator's `self` stanza handles only decryption access and is never counted as a consent (Section 10.3) — an originator who signs MUST do so via a CONSENT block.

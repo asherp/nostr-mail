@@ -414,6 +414,26 @@ pub fn encode_hybrid_agreement(
     recipients_in: &[AgreementRecipientInput],
     originator_consents: bool,
 ) -> Result<String> {
+    let cek = crate::crypto::generate_cek();
+    encode_hybrid_agreement_with_cek(
+        &cek, sender_priv, sender_pub, sender_email, profile_name, body_plaintext, recipients_in, originator_consents,
+    )
+}
+
+/// Like [`encode_hybrid_agreement`] but uses a caller-supplied CEK, so the same
+/// key can also encrypt out-of-band material (e.g. the email subject) under one
+/// envelope. The caller is responsible for generating a fresh random CEK
+/// ([`crate::crypto::generate_cek`]) per message.
+pub fn encode_hybrid_agreement_with_cek(
+    cek: &[u8; 32],
+    sender_priv: &str,
+    sender_pub: &str,
+    sender_email: Option<&str>,
+    profile_name: &str,
+    body_plaintext: &[u8],
+    recipients_in: &[AgreementRecipientInput],
+    originator_consents: bool,
+) -> Result<String> {
     if recipients_in.is_empty() {
         return Err(anyhow::anyhow!(
             "encode_hybrid_agreement requires at least one recipient (use the pairwise format for single-recipient messages)"
@@ -422,15 +442,14 @@ pub fn encode_hybrid_agreement(
     let sender_pub_hex = normalize_pubkey_hex(sender_pub)
         .ok_or_else(|| anyhow::anyhow!("invalid sender pubkey"))?;
 
-    // 1–2. Encrypt the body once under a fresh CEK (Section 10.1 steps 1–2).
-    let cek = crate::crypto::generate_cek();
-    let ciphertext = crate::crypto::aes_gcm_encrypt_raw(&cek, body_plaintext)?;
+    // 1–2. Encrypt the body once under the CEK (Section 10.1 steps 1–2).
+    let ciphertext = crate::crypto::aes_gcm_encrypt_raw(cek, body_plaintext)?;
     let body_b64 = general_purpose::STANDARD.encode(&ciphertext);
 
     // 3. Wrap the CEK to each recipient, then to self (Section 10.1 step 3, 10.4).
     let mut recipients: Vec<Recipient> = Vec::with_capacity(recipients_in.len() + 1);
     for r in recipients_in {
-        let wrapped = crate::crypto::wrap_cek(sender_priv, &r.pubkey, &cek)?;
+        let wrapped = crate::crypto::wrap_cek(sender_priv, &r.pubkey, cek)?;
         recipients.push(Recipient {
             role: r.role.to_ascii_lowercase(),
             pubkey: r.pubkey.clone(),
@@ -439,7 +458,7 @@ pub fn encode_hybrid_agreement(
             reference: None,
         });
     }
-    let self_wrapped = crate::crypto::wrap_cek(sender_priv, &sender_pub_hex, &cek)?;
+    let self_wrapped = crate::crypto::wrap_cek(sender_priv, &sender_pub_hex, cek)?;
     recipients.push(Recipient {
         role: ROLE_SELF.to_string(),
         pubkey: sender_pub_hex.clone(),

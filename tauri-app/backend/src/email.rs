@@ -638,24 +638,30 @@ async fn send_message_with_timeout(mailer: SmtpTransport, email: Message) -> Res
     }
 }
 
-/// Build the armored `text/plain` body for an agreement (spec §§10–11).
+/// Compose an agreement: the armored `text/plain` body plus the subject to put
+/// in the header (spec §§10–11).
 ///
 /// `to` parties become `signer` signatories and `cc` parties become `viewer`s
 /// (spec §6.3). `encrypted` selects the multi-recipient envelope (CEK) form vs.
 /// the plaintext (public) form (§11.8). `originator_consents` includes the
-/// originator's own CONSENT over `H` (§11.2). Returns the armor string;
+/// originator's own CONSENT over `H` (§11.2).
+///
+/// In encrypted mode the **subject is AES-256-GCM-encrypted under the same CEK
+/// as the body** (base64), so it is readable by exactly the recipients and never
+/// leaks in cleartext; in plaintext mode the subject is returned unchanged.
 /// SMTP/MIME assembly is the caller's job, so this is unit-testable.
-pub fn compose_agreement_armor(
+pub fn compose_agreement(
     private_key: &str,
     sender_pub: &str,
     sender_email: Option<&str>,
     profile_name: &str,
+    subject: &str,
     body: &str,
     to: &[crate::types::AgreementParty],
     cc: &[crate::types::AgreementParty],
     encrypted: bool,
     originator_consents: bool,
-) -> Result<String, String> {
+) -> Result<crate::types::ComposedAgreement, String> {
     use crate::agreement::{AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
 
     let mut recips: Vec<AgreementRecipientInput> = Vec::with_capacity(to.len() + cc.len());
@@ -678,13 +684,60 @@ pub fn compose_agreement_armor(
     }
 
     if encrypted {
-        crate::agreement::encode_hybrid_agreement(
-            private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents,
-        ).map_err(|e| e.to_string())
+        // One CEK for the body and the subject.
+        let cek = crate::crypto::generate_cek();
+        let armor = crate::agreement::encode_hybrid_agreement_with_cek(
+            &cek, private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents,
+        ).map_err(|e| e.to_string())?;
+        let enc_subject = crate::crypto::aes_gcm_encrypt_raw(&cek, subject.as_bytes())
+            .map(|ct| general_purpose::STANDARD.encode(ct))
+            .map_err(|e| format!("subject encrypt failed: {}", e))?;
+        Ok(crate::types::ComposedAgreement { armor, subject: enc_subject })
     } else {
-        encode_signed_agreement(
+        let armor = encode_signed_agreement(
             private_key, sender_pub, profile_name, body, &recips, originator_consents,
-        )
+        )?;
+        // Public agreement: subject stays in the clear.
+        Ok(crate::types::ComposedAgreement { armor, subject: subject.to_string() })
+    }
+}
+
+/// Decrypt an agreement subject that was AES-256-GCM-encrypted under the message
+/// CEK (the envelope path; counterpart to [`compose_agreement`]). Unwraps the CEK
+/// from the reader's RECIPIENTS stanza, then decrypts. Returns the subject
+/// unchanged if it isn't CEK-encrypted (e.g. a plaintext-agreement subject) or
+/// if anything fails. The second tuple element is the ciphertext (for DM↔email
+/// hash matching), mirroring [`decrypt_subject`].
+fn decrypt_subject_envelope(
+    subject: &str,
+    recipients: &[crate::agreement::Recipient],
+    sender_pub: &str,
+    private_key: &str,
+    user_pubkey_hex: &str,
+) -> (String, Option<String>) {
+    if subject.is_empty() {
+        return (subject.to_string(), None);
+    }
+    let me = crate::agreement::normalize_pubkey_hex(user_pubkey_hex)
+        .unwrap_or_else(|| user_pubkey_hex.to_string());
+    let stanza = recipients.iter().find(|r| {
+        crate::agreement::normalize_pubkey_hex(&r.pubkey).as_deref() == Some(me.as_str())
+    });
+    let wrapped = match stanza.and_then(|s| s.wrapped_cek.as_deref()) {
+        Some(w) => w,
+        None => return (subject.to_string(), None), // plaintext subject or not a recipient
+    };
+    let cek = match crate::crypto::unwrap_cek(private_key, sender_pub, wrapped) {
+        Ok(c) => c,
+        Err(_) => return (subject.to_string(), None),
+    };
+    let ct = match general_purpose::STANDARD.decode(subject.trim()) {
+        Ok(b) => b,
+        Err(_) => return (subject.to_string(), None), // not base64 ⇒ cleartext
+    };
+    match crate::crypto::aes_gcm_decrypt_raw(&cek, &ct) {
+        Ok(pt) => (String::from_utf8_lossy(&pt).into_owned(), Some(subject.to_string())),
+        Err(_) => (subject.to_string(), Some(subject.to_string())),
     }
 }
 
@@ -712,14 +765,15 @@ pub async fn send_agreement_email(
     let sender_pub = crypto::get_public_key_from_private(private_key)
         .map_err(|e| anyhow::anyhow!("could not derive sender pubkey: {}", e))?;
 
-    let armor = compose_agreement_armor(
-        private_key, &sender_pub, Some(&config.email_address), profile_name, body, to, cc, encrypted, originator_consents,
+    let composed = compose_agreement(
+        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents,
     ).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let armor = composed.armor;
 
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
         .reply_to(config.email_address.parse()?)
-        .subject(subject);
+        .subject(composed.subject);
     for p in to {
         builder = builder.to(p.email.parse()?);
     }
@@ -3780,7 +3834,16 @@ pub fn decrypt_email_body_pipeline(
 
     // Decrypt subject — use armor's embedded pubkey as fallback when sender_pubkey wasn't provided
     let perf_subject = std::time::Instant::now();
-    let (decrypted_subject, subject_ciphertext) = if parsed.body_type == "encrypted" {
+    let (decrypted_subject, subject_ciphertext) = if !parsed.recipients.is_empty() {
+        // Multi-recipient envelope: the subject is AES-256-GCM-encrypted under the
+        // same CEK as the body (or cleartext for a plaintext agreement). The
+        // sender (who wrapped the CEK) is the message author.
+        let sender_pub = parsed.sig_pubkey_hex.as_deref()
+            .or(parsed.seal_pubkey_hex.as_deref())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| fallback.to_string());
+        decrypt_subject_envelope(subject, &parsed.recipients, &sender_pub, private_key, &user_pubkey_hex)
+    } else if parsed.body_type == "encrypted" {
         let nip_hint = parsed.encryption_nip.as_deref().unwrap_or("nip44");
         let subject_fallback = if fallback.is_empty() {
             // The armor signature/seal block contains the sender's pubkey
@@ -6095,10 +6158,15 @@ nitela\n\
 
         let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
         let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
-        let armor = compose_agreement_armor(
+        let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
-            "Mutual NDA terms.", &to, &cc, true, true,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true,
         ).unwrap();
+        let armor = composed.armor;
+
+        // The subject is encrypted under the CEK (not cleartext) for envelope mode.
+        assert_ne!(composed.subject, "Quarterly NDA");
+        assert!(!composed.subject.contains("NDA"));
 
         assert_eq!(verify_email_signature_inline(&armor), Some(true));
         let parsed = parse_armor_components(&armor).expect("parses");
@@ -6108,12 +6176,20 @@ nitela\n\
         assert!(parsed.recipients.iter().any(|r| r.role == "self"));
         assert!(parsed.consent.is_some(), "originator consent included");
 
-        // The To: signatory can decrypt.
+        // The To: signatory recovers both the body and the subject.
         let r = decrypt_email_body_pipeline(
-            &bob.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+            &bob.private_key, &armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
         ).unwrap();
         assert!(r.success);
         assert_eq!(r.body, "Mutual NDA terms.");
+        assert_eq!(r.subject, "Quarterly NDA", "subject decrypts under the CEK");
+
+        // A non-recipient cannot read the subject either.
+        let mallory = crypto::generate_keypair().unwrap();
+        let rm = decrypt_email_body_pipeline(
+            &mallory.private_key, &armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert_ne!(rm.subject, "Quarterly NDA", "non-recipient must not read the subject");
     }
 
     #[test]
@@ -6124,11 +6200,14 @@ nitela\n\
         let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
 
         let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
-        let armor = compose_agreement_armor(
+        let composed = compose_agreement(
             &alice.private_key, &alice_pub, None, "Alice",
-            "We agree to the public terms.", &to, &[], false, true,
+            "Public Statement", "We agree to the public terms.", &to, &[], false, true,
         ).unwrap();
+        let armor = composed.armor;
 
+        // Public agreement: subject stays in the clear.
+        assert_eq!(composed.subject, "Public Statement");
         assert!(armor.starts_with("We agree to the public terms."));
         assert!(armor.contains("BEGIN NOSTR SIGNED BODY"));
         assert!(!armor.contains("ENCRYPTED BODY"));
@@ -6141,8 +6220,8 @@ nitela\n\
     fn test_compose_agreement_rejects_no_recipients() {
         let alice = crypto::generate_keypair().unwrap();
         let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
-        let err = compose_agreement_armor(
-            &alice.private_key, &alice_pub, None, "Alice", "terms", &[], &[], true, false);
+        let err = compose_agreement(
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false);
         assert!(err.is_err());
     }
 

@@ -1867,7 +1867,16 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (backToDraftsBtn) {
             backToDraftsBtn.addEventListener('click', () => window.emailService?.showDraftsList());
         }
-        
+
+        const createAgreementBtn = document.getElementById('create-agreement-btn');
+        if (createAgreementBtn) {
+            createAgreementBtn.addEventListener('click', () => window.emailService?.startNewAgreement());
+        }
+        const refreshAgreements = document.getElementById('refresh-agreements');
+        if (refreshAgreements) {
+            refreshAgreements.addEventListener('click', () => window.emailService?.loadAgreements());
+        }
+
         console.log('Event listeners set up successfully');
     } catch (error) {
         console.error('Error setting up event listeners:', error);
@@ -2909,9 +2918,20 @@ NostrMailApp.prototype.switchTab = async function(tabName) {
             window.emailService.loadDrafts();
         }
     }
+    if (tabName === 'agreements') {
+        if (window.emailService) {
+            window.emailService.loadAgreements();
+        }
+    }
     if (tabName === 'compose') {
         // Check if email settings are configured
         this.checkEmailSettingsForCompose();
+
+        // Reset agreement mode for a plain compose; startNewAgreement() re-enables
+        // it (after this runs) when arriving via the Agreements "+" button.
+        if (window.emailService && !window.emailService._pendingAgreementCompose) {
+            window.emailService.setAgreementMode(false);
+        }
         
         if (window.emailService) {
             // Clear current draft state when switching to compose (unless we're loading a draft)

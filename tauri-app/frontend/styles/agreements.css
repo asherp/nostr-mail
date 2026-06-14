@@ -1,5 +1,31 @@
 /* Agreements (CC / signature workflow) — compose options + status banner */
 
+/* ── Compose: agreement-mode banner ── */
+.agreement-mode-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75em;
+    flex-wrap: wrap;
+    padding: 0.6em 0.85em;
+    border: 1px solid #cfe8cf;
+    border-left: 4px solid #4caf50;
+    border-radius: 6px;
+    background: rgba(76, 175, 80, 0.06);
+    color: #2e7d32;
+    font-size: 0.92em;
+    margin-bottom: 0.6em;
+}
+.agreement-mode-banner .btn-link {
+    background: none;
+    border: none;
+    color: var(--primary, #1a73e8);
+    cursor: pointer;
+    font: inherit;
+    padding: 0;
+    text-decoration: underline;
+}
+
 /* ── Compose options ── */
 .agreement-compose .agreement-enable-label {
     display: flex;

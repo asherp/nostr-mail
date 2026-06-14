@@ -12,8 +12,8 @@ class EmailService {
     // Regex patterns for armor block detection (matches both new and legacy formats)
     // New format: BEGIN NOSTR NIP-XX ENCRYPTED BODY, BEGIN NOSTR SIGNED BODY
     // Legacy: BEGIN NOSTR NIP-XX ENCRYPTED MESSAGE, BEGIN NOSTR SIGNED MESSAGE
-    static ARMOR_BEGIN_ENCRYPTED = /(-{3,})\s*BEGIN NOSTR NIP-\d+ ENCRYPTED (?:MESSAGE|BODY)\s*\1/;
-    static ARMOR_BEGIN_ANY = /(-{3,})\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*\1/;
+    static ARMOR_BEGIN_ENCRYPTED = /(-{3,})\s*BEGIN NOSTR (?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY)\s*\1/;
+    static ARMOR_BEGIN_ANY = /(-{3,})\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*\1/;
 
     constructor() {
         this.searchTimeout = null;
@@ -1695,7 +1695,7 @@ class EmailService {
         if (armorStart < 0) return null;
 
         const lines = normalized.substring(armorStart).split('\n');
-        const isBeginBody = (l) => /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/.test(l.trim());
+        const isBeginBody = (l) => /-{3,}\s*BEGIN NOSTR (?:(?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/.test(l.trim());
         const isBeginSig = (l) => /-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}/.test(l.trim());
         const isBeginSeal = (l) => /-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}/.test(l.trim());
         const isEnd = (l) => /-{3,}\s*END NOSTR (?:(?:NIP-\d+ ENCRYPTED )?MESSAGE|SIGNATURE|SEAL)\s*-{3,}/.test(l.trim());
@@ -2386,6 +2386,82 @@ class EmailService {
             domManager.enable('sendBtn');
             domManager.setHTML('sendBtn', '<i class="fas fa-paper-plane"></i> Send');
         }
+    }
+
+    // ── Agreements tab ──────────────────────────────────────────────
+    // True if a message is an agreement: X-Nostr-Agreement header, or an inline
+    // RECIPIENTS/CONSENT armor block.
+    isAgreementEmail(email) {
+        if (!email) return false;
+        if (/^X-Nostr-Agreement:/im.test(email.raw_headers || '')) return true;
+        const b = email.body || '';
+        return b.includes('BEGIN NOSTR RECIPIENTS') || b.includes('BEGIN NOSTR CONSENT');
+    }
+
+    // Load + render the Agreements tab: the inbox emails filtered to agreements,
+    // rendered with the same rich rows as the inbox.
+    async loadAgreements() {
+        const listEl = document.getElementById('agreements-list');
+        if (!listEl) return;
+        listEl.innerHTML = '<div class="loading-emails">Loading agreements…</div>';
+
+        let emails = appState.getEmails();
+        if (!emails || emails.length === 0) {
+            try { await this.loadEmails(); } catch (e) { /* settings may be missing */ }
+            emails = appState.getEmails();
+        }
+        const agreements = (emails || []).filter(e => this.isAgreementEmail(e));
+        if (!agreements.length) {
+            listEl.innerHTML = '<div class="empty-state" style="padding:1.5em;color:var(--text-secondary,#888);">No agreements yet. Click “Create agreement” to start one.</div>';
+            return;
+        }
+
+        listEl.innerHTML = '';
+        for (const email of agreements) {
+            try {
+                const el = await this.renderInboxEmailItem(email);
+                // Open in the inbox detail view (capture phase pre-empts the row's
+                // own click handler so it doesn't double-open).
+                el.addEventListener('click', (e) => {
+                    e.stopImmediatePropagation();
+                    this._openAgreement(email);
+                }, true);
+                listEl.appendChild(el);
+            } catch (err) {
+                console.warn('[JS] agreement item render failed:', err);
+            }
+        }
+    }
+
+    _openAgreement(email) {
+        const open = () => {
+            if (email.message_count > 1) this.showThreadDetail(email.thread_id, 'inbox');
+            else this.showEmailDetail(email.id);
+        };
+        const p = window.app && typeof window.app.switchTab === 'function'
+            ? window.app.switchTab('inbox') : null;
+        (p && typeof p.then === 'function') ? p.then(open) : open();
+    }
+
+    // Toggle the compose form into / out of agreement mode (used by the
+    // Agreements tab's "Create agreement" button and the "switch to normal" link).
+    setAgreementMode(on) {
+        const cb = document.getElementById('agreement-enabled');
+        if (cb) cb.checked = !!on;
+        const opts = document.getElementById('agreement-options');
+        if (opts) opts.style.display = on ? 'block' : 'none';
+        const banner = document.getElementById('agreement-mode-banner');
+        if (banner) banner.style.display = on ? 'flex' : 'none';
+        const title = document.getElementById('compose-title');
+        if (title) title.textContent = on ? 'Create Agreement' : 'Compose Email';
+    }
+
+    // Open the compose view in agreement mode (from the Agreements tab + button).
+    async startNewAgreement() {
+        this._pendingAgreementCompose = true;
+        try { await (window.app && window.app.switchTab && window.app.switchTab('compose')); } catch (e) {}
+        this.setAgreementMode(true);
+        this._pendingAgreementCompose = false;
     }
 
     // Render the "M of N signed" agreement status banner at the top of the email
@@ -3750,8 +3826,8 @@ class EmailService {
             // Batch-decrypt uncached encrypted emails in a single IPC call
             const uncachedEncrypted = filteredEmails.filter(email => {
                 if (this._previewCache.has(`inbox-${email.id}`)) return false;
-                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-                return firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+                return firstBeginMatch && /ENCRYPTED/.test(firstBeginMatch[1]);
             });
 
             if (uncachedEncrypted.length > 0 && appState.getKeypair()) {
@@ -3981,8 +4057,8 @@ class EmailService {
             // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
             // Nested blocks (quoted replies) may be a different type — only the
             // outermost block determines whether this is an encrypted or signed message.
-            const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-            const outerIsEncrypted = firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+            const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+            const outerIsEncrypted = firstBeginMatch && /ENCRYPTED/.test(firstBeginMatch[1]);
 
             if (outerIsEncrypted) {
                 const keypair = appState.getKeypair();
@@ -4233,7 +4309,7 @@ class EmailService {
         // placeholder string; either way it isn't meaningful to display while
         // we wait for decryption. Substitute a clear "Decrypting…" hint for
         // the subject and blank the preview until the full render lands.
-        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
         const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
         const previewText = isEncrypted ? '' : 'Loading...';
 
@@ -5293,7 +5369,7 @@ ${attachmentsHtml}
             // ciphertext / a placeholder, so start with "Decrypting…" until a
             // per-message task lands a real decrypted subject. Cleartext threads
             // just keep their stored subject as the default.
-            const firstHasArmor = !!(threadEmails[0].body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(threadEmails[0].body));
+            const firstHasArmor = !!(threadEmails[0].body && /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(threadEmails[0].body));
             const decryptingPlaceholder = 'Decrypting…';
             let threadSubjectText = firstHasArmor ? decryptingPlaceholder : threadEmails[0].subject;
             let lastDecryptedSubject = null;
@@ -5361,7 +5437,7 @@ ${attachmentsHtml}
                     const isSent = email._isSentByUser;
                     const emailBody = email.body || '';
                     const bodyBytes = emailBody.length;
-                    const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
+                    const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
 
                     let displayBody = emailBody;
                     let displaySubject = email.subject;
@@ -7542,8 +7618,8 @@ ${attachmentsHtml}
             // Batch-decrypt uncached encrypted sent emails, resolving pubkeys from contact index
             const uncachedEncrypted = filteredEmails.filter(email => {
                 if (this._previewCache.has(`sent-${email.id}`)) return false;
-                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-                return firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+                return firstBeginMatch && /ENCRYPTED/.test(firstBeginMatch[1]);
             });
 
             if (uncachedEncrypted.length > 0 && appState.getKeypair()) {
@@ -7730,8 +7806,8 @@ ${attachmentsHtml}
             previewSubject = email.subject;
 
             // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
-            const sentFirstBegin = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-            const sentOuterIsEncrypted = sentFirstBegin && /NIP-\d+ ENCRYPTED/.test(sentFirstBegin[1]);
+            const sentFirstBegin = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+            const sentOuterIsEncrypted = sentFirstBegin && /ENCRYPTED/.test(sentFirstBegin[1]);
 
             if (sentOuterIsEncrypted) {
                 const keypair = appState.getKeypair();
@@ -7976,7 +8052,7 @@ ${attachmentsHtml}
         // placeholder and the body is armor — show "Decrypting…" on the
         // subject and blank the preview until the full render replaces
         // this skeleton. Cleartext sent emails keep their body snippet.
-        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
         const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
         const previewText = isEncrypted
             ? ''
@@ -8803,7 +8879,7 @@ ${attachmentsHtml}
                 const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('BEGIN NOSTR')).join('\n').trim();
                 // For sent emails, use recipient_pubkey for decryption
                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
-                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
 
                 let decryptedSubject = email.subject;
                 let decryptedBody = cleanedBody;
@@ -9796,8 +9872,8 @@ ${attachmentsHtml}
         let previewSubject = draft.subject;
 
         // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
-        const draftFirstBegin = draft.body && draft.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-        const draftOuterIsEncrypted = draftFirstBegin && /NIP-\d+ ENCRYPTED/.test(draftFirstBegin[1]);
+        const draftFirstBegin = draft.body && draft.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+        const draftOuterIsEncrypted = draftFirstBegin && /ENCRYPTED/.test(draftFirstBegin[1]);
 
         if (draftOuterIsEncrypted) {
             const keypair = appState.getKeypair();
@@ -10223,7 +10299,7 @@ ${attachmentsHtml}
                 // For drafts, use recipient_pubkey for decryption (drafts are emails we're preparing to send)
                 const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey; // Fallback for backward compatibility
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(draft.subject);
-                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 let decryptedSubject = draft.subject;
                 let decryptedBody = cleanedBody;
                 const keypair = appState.getKeypair();

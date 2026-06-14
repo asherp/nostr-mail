@@ -80,6 +80,9 @@
                 <button class="nav-item" data-tab="drafts">
                     <i class="fas fa-save"></i> Drafts
                 </button>
+                <button class="nav-item" data-tab="agreements">
+                    <i class="fas fa-file-signature"></i> Agreements
+                </button>
                 <button class="nav-item" data-tab="dm">
                     <i class="fas fa-comments"></i> Messages
                 </button>
@@ -126,10 +129,10 @@
                         <button class="btn btn-secondary back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
                             <i class="fas fa-arrow-left"></i> Back
                         </button>
-                        <h2>Compose Email</h2>
+                        <h2 id="compose-title">Compose Email</h2>
                     </div>
                 </div>
-                
+
                 <div class="compose-form">
                     <div class="form-group">
                         <label for="to-address">To:</label>
@@ -154,10 +157,13 @@
                     </div>
 
                     <div class="form-group agreement-compose">
-                        <label class="agreement-enable-label">
-                            <input type="checkbox" id="agreement-enabled" onchange="document.getElementById('agreement-options').style.display = this.checked ? 'block' : 'none';">
-                            <i class="fas fa-file-signature"></i> Make this an agreement (request signatures)
-                        </label>
+                        <!-- Agreement mode is entered from the Agreements tab's "Create agreement"
+                             button (startNewAgreement), which sets #agreement-enabled. -->
+                        <input type="checkbox" id="agreement-enabled" style="display: none;">
+                        <div id="agreement-mode-banner" class="agreement-mode-banner" style="display: none;">
+                            <span><i class="fas fa-file-signature"></i> Creating an agreement — To: recipients will be asked to sign.</span>
+                            <button type="button" class="btn-link" onclick="window.emailService.setAgreementMode(false)">Switch to normal email</button>
+                        </div>
                         <div id="agreement-options" class="agreement-options" style="display: none;">
                             <div class="form-group">
                                 <label for="cc-address">Cc (viewers — can read, not asked to sign):</label>
@@ -342,6 +348,29 @@
                     <div class="email-detail-content" id="drafts-detail-content">
                         <!-- Draft detail content will be populated here -->
                     </div>
+                </div>
+            </div>
+
+            <!-- Agreements Tab -->
+            <div class="tab-content" id="agreements">
+                <div class="tab-header">
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                        <button class="btn btn-secondary back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2>Agreements</h2>
+                    </div>
+                    <div class="inbox-actions">
+                        <button id="refresh-agreements" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>
+                        </button>
+                        <button id="create-agreement-btn" class="btn btn-primary">
+                            <i class="fas fa-plus"></i> <span class="btn-text">Create agreement</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="email-list" id="agreements-list">
+                    <!-- Agreement messages (filtered) will be populated here -->
                 </div>
             </div>
 

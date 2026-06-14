@@ -2374,33 +2374,58 @@ class EmailService {
         return b.includes('BEGIN NOSTR RECIPIENTS') || b.includes('BEGIN NOSTR CONSENT');
     }
 
-    // Load + render the Agreements tab: the inbox emails filtered to agreements,
-    // rendered with the same rich rows as the inbox.
+    // Load + render the Agreements tab: inbox AND sent emails filtered to
+    // agreements, deduplicated by thread (newest wins), rendered with the same
+    // rich rows; each routes to its own (inbox/sent) detail view on click.
     async loadAgreements() {
         const listEl = document.getElementById('agreements-list');
         if (!listEl) return;
         listEl.innerHTML = '<div class="loading-emails">Loading agreements…</div>';
 
-        let emails = appState.getEmails();
-        if (!emails || emails.length === 0) {
+        let inbox = appState.getEmails();
+        if (!inbox || inbox.length === 0) {
             try { await this.loadEmails(); } catch (e) { /* settings may be missing */ }
-            emails = appState.getEmails();
+            inbox = appState.getEmails();
         }
-        const agreements = (emails || []).filter(e => this.isAgreementEmail(e));
-        if (!agreements.length) {
+        let sent = appState.getSentEmails();
+        if (!sent || sent.length === 0) {
+            try { await this.loadSentEmails(); } catch (e) { /* settings may be missing */ }
+            sent = appState.getSentEmails();
+        }
+
+        // Tag source, keep only agreements.
+        const tagged = [
+            ...(inbox || []).map(e => ({ e, source: 'inbox' })),
+            ...(sent || []).map(e => ({ e, source: 'sent' })),
+        ].filter(x => this.isAgreementEmail(x.e));
+
+        // Dedupe by thread (an agreement thread can appear in both stores); keep newest.
+        const byKey = new Map();
+        for (const x of tagged) {
+            const key = x.e.thread_id || x.e.message_id || x.e.id;
+            const prev = byKey.get(key);
+            if (!prev || this._emailDateMs(x.e) > this._emailDateMs(prev.e)) byKey.set(key, x);
+        }
+        const items = [...byKey.values()].sort((a, b) => this._emailDateMs(b.e) - this._emailDateMs(a.e));
+
+        if (!items.length) {
             listEl.innerHTML = '<div class="empty-state" style="padding:1.5em;color:var(--text-secondary,#888);">No agreements yet. Click “Create agreement” to start one.</div>';
             return;
         }
 
         listEl.innerHTML = '';
-        for (const email of agreements) {
+        for (const { e: email, source } of items) {
             try {
-                const el = await this.renderInboxEmailItem(email);
-                // Open in the inbox detail view (capture phase pre-empts the row's
-                // own click handler so it doesn't double-open).
-                el.addEventListener('click', (e) => {
-                    e.stopImmediatePropagation();
-                    this._openAgreement(email);
+                const el = source === 'sent'
+                    ? await this.renderSentEmailItem(email)
+                    : await this.renderInboxEmailItem(email);
+                if (!el) continue; // sent renderer returns null when hide_undecryptable is on
+                // Open in the matching (inbox/sent) detail view. Capture phase
+                // pre-empts the row's own handler so it doesn't double-open in a
+                // hidden tab.
+                el.addEventListener('click', (ev) => {
+                    ev.stopImmediatePropagation();
+                    this._openAgreement(email, source);
                 }, true);
                 listEl.appendChild(el);
             } catch (err) {
@@ -2409,13 +2434,22 @@ class EmailService {
         }
     }
 
-    _openAgreement(email) {
+    _emailDateMs(e) {
+        const d = e && (e.date ?? e.created_at);
+        if (d == null) return 0;
+        const t = typeof d === 'number' ? d : Date.parse(d);
+        return isNaN(t) ? 0 : t;
+    }
+
+    _openAgreement(email, source) {
+        const tab = source === 'sent' ? 'sent' : 'inbox';
         const open = () => {
-            if (email.message_count > 1) this.showThreadDetail(email.thread_id, 'inbox');
+            if (email.message_count > 1) this.showThreadDetail(email.thread_id, tab);
+            else if (source === 'sent') this.showSentDetail(email.id);
             else this.showEmailDetail(email.id);
         };
         const p = window.app && typeof window.app.switchTab === 'function'
-            ? window.app.switchTab('inbox') : null;
+            ? window.app.switchTab(tab) : null;
         (p && typeof p.then === 'function') ? p.then(open) : open();
     }
 

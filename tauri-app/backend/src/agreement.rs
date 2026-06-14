@@ -411,17 +411,19 @@ pub fn encode_hybrid_agreement(
     body_plaintext: &[u8],
     recipients_in: &[AgreementRecipientInput],
     originator_consents: bool,
+    encoding: Option<&str>,
 ) -> Result<String> {
     let cek = crate::crypto::generate_cek();
     encode_hybrid_agreement_with_cek(
-        &cek, sender_priv, sender_pub, sender_email, profile_name, body_plaintext, recipients_in, originator_consents,
+        &cek, sender_priv, sender_pub, sender_email, profile_name, body_plaintext, recipients_in, originator_consents, encoding,
     )
 }
 
 /// Like [`encode_hybrid_agreement`] but uses a caller-supplied CEK, so the same
 /// key can also encrypt out-of-band material (e.g. the email subject) under one
 /// envelope. The caller is responsible for generating a fresh random CEK
-/// ([`crate::crypto::generate_cek`]) per message.
+/// ([`crate::crypto::generate_cek`]) per message. `encoding` is the user's
+/// Advanced glossia scheme (`None` ⇒ default).
 pub fn encode_hybrid_agreement_with_cek(
     cek: &[u8; 32],
     sender_priv: &str,
@@ -431,6 +433,7 @@ pub fn encode_hybrid_agreement_with_cek(
     body_plaintext: &[u8],
     recipients_in: &[AgreementRecipientInput],
     originator_consents: bool,
+    encoding: Option<&str>,
 ) -> Result<String> {
     if recipients_in.is_empty() {
         return Err(anyhow::anyhow!(
@@ -444,7 +447,7 @@ pub fn encode_hybrid_agreement_with_cek(
     // glossia-encode the ciphertext so it survives email transport (quote
     // prefixes / word-wrap) intact — base64 would break signed reply chains (§5).
     let ciphertext = crate::crypto::aes_gcm_encrypt_raw(cek, body_plaintext)?;
-    let (body_encoded, body_decoded_bytes) = crate::email::glossia_encode_bytes(&ciphertext)
+    let (body_encoded, body_decoded_bytes) = crate::email::glossia_encode_bytes_with(&ciphertext, encoding)
         .ok_or_else(|| anyhow::anyhow!("glossia encode of agreement body failed"))?;
 
     // 3. Wrap the CEK to each recipient, then to self (Section 10.1 step 3, 10.4).
@@ -823,7 +826,7 @@ mod tests {
             AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.org".into()) },
         ];
         let armor = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator", body, &recips, false,
+            &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator", body, &recips, false, None,
         ).unwrap();
 
         // Structure: generic encrypted body, recipients (incl. self last), no consent.
@@ -864,7 +867,7 @@ mod tests {
             AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone(), email: None },
         ];
         let armor = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, None, "Originator", body, &recips, true,
+            &sender.private_key, &sender.public_key, None, "Originator", body, &recips, true, None,
         ).unwrap();
 
         assert!(armor.contains("BEGIN NOSTR CONSENT"));
@@ -895,7 +898,7 @@ mod tests {
     fn test_encode_hybrid_agreement_rejects_empty_recipients() {
         let sender = crate::crypto::generate_keypair().unwrap();
         let err = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, None, "X", b"x", &[], false);
+            &sender.private_key, &sender.public_key, None, "X", b"x", &[], false, None);
         assert!(err.is_err());
     }
 }

@@ -647,8 +647,9 @@ async fn send_message_with_timeout(mailer: SmtpTransport, email: Message) -> Res
 /// originator's own CONSENT over `H` (§11.2).
 ///
 /// In encrypted mode the **subject is AES-256-GCM-encrypted under the same CEK
-/// as the body** (base64), so it is readable by exactly the recipients and never
-/// leaks in cleartext; in plaintext mode the subject is returned unchanged.
+/// as the body** and glossia-encoded, so it is readable by exactly the recipients
+/// and never leaks in cleartext; in plaintext mode the subject is returned
+/// unchanged. `encoding` is the user's Advanced glossia scheme (`None` ⇒ default).
 /// SMTP/MIME assembly is the caller's job, so this is unit-testable.
 pub fn compose_agreement(
     private_key: &str,
@@ -661,6 +662,7 @@ pub fn compose_agreement(
     cc: &[crate::types::AgreementParty],
     encrypted: bool,
     originator_consents: bool,
+    encoding: Option<&str>,
 ) -> Result<crate::types::ComposedAgreement, String> {
     use crate::agreement::{AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
 
@@ -687,18 +689,18 @@ pub fn compose_agreement(
         // One CEK for the body and the subject.
         let cek = crate::crypto::generate_cek();
         let armor = crate::agreement::encode_hybrid_agreement_with_cek(
-            &cek, private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents,
+            &cek, private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents, encoding,
         ).map_err(|e| e.to_string())?;
-        // Glossia-encode the subject ciphertext too, so the Subject header looks
-        // like prose and survives header folding (not an opaque base64 blob).
+        // Glossia-encode the subject ciphertext too (same scheme as the body), so
+        // the Subject header reads as prose and survives header folding.
         let subject_ct = crate::crypto::aes_gcm_encrypt_raw(&cek, subject.as_bytes())
             .map_err(|e| format!("subject encrypt failed: {}", e))?;
-        let (enc_subject, _) = glossia_encode_bytes(&subject_ct)
+        let (enc_subject, _) = glossia_encode_bytes_with(&subject_ct, encoding)
             .ok_or_else(|| "subject glossia encode failed".to_string())?;
         Ok(crate::types::ComposedAgreement { armor, subject: enc_subject })
     } else {
         let armor = encode_signed_agreement(
-            private_key, sender_pub, profile_name, body, &recips, originator_consents,
+            private_key, sender_pub, profile_name, body, &recips, originator_consents, encoding,
         )?;
         // Public agreement: subject stays in the clear.
         Ok(crate::types::ComposedAgreement { armor, subject: subject.to_string() })
@@ -765,6 +767,7 @@ pub async fn send_agreement_email(
     references: Option<&str>,
     include_pubkey_header: bool,
     include_sig_header: bool,
+    encoding: Option<&str>,
 ) -> Result<String> {
     let private_key = config.private_key.as_deref()
         .ok_or_else(|| anyhow::anyhow!("no private key configured; cannot sign the agreement"))?;
@@ -772,7 +775,7 @@ pub async fn send_agreement_email(
         .map_err(|e| anyhow::anyhow!("could not derive sender pubkey: {}", e))?;
 
     let composed = compose_agreement(
-        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents,
+        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents, encoding,
     ).map_err(|e| anyhow::anyhow!("{}", e))?;
     let armor = composed.armor;
 
@@ -1916,34 +1919,22 @@ fn try_glossia_decode_to_bytes(text: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Map a frontend encoding-scheme name (the user's Advanced "encoding" setting)
+/// to glossia `(language, wordlist)`. `None`/empty defaults to english/bip39.
+pub(crate) fn glossia_lang_wordlist(encoding: Option<&str>) -> (String, String) {
+    match encoding.unwrap_or("").to_lowercase().as_str() {
+        "" | "english" | "english - bip39" | "bip39" => ("english".to_string(), "bip39".to_string()),
+        "latin" => ("latin".to_string(), "default".to_string()),
+        other => (other.to_string(), "default".to_string()),
+    }
+}
+
 /// Glossia round-trip: encode plaintext bytes into the given language, then decode back
 /// to get canonical bytes. This ensures signature verification survives transport
 /// (word-wrap, quote prefixes, etc.) because the signature is on the decoded binary.
 /// Returns None if glossia encode/decode fails (caller should fall back to raw UTF-8 bytes).
 pub fn glossia_roundtrip_to_bytes(text: &str, encoding: &str) -> Option<Vec<u8>> {
-    let hex_input = glossia::hex_encode(text.as_bytes());
-    // Map frontend encoding names to glossia parameters
-    let encoding_lower = encoding.to_lowercase();
-    let (language, wordlist) = match encoding_lower.as_str() {
-        "latin" => ("latin", "default"),
-        "english" | "english - bip39" => ("english", "bip39"),
-        _ => (encoding_lower.as_str(), "default"),
-    };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        glossia::encode_into_language(
-            &hex_input, language, wordlist, "body",
-            None, 42, false, None, None, None, None,
-        )
-    }));
-    let encoded = match result {
-        Ok(Ok((encoded_text, _, _, _))) => encoded_text,
-        _ => {
-            debug_log!("[RUST] glossia_roundtrip_to_bytes: encode failed for encoding={}", encoding);
-            return None;
-        }
-    };
-    // Decode back to bytes
-    try_glossia_decode_to_bytes(&encoded)
+    glossia_encode_bytes_with(text.as_bytes(), Some(encoding)).map(|(_, bytes)| bytes)
 }
 
 /// Decode a single section of armor body content (non-quoted lines only) to bytes.
@@ -4056,16 +4047,19 @@ pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
     body.as_bytes().to_vec()
 }
 
-/// Glossia-encode raw bytes for an armor body: returns the encoded words and the
-/// canonical decoded bytes (what `decode_armor_section` will recover, i.e. the
-/// bytes a signature is computed over). Glossia — not base64 — is used because
-/// its word tokens survive email transport (quote `> ` prefixes, word-wrapping,
-/// reflow) that would corrupt base64 and break signed reply chains (spec §5).
-pub(crate) fn glossia_encode_bytes(data: &[u8]) -> Option<(String, Vec<u8>)> {
+/// Glossia-encode raw bytes for an armor body using the given encoding scheme
+/// (the user's Advanced "encoding" setting; `None` ⇒ english/bip39). Returns the
+/// encoded words and the canonical decoded bytes (what `decode_armor_section`
+/// recovers, i.e. the bytes a signature is computed over). Glossia — not base64 —
+/// is used because its word tokens survive email transport (quote `> ` prefixes,
+/// word-wrapping, reflow) that would corrupt base64 and break signed reply chains
+/// (spec §5). Decoding auto-detects the dialect, so only encoding needs the setting.
+pub(crate) fn glossia_encode_bytes_with(data: &[u8], encoding: Option<&str>) -> Option<(String, Vec<u8>)> {
     let hex_input = glossia::hex_encode(data);
+    let (language, wordlist) = glossia_lang_wordlist(encoding);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         glossia::encode_into_language(
-            &hex_input, "english", "bip39", "body",
+            &hex_input, &language, &wordlist, "body",
             None, 42, false, None, None, None, None,
         )
     }));
@@ -4079,8 +4073,8 @@ pub(crate) fn glossia_encode_bytes(data: &[u8]) -> Option<(String, Vec<u8>)> {
 
 /// Glossia-encode plaintext for a `SIGNED BODY` (spec §3.2): returns the encoded
 /// words and the canonical decoded bytes the signature is computed over (§4).
-fn glossia_encode_signed_body(text: &str) -> Option<(String, Vec<u8>)> {
-    glossia_encode_bytes(text.as_bytes())
+fn glossia_encode_signed_body(text: &str, encoding: Option<&str>) -> Option<(String, Vec<u8>)> {
+    glossia_encode_bytes_with(text.as_bytes(), encoding)
 }
 
 /// Compose a **plaintext (public) agreement** — the unencrypted counterpart to
@@ -4107,6 +4101,7 @@ pub fn encode_signed_agreement(
     terms_plaintext: &str,
     recipients_in: &[crate::agreement::AgreementRecipientInput],
     originator_consents: bool,
+    encoding: Option<&str>,
 ) -> Result<String, String> {
     use crate::agreement::{
         canonicalize_block, document_hash, level_signing_bytes, serialize_recipients,
@@ -4118,7 +4113,7 @@ pub fn encode_signed_agreement(
     let sender_pub_hex = crate::agreement::normalize_pubkey_hex(sender_pub)
         .ok_or_else(|| "invalid sender pubkey".to_string())?;
 
-    let (encoded_body, canonical_bytes) = glossia_encode_signed_body(terms_plaintext)
+    let (encoded_body, canonical_bytes) = glossia_encode_signed_body(terms_plaintext, encoding)
         .ok_or_else(|| "glossia encode of agreement terms failed".to_string())?;
 
     // Signatories/viewers with no key wrap (plaintext): role pubkey [email].
@@ -5769,7 +5764,7 @@ nitela\n\
         ];
         let armor = encode_hybrid_agreement(
             &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator",
-            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true,
+            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true, None,
         ).unwrap();
 
         assert_eq!(verify_email_signature_inline(&armor), Some(true),
@@ -5800,7 +5795,7 @@ nitela\n\
         ];
         let armor = encode_hybrid_agreement(
             &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator",
-            b"terms", &recips, false,
+            b"terms", &recips, false, None,
         ).unwrap();
         assert_eq!(verify_email_signature_inline(&armor), Some(true));
 
@@ -5838,7 +5833,7 @@ nitela\n\
         }];
         encode_hybrid_agreement(
             &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
-            "Alice", b"Please confirm you control this address.", &recips, false,
+            "Alice", b"Please confirm you control this address.", &recips, false, None,
         ).unwrap()
     }
 
@@ -5907,7 +5902,7 @@ nitela\n\
         }];
         encode_hybrid_agreement(
             &alice.private_key, &alice.public_key, None, "Alice",
-            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true,
+            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true, None,
         ).unwrap()
     }
 
@@ -6004,7 +5999,7 @@ nitela\n\
         ];
         let armor = encode_hybrid_agreement(
             &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
-            "Alice", plaintext.as_bytes(), &recips, false,
+            "Alice", plaintext.as_bytes(), &recips, false, None,
         ).unwrap();
 
         // Bob (signer) recovers the body.
@@ -6040,7 +6035,7 @@ nitela\n\
             role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: None,
         }];
         let armor = encode_hybrid_agreement(
-            &alice.private_key, &alice.public_key, None, "Alice", b"secret terms", &recips, false,
+            &alice.private_key, &alice.public_key, None, "Alice", b"secret terms", &recips, false, None,
         ).unwrap();
 
         let r = decrypt_email_body_pipeline(
@@ -6058,7 +6053,7 @@ nitela\n\
             role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.com".into()),
         }];
         let armor = encode_hybrid_agreement(
-            &alice.private_key, &alice.public_key, Some("alice@x.example"), "Alice", b"terms", &recips, true,
+            &alice.private_key, &alice.public_key, Some("alice@x.example"), "Alice", b"terms", &recips, true, None,
         ).unwrap();
 
         let parsed = parse_armor_components(&armor).expect("parses");
@@ -6077,12 +6072,12 @@ nitela\n\
         let recips = vec![AgreementRecipientInput {
             role: ROLE_SIGNER.into(), pubkey: bob_pub.to_string(), email: None,
         }];
-        encode_signed_agreement(&alice.private_key, &alice.public_key, "Alice", terms, &recips, true).unwrap()
+        encode_signed_agreement(&alice.private_key, &alice.public_key, "Alice", terms, &recips, true, None).unwrap()
     }
 
     fn build_plaintext_consent_reply(responder: &crate::types::KeyPair, prior_armor: &str, h: &str) -> String {
         let responder_hex = crate::agreement::normalize_pubkey_hex(&responder.public_key).unwrap();
-        let (reply_glossia, _) = glossia_encode_signed_body("I agree to the terms.").unwrap();
+        let (reply_glossia, _) = glossia_encode_signed_body("I agree to the terms.", None).unwrap();
         let prior_only = &prior_armor[prior_armor.find("----- BEGIN NOSTR").unwrap()..];
         let template = format!(
             "I agree to the terms.\n\n----- BEGIN NOSTR SIGNED BODY -----\n{}\n\
@@ -6174,7 +6169,7 @@ nitela\n\
         let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
-            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, None,
         ).unwrap();
         let armor = composed.armor;
 
@@ -6216,7 +6211,7 @@ nitela\n\
         let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, None, "Alice",
-            "Public Statement", "We agree to the public terms.", &to, &[], false, true,
+            "Public Statement", "We agree to the public terms.", &to, &[], false, true, None,
         ).unwrap();
         let armor = composed.armor;
 
@@ -6235,8 +6230,41 @@ nitela\n\
         let alice = crypto::generate_keypair().unwrap();
         let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
         let err = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false);
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, None);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_glossia_encode_bytes_honors_encoding_scheme() {
+        // The Advanced "encoding" setting must change the dialect used, while
+        // round-tripping to identical bytes.
+        let data: Vec<u8> = (0u8..48).collect();
+        let (latin, latin_bytes) = glossia_encode_bytes_with(&data, Some("latin")).unwrap();
+        let (english, english_bytes) = glossia_encode_bytes_with(&data, Some("english - bip39")).unwrap();
+        assert_eq!(latin_bytes, data);
+        assert_eq!(english_bytes, data);
+        assert_ne!(latin, english, "different schemes must produce different encodings");
+    }
+
+    #[test]
+    fn test_compose_agreement_applies_encoding_setting() {
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+
+        // Compose the same plaintext agreement under two schemes; the encoded
+        // bodies must differ, yet both verify and decrypt.
+        let latin = compose_agreement(
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, Some("latin"),
+        ).unwrap();
+        let english = compose_agreement(
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, Some("english - bip39"),
+        ).unwrap();
+        assert_ne!(latin.armor, english.armor, "encoding setting must change the armor body");
+        assert_eq!(verify_email_signature_inline(&latin.armor), Some(true));
+        assert_eq!(verify_email_signature_inline(&english.armor), Some(true));
     }
 
     #[test]
@@ -6245,7 +6273,7 @@ nitela\n\
         // must decode to identical bytes after an email client quote-prefixes
         // ("> ") and re-wraps it — base64 would be corrupted by the "> ".
         let ciphertext: Vec<u8> = (0u8..64).collect();
-        let (encoded, canonical) = glossia_encode_bytes(&ciphertext).unwrap();
+        let (encoded, canonical) = glossia_encode_bytes_with(&ciphertext, None).unwrap();
         assert_eq!(canonical, ciphertext, "glossia round-trips the bytes");
 
         let words: Vec<&str> = encoded.split_whitespace().collect();

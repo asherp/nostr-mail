@@ -134,7 +134,7 @@
                 </div>
 
                 <div class="compose-form">
-                    <div class="form-group">
+                    <div class="form-group" id="compose-to-group">
                         <label for="to-address">To:</label>
                         <select id="nostr-contact-select" class="form-control" style="margin-bottom: 8px;">
                             <option value="">Select a Nostr contact with email...</option>
@@ -166,12 +166,26 @@
                         </div>
                         <div id="agreement-options" class="agreement-options" style="display: none;">
                             <div class="form-group">
+                                <label>To (signatories — asked to sign):</label>
+                                <div class="recipient-picker">
+                                    <select id="to-contact-select" class="form-control">
+                                        <option value="">Add a contact…</option>
+                                    </select>
+                                    <div class="manual-entry">
+                                        <input type="email" id="to-manual-email" placeholder="signer@example.com" autocorrect="off" autocapitalize="off" spellcheck="false">
+                                        <input type="text" id="to-manual-npub" placeholder="npub1… or hex pubkey" autocorrect="off" autocapitalize="off" spellcheck="false" style="font-family: monospace;">
+                                        <button type="button" id="to-add-manual-btn" class="btn btn-secondary">Add</button>
+                                    </div>
+                                    <div id="to-recipients-list" class="recipient-chips"></div>
+                                </div>
+                            </div>
+                            <div class="form-group">
                                 <label>Cc (viewers — can read, not asked to sign):</label>
-                                <div class="cc-picker">
+                                <div class="recipient-picker">
                                     <select id="cc-contact-select" class="form-control">
                                         <option value="">Add a contact…</option>
                                     </select>
-                                    <div class="cc-manual-entry">
+                                    <div class="manual-entry">
                                         <input type="email" id="cc-manual-email" placeholder="viewer@example.com" autocorrect="off" autocapitalize="off" spellcheck="false">
                                         <input type="text" id="cc-manual-npub" placeholder="npub1… or hex pubkey" autocorrect="off" autocapitalize="off" spellcheck="false" style="font-family: monospace;">
                                         <button type="button" id="cc-add-manual-btn" class="btn btn-secondary">Add</button>
@@ -192,7 +206,7 @@
                             </label>
                             <p class="agreement-hint">
                                 <strong>To:</strong> recipients are asked to sign; <strong>Cc:</strong> recipients are viewers.
-                                Use commas for multiple addresses. Every recipient must be a contact with a known Nostr key.
+                                Add each recipient from your contacts, or enter an email + Nostr key manually.
                             </p>
                         </div>
                     </div>

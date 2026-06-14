@@ -62,14 +62,14 @@
     color: var(--text-secondary, #888);
 }
 
-/* ── Cc viewer picker ── */
-.cc-picker .cc-manual-entry {
+/* ── Recipient pickers (To / Cc) ── */
+.recipient-picker .manual-entry {
     display: flex;
     gap: 0.5em;
     margin-top: 0.5em;
     flex-wrap: wrap;
 }
-.cc-picker .cc-manual-entry input {
+.recipient-picker .manual-entry input {
     flex: 1 1 auto;
     min-width: 8em;
 }

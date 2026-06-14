@@ -2292,40 +2292,18 @@ class EmailService {
         const settings = appState.getSettings();
         const subject = domManager.getValue('subject')?.trim() || '';
         const body = domManager.getValue('messageBody')?.trim() || '';
-        const toRaw = domManager.getValue('toAddress')?.trim() || '';
 
-        if (!subject || !body || !toRaw) {
-            notificationService.showError('An agreement needs a subject, a body, and at least one To: signatory');
+        if (!subject || !body) {
+            notificationService.showError('An agreement needs a subject and a body');
             return;
         }
 
-        const splitEmails = (s) => s.split(/[,;\s]+/).map(e => e.trim().toLowerCase()).filter(Boolean);
-        const toEmails = splitEmails(toRaw);
-
-        // Resolve each To: email → contact pubkey (case-insensitive). A single To:
-        // recipient may also use the manually-entered pubkey field.
-        const contacts = appState.getContacts();
-        const manualPubkey = (document.getElementById('recipient-pubkey-value')?.value || '').trim();
-        const resolve = (email) => {
-            const c = contacts.find(c => c.email && c.email.toLowerCase() === email);
-            return (c && c.pubkey) ? c.pubkey : null;
-        };
-
-        const unresolved = [];
-        const to = [];
-        for (const email of toEmails) {
-            let pk = resolve(email);
-            if (!pk && toEmails.length === 1 && manualPubkey) pk = manualPubkey;
-            if (pk) to.push({ email, pubkey: pk }); else unresolved.push(email);
-        }
-        // Cc viewers come from the picker (each already has {email, pubkey}).
+        // To: signatories and Cc: viewers come from the pickers, each already a
+        // {email, pubkey} pair — no email→pubkey resolution needed.
+        const to = (this._toRecipients || []).map(r => ({ email: r.email, pubkey: r.pubkey }));
         const cc = (this._ccRecipients || []).map(r => ({ email: r.email, pubkey: r.pubkey }));
-        if (unresolved.length > 0) {
-            notificationService.showError('No known Nostr key for: ' + unresolved.join(', ') + '. Add them as contacts first.');
-            return;
-        }
         if (to.length === 0) {
-            notificationService.showError('At least one To: signatory with a known Nostr key is required');
+            notificationService.showError('Add at least one To: signatory');
             return;
         }
 
@@ -2368,8 +2346,10 @@ class EmailService {
             domManager.clear('toAddress');
             domManager.clear('subject');
             domManager.clear('messageBody');
+            this._toRecipients = [];
             this._ccRecipients = [];
-            this._renderCcChips();
+            this._renderRecipientChips('to');
+            this._renderRecipientChips('cc');
             this.selectedNostrContact = null;
             try { this.clearAttachments(); } catch (e) {}
             try { this.clearCurrentDraft(); } catch (e) {}
@@ -2450,43 +2430,58 @@ class EmailService {
         if (banner) banner.style.display = on ? 'flex' : 'none';
         const title = document.getElementById('compose-title');
         if (title) title.textContent = on ? 'Create Agreement' : 'Compose Email';
+        // In agreement mode the To/Cc come from the in-panel pickers; hide the
+        // normal single-recipient To block.
+        const toGroup = document.getElementById('compose-to-group');
+        if (toGroup) toGroup.style.display = on ? 'none' : '';
         if (on) {
-            this._setupCcPicker();
-            this._populateCcContactSelect();
-            this._renderCcChips();
+            ['to', 'cc'].forEach(kind => {
+                this._setupRecipientPicker(kind);
+                this._populateRecipientSelect(kind);
+                this._renderRecipientChips(kind);
+            });
         }
     }
 
     // Open the compose view in agreement mode (from the Agreements tab + button).
     async startNewAgreement() {
         this._pendingAgreementCompose = true;
+        this._toRecipients = [];
         this._ccRecipients = [];
         try { await (window.app && window.app.switchTab && window.app.switchTab('compose')); } catch (e) {}
         this.setAgreementMode(true);
         this._pendingAgreementCompose = false;
     }
 
-    // ── Cc viewer picker ────────────────────────────────────────────
-    // Add one viewer at a time, from contacts or by manual email + npub.
-    _setupCcPicker() {
-        if (this._ccPickerWired) return;
-        this._ccPickerWired = true;
-        const sel = document.getElementById('cc-contact-select');
+    // ── Recipient pickers (To signatories, Cc viewers) ──────────────
+    // Add one recipient at a time, from contacts or by manual email + npub.
+    // `kind` is 'to' or 'cc'.
+    _recipientState(kind) {
+        if (kind === 'to') { this._toRecipients = this._toRecipients || []; return this._toRecipients; }
+        this._ccRecipients = this._ccRecipients || [];
+        return this._ccRecipients;
+    }
+
+    _setupRecipientPicker(kind) {
+        this._pickerWired = this._pickerWired || {};
+        if (this._pickerWired[kind]) return;
+        this._pickerWired[kind] = true;
+        const sel = document.getElementById(`${kind}-contact-select`);
         if (sel) {
             sel.addEventListener('change', () => {
                 const pubkey = sel.value;
                 sel.value = '';
                 if (!pubkey) return;
                 const c = (appState.getContacts() || []).find(x => x.pubkey === pubkey);
-                if (c && c.email) this.addCcRecipient(c.email, c.pubkey);
+                if (c && c.email) this.addRecipient(kind, c.email, c.pubkey);
             });
         }
-        const addBtn = document.getElementById('cc-add-manual-btn');
+        const addBtn = document.getElementById(`${kind}-add-manual-btn`);
         if (addBtn) {
             addBtn.addEventListener('click', () => {
-                const em = document.getElementById('cc-manual-email');
-                const pk = document.getElementById('cc-manual-npub');
-                if (this.addCcRecipient(em?.value, pk?.value)) {
+                const em = document.getElementById(`${kind}-manual-email`);
+                const pk = document.getElementById(`${kind}-manual-npub`);
+                if (this.addRecipient(kind, em?.value, pk?.value)) {
                     if (em) em.value = '';
                     if (pk) pk.value = '';
                 }
@@ -2494,8 +2489,8 @@ class EmailService {
         }
     }
 
-    _populateCcContactSelect() {
-        const sel = document.getElementById('cc-contact-select');
+    _populateRecipientSelect(kind) {
+        const sel = document.getElementById(`${kind}-contact-select`);
         if (!sel) return;
         const contacts = (appState.getContacts() || []).filter(c => c.email && c.pubkey);
         sel.innerHTML = '<option value="">Add a contact…</option>' + contacts.map(c =>
@@ -2503,31 +2498,32 @@ class EmailService {
         ).join('');
     }
 
-    addCcRecipient(email, pubkey) {
+    addRecipient(kind, email, pubkey) {
         email = (email || '').trim().toLowerCase();
         pubkey = (pubkey || '').trim();
+        const role = kind === 'to' ? 'signatory' : 'viewer';
         if (!email || !pubkey) {
-            notificationService.showError('A Cc viewer needs both an email and a Nostr pubkey');
+            notificationService.showError(`A ${role} needs both an email and a Nostr pubkey`);
             return false;
         }
         if (!email.includes('@')) {
             notificationService.showError('Invalid email address');
             return false;
         }
-        if (!this._ccRecipients) this._ccRecipients = [];
-        if (this._ccRecipients.some(r => r.email === email)) {
-            notificationService.showWarning('That viewer is already added');
+        const list = this._recipientState(kind);
+        if (list.some(r => r.email === email)) {
+            notificationService.showWarning('That recipient is already added');
             return false;
         }
-        this._ccRecipients.push({ email, pubkey });
-        this._renderCcChips();
+        list.push({ email, pubkey });
+        this._renderRecipientChips(kind);
         return true;
     }
 
-    _renderCcChips() {
-        const el = document.getElementById('cc-recipients-list');
+    _renderRecipientChips(kind) {
+        const el = document.getElementById(`${kind}-recipients-list`);
         if (!el) return;
-        const list = this._ccRecipients || [];
+        const list = this._recipientState(kind);
         el.innerHTML = list.map((r, i) =>
             `<span class="recipient-chip" title="${Utils.escapeHtml(r.pubkey)}">${Utils.escapeHtml(r.email)}<button type="button" class="recipient-chip-remove" data-idx="${i}" aria-label="Remove ${Utils.escapeHtml(r.email)}">×</button></span>`
         ).join('');
@@ -2536,8 +2532,8 @@ class EmailService {
                 e.stopPropagation();
                 const idx = parseInt(btn.dataset.idx, 10);
                 if (!isNaN(idx)) {
-                    this._ccRecipients.splice(idx, 1);
-                    this._renderCcChips();
+                    list.splice(idx, 1);
+                    this._renderRecipientChips(kind);
                 }
             });
         });

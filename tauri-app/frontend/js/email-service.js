@@ -2293,7 +2293,6 @@ class EmailService {
         const subject = domManager.getValue('subject')?.trim() || '';
         const body = domManager.getValue('messageBody')?.trim() || '';
         const toRaw = domManager.getValue('toAddress')?.trim() || '';
-        const ccRaw = document.getElementById('cc-address')?.value?.trim() || '';
 
         if (!subject || !body || !toRaw) {
             notificationService.showError('An agreement needs a subject, a body, and at least one To: signatory');
@@ -2302,9 +2301,8 @@ class EmailService {
 
         const splitEmails = (s) => s.split(/[,;\s]+/).map(e => e.trim().toLowerCase()).filter(Boolean);
         const toEmails = splitEmails(toRaw);
-        const ccEmails = splitEmails(ccRaw);
 
-        // Resolve each email → contact pubkey (case-insensitive). A single To:
+        // Resolve each To: email → contact pubkey (case-insensitive). A single To:
         // recipient may also use the manually-entered pubkey field.
         const contacts = appState.getContacts();
         const manualPubkey = (document.getElementById('recipient-pubkey-value')?.value || '').trim();
@@ -2320,11 +2318,8 @@ class EmailService {
             if (!pk && toEmails.length === 1 && manualPubkey) pk = manualPubkey;
             if (pk) to.push({ email, pubkey: pk }); else unresolved.push(email);
         }
-        const cc = [];
-        for (const email of ccEmails) {
-            const pk = resolve(email);
-            if (pk) cc.push({ email, pubkey: pk }); else unresolved.push(email);
-        }
+        // Cc viewers come from the picker (each already has {email, pubkey}).
+        const cc = (this._ccRecipients || []).map(r => ({ email: r.email, pubkey: r.pubkey }));
         if (unresolved.length > 0) {
             notificationService.showError('No known Nostr key for: ' + unresolved.join(', ') + '. Add them as contacts first.');
             return;
@@ -2373,7 +2368,8 @@ class EmailService {
             domManager.clear('toAddress');
             domManager.clear('subject');
             domManager.clear('messageBody');
-            const ccEl = document.getElementById('cc-address'); if (ccEl) ccEl.value = '';
+            this._ccRecipients = [];
+            this._renderCcChips();
             this.selectedNostrContact = null;
             try { this.clearAttachments(); } catch (e) {}
             try { this.clearCurrentDraft(); } catch (e) {}
@@ -2454,14 +2450,97 @@ class EmailService {
         if (banner) banner.style.display = on ? 'flex' : 'none';
         const title = document.getElementById('compose-title');
         if (title) title.textContent = on ? 'Create Agreement' : 'Compose Email';
+        if (on) {
+            this._setupCcPicker();
+            this._populateCcContactSelect();
+            this._renderCcChips();
+        }
     }
 
     // Open the compose view in agreement mode (from the Agreements tab + button).
     async startNewAgreement() {
         this._pendingAgreementCompose = true;
+        this._ccRecipients = [];
         try { await (window.app && window.app.switchTab && window.app.switchTab('compose')); } catch (e) {}
         this.setAgreementMode(true);
         this._pendingAgreementCompose = false;
+    }
+
+    // ── Cc viewer picker ────────────────────────────────────────────
+    // Add one viewer at a time, from contacts or by manual email + npub.
+    _setupCcPicker() {
+        if (this._ccPickerWired) return;
+        this._ccPickerWired = true;
+        const sel = document.getElementById('cc-contact-select');
+        if (sel) {
+            sel.addEventListener('change', () => {
+                const pubkey = sel.value;
+                sel.value = '';
+                if (!pubkey) return;
+                const c = (appState.getContacts() || []).find(x => x.pubkey === pubkey);
+                if (c && c.email) this.addCcRecipient(c.email, c.pubkey);
+            });
+        }
+        const addBtn = document.getElementById('cc-add-manual-btn');
+        if (addBtn) {
+            addBtn.addEventListener('click', () => {
+                const em = document.getElementById('cc-manual-email');
+                const pk = document.getElementById('cc-manual-npub');
+                if (this.addCcRecipient(em?.value, pk?.value)) {
+                    if (em) em.value = '';
+                    if (pk) pk.value = '';
+                }
+            });
+        }
+    }
+
+    _populateCcContactSelect() {
+        const sel = document.getElementById('cc-contact-select');
+        if (!sel) return;
+        const contacts = (appState.getContacts() || []).filter(c => c.email && c.pubkey);
+        sel.innerHTML = '<option value="">Add a contact…</option>' + contacts.map(c =>
+            `<option value="${Utils.escapeHtml(c.pubkey)}">${Utils.escapeHtml(c.name || c.email)} — ${Utils.escapeHtml(c.email)}</option>`
+        ).join('');
+    }
+
+    addCcRecipient(email, pubkey) {
+        email = (email || '').trim().toLowerCase();
+        pubkey = (pubkey || '').trim();
+        if (!email || !pubkey) {
+            notificationService.showError('A Cc viewer needs both an email and a Nostr pubkey');
+            return false;
+        }
+        if (!email.includes('@')) {
+            notificationService.showError('Invalid email address');
+            return false;
+        }
+        if (!this._ccRecipients) this._ccRecipients = [];
+        if (this._ccRecipients.some(r => r.email === email)) {
+            notificationService.showWarning('That viewer is already added');
+            return false;
+        }
+        this._ccRecipients.push({ email, pubkey });
+        this._renderCcChips();
+        return true;
+    }
+
+    _renderCcChips() {
+        const el = document.getElementById('cc-recipients-list');
+        if (!el) return;
+        const list = this._ccRecipients || [];
+        el.innerHTML = list.map((r, i) =>
+            `<span class="recipient-chip" title="${Utils.escapeHtml(r.pubkey)}">${Utils.escapeHtml(r.email)}<button type="button" class="recipient-chip-remove" data-idx="${i}" aria-label="Remove ${Utils.escapeHtml(r.email)}">×</button></span>`
+        ).join('');
+        el.querySelectorAll('.recipient-chip-remove').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const idx = parseInt(btn.dataset.idx, 10);
+                if (!isNaN(idx)) {
+                    this._ccRecipients.splice(idx, 1);
+                    this._renderCcChips();
+                }
+            });
+        });
     }
 
     // Render the "M of N signed" agreement status banner at the top of the email

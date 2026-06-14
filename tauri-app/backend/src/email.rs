@@ -689,9 +689,12 @@ pub fn compose_agreement(
         let armor = crate::agreement::encode_hybrid_agreement_with_cek(
             &cek, private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents,
         ).map_err(|e| e.to_string())?;
-        let enc_subject = crate::crypto::aes_gcm_encrypt_raw(&cek, subject.as_bytes())
-            .map(|ct| general_purpose::STANDARD.encode(ct))
+        // Glossia-encode the subject ciphertext too, so the Subject header looks
+        // like prose and survives header folding (not an opaque base64 blob).
+        let subject_ct = crate::crypto::aes_gcm_encrypt_raw(&cek, subject.as_bytes())
             .map_err(|e| format!("subject encrypt failed: {}", e))?;
+        let (enc_subject, _) = glossia_encode_bytes(&subject_ct)
+            .ok_or_else(|| "subject glossia encode failed".to_string())?;
         Ok(crate::types::ComposedAgreement { armor, subject: enc_subject })
     } else {
         let armor = encode_signed_agreement(
@@ -731,9 +734,12 @@ fn decrypt_subject_envelope(
         Ok(c) => c,
         Err(_) => return (subject.to_string(), None),
     };
-    let ct = match general_purpose::STANDARD.decode(subject.trim()) {
-        Ok(b) => b,
-        Err(_) => return (subject.to_string(), None), // not base64 ⇒ cleartext
+    // The subject ciphertext is glossia-encoded (or base64); decode_armor_section
+    // handles both. A cleartext subject won't decode to valid ciphertext, so AES
+    // fails and we fall back to it unchanged.
+    let ct = match decode_armor_section(subject.trim()) {
+        Some(b) => b,
+        None => return (subject.to_string(), None),
     };
     match crate::crypto::aes_gcm_decrypt_raw(&cek, &ct) {
         Ok(pt) => (String::from_utf8_lossy(&pt).into_owned(), Some(subject.to_string())),
@@ -4050,11 +4056,13 @@ pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
     body.as_bytes().to_vec()
 }
 
-/// Glossia-encode plaintext for a `SIGNED BODY` (spec §3.2): returns the encoded
-/// words and the canonical decoded bytes the signature is computed over (§4).
-/// Uses the english/bip39 body dialect, matching the rest of the decode path.
-fn glossia_encode_signed_body(text: &str) -> Option<(String, Vec<u8>)> {
-    let hex_input = glossia::hex_encode(text.as_bytes());
+/// Glossia-encode raw bytes for an armor body: returns the encoded words and the
+/// canonical decoded bytes (what `decode_armor_section` will recover, i.e. the
+/// bytes a signature is computed over). Glossia — not base64 — is used because
+/// its word tokens survive email transport (quote `> ` prefixes, word-wrapping,
+/// reflow) that would corrupt base64 and break signed reply chains (spec §5).
+pub(crate) fn glossia_encode_bytes(data: &[u8]) -> Option<(String, Vec<u8>)> {
+    let hex_input = glossia::hex_encode(data);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         glossia::encode_into_language(
             &hex_input, "english", "bip39", "body",
@@ -4067,6 +4075,12 @@ fn glossia_encode_signed_body(text: &str) -> Option<(String, Vec<u8>)> {
     };
     let canonical = try_glossia_decode_to_bytes(&encoded)?;
     Some((encoded, canonical))
+}
+
+/// Glossia-encode plaintext for a `SIGNED BODY` (spec §3.2): returns the encoded
+/// words and the canonical decoded bytes the signature is computed over (§4).
+fn glossia_encode_signed_body(text: &str) -> Option<(String, Vec<u8>)> {
+    glossia_encode_bytes(text.as_bytes())
 }
 
 /// Compose a **plaintext (public) agreement** — the unencrypted counterpart to
@@ -6223,6 +6237,26 @@ nitela\n\
         let err = compose_agreement(
             &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_glossia_body_survives_quote_prefix_and_wrap() {
+        // The reason agreements use glossia, not base64: a glossia-encoded body
+        // must decode to identical bytes after an email client quote-prefixes
+        // ("> ") and re-wraps it — base64 would be corrupted by the "> ".
+        let ciphertext: Vec<u8> = (0u8..64).collect();
+        let (encoded, canonical) = glossia_encode_bytes(&ciphertext).unwrap();
+        assert_eq!(canonical, ciphertext, "glossia round-trips the bytes");
+
+        let words: Vec<&str> = encoded.split_whitespace().collect();
+        let mangled: String = words
+            .chunks(6)
+            .map(|w| format!("> {}", w.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let recovered = decode_armor_section(&mangled)
+            .expect("decode quote-prefixed, re-wrapped glossia body");
+        assert_eq!(recovered, ciphertext, "glossia body survives quoting + wrapping");
     }
 
     // =============================================

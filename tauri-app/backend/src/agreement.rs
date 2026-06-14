@@ -20,7 +20,6 @@
 //! armor message. Wiring into the recursive armor *parser* lives in `email.rs`.
 
 use anyhow::Result;
-use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -401,10 +400,9 @@ pub struct AgreementRecipientInput {
 /// `sender_email` to do the same for the `self` stanza. Returns the armored
 /// `text/plain` payload.
 ///
-/// This composes the *cryptographic* envelope; glossia prose encoding of the
-/// body/signature (Section 5) is applied by the caller's send pipeline if
-/// desired — here the body is emitted as base64 and the signature/pubkey as hex,
-/// both of which decoders accept.
+/// The body ciphertext is glossia-encoded (Section 5) so it survives email
+/// transport — quote prefixes, word-wrap, reflow — intact; base64 would corrupt
+/// under quoting and break signed reply chains. The signature/pubkey are hex.
 pub fn encode_hybrid_agreement(
     sender_priv: &str,
     sender_pub: &str,
@@ -442,9 +440,12 @@ pub fn encode_hybrid_agreement_with_cek(
     let sender_pub_hex = normalize_pubkey_hex(sender_pub)
         .ok_or_else(|| anyhow::anyhow!("invalid sender pubkey"))?;
 
-    // 1–2. Encrypt the body once under the CEK (Section 10.1 steps 1–2).
+    // 1–2. Encrypt the body once under the CEK (Section 10.1 steps 1–2), then
+    // glossia-encode the ciphertext so it survives email transport (quote
+    // prefixes / word-wrap) intact — base64 would break signed reply chains (§5).
     let ciphertext = crate::crypto::aes_gcm_encrypt_raw(cek, body_plaintext)?;
-    let body_b64 = general_purpose::STANDARD.encode(&ciphertext);
+    let (body_encoded, body_decoded_bytes) = crate::email::glossia_encode_bytes(&ciphertext)
+        .ok_or_else(|| anyhow::anyhow!("glossia encode of agreement body failed"))?;
 
     // 3. Wrap the CEK to each recipient, then to self (Section 10.1 step 3, 10.4).
     let mut recipients: Vec<Recipient> = Vec::with_capacity(recipients_in.len() + 1);
@@ -470,9 +471,9 @@ pub fn encode_hybrid_agreement_with_cek(
     let recipients_body = serialize_recipients(&recipients);
     let canon_recipients = canonicalize_block(&recipients_body);
 
-    // The signed body bytes are the decoded armor body = the ciphertext bytes
-    // (decode_armor_section base64-decodes the emitted body), matching §4/§4.2.
-    let body_decoded = &ciphertext;
+    // The signed body bytes are the canonical decoded armor body — what
+    // decode_armor_section recovers (glossia-decoded), matching §4/§4.2.
+    let body_decoded = &body_decoded_bytes;
 
     // 4. Optional originator CONSENT over H (Sections 11.2, 11.3.1).
     let (consent_body, canon_consent) = if originator_consents {
@@ -499,7 +500,7 @@ pub fn encode_hybrid_agreement_with_cek(
     // NIP-44 (spec Sections 8, 10.5).
     let mut out = String::new();
     out.push_str("----- BEGIN NOSTR ENCRYPTED BODY -----\n");
-    out.push_str(&body_b64);
+    out.push_str(&body_encoded);
     out.push('\n');
     out.push_str("----- BEGIN NOSTR RECIPIENTS -----\n");
     out.push_str(&recipients_body);
@@ -779,15 +780,15 @@ mod tests {
     /// Recover the body from an encoded message as a given reader (by unwrapping
     /// the matching RECIPIENTS stanza and AES-GCM-decrypting). Returns the bytes.
     fn reader_recovers_body(armor: &str, reader_priv: &str, reader_pub_hex: &str, sender_pub_hex: &str) -> Vec<u8> {
-        // Extract the base64 body (line after the ENCRYPTED BODY BEGIN).
-        let body_b64 = armor
+        // Extract the (glossia-encoded) body region and decode it to ciphertext.
+        let body_region: String = armor
             .lines()
             .skip_while(|l| !l.contains("BEGIN NOSTR ENCRYPTED BODY"))
-            .nth(1)
-            .expect("body line")
-            .trim()
-            .to_string();
-        let ciphertext = general_purpose::STANDARD.decode(body_b64).expect("b64 body");
+            .skip(1)
+            .take_while(|l| !l.contains("BEGIN NOSTR") && !l.contains("END NOSTR"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ciphertext = crate::email::decode_armor_section(&body_region).expect("decode body");
 
         // Extract the RECIPIENTS block body.
         let recip_body: String = armor
@@ -877,10 +878,12 @@ mod tests {
         let consent = parse_consent_block(&consent_body).expect("consent parses");
         assert_eq!(normalize_pubkey_hex(&consent.signer).unwrap(), sender_pub_hex);
 
-        // The consent's H must equal SHA-256(ciphertext || canonical(recipients)).
-        let body_b64 = armor.lines()
-            .skip_while(|l| !l.contains("BEGIN NOSTR ENCRYPTED BODY")).nth(1).unwrap().trim();
-        let ciphertext = general_purpose::STANDARD.decode(body_b64).unwrap();
+        // The consent's H must equal SHA-256(decode(body) || canonical(recipients)).
+        let body_region: String = armor.lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR ENCRYPTED BODY")).skip(1)
+            .take_while(|l| !l.contains("BEGIN NOSTR") && !l.contains("END NOSTR"))
+            .collect::<Vec<_>>().join("\n");
+        let ciphertext = crate::email::decode_armor_section(&body_region).unwrap();
         let recip_body: String = armor.lines()
             .skip_while(|l| !l.contains("BEGIN NOSTR RECIPIENTS")).skip(1)
             .take_while(|l| !l.contains("BEGIN NOSTR")).collect::<Vec<_>>().join("\n");

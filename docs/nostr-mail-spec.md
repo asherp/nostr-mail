@@ -206,7 +206,7 @@ When a message has more than one cryptographic recipient — for example multipl
 
 ```
 ----- BEGIN NOSTR ENCRYPTED BODY -----
-<AES-256-GCM ciphertext under CEK, base64 or glossia-encoded>
+<AES-256-GCM ciphertext under CEK, glossia-encoded (see note below)>
 ----- BEGIN NOSTR RECIPIENTS -----
 signer <pubkey-1> <NIP-44-wrapped CEK>
 signer <pubkey-2> <NIP-44-wrapped CEK>
@@ -219,7 +219,9 @@ self   <sender-pubkey> <NIP-44-wrapped CEK>
 ----- END NOSTR MESSAGE -----
 ```
 
-Each RECIPIENTS entry is a single line of three space-separated tokens: `<role> <pubkey> <wrapped-cek>` (see Section 10.2). The sender's own `self` stanza makes the Sent copy decryptable on any device, mirroring the "wrap twice" behavior of NIP-17 DMs.
+**Body encoding — glossia, not base64.** The body ciphertext MUST be glossia-encoded (Section 5), not base64. This is not merely steganographic: an agreement is a signed reply chain, and when a counterparty's email client quotes the prior message it prefixes lines with `> ` and re-wraps them. base64 is corrupted by those mutations, so the decoded bytes — and therefore every nested signature over them — would change and fail to verify. Glossia's word tokens survive quoting, wrapping, and reflow (decoders ignore `> ` and non-payload whitespace, Section 3.5.4), so the canonical decoded bytes are recovered intact. This is why email-native document signing cannot use base64 for the signed payload. (Large bodies/attachments still ride the base64 manifest path, which is not part of the signed reply chain.)
+
+Each RECIPIENTS entry is a single line of three or four space-separated tokens: `<role> <pubkey> [<wrapped-cek>] [<email>]` (see Section 10.2). The sender's own `self` stanza makes the Sent copy decryptable on any device, mirroring the "wrap twice" behavior of NIP-17 DMs.
 
 A multi-recipient message SHOULD be signed; the SIGNATURE then covers both the body and the recipients block (Section 4.2), making the membership and role set tamper-evident. An unsigned multi-recipient message MAY instead carry a SEAL block to supply the sender's pubkey for CEK unwrapping, but in that case the role set is unauthenticated and MUST NOT be relied upon to designate required signatories.
 
@@ -650,7 +652,7 @@ The role is a **workflow** attribute, not an access attribute — every role can
 An agreement is initiated as a signed multi-recipient message:
 
 - **Body**: the agreement cover text / terms, in a signed `ENCRYPTED BODY` (the envelope is signalled by the RECIPIENTS block, not a keyword) — or, for a **plaintext (public) agreement**, a signed `SIGNED BODY` with the terms in the clear (Section 11.8).
-- **Subject**: for an encrypted agreement the `Subject:` header is AES-256-GCM-encrypted under the **same CEK** as the body (base64), so it is readable by exactly the recipients and never leaks in cleartext; a reader recovers it by unwrapping the CEK from their RECIPIENTS stanza. For a plaintext (public) agreement the subject is sent in the clear. The subject is metadata and is **not** covered by the signature or `H` (GCM provides its own integrity), matching the body/subject split of Section 5.
+- **Subject**: for an encrypted agreement the `Subject:` header is AES-256-GCM-encrypted under the **same CEK** as the body and **glossia-encoded** (so it reads as prose and survives header folding), so it is readable by exactly the recipients and never leaks in cleartext; a reader recovers it by unwrapping the CEK from their RECIPIENTS stanza. For a plaintext (public) agreement the subject is sent in the clear. The subject is metadata and is **not** covered by the signature or `H` (GCM provides its own integrity), matching the body/subject split of Section 5.
 - **Attachment(s)**: the contract document(s), encrypted under the same CEK (existing hybrid-attachment path).
 - **RECIPIENTS**: a `signer` stanza for each required signatory, a `viewer` stanza for each viewer, and the `self` stanza.
 - **CONSENT** (optional): if the originator is themselves a required signatory, they include their own CONSENT block (Section 11.3) declaring consent. The originator's `self` stanza handles only decryption access and is never counted as a consent (Section 10.3) — an originator who signs MUST do so via a CONSENT block.

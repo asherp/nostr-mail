@@ -2317,6 +2317,7 @@ class EmailService {
 
         const encrypted = (document.getElementById('agreement-visibility')?.value || 'encrypted') !== 'public';
         const originatorConsents = !!document.getElementById('agreement-consent')?.checked;
+        const encryptSubject = document.getElementById('agreement-encrypt-subject')?.checked !== false;
 
         let useTls = settings.use_tls;
         if (settings.smtp_host === 'smtp.gmail.com' && !useTls) useTls = true;
@@ -2342,7 +2343,7 @@ class EmailService {
             domManager.disable('sendBtn');
             domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
             await TauriService.sendAgreement(
-                emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, true,
+                emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, true, encryptSubject,
                 profileName, messageId, this._replyToMessageId, this._replyReferences,
                 includePubkeyHeader, includeSigHeader, glossiaEncoding, null
             );
@@ -2449,9 +2450,10 @@ class EmailService {
                 let profileName = '';
                 try { profileName = window.profileManager?.getAccountDisplayName(appState.getKeypair()?.public_key) || ''; } catch (e) {}
                 const glossiaEncoding = settings.glossia_encoding_body || null;
+                const encryptSubject = document.getElementById('compose-encrypt-subject')?.checked !== false;
                 await TauriService.sendAgreement(
                     emailConfig, subject, body, to, cc, ccPlain, /* encrypted */ true,
-                    /* originatorConsents */ false, /* isAgreement */ false,
+                    /* originatorConsents */ false, /* isAgreement */ false, encryptSubject,
                     profileName, messageId, this._replyToMessageId, this._replyReferences,
                     includePubkeyHeader, includeSigHeader, glossiaEncoding, null
                 );

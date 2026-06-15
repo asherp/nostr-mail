@@ -159,6 +159,10 @@
                             </div>
                             <div id="composeCc-recipients-list" class="recipient-chips"></div>
                         </div>
+                        <label class="agreement-consent-label" style="margin-top:0.5em;">
+                            <input type="checkbox" id="compose-encrypt-subject" checked>
+                            Encrypt the subject (uncheck so a keyless Cc can see it)
+                        </label>
                         <p class="agreement-hint">When the message is encrypted, the To recipient must have a Nostr key; a Cc without a key still receives it but can't decrypt (it can still verify the signature). When sent in plaintext, no keys are needed.</p>
                     </div>
 
@@ -216,6 +220,10 @@
                                     <option value="public">Public — anyone can read &amp; verify</option>
                                 </select>
                             </div>
+                            <label class="agreement-consent-label">
+                                <input type="checkbox" id="agreement-encrypt-subject" checked>
+                                Encrypt the subject (uncheck so keyless Cc / witnesses can see what they're validating)
+                            </label>
                             <label class="agreement-consent-label">
                                 <input type="checkbox" id="agreement-consent" checked>
                                 I am a signatory and consent to this document

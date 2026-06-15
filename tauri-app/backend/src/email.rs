@@ -3262,93 +3262,27 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
 
 // ── Decrypt pipeline ─────────────────────────────────────────────────
 
-/// JSON manifest structs for legacy email format (serde deserialization).
-#[derive(Debug, serde::Deserialize)]
-struct JsonManifest {
-    body: Option<JsonEncryptedBlob>,
-    attachments: Option<Vec<JsonAttachment>>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct JsonEncryptedBlob {
-    ciphertext: String,
-    #[allow(dead_code)]
-    cipher_sha256: Option<String>,
-    #[allow(dead_code)]
-    cipher_size: Option<u64>,
-    key_wrap: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct JsonAttachment {
-    id: String,
-    orig_filename: String,
-    orig_mime: String,
-    cipher_sha256: Option<String>,
-    cipher_size: Option<u64>,
-    key_wrap: String,
-}
-
-/// Interpret a freshly decrypted body plaintext (from either the pairwise NIP path
-/// or the CEK-envelope path). If it is a JSON manifest — the multi-attachment
-/// hybrid body (§11.2): a nested AES-encrypted body blob plus per-attachment key
-/// wraps — AES-decrypt the body blob into `block.decrypted_text` and return the
-/// parsed manifest so the caller can surface its attachment entries. Otherwise
-/// treat the plaintext as the body directly (set `decrypted_text`) and return
-/// `None`. The manifest itself is already protected by the outer layer (pairwise
-/// NIP-44 or the per-recipient-wrapped CEK), so its `key_wrap` fields are in the
-/// clear here only after that layer has been opened.
+/// Interpret freshly decrypted body bytes (from either the pairwise NIP path or
+/// the CEK-envelope path). If they are an attachment manifest (capnp or legacy
+/// JSON; §11.2) — a nested AES-encrypted body blob plus per-attachment key wraps
+/// — recover the body into `block.decrypted_text` and return the parsed manifest
+/// so the caller can surface its attachment entries. Otherwise treat the bytes as
+/// the plaintext body directly and return `None`. The manifest is already
+/// protected by the outer layer (pairwise NIP-44 or the per-recipient-wrapped
+/// CEK), so its key wraps are in the clear here only after that layer is opened.
 fn apply_manifest_or_plaintext(
-    decrypted: String,
+    decrypted: Vec<u8>,
     block: &mut crate::types::DecryptedBlock,
-) -> Option<JsonManifest> {
-    let trimmed = decrypted.trim();
-    if trimmed.starts_with('{') {
-        if let Ok(manifest) = serde_json::from_str::<JsonManifest>(trimmed) {
-            if let Some(ref body_blob) = manifest.body {
-                let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.key_wrap) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        block.error = Some(format!("Manifest key_wrap base64 decode failed: {}", e));
-                        return Some(manifest);
-                    }
-                };
-                let ct_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.ciphertext) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        block.error = Some(format!("Manifest ciphertext base64 decode failed: {}", e));
-                        return Some(manifest);
-                    }
-                };
-                match crate::crypto::aes_gcm_decrypt_raw(&key_bytes, &ct_bytes) {
-                    Ok(plaintext_bytes) => {
-                        // The plaintext is base64-encoded UTF-8 body (matching JS: atob(aesResult)).
-                        match String::from_utf8(plaintext_bytes) {
-                            Ok(b64_body) => {
-                                match base64::engine::general_purpose::STANDARD.decode(b64_body.trim()) {
-                                    Ok(body_bytes) => match String::from_utf8(body_bytes) {
-                                        Ok(text) => block.decrypted_text = Some(text),
-                                        Err(_) => block.decrypted_text = Some(b64_body),
-                                    },
-                                    // Not base64 — the plaintext IS the body.
-                                    Err(_) => block.decrypted_text = Some(b64_body),
-                                }
-                            }
-                            Err(_) => {
-                                block.error = Some("Manifest body AES plaintext is not UTF-8".to_string());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        block.error = Some(format!("Manifest AES decrypt failed: {}", e));
-                    }
-                }
-                return Some(manifest);
-            }
+) -> Option<crate::manifest::ParsedManifest> {
+    if let Some(manifest) = crate::manifest::parse_manifest(&decrypted) {
+        match manifest.body_text {
+            Some(ref text) => block.decrypted_text = Some(text.clone()),
+            None => block.error = Some("Manifest body decrypt failed".to_string()),
         }
+        return Some(manifest);
     }
-    // Legacy / plain format: the decrypted content is the body text directly.
-    block.decrypted_text = Some(decrypted);
+    // Plain body: the decrypted content is the body text directly.
+    block.decrypted_text = Some(String::from_utf8_lossy(&decrypted).into_owned());
     None
 }
 
@@ -3421,7 +3355,7 @@ fn decrypt_single_block(
     // if present. The CEK is unwrapped against this key; `None` falls back to the
     // sender's identity key (legacy envelopes without an `ephemeral` line).
     ephemeral_pubkey: Option<&str>,
-) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
+) -> (crate::types::DecryptedBlock, Option<crate::manifest::ParsedManifest>) {
     debug_log!("[RUST] decrypt_single_block: type={} nip={:?} sig_pk={:?} seal_pk={:?} fallback={:?} body_preview={:?}",
         body_type, encryption_nip, sig_pubkey_hex.map(|s| &s[..s.len().min(16)]),
         seal_pubkey_hex.map(|s| &s[..s.len().min(16)]),
@@ -3516,11 +3450,11 @@ fn decrypt_single_block(
         match crate::crypto::aes_gcm_decrypt_raw(&cek, &ciphertext) {
             Ok(pt) => {
                 debug_log!("[RUST] decrypt_single_block: envelope decrypt SUCCESS, {} bytes", pt.len());
-                // The body plaintext may be a JSON attachment manifest (§11.2),
+                // The body plaintext may be an attachment manifest (§11.2),
                 // protected here by the per-recipient-wrapped CEK rather than
-                // pairwise NIP-44 — handle it the same way (shared helper).
-                let decrypted = String::from_utf8_lossy(&pt).into_owned();
-                let manifest = apply_manifest_or_plaintext(decrypted, &mut block);
+                // pairwise NIP-44 — handle it the same way (shared helper). Pass
+                // raw bytes: a capnp manifest is binary, not UTF-8.
+                let manifest = apply_manifest_or_plaintext(pt, &mut block);
                 return (block, manifest);
             }
             Err(e) => {
@@ -3590,7 +3524,9 @@ fn decrypt_single_block(
         nip, glossia_ms, ciphertext_len, nip_decrypt_ms, decrypted.len());
 
     // Step 4: Detect manifest vs legacy (shared with the CEK-envelope path).
-    let manifest = apply_manifest_or_plaintext(decrypted, &mut block);
+    // NIP-44 yields a UTF-8 string; a capnp manifest arrives base64-armored
+    // (text-safe), so bytes round-trip cleanly here.
+    let manifest = apply_manifest_or_plaintext(decrypted.into_bytes(), &mut block);
     (block, manifest)
 }
 
@@ -3609,7 +3545,7 @@ fn decrypt_armor_tree(
     // message is rejected before decryption (the signature is NIP-04's only MAC).
     require_signature: bool,
     depth: usize,
-) -> (Vec<crate::types::DecryptedBlock>, Option<JsonManifest>) {
+) -> (Vec<crate::types::DecryptedBlock>, Option<crate::manifest::ParsedManifest>) {
     let perf_level = std::time::Instant::now();
     let mut results = Vec::new();
     let mut outer_manifest = None;
@@ -3909,18 +3845,16 @@ pub fn decrypt_email_body_pipeline(
     let success = outer_block.map(|b| b.decrypted_text.is_some()).unwrap_or(false);
     let error = if success { None } else { outer_block.and_then(|b| b.error.clone()) };
 
-    // Extract attachment metadata from manifest
+    // Extract attachment metadata from manifest (raw bytes → UI-facing base64/hex)
     let (is_manifest, attachments) = if let Some(ref m) = manifest {
-        let atts = m.attachments.as_ref().map(|att_list| {
-            att_list.iter().map(|a| crate::types::ManifestAttachmentInfo {
-                id: a.id.clone(),
-                orig_filename: a.orig_filename.clone(),
-                orig_mime: a.orig_mime.clone(),
-                key_wrap_b64: a.key_wrap.clone(),
-                cipher_sha256_hex: a.cipher_sha256.clone(),
-                cipher_size: a.cipher_size.unwrap_or(0),
-            }).collect()
-        }).unwrap_or_default();
+        let atts = m.attachments.iter().map(|a| crate::types::ManifestAttachmentInfo {
+            id: a.id.clone(),
+            orig_filename: a.orig_filename.clone(),
+            orig_mime: a.orig_mime.clone(),
+            key_wrap_b64: a.key_wrap_b64(),
+            cipher_sha256_hex: Some(a.cipher_sha256_hex()),
+            cipher_size: a.cipher_size,
+        }).collect();
         (true, atts)
     } else {
         (false, Vec::new())
@@ -6929,13 +6863,14 @@ nitela\n\
     }
 
     #[test]
-    fn test_json_manifest_parse() {
-        let json = r#"{"body":{"ciphertext":"dGVzdA==","cipher_sha256":"abc123","key_wrap":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},"attachments":[{"id":"a1","orig_filename":"test.pdf","orig_mime":"application/pdf","cipher_sha256":"def456","cipher_size":65536,"key_wrap":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}]}"#;
-        let manifest: JsonManifest = serde_json::from_str(json).unwrap();
-        assert!(manifest.body.is_some());
-        assert_eq!(manifest.attachments.as_ref().unwrap().len(), 1);
-        assert_eq!(manifest.attachments.as_ref().unwrap()[0].id, "a1");
-        assert_eq!(manifest.attachments.as_ref().unwrap()[0].orig_filename, "test.pdf");
+    fn test_legacy_json_manifest_parse() {
+        // A legacy JSON manifest is still readable (the body blob here isn't a
+        // real GCM ciphertext, so body_text stays None; attachments still parse).
+        let json = r#"{"body":{"ciphertext":"dGVzdA==","cipher_sha256":"abc123","key_wrap":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},"attachments":[{"id":"a1","orig_filename":"test.pdf","orig_mime":"application/pdf","cipher_sha256":"def456","cipher_size":65536,"key_wrap":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}]}"#;
+        let manifest = crate::manifest::parse_manifest(json.as_bytes()).expect("legacy JSON manifest parses");
+        assert_eq!(manifest.attachments.len(), 1);
+        assert_eq!(manifest.attachments[0].id, "a1");
+        assert_eq!(manifest.attachments[0].orig_filename, "test.pdf");
     }
 }
 

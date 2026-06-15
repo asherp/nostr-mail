@@ -297,7 +297,7 @@ const TauriService = {
     },
     // `ccPlain` are keyless Cc emails (header-only, can't decrypt). `isAgreement`
     // false → plain multi-recipient encrypted mail (viewer roles, no marker).
-    sendAgreement: async function(emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, isAgreement, encryptSubject, sign, profileName = null, messageId = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, glossiaEncoding = null, subjectEncoding = null) {
+    sendAgreement: async function(emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, isAgreement, encryptSubject, sign, profileName = null, messageId = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, glossiaEncoding = null, subjectEncoding = null, attachments = null) {
         const args = { emailConfig, subject, body, to, cc, encrypted, originatorConsents };
         if (ccPlain != null) args.ccPlain = ccPlain;
         if (isAgreement != null) args.isAgreement = isAgreement;
@@ -311,6 +311,7 @@ const TauriService = {
         if (includeSigHeader != null) args.includeSigHeader = includeSigHeader;
         if (glossiaEncoding != null) args.glossiaEncoding = glossiaEncoding;
         if (subjectEncoding != null) args.subjectEncoding = subjectEncoding;
+        if (attachments != null) args.attachments = attachments;
         return await this.invoke('send_agreement', args);
     },
     // Completion status ("M of N signed") computed from a message/thread armor.

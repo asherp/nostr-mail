@@ -464,6 +464,29 @@ pub fn unwrap_cek(reader_priv: &str, sender_pub: &str, wrapped_cek: &str) -> Res
     Ok(cek)
 }
 
+/// Size boundary attachments are padded to before encryption, hiding the true
+/// file size (spec §11.2 / capnp schema). Must match the decrypt side.
+pub const PADDING_BOUNDARY: usize = 64 * 1024;
+
+/// AES-256-GCM encrypt with size-prefixed padding (inverse of
+/// [`aes_gcm_decrypt_padded`]). The plaintext is `[4-byte LE original size]
+/// [data][random padding]`, padded so the total is a multiple of
+/// [`PADDING_BOUNDARY`]; the decrypt side recovers the original `data` using the
+/// size header, so the exact padded length is not load-bearing for correctness.
+pub fn aes_gcm_encrypt_padded(key_bytes: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    use ::secp256k1::rand::RngCore;
+    let original_size = data.len();
+    let unpadded = 4 + original_size;
+    let padded_len = unpadded.div_ceil(PADDING_BOUNDARY) * PADDING_BOUNDARY;
+    let mut buf = Vec::with_capacity(padded_len);
+    buf.extend_from_slice(&(original_size as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+    let mut pad = vec![0u8; padded_len - unpadded];
+    ::secp256k1::rand::rngs::OsRng.fill_bytes(&mut pad);
+    buf.extend_from_slice(&pad);
+    aes_gcm_encrypt_raw(key_bytes, &buf)
+}
+
 /// AES-256-GCM decrypt + remove padding.
 /// After decryption, first 4 bytes are original size (little-endian u32),
 /// followed by the original data padded to 64 KiB boundaries.

@@ -6,6 +6,7 @@
 
 pub mod crypto;
 pub mod agreement;
+pub mod manifest;
 pub mod email;
 pub mod imap_pool;
 pub mod imap_idle;

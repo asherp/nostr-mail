@@ -22,10 +22,12 @@ All Nostr-Mail content is enclosed in ASCII armor blocks using `-----` delimiter
 | `BEGIN NOSTR ENCRYPTED BODY` | Multi-recipient encrypted content | AES-256-GCM ciphertext under a per-message Content Encryption Key (CEK). Identified as the envelope (CEK) path by the accompanying RECIPIENTS block — there is no distinct keyword |
 | `BEGIN NOSTR RECIPIENTS` | Recipient key-wrap + roles | A per-message `ephemeral` pubkey header, then per-recipient NIP-44-wrapped CEK (sealed via the ephemeral key), pubkey, and role |
 | `BEGIN NOSTR CONSENT` | Explicit consent marker | A signatory's binding consent to a specific agreement (document hash + signer pubkey); see Section 11.3 |
+| `BEGIN NOSTR ATTACHMENTS` | Signed attachment hashes | Public messages only: one line per plaintext attachment (`id`, SHA-256, size, MIME, filename), bound by the signature; see Section 11.2 |
 | `END NOSTR MESSAGE` | Closing tag | Terminates the outermost block |
 | `END NOSTR SEAL` | Closing tag | Terminates standalone seal blocks |
 | `END NOSTR RECIPIENTS` | Closing tag | Terminates a standalone recipients block |
 | `END NOSTR CONSENT` | Closing tag | Terminates a standalone consent block |
+| `END NOSTR ATTACHMENTS` | Closing tag | Terminates a standalone attachments block |
 
 The encryption type is embedded directly in the BEGIN tag (e.g., `BEGIN NOSTR NIP-44 ENCRYPTED BODY`), keeping the format self-describing without metadata lines.
 
@@ -289,15 +291,15 @@ The Schnorr signature over `SHA-256(ciphertext_bytes)` serves as the authenticat
 
 NIP-44 messages are exempt from this requirement because NIP-44 uses ChaCha20 (no padding) with HMAC-SHA256 authentication built in.
 
-### 4.2 Signature Coverage of the Recipients & Consent Blocks
+### 4.2 Signature Coverage of the Recipients, Consent & Attachments Blocks
 
-For multi-recipient messages (Section 3.6), the signature MUST cover the RECIPIENTS block — and, when present, the CONSENT block (Section 11.3) — in addition to the body, so that the membership list, per-recipient roles, and any declared consent cannot be altered without invalidating the signature. The per-level signing contribution becomes:
+For multi-recipient messages (Section 3.6), the signature MUST cover the RECIPIENTS block — and, when present, the CONSENT block (Section 11.3) and the ATTACHMENTS block (Section 11.2) — in addition to the body, so that the membership list, per-recipient roles, any declared consent, and any attached document hashes cannot be altered without invalidating the signature. The per-level signing contribution becomes:
 
 ```
-level(L) = decode(body_L) || canonical(recipients_L) || canonical(consent_L)
+level(L) = decode(body_L) || canonical(recipients_L) || canonical(consent_L) || canonical(attachments_L)
 ```
 
-where `decode(body_L)` is the level's decoded body bytes (as in Section 4); `canonical(recipients_L)` is the **canonicalized recipients block**: the lines between `BEGIN NOSTR RECIPIENTS` and the following delimiter, each stripped of trailing whitespace and any `> ` quote prefix, joined with `\n`, with no trailing newline; and `canonical(consent_L)` is the **canonicalized consent block**, formed by the identical rule over the lines between `BEGIN NOSTR CONSENT` and the following delimiter. The blocks are concatenated in the fixed order **body, then recipients, then consent** (Section 11.3.1). If a level has no RECIPIENTS block, `canonical(recipients_L)` is the empty string; if it has no CONSENT block, `canonical(consent_L)` is the empty string. A level with neither reduces to the Section 4 model.
+where `decode(body_L)` is the level's decoded body bytes (as in Section 4); `canonical(recipients_L)` is the **canonicalized recipients block**: the lines between `BEGIN NOSTR RECIPIENTS` and the following delimiter, each stripped of trailing whitespace and any `> ` quote prefix, joined with `\n`, with no trailing newline; `canonical(consent_L)` is the **canonicalized consent block**, formed by the identical rule over the lines between `BEGIN NOSTR CONSENT` and the following delimiter; and `canonical(attachments_L)` is the **canonicalized attachments block**, formed by the identical rule over the lines between `BEGIN NOSTR ATTACHMENTS` and the following delimiter. The blocks are concatenated in the fixed order **body, then recipients, then consent, then attachments**. If a level lacks any of these blocks, the corresponding canonical string is empty; a level with none reduces to the Section 4 model. (The ATTACHMENTS block is only used by **public** messages — an encrypted message binds its attachments via the in-body manifest instead; Section 11.2.)
 
 The signing target for a level (and its nested levels) is then:
 
@@ -667,7 +669,9 @@ An agreement is initiated as a signed multi-recipient message:
 
 - **Body**: the agreement cover text / terms, in a signed `ENCRYPTED BODY` (the envelope is signalled by the RECIPIENTS block, not a keyword) — or, for a **plaintext (public) agreement**, a signed `SIGNED BODY` with the terms in the clear (Section 11.8).
 - **Subject**: for an encrypted agreement the `Subject:` header is AES-256-GCM-encrypted under the **same CEK** as the body and **glossia-encoded** under the subject's own encoding setting (Section 5; defaults to the body's), so it reads as prose, survives header folding, is readable by exactly the recipients, and never leaks in cleartext; a reader recovers it by unwrapping the CEK from their RECIPIENTS stanza. For a plaintext (public) agreement the subject is sent in the clear. The subject is metadata and is **not** covered by the signature or `H` (GCM provides its own integrity).
-- **Attachment(s)**: the contract document(s). When a message carries attachments, the `ENCRYPTED BODY` is a JSON **manifest** (the existing hybrid-attachment format) rather than the raw body: a nested AES-encrypted body blob plus one entry per attachment carrying that attachment's AES key (`key_wrap`), MIME type, and ciphertext hash (`cipher_sha256`). The manifest is what is AES-256-GCM-encrypted under the CEK and wrapped per-recipient; each attachment's ciphertext rides as an ordinary MIME part (`a1.dat`, `a2.dat`, …). Because the manifest (including every `cipher_sha256`) is inside the signed, `H`-bound body, the attachments are bound to the agreement tamper-evidently even though their bytes travel outside the armor. A message with no attachments encrypts the raw body directly (no manifest).
+- **Attachment(s)**: the contract document(s), bound to the message in one of two ways depending on whether it is encrypted:
+  - *Encrypted message* — when it carries attachments, the `ENCRYPTED BODY` is a **manifest** rather than the raw body: a nested AES-encrypted body blob plus one entry per attachment carrying that attachment's AES key (`keyWrap`), MIME type, and ciphertext hash (`cipherSha256`). The manifest is what is AES-256-GCM-encrypted under the CEK and wrapped per-recipient; each attachment's ciphertext rides as an ordinary MIME part (`a1.dat`, `a2.dat`, …). Because the manifest (including every `cipherSha256`) is inside the signed, `H`-bound body, the attachments are bound tamper-evidently even though their bytes travel outside the armor. A reader recomputes each part's SHA-256 and **rejects** a mismatch. A message with no attachments encrypts the raw body directly (no manifest). The manifest is serialized as **Cap'n Proto** (schema `Manifest`/`EncryptedBlob`/`Attachment`); since the NIP-44 transport is text-typed, the serialized manifest is base64-armored behind a `capnp:` marker. Legacy **JSON** manifests (leading `{`) are still read for old mail.
+  - *Public message* — the body is in the clear, so attachments ride as **plaintext** MIME parts and are bound by a signed `ATTACHMENTS` block listing, per attachment, its `id`, plaintext SHA-256, size, MIME type, and filename. The block is covered by the level signature (Section 4.2), so a swapped/added/removed attachment breaks the signature; a reader verifies each delivered file's SHA-256 against the block.
 - **RECIPIENTS**: a `signer` stanza for each required signatory, a `viewer` stanza for each viewer, and the `self` stanza.
 - **CONSENT** (optional): if the originator is themselves a required signatory, they include their own CONSENT block (Section 11.3) declaring consent. The originator's `self` stanza handles only decryption access and is never counted as a consent (Section 10.3) — an originator who signs MUST do so via a CONSENT block.
 - **SIGNATURE**: the originator's signature, covering body + recipients + any consent (Section 4.2), which fixes the set of required signatories and the exact document bytes.

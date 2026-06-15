@@ -39,16 +39,22 @@ enum NipVersion {
 # Attachments travel as separate MIME parts with opaque filenames
 # (a1.dat, a2.dat, …) and application/octet-stream content type.
 #
-# ── Binary vs JSON detection ──
+# ── Cap'n Proto vs JSON detection ──
 #
-# After NIP decryption, the manifest payload is either:
+# The encrypted body is either a manifest or an ordinary plaintext
+# body. After the outer layer is opened (pairwise NIP-44, or the
+# per-recipient-wrapped CEK), the decrypted payload is:
 #
-#   JSON (legacy)  — first byte is 0x7B ('{')
-#   Cap'n Proto    — first 4 bytes are 0x00000000 (single-segment table)
+#   Cap'n Proto  — "capnp:" prefix, then base64 of the serialized
+#                  single-segment Manifest message
+#   JSON (legacy)— first byte is 0x7B ('{')
+#   plaintext    — anything else (not a manifest)
 #
-# The decoder checks the first byte to select the deserialization path.
-# New messages SHOULD use Cap'n Proto; JSON is retained for reading
-# older emails.
+# The serialized Cap'n Proto bytes are base64-armored behind the
+# "capnp:" marker because the NIP-44 transport (1:1 path) is
+# string-typed and cannot carry raw binary; this also keeps detection
+# unambiguous across both the NIP-44 and CEK transports. New messages
+# use Cap'n Proto; JSON is retained for reading older emails.
 
 struct Manifest {
   body         @0 :EncryptedBlob;

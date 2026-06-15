@@ -580,8 +580,11 @@ pub fn encode_hybrid_agreement_with_cek(
         out.push_str(&sender_pub_hex);
         out.push('\n');
     } else {
-        // Unsigned: SEAL supplies the sender pubkey for CEK unwrapping (§3.6).
-        // The role set is unauthenticated; this MUST NOT be used for agreements.
+        // Unsigned: SEAL carries the sender's *identity* pubkey — the "family
+        // seal"/signet attesting who sent the message, not a key-unwrap input.
+        // The CEK is unwrapped via the RECIPIENTS `ephemeral` pubkey (§10.1), so
+        // SEAL is purely an identity claim here; and being unsigned, its role set
+        // is unauthenticated and MUST NOT be used for agreements (§3.6).
         out.push_str("----- BEGIN NOSTR SEAL -----\n@");
         out.push_str(profile_name);
         out.push('\n');

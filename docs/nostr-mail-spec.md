@@ -224,7 +224,7 @@ self   <sender-pubkey> <CEK wrapped via ephemeral key>
 
 Each RECIPIENTS entry is a single line of three or four space-separated tokens: `<role> <pubkey> [<wrapped-cek>] [<email>]` (see Section 10.2). The sender's own `self` stanza makes the Sent copy decryptable on any device, mirroring the "wrap twice" behavior of NIP-17 DMs.
 
-A multi-recipient message SHOULD be signed; the SIGNATURE then covers both the body and the recipients block (Section 4.2), making the membership and role set tamper-evident. An unsigned multi-recipient message MAY instead carry a SEAL block to supply the sender's pubkey for CEK unwrapping, but in that case the role set is unauthenticated and MUST NOT be relied upon to designate required signatories.
+A multi-recipient message SHOULD be signed; the SIGNATURE then covers both the body and the recipients block (Section 4.2), making the membership and role set tamper-evident. An unsigned multi-recipient message MAY instead carry a SEAL block. The SEAL declares the sender's **identity** pubkey — the "family seal"/signet attesting authorship — not a key-unwrap input: with ephemeral wrapping the CEK is unwrapped via the RECIPIENTS `ephemeral` pubkey (Section 10.1), and the SEAL pubkey is the unwrap counterparty only for legacy envelopes that lack an `ephemeral` line. Being unsigned, the role set is unauthenticated and MUST NOT be relied upon to designate required signatories.
 
 #### 3.6.1 Multi-Recipient Reply
 

@@ -2103,6 +2103,7 @@ async fn compose_agreement(
     profile_name: Option<String>,
     glossia_encoding: Option<String>,
     subject_encoding: Option<String>,
+    attachments: Option<Vec<crate::types::EmailAttachment>>,
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::types::ComposedAgreement, String> {
     email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
@@ -2124,6 +2125,7 @@ async fn compose_agreement(
         sign.unwrap_or(true),
         glossia_encoding.as_deref(),
         subject_encoding.as_deref(),
+        &attachments.unwrap_or_default(),
     )
 }
 

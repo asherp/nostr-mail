@@ -675,7 +675,13 @@ pub fn compose_agreement(
     sign: bool,
     encoding: Option<&str>,
     subject_encoding: Option<&str>,
+    // Plaintext attachments (base64 data). For an encrypted message these are
+    // AES-encrypted into a capnp manifest here (§11.2) and returned as `aN.dat`
+    // MIME parts in the result; for a public message they pass through as
+    // plaintext parts. Empty ⇒ no attachments.
+    attachments: &[crate::types::EmailAttachment],
 ) -> Result<crate::types::ComposedAgreement, String> {
+    use base64::Engine;
     // An agreement is always signed (its signatory set must be authenticated,
     // §3.6); a plain multi-recipient message honors the caller's choice and may
     // be unsigned (SEAL). Consent is separate and only valid when signed.
@@ -706,10 +712,22 @@ pub fn compose_agreement(
     }
 
     if encrypted {
-        // One CEK for the body and the subject.
+        // With attachments, the encrypted body is a capnp manifest (§11.2): the
+        // body + each attachment are AES-encrypted under their own keys, the
+        // manifest holds those keys, and the encrypted attachment bytes ride as
+        // `aN.dat` MIME parts. Without attachments the raw body is encrypted.
+        let (body_payload, parts) = if attachments.is_empty() {
+            (body.to_string(), Vec::new())
+        } else {
+            let inputs = attachment_inputs_from(attachments)?;
+            let (payload, enc_parts) = crate::manifest::build_capnp_manifest(body, &inputs)
+                .map_err(|e| format!("manifest build failed: {}", e))?;
+            (payload, encrypted_parts_to_mime(enc_parts))
+        };
+        // One CEK for the body (manifest) and the subject.
         let cek = crate::crypto::generate_cek();
         let armor = crate::agreement::encode_hybrid_agreement_with_cek(
-            &cek, private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents, sign, encoding,
+            &cek, private_key, sender_pub, sender_email, profile_name, body_payload.as_bytes(), &recips, originator_consents, sign, encoding,
         ).map_err(|e| e.to_string())?;
         // The subject is encrypted under the same CEK by default. The sender may
         // leave it in the clear (`encrypt_subject = false`) so keyless Cc /
@@ -724,14 +742,58 @@ pub fn compose_agreement(
         } else {
             subject.to_string()
         };
-        Ok(crate::types::ComposedAgreement { armor, subject: out_subject })
+        Ok(crate::types::ComposedAgreement { armor, subject: out_subject, attachments: parts })
     } else {
+        // Public agreement: cleartext body. Attachments ride as plaintext MIME
+        // parts; binding them via a signed ATTACHMENTS block is handled next.
         let armor = encode_signed_agreement(
             private_key, sender_pub, profile_name, body, &recips, originator_consents, encoding,
         )?;
         // Public agreement: subject stays in the clear.
-        Ok(crate::types::ComposedAgreement { armor, subject: subject.to_string() })
+        Ok(crate::types::ComposedAgreement { armor, subject: subject.to_string(), attachments: attachments.to_vec() })
     }
+}
+
+/// Decode plaintext [`EmailAttachment`]s (base64 `data`) into manifest inputs.
+fn attachment_inputs_from(
+    attachments: &[crate::types::EmailAttachment],
+) -> Result<Vec<crate::manifest::AttachmentInput>, String> {
+    use base64::Engine;
+    attachments
+        .iter()
+        .map(|a| {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(&a.data)
+                .map_err(|e| format!("attachment {} base64 decode failed: {}", a.filename, e))?;
+            Ok(crate::manifest::AttachmentInput {
+                filename: a.filename.clone(),
+                mime: a.content_type.clone(),
+                data,
+            })
+        })
+        .collect()
+}
+
+/// Convert encrypted manifest parts into `aN.dat` MIME attachments.
+fn encrypted_parts_to_mime(
+    parts: Vec<crate::manifest::EncryptedAttachmentPart>,
+) -> Vec<crate::types::EmailAttachment> {
+    use base64::Engine;
+    parts
+        .into_iter()
+        .map(|p| crate::types::EmailAttachment {
+            filename: p.filename,
+            content_type: "application/octet-stream".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(&p.ciphertext),
+            size: p.ciphertext.len(),
+            is_encrypted: true,
+            encryption_method: Some("manifest_aes".to_string()),
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        })
+        .collect()
 }
 
 /// Decrypt an agreement subject that was AES-256-GCM-encrypted under the message
@@ -802,9 +864,9 @@ pub async fn send_agreement_email(
     include_sig_header: bool,
     encoding: Option<&str>,
     subject_encoding: Option<&str>,
-    // Already-encrypted attachment parts (§11.2). Each rides as a MIME part; its
-    // AES key and metadata live inside the CEK-encrypted manifest that is the
-    // armored body. `None`/empty ⇒ a single-part text message as before.
+    // Plaintext attachments (§11.2). compose_agreement AES-encrypts them into the
+    // manifest (encrypted message) or passes them through (public), returning the
+    // MIME parts to send. `None`/empty ⇒ a single-part text message.
     attachments: Option<&Vec<EmailAttachment>>,
 ) -> Result<String> {
     let private_key = config.private_key.as_deref()
@@ -812,10 +874,15 @@ pub async fn send_agreement_email(
     let sender_pub = crypto::get_public_key_from_private(private_key)
         .map_err(|e| anyhow::anyhow!("could not derive sender pubkey: {}", e))?;
 
+    let empty_atts = Vec::new();
     let composed = compose_agreement(
         private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents, is_agreement, encrypt_subject, sign, encoding, subject_encoding,
+        attachments.unwrap_or(&empty_atts),
     ).map_err(|e| anyhow::anyhow!("{}", e))?;
     let armor = composed.armor;
+    // compose_agreement returns the MIME parts to attach (encrypted aN.dat for an
+    // encrypted message, or plaintext parts for a public one).
+    let out_attachments = composed.attachments;
 
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
@@ -861,17 +928,16 @@ pub async fn send_agreement_email(
         }
     }
 
-    // Single-part unless there are (already-encrypted) attachments, in which case
-    // build multipart/mixed: the armored body as the text part, then each
-    // attachment part — mirroring `send_email` (§11.2).
-    let has_attachments = attachments.map(|a| !a.is_empty()).unwrap_or(false);
-    let email = if has_attachments {
-        let attachments = attachments.unwrap();
-        debug_log!("[RUST] send_agreement_email: building multipart with {} attachments", attachments.len());
+    // Single-part unless there are attachment parts (encrypted aN.dat or public
+    // plaintext, produced by compose_agreement), in which case build
+    // multipart/mixed: the armored body as the text part, then each attachment
+    // part — mirroring `send_email` (§11.2).
+    let email = if !out_attachments.is_empty() {
+        debug_log!("[RUST] send_agreement_email: building multipart with {} attachments", out_attachments.len());
         let mut multipart = MultiPart::mixed().singlepart(
             SinglePart::builder().header(ContentType::TEXT_PLAIN).body(armor),
         );
-        for attachment in attachments {
+        for attachment in &out_attachments {
             let attachment_data = match general_purpose::STANDARD.decode(&attachment.data) {
                 Ok(data) => data,
                 Err(e) => {
@@ -6252,6 +6318,60 @@ nitela\n\
     // =============================================
 
     #[test]
+    fn test_compose_agreement_encrypted_with_capnp_manifest_attachment() {
+        use crate::types::{AgreementParty, EmailAttachment};
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // To
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let file_bytes = b"%PDF-1.7 the actual contract";
+        let attachments = vec![EmailAttachment {
+            filename: "contract.pdf".into(),
+            content_type: "application/pdf".into(),
+            data: b64.encode(file_bytes),
+            size: file_bytes.len(),
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        }];
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
+            "NDA", "Please sign the attached.", &to, &[], true, true, true, true, true, None, None, &attachments,
+        ).unwrap();
+
+        // The body is now a capnp manifest under the CEK; one encrypted MIME part.
+        assert_eq!(composed.attachments.len(), 1);
+        assert_eq!(composed.attachments[0].filename, "a1.dat");
+        assert_eq!(composed.attachments[0].encryption_method.as_deref(), Some("manifest_aes"));
+
+        // Bob recovers the body + attachment metadata from the manifest…
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &composed.armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "decrypt failed: {:?}", r.error);
+        assert!(r.is_manifest);
+        assert_eq!(r.body, "Please sign the attached.");
+        assert_eq!(r.attachments.len(), 1);
+        assert_eq!(r.attachments[0].orig_filename, "contract.pdf");
+
+        // …and the encrypted MIME part decrypts back to the original file.
+        let dec = decrypt_attachment_pipeline(
+            &composed.attachments[0].data,
+            &r.attachments[0].key_wrap_b64,
+            r.attachments[0].cipher_sha256_hex.as_deref(),
+            &r.attachments[0].orig_filename,
+            &r.attachments[0].orig_mime,
+        ).unwrap();
+        assert_eq!(b64.decode(dec.data_b64).unwrap(), file_bytes);
+    }
+
+    #[test]
     fn test_compose_agreement_encrypted_maps_to_and_cc() {
         use crate::types::AgreementParty;
         let alice = crypto::generate_keypair().unwrap(); // sender
@@ -6263,7 +6383,7 @@ nitela\n\
         let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
-            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, true, true, true, None, None,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, true, true, true, None, None, &[],
         ).unwrap();
         let armor = composed.armor;
 
@@ -6305,7 +6425,7 @@ nitela\n\
         let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, None, "Alice",
-            "Public Statement", "We agree to the public terms.", &to, &[], false, true, true, true, true, None, None,
+            "Public Statement", "We agree to the public terms.", &to, &[], false, true, true, true, true, None, None, &[],
         ).unwrap();
         let armor = composed.armor;
 
@@ -6324,7 +6444,7 @@ nitela\n\
         let alice = crypto::generate_keypair().unwrap();
         let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
         let err = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, true, true, true, None, None);
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, true, true, true, None, None, &[]);
         assert!(err.is_err());
     }
 
@@ -6343,7 +6463,7 @@ nitela\n\
 
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
-            "FYI", "Shared with both of you.", &to, &cc, true, false, /* is_agreement */ false, /* encrypt_subject */ true, /* sign */ true, None, None,
+            "FYI", "Shared with both of you.", &to, &cc, true, false, /* is_agreement */ false, /* encrypt_subject */ true, /* sign */ true, None, None, &[],
         ).unwrap();
         let armor = composed.armor;
 
@@ -6373,7 +6493,7 @@ nitela\n\
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
             "Subj", "Unsigned but encrypted.", &to, &[], true, false,
-            /* is_agreement */ false, /* encrypt_subject */ true, /* sign */ false, None, None,
+            /* is_agreement */ false, /* encrypt_subject */ true, /* sign */ false, None, None, &[],
         ).unwrap();
         let armor = composed.armor;
 
@@ -6391,7 +6511,7 @@ nitela\n\
         let signed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
             "Subj", "terms", &to, &[], true, false,
-            /* is_agreement */ true, /* encrypt_subject */ true, /* sign */ false, None, None,
+            /* is_agreement */ true, /* encrypt_subject */ true, /* sign */ false, None, None, &[],
         ).unwrap();
         assert!(signed.armor.contains("BEGIN NOSTR SIGNATURE"));
         assert!(!signed.armor.contains("BEGIN NOSTR SEAL"));
@@ -6420,10 +6540,10 @@ nitela\n\
         // Compose the same plaintext agreement under two schemes; the encoded
         // bodies must differ, yet both verify and decrypt.
         let latin = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, true, Some("latin"), None,
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, true, Some("latin"), None, &[],
         ).unwrap();
         let english = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, true, Some("english - bip39"), None,
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, true, Some("english - bip39"), None, &[],
         ).unwrap();
         assert_ne!(latin.armor, english.armor, "encoding setting must change the armor body");
         assert_eq!(verify_email_signature_inline(&latin.armor), Some(true));
@@ -6443,7 +6563,7 @@ nitela\n\
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
             "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true, true, true,
-            Some("latin"), Some("english - bip39"),
+            Some("latin"), Some("english - bip39"), &[],
         ).unwrap();
 
         // Subject is encrypted (not the cleartext) and decrypts back for the recipient.
@@ -6459,7 +6579,7 @@ nitela\n\
         let fallback = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
             "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true, true, true,
-            Some("latin"), None,
+            Some("latin"), None, &[],
         ).unwrap();
         let rf = decrypt_email_body_pipeline(
             &bob.private_key, &fallback.armor, &fallback.subject, Some(&alice.public_key), None, None, true, false,

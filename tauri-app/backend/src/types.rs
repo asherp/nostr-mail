@@ -28,6 +28,12 @@ pub struct AgreementParty {
 pub struct ComposedAgreement {
     pub armor: String,
     pub subject: String,
+    /// Attachment MIME parts to send alongside the armor. For an encrypted
+    /// message these are the AES-encrypted `aN.dat` parts whose keys live in the
+    /// (CEK-protected) manifest; for a public message they are the plaintext
+    /// attachments. Empty when there are none. (spec §11.2)
+    #[serde(default)]
+    pub attachments: Vec<EmailAttachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

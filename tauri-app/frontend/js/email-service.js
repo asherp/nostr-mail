@@ -1077,59 +1077,24 @@ class EmailService {
         }).flat(); // Flatten array since legacy hybrid encryption creates 2 attachments per file
     }
 
-    // Build the hybrid attachment manifest (spec §11.2) for the multi-recipient
-    // envelope: AES-encrypt the body and each attachment under their own keys,
-    // stamp each attachment's `encryptedData` (so prepareAttachmentsForEmail emits
-    // the matching MIME parts), and return the manifest JSON string. The cleartext
-    // `key_wrap`s inside the manifest are protected by the CEK envelope — the Rust
-    // send path AES-encrypts this JSON under the per-message CEK as the armored
-    // body. Returns null when there are no attachments (caller sends the plain
-    // body directly). Mirrors the 1:1 manifest builder, minus the NIP/armor step.
-    async buildManifestBody(body) {
+    // Map the pending attachments to the plaintext EmailAttachment shape the
+    // multi-recipient send path expects. The Rust side AES-encrypts them into a
+    // capnp manifest (spec §11.2) and emits the encrypted MIME parts — crypto
+    // lives in Rust, not here. Returns null when there are no attachments.
+    plainAttachmentsForEmail() {
         if (!this.attachments || this.attachments.length === 0) return null;
-        const manifest = { body: {}, attachments: [] };
-        if (body) {
-            const bodyAesKey = await this.generateSymmetricKey();
-            // UTF-8 → base64 (handles multi-byte); Rust recovers via base64-decode.
-            const bodyBase64 = btoa(unescape(encodeURIComponent(body)));
-            const encryptedBodyData = await this.encryptWithAES(bodyBase64, bodyAesKey);
-            manifest.body = {
-                ciphertext: encryptedBodyData,
-                cipher_sha256: await this.calculateSHA256(encryptedBodyData),
-                cipher_size: encryptedBodyData.length,
-                key_wrap: bodyAesKey,
-            };
-        }
-        for (let i = 0; i < this.attachments.length; i++) {
-            const attachment = this.attachments[i];
-            const opaqueId = `a${i + 1}`;
-            const attachmentAesKey = await this.generateSymmetricKey();
-            const encryptedAttachmentData = await this.encryptWithAES(attachment.data, attachmentAesKey, true);
-            const attachmentSha256 = await this.calculateSHA256(encryptedAttachmentData);
-            const PADDING_SIZE = 64 * 1024; // 64 KiB
-            const paddedSize = Math.ceil(attachment.size / PADDING_SIZE) * PADDING_SIZE;
-            attachment.encryptedData = {
-                method: 'manifest_aes',
-                encrypted_file: encryptedAttachmentData,
-                opaque_id: opaqueId,
-                aes_key: attachmentAesKey,
-                cipher_sha256: attachmentSha256,
-                original_filename: attachment.name,
-                original_type: attachment.type,
-                original_size: attachment.size,
-            };
-            attachment.size = paddedSize;
-            attachment.isEncrypted = true;
-            manifest.attachments.push({
-                id: opaqueId,
-                orig_filename: attachment.name,
-                orig_mime: attachment.type,
-                cipher_sha256: attachmentSha256,
-                cipher_size: encryptedAttachmentData.length,
-                key_wrap: attachmentAesKey,
-            });
-        }
-        return JSON.stringify(manifest);
+        return this.attachments.map(a => ({
+            filename: a.name,
+            content_type: a.type,
+            data: a.data, // base64 plaintext
+            size: a.size,
+            is_encrypted: false,
+            encryption_method: null,
+            algorithm: null,
+            original_filename: null,
+            original_type: null,
+            original_size: null,
+        }));
     }
 
     // Handle Nostr contact selection
@@ -2397,17 +2362,13 @@ class EmailService {
         try {
             domManager.disable('sendBtn');
             domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
-            // Encrypted agreement: attach the contract document(s) via the hybrid
-            // manifest under the CEK (§11.2) — their cipher hashes live in the
-            // signed manifest, binding them to the agreement. Public agreement:
-            // the body is in the clear, so attachments ride as plaintext MIME.
-            const manifestBody = encrypted ? await this.buildManifestBody(body) : null;
-            const envelopeBody = manifestBody || body;
-            const attachmentData = encrypted
-                ? (manifestBody ? this.prepareAttachmentsForEmail() : null)
-                : this.prepareAttachmentsForEmail();
+            // Pass plaintext body + attachments; Rust builds the capnp manifest
+            // under the CEK for an encrypted agreement (binding each attachment's
+            // hash inside the signed body, §11.2) or sends them in the clear for a
+            // public one.
+            const attachmentData = this.plainAttachmentsForEmail();
             await TauriService.sendAgreement(
-                emailConfig, subject, envelopeBody, to, cc, ccPlain, encrypted, originatorConsents, true, encryptSubject, true,
+                emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, true, encryptSubject, true,
                 profileName, messageId, this._replyToMessageId, this._replyReferences,
                 includePubkeyHeader, includeSigHeader, glossiaEncoding, null, attachmentData
             );
@@ -2519,14 +2480,12 @@ class EmailService {
                 // user toggled the Sign button off → unsigned envelope (SEAL).
                 const signBtn = domManager.get('signBtn');
                 const sign = (settings.automatically_sign !== false) || (signBtn && signBtn.dataset.signed === 'true');
-                // Attachments: wrap the body + files in a hybrid manifest (§11.2)
-                // sent as the CEK-encrypted body, with the encrypted bytes riding
-                // as MIME parts. No attachments ⇒ send the plain body directly.
-                const manifestBody = await this.buildManifestBody(body);
-                const envelopeBody = manifestBody || body;
-                const attachmentData = manifestBody ? this.prepareAttachmentsForEmail() : null;
+                // Pass plaintext body + attachments; Rust AES-encrypts the files
+                // into a capnp manifest under the CEK and emits the MIME parts
+                // (§11.2). No attachments ⇒ the plain body is encrypted directly.
+                const attachmentData = this.plainAttachmentsForEmail();
                 await TauriService.sendAgreement(
-                    emailConfig, subject, envelopeBody, to, cc, ccPlain, /* encrypted */ true,
+                    emailConfig, subject, body, to, cc, ccPlain, /* encrypted */ true,
                     /* originatorConsents */ false, /* isAgreement */ false, encryptSubject, sign,
                     profileName, messageId, this._replyToMessageId, this._replyReferences,
                     includePubkeyHeader, includeSigHeader, glossiaEncoding, null, attachmentData

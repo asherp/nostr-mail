@@ -4084,12 +4084,22 @@ pub fn decrypt_attachment_pipeline(
         .map_err(|e| format!("key_wrap base64 decode failed: {}", e))?;
 
     // Verify SHA-256 if provided (warn on mismatch but continue, matching JS behavior)
+    // Enforce the ciphertext hash recorded in the (signed) manifest: a mismatch
+    // means the attachment bytes were swapped/corrupted in transit, so reject
+    // rather than decrypt tampered content (spec §11.2). The hash binds the
+    // attachment to the signature transitively — the manifest is inside the
+    // signed body — so this check is what makes that binding enforceable.
     if let Some(expected_hash) = cipher_sha256_hex {
-        let mut hasher = Sha256::new();
-        hasher.update(&encrypted_data);
-        let actual_hash = hex::encode(hasher.finalize());
-        if actual_hash != expected_hash {
-            debug_log!("[RUST] decrypt_attachment_pipeline: hash mismatch (expected {}, got {}) — continuing anyway", expected_hash, actual_hash);
+        if !expected_hash.is_empty() {
+            let mut hasher = Sha256::new();
+            hasher.update(&encrypted_data);
+            let actual_hash = hex::encode(hasher.finalize());
+            if actual_hash != expected_hash {
+                return Err(format!(
+                    "Attachment integrity check failed: ciphertext hash mismatch (expected {}, got {}) — the file was altered in transit",
+                    expected_hash, actual_hash
+                ));
+            }
         }
     }
 

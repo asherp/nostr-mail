@@ -300,6 +300,29 @@ mod tests {
     }
 
     #[test]
+    fn tampered_attachment_is_rejected() {
+        let atts = vec![AttachmentInput {
+            filename: "doc.txt".into(),
+            mime: "text/plain".into(),
+            data: b"original".to_vec(),
+        }];
+        let (payload, parts) = build_capnp_manifest("body", &atts).unwrap();
+        let parsed = parse_manifest(payload.as_bytes()).unwrap();
+        // Flip a ciphertext byte → the recorded hash no longer matches → reject.
+        let mut tampered = parts[0].ciphertext.clone();
+        tampered[0] ^= 0xff;
+        let err = crate::email::decrypt_attachment_pipeline(
+            &b64().encode(&tampered),
+            &parsed.attachments[0].key_wrap_b64(),
+            Some(&parsed.attachments[0].cipher_sha256_hex()),
+            "doc.txt",
+            "text/plain",
+        );
+        assert!(err.is_err(), "tampered attachment must be rejected");
+        assert!(err.unwrap_err().contains("integrity check failed"));
+    }
+
+    #[test]
     fn plaintext_is_not_a_manifest() {
         assert!(parse_manifest(b"just a normal body").is_none());
         assert!(parse_manifest(b"{ not really json").is_none());

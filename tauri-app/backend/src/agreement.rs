@@ -411,11 +411,12 @@ pub fn encode_hybrid_agreement(
     body_plaintext: &[u8],
     recipients_in: &[AgreementRecipientInput],
     originator_consents: bool,
+    sign: bool,
     encoding: Option<&str>,
 ) -> Result<String> {
     let cek = crate::crypto::generate_cek();
     encode_hybrid_agreement_with_cek(
-        &cek, sender_priv, sender_pub, sender_email, profile_name, body_plaintext, recipients_in, originator_consents, encoding,
+        &cek, sender_priv, sender_pub, sender_email, profile_name, body_plaintext, recipients_in, originator_consents, sign, encoding,
     )
 }
 
@@ -424,6 +425,12 @@ pub fn encode_hybrid_agreement(
 /// envelope. The caller is responsible for generating a fresh random CEK
 /// ([`crate::crypto::generate_cek`]) per message. `encoding` is the user's
 /// Advanced glossia scheme (`None` ⇒ default).
+///
+/// `sign`: when true, the message carries a SIGNATURE that authenticates the
+/// body, the RECIPIENTS membership/roles, and any CONSENT (spec §4.2). When
+/// false, it carries only a SEAL block supplying the sender's pubkey for CEK
+/// unwrapping — the role set is then **unauthenticated** (§3.6), so an unsigned
+/// envelope MUST NOT carry CONSENT and MUST NOT be used for agreements.
 pub fn encode_hybrid_agreement_with_cek(
     cek: &[u8; 32],
     sender_priv: &str,
@@ -433,6 +440,7 @@ pub fn encode_hybrid_agreement_with_cek(
     body_plaintext: &[u8],
     recipients_in: &[AgreementRecipientInput],
     originator_consents: bool,
+    sign: bool,
     encoding: Option<&str>,
 ) -> Result<String> {
     if recipients_in.is_empty() {
@@ -478,8 +486,9 @@ pub fn encode_hybrid_agreement_with_cek(
     // decode_armor_section recovers (glossia-decoded), matching §4/§4.2.
     let body_decoded = &body_decoded_bytes;
 
-    // 4. Optional originator CONSENT over H (Sections 11.2, 11.3.1).
-    let (consent_body, canon_consent) = if originator_consents {
+    // 4. Optional originator CONSENT over H (Sections 11.2, 11.3.1). Consent is
+    // bound by the signature, so it's only valid on a signed message.
+    let (consent_body, canon_consent) = if originator_consents && sign {
         let h = document_hash(body_decoded, &canon_recipients);
         let consent = Consent {
             agreement_hash: hex::encode(h),
@@ -492,15 +501,10 @@ pub fn encode_hybrid_agreement_with_cek(
         (None, String::new())
     };
 
-    // 5. Sign the §4.2 per-level target: body || recipients || consent.
-    let signing_bytes = level_signing_bytes(body_decoded, &canon_recipients, &canon_consent);
-    let sig_hex = crate::crypto::sign_data_bytes(sender_priv, &signing_bytes)?;
-
-    // 6. Assemble the armor (body → RECIPIENTS → [CONSENT] → SIGNATURE; §11.3.2).
+    // 5. Assemble body → RECIPIENTS → [CONSENT] → SIGNATURE | SEAL (§11.3.2).
     // The body uses the generic `ENCRYPTED BODY` tag (AES-256-GCM under a CEK);
-    // there is no dedicated keyword — the presence of the RECIPIENTS block is
-    // what tells a decoder to take the CEK-envelope path rather than pairwise
-    // NIP-44 (spec Sections 8, 10.5).
+    // the presence of the RECIPIENTS block — not a keyword — selects the
+    // CEK-envelope path over pairwise NIP-44 (spec Sections 8, 10.5).
     let mut out = String::new();
     out.push_str("----- BEGIN NOSTR ENCRYPTED BODY -----\n");
     out.push_str(&body_encoded);
@@ -513,14 +517,26 @@ pub fn encode_hybrid_agreement_with_cek(
         out.push_str(cbody);
         out.push('\n');
     }
-    out.push_str("----- BEGIN NOSTR SIGNATURE -----\n");
-    out.push('@');
-    out.push_str(profile_name);
-    out.push('\n');
-    out.push_str(&sig_hex);
-    out.push('\n');
-    out.push_str(&sender_pub_hex);
-    out.push('\n');
+    if sign {
+        // Signature covers body || recipients || consent (§4.2).
+        let signing_bytes = level_signing_bytes(body_decoded, &canon_recipients, &canon_consent);
+        let sig_hex = crate::crypto::sign_data_bytes(sender_priv, &signing_bytes)?;
+        out.push_str("----- BEGIN NOSTR SIGNATURE -----\n@");
+        out.push_str(profile_name);
+        out.push('\n');
+        out.push_str(&sig_hex);
+        out.push('\n');
+        out.push_str(&sender_pub_hex);
+        out.push('\n');
+    } else {
+        // Unsigned: SEAL supplies the sender pubkey for CEK unwrapping (§3.6).
+        // The role set is unauthenticated; this MUST NOT be used for agreements.
+        out.push_str("----- BEGIN NOSTR SEAL -----\n@");
+        out.push_str(profile_name);
+        out.push('\n');
+        out.push_str(&sender_pub_hex);
+        out.push('\n');
+    }
     out.push_str("----- END NOSTR MESSAGE -----");
     Ok(out)
 }
@@ -826,7 +842,7 @@ mod tests {
             AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.org".into()) },
         ];
         let armor = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator", body, &recips, false, None,
+            &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator", body, &recips, false, true, None,
         ).unwrap();
 
         // Structure: generic encrypted body, recipients (incl. self last), no consent.
@@ -867,7 +883,7 @@ mod tests {
             AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone(), email: None },
         ];
         let armor = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, None, "Originator", body, &recips, true, None,
+            &sender.private_key, &sender.public_key, None, "Originator", body, &recips, true, true, None,
         ).unwrap();
 
         assert!(armor.contains("BEGIN NOSTR CONSENT"));
@@ -898,7 +914,7 @@ mod tests {
     fn test_encode_hybrid_agreement_rejects_empty_recipients() {
         let sender = crate::crypto::generate_keypair().unwrap();
         let err = encode_hybrid_agreement(
-            &sender.private_key, &sender.public_key, None, "X", b"x", &[], false, None);
+            &sender.private_key, &sender.public_key, None, "X", b"x", &[], false, true, None);
         assert!(err.is_err());
     }
 }

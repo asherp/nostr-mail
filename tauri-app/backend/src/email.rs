@@ -672,9 +672,14 @@ pub fn compose_agreement(
     originator_consents: bool,
     is_agreement: bool,
     encrypt_subject: bool,
+    sign: bool,
     encoding: Option<&str>,
     subject_encoding: Option<&str>,
 ) -> Result<crate::types::ComposedAgreement, String> {
+    // An agreement is always signed (its signatory set must be authenticated,
+    // §3.6); a plain multi-recipient message honors the caller's choice and may
+    // be unsigned (SEAL). Consent is separate and only valid when signed.
+    let sign = sign || is_agreement;
     use crate::agreement::{AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
 
     // `To:` are signatories only for an actual agreement; a plain multi-recipient
@@ -704,7 +709,7 @@ pub fn compose_agreement(
         // One CEK for the body and the subject.
         let cek = crate::crypto::generate_cek();
         let armor = crate::agreement::encode_hybrid_agreement_with_cek(
-            &cek, private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents, encoding,
+            &cek, private_key, sender_pub, sender_email, profile_name, body.as_bytes(), &recips, originator_consents, sign, encoding,
         ).map_err(|e| e.to_string())?;
         // The subject is encrypted under the same CEK by default. The sender may
         // leave it in the clear (`encrypt_subject = false`) so keyless Cc /
@@ -787,6 +792,7 @@ pub async fn send_agreement_email(
     originator_consents: bool,
     is_agreement: bool,
     encrypt_subject: bool,
+    sign: bool,
     message_id: Option<&str>,
     in_reply_to: Option<&str>,
     references: Option<&str>,
@@ -801,7 +807,7 @@ pub async fn send_agreement_email(
         .map_err(|e| anyhow::anyhow!("could not derive sender pubkey: {}", e))?;
 
     let composed = compose_agreement(
-        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents, is_agreement, encrypt_subject, encoding, subject_encoding,
+        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents, is_agreement, encrypt_subject, sign, encoding, subject_encoding,
     ).map_err(|e| anyhow::anyhow!("{}", e))?;
     let armor = composed.armor;
 
@@ -5806,7 +5812,7 @@ nitela\n\
         ];
         let armor = encode_hybrid_agreement(
             &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator",
-            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true, None,
+            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true, true, None,
         ).unwrap();
 
         assert_eq!(verify_email_signature_inline(&armor), Some(true),
@@ -5837,7 +5843,7 @@ nitela\n\
         ];
         let armor = encode_hybrid_agreement(
             &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator",
-            b"terms", &recips, false, None,
+            b"terms", &recips, false, true, None,
         ).unwrap();
         assert_eq!(verify_email_signature_inline(&armor), Some(true));
 
@@ -5875,7 +5881,7 @@ nitela\n\
         }];
         encode_hybrid_agreement(
             &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
-            "Alice", b"Please confirm you control this address.", &recips, false, None,
+            "Alice", b"Please confirm you control this address.", &recips, false, true, None,
         ).unwrap()
     }
 
@@ -5944,7 +5950,7 @@ nitela\n\
         }];
         encode_hybrid_agreement(
             &alice.private_key, &alice.public_key, None, "Alice",
-            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true, None,
+            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true, true, None,
         ).unwrap()
     }
 
@@ -6041,7 +6047,7 @@ nitela\n\
         ];
         let armor = encode_hybrid_agreement(
             &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
-            "Alice", plaintext.as_bytes(), &recips, false, None,
+            "Alice", plaintext.as_bytes(), &recips, false, true, None,
         ).unwrap();
 
         // Bob (signer) recovers the body.
@@ -6077,7 +6083,7 @@ nitela\n\
             role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: None,
         }];
         let armor = encode_hybrid_agreement(
-            &alice.private_key, &alice.public_key, None, "Alice", b"secret terms", &recips, false, None,
+            &alice.private_key, &alice.public_key, None, "Alice", b"secret terms", &recips, false, true, None,
         ).unwrap();
 
         let r = decrypt_email_body_pipeline(
@@ -6095,7 +6101,7 @@ nitela\n\
             role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.com".into()),
         }];
         let armor = encode_hybrid_agreement(
-            &alice.private_key, &alice.public_key, Some("alice@x.example"), "Alice", b"terms", &recips, true, None,
+            &alice.private_key, &alice.public_key, Some("alice@x.example"), "Alice", b"terms", &recips, true, true, None,
         ).unwrap();
 
         let parsed = parse_armor_components(&armor).expect("parses");
@@ -6211,7 +6217,7 @@ nitela\n\
         let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
-            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, true, true, None, None,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, true, true, true, None, None,
         ).unwrap();
         let armor = composed.armor;
 
@@ -6253,7 +6259,7 @@ nitela\n\
         let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, None, "Alice",
-            "Public Statement", "We agree to the public terms.", &to, &[], false, true, true, true, None, None,
+            "Public Statement", "We agree to the public terms.", &to, &[], false, true, true, true, true, None, None,
         ).unwrap();
         let armor = composed.armor;
 
@@ -6272,7 +6278,7 @@ nitela\n\
         let alice = crypto::generate_keypair().unwrap();
         let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
         let err = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, true, true, None, None);
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, true, true, true, None, None);
         assert!(err.is_err());
     }
 
@@ -6291,7 +6297,7 @@ nitela\n\
 
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
-            "FYI", "Shared with both of you.", &to, &cc, true, false, /* is_agreement */ false, /* encrypt_subject */ true, None, None,
+            "FYI", "Shared with both of you.", &to, &cc, true, false, /* is_agreement */ false, /* encrypt_subject */ true, /* sign */ true, None, None,
         ).unwrap();
         let armor = composed.armor;
 
@@ -6306,6 +6312,43 @@ nitela\n\
         ).unwrap();
         assert!(r.success);
         assert_eq!(r.body, "Shared with both of you.");
+    }
+
+    #[test]
+    fn test_unsigned_envelope_uses_seal_and_still_decrypts() {
+        // sign = false → a SEAL (no SIGNATURE); recipients still decrypt via the
+        // SEAL pubkey, but there's no signature to verify (spec §3.6).
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "Subj", "Unsigned but encrypted.", &to, &[], true, false,
+            /* is_agreement */ false, /* encrypt_subject */ true, /* sign */ false, None, None,
+        ).unwrap();
+        let armor = composed.armor;
+
+        assert!(armor.contains("BEGIN NOSTR SEAL"));
+        assert!(!armor.contains("BEGIN NOSTR SIGNATURE"));
+        assert_eq!(verify_email_signature_inline(&armor), None, "no signature to verify");
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &armor, &composed.subject, Some(&alice.public_key), None, None, false, false,
+        ).unwrap();
+        assert!(r.success);
+        assert_eq!(r.body, "Unsigned but encrypted.");
+
+        // A forced agreement ignores sign=false (must be signed to authenticate
+        // the signatory set, §3.6).
+        let signed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "Subj", "terms", &to, &[], true, false,
+            /* is_agreement */ true, /* encrypt_subject */ true, /* sign */ false, None, None,
+        ).unwrap();
+        assert!(signed.armor.contains("BEGIN NOSTR SIGNATURE"));
+        assert!(!signed.armor.contains("BEGIN NOSTR SEAL"));
     }
 
     #[test]
@@ -6331,10 +6374,10 @@ nitela\n\
         // Compose the same plaintext agreement under two schemes; the encoded
         // bodies must differ, yet both verify and decrypt.
         let latin = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, Some("latin"), None,
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, true, Some("latin"), None,
         ).unwrap();
         let english = compose_agreement(
-            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, Some("english - bip39"), None,
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, true, Some("english - bip39"), None,
         ).unwrap();
         assert_ne!(latin.armor, english.armor, "encoding setting must change the armor body");
         assert_eq!(verify_email_signature_inline(&latin.armor), Some(true));
@@ -6353,7 +6396,7 @@ nitela\n\
         // and the recipient still recovers both.
         let composed = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
-            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true, true,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true, true, true,
             Some("latin"), Some("english - bip39"),
         ).unwrap();
 
@@ -6369,7 +6412,7 @@ nitela\n\
         // subject_encoding = None falls back to the body encoding.
         let fallback = compose_agreement(
             &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
-            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true, true,
+            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true, true, true,
             Some("latin"), None,
         ).unwrap();
         let rf = decrypt_email_body_pipeline(

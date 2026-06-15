@@ -2343,7 +2343,7 @@ class EmailService {
             domManager.disable('sendBtn');
             domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
             await TauriService.sendAgreement(
-                emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, true, encryptSubject,
+                emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, true, encryptSubject, true,
                 profileName, messageId, this._replyToMessageId, this._replyReferences,
                 includePubkeyHeader, includeSigHeader, glossiaEncoding, null
             );
@@ -2451,9 +2451,13 @@ class EmailService {
                 try { profileName = window.profileManager?.getAccountDisplayName(appState.getKeypair()?.public_key) || ''; } catch (e) {}
                 const glossiaEncoding = settings.glossia_encoding_body || null;
                 const encryptSubject = document.getElementById('compose-encrypt-subject')?.checked !== false;
+                // Signing mirrors 1:1: signed by default (auto-sign), unless the
+                // user toggled the Sign button off → unsigned envelope (SEAL).
+                const signBtn = domManager.get('signBtn');
+                const sign = (settings.automatically_sign !== false) || (signBtn && signBtn.dataset.signed === 'true');
                 await TauriService.sendAgreement(
                     emailConfig, subject, body, to, cc, ccPlain, /* encrypted */ true,
-                    /* originatorConsents */ false, /* isAgreement */ false, encryptSubject,
+                    /* originatorConsents */ false, /* isAgreement */ false, encryptSubject, sign,
                     profileName, messageId, this._replyToMessageId, this._replyReferences,
                     includePubkeyHeader, includeSigHeader, glossiaEncoding, null
                 );

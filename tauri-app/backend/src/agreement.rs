@@ -315,12 +315,89 @@ pub fn level_signing_bytes(
     canonical_recipients_l: &str,
     canonical_consent_l: &str,
 ) -> Vec<u8> {
-    let mut bytes =
-        Vec::with_capacity(body_l_decoded.len() + canonical_recipients_l.len() + canonical_consent_l.len());
+    level_signing_bytes_with_attachments(body_l_decoded, canonical_recipients_l, canonical_consent_l, "")
+}
+
+/// Like [`level_signing_bytes`] but also binds a public message's ATTACHMENTS
+/// block (spec Section 11.2):
+///
+/// ```text
+/// level(L) = decode(body_L) || canonical(recipients_L) || canonical(consent_L) || canonical(attachments_L)
+/// ```
+///
+/// For an **encrypted** message attachments are bound via the in-body manifest,
+/// so `canonical_attachments_l` is empty there; only **public** (plaintext)
+/// messages carry an ATTACHMENTS block. An absent block canonicalizes to the
+/// empty string, so this is byte-identical to the 3-component form for every
+/// existing message.
+pub fn level_signing_bytes_with_attachments(
+    body_l_decoded: &[u8],
+    canonical_recipients_l: &str,
+    canonical_consent_l: &str,
+    canonical_attachments_l: &str,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        body_l_decoded.len()
+            + canonical_recipients_l.len()
+            + canonical_consent_l.len()
+            + canonical_attachments_l.len(),
+    );
     bytes.extend_from_slice(body_l_decoded);
     bytes.extend_from_slice(canonical_recipients_l.as_bytes());
     bytes.extend_from_slice(canonical_consent_l.as_bytes());
+    bytes.extend_from_slice(canonical_attachments_l.as_bytes());
     bytes
+}
+
+/// One entry in a public message's `ATTACHMENTS` block (spec Section 11.2): the
+/// opaque id, the SHA-256 of the **plaintext** file (hex), its size, MIME type,
+/// and original filename. Because the block is folded into the level signature,
+/// these hashes bind the (cleartext) attachments to the message tamper-evidently
+/// — the public-agreement analogue of the encrypted manifest's `cipherSha256`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentSpec {
+    pub id: String,
+    pub sha256: String,
+    pub size: u64,
+    pub mime: String,
+    pub filename: String,
+}
+
+impl AttachmentSpec {
+    /// `<id> <sha256> <size> <mime> <filename>` — filename last (may contain
+    /// spaces; it is the rest of the line).
+    pub fn to_line(&self) -> String {
+        format!("{} {} {} {} {}", self.id, self.sha256, self.size, self.mime, self.filename)
+    }
+}
+
+/// Serialize attachment specs into a canonical ATTACHMENTS block body (no
+/// delimiters), one entry per line in the given order.
+pub fn serialize_attachments(specs: &[AttachmentSpec]) -> String {
+    specs.iter().map(AttachmentSpec::to_line).collect::<Vec<_>>().join("\n")
+}
+
+/// Parse an `ATTACHMENTS` block body (spec Section 11.2). Each non-blank line is
+/// `<id> <sha256> <size> <mime> <filename...>`; the filename is the remainder of
+/// the line (so it may contain spaces). Blank lines and `> ` quote prefixes are
+/// ignored; lines with fewer than 5 tokens are skipped.
+pub fn parse_attachments_block(block_body: &str) -> Vec<AttachmentSpec> {
+    let mut out = Vec::new();
+    for raw in block_body.split('\n') {
+        let line = strip_quote_prefix(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.splitn(5, ' ');
+        let id = match it.next() { Some(t) => t.to_string(), None => continue };
+        let sha256 = match it.next() { Some(t) => t.to_string(), None => continue };
+        let size = match it.next().and_then(|t| t.parse::<u64>().ok()) { Some(v) => v, None => continue };
+        let mime = match it.next() { Some(t) => t.to_string(), None => continue };
+        let filename = match it.next() { Some(t) => t.to_string(), None => continue };
+        out.push(AttachmentSpec { id, sha256, size, mime, filename });
+    }
+    out
 }
 
 /// Agreement completion summary (spec Section 11.5).

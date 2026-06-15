@@ -314,6 +314,10 @@ pub struct ParsedArmorMessage {
     /// Parsed CONSENT block for this level, if any (spec §11.3).
     #[serde(default)]
     pub consent: Option<crate::agreement::Consent>,
+    /// Parsed ATTACHMENTS block for this level (public messages binding plaintext
+    /// attachment hashes; spec §11.2). Empty when absent.
+    #[serde(default)]
+    pub attachments: Vec<crate::agreement::AttachmentSpec>,
 }
 
 /// Per-signature verification result (one per nesting level in the armor chain).

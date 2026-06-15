@@ -745,13 +745,40 @@ pub fn compose_agreement(
         Ok(crate::types::ComposedAgreement { armor, subject: out_subject, attachments: parts })
     } else {
         // Public agreement: cleartext body. Attachments ride as plaintext MIME
-        // parts; binding them via a signed ATTACHMENTS block is handled next.
+        // parts, bound by a signed ATTACHMENTS block (each file's plaintext hash)
+        // so they can't be swapped/added/removed without breaking the signature.
+        let att_specs = public_attachment_specs(attachments)?;
         let armor = encode_signed_agreement(
-            private_key, sender_pub, profile_name, body, &recips, originator_consents, encoding,
+            private_key, sender_pub, profile_name, body, &recips, originator_consents, &att_specs, encoding,
         )?;
         // Public agreement: subject stays in the clear.
         Ok(crate::types::ComposedAgreement { armor, subject: subject.to_string(), attachments: attachments.to_vec() })
     }
+}
+
+/// Compute the signed ATTACHMENTS specs for a public message: each plaintext
+/// attachment's SHA-256 (hex), size, MIME, and filename (spec §11.2).
+fn public_attachment_specs(
+    attachments: &[crate::types::EmailAttachment],
+) -> Result<Vec<crate::agreement::AttachmentSpec>, String> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(&a.data)
+                .map_err(|e| format!("attachment {} base64 decode failed: {}", a.filename, e))?;
+            Ok(crate::agreement::AttachmentSpec {
+                id: format!("a{}", i + 1),
+                sha256: hex::encode(Sha256::digest(&data)),
+                size: data.len() as u64,
+                mime: a.content_type.clone(),
+                filename: a.filename.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Decode plaintext [`EmailAttachment`]s (base64 `data`) into manifest inputs.
@@ -2124,6 +2151,9 @@ struct ArmorLevelParts {
     recipients_text: Option<String>,
     /// Raw CONSENT block body, if present (spec Section 11.3).
     consent_text: Option<String>,
+    /// Raw ATTACHMENTS block body, if present (spec Section 11.2; public
+    /// messages binding plaintext attachment hashes).
+    attachments_text: Option<String>,
     /// The nested (quoted) inner armor, with one level of `> ` prefix stripped,
     /// ready for recursive parsing. `None` for a leaf level.
     nested_armor: Option<String>,
@@ -2141,6 +2171,12 @@ fn level_is_begin_recipients(l: &str) -> bool {
 fn level_is_begin_consent(l: &str) -> bool {
     l.trim().trim_matches('-').trim() == "BEGIN NOSTR CONSENT"
 }
+fn level_is_begin_attachments(l: &str) -> bool {
+    l.trim().trim_matches('-').trim() == "BEGIN NOSTR ATTACHMENTS"
+}
+fn level_is_end_attachments(l: &str) -> bool {
+    l.trim().trim_matches('-').trim() == "END NOSTR ATTACHMENTS"
+}
 fn level_is_begin_sig_or_seal(l: &str) -> bool {
     let t = l.trim().trim_matches('-').trim();
     t == "BEGIN NOSTR SIGNATURE" || t == "BEGIN NOSTR SEAL"
@@ -2156,7 +2192,7 @@ fn level_is_end_consent(l: &str) -> bool {
 /// which must not affect nesting depth.
 fn level_is_end_message(l: &str) -> bool {
     let t = l.trim().trim_matches('-').trim();
-    t.starts_with("END NOSTR") && t != "END NOSTR RECIPIENTS" && t != "END NOSTR CONSENT"
+    t.starts_with("END NOSTR") && t != "END NOSTR RECIPIENTS" && t != "END NOSTR CONSENT" && t != "END NOSTR ATTACHMENTS"
 }
 
 /// Split one armor level into its body, RECIPIENTS, CONSENT, and nested-armor
@@ -2172,12 +2208,13 @@ fn split_armor_level(body: &str) -> Option<ArmorLevelParts> {
     let lines: Vec<&str> = body.lines().collect();
 
     #[derive(PartialEq)]
-    enum S { Before, Body, Recipients, Consent, Nested }
+    enum S { Before, Body, Recipients, Consent, Attachments, Nested }
     let mut state = S::Before;
     let mut depth: i32 = 0;
     let mut body_lines: Vec<&str> = Vec::new();
     let mut recipients_lines: Vec<&str> = Vec::new();
     let mut consent_lines: Vec<&str> = Vec::new();
+    let mut attachments_lines: Vec<&str> = Vec::new();
     let mut nested_lines: Vec<&str> = Vec::new();
 
     for line in &lines {
@@ -2197,6 +2234,8 @@ fn split_armor_level(body: &str) -> Option<ArmorLevelParts> {
                     state = S::Recipients;
                 } else if level_is_begin_consent(line) {
                     state = S::Consent;
+                } else if level_is_begin_attachments(line) {
+                    state = S::Attachments;
                 } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
                     break;
                 } else {
@@ -2210,6 +2249,8 @@ fn split_armor_level(body: &str) -> Option<ArmorLevelParts> {
                     nested_lines.push(line);
                 } else if level_is_begin_consent(line) {
                     state = S::Consent;
+                } else if level_is_begin_attachments(line) {
+                    state = S::Attachments;
                 } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
                     break;
                 } else if level_is_end_recipients(line) {
@@ -2223,12 +2264,27 @@ fn split_armor_level(body: &str) -> Option<ArmorLevelParts> {
                     depth = 2;
                     state = S::Nested;
                     nested_lines.push(line);
+                } else if level_is_begin_attachments(line) {
+                    state = S::Attachments;
                 } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
                     break;
                 } else if level_is_end_consent(line) {
                     state = S::Body;
                 } else {
                     consent_lines.push(line);
+                }
+            }
+            S::Attachments => {
+                if level_is_begin_body(line) {
+                    depth = 2;
+                    state = S::Nested;
+                    nested_lines.push(line);
+                } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
+                    break;
+                } else if level_is_end_attachments(line) {
+                    state = S::Body;
+                } else {
+                    attachments_lines.push(line);
                 }
             }
             S::Nested => {
@@ -2279,6 +2335,7 @@ fn split_armor_level(body: &str) -> Option<ArmorLevelParts> {
         body_text,
         recipients_text: join_opt(&recipients_lines),
         consent_text: join_opt(&consent_lines),
+        attachments_text: join_opt(&attachments_lines),
         nested_armor,
     })
 }
@@ -2562,6 +2619,9 @@ fn attach_agreement_blocks(result: &mut crate::types::ParsedArmorMessage, raw_ar
         result.recipients_text = parts.recipients_text.clone();
         result.consent = parts.consent_text.as_deref()
             .and_then(crate::agreement::parse_consent_block);
+        result.attachments = parts.attachments_text.as_deref()
+            .map(crate::agreement::parse_attachments_block)
+            .unwrap_or_default();
         if let (Some(quoted), Some(nested)) = (result.quoted.as_mut(), parts.nested_armor.as_ref()) {
             attach_agreement_blocks(quoted, nested);
         }
@@ -2987,6 +3047,7 @@ fn armor_message_to_serde(reader: crate::nostr_mail_capnp::armor_message::Reader
         recipients: Vec::new(),
         recipients_text: None,
         consent: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -4139,11 +4200,14 @@ pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
             let canon_consent = parts.consent_text.as_deref()
                 .map(crate::agreement::canonicalize_block)
                 .unwrap_or_default();
-            let mut bytes = crate::agreement::level_signing_bytes(
-                &body_bytes, &canon_recipients, &canon_consent);
+            let canon_attachments = parts.attachments_text.as_deref()
+                .map(crate::agreement::canonicalize_block)
+                .unwrap_or_default();
+            let mut bytes = crate::agreement::level_signing_bytes_with_attachments(
+                &body_bytes, &canon_recipients, &canon_consent, &canon_attachments);
             if let Some(ref nested) = parts.nested_armor {
                 let nested_bytes = extract_ciphertext_binary(nested);
-                debug_log!("[RUST] extract_ciphertext_binary: concatenating {} outer (body+recipients+consent) + {} nested bytes",
+                debug_log!("[RUST] extract_ciphertext_binary: concatenating {} outer (body+recipients+consent+attachments) + {} nested bytes",
                     bytes.len(), nested_bytes.len());
                 bytes.extend_from_slice(&nested_bytes);
             }
@@ -4210,11 +4274,12 @@ pub fn encode_signed_agreement(
     terms_plaintext: &str,
     recipients_in: &[crate::agreement::AgreementRecipientInput],
     originator_consents: bool,
+    attachment_specs: &[crate::agreement::AttachmentSpec],
     encoding: Option<&str>,
 ) -> Result<String, String> {
     use crate::agreement::{
-        canonicalize_block, document_hash, level_signing_bytes, serialize_recipients,
-        Consent, Recipient,
+        canonicalize_block, document_hash, level_signing_bytes_with_attachments,
+        serialize_attachments, serialize_recipients, Consent, Recipient,
     };
     if recipients_in.is_empty() {
         return Err("encode_signed_agreement requires at least one signatory".to_string());
@@ -4246,7 +4311,18 @@ pub fn encode_signed_agreement(
         (None, String::new())
     };
 
-    let signing_bytes = level_signing_bytes(&canonical_bytes, &canon_recipients, &canon_consent);
+    // Public attachments are bound by a signed ATTACHMENTS block carrying each
+    // file's plaintext SHA-256 (§11.2). Empty ⇒ no block, no signing change.
+    let (attachments_body, canon_attachments) = if attachment_specs.is_empty() {
+        (None, String::new())
+    } else {
+        let body = serialize_attachments(attachment_specs);
+        let canon = canonicalize_block(&body);
+        (Some(body), canon)
+    };
+
+    let signing_bytes = level_signing_bytes_with_attachments(
+        &canonical_bytes, &canon_recipients, &canon_consent, &canon_attachments);
     let sig_hex = crate::crypto::sign_data_bytes(sender_priv, &signing_bytes)
         .map_err(|e| e.to_string())?;
 
@@ -4263,6 +4339,11 @@ pub fn encode_signed_agreement(
     if let Some(ref c) = consent_body {
         out.push_str("----- BEGIN NOSTR CONSENT -----\n");
         out.push_str(c);
+        out.push('\n');
+    }
+    if let Some(ref a) = attachments_body {
+        out.push_str("----- BEGIN NOSTR ATTACHMENTS -----\n");
+        out.push_str(a);
         out.push('\n');
     }
     out.push_str("----- BEGIN NOSTR SIGNATURE -----\n@");
@@ -6242,7 +6323,7 @@ nitela\n\
         let recips = vec![AgreementRecipientInput {
             role: ROLE_SIGNER.into(), pubkey: bob_pub.to_string(), email: None,
         }];
-        encode_signed_agreement(&alice.private_key, &alice.public_key, "Alice", terms, &recips, true, None).unwrap()
+        encode_signed_agreement(&alice.private_key, &alice.public_key, "Alice", terms, &recips, true, &[], None).unwrap()
     }
 
     fn build_plaintext_consent_reply(responder: &crate::types::KeyPair, prior_armor: &str, h: &str) -> String {
@@ -6379,6 +6460,51 @@ nitela\n\
             &r.attachments[0].orig_mime,
         ).unwrap();
         assert_eq!(b64.decode(dec.data_b64).unwrap(), file_bytes);
+    }
+
+    #[test]
+    fn test_public_agreement_binds_attachments_in_signature() {
+        use crate::types::{AgreementParty, EmailAttachment};
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let file = b"the public contract document";
+        let attachments = vec![EmailAttachment {
+            filename: "contract.pdf".into(),
+            content_type: "application/pdf".into(),
+            data: b64.encode(file),
+            size: file.len(),
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        }];
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
+            "Public Statement", "We agree to the public terms.", &to, &[],
+            /* encrypted */ false, true, true, true, true, None, None, &attachments,
+        ).unwrap();
+
+        // Public: attachment passes through in the clear, and the armor carries a
+        // signed ATTACHMENTS block with the file's plaintext hash.
+        assert_eq!(composed.attachments.len(), 1);
+        assert!(!composed.attachments[0].is_encrypted);
+        let sha = hex::encode(Sha256::digest(file));
+        assert!(composed.armor.contains("BEGIN NOSTR ATTACHMENTS"));
+        assert!(composed.armor.contains(&sha), "armor should record the plaintext hash");
+        assert_eq!(verify_email_signature_inline(&composed.armor), Some(true));
+
+        // Tampering with the recorded hash (i.e. swapping the bound file) breaks
+        // the signature — the binding is enforced cryptographically.
+        let tampered = composed.armor.replace(&sha, &"f".repeat(64));
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false));
     }
 
     #[test]

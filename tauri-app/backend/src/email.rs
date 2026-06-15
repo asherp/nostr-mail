@@ -681,7 +681,6 @@ pub fn compose_agreement(
     // plaintext parts. Empty ⇒ no attachments.
     attachments: &[crate::types::EmailAttachment],
 ) -> Result<crate::types::ComposedAgreement, String> {
-    use base64::Engine;
     // An agreement is always signed (its signatory set must be authenticated,
     // §3.6); a plain multi-recipient message honors the caller's choice and may
     // be unsigned (SEAL). Consent is separate and only valid when signed.
@@ -716,18 +715,19 @@ pub fn compose_agreement(
         // body + each attachment are AES-encrypted under their own keys, the
         // manifest holds those keys, and the encrypted attachment bytes ride as
         // `aN.dat` MIME parts. Without attachments the raw body is encrypted.
-        let (body_payload, parts) = if attachments.is_empty() {
-            (body.to_string(), Vec::new())
-        } else {
-            let inputs = attachment_inputs_from(attachments)?;
-            let (payload, enc_parts) = crate::manifest::build_capnp_manifest(body, &inputs)
-                .map_err(|e| format!("manifest build failed: {}", e))?;
-            (payload, encrypted_parts_to_mime(enc_parts))
-        };
+        let (body_payload, parts): (Vec<u8>, Vec<crate::types::EmailAttachment>) =
+            if attachments.is_empty() {
+                (body.as_bytes().to_vec(), Vec::new())
+            } else {
+                let inputs = attachment_inputs_from(attachments)?;
+                let (payload, enc_parts) = crate::manifest::build_capnp_manifest(body, &inputs)
+                    .map_err(|e| format!("manifest build failed: {}", e))?;
+                (payload, encrypted_parts_to_mime(enc_parts))
+            };
         // One CEK for the body (manifest) and the subject.
         let cek = crate::crypto::generate_cek();
         let armor = crate::agreement::encode_hybrid_agreement_with_cek(
-            &cek, private_key, sender_pub, sender_email, profile_name, body_payload.as_bytes(), &recips, originator_consents, sign, encoding,
+            &cek, private_key, sender_pub, sender_email, profile_name, &body_payload, &recips, originator_consents, sign, encoding,
         ).map_err(|e| e.to_string())?;
         // The subject is encrypted under the same CEK by default. The sender may
         // leave it in the clear (`encrypt_subject = false`) so keyless Cc /
@@ -3651,8 +3651,8 @@ fn decrypt_single_block(
         nip, glossia_ms, ciphertext_len, nip_decrypt_ms, decrypted.len());
 
     // Step 4: Detect manifest vs legacy (shared with the CEK-envelope path).
-    // NIP-44 yields a UTF-8 string; a capnp manifest arrives base64-armored
-    // (text-safe), so bytes round-trip cleanly here.
+    // NIP-44 yields a UTF-8 string; the 1:1 path carries plaintext/legacy-JSON
+    // bodies here (the raw-binary capnp manifest rides the byte-clean CEK path).
     let manifest = apply_manifest_or_plaintext(decrypted.into_bytes(), &mut block);
     (block, manifest)
 }

@@ -18,19 +18,21 @@
 //! ## Wire format
 //!
 //! New manifests are **Cap'n Proto** (schema `Manifest`/`EncryptedBlob`/
-//! `Attachment`). Cap'n Proto is binary, but the NIP-44 API (1:1 path) is
-//! string-typed, so the serialized manifest is base64-armored behind a
-//! [`CAPNP_PREFIX`] marker — text-safe and uniform across both transports. The
-//! decoder also still reads the **legacy JSON** manifest (first byte `{`) so old
-//! emails keep opening.
+//! `Attachment`), serialized to raw binary behind a [`CAPNP_PREFIX`] marker. The
+//! manifest never touches the wire in the clear: it is the plaintext *body*,
+//! encrypted by the outer layer (pairwise NIP-44 or the per-recipient-wrapped
+//! CEK), and that ciphertext is what gets glossia-encoded for transport. So the
+//! manifest needs no inner armor of its own — it rides as raw bytes inside the
+//! encryption envelope. The decoder also still reads the **legacy JSON** manifest
+//! (first byte `{`) so old emails keep opening.
 
 use anyhow::Result;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
-/// Marker prefixing the base64-armored Cap'n Proto manifest payload. Chosen so a
-/// decoder can unambiguously distinguish capnp (`capnp:…`) from a legacy JSON
-/// manifest (`{…`) and from an ordinary plaintext body.
+/// Marker prefixing the raw Cap'n Proto manifest bytes. Chosen so a decoder can
+/// unambiguously distinguish capnp (`capnp:…`) from a legacy JSON manifest (`{…`)
+/// and from an ordinary plaintext body.
 pub const CAPNP_PREFIX: &str = "capnp:";
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
@@ -85,12 +87,14 @@ pub struct ParsedManifest {
 ///
 /// AES-encrypts the body (raw) and each attachment (size-prefixed + padded)
 /// under independent random keys, records each in the manifest, and returns the
-/// base64-armored manifest payload (to be encrypted as the body) plus the
-/// encrypted attachment MIME parts.
+/// raw manifest payload — the [`CAPNP_PREFIX`] marker followed by the serialized
+/// capnp bytes (to be encrypted as the body) — plus the encrypted attachment MIME
+/// parts. No inner armor: the payload is encrypted by the outer layer and that
+/// ciphertext is glossia-encoded for transport.
 pub fn build_capnp_manifest(
     body: &str,
     attachments: &[AttachmentInput],
-) -> Result<(String, Vec<EncryptedAttachmentPart>)> {
+) -> Result<(Vec<u8>, Vec<EncryptedAttachmentPart>)> {
     let mut message = ::capnp::message::Builder::new_default();
     let mut manifest = message.init_root::<crate::nostr_mail_capnp::manifest::Builder>();
     manifest.set_version(0);
@@ -135,24 +139,23 @@ pub fn build_capnp_manifest(
         }
     }
 
-    let mut buf = Vec::new();
-    ::capnp::serialize::write_message(&mut buf, &message)?;
-    let payload = format!("{}{}", CAPNP_PREFIX, b64().encode(&buf));
+    let mut payload = CAPNP_PREFIX.as_bytes().to_vec();
+    ::capnp::serialize::write_message(&mut payload, &message)?;
     Ok((payload, parts))
 }
 
 /// Parse a decrypted body payload as a manifest, decrypting the nested body blob.
 ///
 /// Returns `None` when the payload is not a manifest (an ordinary plaintext
-/// body). Detects a Cap'n Proto manifest by the [`CAPNP_PREFIX`] marker and a
-/// legacy JSON manifest by a leading `{`.
+/// body). Detects a Cap'n Proto manifest by the [`CAPNP_PREFIX`] marker (the
+/// remaining bytes are the raw serialized capnp) and a legacy JSON manifest by a
+/// leading `{`.
 pub fn parse_manifest(payload: &[u8]) -> Option<ParsedManifest> {
-    let s = std::str::from_utf8(payload).ok()?;
-    let t = s.trim();
-    if let Some(rest) = t.strip_prefix(CAPNP_PREFIX) {
-        let bytes = b64().decode(rest.trim()).ok()?;
-        return parse_capnp_manifest(&bytes);
+    if let Some(rest) = payload.strip_prefix(CAPNP_PREFIX.as_bytes()) {
+        return parse_capnp_manifest(rest);
     }
+    // Legacy JSON manifest (or an ordinary plaintext body): text-typed.
+    let t = std::str::from_utf8(payload).ok()?.trim();
     if t.starts_with('{') {
         return parse_json_manifest(t);
     }
@@ -275,11 +278,15 @@ mod tests {
             },
         ];
         let (payload, parts) = build_capnp_manifest(body, &atts).unwrap();
-        assert!(payload.starts_with(CAPNP_PREFIX));
+        assert!(payload.starts_with(CAPNP_PREFIX.as_bytes()));
+        // The marker is followed by raw capnp bytes (no base64 armor): a single-
+        // segment message's serialized form opens with a `00 00 00 00` segment
+        // header, which is not printable base64 text.
+        assert_eq!(&payload[CAPNP_PREFIX.len()..CAPNP_PREFIX.len() + 4], &[0, 0, 0, 0]);
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].filename, "a1.dat");
 
-        let parsed = parse_manifest(payload.as_bytes()).expect("capnp manifest parses");
+        let parsed = parse_manifest(&payload).expect("capnp manifest parses");
         assert_eq!(parsed.body_text.as_deref(), Some(body));
         assert_eq!(parsed.attachments.len(), 2);
         assert_eq!(parsed.attachments[0].id, "a1");
@@ -307,7 +314,7 @@ mod tests {
             data: b"original".to_vec(),
         }];
         let (payload, parts) = build_capnp_manifest("body", &atts).unwrap();
-        let parsed = parse_manifest(payload.as_bytes()).unwrap();
+        let parsed = parse_manifest(&payload).unwrap();
         // Flip a ciphertext byte → the recorded hash no longer matches → reject.
         let mut tampered = parts[0].ciphertext.clone();
         tampered[0] ^= 0xff;

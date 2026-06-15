@@ -2150,6 +2150,7 @@ async fn send_agreement(
     include_sig_header: Option<bool>,
     glossia_encoding: Option<String>,
     subject_encoding: Option<String>,
+    attachments: Option<Vec<crate::types::EmailAttachment>>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
@@ -2176,6 +2177,7 @@ async fn send_agreement(
         include_sig,
         glossia_encoding.as_deref(),
         subject_encoding.as_deref(),
+        attachments.as_ref(),
     )
     .await
     .map_err(|e| e.to_string())?;

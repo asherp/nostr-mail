@@ -802,6 +802,10 @@ pub async fn send_agreement_email(
     include_sig_header: bool,
     encoding: Option<&str>,
     subject_encoding: Option<&str>,
+    // Already-encrypted attachment parts (§11.2). Each rides as a MIME part; its
+    // AES key and metadata live inside the CEK-encrypted manifest that is the
+    // armored body. `None`/empty ⇒ a single-part text message as before.
+    attachments: Option<&Vec<EmailAttachment>>,
 ) -> Result<String> {
     let private_key = config.private_key.as_deref()
         .ok_or_else(|| anyhow::anyhow!("no private key configured; cannot sign the message"))?;
@@ -857,7 +861,34 @@ pub async fn send_agreement_email(
         }
     }
 
-    let email = builder.body(armor)?;
+    // Single-part unless there are (already-encrypted) attachments, in which case
+    // build multipart/mixed: the armored body as the text part, then each
+    // attachment part — mirroring `send_email` (§11.2).
+    let has_attachments = attachments.map(|a| !a.is_empty()).unwrap_or(false);
+    let email = if has_attachments {
+        let attachments = attachments.unwrap();
+        debug_log!("[RUST] send_agreement_email: building multipart with {} attachments", attachments.len());
+        let mut multipart = MultiPart::mixed().singlepart(
+            SinglePart::builder().header(ContentType::TEXT_PLAIN).body(armor),
+        );
+        for attachment in attachments {
+            let attachment_data = match general_purpose::STANDARD.decode(&attachment.data) {
+                Ok(data) => data,
+                Err(e) => {
+                    debug_log!("[RUST] send_agreement_email: base64 decode failed for {}: {}", attachment.filename, e);
+                    continue;
+                }
+            };
+            let content_type = attachment.content_type.parse::<ContentType>()
+                .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
+            let attachment_part = Attachment::new(attachment.filename.clone())
+                .body(attachment_data, content_type);
+            multipart = multipart.singlepart(attachment_part);
+        }
+        builder.multipart(multipart)?
+    } else {
+        builder.body(armor)?
+    };
     let mailer = build_mailer(config)?;
     send_message_with_timeout(mailer, email).await?;
     let recipient_count = to.len() + cc.len() + cc_plain.len();
@@ -3258,6 +3289,69 @@ struct JsonAttachment {
     key_wrap: String,
 }
 
+/// Interpret a freshly decrypted body plaintext (from either the pairwise NIP path
+/// or the CEK-envelope path). If it is a JSON manifest — the multi-attachment
+/// hybrid body (§11.2): a nested AES-encrypted body blob plus per-attachment key
+/// wraps — AES-decrypt the body blob into `block.decrypted_text` and return the
+/// parsed manifest so the caller can surface its attachment entries. Otherwise
+/// treat the plaintext as the body directly (set `decrypted_text`) and return
+/// `None`. The manifest itself is already protected by the outer layer (pairwise
+/// NIP-44 or the per-recipient-wrapped CEK), so its `key_wrap` fields are in the
+/// clear here only after that layer has been opened.
+fn apply_manifest_or_plaintext(
+    decrypted: String,
+    block: &mut crate::types::DecryptedBlock,
+) -> Option<JsonManifest> {
+    let trimmed = decrypted.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(manifest) = serde_json::from_str::<JsonManifest>(trimmed) {
+            if let Some(ref body_blob) = manifest.body {
+                let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.key_wrap) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        block.error = Some(format!("Manifest key_wrap base64 decode failed: {}", e));
+                        return Some(manifest);
+                    }
+                };
+                let ct_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.ciphertext) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        block.error = Some(format!("Manifest ciphertext base64 decode failed: {}", e));
+                        return Some(manifest);
+                    }
+                };
+                match crate::crypto::aes_gcm_decrypt_raw(&key_bytes, &ct_bytes) {
+                    Ok(plaintext_bytes) => {
+                        // The plaintext is base64-encoded UTF-8 body (matching JS: atob(aesResult)).
+                        match String::from_utf8(plaintext_bytes) {
+                            Ok(b64_body) => {
+                                match base64::engine::general_purpose::STANDARD.decode(b64_body.trim()) {
+                                    Ok(body_bytes) => match String::from_utf8(body_bytes) {
+                                        Ok(text) => block.decrypted_text = Some(text),
+                                        Err(_) => block.decrypted_text = Some(b64_body),
+                                    },
+                                    // Not base64 — the plaintext IS the body.
+                                    Err(_) => block.decrypted_text = Some(b64_body),
+                                }
+                            }
+                            Err(_) => {
+                                block.error = Some("Manifest body AES plaintext is not UTF-8".to_string());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        block.error = Some(format!("Manifest AES decrypt failed: {}", e));
+                    }
+                }
+                return Some(manifest);
+            }
+        }
+    }
+    // Legacy / plain format: the decrypted content is the body text directly.
+    block.decrypted_text = Some(decrypted);
+    None
+}
+
 /// Determine which pubkey to use for NIP decryption at a given armor level.
 /// Mirrors JS: _decryptFromArmorParts pubkey selection logic.
 /// Returns hex pubkey string.
@@ -3328,8 +3422,6 @@ fn decrypt_single_block(
     // sender's identity key (legacy envelopes without an `ephemeral` line).
     ephemeral_pubkey: Option<&str>,
 ) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
-    use base64::Engine;
-
     debug_log!("[RUST] decrypt_single_block: type={} nip={:?} sig_pk={:?} seal_pk={:?} fallback={:?} body_preview={:?}",
         body_type, encryption_nip, sig_pubkey_hex.map(|s| &s[..s.len().min(16)]),
         seal_pubkey_hex.map(|s| &s[..s.len().min(16)]),
@@ -3424,13 +3516,18 @@ fn decrypt_single_block(
         match crate::crypto::aes_gcm_decrypt_raw(&cek, &ciphertext) {
             Ok(pt) => {
                 debug_log!("[RUST] decrypt_single_block: envelope decrypt SUCCESS, {} bytes", pt.len());
-                block.decrypted_text = Some(String::from_utf8_lossy(&pt).into_owned());
+                // The body plaintext may be a JSON attachment manifest (§11.2),
+                // protected here by the per-recipient-wrapped CEK rather than
+                // pairwise NIP-44 — handle it the same way (shared helper).
+                let decrypted = String::from_utf8_lossy(&pt).into_owned();
+                let manifest = apply_manifest_or_plaintext(decrypted, &mut block);
+                return (block, manifest);
             }
             Err(e) => {
                 block.error = Some(format!("Envelope AES-GCM decrypt failed: {}", e));
+                return (block, None);
             }
         }
-        return (block, None);
     }
 
     let nip = encryption_nip.unwrap_or("nip44");
@@ -3492,64 +3589,9 @@ fn decrypt_single_block(
     debug_log!("[RUST-PERF] decrypt_single_block: nip={} glossia={}ms (ct={}b) nip_decrypt={}ms (out={}b)",
         nip, glossia_ms, ciphertext_len, nip_decrypt_ms, decrypted.len());
 
-    // Step 4: Detect manifest vs legacy
-    let trimmed = decrypted.trim();
-    if trimmed.starts_with('{') {
-        // Try JSON manifest parse
-        if let Ok(manifest) = serde_json::from_str::<JsonManifest>(trimmed) {
-            if let Some(ref body_blob) = manifest.body {
-                // AES decrypt the manifest body
-                let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.key_wrap) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        block.error = Some(format!("Manifest key_wrap base64 decode failed: {}", e));
-                        return (block, Some(manifest));
-                    }
-                };
-                let ct_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.ciphertext) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        block.error = Some(format!("Manifest ciphertext base64 decode failed: {}", e));
-                        return (block, Some(manifest));
-                    }
-                };
-
-                match crate::crypto::aes_gcm_decrypt_raw(&key_bytes, &ct_bytes) {
-                    Ok(plaintext_bytes) => {
-                        // The plaintext is base64-encoded UTF-8 body (matching JS: atob(aesResult))
-                        match String::from_utf8(plaintext_bytes) {
-                            Ok(b64_body) => {
-                                // Decode the base64 to get the actual text
-                                match base64::engine::general_purpose::STANDARD.decode(b64_body.trim()) {
-                                    Ok(body_bytes) => {
-                                        match String::from_utf8(body_bytes) {
-                                            Ok(text) => block.decrypted_text = Some(text),
-                                            Err(_) => block.decrypted_text = Some(b64_body),
-                                        }
-                                    }
-                                    Err(_) => {
-                                        // Not base64 — use as-is (the plaintext IS the body)
-                                        block.decrypted_text = Some(b64_body);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                block.error = Some("Manifest body AES plaintext is not UTF-8".to_string());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        block.error = Some(format!("Manifest AES decrypt failed: {}", e));
-                    }
-                }
-                return (block, Some(manifest));
-            }
-        }
-    }
-
-    // Legacy format: decrypted content is the body text directly
-    block.decrypted_text = Some(decrypted);
-    (block, None)
+    // Step 4: Detect manifest vs legacy (shared with the CEK-envelope path).
+    let manifest = apply_manifest_or_plaintext(decrypted, &mut block);
+    (block, manifest)
 }
 
 /// Walk the capnp ArmorMessage tree recursively, decrypting each encrypted block.
@@ -6084,6 +6126,62 @@ nitela\n\
         ).unwrap();
         assert!(r.success, "self decrypt failed: {:?}", r.error);
         assert_eq!(r.body, plaintext);
+    }
+
+    #[test]
+    fn test_envelope_with_attachment_manifest_roundtrips() {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // To: signer
+
+        // Build the same manifest JS produces: a nested AES-encrypted body blob
+        // (body base64'd then AES-GCM'd under its own key) plus a per-attachment
+        // key wrap. The manifest as a whole becomes the CEK-envelope body.
+        let body_text = "Please review and sign the attached contract.";
+        let body_key = crypto::generate_cek();
+        let body_b64 = b64.encode(body_text.as_bytes());
+        let body_ct = crypto::aes_gcm_encrypt_raw(&body_key, body_b64.as_bytes()).unwrap();
+        let att_key = crypto::generate_cek();
+        let manifest = serde_json::json!({
+            "body": {
+                "ciphertext": b64.encode(&body_ct),
+                "cipher_sha256": "00",
+                "cipher_size": body_ct.len(),
+                "key_wrap": b64.encode(body_key),
+            },
+            "attachments": [{
+                "id": "a1",
+                "orig_filename": "contract.pdf",
+                "orig_mime": "application/pdf",
+                "cipher_sha256": "deadbeef",
+                "cipher_size": 65536u64,
+                "key_wrap": b64.encode(att_key),
+            }],
+        });
+        let manifest_json = serde_json::to_string(&manifest).unwrap();
+
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.com".into()),
+        }];
+        let armor = encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
+            "Alice", manifest_json.as_bytes(), &recips, false, true, None,
+        ).unwrap();
+
+        // Bob unwraps the CEK, AES-decrypts the manifest, and the shared handler
+        // recovers the nested body and surfaces the attachment metadata.
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "manifest envelope decrypt failed: {:?}", r.error);
+        assert!(r.is_manifest, "expected a manifest body");
+        assert_eq!(r.body, body_text);
+        assert_eq!(r.attachments.len(), 1);
+        assert_eq!(r.attachments[0].orig_filename, "contract.pdf");
+        assert_eq!(r.attachments[0].key_wrap_b64, b64.encode(att_key));
     }
 
     #[test]

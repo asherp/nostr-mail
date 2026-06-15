@@ -215,7 +215,7 @@ const TauriService = {
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
     },
-    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, recipientPubkey = null, includeRecipientHeader = null) {
+    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, recipientPubkey = null, includeRecipientHeader = null, cc = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -246,6 +246,9 @@ const TauriService = {
         }
         if (includeRecipientHeader !== null && includeRecipientHeader !== undefined) {
             args.includeRecipientHeader = includeRecipientHeader;
+        }
+        if (cc != null && cc.length) {
+            args.cc = cc;
         }
         return await this.invoke('send_email', args);
     },

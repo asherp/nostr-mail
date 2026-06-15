@@ -2047,7 +2047,7 @@ async fn publish_nostr_event(private_key: Option<String>, content: String, kind:
 }
 
 #[tauri::command]
-async fn send_email(mut email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>, include_pubkey_header: Option<bool>, include_sig_header: Option<bool>, recipient_pubkey: Option<String>, include_recipient_header: Option<bool>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn send_email(mut email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>, include_pubkey_header: Option<bool>, include_sig_header: Option<bool>, recipient_pubkey: Option<String>, include_recipient_header: Option<bool>, cc: Option<Vec<String>>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] send_email called with {} attachments, html_body: {}", attachments.as_ref().map(|a| a.len()).unwrap_or(0), html_body.is_some());
 
     // Resolve private key from state if not supplied — keychain migration moved
@@ -2059,11 +2059,12 @@ async fn send_email(mut email_config: EmailConfig, to_address: String, subject: 
     let include_pubkey = include_pubkey_header.unwrap_or(true);
     let include_sig = include_sig_header.unwrap_or(true);
     let include_recipient = include_recipient_header.unwrap_or(true);
+    let cc = cc.unwrap_or_default();
 
     // Send the email via SMTP
     // Note: We don't save to database here - sent emails will be fetched from the server's sent folder via IMAP sync
     // This avoids duplicate entries and ensures we have the server's version with proper headers
-    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref(), include_pubkey, include_sig, recipient_pubkey.as_deref(), include_recipient)
+    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref(), include_pubkey, include_sig, recipient_pubkey.as_deref(), include_recipient, &cc)
         .await
         .map_err(|e| e.to_string())?;
 

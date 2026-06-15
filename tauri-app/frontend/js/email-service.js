@@ -2380,10 +2380,6 @@ class EmailService {
             notificationService.showError('Please configure your email settings first');
             return;
         }
-        if (!appState.hasKeypair()) {
-            notificationService.showError('A Nostr keypair is required to send encrypted Cc mail');
-            return;
-        }
 
         const settings = appState.getSettings();
         const subject = domManager.getValue('subject')?.trim() || '';
@@ -2394,22 +2390,18 @@ class EmailService {
             return;
         }
 
-        // The To recipient must be keyed (we encrypt to them). Try the explicit
-        // pubkey, the selected contact, or a contact matched by email.
+        const ccAll = this._recipientState('composeCc');
+
+        // Whether to encrypt follows the same rule as a 1:1 send: encrypt when the
+        // To recipient is keyed; otherwise honor auto-encrypt / the Encrypt button.
         let toPubkey = this.getRecipientPubkey();
         if (!toPubkey) {
             const c = appState.getContacts().find(c => c.email && c.email.toLowerCase() === toAddress.toLowerCase());
             if (c && c.pubkey) toPubkey = c.pubkey;
         }
-        if (!toPubkey) {
-            notificationService.showError('Cc requires the To recipient to have a Nostr key (the message is encrypted to everyone).');
-            return;
-        }
-
-        const ccAll = this._recipientState('composeCc');
-        const cc = ccAll.filter(r => r.pubkey).map(r => ({ email: r.email, pubkey: r.pubkey }));
-        const ccPlain = ccAll.filter(r => !r.pubkey).map(r => r.email);
-        const to = [{ email: toAddress, pubkey: toPubkey }];
+        const encryptBtn = domManager.get('encryptBtn');
+        const wantsEncrypt = (encryptBtn && encryptBtn.dataset.encrypted === 'true')
+            || (settings.automatically_encrypt !== false);
 
         let useTls = settings.use_tls;
         if (settings.smtp_host === 'smtp.gmail.com' && !useTls) useTls = true;
@@ -2422,28 +2414,12 @@ class EmailService {
             imap_port: settings.imap_port,
             use_tls: useTls,
         };
-
-        const keypair = appState.getKeypair();
-        let profileName = '';
-        try { profileName = window.profileManager?.getAccountDisplayName(keypair?.public_key) || ''; } catch (e) {}
-        const glossiaEncoding = settings.glossia_encoding_body || null;
         const includePubkeyHeader = settings.include_pubkey_header !== false;
         const includeSigHeader = settings.include_sig_header !== false;
+        const includeRecipientHeader = settings.include_recipient_header !== false;
         const messageId = this.generateAndStoreMessageId();
 
-        try {
-            domManager.disable('sendBtn');
-            domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
-            await TauriService.sendAgreement(
-                emailConfig, subject, body, to, cc, ccPlain, /* encrypted */ true,
-                /* originatorConsents */ false, /* isAgreement */ false,
-                profileName, messageId, this._replyToMessageId, this._replyReferences,
-                includePubkeyHeader, includeSigHeader, glossiaEncoding, null
-            );
-            let msg = `Encrypted email sent to ${to.length + cc.length} recipient(s)`;
-            if (ccPlain.length) msg += ` (${ccPlain.length} Cc without a key can't read it)`;
-            notificationService.showSuccess(msg);
-
+        const resetForm = () => {
             domManager.clear('toAddress');
             domManager.clear('subject');
             domManager.clear('messageBody');
@@ -2454,6 +2430,52 @@ class EmailService {
             try { this.clearAttachments(); } catch (e) {}
             try { this.clearCurrentDraft(); } catch (e) {}
             setTimeout(() => { this.syncSentEmails().catch(() => {}); }, 100);
+        };
+
+        try {
+            domManager.disable('sendBtn');
+            domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
+
+            if (toPubkey) {
+                // Encrypted multi-recipient envelope (To keyed). Keyed Cc get the
+                // CEK; keyless Cc go in the Cc header only and can't decrypt.
+                if (!appState.hasKeypair()) {
+                    notificationService.showError('A Nostr keypair is required to send encrypted mail');
+                    return;
+                }
+                const cc = ccAll.filter(r => r.pubkey).map(r => ({ email: r.email, pubkey: r.pubkey }));
+                const ccPlain = ccAll.filter(r => !r.pubkey).map(r => r.email);
+                const to = [{ email: toAddress, pubkey: toPubkey }];
+                let profileName = '';
+                try { profileName = window.profileManager?.getAccountDisplayName(appState.getKeypair()?.public_key) || ''; } catch (e) {}
+                const glossiaEncoding = settings.glossia_encoding_body || null;
+                await TauriService.sendAgreement(
+                    emailConfig, subject, body, to, cc, ccPlain, /* encrypted */ true,
+                    /* originatorConsents */ false, /* isAgreement */ false,
+                    profileName, messageId, this._replyToMessageId, this._replyReferences,
+                    includePubkeyHeader, includeSigHeader, glossiaEncoding, null
+                );
+                let msg = `Encrypted email sent to ${to.length + cc.length} recipient(s)`;
+                if (ccPlain.length) msg += ` (${ccPlain.length} Cc without a key can't read it)`;
+                notificationService.showSuccess(msg);
+                resetForm();
+            } else if (wantsEncrypt) {
+                // Encryption requested/auto but the To recipient has no key.
+                notificationService.showError('Encrypting requires the To recipient to have a Nostr key. Add their key, or turn off auto-encrypt (Advanced settings) to send a plaintext Cc.');
+            } else {
+                // Plaintext multi-recipient: To + Cc go in the headers, no envelope.
+                // Keys are not required; signing still honors the user's settings.
+                const ccEmails = ccAll.map(r => r.email);
+                const plainBody = this._plainBody || body;
+                const attachmentData = this.prepareAttachmentsForEmail();
+                await TauriService.sendEmail(
+                    emailConfig, toAddress, subject, plainBody, null, messageId, attachmentData,
+                    this._htmlBody, this._replyToMessageId, this._replyReferences,
+                    includePubkeyHeader, includeSigHeader, null, includeRecipientHeader, ccEmails
+                );
+                notificationService.showSuccess(`Email sent to ${1 + ccEmails.length} recipient(s)`);
+                resetForm();
+            }
         } catch (error) {
             console.error('[JS] Error sending multi-recipient email:', error);
             notificationService.showError('Failed to send: ' + error);

@@ -386,17 +386,23 @@ pub async fn send_email(
     include_sig_header: bool,
     recipient_pubkey: Option<&str>,
     include_recipient_header: bool,
+    cc: &[String],
 ) -> Result<String> {
     debug_log!("[RUST] send_email: Starting email send process");
     debug_log!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
     debug_log!("[RUST] send_email: From: {}, To: {}", config.email_address, to_address);
     debug_log!("[RUST] send_email: Use TLS: {}", config.use_tls);
-    
+
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
         .reply_to(config.email_address.parse()?)
         .to(to_address.parse()?)
         .subject(subject);
+
+    // Additional cleartext Cc recipients (plain multi-recipient email).
+    for addr in cc {
+        builder = builder.cc(addr.parse()?);
+    }
 
     // Add custom message ID if provided
     if let Some(msg_id) = message_id {

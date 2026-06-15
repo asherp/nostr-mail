@@ -746,6 +746,7 @@ fn decrypt_subject_envelope(
     sender_pub: &str,
     private_key: &str,
     user_pubkey_hex: &str,
+    ephemeral_pubkey: Option<&str>,
 ) -> (String, Option<String>) {
     if subject.is_empty() {
         return (subject.to_string(), None);
@@ -759,7 +760,8 @@ fn decrypt_subject_envelope(
         Some(w) => w,
         None => return (subject.to_string(), None), // plaintext subject or not a recipient
     };
-    let cek = match crate::crypto::unwrap_cek(private_key, sender_pub, wrapped) {
+    let unwrap_pub = ephemeral_pubkey.unwrap_or(sender_pub);
+    let cek = match crate::crypto::unwrap_cek(private_key, unwrap_pub, wrapped) {
         Ok(c) => c,
         Err(_) => return (subject.to_string(), None),
     };
@@ -3321,6 +3323,10 @@ fn decrypt_single_block(
     // RECIPIENTS stanzas for this level (spec §10). Non-empty selects the
     // multi-recipient envelope (CEK) path instead of pairwise NIP decryption.
     recipients: &[crate::agreement::Recipient],
+    // The per-message ephemeral pubkey from the RECIPIENTS block (spec §10.1),
+    // if present. The CEK is unwrapped against this key; `None` falls back to the
+    // sender's identity key (legacy envelopes without an `ephemeral` line).
+    ephemeral_pubkey: Option<&str>,
 ) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
     use base64::Engine;
 
@@ -3353,13 +3359,15 @@ fn decrypt_single_block(
 
     // Multi-recipient envelope path (spec §10): selected by the presence of a
     // RECIPIENTS block, not a special body tag. Find the reader's stanza,
-    // NIP-44-unwrap the per-message CEK against the sender's pubkey, then
-    // AES-256-GCM-decrypt the body.
+    // NIP-44-unwrap the per-message CEK against the ephemeral pubkey (or the
+    // sender's pubkey for legacy envelopes), then AES-256-GCM-decrypt the body.
     if !recipients.is_empty() {
         let me = crate::agreement::normalize_pubkey_hex(user_pubkey_hex)
             .unwrap_or_else(|| user_pubkey_hex.to_string());
-        // The sender (who wrapped the CEK) is the message author: SIGNATURE,
-        // then SEAL, then the fallback (other-party) pubkey.
+        // The sender (message author) is the SIGNATURE, then SEAL, then fallback
+        // (other-party) pubkey. With ephemeral wrapping the CEK is unwrapped
+        // against the ephemeral key instead; the sender pubkey remains the
+        // legacy fallback counterparty.
         let sender_pub = match sig_pubkey_hex.or(seal_pubkey_hex)
             .map(|s| s.to_string())
             .or_else(|| (!fallback_pubkey.is_empty()).then(|| fallback_pubkey.to_string()))
@@ -3398,7 +3406,8 @@ fn decrypt_single_block(
                 return (block, None);
             }
         };
-        let cek = match crate::crypto::unwrap_cek(private_key, &sender_pub, wrapped) {
+        let unwrap_pub = ephemeral_pubkey.unwrap_or(&sender_pub);
+        let cek = match crate::crypto::unwrap_cek(private_key, unwrap_pub, wrapped) {
             Ok(c) => c,
             Err(e) => {
                 block.error = Some(format!("Envelope CEK unwrap failed: {}", e));
@@ -3715,6 +3724,8 @@ fn decrypt_armor_tree(
 
     // Decrypt this level
     let perf_block = std::time::Instant::now();
+    let level_ephemeral = parsed.recipients_text.as_deref()
+        .and_then(crate::agreement::parse_recipients_ephemeral);
     let (block, manifest) = decrypt_single_block(
         &parsed.body_text,
         &parsed.body_type,
@@ -3726,6 +3737,7 @@ fn decrypt_armor_tree(
         user_pubkey_hex,
         fallback_pubkey,
         &parsed.recipients,
+        level_ephemeral.as_deref(),
     );
     let block_ms = perf_block.elapsed().as_millis();
     if manifest.is_some() {
@@ -3882,7 +3894,9 @@ pub fn decrypt_email_body_pipeline(
             .or(parsed.seal_pubkey_hex.as_deref())
             .map(|s| s.to_string())
             .unwrap_or_else(|| fallback.to_string());
-        decrypt_subject_envelope(subject, &parsed.recipients, &sender_pub, private_key, &user_pubkey_hex)
+        let subj_ephemeral = parsed.recipients_text.as_deref()
+            .and_then(crate::agreement::parse_recipients_ephemeral);
+        decrypt_subject_envelope(subject, &parsed.recipients, &sender_pub, private_key, &user_pubkey_hex, subj_ephemeral.as_deref())
     } else if parsed.body_type == "encrypted" {
         let nip_hint = parsed.encryption_nip.as_deref().unwrap_or("nip44");
         let subject_fallback = if fallback.is_empty() {
@@ -6809,6 +6823,7 @@ nitela\n\
             None, None, None, None,
             "nsec1fake", "aabb", "",
             &[],
+            None,
         );
         assert!(!block.was_encrypted);
         assert_eq!(block.decrypted_text.as_deref(), Some("Hello world"));

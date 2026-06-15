@@ -20,7 +20,7 @@ All Nostr-Mail content is enclosed in ASCII armor blocks using `-----` delimiter
 | `BEGIN NOSTR SIGNATURE` | Proof of authorship + identity | Schnorr signature (64 bytes) followed by sender's pubkey (32 bytes) |
 | `BEGIN NOSTR SEAL` | Identity declaration | Sender's Nostr public key (unsigned messages only) |
 | `BEGIN NOSTR ENCRYPTED BODY` | Multi-recipient encrypted content | AES-256-GCM ciphertext under a per-message Content Encryption Key (CEK). Identified as the envelope (CEK) path by the accompanying RECIPIENTS block — there is no distinct keyword |
-| `BEGIN NOSTR RECIPIENTS` | Recipient key-wrap + roles | Per-recipient NIP-44-wrapped CEK, pubkey, and role |
+| `BEGIN NOSTR RECIPIENTS` | Recipient key-wrap + roles | A per-message `ephemeral` pubkey header, then per-recipient NIP-44-wrapped CEK (sealed via the ephemeral key), pubkey, and role |
 | `BEGIN NOSTR CONSENT` | Explicit consent marker | A signatory's binding consent to a specific agreement (document hash + signer pubkey); see Section 11.3 |
 | `END NOSTR MESSAGE` | Closing tag | Terminates the outermost block |
 | `END NOSTR SEAL` | Closing tag | Terminates standalone seal blocks |
@@ -208,10 +208,11 @@ When a message has more than one cryptographic recipient — for example multipl
 ----- BEGIN NOSTR ENCRYPTED BODY -----
 <AES-256-GCM ciphertext under CEK, glossia-encoded (see note below)>
 ----- BEGIN NOSTR RECIPIENTS -----
-signer <pubkey-1> <NIP-44-wrapped CEK>
-signer <pubkey-2> <NIP-44-wrapped CEK>
-viewer <pubkey-3> <NIP-44-wrapped CEK>
-self   <sender-pubkey> <NIP-44-wrapped CEK>
+ephemeral <ephemeral-pubkey>
+signer <pubkey-1> <CEK wrapped via ephemeral key>
+signer <pubkey-2> <CEK wrapped via ephemeral key>
+viewer <pubkey-3> <CEK wrapped via ephemeral key>
+self   <sender-pubkey> <CEK wrapped via ephemeral key>
 ----- BEGIN NOSTR SIGNATURE -----
 @ProfileName
 <signature: glossia-encoded or hex (64 bytes)>
@@ -233,12 +234,14 @@ Each encrypted level in a reply chain has its own independent CEK, and therefore
 ----- BEGIN NOSTR ENCRYPTED BODY -----
 <reply ciphertext under CEK_reply>
 ----- BEGIN NOSTR RECIPIENTS -----
+ephemeral <reply-ephemeral-pubkey>
 signer <pubkey-1> <CEK_reply wrapped to pubkey-1>
 signer <pubkey-2> <CEK_reply wrapped to pubkey-2>
 self   <reply-author-pubkey> <CEK_reply wrapped to self>
 ----- BEGIN NOSTR ENCRYPTED BODY -----
 <original ciphertext under CEK_orig>
 ----- BEGIN NOSTR RECIPIENTS -----
+ephemeral <original-ephemeral-pubkey>
 signer <pubkey-1> <CEK_orig wrapped to pubkey-1>
 signer <pubkey-2> <CEK_orig wrapped to pubkey-2>
 self   <original-author-pubkey> <CEK_orig wrapped to self>
@@ -515,7 +518,7 @@ To make the `(pubkey, email)` pairing itself authenticated rather than inferred 
    - For NIP-44 / CEK-envelope: signature verification is recommended but not required (NIP-44 and AES-256-GCM provide their own authentication via HMAC / GCM tag)
 8. **Decrypt** if encrypted. The path is selected by the **presence of a RECIPIENTS block**, not by a distinct body tag:
    - **Pairwise** (`NIP-04`/`NIP-44 ENCRYPTED BODY`, **no** RECIPIENTS block): use the recipient's private key and the sender's pubkey
-   - **Multi-recipient** (generic `ENCRYPTED BODY` **with** a RECIPIENTS block): locate the stanza whose pubkey matches the reader's own pubkey, NIP-44-unwrap the CEK using the reader's private key and the sender's pubkey, then AES-256-GCM-decrypt the body with the CEK. If no stanza matches the reader's pubkey, the reader is not a recipient of that level and cannot decrypt it (this is expected for levels predating the reader's addition to the thread — see Section 10.8)
+   - **Multi-recipient** (generic `ENCRYPTED BODY` **with** a RECIPIENTS block): locate the stanza whose pubkey matches the reader's own pubkey, NIP-44-unwrap the CEK using the reader's private key and the message's **ephemeral pubkey** (the `ephemeral` line; falling back to the sender's pubkey for legacy envelopes — Section 10.1), then AES-256-GCM-decrypt the body with the CEK. If no stanza matches the reader's pubkey, the reader is not a recipient of that level and cannot decrypt it (this is expected for levels predating the reader's addition to the thread — see Section 10.8)
 
 ## 9. Spam Rescue & Folder Handling
 
@@ -561,22 +564,30 @@ NIP-44 is pairwise: a ciphertext encrypted with the shared secret of `(senderPri
 1. Generate a random 256-bit Content Encryption Key (CEK).
 2. Encrypt the body ONCE with AES-256-GCM under the CEK            → one ENCRYPTED BODY
    (attachments are encrypted under the same CEK, as today).
-3. For each pubkey P in { To ∪ Cc ∪ sender-self }:
-       wrapped[P] = NIP44_encrypt(CEK, senderPriv, P)             → one RECIPIENTS stanza per P
-4. Emit: [ENCRYPTED BODY] + [RECIPIENTS block] + optional [SIGNATURE]
+3. Generate a per-message ephemeral keypair (ephPriv, ephPub).    → published as the
+   The ephemeral private key is used only for the wraps below,        RECIPIENTS `ephemeral` line
+   then discarded.
+4. For each pubkey P in { To ∪ Cc ∪ sender-self }:
+       wrapped[P] = NIP44_encrypt(CEK, ephPriv, P)                → one RECIPIENTS stanza per P
+5. Emit: [ENCRYPTED BODY] + [RECIPIENTS block] + optional [SIGNATURE]
 ```
 
-To read the message, a recipient locates the stanza addressed to their own pubkey, NIP-44-unwraps the CEK with their private key and the sender's pubkey, then AES-256-GCM-decrypts the body. The body ciphertext is produced once regardless of recipient count; only the 32-byte CEK is wrapped per recipient.
+**Ephemeral key wrapping (AGE-style).** The CEK is wrapped against a fresh **per-message ephemeral key**, not the sender's identity key. The ephemeral public key is published as the RECIPIENTS block's `ephemeral <pubkey>` header line (Section 10.2); each `wrapped-cek` is `NIP44_encrypt(CEK, ephPriv, recipientPub)`. This keeps the encryption layer separate from the signing/identity key: the long-term secret never performs the CEK ECDH, the ECDH is not reused across messages, and an unsigned envelope (SEAL) discloses no sender-derived key material in its wraps. Because the ephemeral line lives inside the RECIPIENTS block, it is covered by the level's SIGNATURE along with the recipient set.
 
-The sender's pubkey (needed to unwrap the CEK) is taken from the SIGNATURE block, the SEAL block, or the `X-Nostr-Pubkey` header — a multi-recipient message MUST therefore carry one of these.
+To read the message, a recipient locates the stanza addressed to their own pubkey, NIP-44-unwraps the CEK with **their private key and the message's ephemeral public key** (from the `ephemeral` line), then AES-256-GCM-decrypts the body. The body ciphertext is produced once regardless of recipient count; only the 32-byte CEK is wrapped per recipient.
+
+For backward compatibility, a decoder that finds no `ephemeral` line MUST fall back to unwrapping against the **sender's identity pubkey** (legacy envelopes wrapped the CEK directly to the sender's key). The sender's pubkey is taken from the SIGNATURE block, the SEAL block, or the `X-Nostr-Pubkey` header — a multi-recipient message MUST therefore carry one of these (the sender's pubkey also remains the unwrap counterparty for legacy envelopes).
 
 ### 10.2 RECIPIENTS Block Format
 
-The RECIPIENTS block contains one entry per line. Each entry begins with the two required tokens `role` and `pubkey`, followed by any subset of the **optional, content-typed** tokens below, in any order:
+The RECIPIENTS block opens with an optional `ephemeral <pubkey>` header line (Section 10.1) and then contains one recipient entry per line. Each recipient entry begins with the two required tokens `role` and `pubkey`, followed by any subset of the **optional, content-typed** tokens below, in any order:
 
 ```
+ephemeral <pubkey>
 <role> <pubkey> [<wrapped-cek>] [<email>] [<reference>]
 ```
+
+The `ephemeral` line is **not** a recipient stanza: it publishes the per-message ephemeral public key against which every `wrapped-cek` in the block was sealed. Decoders MUST recognize a line whose first token is `ephemeral` as this header (its second token is the ephemeral pubkey) and MUST NOT treat it as a recipient. It SHOULD be the first non-blank line of the block. When absent, decoders fall back to the sender's identity pubkey as the unwrap counterparty (Section 10.1).
 
 | Field | Encoding | Notes |
 |-------|----------|-------|
@@ -601,7 +612,9 @@ Rules:
 
 ### 10.4 Self-Stanza
 
-Every multi-recipient message MUST include a `self` stanza wrapping the CEK to the sender's own pubkey (`NIP44_encrypt(CEK, senderPriv, senderPub)`). This mirrors the "wrap twice — once to the recipient, once to yourself" behavior of NIP-17 DMs and is what makes sent agreements readable after a fresh install or on a second device.
+Every multi-recipient message MUST include a `self` stanza wrapping the CEK to the sender's own pubkey (`NIP44_encrypt(CEK, ephPriv, senderPub)` — the same ephemeral wrap as every other stanza; Section 10.1). This mirrors the "wrap twice — once to the recipient, once to yourself" behavior of NIP-17 DMs and is what makes sent agreements readable after a fresh install or on a second device.
+
+The `self` role is an **accounting marker**, distinct from which pubkey appears in the stanza. The stanza's `pubkey` is the sender's own identity key (the unwrap target, so the sender can recover the CEK from the ephemeral pubkey), but the role is `self` precisely so the sender is **excluded** from signatory / required-signer / completion accounting (Sections 10.3, 11.5). Labeling the sender's own stanza `signer` or `viewer` would wrongly count the sender as a counterparty to their own agreement; `self` must therefore be used even though the pubkey is the sender's real identity.
 
 ### 10.5 Single-Recipient Gating & Backward Compatibility
 

@@ -416,6 +416,17 @@ pub fn generate_cek() -> [u8; 32] {
     cek
 }
 
+/// Generate a per-message ephemeral keypair for CEK wrapping (spec Section 10.1,
+/// AGE-style). Returns `(private_key_bech32, public_key_hex)`. The private key is
+/// used only to wrap the CEK to each recipient and is then discarded; the public
+/// key is published in the RECIPIENTS block so recipients can unwrap. Using an
+/// ephemeral key (rather than the sender's identity key) for the ECDH wrap keeps
+/// the encryption layer separate from the signing/identity key.
+pub fn generate_ephemeral_keypair() -> Result<(String, String)> {
+    let keys = Keys::generate();
+    Ok((keys.secret_key().to_bech32()?, keys.public_key().to_hex()))
+}
+
 /// Wrap a CEK to a single recipient using NIP-44 (spec Section 10.1, step 3).
 ///
 /// The 32-byte CEK is hex-encoded and NIP-44 encrypted with the shared secret of

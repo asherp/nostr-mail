@@ -28,6 +28,14 @@ pub const ROLE_SIGNER: &str = "signer";
 pub const ROLE_VIEWER: &str = "viewer";
 pub const ROLE_SELF: &str = "self";
 
+/// Leading marker for the RECIPIENTS block's ephemeral-pubkey header line
+/// (spec Section 10.1). The line `ephemeral <pubkey-hex>` publishes the
+/// per-message ephemeral public key against which every `wrapped-cek` in the
+/// block was sealed. It is not a recipient stanza and is excluded from parsing
+/// into [`Recipient`]s, but — living inside the signed RECIPIENTS block — it is
+/// covered by the level's SIGNATURE.
+pub const RECIPIENTS_EPHEMERAL: &str = "ephemeral";
+
 /// A single entry in a `RECIPIENTS` block (spec Section 10.2). After the fixed
 /// `role` and `pubkey`, the remaining tokens are **optional and typed by
 /// content**, in any order:
@@ -163,6 +171,11 @@ pub fn parse_recipients_block(block_body: &str) -> Vec<Recipient> {
             Some(t) => t.to_ascii_lowercase(),
             None => continue,
         };
+        // The `ephemeral <pubkey>` header line is not a recipient stanza
+        // (spec §10.1); skip it here — see [`parse_recipients_ephemeral`].
+        if role == RECIPIENTS_EPHEMERAL {
+            continue;
+        }
         let pubkey = match toks.next() {
             Some(t) => t.to_string(),
             None => continue,
@@ -182,6 +195,27 @@ pub fn parse_recipients_block(block_body: &str) -> Vec<Recipient> {
         out.push(Recipient { role, pubkey, wrapped_cek, email, reference });
     }
     out
+}
+
+/// Extract the per-message ephemeral public key from a RECIPIENTS block body
+/// (spec Section 10.1): the `<pubkey>` of the first `ephemeral <pubkey>` line.
+///
+/// Returns `None` for legacy blocks that wrapped the CEK directly to the
+/// sender's identity key (no `ephemeral` line). Callers unwrap against this key
+/// when present, falling back to the sender's pubkey otherwise. Blank lines and
+/// `> ` quote prefixes are ignored.
+pub fn parse_recipients_ephemeral(block_body: &str) -> Option<String> {
+    for raw in block_body.split('\n') {
+        let line = strip_quote_prefix(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut toks = line.split_whitespace();
+        if toks.next().map(|t| t.eq_ignore_ascii_case(RECIPIENTS_EPHEMERAL)) == Some(true) {
+            return toks.next().map(|t| t.to_string());
+        }
+    }
+    None
 }
 
 /// Serialize recipients into a canonical RECIPIENTS block body (no BEGIN/END
@@ -458,10 +492,15 @@ pub fn encode_hybrid_agreement_with_cek(
     let (body_encoded, body_decoded_bytes) = crate::email::glossia_encode_bytes_with(&ciphertext, encoding)
         .ok_or_else(|| anyhow::anyhow!("glossia encode of agreement body failed"))?;
 
-    // 3. Wrap the CEK to each recipient, then to self (Section 10.1 step 3, 10.4).
+    // 3. Wrap the CEK with a per-message ephemeral key (AGE-style; Section 10.1
+    // step 3, 10.4). The ephemeral private key seals the CEK to each recipient
+    // (and to the sender's own `self` stanza) via NIP-44 ECDH, then is discarded;
+    // its public key is published in the block so recipients can unwrap. This
+    // keeps the encryption layer off the sender's signing/identity key.
+    let (eph_priv, eph_pub_hex) = crate::crypto::generate_ephemeral_keypair()?;
     let mut recipients: Vec<Recipient> = Vec::with_capacity(recipients_in.len() + 1);
     for r in recipients_in {
-        let wrapped = crate::crypto::wrap_cek(sender_priv, &r.pubkey, cek)?;
+        let wrapped = crate::crypto::wrap_cek(&eph_priv, &r.pubkey, cek)?;
         recipients.push(Recipient {
             role: r.role.to_ascii_lowercase(),
             pubkey: r.pubkey.clone(),
@@ -470,7 +509,12 @@ pub fn encode_hybrid_agreement_with_cek(
             reference: None,
         });
     }
-    let self_wrapped = crate::crypto::wrap_cek(sender_priv, &sender_pub_hex, cek)?;
+    // The `self` stanza lets the sender decrypt their own sent copy. Its role is
+    // `self` (not signer/viewer) so it is excluded from signatory/completion
+    // accounting (Sections 10.3/10.4/11.5); its pubkey is the sender's identity
+    // key (the unwrap target), but the CEK is wrapped against the ephemeral key
+    // like every other stanza.
+    let self_wrapped = crate::crypto::wrap_cek(&eph_priv, &sender_pub_hex, cek)?;
     recipients.push(Recipient {
         role: ROLE_SELF.to_string(),
         pubkey: sender_pub_hex.clone(),
@@ -479,7 +523,14 @@ pub fn encode_hybrid_agreement_with_cek(
         reference: None,
     });
 
-    let recipients_body = serialize_recipients(&recipients);
+    // The ephemeral pubkey heads the block (a non-stanza line) so it is covered
+    // by the level's SIGNATURE along with the recipient set (Section 10.1).
+    let recipients_body = format!(
+        "{} {}\n{}",
+        RECIPIENTS_EPHEMERAL,
+        eph_pub_hex,
+        serialize_recipients(&recipients)
+    );
     let canon_recipients = canonicalize_block(&recipients_body);
 
     // The signed body bytes are the canonical decoded armor body — what
@@ -822,7 +873,10 @@ mod tests {
             .iter()
             .find(|r| normalize_pubkey_hex(&r.pubkey).as_deref() == Some(reader_pub_hex))
             .expect("reader has a stanza");
-        let cek = crate::crypto::unwrap_cek(reader_priv, sender_pub_hex, stanza.wrapped_cek.as_deref().unwrap()).unwrap();
+        // The CEK is wrapped against the per-message ephemeral key (§10.1).
+        let unwrap_pub = parse_recipients_ephemeral(&recip_body)
+            .unwrap_or_else(|| sender_pub_hex.to_string());
+        let cek = crate::crypto::unwrap_cek(reader_priv, &unwrap_pub, stanza.wrapped_cek.as_deref().unwrap()).unwrap();
         crate::crypto::aes_gcm_decrypt_raw(&cek, &ciphertext).unwrap()
     }
 
@@ -869,6 +923,49 @@ mod tests {
         assert_eq!(reader_recovers_body(&armor, &alice.private_key, &alice_hex, &sender_pub_hex), body);
         assert_eq!(reader_recovers_body(&armor, &bob.private_key, &bob_hex, &sender_pub_hex), body);
         assert_eq!(reader_recovers_body(&armor, &sender.private_key, &sender_pub_hex, &sender_pub_hex), body);
+    }
+
+    #[test]
+    fn test_envelope_wraps_cek_with_ephemeral_key_not_sender_identity() {
+        let sender = crate::crypto::generate_keypair().unwrap();
+        let sender_pub_hex = normalize_pubkey_hex(
+            &crate::crypto::get_public_key_from_private(&sender.private_key).unwrap()).unwrap();
+        let alice = crate::crypto::generate_keypair().unwrap();
+        let alice_hex = normalize_pubkey_hex(&alice.public_key).unwrap();
+
+        let body = b"ephemeral wrap test";
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone(), email: None,
+        }];
+        let armor = encode_hybrid_agreement(
+            &sender.private_key, &sender.public_key, None, "Originator", body, &recips, false, true, None,
+        ).unwrap();
+
+        let recip_body: String = armor
+            .lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR RECIPIENTS"))
+            .skip(1)
+            .take_while(|l| !l.contains("BEGIN NOSTR"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The block publishes a per-message ephemeral pubkey, distinct from the
+        // sender's identity key, and it is excluded from the parsed stanzas.
+        let eph = parse_recipients_ephemeral(&recip_body).expect("ephemeral line present");
+        let eph = normalize_pubkey_hex(&eph).expect("ephemeral pubkey is valid");
+        assert_ne!(eph, sender_pub_hex, "ephemeral key must differ from sender identity");
+        let recips_parsed = parse_recipients_block(&recip_body);
+        assert!(recips_parsed.iter().all(|r| normalize_pubkey_hex(&r.pubkey).as_deref() != Some(eph.as_str())),
+            "ephemeral line is not a recipient stanza");
+
+        let stanza = recips_parsed.iter()
+            .find(|r| normalize_pubkey_hex(&r.pubkey).as_deref() == Some(alice_hex.as_str()))
+            .unwrap();
+        let wrapped = stanza.wrapped_cek.as_deref().unwrap();
+        // Unwrapping against the ephemeral key works…
+        assert!(crate::crypto::unwrap_cek(&alice.private_key, &eph, wrapped).is_ok());
+        // …but unwrapping against the sender identity key does NOT (ephemeral wrap).
+        assert!(crate::crypto::unwrap_cek(&alice.private_key, &sender_pub_hex, wrapped).is_err());
     }
 
     #[test]

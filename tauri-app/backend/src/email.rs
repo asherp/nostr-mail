@@ -2159,39 +2159,50 @@ struct ArmorLevelParts {
     nested_armor: Option<String>,
 }
 
+/// Reduce a line to its armor-marker core: drop a leading email quote prefix
+/// (`> ` or `>`), surrounding whitespace, and the `-----` rails. This makes a
+/// marker recognized identically whether or not the line is quoted in a reply —
+/// `BEGIN NOSTR SIGNED BODY` is the canonical start with or without the quote
+/// delimiter. One quote level is stripped per parse pass; deeper nesting is
+/// unwrapped on recursion (matching `nested_lines`' `> ` stripping).
+fn marker_core(l: &str) -> &str {
+    let t = l.trim();
+    let t = t.strip_prefix("> ").or_else(|| t.strip_prefix('>')).unwrap_or(t);
+    t.trim().trim_matches('-').trim()
+}
 fn level_is_begin_body(l: &str) -> bool {
-    let t = l.trim().trim_matches('-').trim();
+    let t = marker_core(l);
     t.starts_with("BEGIN NOSTR NIP-")            // pairwise NIP-04 / NIP-44
         || t.starts_with("BEGIN NOSTR ENCRYPTED") // generic AES-256-GCM under a CEK (multi-recipient envelope)
         || t.starts_with("BEGIN NOSTR SIGNED")
 }
 fn level_is_begin_recipients(l: &str) -> bool {
-    l.trim().trim_matches('-').trim() == "BEGIN NOSTR RECIPIENTS"
+    marker_core(l) == "BEGIN NOSTR RECIPIENTS"
 }
 fn level_is_begin_consent(l: &str) -> bool {
-    l.trim().trim_matches('-').trim() == "BEGIN NOSTR CONSENT"
+    marker_core(l) == "BEGIN NOSTR CONSENT"
 }
 fn level_is_begin_attachments(l: &str) -> bool {
-    l.trim().trim_matches('-').trim() == "BEGIN NOSTR ATTACHMENTS"
+    marker_core(l) == "BEGIN NOSTR ATTACHMENTS"
 }
 fn level_is_end_attachments(l: &str) -> bool {
-    l.trim().trim_matches('-').trim() == "END NOSTR ATTACHMENTS"
+    marker_core(l) == "END NOSTR ATTACHMENTS"
 }
 fn level_is_begin_sig_or_seal(l: &str) -> bool {
-    let t = l.trim().trim_matches('-').trim();
+    let t = marker_core(l);
     t == "BEGIN NOSTR SIGNATURE" || t == "BEGIN NOSTR SEAL"
 }
 fn level_is_end_recipients(l: &str) -> bool {
-    l.trim().trim_matches('-').trim() == "END NOSTR RECIPIENTS"
+    marker_core(l) == "END NOSTR RECIPIENTS"
 }
 fn level_is_end_consent(l: &str) -> bool {
-    l.trim().trim_matches('-').trim() == "END NOSTR CONSENT"
+    marker_core(l) == "END NOSTR CONSENT"
 }
 /// A message-closing END (`END NOSTR MESSAGE`, legacy `END NOSTR NIP-XX …`, or
 /// `END NOSTR SEAL`) — but NOT the standalone RECIPIENTS/CONSENT terminators,
 /// which must not affect nesting depth.
 fn level_is_end_message(l: &str) -> bool {
-    let t = l.trim().trim_matches('-').trim();
+    let t = marker_core(l);
     t.starts_with("END NOSTR") && t != "END NOSTR RECIPIENTS" && t != "END NOSTR CONSENT" && t != "END NOSTR ATTACHMENTS"
 }
 

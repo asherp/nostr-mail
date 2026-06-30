@@ -320,6 +320,16 @@ pub struct ParsedArmorMessage {
     pub attachments: Vec<crate::agreement::AttachmentSpec>,
 }
 
+/// Result of building a 1:1 (pairwise) encrypted manifest body in Rust (spec
+/// §11.2): the NIP-encrypted, ASCII-armored body to place in the message, plus
+/// the encrypted `aN.dat` attachment MIME parts to send alongside it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptedManifestBody {
+    pub armored_body: String,
+    pub attachments: Vec<EmailAttachment>,
+}
+
 /// Result of checking a delivered plaintext attachment against a public message's
 /// signed ATTACHMENTS block (spec §11.2). A file is trustworthy only when the
 /// message signature is valid (so the block is authentic) *and* the file's

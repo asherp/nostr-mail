@@ -301,6 +301,14 @@ const TauriService = {
     verifyPublicAttachment: async function(armor, filename, dataBase64) {
         return await this.invoke('verify_public_attachment', { armor, filename, dataBase64 });
     },
+    // Build a 1:1 (pairwise) encrypted manifest body in Rust (spec §11.2): AES the
+    // body + plaintext attachments into a capnp manifest, NIP-encrypt it to
+    // `recipientPubkey`, and ASCII-armor it. `attachments` are plaintext
+    // (plainAttachmentsForEmail shape). Returns { armoredBody, attachments } where
+    // attachments are the encrypted aN.dat parts. Uses the active account key.
+    encryptManifestBody: async function(recipientPubkey, body, attachments, algorithm) {
+        return await this.invoke('encrypt_manifest_body', { recipientPubkey, body, attachments, algorithm });
+    },
     // `ccPlain` are keyless Cc emails (header-only, can't decrypt). `isAgreement`
     // false → plain multi-recipient encrypted mail (viewer roles, no marker).
     sendAgreement: async function(emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, isAgreement, encryptSubject, sign, profileName = null, messageId = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, glossiaEncoding = null, subjectEncoding = null, attachments = null) {

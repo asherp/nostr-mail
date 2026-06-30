@@ -823,6 +823,42 @@ fn encrypted_parts_to_mime(
         .collect()
 }
 
+/// Wrap a NIP ciphertext in the ASCII armor a 1:1 body uses (mirrors the
+/// frontend's `armorCiphertext`): `-----BEGIN NOSTR NIP-XX ENCRYPTED BODY-----`.
+fn armor_ciphertext(ciphertext: &str, algorithm: &str) -> String {
+    let armor_type = if algorithm.eq_ignore_ascii_case("nip04") { "NIP-04" } else { "NIP-44" };
+    format!(
+        "-----BEGIN NOSTR {} ENCRYPTED BODY-----\n{}\n-----END NOSTR MESSAGE-----",
+        armor_type,
+        ciphertext.trim()
+    )
+}
+
+/// Build a 1:1 (pairwise) encrypted manifest body in Rust (spec §11.2).
+///
+/// AES-encrypts the body + each plaintext attachment into a Cap'n Proto manifest
+/// (text-armored for the string-typed NIP transport), NIP-encrypts that manifest
+/// to `recipient_pubkey`, and ASCII-armors the result. Returns the armored body
+/// plus the encrypted `aN.dat` MIME parts. The subject, glossia encoding, and
+/// signing remain the caller's responsibility (unchanged from the JSON flow).
+pub fn encrypt_manifest_body(
+    sender_priv: &str,
+    recipient_pubkey: &str,
+    body: &str,
+    attachments: &[crate::types::EmailAttachment],
+    algorithm: &str,
+) -> Result<crate::types::EncryptedManifestBody, String> {
+    let inputs = attachment_inputs_from(attachments)?;
+    let (payload, parts) = crate::manifest::build_capnp_manifest_armored(body, &inputs)
+        .map_err(|e| format!("manifest build failed: {}", e))?;
+    let ciphertext = crate::crypto::encrypt_message(sender_priv, recipient_pubkey, &payload, Some(algorithm))
+        .map_err(|e| format!("manifest encrypt failed: {}", e))?;
+    Ok(crate::types::EncryptedManifestBody {
+        armored_body: armor_ciphertext(&ciphertext, algorithm),
+        attachments: encrypted_parts_to_mime(parts),
+    })
+}
+
 /// Decrypt an agreement subject that was AES-256-GCM-encrypted under the message
 /// CEK (the envelope path; counterpart to [`compose_agreement`]). Unwraps the CEK
 /// from the reader's RECIPIENTS stanza, then decrypts. Returns the subject
@@ -6556,6 +6592,59 @@ nitela\n\
         // the signature — the binding is enforced cryptographically.
         let tampered = composed.armor.replace(&sha, &"f".repeat(64));
         assert_eq!(verify_email_signature_inline(&tampered), Some(false));
+    }
+
+    #[test]
+    fn test_encrypt_manifest_body_1v1_roundtrips() {
+        use crate::types::EmailAttachment;
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // recipient
+
+        let file = b"%PDF-1.7 the 1:1 attachment bytes";
+        let atts = vec![EmailAttachment {
+            filename: "invoice.pdf".into(),
+            content_type: "application/pdf".into(),
+            data: b64.encode(file),
+            size: file.len(),
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        }];
+
+        // Rust builds the capnp manifest, NIP-44-encrypts it to bob, and armors it.
+        let out = encrypt_manifest_body(
+            &alice.private_key, &bob.public_key, "Hello Bob, see attached.", &atts, "nip44",
+        ).unwrap();
+        assert!(out.armored_body.contains("BEGIN NOSTR NIP-44 ENCRYPTED BODY"));
+        assert_eq!(out.attachments.len(), 1);
+        assert_eq!(out.attachments[0].filename, "a1.dat");
+
+        // Bob recovers the body + attachment metadata from the manifest (no
+        // signature yet — signing happens later in the send path).
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &out.armored_body, "", Some(&alice.public_key), None, None,
+            /* require_signature */ false, false,
+        ).unwrap();
+        assert!(r.success, "decrypt failed: {:?}", r.error);
+        assert!(r.is_manifest);
+        assert_eq!(r.body, "Hello Bob, see attached.");
+        assert_eq!(r.attachments.len(), 1);
+        assert_eq!(r.attachments[0].orig_filename, "invoice.pdf");
+
+        // …and the encrypted MIME part decrypts back to the original file.
+        let dec = decrypt_attachment_pipeline(
+            &out.attachments[0].data,
+            &r.attachments[0].key_wrap_b64,
+            r.attachments[0].cipher_sha256_hex.as_deref(),
+            &r.attachments[0].orig_filename,
+            &r.attachments[0].orig_mime,
+        ).unwrap();
+        assert_eq!(b64.decode(dec.data_b64).unwrap(), file);
     }
 
     #[test]

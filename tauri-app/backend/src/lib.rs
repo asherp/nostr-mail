@@ -2085,6 +2085,25 @@ async fn construct_email_headers(mut email_config: EmailConfig, to_address: Stri
         .map_err(|e| e.to_string())
 }
 
+/// Build a 1:1 (pairwise) encrypted manifest body in Rust (spec §11.2): AES the
+/// body + plaintext attachments into a Cap'n Proto manifest, NIP-encrypt it to
+/// `recipientPubkey`, and ASCII-armor it. Returns `{ armoredBody, attachments }`
+/// (the encrypted `aN.dat` parts). The frontend keeps handling subject, glossia,
+/// and signing. See [`email::encrypt_manifest_body`].
+#[tauri::command]
+fn encrypt_manifest_body(
+    private_key: Option<String>,
+    recipient_pubkey: String,
+    body: String,
+    attachments: Vec<crate::types::EmailAttachment>,
+    algorithm: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<types::EncryptedManifestBody, String> {
+    let private_key = resolve_private_key(private_key, &state)?;
+    let algo = algorithm.as_deref().unwrap_or("nip44");
+    email::encrypt_manifest_body(&private_key, &recipient_pubkey, &body, &attachments, algo)
+}
+
 /// Verify a delivered (plaintext) attachment against a public message's signed
 /// ATTACHMENTS block (spec §11.2): recompute its SHA-256 and check it against the
 /// signed spec, also confirming the message signature is valid. `data_base64` is
@@ -7622,6 +7641,7 @@ pub fn run() {
         compose_agreement,
         send_agreement,
         verify_public_attachment,
+        encrypt_manifest_body,
         agreement_status,
         verify_email_binding,
         fetch_image,

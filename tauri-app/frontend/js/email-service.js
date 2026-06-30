@@ -7513,116 +7513,57 @@ ${attachmentsHtml}
             this._subjectCiphertext = null;
 
             if (shouldUseManifest) {
-                // Use manifest-based encryption when attachments are present or body is large
+                // Manifest-based encryption (attachments present or large body).
+                // The capnp manifest + body NIP-encryption are built in Rust
+                // (crypto consolidated there; spec §11.2). Subject NIP-encryption,
+                // glossia encoding, and signing stay here, unchanged.
                 const reason = hasAttachments ? 'has attachments' : 'large body (>64KB)';
-                console.log(`[JS] Using manifest-based encryption (${reason})`);
-                
-                // Create the manifest structure
-                const manifest = {
-                    body: {},
-                    attachments: []
-                };
-                
-                // 1. Encrypt body with AES and store in manifest
-                if (body) {
-                    console.log('[JS] Encrypting body with AES...');
-                    const bodyAesKey = await this.generateSymmetricKey();
-                    // Convert UTF-8 string to base64 properly (handles multi-byte characters)
-                    const bodyBase64 = btoa(unescape(encodeURIComponent(body)));
-                    const encryptedBodyData = await this.encryptWithAES(bodyBase64, bodyAesKey);
-                    const bodySha256 = await this.calculateSHA256(encryptedBodyData);
-                    
-                    manifest.body = {
-                        ciphertext: encryptedBodyData,
-                        cipher_sha256: bodySha256,
-                        cipher_size: encryptedBodyData.length,
-                        key_wrap: bodyAesKey // Unencrypted AES key (manifest will be encrypted)
-                    };
-                    console.log('[JS] Body encrypted with AES, size:', encryptedBodyData.length);
-                }
-                
-                // 2. Encrypt attachments with AES and create manifest entries
-                for (let i = 0; i < this.attachments.length; i++) {
-                    const attachment = this.attachments[i];
-                    const opaqueId = `a${i + 1}`;
-                    
-                    console.log(`[JS] Encrypting attachment ${opaqueId}: ${attachment.name}`);
-                    
-                    // Generate AES key for this attachment
-                    const attachmentAesKey = await this.generateSymmetricKey();
-                    
-                    // Encrypt attachment data with AES (with padding)
-                    const encryptedAttachmentData = await this.encryptWithAES(attachment.data, attachmentAesKey, true);
-                    const attachmentSha256 = await this.calculateSHA256(encryptedAttachmentData);
-                    
-                    // Calculate padded size for display
-                    const originalSize = attachment.size;
-                    const PADDING_SIZE = 64 * 1024; // 64 KiB
-                    const paddedSize = Math.ceil(originalSize / PADDING_SIZE) * PADDING_SIZE;
-                    
-                    // Update attachment with opaque filename and encrypted data
-                    attachment.encryptedData = {
-                        method: 'manifest_aes',
-                        encrypted_file: encryptedAttachmentData,
-                        opaque_id: opaqueId,
-                        aes_key: attachmentAesKey, // Store AES key for decryption
-                        cipher_sha256: attachmentSha256,
-                        original_filename: attachment.name,
-                        original_type: attachment.type,
-                        original_size: originalSize
-                    };
-                    
-                    // Update attachment size to show padded size
-                    attachment.size = paddedSize;
-                    attachment.isEncrypted = true;
-                    
-                    // Add to manifest
-                    manifest.attachments.push({
-                        id: opaqueId,
-                        orig_filename: attachment.name,
-                        orig_mime: attachment.type,
-                        cipher_sha256: attachmentSha256,
-                        cipher_size: encryptedAttachmentData.length,
-                        key_wrap: attachmentAesKey // Unencrypted AES key (manifest will be encrypted)
-                    });
-                    
-                    console.log(`[JS] Attachment ${opaqueId} encrypted, size: ${encryptedAttachmentData.length}`);
-                }
-                
-                // 3. Encrypt subject (direct NIP encryption)
+                console.log(`[JS] Using manifest-based encryption (${reason}) — built in Rust`);
+
+                // 1. Encrypt subject (direct NIP encryption) — unchanged.
                 let encryptedSubject = subject;
                 if (subject) {
-                    console.log('[JS] Encrypting subject with NIP...');
                     encryptedSubject = await TauriService.encryptMessageWithAlgorithm(pubkey, subject, encryptionAlgorithm);
-                    console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
                     this._subjectCiphertext = encryptedSubject.trim();
                     domManager.setValue('subject', encryptedSubject.trim());
                 }
 
-                // 4. JSON.stringify(manifest) → encrypt entire manifest with NIP → ASCII armor
-                console.log('[JS] Creating encrypted manifest...');
-                const manifestJson = JSON.stringify(manifest);
-                console.log('[JS] Manifest JSON size:', manifestJson.length);
+                // 2. Body + attachments → Rust builds the capnp manifest, NIP-
+                //    encrypts it to the recipient, and ASCII-armors it.
+                const plainAtts = this.plainAttachmentsForEmail() || [];
+                const result = await TauriService.encryptManifestBody(
+                    pubkey, body || '', plainAtts, encryptionAlgorithm
+                );
+                domManager.setValue('messageBody', result.armoredBody.trim());
+                // Truthy → triggers the _plainBody/_htmlBody rebuild below.
+                rawEncryptedBody = result.armoredBody;
 
-                const encryptedManifest = await TauriService.encryptMessageWithAlgorithm(pubkey, manifestJson, encryptionAlgorithm);
-                console.log('[JS] Manifest encrypted, size:', encryptedManifest.length);
-                rawEncryptedBody = encryptedManifest;
+                // 3. Stamp each pending attachment with its encrypted form so
+                //    prepareAttachmentsForEmail() emits the matching aN.dat MIME
+                //    parts (the encrypted bytes ride outside the armor).
+                (result.attachments || []).forEach((part, i) => {
+                    const att = this.attachments[i];
+                    if (!att) return;
+                    att.encryptedData = {
+                        method: 'manifest_aes',
+                        encrypted_file: part.data,
+                        opaque_id: `a${i + 1}`,
+                        original_filename: att.name,
+                        original_type: att.type,
+                        original_size: att.size,
+                    };
+                    att.isEncrypted = true;
+                });
 
-                // Wrap in ASCII armor
-                const armoredManifest = this.armorCiphertext(encryptedManifest, encryptionAlgorithm);
-                domManager.setValue('messageBody', armoredManifest.trim());
-                
                 // NIP-44 clears any stale signature since body state changed.
                 // NIP-04 signing happens after glossia encoding (below).
                 if (encryptionAlgorithm !== 'nip04') {
                     this.clearSignature();
                 }
 
-                // Update attachment list display
                 this.renderAttachmentList();
-
                 notificationService.showSuccess(`Email encrypted using manifest format (${reason}) with ${encryptionAlgorithm.toUpperCase()}`);
-                
+
             } else {
                 // Use simplified encryption when no attachments
                 console.log('[JS] Using simplified encryption (no attachments)');

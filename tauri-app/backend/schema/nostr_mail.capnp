@@ -45,19 +45,21 @@ enum NipVersion {
 # body. After the outer layer is opened (pairwise NIP-44, or the
 # per-recipient-wrapped CEK), the decrypted payload is:
 #
-#   Cap'n Proto  — "capnp:" marker, then the raw serialized
+#   Cap'n Proto  — "capnp:"   marker, then the raw serialized
 #                  single-segment Manifest message (binary)
+#   Cap'n Proto  — "capnp64:" marker, then base64 of that message
 #   JSON (legacy)— first byte is 0x7B ('{')
 #   plaintext    — anything else (not a manifest)
 #
-# The serialized Cap'n Proto rides as raw bytes behind the "capnp:"
-# marker — no base64 armor. The manifest never touches the wire in the
-# clear: it is encrypted by the outer layer (CEK or NIP-44) and that
-# ciphertext is what gets glossia-encoded for transport, so no inner
-# armor is needed. The CEK transport is byte-clean; the legacy pairwise
-# NIP-44 path is string-typed and only ever carried plaintext or the
-# legacy JSON manifest. New messages use Cap'n Proto; JSON is retained
-# for reading older emails.
+# The manifest never touches the wire in the clear: it is encrypted by
+# the outer layer (CEK or NIP-44) and that ciphertext is what gets
+# glossia-encoded for transport, so it needs no inner armor of its own.
+# Two markers exist because the two transports differ: the multi-
+# recipient CEK envelope is byte-clean and carries raw bytes ("capnp:");
+# the pairwise NIP-44 API is string-typed (decrypt yields a String) and
+# cannot carry raw binary, so the 1:1 path base64-armors the same bytes
+# ("capnp64:"). New messages use Cap'n Proto; JSON is retained for
+# reading older emails.
 
 struct Manifest {
   body         @0 :EncryptedBlob;

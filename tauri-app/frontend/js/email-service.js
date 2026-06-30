@@ -9755,6 +9755,27 @@ ${attachmentsHtml}
                 );
 
             } else {
+                // If this message binds this attachment via a signed ATTACHMENTS
+                // block (public agreement, §11.2), enforce the hash + signature
+                // before delivering — refuse a swapped/tampered file.
+                if (email.body && email.body.includes('BEGIN NOSTR ATTACHMENTS')) {
+                    try {
+                        const v = await TauriService.verifyPublicAttachment(
+                            email.body, attachment.filename, attachment.data
+                        );
+                        if (v.specFound && !v.verified) {
+                            const why = !v.signatureValid
+                                ? 'the message signature is invalid'
+                                : 'the file does not match the signed hash';
+                            window.notificationService.showError(
+                                `Refusing to open "${attachment.filename}": ${why} (possible tampering).`
+                            );
+                            return;
+                        }
+                    } catch (e) {
+                        console.warn('[JS] public attachment verification error:', e);
+                    }
+                }
                 // Plain attachment - deliver directly (save or share)
                 await this._deliverFile(
                     action,

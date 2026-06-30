@@ -295,6 +295,12 @@ const TauriService = {
         if (subjectEncoding != null) args.subjectEncoding = subjectEncoding;
         return await this.invoke('compose_agreement', args);
     },
+    // Verify a delivered plaintext attachment against a public message's signed
+    // ATTACHMENTS block (spec §11.2). `dataBase64` is the file's bytes. Returns
+    // { verified, signatureValid, specFound, hashMatch, expectedSha256, actualSha256 }.
+    verifyPublicAttachment: async function(armor, filename, dataBase64) {
+        return await this.invoke('verify_public_attachment', { armor, filename, dataBase64 });
+    },
     // `ccPlain` are keyless Cc emails (header-only, can't decrypt). `isAgreement`
     // false → plain multi-recipient encrypted mail (viewer roles, no marker).
     sendAgreement: async function(emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, isAgreement, encryptSubject, sign, profileName = null, messageId = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, glossiaEncoding = null, subjectEncoding = null, attachments = null) {

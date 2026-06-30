@@ -4387,6 +4387,46 @@ pub fn verify_email_signature(sender_pubkey: &str, signature: &str, body: &str) 
 
 /// Verify email signature using the in-body SIGNATURE block (primary trust path).
 /// Returns `Some(true/false)` if an inline signature was found, `None` if no inline sig exists.
+/// Verify a delivered plaintext attachment against a public message's signed
+/// ATTACHMENTS block (spec §11.2).
+///
+/// Public attachments ride as plaintext MIME parts; the signed block binds each
+/// file's plaintext SHA-256, and the block is covered by the message signature.
+/// So a delivered file is trustworthy only when (a) the armor signature(s) are
+/// valid — making the block authentic — and (b) the file's SHA-256 matches a
+/// listed spec with that filename. Returns the full breakdown so callers can
+/// distinguish "no such attachment in the message" from "hash mismatch".
+pub fn verify_public_attachment(
+    armor: &str,
+    filename: &str,
+    data: &[u8],
+) -> crate::types::PublicAttachmentVerification {
+    use sha2::{Digest, Sha256};
+    let actual_sha256 = hex::encode(Sha256::digest(data));
+
+    // The block is only authentic if the message signature verifies.
+    let sigs = verify_all_signatures_inline(armor);
+    let signature_valid = !sigs.is_empty() && sigs.iter().all(|s| s.is_valid);
+
+    let specs = parse_armor_components(armor)
+        .map(|p| p.attachments)
+        .unwrap_or_default();
+    let named: Vec<&crate::agreement::AttachmentSpec> =
+        specs.iter().filter(|s| s.filename == filename).collect();
+    let spec_found = !named.is_empty();
+    let hash_match = named.iter().any(|s| s.sha256.eq_ignore_ascii_case(&actual_sha256));
+    let expected_sha256 = named.first().map(|s| s.sha256.clone());
+
+    crate::types::PublicAttachmentVerification {
+        verified: signature_valid && spec_found && hash_match,
+        signature_valid,
+        spec_found,
+        hash_match,
+        expected_sha256,
+        actual_sha256,
+    }
+}
+
 pub fn verify_email_signature_inline(body: &str) -> Option<bool> {
     let parsed = parse_armor_components(body)?;
     let sig_hex = parsed.signature_hex.as_ref()?;
@@ -6516,6 +6556,60 @@ nitela\n\
         // the signature — the binding is enforced cryptographically.
         let tampered = composed.armor.replace(&sha, &"f".repeat(64));
         assert_eq!(verify_email_signature_inline(&tampered), Some(false));
+    }
+
+    #[test]
+    fn test_verify_public_attachment_accepts_and_rejects() {
+        use crate::types::{AgreementParty, EmailAttachment};
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let file = b"the public contract document";
+        let attachments = vec![EmailAttachment {
+            filename: "contract.pdf".into(),
+            content_type: "application/pdf".into(),
+            data: b64.encode(file),
+            size: file.len(),
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        }];
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
+            "Public Statement", "We agree.", &to, &[],
+            /* encrypted */ false, true, true, true, true, None, None, &attachments,
+        ).unwrap();
+
+        // The genuine file verifies: signature valid, spec found, hash matches.
+        let ok = verify_public_attachment(&composed.armor, "contract.pdf", file);
+        assert!(ok.verified);
+        assert!(ok.signature_valid && ok.spec_found && ok.hash_match);
+
+        // A swapped file (same name) is rejected — hash no longer matches.
+        let tampered = b"a different document entirely";
+        let bad = verify_public_attachment(&composed.armor, "contract.pdf", tampered);
+        assert!(!bad.verified);
+        assert!(bad.spec_found && !bad.hash_match);
+        assert_eq!(bad.expected_sha256, ok.expected_sha256);
+
+        // A file the message never declared is not bound.
+        let unknown = verify_public_attachment(&composed.armor, "evil.exe", file);
+        assert!(!unknown.verified && !unknown.spec_found);
+
+        // If the signed ATTACHMENTS block is tampered (here, its recorded hash),
+        // the signature no longer verifies, so nothing is trusted.
+        let genuine_sha = hex::encode(Sha256::digest(file));
+        let forged = composed.armor.replace(&genuine_sha, &"f".repeat(64));
+        let untrusted = verify_public_attachment(&forged, "contract.pdf", file);
+        assert!(!untrusted.signature_valid && !untrusted.verified);
     }
 
     #[test]

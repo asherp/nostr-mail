@@ -320,6 +320,27 @@ pub struct ParsedArmorMessage {
     pub attachments: Vec<crate::agreement::AttachmentSpec>,
 }
 
+/// Result of checking a delivered plaintext attachment against a public message's
+/// signed ATTACHMENTS block (spec §11.2). A file is trustworthy only when the
+/// message signature is valid (so the block is authentic) *and* the file's
+/// SHA-256 matches a listed spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicAttachmentVerification {
+    /// `signature_valid && spec_found && hash_match` — the file is bound.
+    pub verified: bool,
+    /// The message's armor signature(s) verified (the ATTACHMENTS block is authentic).
+    pub signature_valid: bool,
+    /// The block lists an attachment with this filename.
+    pub spec_found: bool,
+    /// The delivered file's SHA-256 matches the listed spec.
+    pub hash_match: bool,
+    /// The SHA-256 recorded in the block for this filename, if any.
+    pub expected_sha256: Option<String>,
+    /// The SHA-256 actually computed over the delivered bytes.
+    pub actual_sha256: String,
+}
+
 /// Per-signature verification result (one per nesting level in the armor chain).
 /// Array is ordered innermost-first, matching the JS verifyAllSignatures convention.
 #[derive(Debug, Clone, Serialize, Deserialize)]

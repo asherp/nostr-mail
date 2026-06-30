@@ -2085,6 +2085,23 @@ async fn construct_email_headers(mut email_config: EmailConfig, to_address: Stri
         .map_err(|e| e.to_string())
 }
 
+/// Verify a delivered (plaintext) attachment against a public message's signed
+/// ATTACHMENTS block (spec §11.2): recompute its SHA-256 and check it against the
+/// signed spec, also confirming the message signature is valid. `data_base64` is
+/// the delivered file's bytes. See [`email::verify_public_attachment`].
+#[tauri::command]
+fn verify_public_attachment(
+    armor: String,
+    filename: String,
+    data_base64: String,
+) -> Result<types::PublicAttachmentVerification, String> {
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&data_base64)
+        .map_err(|e| format!("attachment base64 decode failed: {}", e))?;
+    Ok(email::verify_public_attachment(&armor, &filename, &data))
+}
+
 /// Build the armored body for an agreement without sending it (compose preview).
 /// `to` parties become signatories, `cc` parties become viewers (spec §6.3).
 /// `encrypted` selects the multi-recipient envelope vs the plaintext/public form.
@@ -7604,6 +7621,7 @@ pub fn run() {
         construct_email_headers,
         compose_agreement,
         send_agreement,
+        verify_public_attachment,
         agreement_status,
         verify_email_binding,
         fetch_image,

@@ -670,7 +670,7 @@ An agreement is initiated as a signed multi-recipient message:
 - **Body**: the agreement cover text / terms, in a signed `ENCRYPTED BODY` (the envelope is signalled by the RECIPIENTS block, not a keyword) — or, for a **plaintext (public) agreement**, a signed `SIGNED BODY` with the terms in the clear (Section 11.8).
 - **Subject**: for an encrypted agreement the `Subject:` header is AES-256-GCM-encrypted under the **same CEK** as the body and **glossia-encoded** under the subject's own encoding setting (Section 5; defaults to the body's), so it reads as prose, survives header folding, is readable by exactly the recipients, and never leaks in cleartext; a reader recovers it by unwrapping the CEK from their RECIPIENTS stanza. For a plaintext (public) agreement the subject is sent in the clear. The subject is metadata and is **not** covered by the signature or `H` (GCM provides its own integrity).
 - **Attachment(s)**: the contract document(s), bound to the message in one of two ways depending on whether it is encrypted:
-  - *Encrypted message* — when it carries attachments, the `ENCRYPTED BODY` is a **manifest** rather than the raw body: a nested AES-encrypted body blob plus one entry per attachment carrying that attachment's AES key (`keyWrap`), MIME type, and ciphertext hash (`cipherSha256`). The manifest is what is AES-256-GCM-encrypted under the CEK and wrapped per-recipient; each attachment's ciphertext rides as an ordinary MIME part (`a1.dat`, `a2.dat`, …). Because the manifest (including every `cipherSha256`) is inside the signed, `H`-bound body, the attachments are bound tamper-evidently even though their bytes travel outside the armor. A reader recomputes each part's SHA-256 and **rejects** a mismatch. A message with no attachments encrypts the raw body directly (no manifest). The manifest is serialized as **Cap'n Proto** (schema `Manifest`/`EncryptedBlob`/`Attachment`); since the NIP-44 transport is text-typed, the serialized manifest is base64-armored behind a `capnp:` marker. Legacy **JSON** manifests (leading `{`) are still read for old mail.
+  - *Encrypted message* — when it carries attachments, the `ENCRYPTED BODY` is a **manifest** rather than the raw body: a nested AES-encrypted body blob plus one entry per attachment carrying that attachment's AES key (`keyWrap`), MIME type, and ciphertext hash (`cipherSha256`). The manifest is what is AES-256-GCM-encrypted under the CEK and wrapped per-recipient; each attachment's ciphertext rides as an ordinary MIME part (`a1.dat`, `a2.dat`, …). Because the manifest (including every `cipherSha256`) is inside the signed, `H`-bound body, the attachments are bound tamper-evidently even though their bytes travel outside the armor. A reader recomputes each part's SHA-256 and **rejects** a mismatch. A message with no attachments encrypts the raw body directly (no manifest). The manifest is serialized as **Cap'n Proto** (schema `Manifest`/`EncryptedBlob`/`Attachment`) to raw binary behind a `capnp:` marker. No inner armor is needed: the manifest is the plaintext body, so it is encrypted by the outer layer (per-recipient-wrapped CEK) and that ciphertext is glossia-encoded for transport. Legacy **JSON** manifests (leading `{`) are still read for old mail.
   - *Public message* — the body is in the clear, so attachments ride as **plaintext** MIME parts and are bound by a signed `ATTACHMENTS` block listing, per attachment, its `id`, plaintext SHA-256, size, MIME type, and filename. The block is covered by the level signature (Section 4.2), so a swapped/added/removed attachment breaks the signature; a reader verifies each delivered file's SHA-256 against the block.
 - **RECIPIENTS**: a `signer` stanza for each required signatory, a `viewer` stanza for each viewer, and the `self` stanza.
 - **CONSENT** (optional): if the originator is themselves a required signatory, they include their own CONSENT block (Section 11.3) declaring consent. The originator's `self` stanza handles only decryption access and is never counted as a consent (Section 10.3) — an originator who signs MUST do so via a CONSENT block.
@@ -679,6 +679,44 @@ An agreement is initiated as a signed multi-recipient message:
 The originating message's body + RECIPIENTS define the **document hash** `H` that every consent in the thread refers to (Section 11.3.1).
 
 Clients MAY include an `X-Nostr-Agreement` MIME header (boolean/identifier) to let IMAP filtering surface agreement threads without decrypting bodies. The authoritative agreement state always comes from the signed armor blocks, not the header.
+
+#### 11.2.1 Externalized attachment keyring (PROPOSED — not yet implemented)
+
+> Status: **draft proposal.** The implemented behavior is the inline manifest of §11.2. This subsection specifies an optional, opt-in variant that moves the attachment key material out of the glossia-encoded body to save encoding size. It is gated behind a format-version bump; readers that do not understand it fall back cleanly.
+
+**Motivation.** In the inline manifest (§11.2) the encrypted body is `Manifest = { body blob, attachments[] }`. The whole thing is glossia-encoded at roughly a 6–7× character expansion (Section 5). The **body blob must stay inline** because the body is the conversation text and glossia is what lets it survive forwards, inline replies, and `>`-quoting (Section 5; `glossia-design.md`). The **attachment keyring** (`attachments[]`) does not share that requirement: each entry is only useful together with its `aN.dat` MIME part, and those parts are already stripped by clients on reply/inline-quote (they survive forwards only). So the keyring can ride as its own part — coupled to the same transport fate as the files it unlocks — with **no additional loss of chain-survival**, while leaving the glossia body free of the per-attachment key material.
+
+**Wire format.** A message using this variant emits:
+
+1. **Inline body** — the raw body text AES-256-GCM-encrypted under the CEK and glossia-encoded, identical to a *no-attachment* message (no `Manifest` wrapper). It carries the RECIPIENTS block, optional CONSENT, and the SIGNATURE as usual.
+2. **Keyring part** — a MIME part `keyring.dat` (`application/octet-stream`) holding `AES-256-GCM(CEK, capnp Keyring)`, where `Keyring` is the existing `List(Attachment)` (the `body` field of `Manifest` is omitted). Padded to a fixed boundary like attachment parts to avoid leaking the attachment count precisely.
+3. **Attachment parts** — `a1.dat`, `a2.dat`, … exactly as in §11.2.
+
+The signed body binds the keyring with a single reference line inside the armor (covered by the SIGNATURE / `H`, Section 4.2):
+
+```
+----- BEGIN NOSTR ATTACHMENTS -----
+keyring sha256=<64-hex of keyring.dat ciphertext> size=<bytes>
+----- END NOSTR ATTACHMENTS -----
+```
+
+This is the encrypted-message analogue of the public `ATTACHMENTS` block (§11.2, *Public message*): there it lists each plaintext file hash; here it binds the single encrypted keyring's ciphertext hash. The keyring in turn binds each file via its existing `cipherSha256`, so the signature transitively commits to every attachment exactly as the inline manifest does.
+
+**Decryption.**
+
+1. Open the outer layer (unwrap CEK from the reader's RECIPIENTS stanza, or pairwise NIP-44).
+2. Decrypt and display the inline body.
+3. If a `NOSTR ATTACHMENTS` reference is present: locate `keyring.dat`, recompute its SHA-256, **reject** on mismatch with the signed reference, then AES-256-GCM-decrypt it under the CEK to recover the `Keyring`.
+4. For each `Keyring` entry: locate `aN.dat`, verify its `cipherSha256`, AES-decrypt under `keyWrap`, and restore `origFilename`/`origMime`.
+
+**Degradation & versioning.**
+
+- On a **reply/inline-quote** that strips parts, the reader still recovers and displays the body inline (it is an ordinary encrypted body) and surfaces "attachments not included in this reply" — the same outcome as the files being absent under §11.2.
+- A reader that predates this variant ignores the `NOSTR ATTACHMENTS` reference line and still reads the inline body as a normal encrypted body; it simply does not surface the attachments. The variant is therefore safe to send to mixed-version recipients only when the sender accepts that older readers won't see attachments — hence it is **opt-in** and version-flagged.
+
+**Security.** The SIGNATURE covers body + keyring hash; the keyring covers each file hash — identical tamper-evidence to the inline manifest. The keyring is CEK-encrypted, so its key material stays confidential to recipients, as in §11.2. The cleartext `NOSTR ATTACHMENTS` reference reveals only that the message has attachments and the keyring's size — information the presence of `aN.dat` parts already exposes.
+
+**Trade-off.** The saving is the keyring bytes (~115 B/attachment) moving from glossia (~6–7×) to base64 MIME (~1.33×); the body-text cost is unchanged. The win is therefore modest for 1–2 attachments and grows with attachment count. It buys size at zero additional chain-survival cost for the body, but at the cost of attachment visibility to older/forwarding-stripped readers.
 
 ### 11.3 Consent Block
 

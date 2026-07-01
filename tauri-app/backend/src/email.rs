@@ -144,6 +144,24 @@ impl Header for XNostrRecipient {
     }
 }
 
+/// `X-Nostr-Agreement` — a non-authoritative marker that a thread is an
+/// agreement, so IMAP can surface agreement threads without decrypting bodies
+/// (spec §6.1, §11.2). The authoritative state always comes from the armor.
+#[derive(Debug, Clone)]
+struct XNostrAgreement(String);
+
+impl Header for XNostrAgreement {
+    fn name() -> HeaderName {
+        HeaderName::new_from_ascii_str("X-Nostr-Agreement")
+    }
+    fn parse(s: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Ok(XNostrAgreement(s.to_string()))
+    }
+    fn display(&self) -> HeaderValue {
+        HeaderValue::new(Self::name(), self.0.clone())
+    }
+}
+
 /// Construct email headers without sending the email
 pub fn construct_email_headers(
     config: &EmailConfig,
@@ -368,17 +386,23 @@ pub async fn send_email(
     include_sig_header: bool,
     recipient_pubkey: Option<&str>,
     include_recipient_header: bool,
+    cc: &[String],
 ) -> Result<String> {
     debug_log!("[RUST] send_email: Starting email send process");
     debug_log!("[RUST] send_email: SMTP Host: {}, Port: {}", config.smtp_host, config.smtp_port);
     debug_log!("[RUST] send_email: From: {}, To: {}", config.email_address, to_address);
     debug_log!("[RUST] send_email: Use TLS: {}", config.use_tls);
-    
+
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
         .reply_to(config.email_address.parse()?)
         .to(to_address.parse()?)
         .subject(subject);
+
+    // Additional cleartext Cc recipients (plain multi-recipient email).
+    for addr in cc {
+        builder = builder.cc(addr.parse()?);
+    }
 
     // Add custom message ID if provided
     if let Some(msg_id) = message_id {
@@ -591,6 +615,416 @@ pub async fn send_email(
             Err(anyhow::anyhow!("SMTP send operation timed out after 60 seconds. Check your internet connection and SMTP settings."))
         }
     }
+}
+
+/// Build an SMTP transport from the config (shared TLS/credentials setup).
+fn build_mailer(config: &EmailConfig) -> Result<SmtpTransport> {
+    let creds = Credentials::new(config.email_address.clone(), config.password.clone());
+    let mut mailer_builder = SmtpTransport::relay(&config.smtp_host)?
+        .port(config.smtp_port)
+        .credentials(creds);
+    if config.use_tls {
+        let tls_params = lettre::transport::smtp::client::TlsParameters::new(config.smtp_host.clone())?;
+        mailer_builder = mailer_builder.tls(lettre::transport::smtp::client::Tls::Required(tls_params));
+    } else {
+        mailer_builder = mailer_builder.tls(lettre::transport::smtp::client::Tls::None);
+    }
+    Ok(mailer_builder.build())
+}
+
+/// Send a built message via SMTP with the standard 60s timeout / blocking-thread
+/// handling.
+async fn send_message_with_timeout(mailer: SmtpTransport, email: Message) -> Result<()> {
+    let send_future = task::spawn_blocking(move || mailer.send(&email));
+    match timeout(Duration::from_secs(60), send_future).await {
+        Ok(Ok(Ok(_))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(anyhow::anyhow!("Failed to send email: {}", e)),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Task join error: {}", e)),
+        Err(_) => Err(anyhow::anyhow!("SMTP send operation timed out after 60 seconds")),
+    }
+}
+
+/// Compose an agreement: the armored `text/plain` body plus the subject to put
+/// in the header (spec §§10–11).
+///
+/// `to` parties become `signer` signatories and `cc` parties become `viewer`s
+/// (spec §6.3). `encrypted` selects the multi-recipient envelope (CEK) form vs.
+/// the plaintext (public) form (§11.8). `originator_consents` includes the
+/// originator's own CONSENT over `H` (§11.2).
+///
+/// In encrypted mode the **subject is AES-256-GCM-encrypted under the same CEK
+/// as the body** and glossia-encoded, so it is readable by exactly the recipients
+/// and never leaks in cleartext; in plaintext mode the subject is returned
+/// unchanged. `encoding` is the user's Advanced glossia scheme for the body;
+/// `subject_encoding` is the (independent) scheme for the subject, falling back
+/// to `encoding` when `None`. SMTP/MIME assembly is the caller's job, so this is
+/// unit-testable.
+pub fn compose_agreement(
+    private_key: &str,
+    sender_pub: &str,
+    sender_email: Option<&str>,
+    profile_name: &str,
+    subject: &str,
+    body: &str,
+    to: &[crate::types::AgreementParty],
+    cc: &[crate::types::AgreementParty],
+    encrypted: bool,
+    originator_consents: bool,
+    is_agreement: bool,
+    encrypt_subject: bool,
+    sign: bool,
+    encoding: Option<&str>,
+    subject_encoding: Option<&str>,
+    // Plaintext attachments (base64 data). For an encrypted message these are
+    // AES-encrypted into a capnp manifest here (§11.2) and returned as `aN.dat`
+    // MIME parts in the result; for a public message they pass through as
+    // plaintext parts. Empty ⇒ no attachments.
+    attachments: &[crate::types::EmailAttachment],
+) -> Result<crate::types::ComposedAgreement, String> {
+    // An agreement is always signed (its signatory set must be authenticated,
+    // §3.6); a plain multi-recipient message honors the caller's choice and may
+    // be unsigned (SEAL). Consent is separate and only valid when signed.
+    let sign = sign || is_agreement;
+    use crate::agreement::{AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
+
+    // `To:` are signatories only for an actual agreement; a plain multi-recipient
+    // email tags everyone `viewer` (read access, no signing) so it isn't surfaced
+    // as an unsigned agreement (spec §6.3, §11.1).
+    let to_role = if is_agreement { ROLE_SIGNER } else { ROLE_VIEWER };
+    let mut recips: Vec<AgreementRecipientInput> = Vec::with_capacity(to.len() + cc.len());
+    for p in to {
+        recips.push(AgreementRecipientInput {
+            role: to_role.to_string(),
+            pubkey: p.pubkey.clone(),
+            email: Some(p.email.clone()),
+        });
+    }
+    for p in cc {
+        recips.push(AgreementRecipientInput {
+            role: ROLE_VIEWER.to_string(),
+            pubkey: p.pubkey.clone(),
+            email: Some(p.email.clone()),
+        });
+    }
+    if recips.is_empty() {
+        return Err("a multi-recipient message needs at least one keyed To: or Cc: recipient".to_string());
+    }
+
+    if encrypted {
+        // With attachments, the encrypted body is a capnp manifest (§11.2): the
+        // body + each attachment are AES-encrypted under their own keys, the
+        // manifest holds those keys, and the encrypted attachment bytes ride as
+        // `aN.dat` MIME parts. Without attachments the raw body is encrypted.
+        let (body_payload, parts): (Vec<u8>, Vec<crate::types::EmailAttachment>) =
+            if attachments.is_empty() {
+                (body.as_bytes().to_vec(), Vec::new())
+            } else {
+                let inputs = attachment_inputs_from(attachments)?;
+                let (payload, enc_parts) = crate::manifest::build_capnp_manifest(body, &inputs)
+                    .map_err(|e| format!("manifest build failed: {}", e))?;
+                (payload, encrypted_parts_to_mime(enc_parts))
+            };
+        // One CEK for the body (manifest) and the subject.
+        let cek = crate::crypto::generate_cek();
+        let armor = crate::agreement::encode_hybrid_agreement_with_cek(
+            &cek, private_key, sender_pub, sender_email, profile_name, &body_payload, &recips, originator_consents, sign, encoding,
+        ).map_err(|e| e.to_string())?;
+        // The subject is encrypted under the same CEK by default. The sender may
+        // leave it in the clear (`encrypt_subject = false`) so keyless Cc /
+        // witnesses have some context for what they're validating — the body
+        // stays encrypted regardless.
+        let out_subject = if encrypt_subject {
+            let subject_ct = crate::crypto::aes_gcm_encrypt_raw(&cek, subject.as_bytes())
+                .map_err(|e| format!("subject encrypt failed: {}", e))?;
+            glossia_encode_bytes_with(&subject_ct, subject_encoding.or(encoding))
+                .ok_or_else(|| "subject glossia encode failed".to_string())?
+                .0
+        } else {
+            subject.to_string()
+        };
+        Ok(crate::types::ComposedAgreement { armor, subject: out_subject, attachments: parts })
+    } else {
+        // Public agreement: cleartext body. Attachments ride as plaintext MIME
+        // parts, bound by a signed ATTACHMENTS block (each file's plaintext hash)
+        // so they can't be swapped/added/removed without breaking the signature.
+        let att_specs = public_attachment_specs(attachments)?;
+        let armor = encode_signed_agreement(
+            private_key, sender_pub, profile_name, body, &recips, originator_consents, &att_specs, encoding,
+        )?;
+        // Public agreement: subject stays in the clear.
+        Ok(crate::types::ComposedAgreement { armor, subject: subject.to_string(), attachments: attachments.to_vec() })
+    }
+}
+
+/// Compute the signed ATTACHMENTS specs for a public message: each plaintext
+/// attachment's SHA-256 (hex), size, MIME, and filename (spec §11.2).
+fn public_attachment_specs(
+    attachments: &[crate::types::EmailAttachment],
+) -> Result<Vec<crate::agreement::AttachmentSpec>, String> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(&a.data)
+                .map_err(|e| format!("attachment {} base64 decode failed: {}", a.filename, e))?;
+            Ok(crate::agreement::AttachmentSpec {
+                id: format!("a{}", i + 1),
+                sha256: hex::encode(Sha256::digest(&data)),
+                size: data.len() as u64,
+                mime: a.content_type.clone(),
+                filename: a.filename.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Decode plaintext [`EmailAttachment`]s (base64 `data`) into manifest inputs.
+fn attachment_inputs_from(
+    attachments: &[crate::types::EmailAttachment],
+) -> Result<Vec<crate::manifest::AttachmentInput>, String> {
+    use base64::Engine;
+    attachments
+        .iter()
+        .map(|a| {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(&a.data)
+                .map_err(|e| format!("attachment {} base64 decode failed: {}", a.filename, e))?;
+            Ok(crate::manifest::AttachmentInput {
+                filename: a.filename.clone(),
+                mime: a.content_type.clone(),
+                data,
+            })
+        })
+        .collect()
+}
+
+/// Convert encrypted manifest parts into `aN.dat` MIME attachments.
+fn encrypted_parts_to_mime(
+    parts: Vec<crate::manifest::EncryptedAttachmentPart>,
+) -> Vec<crate::types::EmailAttachment> {
+    use base64::Engine;
+    parts
+        .into_iter()
+        .map(|p| crate::types::EmailAttachment {
+            filename: p.filename,
+            content_type: "application/octet-stream".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(&p.ciphertext),
+            size: p.ciphertext.len(),
+            is_encrypted: true,
+            encryption_method: Some("manifest_aes".to_string()),
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        })
+        .collect()
+}
+
+/// Wrap a NIP ciphertext in the ASCII armor a 1:1 body uses (mirrors the
+/// frontend's `armorCiphertext`): `-----BEGIN NOSTR NIP-XX ENCRYPTED BODY-----`.
+fn armor_ciphertext(ciphertext: &str, algorithm: &str) -> String {
+    let armor_type = if algorithm.eq_ignore_ascii_case("nip04") { "NIP-04" } else { "NIP-44" };
+    format!(
+        "-----BEGIN NOSTR {} ENCRYPTED BODY-----\n{}\n-----END NOSTR MESSAGE-----",
+        armor_type,
+        ciphertext.trim()
+    )
+}
+
+/// Build a 1:1 (pairwise) encrypted manifest body in Rust (spec §11.2).
+///
+/// AES-encrypts the body + each plaintext attachment into a Cap'n Proto manifest
+/// (text-armored for the string-typed NIP transport), NIP-encrypts that manifest
+/// to `recipient_pubkey`, and ASCII-armors the result. Returns the armored body
+/// plus the encrypted `aN.dat` MIME parts. The subject, glossia encoding, and
+/// signing remain the caller's responsibility (unchanged from the JSON flow).
+pub fn encrypt_manifest_body(
+    sender_priv: &str,
+    recipient_pubkey: &str,
+    body: &str,
+    attachments: &[crate::types::EmailAttachment],
+    algorithm: &str,
+) -> Result<crate::types::EncryptedManifestBody, String> {
+    let inputs = attachment_inputs_from(attachments)?;
+    let (payload, parts) = crate::manifest::build_capnp_manifest_armored(body, &inputs)
+        .map_err(|e| format!("manifest build failed: {}", e))?;
+    let ciphertext = crate::crypto::encrypt_message(sender_priv, recipient_pubkey, &payload, Some(algorithm))
+        .map_err(|e| format!("manifest encrypt failed: {}", e))?;
+    Ok(crate::types::EncryptedManifestBody {
+        armored_body: armor_ciphertext(&ciphertext, algorithm),
+        attachments: encrypted_parts_to_mime(parts),
+    })
+}
+
+/// Decrypt an agreement subject that was AES-256-GCM-encrypted under the message
+/// CEK (the envelope path; counterpart to [`compose_agreement`]). Unwraps the CEK
+/// from the reader's RECIPIENTS stanza, then decrypts. Returns the subject
+/// unchanged if it isn't CEK-encrypted (e.g. a plaintext-agreement subject) or
+/// if anything fails. The second tuple element is the ciphertext (for DM↔email
+/// hash matching), mirroring [`decrypt_subject`].
+fn decrypt_subject_envelope(
+    subject: &str,
+    recipients: &[crate::agreement::Recipient],
+    sender_pub: &str,
+    private_key: &str,
+    user_pubkey_hex: &str,
+    ephemeral_pubkey: Option<&str>,
+) -> (String, Option<String>) {
+    if subject.is_empty() {
+        return (subject.to_string(), None);
+    }
+    let me = crate::agreement::normalize_pubkey_hex(user_pubkey_hex)
+        .unwrap_or_else(|| user_pubkey_hex.to_string());
+    let stanza = recipients.iter().find(|r| {
+        crate::agreement::normalize_pubkey_hex(&r.pubkey).as_deref() == Some(me.as_str())
+    });
+    let wrapped = match stanza.and_then(|s| s.wrapped_cek.as_deref()) {
+        Some(w) => w,
+        None => return (subject.to_string(), None), // plaintext subject or not a recipient
+    };
+    let unwrap_pub = ephemeral_pubkey.unwrap_or(sender_pub);
+    let cek = match crate::crypto::unwrap_cek(private_key, unwrap_pub, wrapped) {
+        Ok(c) => c,
+        Err(_) => return (subject.to_string(), None),
+    };
+    // The subject ciphertext is glossia-encoded (or base64); decode_armor_section
+    // handles both. A cleartext subject won't decode to valid ciphertext, so AES
+    // fails and we fall back to it unchanged.
+    let ct = match decode_armor_section(subject.trim()) {
+        Some(b) => b,
+        None => return (subject.to_string(), None),
+    };
+    match crate::crypto::aes_gcm_decrypt_raw(&cek, &ct) {
+        Ok(pt) => (String::from_utf8_lossy(&pt).into_owned(), Some(subject.to_string())),
+        Err(_) => (subject.to_string(), Some(subject.to_string())),
+    }
+}
+
+/// Compose an agreement and send it to all signatories (`To:`) and viewers
+/// (`Cc:`) in one message (spec §6.3). Adds the `X-Nostr-Agreement` marker
+/// (§6.1) and, when enabled, the `X-Nostr-Pubkey`/`X-Nostr-Sig` headers. The
+/// body's armor already carries the authoritative SIGNATURE.
+pub async fn send_agreement_email(
+    config: &EmailConfig,
+    subject: &str,
+    profile_name: &str,
+    body: &str,
+    to: &[crate::types::AgreementParty],
+    cc: &[crate::types::AgreementParty],
+    cc_plain: &[String],
+    encrypted: bool,
+    originator_consents: bool,
+    is_agreement: bool,
+    encrypt_subject: bool,
+    sign: bool,
+    message_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+    include_pubkey_header: bool,
+    include_sig_header: bool,
+    encoding: Option<&str>,
+    subject_encoding: Option<&str>,
+    // Plaintext attachments (§11.2). compose_agreement AES-encrypts them into the
+    // manifest (encrypted message) or passes them through (public), returning the
+    // MIME parts to send. `None`/empty ⇒ a single-part text message.
+    attachments: Option<&Vec<EmailAttachment>>,
+) -> Result<String> {
+    let private_key = config.private_key.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("no private key configured; cannot sign the message"))?;
+    let sender_pub = crypto::get_public_key_from_private(private_key)
+        .map_err(|e| anyhow::anyhow!("could not derive sender pubkey: {}", e))?;
+
+    let empty_atts = Vec::new();
+    let composed = compose_agreement(
+        private_key, &sender_pub, Some(&config.email_address), profile_name, subject, body, to, cc, encrypted, originator_consents, is_agreement, encrypt_subject, sign, encoding, subject_encoding,
+        attachments.unwrap_or(&empty_atts),
+    ).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let armor = composed.armor;
+    // compose_agreement returns the MIME parts to attach (encrypted aN.dat for an
+    // encrypted message, or plaintext parts for a public one).
+    let out_attachments = composed.attachments;
+
+    let mut builder = Message::builder()
+        .from(config.email_address.parse()?)
+        .reply_to(config.email_address.parse()?)
+        .subject(composed.subject);
+    for p in to {
+        builder = builder.to(p.email.parse()?);
+    }
+    for p in cc {
+        builder = builder.cc(p.email.parse()?);
+    }
+    // Keyless Cc: no Nostr key, so no CEK wrap and no RECIPIENTS stanza — they
+    // appear in the Cc header only and receive the (encrypted) message without
+    // being able to decrypt it. They CAN still verify the in-body signature
+    // (useful for escrow/witness Cc).
+    for addr in cc_plain {
+        builder = builder.cc(addr.parse()?);
+    }
+    if let Some(m) = message_id {
+        builder = builder.message_id(Some(m.to_string()));
+    }
+    if let Some(r) = in_reply_to {
+        builder = builder.in_reply_to(r.to_string());
+    }
+    if let Some(r) = references {
+        builder = builder.references(r.to_string());
+    }
+
+    // Agreement marker for decrypt-free IMAP filtering (§6.1) — only for actual
+    // agreements, not plain multi-recipient mail; non-authoritative.
+    if is_agreement {
+        builder = builder.header(XNostrAgreement("1".to_string()));
+    }
+
+    // X-Nostr-Pubkey / X-Nostr-Sig mirror the in-body SIGNATURE (secondary path).
+    if include_pubkey_header {
+        builder = builder.header(XNostrPubkey(sender_pub.clone()));
+        if include_sig_header {
+            let binary = extract_ciphertext_binary(&armor);
+            if let Ok(signature) = crypto::sign_data_bytes(private_key, &binary) {
+                builder = builder.header(XNostrSig(signature));
+            }
+        }
+    }
+
+    // Single-part unless there are attachment parts (encrypted aN.dat or public
+    // plaintext, produced by compose_agreement), in which case build
+    // multipart/mixed: the armored body as the text part, then each attachment
+    // part — mirroring `send_email` (§11.2).
+    let email = if !out_attachments.is_empty() {
+        debug_log!("[RUST] send_agreement_email: building multipart with {} attachments", out_attachments.len());
+        let mut multipart = MultiPart::mixed().singlepart(
+            SinglePart::builder().header(ContentType::TEXT_PLAIN).body(armor),
+        );
+        for attachment in &out_attachments {
+            let attachment_data = match general_purpose::STANDARD.decode(&attachment.data) {
+                Ok(data) => data,
+                Err(e) => {
+                    debug_log!("[RUST] send_agreement_email: base64 decode failed for {}: {}", attachment.filename, e);
+                    continue;
+                }
+            };
+            let content_type = attachment.content_type.parse::<ContentType>()
+                .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
+            let attachment_part = Attachment::new(attachment.filename.clone())
+                .body(attachment_data, content_type);
+            multipart = multipart.singlepart(attachment_part);
+        }
+        builder.multipart(multipart)?
+    } else {
+        builder.body(armor)?
+    };
+    let mailer = build_mailer(config)?;
+    send_message_with_timeout(mailer, email).await?;
+    let recipient_count = to.len() + cc.len() + cc_plain.len();
+    Ok(format!(
+        "{} sent to {} recipient(s)",
+        if is_agreement { "Agreement" } else { "Message" }, recipient_count
+    ))
 }
 
 /// Delete a sent email from the IMAP server by moving it to Trash
@@ -1690,34 +2124,22 @@ fn try_glossia_decode_to_bytes(text: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Map a frontend encoding-scheme name (the user's Advanced "encoding" setting)
+/// to glossia `(language, wordlist)`. `None`/empty defaults to english/bip39.
+pub(crate) fn glossia_lang_wordlist(encoding: Option<&str>) -> (String, String) {
+    match encoding.unwrap_or("").to_lowercase().as_str() {
+        "" | "english" | "english - bip39" | "bip39" => ("english".to_string(), "bip39".to_string()),
+        "latin" => ("latin".to_string(), "default".to_string()),
+        other => (other.to_string(), "default".to_string()),
+    }
+}
+
 /// Glossia round-trip: encode plaintext bytes into the given language, then decode back
 /// to get canonical bytes. This ensures signature verification survives transport
 /// (word-wrap, quote prefixes, etc.) because the signature is on the decoded binary.
 /// Returns None if glossia encode/decode fails (caller should fall back to raw UTF-8 bytes).
 pub fn glossia_roundtrip_to_bytes(text: &str, encoding: &str) -> Option<Vec<u8>> {
-    let hex_input = glossia::hex_encode(text.as_bytes());
-    // Map frontend encoding names to glossia parameters
-    let encoding_lower = encoding.to_lowercase();
-    let (language, wordlist) = match encoding_lower.as_str() {
-        "latin" => ("latin", "default"),
-        "english" | "english - bip39" => ("english", "bip39"),
-        _ => (encoding_lower.as_str(), "default"),
-    };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        glossia::encode_into_language(
-            &hex_input, language, wordlist, "body",
-            None, 42, false, None, None, None, None,
-        )
-    }));
-    let encoded = match result {
-        Ok(Ok((encoded_text, _, _, _))) => encoded_text,
-        _ => {
-            debug_log!("[RUST] glossia_roundtrip_to_bytes: encode failed for encoding={}", encoding);
-            return None;
-        }
-    };
-    // Decode back to bytes
-    try_glossia_decode_to_bytes(&encoded)
+    glossia_encode_bytes_with(text.as_bytes(), Some(encoding)).map(|(_, bytes)| bytes)
 }
 
 /// Decode a single section of armor body content (non-quoted lines only) to bytes.
@@ -1753,64 +2175,181 @@ pub fn decode_armor_section(content: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// Parse armor structure with depth counting, separating outermost body from nested armor.
-/// Returns (body_text, nested_armor) where nested_armor has one level of "> " prefix stripped.
-/// Handles both non-quoted nested armor (reply chains) and > quoted nested armor.
-fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
+/// The constituent parts of a single armor level, separated from the body's
+/// armor region. Per spec Section 11.3.2 the on-wire order within a level is
+/// body → RECIPIENTS → CONSENT → nested(inner) → SIGNATURE stack.
+struct ArmorLevelParts {
+    /// The level's body content (ciphertext / encoded plaintext), with the
+    /// RECIPIENTS and CONSENT blocks removed.
+    body_text: String,
+    /// Raw RECIPIENTS block body (the lines between its BEGIN and the following
+    /// delimiter), if present (spec Section 10.2).
+    recipients_text: Option<String>,
+    /// Raw CONSENT block body, if present (spec Section 11.3).
+    consent_text: Option<String>,
+    /// Raw ATTACHMENTS block body, if present (spec Section 11.2; public
+    /// messages binding plaintext attachment hashes).
+    attachments_text: Option<String>,
+    /// The nested (quoted) inner armor, with one level of `> ` prefix stripped,
+    /// ready for recursive parsing. `None` for a leaf level.
+    nested_armor: Option<String>,
+}
+
+/// Reduce a line to its armor-marker core: drop a leading email quote prefix
+/// (`> ` or `>`), surrounding whitespace, and the `-----` rails. This makes a
+/// marker recognized identically whether or not the line is quoted in a reply —
+/// `BEGIN NOSTR SIGNED BODY` is the canonical start with or without the quote
+/// delimiter. One quote level is stripped per parse pass; deeper nesting is
+/// unwrapped on recursion (matching `nested_lines`' `> ` stripping).
+fn marker_core(l: &str) -> &str {
+    let t = l.trim();
+    let t = t.strip_prefix("> ").or_else(|| t.strip_prefix('>')).unwrap_or(t);
+    t.trim().trim_matches('-').trim()
+}
+fn level_is_begin_body(l: &str) -> bool {
+    let t = marker_core(l);
+    t.starts_with("BEGIN NOSTR NIP-")            // pairwise NIP-04 / NIP-44
+        || t.starts_with("BEGIN NOSTR ENCRYPTED") // generic AES-256-GCM under a CEK (multi-recipient envelope)
+        || t.starts_with("BEGIN NOSTR SIGNED")
+}
+fn level_is_begin_recipients(l: &str) -> bool {
+    marker_core(l) == "BEGIN NOSTR RECIPIENTS"
+}
+fn level_is_begin_consent(l: &str) -> bool {
+    marker_core(l) == "BEGIN NOSTR CONSENT"
+}
+fn level_is_begin_attachments(l: &str) -> bool {
+    marker_core(l) == "BEGIN NOSTR ATTACHMENTS"
+}
+fn level_is_end_attachments(l: &str) -> bool {
+    marker_core(l) == "END NOSTR ATTACHMENTS"
+}
+fn level_is_begin_sig_or_seal(l: &str) -> bool {
+    let t = marker_core(l);
+    t == "BEGIN NOSTR SIGNATURE" || t == "BEGIN NOSTR SEAL"
+}
+fn level_is_end_recipients(l: &str) -> bool {
+    marker_core(l) == "END NOSTR RECIPIENTS"
+}
+fn level_is_end_consent(l: &str) -> bool {
+    marker_core(l) == "END NOSTR CONSENT"
+}
+/// A message-closing END (`END NOSTR MESSAGE`, legacy `END NOSTR NIP-XX …`, or
+/// `END NOSTR SEAL`) — but NOT the standalone RECIPIENTS/CONSENT terminators,
+/// which must not affect nesting depth.
+fn level_is_end_message(l: &str) -> bool {
+    let t = marker_core(l);
+    t.starts_with("END NOSTR") && t != "END NOSTR RECIPIENTS" && t != "END NOSTR CONSENT" && t != "END NOSTR ATTACHMENTS"
+}
+
+/// Split one armor level into its body, RECIPIENTS, CONSENT, and nested-armor
+/// parts (spec Sections 10–11). This is the shared primitive behind
+/// [`parse_armor_depth`] and [`extract_ciphertext_binary`]; both must agree on
+/// what counts as "the body" so that signing and verification stay consistent.
+///
+/// Existing single-recipient / plaintext messages carry no RECIPIENTS or CONSENT
+/// blocks, so `recipients_text`/`consent_text` are `None` and `body_text` is
+/// byte-identical to the legacy behavior.
+fn split_armor_level(body: &str) -> Option<ArmorLevelParts> {
     let body = body.replace("\r\n", "\n");
     let lines: Vec<&str> = body.lines().collect();
 
-    let contains_begin_body = |l: &str| {
-        l.contains("BEGIN NOSTR NIP-") || l.contains("BEGIN NOSTR SIGNED")
-    };
-    let contains_sig_seal = |l: &str| {
-        l.contains("BEGIN NOSTR SIGNATURE") || l.contains("BEGIN NOSTR SEAL")
-    };
-    let contains_end = |l: &str| l.contains("END NOSTR");
-
+    #[derive(PartialEq)]
+    enum S { Before, Body, Recipients, Consent, Attachments, Nested }
+    let mut state = S::Before;
     let mut depth: i32 = 0;
-    let mut in_body = false;
-    let mut in_nested = false;
     let mut body_lines: Vec<&str> = Vec::new();
+    let mut recipients_lines: Vec<&str> = Vec::new();
+    let mut consent_lines: Vec<&str> = Vec::new();
+    let mut attachments_lines: Vec<&str> = Vec::new();
     let mut nested_lines: Vec<&str> = Vec::new();
 
     for line in &lines {
-        if !in_body && !in_nested {
-            if contains_begin_body(line) {
-                depth = 1;
-                in_body = true;
+        match state {
+            S::Before => {
+                if level_is_begin_body(line) {
+                    depth = 1;
+                    state = S::Body;
+                }
             }
-            continue;
-        }
-
-        if in_body {
-            if contains_begin_body(line) {
-                depth += 1;
-                in_nested = true;
-                in_body = false;
+            S::Body => {
+                if level_is_begin_body(line) {
+                    depth = 2;
+                    state = S::Nested;
+                    nested_lines.push(line);
+                } else if level_is_begin_recipients(line) {
+                    state = S::Recipients;
+                } else if level_is_begin_consent(line) {
+                    state = S::Consent;
+                } else if level_is_begin_attachments(line) {
+                    state = S::Attachments;
+                } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
+                    break;
+                } else {
+                    body_lines.push(line);
+                }
+            }
+            S::Recipients => {
+                if level_is_begin_body(line) {
+                    depth = 2;
+                    state = S::Nested;
+                    nested_lines.push(line);
+                } else if level_is_begin_consent(line) {
+                    state = S::Consent;
+                } else if level_is_begin_attachments(line) {
+                    state = S::Attachments;
+                } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
+                    break;
+                } else if level_is_end_recipients(line) {
+                    state = S::Body;
+                } else {
+                    recipients_lines.push(line);
+                }
+            }
+            S::Consent => {
+                if level_is_begin_body(line) {
+                    depth = 2;
+                    state = S::Nested;
+                    nested_lines.push(line);
+                } else if level_is_begin_attachments(line) {
+                    state = S::Attachments;
+                } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
+                    break;
+                } else if level_is_end_consent(line) {
+                    state = S::Body;
+                } else {
+                    consent_lines.push(line);
+                }
+            }
+            S::Attachments => {
+                if level_is_begin_body(line) {
+                    depth = 2;
+                    state = S::Nested;
+                    nested_lines.push(line);
+                } else if level_is_begin_sig_or_seal(line) || level_is_end_message(line) {
+                    break;
+                } else if level_is_end_attachments(line) {
+                    state = S::Body;
+                } else {
+                    attachments_lines.push(line);
+                }
+            }
+            S::Nested => {
                 nested_lines.push(line);
-                continue;
-            }
-            if depth == 1 && (contains_sig_seal(line) || contains_end(line)) {
-                break;
-            }
-            body_lines.push(line);
-            continue;
-        }
-
-        if in_nested {
-            nested_lines.push(line);
-            if contains_begin_body(line) {
-                depth += 1;
-            }
-            if contains_end(line) {
-                depth -= 1;
-                if depth == 1 {
-                    in_nested = false;
-                    in_body = true;
+                if level_is_begin_body(line) {
+                    depth += 1;
+                } else if level_is_end_message(line) {
+                    depth -= 1;
+                    if depth == 1 {
+                        state = S::Body;
+                    }
                 }
             }
         }
+    }
+
+    if state == S::Before {
+        return None;
     }
 
     let body_text = body_lines.join("\n").trim().to_string();
@@ -1818,7 +2357,16 @@ fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
         return None;
     }
 
-    let nested = if nested_lines.is_empty() {
+    let join_opt = |v: &[&str]| -> Option<String> {
+        if v.is_empty() {
+            None
+        } else {
+            let s = v.join("\n").trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+    };
+
+    let nested_armor = if nested_lines.is_empty() {
         None
     } else {
         let stripped: Vec<&str> = nested_lines.iter().map(|l| {
@@ -1826,10 +2374,26 @@ fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
             else if *l == ">" { "" }
             else { *l }
         }).collect();
-        Some(stripped.join("\n").trim().to_string())
+        let s = stripped.join("\n").trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
     };
 
-    Some((body_text, nested))
+    Some(ArmorLevelParts {
+        body_text,
+        recipients_text: join_opt(&recipients_lines),
+        consent_text: join_opt(&consent_lines),
+        attachments_text: join_opt(&attachments_lines),
+        nested_armor,
+    })
+}
+
+/// Parse armor structure with depth counting, separating outermost body from nested armor.
+/// Returns (body_text, nested_armor) where nested_armor has one level of "> " prefix stripped.
+/// Handles both non-quoted nested armor (reply chains) and > quoted nested armor.
+/// RECIPIENTS / CONSENT blocks (spec Sections 10–11) are excluded from `body_text`.
+fn parse_armor_depth(body: &str) -> Option<(String, Option<String>)> {
+    let parts = split_armor_level(body)?;
+    Some((parts.body_text, parts.nested_armor))
 }
 
 /// Decode a combined 96-byte signature+pubkey block.
@@ -2056,6 +2620,11 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
         result.quoted_armor_text = raw_quoted_text;
     }
 
+    // Attach RECIPIENTS/CONSENT (spec §§10–11) per level. These live outside the
+    // capnp schema, so they're parsed from the raw armor text and attached here,
+    // before caching, so cached subtrees carry them too.
+    attach_agreement_blocks(&mut result, &normalized);
+
     debug_log!("[RUST] parse_armor_components: success body_type={} nip={:?} has_sig={} has_seal={} has_quoted={}",
         result.body_type, result.encryption_nip, result.signature_hex.is_some(),
         result.seal_pubkey_hex.is_some(), result.quoted.is_some());
@@ -2083,6 +2652,27 @@ pub fn parse_armor_components(armor_text: &str) -> Option<crate::types::ParsedAr
         result.encryption_nip, result.quoted.is_some());
 
     Some(result)
+}
+
+/// Attach each level's RECIPIENTS/CONSENT blocks (spec §§10–11) to an already
+/// parsed `ParsedArmorMessage`, walking the raw armor with `split_armor_level`
+/// in lock-step with the parsed `quoted` chain. These blocks live outside the
+/// capnp schema, mirroring how `prefix_text`/`quoted_armor_text` are populated.
+fn attach_agreement_blocks(result: &mut crate::types::ParsedArmorMessage, raw_armor: &str) {
+    if let Some(parts) = split_armor_level(raw_armor) {
+        result.recipients = parts.recipients_text.as_deref()
+            .map(crate::agreement::parse_recipients_block)
+            .unwrap_or_default();
+        result.recipients_text = parts.recipients_text.clone();
+        result.consent = parts.consent_text.as_deref()
+            .and_then(crate::agreement::parse_consent_block);
+        result.attachments = parts.attachments_text.as_deref()
+            .map(crate::agreement::parse_attachments_block)
+            .unwrap_or_default();
+        if let (Some(quoted), Some(nested)) = (result.quoted.as_mut(), parts.nested_armor.as_ref()) {
+            attach_agreement_blocks(quoted, nested);
+        }
+    }
 }
 
 /// Populate a capnp ArmorMessage builder from armor text.
@@ -2120,10 +2710,9 @@ fn populate_armor_from_text(
     // ── Phase A: Line extraction (state machine) ──
     let lines: Vec<&str> = normalized[armor_start..].lines().collect();
 
-    let is_begin_body = |l: &str| -> bool {
-        let t = l.trim().trim_matches('-').trim();
-        t.starts_with("BEGIN NOSTR NIP-") || t.starts_with("BEGIN NOSTR SIGNED")
-    };
+    let is_begin_body = |l: &str| -> bool { level_is_begin_body(l) };
+    let is_begin_recipients = |l: &str| -> bool { level_is_begin_recipients(l) };
+    let is_begin_consent = |l: &str| -> bool { level_is_begin_consent(l) };
     let is_begin_sig = |l: &str| -> bool {
         let t = l.trim().trim_matches('-').trim();
         t == "BEGIN NOSTR SIGNATURE"
@@ -2132,10 +2721,9 @@ fn populate_armor_from_text(
         let t = l.trim().trim_matches('-').trim();
         t == "BEGIN NOSTR SEAL"
     };
-    let is_end = |l: &str| -> bool {
-        let t = l.trim().trim_matches('-').trim();
-        t.starts_with("END NOSTR")
-    };
+    // Message-closing END only — RECIPIENTS/CONSENT standalone terminators must
+    // not affect nesting depth (spec Sections 10.2, 11.3).
+    let is_end = |l: &str| -> bool { level_is_end_message(l) };
 
     let mut depth: i32 = 0;
     let mut state = "before";
@@ -2144,6 +2732,11 @@ fn populate_armor_from_text(
     let mut quoted_armor_lines: Vec<&str> = Vec::new();
     let mut sig_lines: Vec<&str> = Vec::new();
     let mut seal_lines: Vec<&str> = Vec::new();
+    // RECIPIENTS / CONSENT block bodies (spec Sections 10–11). Captured here so
+    // body_text stays clean; serde exposure / capnp storage follows in a later
+    // phase.
+    let mut recipients_lines: Vec<&str> = Vec::new();
+    let mut consent_lines: Vec<&str> = Vec::new();
 
     for line in &lines {
         match state {
@@ -2159,6 +2752,10 @@ fn populate_armor_from_text(
                     depth += 1;
                     state = "quoted";
                     quoted_armor_lines.push(line);
+                } else if is_begin_recipients(line) && depth == 1 {
+                    state = "recipients";
+                } else if is_begin_consent(line) && depth == 1 {
+                    state = "consent";
                 } else if is_begin_sig(line) && depth == 1 {
                     state = "sig";
                 } else if is_begin_seal(line) && depth == 1 {
@@ -2167,6 +2764,42 @@ fn populate_armor_from_text(
                     state = "done";
                 } else {
                     body_lines.push(line);
+                }
+            }
+            "recipients" => {
+                if is_begin_body(line) {
+                    depth += 1;
+                    state = "quoted";
+                    quoted_armor_lines.push(line);
+                } else if is_begin_consent(line) && depth == 1 {
+                    state = "consent";
+                } else if is_begin_sig(line) && depth == 1 {
+                    state = "sig";
+                } else if is_begin_seal(line) && depth == 1 {
+                    state = "seal";
+                } else if level_is_end_recipients(line) {
+                    state = "body";
+                } else if is_end(line) && depth == 1 {
+                    state = "done";
+                } else {
+                    recipients_lines.push(line);
+                }
+            }
+            "consent" => {
+                if is_begin_body(line) {
+                    depth += 1;
+                    state = "quoted";
+                    quoted_armor_lines.push(line);
+                } else if is_begin_sig(line) && depth == 1 {
+                    state = "sig";
+                } else if is_begin_seal(line) && depth == 1 {
+                    state = "seal";
+                } else if level_is_end_consent(line) {
+                    state = "body";
+                } else if is_end(line) && depth == 1 {
+                    state = "done";
+                } else {
+                    consent_lines.push(line);
                 }
             }
             "quoted" => {
@@ -2189,6 +2822,9 @@ fn populate_armor_from_text(
             _ => {}
         }
     }
+    // Keep the captured blocks observable to the compiler until serde/capnp
+    // wiring lands; deliberately unused for now.
+    let _ = (&recipients_lines, &consent_lines);
 
     if state == "before" {
         debug_log!("[RUST] populate_armor_from_text: state machine never left 'before'");
@@ -2453,6 +3089,12 @@ fn armor_message_to_serde(reader: crate::nostr_mail_capnp::armor_message::Reader
         quoted,
         quoted_armor_text,
         body_bytes_b64,
+        // RECIPIENTS/CONSENT live outside the capnp schema; attached by
+        // attach_agreement_blocks in parse_armor_components after this conversion.
+        recipients: Vec::new(),
+        recipients_text: None,
+        consent: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -2794,31 +3436,28 @@ fn glossia_decode_subject(subject: &str, nip_hint: &str) -> Option<String> {
 
 // ── Decrypt pipeline ─────────────────────────────────────────────────
 
-/// JSON manifest structs for legacy email format (serde deserialization).
-#[derive(Debug, serde::Deserialize)]
-struct JsonManifest {
-    body: Option<JsonEncryptedBlob>,
-    attachments: Option<Vec<JsonAttachment>>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct JsonEncryptedBlob {
-    ciphertext: String,
-    #[allow(dead_code)]
-    cipher_sha256: Option<String>,
-    #[allow(dead_code)]
-    cipher_size: Option<u64>,
-    key_wrap: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct JsonAttachment {
-    id: String,
-    orig_filename: String,
-    orig_mime: String,
-    cipher_sha256: Option<String>,
-    cipher_size: Option<u64>,
-    key_wrap: String,
+/// Interpret freshly decrypted body bytes (from either the pairwise NIP path or
+/// the CEK-envelope path). If they are an attachment manifest (capnp or legacy
+/// JSON; §11.2) — a nested AES-encrypted body blob plus per-attachment key wraps
+/// — recover the body into `block.decrypted_text` and return the parsed manifest
+/// so the caller can surface its attachment entries. Otherwise treat the bytes as
+/// the plaintext body directly and return `None`. The manifest is already
+/// protected by the outer layer (pairwise NIP-44 or the per-recipient-wrapped
+/// CEK), so its key wraps are in the clear here only after that layer is opened.
+fn apply_manifest_or_plaintext(
+    decrypted: Vec<u8>,
+    block: &mut crate::types::DecryptedBlock,
+) -> Option<crate::manifest::ParsedManifest> {
+    if let Some(manifest) = crate::manifest::parse_manifest(&decrypted) {
+        match manifest.body_text {
+            Some(ref text) => block.decrypted_text = Some(text.clone()),
+            None => block.error = Some("Manifest body decrypt failed".to_string()),
+        }
+        return Some(manifest);
+    }
+    // Plain body: the decrypted content is the body text directly.
+    block.decrypted_text = Some(String::from_utf8_lossy(&decrypted).into_owned());
+    None
 }
 
 /// Determine which pubkey to use for NIP decryption at a given armor level.
@@ -2883,9 +3522,14 @@ fn decrypt_single_block(
     private_key: &str,
     user_pubkey_hex: &str,
     fallback_pubkey: &str,
-) -> (crate::types::DecryptedBlock, Option<JsonManifest>) {
-    use base64::Engine;
-
+    // RECIPIENTS stanzas for this level (spec §10). Non-empty selects the
+    // multi-recipient envelope (CEK) path instead of pairwise NIP decryption.
+    recipients: &[crate::agreement::Recipient],
+    // The per-message ephemeral pubkey from the RECIPIENTS block (spec §10.1),
+    // if present. The CEK is unwrapped against this key; `None` falls back to the
+    // sender's identity key (legacy envelopes without an `ephemeral` line).
+    ephemeral_pubkey: Option<&str>,
+) -> (crate::types::DecryptedBlock, Option<crate::manifest::ParsedManifest>) {
     debug_log!("[RUST] decrypt_single_block: type={} nip={:?} sig_pk={:?} seal_pk={:?} fallback={:?} body_preview={:?}",
         body_type, encryption_nip, sig_pubkey_hex.map(|s| &s[..s.len().min(16)]),
         seal_pubkey_hex.map(|s| &s[..s.len().min(16)]),
@@ -2911,6 +3555,87 @@ fn decrypt_single_block(
         }
         block.decrypted_text = Some(decoded.unwrap_or_else(|| body_text.to_string()));
         return (block, None);
+    }
+
+    // Multi-recipient envelope path (spec §10): selected by the presence of a
+    // RECIPIENTS block, not a special body tag. Find the reader's stanza,
+    // NIP-44-unwrap the per-message CEK against the ephemeral pubkey (or the
+    // sender's pubkey for legacy envelopes), then AES-256-GCM-decrypt the body.
+    if !recipients.is_empty() {
+        let me = crate::agreement::normalize_pubkey_hex(user_pubkey_hex)
+            .unwrap_or_else(|| user_pubkey_hex.to_string());
+        // The sender (message author) is the SIGNATURE, then SEAL, then fallback
+        // (other-party) pubkey. With ephemeral wrapping the CEK is unwrapped
+        // against the ephemeral key instead; the sender pubkey remains the
+        // legacy fallback counterparty.
+        let sender_pub = match sig_pubkey_hex.or(seal_pubkey_hex)
+            .map(|s| s.to_string())
+            .or_else(|| (!fallback_pubkey.is_empty()).then(|| fallback_pubkey.to_string()))
+        {
+            Some(p) => p,
+            None => {
+                block.error = Some("Envelope message has no sender pubkey for CEK unwrap".to_string());
+                return (block, None);
+            }
+        };
+        let stanza = recipients.iter().find(|r| {
+            crate::agreement::normalize_pubkey_hex(&r.pubkey).as_deref() == Some(me.as_str())
+        });
+        let stanza = match stanza {
+            Some(s) => s,
+            None => {
+                // Expected when reading a level predating the reader's addition
+                // to the thread (spec §10.8).
+                block.error = Some("Not a recipient of this message level (no matching RECIPIENTS stanza)".to_string());
+                return (block, None);
+            }
+        };
+        let wrapped = match &stanza.wrapped_cek {
+            Some(w) => w,
+            None => {
+                // No CEK in the email: a plaintext (public) agreement stanza
+                // (§11.8) — malformed for an ENCRYPTED body — or gift-wrap mode
+                // (§11.7), where the CEK arrives in the referenced DM (not yet
+                // wired). Either way this body can't be decrypted from the email.
+                let why = if stanza.reference.is_some() {
+                    "CEK is delivered out-of-band (gift-wrap reference); DM delivery not yet supported"
+                } else {
+                    "RECIPIENTS stanza carries no CEK but the body is encrypted"
+                };
+                block.error = Some(why.to_string());
+                return (block, None);
+            }
+        };
+        let unwrap_pub = ephemeral_pubkey.unwrap_or(&sender_pub);
+        let cek = match crate::crypto::unwrap_cek(private_key, unwrap_pub, wrapped) {
+            Ok(c) => c,
+            Err(e) => {
+                block.error = Some(format!("Envelope CEK unwrap failed: {}", e));
+                return (block, None);
+            }
+        };
+        let ciphertext = match decode_armor_section(body_text) {
+            Some(b) => b,
+            None => {
+                block.error = Some("Envelope body decode failed".to_string());
+                return (block, None);
+            }
+        };
+        match crate::crypto::aes_gcm_decrypt_raw(&cek, &ciphertext) {
+            Ok(pt) => {
+                debug_log!("[RUST] decrypt_single_block: envelope decrypt SUCCESS, {} bytes", pt.len());
+                // The body plaintext may be an attachment manifest (§11.2),
+                // protected here by the per-recipient-wrapped CEK rather than
+                // pairwise NIP-44 — handle it the same way (shared helper). Pass
+                // raw bytes: a capnp manifest is binary, not UTF-8.
+                let manifest = apply_manifest_or_plaintext(pt, &mut block);
+                return (block, manifest);
+            }
+            Err(e) => {
+                block.error = Some(format!("Envelope AES-GCM decrypt failed: {}", e));
+                return (block, None);
+            }
+        }
     }
 
     let nip = encryption_nip.unwrap_or("nip44");
@@ -2972,64 +3697,11 @@ fn decrypt_single_block(
     debug_log!("[RUST-PERF] decrypt_single_block: nip={} glossia={}ms (ct={}b) nip_decrypt={}ms (out={}b)",
         nip, glossia_ms, ciphertext_len, nip_decrypt_ms, decrypted.len());
 
-    // Step 4: Detect manifest vs legacy
-    let trimmed = decrypted.trim();
-    if trimmed.starts_with('{') {
-        // Try JSON manifest parse
-        if let Ok(manifest) = serde_json::from_str::<JsonManifest>(trimmed) {
-            if let Some(ref body_blob) = manifest.body {
-                // AES decrypt the manifest body
-                let key_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.key_wrap) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        block.error = Some(format!("Manifest key_wrap base64 decode failed: {}", e));
-                        return (block, Some(manifest));
-                    }
-                };
-                let ct_bytes = match base64::engine::general_purpose::STANDARD.decode(&body_blob.ciphertext) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        block.error = Some(format!("Manifest ciphertext base64 decode failed: {}", e));
-                        return (block, Some(manifest));
-                    }
-                };
-
-                match crate::crypto::aes_gcm_decrypt_raw(&key_bytes, &ct_bytes) {
-                    Ok(plaintext_bytes) => {
-                        // The plaintext is base64-encoded UTF-8 body (matching JS: atob(aesResult))
-                        match String::from_utf8(plaintext_bytes) {
-                            Ok(b64_body) => {
-                                // Decode the base64 to get the actual text
-                                match base64::engine::general_purpose::STANDARD.decode(b64_body.trim()) {
-                                    Ok(body_bytes) => {
-                                        match String::from_utf8(body_bytes) {
-                                            Ok(text) => block.decrypted_text = Some(text),
-                                            Err(_) => block.decrypted_text = Some(b64_body),
-                                        }
-                                    }
-                                    Err(_) => {
-                                        // Not base64 — use as-is (the plaintext IS the body)
-                                        block.decrypted_text = Some(b64_body);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                block.error = Some("Manifest body AES plaintext is not UTF-8".to_string());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        block.error = Some(format!("Manifest AES decrypt failed: {}", e));
-                    }
-                }
-                return (block, Some(manifest));
-            }
-        }
-    }
-
-    // Legacy format: decrypted content is the body text directly
-    block.decrypted_text = Some(decrypted);
-    (block, None)
+    // Step 4: Detect manifest vs legacy (shared with the CEK-envelope path).
+    // NIP-44 yields a UTF-8 string; the 1:1 path carries plaintext/legacy-JSON
+    // bodies here (the raw-binary capnp manifest rides the byte-clean CEK path).
+    let manifest = apply_manifest_or_plaintext(decrypted.into_bytes(), &mut block);
+    (block, manifest)
 }
 
 /// Walk the capnp ArmorMessage tree recursively, decrypting each encrypted block.
@@ -3047,7 +3719,7 @@ fn decrypt_armor_tree(
     // message is rejected before decryption (the signature is NIP-04's only MAC).
     require_signature: bool,
     depth: usize,
-) -> (Vec<crate::types::DecryptedBlock>, Option<JsonManifest>) {
+) -> (Vec<crate::types::DecryptedBlock>, Option<crate::manifest::ParsedManifest>) {
     let perf_level = std::time::Instant::now();
     let mut results = Vec::new();
     let mut outer_manifest = None;
@@ -3204,6 +3876,8 @@ fn decrypt_armor_tree(
 
     // Decrypt this level
     let perf_block = std::time::Instant::now();
+    let level_ephemeral = parsed.recipients_text.as_deref()
+        .and_then(crate::agreement::parse_recipients_ephemeral);
     let (block, manifest) = decrypt_single_block(
         &parsed.body_text,
         &parsed.body_type,
@@ -3214,6 +3888,8 @@ fn decrypt_armor_tree(
         private_key,
         user_pubkey_hex,
         fallback_pubkey,
+        &parsed.recipients,
+        level_ephemeral.as_deref(),
     );
     let block_ms = perf_block.elapsed().as_millis();
     if manifest.is_some() {
@@ -3343,18 +4019,16 @@ pub fn decrypt_email_body_pipeline(
     let success = outer_block.map(|b| b.decrypted_text.is_some()).unwrap_or(false);
     let error = if success { None } else { outer_block.and_then(|b| b.error.clone()) };
 
-    // Extract attachment metadata from manifest
+    // Extract attachment metadata from manifest (raw bytes → UI-facing base64/hex)
     let (is_manifest, attachments) = if let Some(ref m) = manifest {
-        let atts = m.attachments.as_ref().map(|att_list| {
-            att_list.iter().map(|a| crate::types::ManifestAttachmentInfo {
-                id: a.id.clone(),
-                orig_filename: a.orig_filename.clone(),
-                orig_mime: a.orig_mime.clone(),
-                key_wrap_b64: a.key_wrap.clone(),
-                cipher_sha256_hex: a.cipher_sha256.clone(),
-                cipher_size: a.cipher_size.unwrap_or(0),
-            }).collect()
-        }).unwrap_or_default();
+        let atts = m.attachments.iter().map(|a| crate::types::ManifestAttachmentInfo {
+            id: a.id.clone(),
+            orig_filename: a.orig_filename.clone(),
+            orig_mime: a.orig_mime.clone(),
+            key_wrap_b64: a.key_wrap_b64(),
+            cipher_sha256_hex: Some(a.cipher_sha256_hex()),
+            cipher_size: a.cipher_size,
+        }).collect();
         (true, atts)
     } else {
         (false, Vec::new())
@@ -3362,7 +4036,18 @@ pub fn decrypt_email_body_pipeline(
 
     // Decrypt subject — use armor's embedded pubkey as fallback when sender_pubkey wasn't provided
     let perf_subject = std::time::Instant::now();
-    let (decrypted_subject, subject_ciphertext) = if parsed.body_type == "encrypted" {
+    let (decrypted_subject, subject_ciphertext) = if !parsed.recipients.is_empty() {
+        // Multi-recipient envelope: the subject is AES-256-GCM-encrypted under the
+        // same CEK as the body (or cleartext for a plaintext agreement). The
+        // sender (who wrapped the CEK) is the message author.
+        let sender_pub = parsed.sig_pubkey_hex.as_deref()
+            .or(parsed.seal_pubkey_hex.as_deref())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| fallback.to_string());
+        let subj_ephemeral = parsed.recipients_text.as_deref()
+            .and_then(crate::agreement::parse_recipients_ephemeral);
+        decrypt_subject_envelope(subject, &parsed.recipients, &sender_pub, private_key, &user_pubkey_hex, subj_ephemeral.as_deref())
+    } else if parsed.body_type == "encrypted" {
         let nip_hint = parsed.encryption_nip.as_deref().unwrap_or("nip44");
         let subject_fallback = if fallback.is_empty() {
             // The armor signature/seal block contains the sender's pubkey
@@ -3507,12 +4192,22 @@ pub fn decrypt_attachment_pipeline(
         .map_err(|e| format!("key_wrap base64 decode failed: {}", e))?;
 
     // Verify SHA-256 if provided (warn on mismatch but continue, matching JS behavior)
+    // Enforce the ciphertext hash recorded in the (signed) manifest: a mismatch
+    // means the attachment bytes were swapped/corrupted in transit, so reject
+    // rather than decrypt tampered content (spec §11.2). The hash binds the
+    // attachment to the signature transitively — the manifest is inside the
+    // signed body — so this check is what makes that binding enforceable.
     if let Some(expected_hash) = cipher_sha256_hex {
-        let mut hasher = Sha256::new();
-        hasher.update(&encrypted_data);
-        let actual_hash = hex::encode(hasher.finalize());
-        if actual_hash != expected_hash {
-            debug_log!("[RUST] decrypt_attachment_pipeline: hash mismatch (expected {}, got {}) — continuing anyway", expected_hash, actual_hash);
+        if !expected_hash.is_empty() {
+            let mut hasher = Sha256::new();
+            hasher.update(&encrypted_data);
+            let actual_hash = hex::encode(hasher.finalize());
+            if actual_hash != expected_hash {
+                return Err(format!(
+                    "Attachment integrity check failed: ciphertext hash mismatch (expected {}, got {}) — the file was altered in transit",
+                    expected_hash, actual_hash
+                ));
+            }
         }
     }
 
@@ -3538,12 +4233,28 @@ pub fn decrypt_attachment_pipeline(
 /// decoded bytes from all levels (matching the JS signing behavior).
 /// For non-armored bodies: returns the UTF-8 bytes of the body text.
 pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
-    // Use depth-counting parser to properly handle nested reply armor
-    if let Some((body_text, nested_armor)) = parse_armor_depth(body) {
-        if let Some(mut bytes) = decode_armor_section(&body_text) {
-            if let Some(ref nested) = nested_armor {
+    // Use depth-counting parser to properly handle nested reply armor.
+    // The per-level signing contribution is body || canonical(recipients) ||
+    // canonical(consent) (spec Section 4.2); levels are concatenated outermost
+    // → innermost, matching Sections 3.5.0 / 3.6.1. For messages with no
+    // RECIPIENTS/CONSENT blocks (the common case) this reduces to decode(body)
+    // and is byte-identical to the legacy behavior.
+    if let Some(parts) = split_armor_level(body) {
+        if let Some(body_bytes) = decode_armor_section(&parts.body_text) {
+            let canon_recipients = parts.recipients_text.as_deref()
+                .map(crate::agreement::canonicalize_block)
+                .unwrap_or_default();
+            let canon_consent = parts.consent_text.as_deref()
+                .map(crate::agreement::canonicalize_block)
+                .unwrap_or_default();
+            let canon_attachments = parts.attachments_text.as_deref()
+                .map(crate::agreement::canonicalize_block)
+                .unwrap_or_default();
+            let mut bytes = crate::agreement::level_signing_bytes_with_attachments(
+                &body_bytes, &canon_recipients, &canon_consent, &canon_attachments);
+            if let Some(ref nested) = parts.nested_armor {
                 let nested_bytes = extract_ciphertext_binary(nested);
-                debug_log!("[RUST] extract_ciphertext_binary: concatenating {} outer + {} nested bytes",
+                debug_log!("[RUST] extract_ciphertext_binary: concatenating {} outer (body+recipients+consent+attachments) + {} nested bytes",
                     bytes.len(), nested_bytes.len());
                 bytes.extend_from_slice(&nested_bytes);
             }
@@ -3554,6 +4265,143 @@ pub fn extract_ciphertext_binary(body: &str) -> Vec<u8> {
     // Non-armored body: return UTF-8 bytes
     debug_log!("[RUST] extract_ciphertext_binary: plain text, {} bytes", body.len());
     body.as_bytes().to_vec()
+}
+
+/// Glossia-encode raw bytes for an armor body using the given encoding scheme
+/// (the user's Advanced "encoding" setting; `None` ⇒ english/bip39). Returns the
+/// encoded words and the canonical decoded bytes (what `decode_armor_section`
+/// recovers, i.e. the bytes a signature is computed over). Glossia — not base64 —
+/// is used because its word tokens survive email transport (quote `> ` prefixes,
+/// word-wrapping, reflow) that would corrupt base64 and break signed reply chains
+/// (spec §5). Decoding auto-detects the dialect, so only encoding needs the setting.
+pub(crate) fn glossia_encode_bytes_with(data: &[u8], encoding: Option<&str>) -> Option<(String, Vec<u8>)> {
+    let hex_input = glossia::hex_encode(data);
+    let (language, wordlist) = glossia_lang_wordlist(encoding);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        glossia::encode_into_language(
+            &hex_input, &language, &wordlist, "body",
+            None, 42, false, None, None, None, None,
+        )
+    }));
+    let encoded = match result {
+        Ok(Ok((enc, _, _, _))) => enc,
+        _ => return None,
+    };
+    let canonical = try_glossia_decode_to_bytes(&encoded)?;
+    Some((encoded, canonical))
+}
+
+/// Glossia-encode plaintext for a `SIGNED BODY` (spec §3.2): returns the encoded
+/// words and the canonical decoded bytes the signature is computed over (§4).
+fn glossia_encode_signed_body(text: &str, encoding: Option<&str>) -> Option<(String, Vec<u8>)> {
+    glossia_encode_bytes_with(text.as_bytes(), encoding)
+}
+
+/// Compose a **plaintext (public) agreement** — the unencrypted counterpart to
+/// `agreement::encode_hybrid_agreement` (spec §11.8). The terms are carried in a
+/// signed `SIGNED BODY` (readable by any client, with the plaintext also above
+/// the armor per §3.2), and the RECIPIENTS block declares the signatories/viewers
+/// with no `wrapped-cek` token (`Recipient.wrapped_cek == None`) since nothing
+/// is encrypted.
+///
+/// The document hash `H`, consent binding, signature coverage (§4.2), and
+/// completion accounting (§11.5) are identical to the encrypted case — they
+/// operate on the decoded body bytes regardless of cipher — so the agreement is
+/// verifiable offline by **anyone**, not just recipients. The trade-off vs the
+/// encrypted form is confidentiality: the terms and participant set are public.
+///
+/// `recipients_in` are the signatories (`signer`) and viewers (`viewer`); no
+/// `self` stanza is emitted (there is nothing to decrypt). When
+/// `originator_consents` is true the originator's CONSENT over `H` is included
+/// (the originator is then a required signatory, §11.2).
+pub fn encode_signed_agreement(
+    sender_priv: &str,
+    sender_pub: &str,
+    profile_name: &str,
+    terms_plaintext: &str,
+    recipients_in: &[crate::agreement::AgreementRecipientInput],
+    originator_consents: bool,
+    attachment_specs: &[crate::agreement::AttachmentSpec],
+    encoding: Option<&str>,
+) -> Result<String, String> {
+    use crate::agreement::{
+        canonicalize_block, document_hash, level_signing_bytes_with_attachments,
+        serialize_attachments, serialize_recipients, Consent, Recipient,
+    };
+    if recipients_in.is_empty() {
+        return Err("encode_signed_agreement requires at least one signatory".to_string());
+    }
+    let sender_pub_hex = crate::agreement::normalize_pubkey_hex(sender_pub)
+        .ok_or_else(|| "invalid sender pubkey".to_string())?;
+
+    let (encoded_body, canonical_bytes) = glossia_encode_signed_body(terms_plaintext, encoding)
+        .ok_or_else(|| "glossia encode of agreement terms failed".to_string())?;
+
+    // Signatories/viewers with no key wrap (plaintext): role pubkey [email].
+    let recipients: Vec<Recipient> = recipients_in.iter().map(|r| Recipient {
+        role: r.role.to_ascii_lowercase(),
+        pubkey: r.pubkey.clone(),
+        wrapped_cek: None,
+        email: r.email.clone(),
+        reference: None,
+    }).collect();
+    let recipients_body = serialize_recipients(&recipients);
+    let canon_recipients = canonicalize_block(&recipients_body);
+
+    let (consent_body, canon_consent) = if originator_consents {
+        let h = document_hash(&canonical_bytes, &canon_recipients);
+        let consent = Consent { agreement_hash: hex::encode(h), signer: sender_pub_hex.clone() };
+        let body = consent.to_block_body();
+        let canon = canonicalize_block(&body);
+        (Some(body), canon)
+    } else {
+        (None, String::new())
+    };
+
+    // Public attachments are bound by a signed ATTACHMENTS block carrying each
+    // file's plaintext SHA-256 (§11.2). Empty ⇒ no block, no signing change.
+    let (attachments_body, canon_attachments) = if attachment_specs.is_empty() {
+        (None, String::new())
+    } else {
+        let body = serialize_attachments(attachment_specs);
+        let canon = canonicalize_block(&body);
+        (Some(body), canon)
+    };
+
+    let signing_bytes = level_signing_bytes_with_attachments(
+        &canonical_bytes, &canon_recipients, &canon_consent, &canon_attachments);
+    let sig_hex = crate::crypto::sign_data_bytes(sender_priv, &signing_bytes)
+        .map_err(|e| e.to_string())?;
+
+    let mut out = String::new();
+    // Plaintext above the armor for non-Nostr-Mail clients (spec §3.2).
+    out.push_str(terms_plaintext);
+    out.push_str("\n\n");
+    out.push_str("----- BEGIN NOSTR SIGNED BODY -----\n");
+    out.push_str(&encoded_body);
+    out.push('\n');
+    out.push_str("----- BEGIN NOSTR RECIPIENTS -----\n");
+    out.push_str(&recipients_body);
+    out.push('\n');
+    if let Some(ref c) = consent_body {
+        out.push_str("----- BEGIN NOSTR CONSENT -----\n");
+        out.push_str(c);
+        out.push('\n');
+    }
+    if let Some(ref a) = attachments_body {
+        out.push_str("----- BEGIN NOSTR ATTACHMENTS -----\n");
+        out.push_str(a);
+        out.push('\n');
+    }
+    out.push_str("----- BEGIN NOSTR SIGNATURE -----\n@");
+    out.push_str(profile_name);
+    out.push('\n');
+    out.push_str(&sig_hex);
+    out.push('\n');
+    out.push_str(&sender_pub_hex);
+    out.push('\n');
+    out.push_str("----- END NOSTR MESSAGE -----");
+    Ok(out)
 }
 
 /// Verify email signature using binary ciphertext extraction.
@@ -3575,6 +4423,46 @@ pub fn verify_email_signature(sender_pubkey: &str, signature: &str, body: &str) 
 
 /// Verify email signature using the in-body SIGNATURE block (primary trust path).
 /// Returns `Some(true/false)` if an inline signature was found, `None` if no inline sig exists.
+/// Verify a delivered plaintext attachment against a public message's signed
+/// ATTACHMENTS block (spec §11.2).
+///
+/// Public attachments ride as plaintext MIME parts; the signed block binds each
+/// file's plaintext SHA-256, and the block is covered by the message signature.
+/// So a delivered file is trustworthy only when (a) the armor signature(s) are
+/// valid — making the block authentic — and (b) the file's SHA-256 matches a
+/// listed spec with that filename. Returns the full breakdown so callers can
+/// distinguish "no such attachment in the message" from "hash mismatch".
+pub fn verify_public_attachment(
+    armor: &str,
+    filename: &str,
+    data: &[u8],
+) -> crate::types::PublicAttachmentVerification {
+    use sha2::{Digest, Sha256};
+    let actual_sha256 = hex::encode(Sha256::digest(data));
+
+    // The block is only authentic if the message signature verifies.
+    let sigs = verify_all_signatures_inline(armor);
+    let signature_valid = !sigs.is_empty() && sigs.iter().all(|s| s.is_valid);
+
+    let specs = parse_armor_components(armor)
+        .map(|p| p.attachments)
+        .unwrap_or_default();
+    let named: Vec<&crate::agreement::AttachmentSpec> =
+        specs.iter().filter(|s| s.filename == filename).collect();
+    let spec_found = !named.is_empty();
+    let hash_match = named.iter().any(|s| s.sha256.eq_ignore_ascii_case(&actual_sha256));
+    let expected_sha256 = named.first().map(|s| s.sha256.clone());
+
+    crate::types::PublicAttachmentVerification {
+        verified: signature_valid && spec_found && hash_match,
+        signature_valid,
+        spec_found,
+        hash_match,
+        expected_sha256,
+        actual_sha256,
+    }
+}
+
 pub fn verify_email_signature_inline(body: &str) -> Option<bool> {
     let parsed = parse_armor_components(body)?;
     let sig_hex = parsed.signature_hex.as_ref()?;
@@ -3699,6 +4587,206 @@ fn verify_all_signatures_recursive(body: &str, depth: usize) -> Vec<crate::types
 
     debug_log!("[RUST] verify_all_sigs_recursive: depth={}, returning {} total results", depth, results.len());
     results
+}
+
+/// Recursively collect each armor level's RECIPIENTS stanzas, keyed by nesting
+/// depth (0 = outermost). Uses the same `split_armor_level` walk as the signing
+/// path, so depths line up with [`verify_all_signatures_inline`].
+fn collect_level_recipients(armor: &str, depth: usize, out: &mut Vec<(usize, Vec<crate::agreement::Recipient>)>) {
+    if let Some(parts) = split_armor_level(armor) {
+        let recips = parts.recipients_text.as_deref()
+            .map(crate::agreement::parse_recipients_block)
+            .unwrap_or_default();
+        out.push((depth, recips));
+        if let Some(nested) = parts.nested_armor {
+            collect_level_recipients(&nested, depth + 1, out);
+        }
+    }
+}
+
+/// Verify email↔npub bindings provable from a single self-contained thread —
+/// **statelessly** (issue #102). There is no outstanding-challenge store: because
+/// a reply nests the issuer's own signed challenge, "I issued this" is re-derived
+/// by checking that the email-asserting level is signed by `my_pubkey`. This makes
+/// the verdict a pure function of mailbox contents, so a fresh client reconstructs
+/// all bindings by re-scanning (mirroring the stateless §9.1 spam-rescue design).
+///
+/// A binding `(R, email)` is returned iff, in the same thread:
+///   1. every signature in the chain verifies (chain integrity, §4.2); and
+///   2. some level signed by `my_pubkey` carries a RECIPIENTS stanza pairing `R`
+///      with `email` (the issuer's authenticated assertion); and
+///   3. an **outer** level (nesting that challenge) is signed by `R` — proving
+///      `R` controls the npub and received/read the challenge.
+///
+/// `my_pubkey` is the verifier's own key (hex or npub) — this is the issuer-side
+/// check; the reverse binding (when the counterparty asserted *your* address in a
+/// level they signed) is the symmetric call with their key.
+pub fn verify_email_binding(thread: &str, my_pubkey: &str) -> Vec<crate::agreement::Binding> {
+    let me = match crate::agreement::normalize_pubkey_hex(my_pubkey) {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+
+    // 1. Chain integrity: every in-thread signature must verify (§4.2). A single
+    //    broken signature (e.g. a tampered (npub,email) pairing) voids the proof.
+    let sigs = verify_all_signatures_inline(thread);
+    if sigs.is_empty() || sigs.iter().any(|s| !s.is_valid) {
+        return Vec::new();
+    }
+    let signer_at = |depth: usize| -> Option<String> {
+        sigs.iter()
+            .find(|s| s.depth == depth)
+            .and_then(|s| s.pubkey_hex.as_deref())
+            .and_then(crate::agreement::normalize_pubkey_hex)
+    };
+
+    // 2. Per-level recipient stanzas.
+    let mut levels: Vec<(usize, Vec<crate::agreement::Recipient>)> = Vec::new();
+    collect_level_recipients(thread, 0, &mut levels);
+
+    // 3. For each level I signed, each emailed recipient R who also signed an
+    //    outer (quoting) level ⇒ proven binding.
+    let mut out: Vec<crate::agreement::Binding> = Vec::new();
+    for (depth, recips) in &levels {
+        if signer_at(*depth).as_deref() != Some(me.as_str()) {
+            continue; // not a level I (the issuer) signed
+        }
+        for r in recips {
+            let email = match &r.email {
+                Some(e) => e,
+                None => continue,
+            };
+            let r_hex = match crate::agreement::normalize_pubkey_hex(&r.pubkey) {
+                Some(h) => h,
+                None => continue,
+            };
+            if r_hex == me {
+                continue; // skip the issuer's own (self) stanza
+            }
+            let replied = (0..*depth).any(|d| signer_at(d).as_deref() == Some(r_hex.as_str()));
+            if replied {
+                let binding = crate::agreement::Binding {
+                    pubkey: r_hex.clone(),
+                    email: email.clone(),
+                    issuer_pubkey: me.clone(),
+                };
+                if !out.contains(&binding) {
+                    out.push(binding);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One armor level's agreement-relevant content, for thread-wide accounting.
+struct ThreadLevel {
+    depth: usize,
+    body_text: String,
+    /// Raw RECIPIENTS block body (needed verbatim to recompute the canonical
+    /// form for the document hash `H`), plus the parsed entries.
+    recipients_text: Option<String>,
+    recipients: Vec<crate::agreement::Recipient>,
+    consent: Option<crate::agreement::Consent>,
+}
+
+/// Recursively collect each level's body / RECIPIENTS / CONSENT (0 = outermost),
+/// using the same `split_armor_level` walk as signing so depths line up with
+/// [`verify_all_signatures_inline`].
+fn collect_thread_levels(armor: &str, depth: usize, out: &mut Vec<ThreadLevel>) {
+    if let Some(parts) = split_armor_level(armor) {
+        out.push(ThreadLevel {
+            depth,
+            body_text: parts.body_text.clone(),
+            recipients: parts.recipients_text.as_deref()
+                .map(crate::agreement::parse_recipients_block)
+                .unwrap_or_default(),
+            recipients_text: parts.recipients_text.clone(),
+            consent: parts.consent_text.as_deref()
+                .and_then(crate::agreement::parse_consent_block),
+        });
+        if let Some(nested) = parts.nested_armor {
+            collect_thread_levels(&nested, depth + 1, out);
+        }
+    }
+}
+
+/// Compute an agreement's "M of N signed" status from a self-contained thread
+/// (spec Section 11.5), offline and server-free.
+///
+/// Returns `None` when the thread is not an agreement (its originating level has
+/// no RECIPIENTS block). Otherwise:
+///   * the **originating** (innermost) level fixes the document hash
+///     `H = SHA-256(decode(body₁) || canonical(recipients₁))` (Section 11.3.1)
+///     and the required signatory set — its `signer` stanzas, plus the
+///     originator iff the originating level itself carries a CONSENT block
+///     (Section 11.2);
+///   * a signatory counts as consented only via a CONSENT block over this `H`
+///     whose `signer` equals that level's **verified** SIGNATURE pubkey
+///     (Sections 11.3, 11.5) — a signed comment without consent never counts.
+pub fn verify_agreement_status(thread: &str) -> Option<crate::agreement::AgreementStatus> {
+    let mut levels: Vec<ThreadLevel> = Vec::new();
+    collect_thread_levels(thread, 0, &mut levels);
+
+    // The originating message is the innermost (deepest) level.
+    let orig = levels.iter().max_by_key(|l| l.depth)?;
+    let orig_recipients_text = orig.recipients_text.as_deref()?; // not an agreement otherwise
+
+    // Per-level verified signer pubkey (hex), keyed by depth.
+    let sigs = verify_all_signatures_inline(thread);
+    let signer_at = |depth: usize| -> Option<(String, bool)> {
+        sigs.iter().find(|s| s.depth == depth).and_then(|s| {
+            s.pubkey_hex.as_deref()
+                .and_then(crate::agreement::normalize_pubkey_hex)
+                .map(|h| (h, s.is_valid))
+        })
+    };
+
+    // H over the originating body + canonicalized recipients (excludes consent).
+    let body_bytes = decode_armor_section(&orig.body_text)?;
+    let canon_recipients = crate::agreement::canonicalize_block(orig_recipients_text);
+    let h = hex::encode(crate::agreement::document_hash(&body_bytes, &canon_recipients));
+
+    // Required signatories: originating `signer` stanzas (+ originator if the
+    // originating level itself consented).
+    let mut required: Vec<String> = orig.recipients.iter()
+        .filter(|r| r.is_signer())
+        .map(|r| r.pubkey.clone())
+        .collect();
+    if orig.consent.is_some() {
+        if let Some((orig_signer, _valid)) = signer_at(orig.depth) {
+            required.push(orig_signer);
+        }
+    }
+
+    // Consents: a CONSENT over H, whose signer matches that level's *verified*
+    // signature pubkey.
+    let mut consented: Vec<String> = Vec::new();
+    for level in &levels {
+        let consent = match &level.consent { Some(c) => c, None => continue };
+        if !consent.agreement_hash.eq_ignore_ascii_case(&h) {
+            continue;
+        }
+        let (signer_hex, valid) = match signer_at(level.depth) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !valid {
+            continue; // consent bound by an invalid signature does not count
+        }
+        if crate::agreement::normalize_pubkey_hex(&consent.signer).as_deref() == Some(signer_hex.as_str()) {
+            consented.push(signer_hex);
+        }
+    }
+
+    let mut status = crate::agreement::compute_completion(&required, &consented);
+    // No required signatories ⇒ this is a plain multi-recipient message (all
+    // viewers), not an agreement.
+    if status.n == 0 {
+        return None;
+    }
+    status.document_hash = h;
+    Some(status)
 }
 
 /// Extract message ID from email headers
@@ -4902,6 +5990,1059 @@ nitela\n\
     }
 
     // =============================================
+    // Multi-recipient / agreement armor (spec §§10–11)
+    // =============================================
+
+    // hex pubkey for a generated keypair (verify_signature_bytes accepts hex/npub).
+    fn pubkey_hex(npub: &str) -> String {
+        crate::agreement::normalize_pubkey_hex(npub).expect("valid npub")
+    }
+
+    #[test]
+    fn test_split_armor_level_separates_recipients_and_consent() {
+        let body = "----- BEGIN NOSTR ENCRYPTED BODY -----\n\
+            QUJDREVG\n\
+            ----- BEGIN NOSTR RECIPIENTS -----\n\
+            signer aa bb\n\
+            self cc dd\n\
+            ----- BEGIN NOSTR CONSENT -----\n\
+            agreement deadbeef\n\
+            signer aa\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n\
+            sig pub\n\
+            ----- END NOSTR MESSAGE -----";
+        let parts = split_armor_level(body).expect("should split");
+        assert_eq!(parts.body_text, "QUJDREVG");
+        assert_eq!(parts.recipients_text.as_deref(), Some("signer aa bb\nself cc dd"));
+        assert_eq!(parts.consent_text.as_deref(), Some("agreement deadbeef\nsigner aa"));
+        assert!(parts.nested_armor.is_none());
+    }
+
+    #[test]
+    fn test_split_armor_level_no_blocks_matches_legacy_body() {
+        // A plain single-recipient message: body_text is exactly the ciphertext,
+        // and there are no recipients/consent blocks.
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8=\n\
+            ----- END NOSTR MESSAGE -----";
+        let parts = split_armor_level(body).expect("should split");
+        assert_eq!(parts.body_text, "SGVsbG8=");
+        assert!(parts.recipients_text.is_none());
+        assert!(parts.consent_text.is_none());
+        assert!(parts.nested_armor.is_none());
+    }
+
+    #[test]
+    fn test_extract_ciphertext_binary_includes_recipients_and_consent() {
+        // Section 4.2: level(L) = decode(body) || canonical(recipients) || canonical(consent)
+        let body_bytes = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let b64 = general_purpose::STANDARD.encode(&body_bytes);
+        let recipients = "signer aa bb\nself cc dd";
+        let consent = "agreement H\nsigner aa";
+        let body = format!(
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n\
+            ----- BEGIN NOSTR RECIPIENTS -----\n{}\n\
+            ----- BEGIN NOSTR CONSENT -----\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            b64, recipients, consent
+        );
+        let got = extract_ciphertext_binary(&body);
+        let expected = crate::agreement::level_signing_bytes(
+            &body_bytes,
+            &crate::agreement::canonicalize_block(recipients),
+            &crate::agreement::canonicalize_block(consent),
+        );
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_multi_recipient_signed_message_verifies_section_4_2() {
+        // Build a multi-recipient (group-encrypted) message and sign over the Section 4.2 target,
+        // then confirm in-body verification succeeds and tampering breaks it.
+        let alice = crypto::generate_keypair().unwrap();
+        let alice_pub_hex = pubkey_hex(&alice.public_key);
+
+        let body_bytes = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let b64 = general_purpose::STANDARD.encode(&body_bytes);
+        let recipients = format!("signer {} wrapA\nself {} wrapS", alice_pub_hex, alice_pub_hex);
+
+        let signing_bytes = crate::agreement::level_signing_bytes(
+            &body_bytes,
+            &crate::agreement::canonicalize_block(&recipients),
+            "",
+        );
+        let sig_hex = crypto::sign_data_bytes(&alice.private_key, &signing_bytes).unwrap();
+
+        let body = format!(
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n\
+            ----- BEGIN NOSTR RECIPIENTS -----\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n{}\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            b64, recipients, sig_hex, alice_pub_hex
+        );
+
+        assert_eq!(verify_email_signature_inline(&body), Some(true),
+            "multi-recipient signature must verify over body+recipients");
+
+        // Tamper a recipient role (signer→viewer): the canonical recipients block
+        // changes, so the signature must no longer verify (membership is bound).
+        let tampered = body.replacen(
+            &format!("signer {} wrapA", alice_pub_hex),
+            &format!("viewer {} wrapA", alice_pub_hex),
+            1,
+        );
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false),
+            "re-labeling a signatory as viewer must invalidate the signature");
+    }
+
+    #[test]
+    fn test_agreement_consent_message_verifies_and_tamper_detected() {
+        // A signatory's consenting reply: CONSENT block bound by the level signature.
+        let alice = crypto::generate_keypair().unwrap();
+        let alice_pub_hex = pubkey_hex(&alice.public_key);
+
+        let body_bytes = b"This Mutual NDA is entered into as of 2026-06-13.".to_vec();
+        let b64 = general_purpose::STANDARD.encode(&body_bytes);
+        let recipients = format!("signer {} wrapA\nself {} wrapS", alice_pub_hex, alice_pub_hex);
+        let canon_recipients = crate::agreement::canonicalize_block(&recipients);
+
+        // H = SHA-256(body || canonical(recipients)) — excludes consent (§11.3.1).
+        let h = crate::agreement::document_hash(&body_bytes, &canon_recipients);
+        let consent = format!("agreement {}\nsigner    {}", hex::encode(h), alice_pub_hex);
+        let canon_consent = crate::agreement::canonicalize_block(&consent);
+
+        let signing_bytes = crate::agreement::level_signing_bytes(
+            &body_bytes, &canon_recipients, &canon_consent);
+        let sig_hex = crypto::sign_data_bytes(&alice.private_key, &signing_bytes).unwrap();
+
+        let body = format!(
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n\
+            ----- BEGIN NOSTR RECIPIENTS -----\n{}\n\
+            ----- BEGIN NOSTR CONSENT -----\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n\
+            @Alice\n{}\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            b64, recipients, consent, sig_hex, alice_pub_hex
+        );
+
+        assert_eq!(verify_email_signature_inline(&body), Some(true),
+            "consent message must verify over body+recipients+consent");
+
+        // Tamper the consented document hash → signature must fail.
+        let tampered = body.replacen(&hex::encode(h), &"00".repeat(32), 1);
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false),
+            "altering the consented document hash must invalidate the signature");
+    }
+
+    #[test]
+    fn test_encoded_hybrid_agreement_verifies_through_email_path() {
+        // Cross-module round-trip: the agreement encoder's output must verify
+        // through the email signature path (spec §4.2).
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
+        let sender = crypto::generate_keypair().unwrap();
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+
+        let recips = vec![
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone(), email: Some("alice@example.com".into()) },
+            AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.org".into()) },
+        ];
+        let armor = encode_hybrid_agreement(
+            &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator",
+            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true, true, None,
+        ).unwrap();
+
+        assert_eq!(verify_email_signature_inline(&armor), Some(true),
+            "encoder output must verify through the §4.2 email signature path");
+
+        let sigs = verify_all_signatures_inline(&armor);
+        assert_eq!(sigs.len(), 1);
+        assert!(sigs[0].is_valid);
+
+        // The parser must keep the body clean of the RECIPIENTS/CONSENT blocks.
+        let parsed = parse_armor_components(&armor).expect("parses");
+        assert!(!parsed.body_text.contains("signer "));
+        assert!(!parsed.body_text.contains("agreement "));
+    }
+
+    #[test]
+    fn test_bound_email_in_recipients_is_tamper_evident() {
+        // Issue #102: the (pubkey, email) pairing lives inside the signed
+        // RECIPIENTS block, so re-pairing an npub to a different address must
+        // break the originator's signature (§10.6).
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let sender = crypto::generate_keypair().unwrap();
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let recips = vec![
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: alice.public_key.clone(), email: Some("alice@example.com".into()) },
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.org".into()) },
+        ];
+        let armor = encode_hybrid_agreement(
+            &sender.private_key, &sender.public_key, Some("me@example.net"), "Originator",
+            b"terms", &recips, false, true, None,
+        ).unwrap();
+        assert_eq!(verify_email_signature_inline(&armor), Some(true));
+
+        // Swap alice's bound address to an attacker-controlled mailbox.
+        let tampered = armor.replacen("alice@example.com", "attacker@evil.test", 1);
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false),
+            "re-pairing an npub to a different email must invalidate the signature");
+    }
+
+    // =============================================
+    // Stateless email↔npub binding verification (issue #102)
+    // =============================================
+
+    /// Build Bob's signed reply nesting Alice's challenge unchanged, signing over
+    /// the §4.2 chain target (extract_ciphertext_binary ignores signature blocks,
+    /// so we can compute the target from a placeholder armor then substitute).
+    fn build_signed_reply(responder: &crate::types::KeyPair, challenge_armor: &str) -> String {
+        let responder_hex = crate::agreement::normalize_pubkey_hex(&responder.public_key).unwrap();
+        let reply_b64 = general_purpose::STANDARD.encode(b"Confirmed - same terms.");
+        let template = format!(
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n@Responder\nSIGPLACEHOLDER\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            reply_b64, challenge_armor, responder_hex
+        );
+        let bytes = extract_ciphertext_binary(&template);
+        let sig = crypto::sign_data_bytes(&responder.private_key, &bytes).unwrap();
+        template.replace("SIGPLACEHOLDER", &sig)
+    }
+
+    fn issue_challenge(alice: &crate::types::KeyPair, bob_pub: &str, bob_email: &str) -> String {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob_pub.to_string(), email: Some(bob_email.into()),
+        }];
+        encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
+            "Alice", b"Please confirm you control this address.", &recips, false, true, None,
+        ).unwrap()
+    }
+
+    #[test]
+    fn test_verify_email_binding_completed_handshake() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_hex = crate::agreement::normalize_pubkey_hex(&alice.public_key).unwrap();
+        let bob_hex = crate::agreement::normalize_pubkey_hex(&bob.public_key).unwrap();
+
+        let challenge = issue_challenge(&alice, &bob.public_key, "bob@example.com");
+        let reply = build_signed_reply(&bob, &challenge);
+
+        let bindings = verify_email_binding(&reply, &alice.public_key);
+        assert_eq!(bindings.len(), 1, "exactly one binding proven");
+        assert_eq!(bindings[0], crate::agreement::Binding {
+            pubkey: bob_hex,
+            email: "bob@example.com".into(),
+            issuer_pubkey: alice_hex,
+        });
+    }
+
+    #[test]
+    fn test_verify_email_binding_requires_a_reply() {
+        // A single inbound challenge is never a sufficient proof — no reply, no binding.
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let challenge = issue_challenge(&alice, &bob.public_key, "bob@example.com");
+        assert!(verify_email_binding(&challenge, &alice.public_key).is_empty());
+    }
+
+    #[test]
+    fn test_verify_email_binding_tampered_pairing_voids_proof() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let challenge = issue_challenge(&alice, &bob.public_key, "bob@example.com");
+        let reply = build_signed_reply(&bob, &challenge);
+
+        // Re-pair Bob's npub to an attacker mailbox inside the (signed) challenge.
+        let tampered = reply.replacen("bob@example.com", "attacker@evil.test", 1);
+        assert!(verify_email_binding(&tampered, &alice.public_key).is_empty(),
+            "a tampered (npub,email) pairing breaks the chain and yields no binding");
+    }
+
+    #[test]
+    fn test_verify_email_binding_wrong_issuer_perspective() {
+        // From Bob's perspective there is no level *he* signed asserting an email,
+        // so the same thread proves no binding for him (it's an issuer-side check).
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let challenge = issue_challenge(&alice, &bob.public_key, "bob@example.com");
+        let reply = build_signed_reply(&bob, &challenge);
+        assert!(verify_email_binding(&reply, &bob.public_key).is_empty());
+    }
+
+    // =============================================
+    // Agreement completion status (spec §11.5)
+    // =============================================
+
+    /// Alice originates an agreement she's also a signatory of (she consents),
+    /// with Bob as the other required signer.
+    fn originate_agreement(alice: &crate::types::KeyPair, bob_pub: &str) -> String {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob_pub.to_string(), email: None,
+        }];
+        encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, None, "Alice",
+            b"This Mutual NDA is entered into as of 2026-06-13.", &recips, true, true, None,
+        ).unwrap()
+    }
+
+    /// Read the document hash H out of a message's CONSENT block.
+    fn hash_from_consent(armor: &str) -> String {
+        let body: String = armor.lines()
+            .skip_while(|l| !l.contains("BEGIN NOSTR CONSENT")).skip(1)
+            .take_while(|l| !l.contains("BEGIN NOSTR")).collect::<Vec<_>>().join("\n");
+        crate::agreement::parse_consent_block(&body).unwrap().agreement_hash
+    }
+
+    /// Build a consenting reply: nests the prior message, adds the responder's
+    /// CONSENT over H, signed over the §4.2 chain target.
+    fn build_consent_reply(responder: &crate::types::KeyPair, prior_armor: &str, h: &str) -> String {
+        let responder_hex = crate::agreement::normalize_pubkey_hex(&responder.public_key).unwrap();
+        let reply_b64 = general_purpose::STANDARD.encode(b"I agree to the terms.");
+        let template = format!(
+            "----- BEGIN NOSTR ENCRYPTED BODY -----\n{}\n\
+            ----- BEGIN NOSTR CONSENT -----\nagreement {}\nsigner    {}\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n@Responder\nSIGPLACEHOLDER\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            reply_b64, h, responder_hex, prior_armor, responder_hex
+        );
+        let bytes = extract_ciphertext_binary(&template);
+        let sig = crypto::sign_data_bytes(&responder.private_key, &bytes).unwrap();
+        template.replace("SIGPLACEHOLDER", &sig)
+    }
+
+    #[test]
+    fn test_agreement_status_complete_when_all_consent() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let agreement = originate_agreement(&alice, &bob.public_key);
+        let h = hash_from_consent(&agreement);
+        let reply = build_consent_reply(&bob, &agreement, &h);
+
+        let status = verify_agreement_status(&reply).expect("is an agreement");
+        assert_eq!((status.m, status.n), (2, 2), "originator + signer both consented");
+        assert!(status.complete);
+        assert_eq!(status.document_hash, h);
+    }
+
+    #[test]
+    fn test_agreement_status_comment_does_not_count() {
+        // Bob replies without a CONSENT block (a comment): only Alice has consented.
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let agreement = originate_agreement(&alice, &bob.public_key);
+        let reply = build_signed_reply(&bob, &agreement); // no consent block
+
+        let status = verify_agreement_status(&reply).expect("is an agreement");
+        assert_eq!((status.m, status.n), (1, 2), "comment without consent is not counted");
+        assert!(!status.complete);
+    }
+
+    #[test]
+    fn test_agreement_status_tampered_consent_hash_not_counted() {
+        // Bob consents to the wrong document hash → his consent must not count.
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let agreement = originate_agreement(&alice, &bob.public_key);
+        let wrong_h = "00".repeat(32);
+        let reply = build_consent_reply(&bob, &agreement, &wrong_h);
+
+        let status = verify_agreement_status(&reply).expect("is an agreement");
+        assert_eq!((status.m, status.n), (1, 2), "consent over the wrong H is ignored");
+        assert!(!status.complete);
+    }
+
+    #[test]
+    fn test_agreement_status_none_for_non_agreement() {
+        // A plain pairwise message (no RECIPIENTS block) is not an agreement.
+        let body = "----- BEGIN NOSTR NIP-44 ENCRYPTED BODY -----\n\
+            SGVsbG8gV29ybGQ=\n\
+            ----- END NOSTR MESSAGE -----";
+        assert!(verify_agreement_status(body).is_none());
+    }
+
+    // =============================================
+    // Multi-recipient envelope decryption (spec §10, §8 step 8)
+    // =============================================
+
+    #[test]
+    fn test_envelope_decrypts_for_recipient_and_self() {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER, ROLE_VIEWER};
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // To: signer
+        let carol = crypto::generate_keypair().unwrap();  // Cc: viewer
+        let plaintext = "This Mutual NDA is entered into as of 2026-06-13.";
+
+        let recips = vec![
+            AgreementRecipientInput { role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.com".into()) },
+            AgreementRecipientInput { role: ROLE_VIEWER.into(), pubkey: carol.public_key.clone(), email: Some("carol@example.org".into()) },
+        ];
+        let armor = encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
+            "Alice", plaintext.as_bytes(), &recips, false, true, None,
+        ).unwrap();
+
+        // Bob (signer) recovers the body.
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "recipient decrypt failed: {:?}", r.error);
+        assert_eq!(r.body, plaintext);
+
+        // Carol (viewer) also recovers the body — role is workflow, not access.
+        let r = decrypt_email_body_pipeline(
+            &carol.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "viewer decrypt failed: {:?}", r.error);
+        assert_eq!(r.body, plaintext);
+
+        // Alice's own Sent copy decrypts via her self stanza.
+        let r = decrypt_email_body_pipeline(
+            &alice.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "self decrypt failed: {:?}", r.error);
+        assert_eq!(r.body, plaintext);
+    }
+
+    #[test]
+    fn test_envelope_with_attachment_manifest_roundtrips() {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // To: signer
+
+        // Build the same manifest JS produces: a nested AES-encrypted body blob
+        // (body base64'd then AES-GCM'd under its own key) plus a per-attachment
+        // key wrap. The manifest as a whole becomes the CEK-envelope body.
+        let body_text = "Please review and sign the attached contract.";
+        let body_key = crypto::generate_cek();
+        let body_b64 = b64.encode(body_text.as_bytes());
+        let body_ct = crypto::aes_gcm_encrypt_raw(&body_key, body_b64.as_bytes()).unwrap();
+        let att_key = crypto::generate_cek();
+        let manifest = serde_json::json!({
+            "body": {
+                "ciphertext": b64.encode(&body_ct),
+                "cipher_sha256": "00",
+                "cipher_size": body_ct.len(),
+                "key_wrap": b64.encode(body_key),
+            },
+            "attachments": [{
+                "id": "a1",
+                "orig_filename": "contract.pdf",
+                "orig_mime": "application/pdf",
+                "cipher_sha256": "deadbeef",
+                "cipher_size": 65536u64,
+                "key_wrap": b64.encode(att_key),
+            }],
+        });
+        let manifest_json = serde_json::to_string(&manifest).unwrap();
+
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.com".into()),
+        }];
+        let armor = encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, Some("alice@issuer.example"),
+            "Alice", manifest_json.as_bytes(), &recips, false, true, None,
+        ).unwrap();
+
+        // Bob unwraps the CEK, AES-decrypts the manifest, and the shared handler
+        // recovers the nested body and surfaces the attachment metadata.
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "manifest envelope decrypt failed: {:?}", r.error);
+        assert!(r.is_manifest, "expected a manifest body");
+        assert_eq!(r.body, body_text);
+        assert_eq!(r.attachments.len(), 1);
+        assert_eq!(r.attachments[0].orig_filename, "contract.pdf");
+        assert_eq!(r.attachments[0].key_wrap_b64, b64.encode(att_key));
+    }
+
+    #[test]
+    fn test_envelope_non_recipient_cannot_decrypt() {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let mallory = crypto::generate_keypair().unwrap(); // not a recipient
+
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: None,
+        }];
+        let armor = encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, None, "Alice", b"secret terms", &recips, false, true, None,
+        ).unwrap();
+
+        let r = decrypt_email_body_pipeline(
+            &mallory.private_key, &armor, "Subject", Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(!r.success, "a non-recipient must not decrypt the envelope");
+    }
+
+    #[test]
+    fn test_parse_armor_components_exposes_recipients_and_consent() {
+        use crate::agreement::{encode_hybrid_agreement, AgreementRecipientInput, ROLE_SIGNER};
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob.public_key.clone(), email: Some("bob@example.com".into()),
+        }];
+        let armor = encode_hybrid_agreement(
+            &alice.private_key, &alice.public_key, Some("alice@x.example"), "Alice", b"terms", &recips, true, true, None,
+        ).unwrap();
+
+        let parsed = parse_armor_components(&armor).expect("parses");
+        // Recipients (incl. self) and the originator's consent are surfaced on the struct.
+        assert_eq!(parsed.recipients.len(), 2);
+        assert!(parsed.recipients.iter().any(|r| r.is_signer() && r.email.as_deref() == Some("bob@example.com")));
+        assert!(parsed.consent.is_some(), "originator consent surfaced");
+    }
+
+    // =============================================
+    // Plaintext (public) agreements (spec §11.8)
+    // =============================================
+
+    fn originate_plaintext_agreement(alice: &crate::types::KeyPair, bob_pub: &str, terms: &str) -> String {
+        use crate::agreement::{AgreementRecipientInput, ROLE_SIGNER};
+        let recips = vec![AgreementRecipientInput {
+            role: ROLE_SIGNER.into(), pubkey: bob_pub.to_string(), email: None,
+        }];
+        encode_signed_agreement(&alice.private_key, &alice.public_key, "Alice", terms, &recips, true, &[], None).unwrap()
+    }
+
+    fn build_plaintext_consent_reply(responder: &crate::types::KeyPair, prior_armor: &str, h: &str) -> String {
+        let responder_hex = crate::agreement::normalize_pubkey_hex(&responder.public_key).unwrap();
+        let (reply_glossia, _) = glossia_encode_signed_body("I agree to the terms.", None).unwrap();
+        let prior_only = &prior_armor[prior_armor.find("----- BEGIN NOSTR").unwrap()..];
+        let template = format!(
+            "I agree to the terms.\n\n----- BEGIN NOSTR SIGNED BODY -----\n{}\n\
+            ----- BEGIN NOSTR CONSENT -----\nagreement {}\nsigner    {}\n{}\n\
+            ----- BEGIN NOSTR SIGNATURE -----\n@Responder\nSIGPLACEHOLDER\n{}\n\
+            ----- END NOSTR MESSAGE -----",
+            reply_glossia, h, responder_hex, prior_only, responder_hex
+        );
+        let bytes = extract_ciphertext_binary(&template);
+        let sig = crypto::sign_data_bytes(&responder.private_key, &bytes).unwrap();
+        template.replace("SIGPLACEHOLDER", &sig)
+    }
+
+    #[test]
+    fn test_plaintext_agreement_is_readable_signed_and_tracked() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let terms = "This public statement is agreed to by the undersigned, dated 2026-06-13.";
+        let agreement = originate_plaintext_agreement(&alice, &bob.public_key, terms);
+
+        // Terms are in the clear above the armor (readable by any client, §3.2).
+        assert!(agreement.starts_with(terms));
+        // Public agreement uses a SIGNED BODY, not an ENCRYPTED BODY.
+        assert!(agreement.contains("BEGIN NOSTR SIGNED BODY"));
+        assert!(!agreement.contains("ENCRYPTED BODY"));
+
+        // The originator's signature verifies over the §4.2 target.
+        assert_eq!(verify_email_signature_inline(&agreement), Some(true));
+
+        // Signatories are declared with no CEK token.
+        let parsed = parse_armor_components(&agreement).expect("parses");
+        assert_eq!(parsed.recipients.len(), 1);
+        assert!(parsed.recipients[0].wrapped_cek.is_none());
+        assert!(parsed.recipients[0].is_signer());
+
+        // Completion is tracked: originator consented, the other signatory pending.
+        let status = verify_agreement_status(&agreement).expect("is an agreement");
+        assert_eq!((status.m, status.n), (1, 2));
+        assert!(!status.complete);
+    }
+
+    #[test]
+    fn test_plaintext_agreement_completes_with_countersignature() {
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let terms = "We, the undersigned, commit to the following terms.";
+        let agreement = originate_plaintext_agreement(&alice, &bob.public_key, terms);
+        let h = hash_from_consent(&agreement);
+        let reply = build_plaintext_consent_reply(&bob, &agreement, &h);
+
+        // The whole plaintext signature chain verifies and completion reaches 2 of 2.
+        let sigs = verify_all_signatures_inline(&reply);
+        assert!(sigs.iter().all(|s| s.is_valid), "plaintext reply chain must verify");
+        let status = verify_agreement_status(&reply).expect("is an agreement");
+        assert_eq!((status.m, status.n), (2, 2));
+        assert!(status.complete);
+        assert_eq!(status.document_hash, h);
+    }
+
+    #[test]
+    fn test_plaintext_agreement_terms_tamper_breaks_signature() {
+        // The signed payload is the glossia SIGNED BODY (not the human-readable
+        // preface). Mutating it must break the originator's signature.
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let agreement = originate_plaintext_agreement(&alice, &bob.public_key, "Pay 100 on delivery.");
+        assert_eq!(verify_email_signature_inline(&agreement), Some(true));
+
+        let parsed = parse_armor_components(&agreement).unwrap();
+        let body = parsed.body_text;
+        let tampered = agreement.replacen(&body, &format!("{} extra", body), 1);
+        assert_ne!(tampered, agreement, "body must appear verbatim in the armor");
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false));
+    }
+
+    // =============================================
+    // compose_agreement_armor (send-path) — To→signer, Cc→viewer (§6.3)
+    // =============================================
+
+    #[test]
+    fn test_compose_agreement_encrypted_with_capnp_manifest_attachment() {
+        use crate::types::{AgreementParty, EmailAttachment};
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // To
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let file_bytes = b"%PDF-1.7 the actual contract";
+        let attachments = vec![EmailAttachment {
+            filename: "contract.pdf".into(),
+            content_type: "application/pdf".into(),
+            data: b64.encode(file_bytes),
+            size: file_bytes.len(),
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        }];
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
+            "NDA", "Please sign the attached.", &to, &[], true, true, true, true, true, None, None, &attachments,
+        ).unwrap();
+
+        // The body is now a capnp manifest under the CEK; one encrypted MIME part.
+        assert_eq!(composed.attachments.len(), 1);
+        assert_eq!(composed.attachments[0].filename, "a1.dat");
+        assert_eq!(composed.attachments[0].encryption_method.as_deref(), Some("manifest_aes"));
+
+        // Bob recovers the body + attachment metadata from the manifest…
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &composed.armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success, "decrypt failed: {:?}", r.error);
+        assert!(r.is_manifest);
+        assert_eq!(r.body, "Please sign the attached.");
+        assert_eq!(r.attachments.len(), 1);
+        assert_eq!(r.attachments[0].orig_filename, "contract.pdf");
+
+        // …and the encrypted MIME part decrypts back to the original file.
+        let dec = decrypt_attachment_pipeline(
+            &composed.attachments[0].data,
+            &r.attachments[0].key_wrap_b64,
+            r.attachments[0].cipher_sha256_hex.as_deref(),
+            &r.attachments[0].orig_filename,
+            &r.attachments[0].orig_mime,
+        ).unwrap();
+        assert_eq!(b64.decode(dec.data_b64).unwrap(), file_bytes);
+    }
+
+    #[test]
+    fn test_public_agreement_binds_attachments_in_signature() {
+        use crate::types::{AgreementParty, EmailAttachment};
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let file = b"the public contract document";
+        let attachments = vec![EmailAttachment {
+            filename: "contract.pdf".into(),
+            content_type: "application/pdf".into(),
+            data: b64.encode(file),
+            size: file.len(),
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        }];
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
+            "Public Statement", "We agree to the public terms.", &to, &[],
+            /* encrypted */ false, true, true, true, true, None, None, &attachments,
+        ).unwrap();
+
+        // Public: attachment passes through in the clear, and the armor carries a
+        // signed ATTACHMENTS block with the file's plaintext hash.
+        assert_eq!(composed.attachments.len(), 1);
+        assert!(!composed.attachments[0].is_encrypted);
+        let sha = hex::encode(Sha256::digest(file));
+        assert!(composed.armor.contains("BEGIN NOSTR ATTACHMENTS"));
+        assert!(composed.armor.contains(&sha), "armor should record the plaintext hash");
+        assert_eq!(verify_email_signature_inline(&composed.armor), Some(true));
+
+        // Tampering with the recorded hash (i.e. swapping the bound file) breaks
+        // the signature — the binding is enforced cryptographically.
+        let tampered = composed.armor.replace(&sha, &"f".repeat(64));
+        assert_eq!(verify_email_signature_inline(&tampered), Some(false));
+    }
+
+    #[test]
+    fn test_encrypt_manifest_body_1v1_roundtrips() {
+        use crate::types::EmailAttachment;
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // recipient
+
+        let file = b"%PDF-1.7 the 1:1 attachment bytes";
+        let atts = vec![EmailAttachment {
+            filename: "invoice.pdf".into(),
+            content_type: "application/pdf".into(),
+            data: b64.encode(file),
+            size: file.len(),
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        }];
+
+        // Rust builds the capnp manifest, NIP-44-encrypts it to bob, and armors it.
+        let out = encrypt_manifest_body(
+            &alice.private_key, &bob.public_key, "Hello Bob, see attached.", &atts, "nip44",
+        ).unwrap();
+        assert!(out.armored_body.contains("BEGIN NOSTR NIP-44 ENCRYPTED BODY"));
+        assert_eq!(out.attachments.len(), 1);
+        assert_eq!(out.attachments[0].filename, "a1.dat");
+
+        // Bob recovers the body + attachment metadata from the manifest (no
+        // signature yet — signing happens later in the send path).
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &out.armored_body, "", Some(&alice.public_key), None, None,
+            /* require_signature */ false, false,
+        ).unwrap();
+        assert!(r.success, "decrypt failed: {:?}", r.error);
+        assert!(r.is_manifest);
+        assert_eq!(r.body, "Hello Bob, see attached.");
+        assert_eq!(r.attachments.len(), 1);
+        assert_eq!(r.attachments[0].orig_filename, "invoice.pdf");
+
+        // …and the encrypted MIME part decrypts back to the original file.
+        let dec = decrypt_attachment_pipeline(
+            &out.attachments[0].data,
+            &r.attachments[0].key_wrap_b64,
+            r.attachments[0].cipher_sha256_hex.as_deref(),
+            &r.attachments[0].orig_filename,
+            &r.attachments[0].orig_mime,
+        ).unwrap();
+        assert_eq!(b64.decode(dec.data_b64).unwrap(), file);
+    }
+
+    #[test]
+    fn test_verify_public_attachment_accepts_and_rejects() {
+        use crate::types::{AgreementParty, EmailAttachment};
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let file = b"the public contract document";
+        let attachments = vec![EmailAttachment {
+            filename: "contract.pdf".into(),
+            content_type: "application/pdf".into(),
+            data: b64.encode(file),
+            size: file.len(),
+            is_encrypted: false,
+            encryption_method: None,
+            algorithm: None,
+            original_filename: None,
+            original_type: None,
+            original_size: None,
+        }];
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
+            "Public Statement", "We agree.", &to, &[],
+            /* encrypted */ false, true, true, true, true, None, None, &attachments,
+        ).unwrap();
+
+        // The genuine file verifies: signature valid, spec found, hash matches.
+        let ok = verify_public_attachment(&composed.armor, "contract.pdf", file);
+        assert!(ok.verified);
+        assert!(ok.signature_valid && ok.spec_found && ok.hash_match);
+
+        // A swapped file (same name) is rejected — hash no longer matches.
+        let tampered = b"a different document entirely";
+        let bad = verify_public_attachment(&composed.armor, "contract.pdf", tampered);
+        assert!(!bad.verified);
+        assert!(bad.spec_found && !bad.hash_match);
+        assert_eq!(bad.expected_sha256, ok.expected_sha256);
+
+        // A file the message never declared is not bound.
+        let unknown = verify_public_attachment(&composed.armor, "evil.exe", file);
+        assert!(!unknown.verified && !unknown.spec_found);
+
+        // If the signed ATTACHMENTS block is tampered (here, its recorded hash),
+        // the signature no longer verifies, so nothing is trusted.
+        let genuine_sha = hex::encode(Sha256::digest(file));
+        let forged = composed.armor.replace(&genuine_sha, &"f".repeat(64));
+        let untrusted = verify_public_attachment(&forged, "contract.pdf", file);
+        assert!(!untrusted.signature_valid && !untrusted.verified);
+    }
+
+    #[test]
+    fn test_compose_agreement_encrypted_maps_to_and_cc() {
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap(); // sender
+        let bob = crypto::generate_keypair().unwrap();    // To
+        let carol = crypto::generate_keypair().unwrap();  // Cc
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@me.example"), "Alice",
+            "Quarterly NDA", "Mutual NDA terms.", &to, &cc, true, true, true, true, true, None, None, &[],
+        ).unwrap();
+        let armor = composed.armor;
+
+        // The subject is encrypted under the CEK (not cleartext) for envelope mode.
+        assert_ne!(composed.subject, "Quarterly NDA");
+        assert!(!composed.subject.contains("NDA"));
+
+        assert_eq!(verify_email_signature_inline(&armor), Some(true));
+        let parsed = parse_armor_components(&armor).expect("parses");
+        // bob is a signer, carol a viewer, plus the sender's self stanza.
+        assert!(parsed.recipients.iter().any(|r| r.role == "signer" && r.email.as_deref() == Some("bob@example.com")));
+        assert!(parsed.recipients.iter().any(|r| r.role == "viewer" && r.email.as_deref() == Some("carol@example.org")));
+        assert!(parsed.recipients.iter().any(|r| r.role == "self"));
+        assert!(parsed.consent.is_some(), "originator consent included");
+
+        // The To: signatory recovers both the body and the subject.
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success);
+        assert_eq!(r.body, "Mutual NDA terms.");
+        assert_eq!(r.subject, "Quarterly NDA", "subject decrypts under the CEK");
+
+        // A non-recipient cannot read the subject either.
+        let mallory = crypto::generate_keypair().unwrap();
+        let rm = decrypt_email_body_pipeline(
+            &mallory.private_key, &armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert_ne!(rm.subject, "Quarterly NDA", "non-recipient must not read the subject");
+    }
+
+    #[test]
+    fn test_compose_agreement_plaintext_is_public_and_signed() {
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, None, "Alice",
+            "Public Statement", "We agree to the public terms.", &to, &[], false, true, true, true, true, None, None, &[],
+        ).unwrap();
+        let armor = composed.armor;
+
+        // Public agreement: subject stays in the clear.
+        assert_eq!(composed.subject, "Public Statement");
+        assert!(armor.starts_with("We agree to the public terms."));
+        assert!(armor.contains("BEGIN NOSTR SIGNED BODY"));
+        assert!(!armor.contains("ENCRYPTED BODY"));
+        assert_eq!(verify_email_signature_inline(&armor), Some(true));
+        let status = verify_agreement_status(&armor).expect("is an agreement");
+        assert_eq!((status.m, status.n), (1, 2));
+    }
+
+    #[test]
+    fn test_compose_agreement_rejects_no_recipients() {
+        let alice = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let err = compose_agreement(
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "terms", &[], &[], true, false, true, true, true, None, None, &[]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_compose_plain_multi_recipient_is_not_an_agreement() {
+        // is_agreement = false → all recipients are `viewer` (no signatories), no
+        // X-Nostr-Agreement marker, and verify_agreement_status sees no agreement —
+        // a plain encrypted CC'd email, not a pseudo-agreement.
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let carol = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+        let cc = vec![AgreementParty { email: "carol@example.org".into(), pubkey: carol.public_key.clone() }];
+
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "FYI", "Shared with both of you.", &to, &cc, true, false, /* is_agreement */ false, /* encrypt_subject */ true, /* sign */ true, None, None, &[],
+        ).unwrap();
+        let armor = composed.armor;
+
+        // No signatories ⇒ not surfaced as an agreement.
+        assert!(verify_agreement_status(&armor).is_none(), "plain CC'd email must not be an agreement");
+        // Both recipients still decrypt (they're viewers with a wrapped CEK).
+        let parsed = parse_armor_components(&armor).expect("parses");
+        assert!(parsed.recipients.iter().all(|r| r.role == "viewer" || r.role == "self"));
+        assert_eq!(verify_email_signature_inline(&armor), Some(true));
+        let r = decrypt_email_body_pipeline(
+            &carol.private_key, &armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success);
+        assert_eq!(r.body, "Shared with both of you.");
+    }
+
+    #[test]
+    fn test_unsigned_envelope_uses_seal_and_still_decrypts() {
+        // sign = false → a SEAL (no SIGNATURE); recipients still decrypt via the
+        // SEAL pubkey, but there's no signature to verify (spec §3.6).
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "Subj", "Unsigned but encrypted.", &to, &[], true, false,
+            /* is_agreement */ false, /* encrypt_subject */ true, /* sign */ false, None, None, &[],
+        ).unwrap();
+        let armor = composed.armor;
+
+        assert!(armor.contains("BEGIN NOSTR SEAL"));
+        assert!(!armor.contains("BEGIN NOSTR SIGNATURE"));
+        assert_eq!(verify_email_signature_inline(&armor), None, "no signature to verify");
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &armor, &composed.subject, Some(&alice.public_key), None, None, false, false,
+        ).unwrap();
+        assert!(r.success);
+        assert_eq!(r.body, "Unsigned but encrypted.");
+
+        // A forced agreement ignores sign=false (must be signed to authenticate
+        // the signatory set, §3.6).
+        let signed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "Subj", "terms", &to, &[], true, false,
+            /* is_agreement */ true, /* encrypt_subject */ true, /* sign */ false, None, None, &[],
+        ).unwrap();
+        assert!(signed.armor.contains("BEGIN NOSTR SIGNATURE"));
+        assert!(!signed.armor.contains("BEGIN NOSTR SEAL"));
+    }
+
+    #[test]
+    fn test_glossia_encode_bytes_honors_encoding_scheme() {
+        // The Advanced "encoding" setting must change the dialect used, while
+        // round-tripping to identical bytes.
+        let data: Vec<u8> = (0u8..48).collect();
+        let (latin, latin_bytes) = glossia_encode_bytes_with(&data, Some("latin")).unwrap();
+        let (english, english_bytes) = glossia_encode_bytes_with(&data, Some("english - bip39")).unwrap();
+        assert_eq!(latin_bytes, data);
+        assert_eq!(english_bytes, data);
+        assert_ne!(latin, english, "different schemes must produce different encodings");
+    }
+
+    #[test]
+    fn test_compose_agreement_applies_encoding_setting() {
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+
+        // Compose the same plaintext agreement under two schemes; the encoded
+        // bodies must differ, yet both verify and decrypt.
+        let latin = compose_agreement(
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, true, Some("latin"), None, &[],
+        ).unwrap();
+        let english = compose_agreement(
+            &alice.private_key, &alice_pub, None, "Alice", "Subj", "Public terms.", &to, &[], false, true, true, true, true, Some("english - bip39"), None, &[],
+        ).unwrap();
+        assert_ne!(latin.armor, english.armor, "encoding setting must change the armor body");
+        assert_eq!(verify_email_signature_inline(&latin.armor), Some(true));
+        assert_eq!(verify_email_signature_inline(&english.armor), Some(true));
+    }
+
+    #[test]
+    fn test_compose_agreement_independent_subject_encoding() {
+        use crate::types::AgreementParty;
+        let alice = crypto::generate_keypair().unwrap();
+        let bob = crypto::generate_keypair().unwrap();
+        let alice_pub = crypto::get_public_key_from_private(&alice.private_key).unwrap();
+        let to = vec![AgreementParty { email: "bob@example.com".into(), pubkey: bob.public_key.clone() }];
+
+        // Body in latin, subject in english — the subject uses its own scheme,
+        // and the recipient still recovers both.
+        let composed = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true, true, true,
+            Some("latin"), Some("english - bip39"), &[],
+        ).unwrap();
+
+        // Subject is encrypted (not the cleartext) and decrypts back for the recipient.
+        assert_ne!(composed.subject, "Quarterly NDA");
+        let r = decrypt_email_body_pipeline(
+            &bob.private_key, &composed.armor, &composed.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert!(r.success);
+        assert_eq!(r.body, "Mutual NDA terms.");
+        assert_eq!(r.subject, "Quarterly NDA", "subject decrypts regardless of its own scheme");
+
+        // subject_encoding = None falls back to the body encoding.
+        let fallback = compose_agreement(
+            &alice.private_key, &alice_pub, Some("alice@x.example"), "Alice",
+            "Quarterly NDA", "Mutual NDA terms.", &to, &[], true, true, true, true, true,
+            Some("latin"), None, &[],
+        ).unwrap();
+        let rf = decrypt_email_body_pipeline(
+            &bob.private_key, &fallback.armor, &fallback.subject, Some(&alice.public_key), None, None, true, false,
+        ).unwrap();
+        assert_eq!(rf.subject, "Quarterly NDA");
+    }
+
+    #[test]
+    fn test_glossia_body_survives_quote_prefix_and_wrap() {
+        // The reason agreements use glossia, not base64: a glossia-encoded body
+        // must decode to identical bytes after an email client quote-prefixes
+        // ("> ") and re-wraps it — base64 would be corrupted by the "> ".
+        let ciphertext: Vec<u8> = (0u8..64).collect();
+        let (encoded, canonical) = glossia_encode_bytes_with(&ciphertext, None).unwrap();
+        assert_eq!(canonical, ciphertext, "glossia round-trips the bytes");
+
+        let words: Vec<&str> = encoded.split_whitespace().collect();
+        let mangled: String = words
+            .chunks(6)
+            .map(|w| format!("> {}", w.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let recovered = decode_armor_section(&mangled)
+            .expect("decode quote-prefixed, re-wrapped glossia body");
+        assert_eq!(recovered, ciphertext, "glossia body survives quoting + wrapping");
+    }
+
+    // =============================================
     // parse_armor_components tests
     // =============================================
 
@@ -5268,6 +7409,8 @@ nitela\n\
             "plain",
             None, None, None, None,
             "nsec1fake", "aabb", "",
+            &[],
+            None,
         );
         assert!(!block.was_encrypted);
         assert_eq!(block.decrypted_text.as_deref(), Some("Hello world"));
@@ -5275,13 +7418,14 @@ nitela\n\
     }
 
     #[test]
-    fn test_json_manifest_parse() {
-        let json = r#"{"body":{"ciphertext":"dGVzdA==","cipher_sha256":"abc123","key_wrap":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},"attachments":[{"id":"a1","orig_filename":"test.pdf","orig_mime":"application/pdf","cipher_sha256":"def456","cipher_size":65536,"key_wrap":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}]}"#;
-        let manifest: JsonManifest = serde_json::from_str(json).unwrap();
-        assert!(manifest.body.is_some());
-        assert_eq!(manifest.attachments.as_ref().unwrap().len(), 1);
-        assert_eq!(manifest.attachments.as_ref().unwrap()[0].id, "a1");
-        assert_eq!(manifest.attachments.as_ref().unwrap()[0].orig_filename, "test.pdf");
+    fn test_legacy_json_manifest_parse() {
+        // A legacy JSON manifest is still readable (the body blob here isn't a
+        // real GCM ciphertext, so body_text stays None; attachments still parse).
+        let json = r#"{"body":{"ciphertext":"dGVzdA==","cipher_sha256":"abc123","key_wrap":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},"attachments":[{"id":"a1","orig_filename":"test.pdf","orig_mime":"application/pdf","cipher_sha256":"def456","cipher_size":65536,"key_wrap":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}]}"#;
+        let manifest = crate::manifest::parse_manifest(json.as_bytes()).expect("legacy JSON manifest parses");
+        assert_eq!(manifest.attachments.len(), 1);
+        assert_eq!(manifest.attachments[0].id, "a1");
+        assert_eq!(manifest.attachments[0].orig_filename, "test.pdf");
     }
 
     // ---- Transport authentication (issue #101) ----

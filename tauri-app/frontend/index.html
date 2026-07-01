@@ -25,6 +25,7 @@
     <link href="vendor/fontawesome/css/all.min.css" rel="stylesheet">
     <link href="vendor/tom-select/css/tom-select.default.min.css" rel="stylesheet">
     <link rel="stylesheet" href="styles/folder-multiselect.css">
+    <link rel="stylesheet" href="styles/agreements.css">
     <script src="vendor/html5-qrcode/html5-qrcode.min.js"></script>
     <script src="vendor/tom-select/js/tom-select.complete.min.js"></script>
     <script type="importmap">
@@ -79,6 +80,9 @@
                 <button class="nav-item" data-tab="drafts">
                     <i class="fas fa-save"></i> Drafts
                 </button>
+                <button class="nav-item" data-tab="agreements">
+                    <i class="fas fa-file-signature"></i> Agreements
+                </button>
                 <button class="nav-item" data-tab="dm">
                     <i class="fas fa-comments"></i> Messages
                 </button>
@@ -125,12 +129,12 @@
                         <button class="btn btn-secondary back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
                             <i class="fas fa-arrow-left"></i> Back
                         </button>
-                        <h2>Compose Email</h2>
+                        <h2 id="compose-title">Compose Email</h2>
                     </div>
                 </div>
-                
+
                 <div class="compose-form">
-                    <div class="form-group">
+                    <div class="form-group" id="compose-to-group">
                         <label for="to-address">To:</label>
                         <select id="nostr-contact-select" class="form-control" style="margin-bottom: 8px;">
                             <option value="">Select a Nostr contact with email...</option>
@@ -141,7 +145,27 @@
                             <input type="text" id="recipient-pubkey-value" placeholder="npub1... or hex pubkey (optional)" style="font-family: monospace; font-size: 0.85em;" autocorrect="off" autocapitalize="off" spellcheck="false">
                         </div>
                     </div>
-                    
+
+                    <div class="form-group" id="compose-cc-group">
+                        <label>Cc (optional):</label>
+                        <div class="recipient-picker">
+                            <select id="composeCc-contact-select" class="form-control">
+                                <option value="">Add a contact…</option>
+                            </select>
+                            <div class="manual-entry">
+                                <input type="email" id="composeCc-manual-email" placeholder="someone@example.com" autocorrect="off" autocapitalize="off" spellcheck="false">
+                                <input type="text" id="composeCc-manual-npub" placeholder="npub1… or hex (optional)" autocorrect="off" autocapitalize="off" spellcheck="false" style="font-family: monospace;">
+                                <button type="button" id="composeCc-add-manual-btn" class="btn btn-secondary">Add</button>
+                            </div>
+                            <div id="composeCc-recipients-list" class="recipient-chips"></div>
+                        </div>
+                        <label class="agreement-consent-label" style="margin-top:0.5em;">
+                            <input type="checkbox" id="compose-encrypt-subject" checked>
+                            Encrypt the subject (uncheck so a keyless Cc can see it)
+                        </label>
+                        <p class="agreement-hint">When the message is encrypted, the To recipient must have a Nostr key; a Cc without a key still receives it but can't decrypt (it can still verify the signature). When sent in plaintext, no keys are needed.</p>
+                    </div>
+
                     <div class="form-group">
                         <label for="subject">Subject:</label>
                         <input type="text" id="subject" placeholder="Subject">
@@ -151,7 +175,66 @@
                         <label for="message-body">Message:</label>
                         <textarea id="message-body" rows="10" placeholder="Type your message here..."></textarea>
                     </div>
-                    
+
+                    <div class="form-group agreement-compose">
+                        <!-- Agreement mode is entered from the Agreements tab's "Create agreement"
+                             button (startNewAgreement), which sets #agreement-enabled. -->
+                        <input type="checkbox" id="agreement-enabled" style="display: none;">
+                        <div id="agreement-mode-banner" class="agreement-mode-banner" style="display: none;">
+                            <span><i class="fas fa-file-signature"></i> Creating an agreement — To: recipients will be asked to sign.</span>
+                            <button type="button" class="btn-link" onclick="window.emailService.setAgreementMode(false)">Switch to normal email</button>
+                        </div>
+                        <div id="agreement-options" class="agreement-options" style="display: none;">
+                            <div class="form-group">
+                                <label>To (signatories — asked to sign):</label>
+                                <div class="recipient-picker">
+                                    <select id="to-contact-select" class="form-control">
+                                        <option value="">Add a contact…</option>
+                                    </select>
+                                    <div class="manual-entry">
+                                        <input type="email" id="to-manual-email" placeholder="signer@example.com" autocorrect="off" autocapitalize="off" spellcheck="false">
+                                        <input type="text" id="to-manual-npub" placeholder="npub1… or hex pubkey" autocorrect="off" autocapitalize="off" spellcheck="false" style="font-family: monospace;">
+                                        <button type="button" id="to-add-manual-btn" class="btn btn-secondary">Add</button>
+                                    </div>
+                                    <div id="to-recipients-list" class="recipient-chips"></div>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Cc (viewers — can read, not asked to sign):</label>
+                                <div class="recipient-picker">
+                                    <select id="cc-contact-select" class="form-control">
+                                        <option value="">Add a contact…</option>
+                                    </select>
+                                    <div class="manual-entry">
+                                        <input type="email" id="cc-manual-email" placeholder="viewer@example.com" autocorrect="off" autocapitalize="off" spellcheck="false">
+                                        <input type="text" id="cc-manual-npub" placeholder="npub1… or hex pubkey" autocorrect="off" autocapitalize="off" spellcheck="false" style="font-family: monospace;">
+                                        <button type="button" id="cc-add-manual-btn" class="btn btn-secondary">Add</button>
+                                    </div>
+                                    <div id="cc-recipients-list" class="recipient-chips"></div>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="agreement-visibility">Visibility:</label>
+                                <select id="agreement-visibility" class="form-control">
+                                    <option value="encrypted">Encrypted — only recipients can read</option>
+                                    <option value="public">Public — anyone can read &amp; verify</option>
+                                </select>
+                            </div>
+                            <label class="agreement-consent-label">
+                                <input type="checkbox" id="agreement-encrypt-subject" checked>
+                                Encrypt the subject (uncheck so keyless Cc / witnesses can see what they're validating)
+                            </label>
+                            <label class="agreement-consent-label">
+                                <input type="checkbox" id="agreement-consent" checked>
+                                I am a signatory and consent to this document
+                            </label>
+                            <p class="agreement-hint">
+                                <strong>To:</strong> recipients are asked to sign; <strong>Cc:</strong> recipients are viewers.
+                                Add each recipient from your contacts, or enter an email + Nostr key manually.
+                            </p>
+                        </div>
+                    </div>
+
                     <input type="file" id="attachment-input" multiple accept="*/*" style="display: none;">
                     <div id="attachment-list" class="attachment-list">
                         <!-- Attachments will be displayed here -->
@@ -313,6 +396,29 @@
                     <div class="email-detail-content" id="drafts-detail-content">
                         <!-- Draft detail content will be populated here -->
                     </div>
+                </div>
+            </div>
+
+            <!-- Agreements Tab -->
+            <div class="tab-content" id="agreements">
+                <div class="tab-header">
+                    <div style="display: flex; align-items: center; gap: var(--spacing-md); flex: 1;">
+                        <button class="btn btn-secondary back-to-nav-btn" aria-label="Back to navigation" style="display: none;">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <h2>Agreements</h2>
+                    </div>
+                    <div class="inbox-actions">
+                        <button id="refresh-agreements" class="btn btn-secondary">
+                            <i class="fas fa-sync"></i> <span class="btn-text">Refresh</span>
+                        </button>
+                        <button id="create-agreement-btn" class="btn btn-primary">
+                            <i class="fas fa-plus"></i> <span class="btn-text">Create agreement</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="email-list" id="agreements-list">
+                    <!-- Agreement messages (filtered) will be populated here -->
                 </div>
             </div>
 

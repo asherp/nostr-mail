@@ -5,6 +5,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 pub mod crypto;
+pub mod agreement;
+pub mod manifest;
 pub mod email;
 pub mod imap_pool;
 pub mod imap_idle;
@@ -2046,7 +2048,7 @@ async fn publish_nostr_event(private_key: Option<String>, content: String, kind:
 }
 
 #[tauri::command]
-async fn send_email(mut email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>, include_pubkey_header: Option<bool>, include_sig_header: Option<bool>, recipient_pubkey: Option<String>, include_recipient_header: Option<bool>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn send_email(mut email_config: EmailConfig, to_address: String, subject: String, body: String, nostr_npub: Option<String>, message_id: Option<String>, attachments: Option<Vec<crate::types::EmailAttachment>>, html_body: Option<String>, in_reply_to: Option<String>, references: Option<String>, include_pubkey_header: Option<bool>, include_sig_header: Option<bool>, recipient_pubkey: Option<String>, include_recipient_header: Option<bool>, cc: Option<Vec<String>>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     println!("[RUST] send_email called with {} attachments, html_body: {}", attachments.as_ref().map(|a| a.len()).unwrap_or(0), html_body.is_some());
 
     // Resolve private key from state if not supplied — keychain migration moved
@@ -2058,11 +2060,12 @@ async fn send_email(mut email_config: EmailConfig, to_address: String, subject: 
     let include_pubkey = include_pubkey_header.unwrap_or(true);
     let include_sig = include_sig_header.unwrap_or(true);
     let include_recipient = include_recipient_header.unwrap_or(true);
+    let cc = cc.unwrap_or_default();
 
     // Send the email via SMTP
     // Note: We don't save to database here - sent emails will be fetched from the server's sent folder via IMAP sync
     // This avoids duplicate entries and ensures we have the server's version with proper headers
-    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref(), include_pubkey, include_sig, recipient_pubkey.as_deref(), include_recipient)
+    email::send_email(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref(), include_pubkey, include_sig, recipient_pubkey.as_deref(), include_recipient, &cc)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2080,6 +2083,158 @@ async fn construct_email_headers(mut email_config: EmailConfig, to_address: Stri
     let include_recipient = include_recipient_header.unwrap_or(true);
     email::construct_email_headers(&email_config, &to_address, &subject, &body, nostr_npub.as_deref(), message_id.as_deref(), attachments.as_ref(), html_body.as_deref(), in_reply_to.as_deref(), references.as_deref(), include_pubkey, include_sig, recipient_pubkey.as_deref(), include_recipient)
         .map_err(|e| e.to_string())
+}
+
+/// Build a 1:1 (pairwise) encrypted manifest body in Rust (spec §11.2): AES the
+/// body + plaintext attachments into a Cap'n Proto manifest, NIP-encrypt it to
+/// `recipientPubkey`, and ASCII-armor it. Returns `{ armoredBody, attachments }`
+/// (the encrypted `aN.dat` parts). The frontend keeps handling subject, glossia,
+/// and signing. See [`email::encrypt_manifest_body`].
+#[tauri::command]
+fn encrypt_manifest_body(
+    private_key: Option<String>,
+    recipient_pubkey: String,
+    body: String,
+    attachments: Vec<crate::types::EmailAttachment>,
+    algorithm: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<types::EncryptedManifestBody, String> {
+    let private_key = resolve_private_key(private_key, &state)?;
+    let algo = algorithm.as_deref().unwrap_or("nip44");
+    email::encrypt_manifest_body(&private_key, &recipient_pubkey, &body, &attachments, algo)
+}
+
+/// Verify a delivered (plaintext) attachment against a public message's signed
+/// ATTACHMENTS block (spec §11.2): recompute its SHA-256 and check it against the
+/// signed spec, also confirming the message signature is valid. `data_base64` is
+/// the delivered file's bytes. See [`email::verify_public_attachment`].
+#[tauri::command]
+fn verify_public_attachment(
+    armor: String,
+    filename: String,
+    data_base64: String,
+) -> Result<types::PublicAttachmentVerification, String> {
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&data_base64)
+        .map_err(|e| format!("attachment base64 decode failed: {}", e))?;
+    Ok(email::verify_public_attachment(&armor, &filename, &data))
+}
+
+/// Build the armored body for an agreement without sending it (compose preview).
+/// `to` parties become signatories, `cc` parties become viewers (spec §6.3).
+/// `encrypted` selects the multi-recipient envelope vs the plaintext/public form.
+#[tauri::command]
+async fn compose_agreement(
+    mut email_config: EmailConfig,
+    subject: String,
+    body: String,
+    to: Vec<crate::types::AgreementParty>,
+    cc: Vec<crate::types::AgreementParty>,
+    encrypted: bool,
+    originator_consents: bool,
+    is_agreement: Option<bool>,
+    encrypt_subject: Option<bool>,
+    sign: Option<bool>,
+    profile_name: Option<String>,
+    glossia_encoding: Option<String>,
+    subject_encoding: Option<String>,
+    attachments: Option<Vec<crate::types::EmailAttachment>>,
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::types::ComposedAgreement, String> {
+    email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
+    let private_key = email_config.private_key.as_deref().unwrap();
+    let sender_pub = crypto::get_public_key_from_private(private_key).map_err(|e| e.to_string())?;
+    email::compose_agreement(
+        private_key,
+        &sender_pub,
+        Some(&email_config.email_address),
+        profile_name.as_deref().unwrap_or(""),
+        &subject,
+        &body,
+        &to,
+        &cc,
+        encrypted,
+        originator_consents,
+        is_agreement.unwrap_or(true),
+        encrypt_subject.unwrap_or(true),
+        sign.unwrap_or(true),
+        glossia_encoding.as_deref(),
+        subject_encoding.as_deref(),
+        &attachments.unwrap_or_default(),
+    )
+}
+
+/// Compose and send an agreement to all signatories (`To:`) and viewers (`Cc:`)
+/// in one message (spec §6.3). The armored body carries the authoritative
+/// SIGNATURE; an `X-Nostr-Agreement` marker enables decrypt-free IMAP filtering.
+#[tauri::command]
+async fn send_agreement(
+    mut email_config: EmailConfig,
+    subject: String,
+    body: String,
+    to: Vec<crate::types::AgreementParty>,
+    cc: Vec<crate::types::AgreementParty>,
+    cc_plain: Option<Vec<String>>,
+    encrypted: bool,
+    originator_consents: bool,
+    is_agreement: Option<bool>,
+    encrypt_subject: Option<bool>,
+    sign: Option<bool>,
+    profile_name: Option<String>,
+    message_id: Option<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
+    include_pubkey_header: Option<bool>,
+    include_sig_header: Option<bool>,
+    glossia_encoding: Option<String>,
+    subject_encoding: Option<String>,
+    attachments: Option<Vec<crate::types::EmailAttachment>>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    email_config.private_key = Some(resolve_private_key(email_config.private_key, &state)?);
+    let include_pubkey = include_pubkey_header.unwrap_or(true);
+    let include_sig = include_sig_header.unwrap_or(true);
+    let cc_plain = cc_plain.unwrap_or_default();
+    email::send_agreement_email(
+        &email_config,
+        &subject,
+        profile_name.as_deref().unwrap_or(""),
+        &body,
+        &to,
+        &cc,
+        &cc_plain,
+        encrypted,
+        originator_consents,
+        is_agreement.unwrap_or(true),
+        encrypt_subject.unwrap_or(true),
+        sign.unwrap_or(true),
+        message_id.as_deref(),
+        in_reply_to.as_deref(),
+        references.as_deref(),
+        include_pubkey,
+        include_sig,
+        glossia_encoding.as_deref(),
+        subject_encoding.as_deref(),
+        attachments.as_ref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Compute an agreement's "M of N signed" completion status from a message/thread
+/// armor (spec §11.5). Returns `None` when the armor is not an agreement.
+#[tauri::command]
+fn agreement_status(armor: String) -> Option<crate::agreement::AgreementStatus> {
+    email::verify_agreement_status(&armor)
+}
+
+/// Verify email↔npub bindings provable from a self-contained thread (issue #102),
+/// from the verifier's own pubkey's perspective. Stateless — no challenge store.
+#[tauri::command]
+fn verify_email_binding(armor: String, my_pubkey: String) -> Vec<crate::agreement::Binding> {
+    email::verify_email_binding(&armor, &my_pubkey)
 }
 
 #[tauri::command]
@@ -7483,6 +7638,12 @@ pub fn run() {
         publish_nostr_event,
         send_email,
         construct_email_headers,
+        compose_agreement,
+        send_agreement,
+        verify_public_attachment,
+        encrypt_manifest_body,
+        agreement_status,
+        verify_email_binding,
         fetch_image,
         fetch_multiple_images,
         fetch_profiles,

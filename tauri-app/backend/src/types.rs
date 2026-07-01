@@ -8,6 +8,34 @@ pub struct KeyPair {
     pub public_key: String,
 }
 
+/// A party on an agreement, as supplied by the compose UI. `To:` parties become
+/// `signer` signatories and `Cc:` parties become `viewer`s (spec §6.3). The
+/// `pubkey` is hex or npub; the `email` is the transport address (and is bound
+/// inside the signed RECIPIENTS block, spec §10.2 / #102).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementParty {
+    pub email: String,
+    pub pubkey: String,
+}
+
+/// Output of composing an agreement: the armored `text/plain` body and the
+/// subject to place in the header. For an encrypted (envelope) agreement the
+/// `subject` is AES-256-GCM-encrypted under the same CEK as the body; for a
+/// plaintext (public) agreement it is the cleartext subject.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposedAgreement {
+    pub armor: String,
+    pub subject: String,
+    /// Attachment MIME parts to send alongside the armor. For an encrypted
+    /// message these are the AES-encrypted `aN.dat` parts whose keys live in the
+    /// (CEK-protected) manifest; for a public message they are the plaintext
+    /// attachments. Empty when there are none. (spec §11.2)
+    #[serde(default)]
+    pub attachments: Vec<EmailAttachment>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountInfo {
     pub public_key: String,
@@ -274,6 +302,53 @@ pub struct ParsedArmorMessage {
     pub quoted_armor_text: Option<String>,
     /// Decoded body bytes as base64 (for signature verification without re-decoding)
     pub body_bytes_b64: Option<String>,
+    /// Parsed RECIPIENTS block entries for this level (spec §10.2). Non-empty
+    /// marks the multi-recipient envelope (CEK) decryption path. Populated
+    /// outside the capnp schema, like `prefix_text`/`quoted_armor_text`.
+    #[serde(default)]
+    pub recipients: Vec<crate::agreement::Recipient>,
+    /// Raw RECIPIENTS block body, retained verbatim so the canonical form (and
+    /// thus the document hash `H`) can be recomputed (spec §4.2, §11.3.1).
+    #[serde(default)]
+    pub recipients_text: Option<String>,
+    /// Parsed CONSENT block for this level, if any (spec §11.3).
+    #[serde(default)]
+    pub consent: Option<crate::agreement::Consent>,
+    /// Parsed ATTACHMENTS block for this level (public messages binding plaintext
+    /// attachment hashes; spec §11.2). Empty when absent.
+    #[serde(default)]
+    pub attachments: Vec<crate::agreement::AttachmentSpec>,
+}
+
+/// Result of building a 1:1 (pairwise) encrypted manifest body in Rust (spec
+/// §11.2): the NIP-encrypted, ASCII-armored body to place in the message, plus
+/// the encrypted `aN.dat` attachment MIME parts to send alongside it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptedManifestBody {
+    pub armored_body: String,
+    pub attachments: Vec<EmailAttachment>,
+}
+
+/// Result of checking a delivered plaintext attachment against a public message's
+/// signed ATTACHMENTS block (spec §11.2). A file is trustworthy only when the
+/// message signature is valid (so the block is authentic) *and* the file's
+/// SHA-256 matches a listed spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicAttachmentVerification {
+    /// `signature_valid && spec_found && hash_match` — the file is bound.
+    pub verified: bool,
+    /// The message's armor signature(s) verified (the ATTACHMENTS block is authentic).
+    pub signature_valid: bool,
+    /// The block lists an attachment with this filename.
+    pub spec_found: bool,
+    /// The delivered file's SHA-256 matches the listed spec.
+    pub hash_match: bool,
+    /// The SHA-256 recorded in the block for this filename, if any.
+    pub expected_sha256: Option<String>,
+    /// The SHA-256 actually computed over the delivered bytes.
+    pub actual_sha256: String,
 }
 
 /// Per-signature verification result (one per nesting level in the armor chain).

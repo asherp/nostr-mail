@@ -1980,9 +1980,9 @@ class ContactsService {
                 
                 // Update the UI to show it's an encrypted email
                 if (toAddressInput) {
-                    const isDarkMode = document.body.classList.contains('dark-mode');
-                    toAddressInput.style.borderColor = '#667eea';
-                    toAddressInput.style.backgroundColor = isDarkMode ? '#1a1f3a' : '#f8f9ff';
+                    const styles = getComputedStyle(document.body);
+                    toAddressInput.style.borderColor = styles.getPropertyValue('--color-primary').trim() || '#667eea';
+                    toAddressInput.style.backgroundColor = styles.getPropertyValue('--color-input-bg').trim() || '#f8f9ff';
                 }
                 
                 window.notificationService.showSuccess(`Email address and recipient pubkey filled in for ${contact.name}`);

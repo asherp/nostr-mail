@@ -20,7 +20,23 @@
     <link rel="stylesheet" href="styles/loading.css">
     <link rel="stylesheet" href="styles/responsive.css">
     <link rel="stylesheet" href="styles/dark-mode.css">
+    <link rel="stylesheet" href="styles/themes.css">
     <link rel="stylesheet" href="styles/avatars.css">
+    <!-- Apply saved theme before first paint to avoid a flash of the wrong theme -->
+    <script>
+      (function () {
+        try {
+          var THEMES = ['light', 'dark', 'high-contrast', 'ocean', 'forest'];
+          var theme = localStorage.getItem('theme');
+          if (!theme) {
+            // Backward compatibility with the old binary dark-mode preference.
+            theme = localStorage.getItem('darkMode') === '1' ? 'dark' : 'light';
+          }
+          if (THEMES.indexOf(theme) === -1) theme = 'light';
+          document.documentElement.setAttribute('data-theme', theme);
+        } catch (e) {}
+      })();
+    </script>
     <link rel="stylesheet" href="styles.css">
     <link href="vendor/fontawesome/css/all.min.css" rel="stylesheet">
     <link href="vendor/tom-select/css/tom-select.default.min.css" rel="stylesheet">
@@ -839,16 +855,29 @@
                         <div class="settings-section-content">
                         <div class="form-group">
                             <label>Theme:</label>
-                            <div class="input-with-button">
-                                <div style="display: flex; align-items: center; gap: 12px;">
-                                    <span id="theme-label">Dark Mode</span>
-                                    <button id="dark-mode-toggle" class="btn btn-secondary" title="Toggle dark mode" style="display: flex; align-items: center; justify-content: center; gap: 8px;">
-                                        <i id="dark-mode-icon" class="fas fa-moon"></i>
-                                        <span id="dark-mode-text">Enable Dark Mode</span>
-                                    </button>
-                                </div>
+                            <div id="theme-picker" class="theme-picker" role="radiogroup" aria-label="Color theme">
+                                <button type="button" class="theme-swatch" data-theme-value="light" role="radio" aria-checked="false" title="Light">
+                                    <span class="theme-swatch-preview" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);"><span class="theme-swatch-dot" style="background:#ffffff;"></span></span>
+                                    <span class="theme-swatch-name">Light</span>
+                                </button>
+                                <button type="button" class="theme-swatch" data-theme-value="dark" role="radio" aria-checked="false" title="Dark">
+                                    <span class="theme-swatch-preview" style="background: linear-gradient(135deg, #232946 0%, #121629 100%);"><span class="theme-swatch-dot" style="background:#667eea;"></span></span>
+                                    <span class="theme-swatch-name">Dark</span>
+                                </button>
+                                <button type="button" class="theme-swatch" data-theme-value="high-contrast" role="radio" aria-checked="false" title="High contrast">
+                                    <span class="theme-swatch-preview" style="background:#000000;"><span class="theme-swatch-dot" style="background:#ffd400;"></span></span>
+                                    <span class="theme-swatch-name">High contrast</span>
+                                </button>
+                                <button type="button" class="theme-swatch" data-theme-value="ocean" role="radio" aria-checked="false" title="Ocean">
+                                    <span class="theme-swatch-preview" style="background: linear-gradient(135deg, #12303f 0%, #071620 100%);"><span class="theme-swatch-dot" style="background:#2b9dc9;"></span></span>
+                                    <span class="theme-swatch-name">Ocean</span>
+                                </button>
+                                <button type="button" class="theme-swatch" data-theme-value="forest" role="radio" aria-checked="false" title="Forest">
+                                    <span class="theme-swatch-preview" style="background: linear-gradient(135deg, #1c3227 0%, #0c160f 100%);"><span class="theme-swatch-dot" style="background:#3fae6b;"></span></span>
+                                    <span class="theme-swatch-name">Forest</span>
+                                </button>
                             </div>
-                            <small class="form-text text-muted">Switch between light and dark theme</small>
+                            <small class="form-text text-muted">Choose a color theme. Your choice is saved and applied on startup.</small>
                         </div>
                         </div>
                     </div>

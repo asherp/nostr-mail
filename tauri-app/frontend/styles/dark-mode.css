@@ -69,7 +69,7 @@ body.dark-mode .email-item {
 
 body.dark-mode .email-item.unread {
     background-color: #232946;
-    border-left: 4px solid #667eea;
+    border-left: 4px solid var(--color-primary);
 }
 
 body.dark-mode .modal {
@@ -90,7 +90,7 @@ body.dark-mode .form-group textarea {
 
 body.dark-mode .form-group input:focus,
 body.dark-mode .form-group textarea:focus {
-    border-color: #667eea;
+    border-color: var(--color-primary);
     box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
 }
 

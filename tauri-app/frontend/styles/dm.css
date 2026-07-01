@@ -61,7 +61,7 @@
 
 .dm-search-input:focus {
     outline: none;
-    border-color: #667eea;
+    border-color: var(--color-primary);
     background-color: white;
     box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
 }
@@ -84,7 +84,7 @@ body.dark-mode .dm-search-input {
 }
 
 body.dark-mode .dm-search-input:focus {
-    border-color: #667eea;
+    border-color: var(--color-primary);
     background-color: #232946;
     box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
 }
@@ -189,7 +189,7 @@ body.dark-mode .dm-search-icon {
 }
 
 .dm-contact-item.active {
-    background-color: #667eea;
+    background-color: var(--color-primary);
     color: white;
 }
 
@@ -445,7 +445,7 @@ body.dark-mode .dm-back-to-list-btn:hover {
 }
 
 .message-sent .message-content {
-    background: #667eea;
+    background: var(--color-primary);
     color: white;
 }
 
@@ -810,7 +810,7 @@ body.dark-mode .dm-debug-copy:hover {
 }
 
 .dm-send-btn {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: var(--color-primary-gradient);
     color: white;
     border: none;
     border-radius: 50%;
@@ -825,7 +825,7 @@ body.dark-mode .dm-debug-copy:hover {
 }
 
 .dm-send-btn:hover:not(:disabled) {
-    background: linear-gradient(135deg, #5568d3 0%, #653a8f 100%);
+    background: linear-gradient(135deg, var(--color-primary-hover) 0%, #653a8f 100%);
 }
 
 .dm-send-btn:disabled {

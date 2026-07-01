@@ -1210,14 +1210,12 @@ fn keychain_list_accounts(state: tauri::State<AppState>) -> Result<Vec<AccountIn
     }).collect())
 }
 
-#[tauri::command]
-fn keychain_set_active_account(public_key: String, state: tauri::State<AppState>) -> Result<(), String> {
-    println!("[RUST] keychain_set_active_account called for: {}...", &public_key[..20.min(public_key.len())]);
-    // Switching the active account: tear down the previous account's IMAP IDLE
-    // watcher and pooled connections so nothing credential-bound to the old
-    // user is reused. The frontend restarts IDLE for the new account.
-    state.stop_idle_watcher();
-    let private_key = state.keychain.get_key(&public_key)?
+/// Load the given account's key from the keychain into in-memory state
+/// (`current_keys` + `current_private_key`) so it becomes the active account
+/// for signing, AUTH, and email sync. Does not touch the persisted active
+/// pointer or the IMAP watcher — callers handle those as needed.
+fn activate_account_in_memory(public_key: &str, state: &AppState) -> Result<(), String> {
+    let private_key = state.keychain.get_key(public_key)?
         .ok_or_else(|| format!("No key found in keychain for {}", &public_key[..20.min(public_key.len())]))?;
     let secret_key = nostr_sdk::prelude::SecretKey::from_bech32(&private_key).map_err(|e| e.to_string())?;
     let keys = nostr_sdk::prelude::Keys::new(secret_key);
@@ -1227,11 +1225,42 @@ fn keychain_set_active_account(public_key: String, state: tauri::State<AppState>
 }
 
 #[tauri::command]
+fn keychain_set_active_account(public_key: String, state: tauri::State<AppState>) -> Result<(), String> {
+    println!("[RUST] keychain_set_active_account called for: {}...", &public_key[..20.min(public_key.len())]);
+    // Switching the active account: tear down the previous account's IMAP IDLE
+    // watcher and pooled connections so nothing credential-bound to the old
+    // user is reused. The frontend restarts IDLE for the new account.
+    state.stop_idle_watcher();
+    activate_account_in_memory(&public_key, &state)?;
+    // Persist the choice so the same account is restored on the next app
+    // launch. Non-fatal if it fails — the account is still active this session.
+    if let Err(e) = state.keychain.set_active(&public_key) {
+        println!("[RUST] Warning: failed to persist active account: {}", e);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn keychain_get_active_account(state: tauri::State<AppState>) -> Result<Option<String>, String> {
-    let pubkey = state.current_private_key.lock().unwrap()
+    // Fast path: an account is already loaded in memory this session.
+    let in_memory = state.current_private_key.lock().unwrap()
         .as_ref()
         .and_then(|pk| crypto::get_public_key_from_private(pk).ok());
-    Ok(pubkey)
+    if in_memory.is_some() {
+        return Ok(in_memory);
+    }
+
+    // Cold start (e.g. after an app restart): nothing is loaded yet. Restore
+    // the account the user last made active from the persisted vault pointer,
+    // loading its key into memory so the rest of the app sees it as active.
+    match state.keychain.get_active()? {
+        Some(pubkey) => {
+            activate_account_in_memory(&pubkey, &state)?;
+            println!("[RUST] Restored persisted active account: {}...", &pubkey[..20.min(pubkey.len())]);
+            Ok(Some(pubkey))
+        }
+        None => Ok(None),
+    }
 }
 
 #[tauri::command]

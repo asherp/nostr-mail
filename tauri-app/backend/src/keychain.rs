@@ -12,6 +12,13 @@ const VAULT_ACCOUNT: &str = "vault";
 struct Vault {
     /// pubkey -> private key
     keys: HashMap<String, String>,
+    /// The public key of the account the user last made active. Persisted so
+    /// the app restores the same account on restart instead of picking an
+    /// arbitrary entry from `keys` (a HashMap has no stable order). Optional
+    /// and `#[serde(default)]` for backward compatibility with older vaults
+    /// written before this field existed.
+    #[serde(default)]
+    active: Option<String>,
 }
 
 /// Manages private keys in the OS keychain with an in-memory cache.
@@ -115,12 +122,41 @@ impl KeychainManager {
     pub fn delete_key(&self, public_key: &str) -> Result<(), String> {
         let mut vault = self.load_vault()?;
         vault.keys.remove(public_key);
+        // Drop the active pointer if it referenced the key we just removed,
+        // so a restart doesn't try to restore a deleted account.
+        if vault.active.as_deref() == Some(public_key) {
+            vault.active = None;
+        }
         self.save_vault(&vault)
     }
 
     pub fn list_pubkeys(&self) -> Result<Vec<String>, String> {
         let vault = self.load_vault()?;
         Ok(vault.keys.keys().cloned().collect())
+    }
+
+    /// Persist which account is active so it survives an app restart. Only
+    /// records the pointer if the key exists in the vault.
+    pub fn set_active(&self, public_key: &str) -> Result<(), String> {
+        let mut vault = self.load_vault()?;
+        if !vault.keys.contains_key(public_key) {
+            return Err(format!(
+                "Cannot set active account: no key in vault for {}",
+                &public_key[..20.min(public_key.len())]
+            ));
+        }
+        vault.active = Some(public_key.to_string());
+        self.save_vault(&vault)
+    }
+
+    /// The persisted active account, if any. Returns `None` when the pointer
+    /// is unset or refers to a key that no longer exists in the vault.
+    pub fn get_active(&self) -> Result<Option<String>, String> {
+        let vault = self.load_vault()?;
+        match vault.active {
+            Some(ref pk) if vault.keys.contains_key(pk) => Ok(Some(pk.clone())),
+            _ => Ok(None),
+        }
     }
 
     #[cfg(not(target_os = "android"))]
@@ -247,5 +283,44 @@ mod android {
                 .map_err(|e| { drain_exception(env); format!("VaultStorage.clear threw: {}", e) })?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Serde-only tests for the Vault format. These deliberately avoid the OS
+    // keychain (no D-Bus / Secret Service needed) so they run in headless CI.
+
+    /// Vaults written before the `active` field existed (only `keys`) must
+    /// still deserialize, defaulting `active` to `None`.
+    #[test]
+    fn test_vault_deserializes_legacy_json_without_active() {
+        let legacy = r#"{"keys":{"npub_abc":"nsec_abc"}}"#;
+        let vault: Vault = serde_json::from_str(legacy).unwrap();
+        assert_eq!(vault.keys.get("npub_abc").map(String::as_str), Some("nsec_abc"));
+        assert_eq!(vault.active, None);
+    }
+
+    /// The active pointer round-trips through serialization.
+    #[test]
+    fn test_vault_roundtrips_active() {
+        let mut vault = Vault::default();
+        vault.keys.insert("npub_abc".to_string(), "nsec_abc".to_string());
+        vault.active = Some("npub_abc".to_string());
+
+        let json = serde_json::to_string(&vault).unwrap();
+        let restored: Vault = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.active.as_deref(), Some("npub_abc"));
+        assert_eq!(restored.keys, vault.keys);
+    }
+
+    /// A freshly created vault has no active account.
+    #[test]
+    fn test_vault_default_has_no_active() {
+        let vault = Vault::default();
+        assert!(vault.active.is_none());
+        assert!(vault.keys.is_empty());
     }
 }

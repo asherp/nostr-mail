@@ -28,7 +28,7 @@
 }
 
 #qr-reader__scan_region {
-    border: 2px solid #667eea;
+    border: 2px solid var(--color-primary);
     border-radius: 8px;
 }
 

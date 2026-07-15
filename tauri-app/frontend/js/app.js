@@ -1757,10 +1757,15 @@ NostrMailApp.prototype.setupEventListeners = function() {
         // Profile switcher
         this.setupProfileSwitcherListeners();
 
-        // Dark mode toggle
-        const darkToggle = document.getElementById('dark-mode-toggle');
-        if (darkToggle) {
-            darkToggle.addEventListener('click', () => this.toggleDarkMode());
+        // Theme picker
+        const themePicker = document.getElementById('theme-picker');
+        if (themePicker) {
+            themePicker.addEventListener('click', (e) => {
+                const swatch = e.target.closest('.theme-swatch');
+                if (swatch) {
+                    this.setTheme(swatch.getAttribute('data-theme-value'));
+                }
+            });
         }
         
         // Profile form
@@ -5694,28 +5699,58 @@ NostrMailApp.prototype.updatePublicKeyDisplay = async function() {
     }
 }
 
-// Dark mode management
+// Theme management
+NostrMailApp.AVAILABLE_THEMES = ['light', 'dark', 'high-contrast', 'ocean', 'forest'];
+
+// Resolve the active theme, honoring the legacy darkMode preference for
+// users who set it before the multi-theme picker existed.
+NostrMailApp.prototype.getSavedTheme = function() {
+    let theme = localStorage.getItem('theme');
+    if (!theme) {
+        theme = localStorage.getItem('darkMode') === '1' ? 'dark' : 'light';
+    }
+    if (NostrMailApp.AVAILABLE_THEMES.indexOf(theme) === -1) {
+        theme = 'light';
+    }
+    return theme;
+};
+
+NostrMailApp.prototype.setTheme = function(theme) {
+    if (NostrMailApp.AVAILABLE_THEMES.indexOf(theme) === -1) {
+        theme = 'light';
+    }
+
+    // Token sets live on :root[data-theme]; keep html and body in sync.
+    document.documentElement.setAttribute('data-theme', theme);
+    document.body.setAttribute('data-theme', theme);
+
+    // Dark keeps the legacy .dark-mode class (its visual overrides live in
+    // dark-mode.css); every other non-light theme uses the generic token
+    // layer driven by the .themed class.
+    document.body.classList.toggle('dark-mode', theme === 'dark');
+    document.body.classList.toggle('themed', theme !== 'light' && theme !== 'dark');
+
+    // Persist, and keep darkMode in sync for any older code paths.
+    localStorage.setItem('theme', theme);
+    localStorage.setItem('darkMode', theme === 'dark' ? '1' : '0');
+
+    // Reflect the selection in the Settings picker if it is rendered.
+    const swatches = document.querySelectorAll('#theme-picker .theme-swatch');
+    swatches.forEach((swatch) => {
+        const selected = swatch.getAttribute('data-theme-value') === theme;
+        swatch.setAttribute('aria-checked', selected ? 'true' : 'false');
+    });
+};
+
+// Backward-compatible shims for any remaining callers.
 NostrMailApp.prototype.setDarkMode = function(enabled) {
-    document.body.classList.toggle('dark-mode', enabled);
-    const icon = document.getElementById('dark-mode-icon');
-    if (icon) {
-        icon.className = enabled ? 'fas fa-sun' : 'fas fa-moon';
-    }
-    const text = document.getElementById('dark-mode-text');
-    if (text) {
-        text.textContent = enabled ? 'Enable Light Mode' : 'Enable Dark Mode';
-    }
-    const label = document.getElementById('theme-label');
-    if (label) {
-        label.textContent = enabled ? 'Dark Mode (Enabled)' : 'Light Mode (Enabled)';
-    }
-    localStorage.setItem('darkMode', enabled ? '1' : '0');
-}
+    this.setTheme(enabled ? 'dark' : 'light');
+};
 
 NostrMailApp.prototype.toggleDarkMode = function() {
-    const enabled = !document.body.classList.contains('dark-mode');
-    this.setDarkMode(enabled);
-}
+    const isDark = this.getSavedTheme() === 'dark';
+    this.setTheme(isDark ? 'light' : 'dark');
+};
 
 // Add a method to render the email warning
 NostrMailApp.prototype.renderProfileEmailWarning = function() {
@@ -6023,11 +6058,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
 
-    // Set initial dark mode from localStorage
-    const darkPref = localStorage.getItem('darkMode');
-    window.app.setDarkMode(darkPref === '1');
-    
-    console.log('🎨 Dark mode initialized:', darkPref === '1' ? 'enabled' : 'disabled');
+    // Apply the saved theme (the inline <head> script already set data-theme
+    // on <html> pre-paint; this syncs the body classes and picker state).
+    const initialTheme = window.app.getSavedTheme();
+    window.app.setTheme(initialTheme);
+
+    console.log('🎨 Theme initialized:', initialTheme);
     
     // Initialize the application
     window.app.init();

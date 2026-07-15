@@ -28,7 +28,7 @@
 }
 
 .contact-item.active {
-    background-color: #667eea;
+    background-color: var(--color-primary);
     color: white;
 }
 
@@ -196,7 +196,7 @@ body.dark-mode .contact-section-content .section-empty-message {
     border: none;
     cursor: pointer;
     padding: 4px;
-    color: #667eea;
+    color: var(--color-primary);
     font-size: 14px;
     opacity: 0.8;
     transition: opacity 0.2s ease, color 0.2s ease;
@@ -208,7 +208,7 @@ body.dark-mode .contact-section-content .section-empty-message {
 
 .contact-email-icon:hover {
     opacity: 1;
-    color: #5568d3;
+    color: var(--color-primary-hover);
     background-color: rgba(102, 126, 234, 0.1);
 }
 
@@ -388,7 +388,7 @@ body.dark-mode .contact-section-content .section-empty-message {
 }
 
 .contact-detail-email {
-    color: #667eea;
+    color: var(--color-primary);
     text-decoration: none;
     font-weight: 500;
 }
@@ -405,7 +405,7 @@ body.dark-mode .contact-section-content .section-empty-message {
     margin: 0 0 15px 0;
     font-size: 1.1rem;
     color: #333;
-    border-bottom: 2px solid #667eea;
+    border-bottom: 2px solid var(--color-primary);
     padding-bottom: 5px;
 }
 
@@ -472,7 +472,7 @@ body.dark-mode .contact-section-content .section-empty-message {
 
 .contacts-search-input:focus {
     outline: none;
-    border-color: #667eea;
+    border-color: var(--color-primary);
     background-color: white;
     box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
 }
@@ -513,7 +513,7 @@ body.dark-mode .contact-detail-info h3 {
 
 body.dark-mode .contact-detail-section h4 {
     color: #e0e0e0;
-    border-bottom-color: #667eea;
+    border-bottom-color: var(--color-primary);
 }
 
 body.dark-mode .contact-detail-field label {
@@ -551,7 +551,7 @@ body.dark-mode .contact-item:hover {
 }
 
 body.dark-mode .contact-item.active {
-    background-color: #667eea;
+    background-color: var(--color-primary);
     color: white;
 }
 
@@ -573,7 +573,7 @@ body.dark-mode .contact-detail-pubkey-code {
 }
 
 body.dark-mode .contact-email-icon {
-    color: #667eea;
+    color: var(--color-primary);
     opacity: 0.8;
 }
 
@@ -591,7 +591,7 @@ body.dark-mode .contacts-search-input {
 }
 
 body.dark-mode .contacts-search-input:focus {
-    border-color: #667eea;
+    border-color: var(--color-primary);
     background-color: #232946;
     box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
 }
@@ -654,7 +654,7 @@ body.dark-mode .contact-item.active .contact-delete-icon:hover {
 
 .privacy-toggle-icon {
     font-size: 1.2rem;
-    color: #667eea;
+    color: var(--color-primary);
 }
 
 .privacy-toggle-title {
@@ -693,7 +693,7 @@ body.dark-mode .contact-item.active .contact-delete-icon:hover {
 }
 
 .privacy-toggle input[type="checkbox"]:checked + .privacy-toggle-slider {
-    background-color: #667eea;
+    background-color: var(--color-primary);
 }
 
 .privacy-toggle-slider::before {
@@ -740,7 +740,7 @@ body.dark-mode .contact-item.active .contact-delete-icon:hover {
     z-index: 10;
     padding: 0;
     font-size: 0.95rem;
-    color: #667eea;
+    color: var(--color-primary);
     font-weight: 600;
     backdrop-filter: blur(2px);
 }
@@ -755,7 +755,7 @@ body.dark-mode .contact-item.active .contact-delete-icon:hover {
 
 body.dark-mode .privacy-toggle-loading {
     background-color: rgba(24, 26, 32, 0.98);
-    color: #667eea;
+    color: var(--color-primary);
 }
 
 /* Dark mode support for privacy toggle */
@@ -777,7 +777,7 @@ body.dark-mode .privacy-toggle-slider {
 }
 
 body.dark-mode .privacy-toggle input[type="checkbox"]:checked + .privacy-toggle-slider {
-    background-color: #667eea;
+    background-color: var(--color-primary);
 }
 
 body.dark-mode .privacy-toggle-description {

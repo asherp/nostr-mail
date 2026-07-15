@@ -297,7 +297,7 @@ body.dark-mode .confirmation-modal .confirmation-dialog select {
 
 body.dark-mode .confirmation-modal .confirmation-dialog select:focus,
 body.dark-mode .confirmation-modal .confirmation-dialog input[type="text"]:focus {
-    border-color: #667eea !important;
+    border-color: var(--color-primary) !important;
     box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1) !important;
 }
 

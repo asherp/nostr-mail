@@ -26,8 +26,11 @@ class Utils {
         iframe.style.minHeight = '100px';
         container.appendChild(iframe);
         const doc = iframe.contentDocument || iframe.contentWindow.document;
-        // Inject dark mode aware base styles + the email HTML
-        const isDark = document.body.classList.contains('dark-mode');
+        // Inject dark mode aware base styles + the email HTML.
+        // Every theme except light uses a dark surface, so apply the dark
+        // email overrides whenever the active theme is not light.
+        const activeTheme = document.documentElement.getAttribute('data-theme') || 'light';
+        const isDark = activeTheme !== 'light';
         doc.open();
         const darkOverrides = isDark ? `
             h4 { color: #9ca3af !important; }

@@ -785,7 +785,7 @@ body.dark-mode .email-item {
 
 body.dark-mode .email-item.unread {
     background-color: #232946;
-    border-left: 4px solid #667eea;
+    border-left: 4px solid var(--color-primary);
 }
 
 body.dark-mode .email-item:hover {
@@ -1016,7 +1016,7 @@ body.dark-mode .email-attachment-icon {
 
 .email-search-input:focus {
     outline: none;
-    border-color: #667eea;
+    border-color: var(--color-primary);
     background-color: white;
     box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
 }
@@ -1039,7 +1039,7 @@ body.dark-mode .email-search-input {
 }
 
 body.dark-mode .email-search-input:focus {
-    border-color: #667eea;
+    border-color: var(--color-primary);
     background-color: #232946;
     box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
 }
@@ -1188,7 +1188,7 @@ body.dark-mode .email-body-content-text {
     min-width: 20px;
     height: 20px;
     border-radius: 10px;
-    background: #667eea;
+    background: var(--color-primary);
     color: white;
     font-size: 0.75rem;
     font-weight: 600;

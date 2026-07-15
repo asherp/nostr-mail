@@ -392,10 +392,10 @@ class EmailService {
         });
     }
 
-    // Get appropriate background color for Nostr contact input based on dark mode
+    // Get appropriate background color for Nostr contact input from the active theme
     getNostrContactInputBackgroundColor() {
-        const isDarkMode = document.body.classList.contains('dark-mode');
-        return isDarkMode ? '#1a1f3a' : '#f8f9ff';
+        const inputBg = getComputedStyle(document.body).getPropertyValue('--color-input-bg').trim();
+        return inputBg || '#f8f9ff';
     }
 
     /**

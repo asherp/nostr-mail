@@ -193,7 +193,7 @@ body.dark-mode .relay-item-actions .relay-toggle-caption {
 }
 
 .relay-item-actions input[type="checkbox"]:checked {
-    background-color: #667eea;
+    background-color: var(--color-primary);
 }
 
 .relay-item-actions input[type="checkbox"]:checked::before {

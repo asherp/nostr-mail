@@ -14,7 +14,7 @@
 }
 
 .btn-primary {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: var(--color-primary-gradient);
     color: white;
 }
 
@@ -205,7 +205,7 @@ select.btn-select:hover:not(:disabled) {
 
 select.btn-select:focus {
     outline: none;
-    border-color: #667eea;
+    border-color: var(--color-primary);
     box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
 }
 

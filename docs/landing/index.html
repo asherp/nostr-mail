@@ -535,6 +535,8 @@
       font-weight: 600;
     }
 
+    .comparison-table-wide { min-width: 820px; }
+
     .check { color: #22c55e; font-weight: 700; font-size: 1.1rem; }
     .cross { color: #ef4444; font-weight: 700; font-size: 1.1rem; }
     .highlight-col { background: rgba(124,58,237,0.06); }
@@ -553,6 +555,10 @@
       display: flex;
       align-items: flex-start;
       gap: 12px;
+    }
+
+    .integration-note + .integration-note {
+      margin-top: 16px;
     }
 
     .integration-note i {
@@ -1002,70 +1008,111 @@
     </div>
   </section>
 
-  <!-- ===== nostr-mail vs Nmail ===== -->
+  <!-- ===== nostr-mail vs Nmail vs Mailstr ===== -->
   <section class="section" id="approaches">
     <div class="container">
       <div class="section-header fade-in">
-        <h2>Two approaches to <span class="gradient-text">private email</span></h2>
-        <p>Another project, <a href="https://nostrmail.org" target="_blank" rel="noopener">Nmail</a>, shares the name &ldquo;Nostr Mail&rdquo; and a similar goal, but takes a different architectural approach. Nmail uses Nostr relays as the primary transport layer. Our approach embeds Nostr identity and end-to-end encryption inside the existing email ecosystem (SMTP/IMAP). Both designs are valid&mdash;they just optimize for different tradeoffs.</p>
+        <h2>Three approaches to <span class="gradient-text">private email</span></h2>
+        <p>Several projects share the name &ldquo;Nostr mail&rdquo; but not the architecture. <a href="https://nostrmail.org" target="_blank" rel="noopener">Nmail</a> is relay-native: it replaces SMTP with Nostr relays and bridges out to legacy email when it has to. <a href="https://mailstr.app" target="_blank" rel="noopener">Mailstr</a> is a hosted gateway: it sells you an address, receives ordinary email on your behalf, encrypts it to your key, and stores it on relays. nostr-mail is neither &mdash; it is an encryption layer over the email you already have, so the ciphertext is produced on your device and travels over standard SMTP. All three are valid designs; they just put the trust boundary in different places.</p>
       </div>
       <div class="comparison-table-wrapper fade-in">
-        <table class="comparison-table">
+        <table class="comparison-table comparison-table-wide">
           <thead>
             <tr>
               <th>Aspect</th>
               <th>nostr-mail</th>
               <th>Nmail (nostrmail.org)</th>
+              <th>Mailstr (mailstr.app)</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>End-to-end encryption</td>
-              <td class="highlight-col">E2E across arbitrary email providers (Gmail &harr; Outlook &harr; Proton, etc.)</td>
-              <td>E2E within the Nostr network; messages leaving via SMTP bridges are typically plaintext after the bridge</td>
+              <td>What it is</td>
+              <td class="highlight-col">Native client (Tauri) you run yourself</td>
+              <td>Protocol + reference client and SDKs</td>
+              <td>Hosted service with a web inbox</td>
             </tr>
             <tr>
-              <td>Transport</td>
-              <td class="highlight-col">Standard SMTP &amp; IMAP</td>
-              <td>Nostr relays (custom event kinds, e.g. 1301)</td>
+              <td>Where encryption happens</td>
+              <td class="highlight-col">On your device, before the message ever reaches SMTP</td>
+              <td>On your device, before the event reaches a relay</td>
+              <td>On their bridge, after it receives your mail in plaintext</td>
             </tr>
             <tr>
-              <td>Existing inbox</td>
-              <td class="highlight-col">Native &mdash; works directly in Gmail, Outlook, any IMAP client</td>
-              <td>Requires a bridge service for traditional inboxes</td>
+              <td>Trust in an operator</td>
+              <td class="highlight-col">None &mdash; there is no operator in the path</td>
+              <td>Relays store gift-wrapped events; bridges see plaintext when used</td>
+              <td>The bridge is a trusted party at ingest &mdash; it performs the encryption</td>
+            </tr>
+            <tr>
+              <td>End-to-end scope</td>
+              <td class="highlight-col">True E2E between two nostr-mail users, across arbitrary providers (Gmail &harr; Outlook &harr; Proton)</td>
+              <td>E2E within the Nostr network; messages leaving via an SMTP bridge are plaintext after the bridge</td>
+              <td>Bridge&rarr;you leg only. They say so plainly: the sender&rarr;bridge leg is ordinary email</td>
+            </tr>
+            <tr>
+              <td>Transport &amp; storage</td>
+              <td class="highlight-col">Standard SMTP &amp; IMAP; archived by your existing provider</td>
+              <td>Nostr relays (custom event kinds, e.g. 1301); retention depends on relays</td>
+              <td>Inbound SMTP, then stored on the Nostr relays you choose</td>
+            </tr>
+            <tr>
+              <td>Address &amp; discovery</td>
+              <td class="highlight-col">Your existing addresses, published via your Nostr profile (kind 0)</td>
+              <td>Nostr identity / NIP-05</td>
+              <td><code>you@mailstr.app</code>, which doubles as your NIP-05 handle</td>
+            </tr>
+            <tr>
+              <td>Counterparty adoption</td>
+              <td class="highlight-col">Both sides need nostr-mail for E2E; without it you are sending ordinary email</td>
+              <td>Correspondent needs Nostr, or a bridge in between</td>
+              <td>None &mdash; anyone with a normal inbox can reach you today</td>
             </tr>
             <tr>
               <td>Metadata hiding</td>
-              <td class="highlight-col">Subject + body encrypted and encoded as natural-looking text (Glossia)</td>
-              <td>Full envelope hidden via NIP-59; relays see minimal metadata</td>
-            </tr>
-            <tr>
-              <td>Discovery</td>
-              <td class="highlight-col">Email address published via profile (kind 0)</td>
-              <td>NIP-05 (<code>user@domain</code> &rarr; pubkey)</td>
+              <td class="highlight-col">Subject and body encrypted, then encoded as natural-looking text (Glossia)</td>
+              <td>Full envelope hidden via NIP-59 gift wrapping</td>
+              <td>Inbound envelope is visible to the bridge; ciphertext at rest on relays</td>
             </tr>
             <tr>
               <td>Attachments</td>
-              <td class="highlight-col">AES-256 + NIP-44 key wrapping, embedded in MIME</td>
-              <td>Out-of-band storage (e.g., Blossom servers)</td>
+              <td class="highlight-col">AES-256 with NIP-44 key wrapping, embedded directly in MIME</td>
+              <td>Out-of-band storage (Blossom servers) with hybrid referencing</td>
+              <td>Not advertised</td>
             </tr>
             <tr>
-              <td>Archival storage</td>
-              <td class="highlight-col">Backed by existing email providers (IMAP folders, search, retention)</td>
-              <td>Depends on relay availability and retention</td>
+              <td>Size ceiling</td>
+              <td class="highlight-col">Your provider&rsquo;s message limit (commonly ~25&nbsp;MB), against a mailbox quota measured in gigabytes</td>
+              <td>Relay event limits, sidestepped by pushing blobs to Blossom and referencing them</td>
+              <td>Whatever the relays accept &mdash; no blob offload published</td>
             </tr>
             <tr>
-              <td>Legacy SMTP interop</td>
-              <td class="highlight-col">Built-in &mdash; can reach any email address globally</td>
-              <td>Requires bridging to reach SMTP users</td>
+              <td>Cost</td>
+              <td class="highlight-col">Free, MIT licensed</td>
+              <td>Free, MIT licensed</td>
+              <td>One-time Lightning payment to claim the name</td>
+            </tr>
+            <tr>
+              <td>Platforms</td>
+              <td class="highlight-col">macOS, Windows, Linux, Android (zapstore)</td>
+              <td>Web, Linux, Android (zapstore)</td>
+              <td>Web</td>
             </tr>
           </tbody>
         </table>
       </div>
       <p class="integration-note fade-in">
+        <i class="fas fa-shield-halved"></i>
+        <span><strong>The difference that matters most is who holds the plaintext.</strong> Mailstr is unusually honest about this &mdash; they state up front that the sender-to-bridge leg is ordinary email and not end-to-end encrypted, which most providers never mention. But the consequence runs deeper than the caveat suggests: because their bridge is what performs the encryption, it necessarily sees every inbound message in the clear. It is a trusted party, not a passive relay. nostr-mail has no such party in the path &mdash; ciphertext is produced on your machine and no one but the recipient can open it. The same limitation applies to any Nmail message that arrives through an SMTP bridge.
+      </span></p>
+      <p class="integration-note fade-in">
+        <i class="fas fa-box-archive"></i>
+        <span><strong>Relays were built to broadcast, not to archive.</strong> Every relay advertises a <code>max_message_length</code> (NIP-11), and the values in the wild vary by more than an order of magnitude &mdash; so anything stored as a relay event inherits whatever ceiling the strictest relay in your set applies, and a large attachment simply will not fit. Nmail confronts this directly by pushing blobs to Blossom servers and referencing them from the event. Mailstr has not published how it handles large attachments. IMAP needed no such workaround: it was designed for storage from the start, with multi-megabyte MIME messages, folders, server-side search, and retention your provider already operates &mdash; which is what nostr-mail encrypts into rather than replacing.
+      </span></p>
+      <p class="integration-note fade-in">
         <i class="fas fa-circle-info"></i>
-        We&rsquo;re exploring hybrid models that combine both approaches&mdash;using Nostr relay transport (e.g. NIP-59 gift wrapping) for metadata privacy, while retaining SMTP/IMAP compatibility for universal reach. In that model, our end-to-end encryption layer can ride inside relay-wrapped messages when needed, giving users a spectrum between maximum interoperability and maximum privacy.
-      </p>
+        <span><strong>Mailstr is closer to complementary than competitive.</strong> Its real advantage is that it requires zero adoption from the people writing to you, where our end-to-end encryption only engages when your correspondent also runs nostr-mail. A <code>@mailstr.app</code> address as a durable inbound identity, with nostr-mail handling E2E whenever the other side is on Nostr, would be a coherent pairing. The obstacle today is storage, not intent: Mailstr keeps your mail on Nostr relays rather than in an IMAP mailbox, and nostr-mail reads IMAP &mdash; so our client cannot open a Mailstr inbox. If they ever expose IMAP, this becomes a straightforward integration. Separately, we are exploring relay transport (NIP-59 gift wrapping) alongside SMTP/IMAP, giving users a spectrum between maximum reach and maximum metadata privacy.
+      </span></p>
     </div>
   </section>
 

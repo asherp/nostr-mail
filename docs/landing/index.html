@@ -1076,9 +1076,15 @@
             </tr>
             <tr>
               <td>Attachments</td>
-              <td class="highlight-col">AES-256 with NIP-44 key wrapping, embedded in MIME</td>
+              <td class="highlight-col">AES-256 with NIP-44 key wrapping, embedded directly in MIME</td>
               <td>Out-of-band storage (Blossom servers) with hybrid referencing</td>
               <td>Not advertised</td>
+            </tr>
+            <tr>
+              <td>Size ceiling</td>
+              <td class="highlight-col">Your provider&rsquo;s message limit (commonly ~25&nbsp;MB), against a mailbox quota measured in gigabytes</td>
+              <td>Relay event limits, sidestepped by pushing blobs to Blossom and referencing them</td>
+              <td>Whatever the relays accept &mdash; no blob offload published</td>
             </tr>
             <tr>
               <td>Cost</td>
@@ -1098,6 +1104,10 @@
       <p class="integration-note fade-in">
         <i class="fas fa-shield-halved"></i>
         <span><strong>The difference that matters most is who holds the plaintext.</strong> Mailstr is unusually honest about this &mdash; they state up front that the sender-to-bridge leg is ordinary email and not end-to-end encrypted, which most providers never mention. But the consequence runs deeper than the caveat suggests: because their bridge is what performs the encryption, it necessarily sees every inbound message in the clear. It is a trusted party, not a passive relay. nostr-mail has no such party in the path &mdash; ciphertext is produced on your machine and no one but the recipient can open it. The same limitation applies to any Nmail message that arrives through an SMTP bridge.
+      </span></p>
+      <p class="integration-note fade-in">
+        <i class="fas fa-box-archive"></i>
+        <span><strong>Relays were built to broadcast, not to archive.</strong> Every relay advertises a <code>max_message_length</code> (NIP-11), and the values in the wild vary by more than an order of magnitude &mdash; so anything stored as a relay event inherits whatever ceiling the strictest relay in your set applies, and a large attachment simply will not fit. Nmail confronts this directly by pushing blobs to Blossom servers and referencing them from the event. Mailstr has not published how it handles large attachments. IMAP needed no such workaround: it was designed for storage from the start, with multi-megabyte MIME messages, folders, server-side search, and retention your provider already operates &mdash; which is what nostr-mail encrypts into rather than replacing.
       </span></p>
       <p class="integration-note fade-in">
         <i class="fas fa-circle-info"></i>

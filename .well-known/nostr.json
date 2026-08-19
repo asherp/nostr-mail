@@ -1,0 +1,18 @@
+{
+  "names": {
+    "_": "ea11ede7f866f99f31d25380dbab5ad56953328c8379e9a97bb33d14fdfd7ae0",
+    "asherp": "f737bf4e6c4e88a6c32a43896fdc0f095bdc8053d65a1a2a29125b4e2e4ae071"
+  },
+  "relays": {
+    "ea11ede7f866f99f31d25380dbab5ad56953328c8379e9a97bb33d14fdfd7ae0": [
+      "wss://relay.damus.io",
+      "wss://nos.lol",
+      "wss://relay.nostr.pub",
+      "wss://nostr.rocks",
+      "wss://nostr.mom",
+      "wss://nostr.wine",
+      "wss://cache1.primal.net",
+      "wss://relay.nostr.band"
+    ]
+  }
+}

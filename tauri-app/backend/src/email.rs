@@ -3950,6 +3950,53 @@ pub fn verify_transport_authentication(
         }
     };
     
+    // Prefer verifying DKIM ourselves over reading someone's word for it. A
+    // signature we checked is evidence; a header is a claim whose weight rests
+    // entirely on having picked the right hop's copy.
+    //
+    // Only three of the five verdicts are conclusive. NoSignature and
+    // Unavailable mean we learned nothing — an offline device or a sender who
+    // does not sign — so those fall through to the header path rather than
+    // rejecting mail we simply could not check.
+    if let Some(bytes) = raw_bytes {
+        match crate::dkim::verify_dkim(bytes, &from_domain) {
+            verdict @ crate::dkim::DkimVerdict::PassAligned { .. } => {
+                let crate::dkim::DkimVerdict::PassAligned { domain } = verdict else {
+                    unreachable!()
+                };
+                return Ok(TransportAuthVerdict {
+                    transport_verified: true,
+                    method: TransportAuthMethod::Dkim,
+                    reason: format!("DKIM signature verified locally for domain {domain}"),
+                });
+            }
+            crate::dkim::DkimVerdict::PassNotAligned { signed_by, from_domain } => {
+                return Ok(TransportAuthVerdict {
+                    transport_verified: false,
+                    method: TransportAuthMethod::Dkim,
+                    reason: format!(
+                        "DKIM signature verified but was made by {signed_by}, which does not \
+                         speak for the From: domain {from_domain}"
+                    ),
+                });
+            }
+            crate::dkim::DkimVerdict::Fail { reason } => {
+                return Ok(TransportAuthVerdict {
+                    transport_verified: false,
+                    method: TransportAuthMethod::Dkim,
+                    reason: format!("DKIM verification failed locally: {reason}"),
+                });
+            }
+            verdict @ (crate::dkim::DkimVerdict::NoSignature
+            | crate::dkim::DkimVerdict::Unavailable { .. }) => {
+                debug_log!(
+                    "[RUST] transport auth: local DKIM inconclusive ({verdict:?}); \
+                     falling back to Authentication-Results"
+                );
+            }
+        }
+    }
+
     // Take the Authentication-Results header our own receiving MTA prepended.
     // Anything below it may have been written by the sender — see the doc
     // comment on get_trusted_authentication_results_header.

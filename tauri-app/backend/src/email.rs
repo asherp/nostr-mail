@@ -3779,21 +3779,42 @@ fn extract_domain_from_email_address(from_header: &str) -> Option<String> {
     None
 }
 
-/// Get the last Authentication-Results header (trusted final MTA)
-fn get_last_authentication_results_header(email: &mailparse::ParsedMail) -> Option<String> {
-    // Get all Authentication-Results headers
-    let mut auth_results_headers: Vec<String> = email.headers
-        .get_all_values("Authentication-Results")
-        .into_iter()
-        .collect();
-    
-    // Return the last one (most recent/final MTA)
-    auth_results_headers.pop()
+/// Get the Authentication-Results header written by our own receiving MTA.
+///
+/// MTAs *prepend* trace headers, so the **first** `Authentication-Results` in
+/// document order is the one added by the last server to handle the message —
+/// the recipient's own provider. Every header below it is either an older hop
+/// or was supplied by the sender.
+///
+/// This distinction is the whole security property. A sender can put
+/// `Authentication-Results: whatever; dmarc=pass` directly into the message
+/// they compose; the receiving provider then prepends its genuine verdict
+/// *above* it. Selecting from the bottom therefore hands the attacker a
+/// guaranteed win, and selecting from the top is what makes the verdict
+/// meaningful.
+///
+/// RFC 8601 §5 states the same rule: a receiving ADMD must remove or refuse to
+/// trust `Authentication-Results` headers that originate outside its own trust
+/// boundary.
+fn get_trusted_authentication_results_header(email: &mailparse::ParsedMail) -> Option<String> {
+    let headers = email.headers.get_all_values("Authentication-Results");
+
+    if headers.len() > 1 {
+        debug_log!(
+            "[RUST] transport auth: {} Authentication-Results headers present; trusting the \
+             topmost (added by our receiving MTA) and ignoring {} lower, untrusted one(s)",
+            headers.len(),
+            headers.len() - 1
+        );
+    }
+
+    headers.into_iter().next()
 }
 
 /// Parsed authentication results from Authentication-Results header
 #[derive(Debug, Clone)]
 struct AuthResults {
+    authserv_id: Option<String>, // The server that asserted these results
     dmarc: Option<String>,  // "pass", "fail", "none", etc.
     dkim: Option<String>,   // "pass", "fail", "none", etc.
     dkim_domain: Option<String>, // The header.d domain from DKIM
@@ -3803,18 +3824,27 @@ struct AuthResults {
 /// Parse Authentication-Results header value
 fn parse_authentication_results(header_value: &str) -> AuthResults {
     let mut auth_results = AuthResults {
+        authserv_id: None,
         dmarc: None,
         dkim: None,
         dkim_domain: None,
         spf: None,
     };
-    
+
     // Authentication-Results format: authserv-id; method1=result1 reason1; method2=result2 reason2; ...
     // Example: "mail.example.com; dmarc=pass header.from=example.com; dkim=pass header.d=example.com; spf=pass smtp.mailfrom=example.com"
-    
+
     // Split by semicolon to get individual results
     let parts: Vec<&str> = header_value.split(';').collect();
-    
+
+    // The authserv-id is the first field. Record it so the verdict says *who*
+    // asserted the result — without it a "DMARC passed" reason is unattributable.
+    // RFC 8601 allows an optional version number after the id ("example.com 1").
+    auth_results.authserv_id = parts.first()
+        .and_then(|part| part.split_whitespace().next())
+        .map(|id| id.to_lowercase())
+        .filter(|id| !id.is_empty());
+
     for part in parts.iter().skip(1) { // Skip first part (authserv-id)
         let part = part.trim();
         
@@ -3920,8 +3950,10 @@ pub fn verify_transport_authentication(
         }
     };
     
-    // Find the last Authentication-Results header (trusted final MTA)
-    let auth_results_header = match get_last_authentication_results_header(email) {
+    // Take the Authentication-Results header our own receiving MTA prepended.
+    // Anything below it may have been written by the sender — see the doc
+    // comment on get_trusted_authentication_results_header.
+    let auth_results_header = match get_trusted_authentication_results_header(email) {
         Some(header) => header,
         None => {
             return Ok(TransportAuthVerdict {
@@ -3934,22 +3966,28 @@ pub fn verify_transport_authentication(
     
     // Parse Authentication-Results header
     let auth_results = parse_authentication_results(&auth_results_header);
-    
+
+    // Who asserted this verdict. Without attribution a bare "DMARC passed" is
+    // not auditable after the fact.
+    let asserted_by = auth_results.authserv_id
+        .clone()
+        .unwrap_or_else(|| "unknown server".to_string());
+
     // Evaluate in priority order: DMARC > DKIM > SPF
-    
+
     // 1. Check DMARC
     if let Some(ref dmarc_result) = auth_results.dmarc {
         if dmarc_result == "pass" {
             return Ok(TransportAuthVerdict {
                 transport_verified: true,
                 method: TransportAuthMethod::Dmarc,
-                reason: format!("DMARC verification passed for domain {}", from_domain),
+                reason: format!("DMARC verification passed for domain {} (asserted by {})", from_domain, asserted_by),
             });
         } else if dmarc_result == "fail" {
             return Ok(TransportAuthVerdict {
                 transport_verified: false,
                 method: TransportAuthMethod::Dmarc,
-                reason: format!("DMARC verification failed for domain {}", from_domain),
+                reason: format!("DMARC verification failed for domain {} (asserted by {})", from_domain, asserted_by),
             });
         }
     }
@@ -3963,7 +4001,7 @@ pub fn verify_transport_authentication(
                     return Ok(TransportAuthVerdict {
                         transport_verified: true,
                         method: TransportAuthMethod::Dkim,
-                        reason: format!("DKIM verification passed with alignment: header.from={}, header.d={}", from_domain, dkim_domain),
+                        reason: format!("DKIM verification passed with alignment: header.from={}, header.d={} (asserted by {})", from_domain, dkim_domain, asserted_by),
                     });
                 } else {
                     return Ok(TransportAuthVerdict {
@@ -3994,7 +4032,7 @@ pub fn verify_transport_authentication(
             return Ok(TransportAuthVerdict {
                 transport_verified: true,
                 method: TransportAuthMethod::None, // SPF is not a separate method in our enum, use "none"
-                reason: format!("SPF verification passed for domain {}", from_domain),
+                reason: format!("SPF verification passed for domain {} (asserted by {})", from_domain, asserted_by),
             });
         } else if spf_result == "fail" {
             return Ok(TransportAuthVerdict {
@@ -7447,5 +7485,177 @@ mod decode_perf_bench {
             N, warm_us[0], percentile(&warm_us, 0.50), percentile(&warm_us, 0.90),
             percentile(&warm_us, 0.99), sum as f64 / N as f64, (sum as f64 / N as f64) / 1000.0);
         println!("[BENCH] sig block: {} chars, {} words", content.len(), content.split_whitespace().count());
+    }
+}
+
+#[cfg(test)]
+mod transport_auth_tests {
+    use super::*;
+
+    // ---- Transport authentication: Authentication-Results trust boundary ----
+    //
+    // Regression coverage for the forged-verdict bug: the selector used to take
+    // the *bottom* Authentication-Results header. Since MTAs prepend trace
+    // headers, the bottom entry is the oldest — and is exactly where a header
+    // the sender wrote themselves ends up. The genuine verdict from our own
+    // provider sits above it.
+
+    /// Build an RFC 5322 message from header lines plus a From: address.
+    /// Header order is preserved, so index 0 is the topmost header — the
+    /// position our receiving MTA would have prepended into.
+    fn message_with_auth_headers(auth_headers: &[&str], from: &str) -> Vec<u8> {
+        let mut raw = String::new();
+        for header in auth_headers {
+            raw.push_str("Authentication-Results: ");
+            raw.push_str(header);
+            raw.push_str("\r\n");
+        }
+        raw.push_str(&format!("From: {}\r\n", from));
+        raw.push_str("Subject: test\r\n");
+        raw.push_str("\r\n");
+        raw.push_str("body\r\n");
+        raw.into_bytes()
+    }
+
+    #[test]
+    fn test_transport_auth_ignores_forged_pass_below_genuine_fail() {
+        // The attack: our provider says the message failed DMARC, and the
+        // sender embedded their own "pass" in the message they composed.
+        // The forged header lands underneath the genuine one.
+        let raw = message_with_auth_headers(
+            &[
+                "mx.google.com; dmarc=fail header.from=bank.example",
+                "attacker.invalid; dmarc=pass header.from=bank.example",
+            ],
+            "\"Bank\" <security@bank.example>",
+        );
+
+        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
+
+        assert!(!verdict.transport_verified,
+            "a sender-supplied dmarc=pass below our provider's dmarc=fail must not verify; got: {}",
+            verdict.reason);
+        assert!(verdict.reason.contains("mx.google.com"),
+            "the verdict must be attributed to our provider, not the forged header; got: {}",
+            verdict.reason);
+    }
+
+    #[test]
+    fn test_transport_auth_ignores_forged_pass_when_provider_reports_none() {
+        // Weaker but likelier variant: our provider publishes no usable verdict
+        // (dmarc=none, no DKIM/SPF), and the sender supplies a pass below it.
+        let raw = message_with_auth_headers(
+            &[
+                "mx.google.com; dmarc=none",
+                "attacker.invalid; dmarc=pass header.from=bank.example",
+            ],
+            "\"Bank\" <security@bank.example>",
+        );
+
+        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
+
+        assert!(!verdict.transport_verified,
+            "dmarc=none from our provider must not be upgraded by a lower forged header; got: {}",
+            verdict.reason);
+    }
+
+    #[test]
+    fn test_transport_auth_accepts_genuine_topmost_dmarc_pass() {
+        // The fix must not break the legitimate case.
+        let raw = message_with_auth_headers(
+            &["mx.google.com; dmarc=pass header.from=bank.example"],
+            "\"Bank\" <security@bank.example>",
+        );
+
+        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
+
+        assert!(verdict.transport_verified,
+            "a genuine dmarc=pass from our provider must verify; got: {}", verdict.reason);
+        assert!(matches!(verdict.method, TransportAuthMethod::Dmarc));
+        assert!(verdict.reason.contains("mx.google.com"),
+            "verdict should name the asserting server; got: {}", verdict.reason);
+    }
+
+    #[test]
+    fn test_transport_auth_multi_hop_forward_uses_our_provider_verdict() {
+        // Legitimate forwarded mail carries several genuine headers from
+        // successive hops. Ours is still the topmost one.
+        let raw = message_with_auth_headers(
+            &[
+                "mx.google.com; dmarc=pass header.from=list.example",
+                "mx.forwarder.example; dmarc=fail header.from=list.example",
+            ],
+            "\"List\" <news@list.example>",
+        );
+
+        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
+
+        assert!(verdict.transport_verified,
+            "an older hop's fail must not override our provider's pass; got: {}", verdict.reason);
+    }
+
+    #[test]
+    fn test_transport_auth_dkim_requires_alignment() {
+        // dkim=pass only counts when header.d aligns with the From: domain,
+        // otherwise anyone with a valid signature on their own domain could
+        // sign mail claiming to be from someone else.
+        let raw = message_with_auth_headers(
+            &["mx.google.com; dkim=pass header.d=attacker.example"],
+            "\"Bank\" <security@bank.example>",
+        );
+
+        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
+
+        assert!(!verdict.transport_verified,
+            "dkim=pass with a non-aligned header.d must not verify; got: {}", verdict.reason);
+    }
+
+    #[test]
+    fn test_transport_auth_dkim_aligned_pass_verifies() {
+        let raw = message_with_auth_headers(
+            &["mx.google.com; dkim=pass header.d=bank.example"],
+            "\"Bank\" <security@bank.example>",
+        );
+
+        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
+
+        assert!(verdict.transport_verified,
+            "aligned dkim=pass should verify; got: {}", verdict.reason);
+        assert!(matches!(verdict.method, TransportAuthMethod::Dkim));
+    }
+
+    #[test]
+    fn test_transport_auth_no_header_is_unverified() {
+        let raw = b"From: \"Bank\" <security@bank.example>\r\nSubject: test\r\n\r\nbody\r\n";
+
+        let verdict = verify_transport_authentication(Some(raw), None).unwrap();
+
+        assert!(!verdict.transport_verified,
+            "absence of any Authentication-Results must not verify; got: {}", verdict.reason);
+    }
+
+    #[test]
+    fn test_trusted_header_selector_takes_topmost() {
+        // Direct unit test of the selector, independent of verdict logic.
+        let raw = message_with_auth_headers(
+            &["first.example; dmarc=pass", "second.example; dmarc=pass"],
+            "a@b.example",
+        );
+        let parsed = parse_mail(&raw).unwrap();
+
+        let selected = get_trusted_authentication_results_header(&parsed).unwrap();
+
+        assert!(selected.contains("first.example"),
+            "selector must return the topmost header; got: {}", selected);
+    }
+
+    #[test]
+    fn test_parse_authentication_results_extracts_authserv_id() {
+        let results = parse_authentication_results("mx.google.com; dmarc=pass header.from=example.com");
+        assert_eq!(results.authserv_id.as_deref(), Some("mx.google.com"));
+
+        // RFC 8601 permits a version number after the authserv-id.
+        let versioned = parse_authentication_results("example.com 1; dmarc=pass");
+        assert_eq!(versioned.authserv_id.as_deref(), Some("example.com"));
     }
 }

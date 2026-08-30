@@ -4034,6 +4034,59 @@ pub fn verify_transport_authentication(
         }
     };
     
+    // Before falling back to reading anyone's verdict, try to verify DKIM
+    // ourselves. A signature we checked is evidence; an Authentication-Results
+    // header is a claim, which is why the code below has to establish that a
+    // trusted provider stamped it.
+    //
+    // This deliberately sits *ahead* of the authserv-id gate rather than behind
+    // it. The gate fails closed when we cannot recognise the user's provider,
+    // which is right for a header we have to take on trust, but a signature we
+    // verified against the signing domain's own published key does not depend
+    // on trusting any hop — so it can legitimately answer where the gate
+    // abstains. It only ever grants trust on PassAligned: verified signature,
+    // and `d=` speaks for the From: domain.
+    //
+    // Two of the five verdicts are inconclusive. NoSignature and Unavailable
+    // mean we learned nothing — a sender who does not sign, or a device with no
+    // DNS — so those fall through to the header path rather than rejecting mail
+    // we merely could not check.
+    if let Some(bytes) = raw_bytes {
+        match crate::dkim::verify_dkim(bytes, &from_domain) {
+            crate::dkim::DkimVerdict::PassAligned { domain } => {
+                return Ok(TransportAuthVerdict {
+                    transport_verified: true,
+                    method: TransportAuthMethod::Dkim,
+                    reason: format!("DKIM signature verified locally for domain {domain}"),
+                });
+            }
+            crate::dkim::DkimVerdict::PassNotAligned { signed_by, from_domain } => {
+                return Ok(TransportAuthVerdict {
+                    transport_verified: false,
+                    method: TransportAuthMethod::Dkim,
+                    reason: format!(
+                        "DKIM signature verified but was made by {signed_by}, which does not \
+                         speak for the From: domain {from_domain}"
+                    ),
+                });
+            }
+            crate::dkim::DkimVerdict::Fail { reason } => {
+                return Ok(TransportAuthVerdict {
+                    transport_verified: false,
+                    method: TransportAuthMethod::Dkim,
+                    reason: format!("DKIM verification failed locally: {reason}"),
+                });
+            }
+            verdict @ (crate::dkim::DkimVerdict::NoSignature
+            | crate::dkim::DkimVerdict::Unavailable { .. }) => {
+                debug_log!(
+                    "[RUST] transport auth: local DKIM inconclusive ({verdict:?}); \
+                     falling back to Authentication-Results"
+                );
+            }
+        }
+    }
+
     // Select the top-most Authentication-Results header stamped by a trusted
     // authserv-id (our own receiving provider). A sender-injected A-R sits below
     // the provider's and is ignored; if no trusted header exists we do not fall

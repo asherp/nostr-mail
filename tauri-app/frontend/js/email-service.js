@@ -9515,18 +9515,13 @@ ${attachmentsHtml}
             // Always re-render all drafts (simpler approach)
             draftsList.innerHTML = '';
 
-            // Check if we should hide unverified messages
             const settings = appState.getSettings();
-            const hideUnverified = settings && settings.hide_unsigned_messages === true;
 
-            // Process drafts in parallel with timeout protection
+            // Drafts are authored by the current user and are not signed until they
+            // are sent — the hide_unsigned_messages setting protects against
+            // unverified inbound senders and does not apply here. Always show your
+            // own drafts (mirrors the sent-mail rendering path).
             const draftPromises = drafts
-                .filter(draft => {
-                    if (hideUnverified && draft.signature_valid !== true) {
-                        return false;
-                    }
-                    return true;
-                })
                 .map(async (draft) => {
                     try {
                         const timeoutPromise = new Promise((_, reject) =>
@@ -9555,8 +9550,6 @@ ${attachmentsHtml}
                 const hideUndecryptable = settings && settings.hide_undecryptable_emails === true;
                 if (hideUndecryptable && drafts.length > 0) {
                     draftsList.innerHTML = '<div class="text-center text-muted">No decryptable drafts found. All drafts are encrypted for a different keypair.</div>';
-                } else if (hideUnverified && drafts.length > 0) {
-                    draftsList.innerHTML = '<div class="text-center text-muted">No verified drafts found. All drafts have missing or invalid signatures.</div>';
                 } else {
                     draftsList.innerHTML = '<div class="text-center text-muted">No drafts found</div>';
                 }

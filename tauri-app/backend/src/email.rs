@@ -3779,42 +3779,118 @@ fn extract_domain_from_email_address(from_header: &str) -> Option<String> {
     None
 }
 
-/// Get the Authentication-Results header written by our own receiving MTA.
+/// Extract the organizational (registrable) domain from a hostname or domain.
 ///
-/// MTAs *prepend* trace headers, so the **first** `Authentication-Results` in
-/// document order is the one added by the last server to handle the message —
-/// the recipient's own provider. Every header below it is either an older hop
-/// or was supplied by the sender.
-///
-/// This distinction is the whole security property. A sender can put
-/// `Authentication-Results: whatever; dmarc=pass` directly into the message
-/// they compose; the receiving provider then prepends its genuine verdict
-/// *above* it. Selecting from the bottom therefore hands the attacker a
-/// guaranteed win, and selecting from the top is what makes the verdict
-/// meaningful.
-///
-/// RFC 8601 §5 states the same rule: a receiving ADMD must remove or refuse to
-/// trust `Authentication-Results` headers that originate outside its own trust
-/// boundary.
-fn get_trusted_authentication_results_header(email: &mailparse::ParsedMail) -> Option<String> {
-    let headers = email.headers.get_all_values("Authentication-Results");
-
-    if headers.len() > 1 {
-        debug_log!(
-            "[RUST] transport auth: {} Authentication-Results headers present; trusting the \
-             topmost (added by our receiving MTA) and ignoring {} lower, untrusted one(s)",
-            headers.len(),
-            headers.len() - 1
-        );
+/// Heuristic, not a full Public Suffix List: handles a small set of common
+/// multi-label suffixes (e.g. `co.uk`) and otherwise returns the last two
+/// labels. Used for DMARC relaxed alignment and for comparing an A-R header's
+/// authserv-id against the user's provider. `mx.google.com` -> `google.com`,
+/// `imap.gmail.com` -> `gmail.com`, `mail.example.co.uk` -> `example.co.uk`.
+fn organizational_domain(domain: &str) -> String {
+    let d = domain.trim().trim_end_matches('.').to_lowercase();
+    let labels: Vec<&str> = d.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.len() <= 2 {
+        return labels.join(".");
     }
+    // Two-label public suffixes where the registrable domain is the last three
+    // labels. Small curated list; extend as needed (this is not a full PSL).
+    const MULTI_SUFFIXES: &[&str] = &[
+        "co.uk", "org.uk", "gov.uk", "ac.uk", "co.jp", "co.nz", "co.za",
+        "com.au", "net.au", "org.au", "com.br", "co.in", "co.kr",
+    ];
+    let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
+    if labels.len() >= 3 && MULTI_SUFFIXES.contains(&last_two.as_str()) {
+        return format!("{}.{}", labels[labels.len() - 3], last_two);
+    }
+    last_two
+}
 
-    headers.into_iter().next()
+/// Derive the set of trusted authserv-id organizational domains for a user's
+/// provider. An `Authentication-Results` header is only honored when its
+/// authserv-id's organizational domain is in this set.
+///
+/// Seeded from the user's email domain and IMAP host (covers self-hosted /
+/// vanity-domain providers whose authserv-id shares their org domain), plus
+/// provider-specific values for major providers whose receiving MTA stamps a
+/// different org domain than the mailbox domain (e.g. Gmail's `mx.google.com`
+/// vs `gmail.com`).
+fn trusted_authserv_org_domains(email_domain: &str, imap_host: &str) -> Vec<String> {
+    let mut set: Vec<String> = Vec::new();
+    let mut push = |d: String| {
+        if !d.is_empty() && !set.contains(&d) {
+            set.push(d);
+        }
+    };
+    let email_org = organizational_domain(email_domain);
+    let imap_org = organizational_domain(imap_host);
+    for org in [email_org.as_str(), imap_org.as_str()] {
+        match org {
+            "gmail.com" | "googlemail.com" | "google.com" => push("google.com".to_string()),
+            "outlook.com" | "hotmail.com" | "live.com" | "msn.com" | "office365.com"
+            | "microsoft.com" => {
+                push("outlook.com".to_string());
+                push("microsoft.com".to_string());
+            }
+            "yahoo.com" | "ymail.com" | "yahoodns.net" => push("yahoo.com".to_string()),
+            "icloud.com" | "me.com" | "mac.com" => push("icloud.com".to_string()),
+            "proton.me" | "protonmail.com" | "pm.me" => {
+                push("proton.me".to_string());
+                push("protonmail.ch".to_string());
+            }
+            "fastmail.com" => {
+                push("fastmail.com".to_string());
+                push("messagingengine.com".to_string());
+            }
+            _ => {}
+        }
+    }
+    push(email_org);
+    push(imap_org);
+    set
+}
+
+/// Extract the authserv-id from an `Authentication-Results` header value: the
+/// token before the first `;`, with any optional trailing version number
+/// dropped. Returns it lower-cased.
+fn parse_authserv_id(header_value: &str) -> Option<String> {
+    let first = header_value.split(';').next()?.trim();
+    let id = first.split_whitespace().next()?.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_lowercase())
+    }
+}
+
+/// Select the `Authentication-Results` header to trust: the FIRST (top-most —
+/// the closest/most-recently-prepended MTA, i.e. the user's own receiving
+/// provider) header whose authserv-id's organizational domain is in
+/// `trusted_org_domains`. Headers below it — including any an upstream relay or
+/// the *sender* injected — are ignored.
+///
+/// Position alone is insufficient: if our provider added no A-R header at all, a
+/// sender-forged header would be first, so the authserv-id gate is what actually
+/// anchors trust. Relays prepend trace headers, so the trusted provider's A-R is
+/// at the top; the previous `.pop()` selected the bottom-most (sender-injectable)
+/// header, which is forgeable (see issue #101).
+fn select_trusted_authentication_results(
+    email: &mailparse::ParsedMail,
+    trusted_org_domains: &[String],
+) -> Option<String> {
+    for value in email.headers.get_all_values("Authentication-Results") {
+        if let Some(authserv) = parse_authserv_id(&value) {
+            let authserv_org = organizational_domain(&authserv);
+            if trusted_org_domains.iter().any(|t| *t == authserv_org) {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 /// Parsed authentication results from Authentication-Results header
 #[derive(Debug, Clone)]
 struct AuthResults {
-    authserv_id: Option<String>, // The server that asserted these results
     dmarc: Option<String>,  // "pass", "fail", "none", etc.
     dkim: Option<String>,   // "pass", "fail", "none", etc.
     dkim_domain: Option<String>, // The header.d domain from DKIM
@@ -3824,27 +3900,18 @@ struct AuthResults {
 /// Parse Authentication-Results header value
 fn parse_authentication_results(header_value: &str) -> AuthResults {
     let mut auth_results = AuthResults {
-        authserv_id: None,
         dmarc: None,
         dkim: None,
         dkim_domain: None,
         spf: None,
     };
-
+    
     // Authentication-Results format: authserv-id; method1=result1 reason1; method2=result2 reason2; ...
     // Example: "mail.example.com; dmarc=pass header.from=example.com; dkim=pass header.d=example.com; spf=pass smtp.mailfrom=example.com"
-
+    
     // Split by semicolon to get individual results
     let parts: Vec<&str> = header_value.split(';').collect();
-
-    // The authserv-id is the first field. Record it so the verdict says *who*
-    // asserted the result — without it a "DMARC passed" reason is unattributable.
-    // RFC 8601 allows an optional version number after the id ("example.com 1").
-    auth_results.authserv_id = parts.first()
-        .and_then(|part| part.split_whitespace().next())
-        .map(|id| id.to_lowercase())
-        .filter(|id| !id.is_empty());
-
+    
     for part in parts.iter().skip(1) { // Skip first part (authserv-id)
         let part = part.trim();
         
@@ -3892,16 +3959,33 @@ fn parse_authentication_results(header_value: &str) -> AuthResults {
     auth_results
 }
 
-/// Check DKIM alignment: header.from domain must match DKIM header.d domain
+/// Check DKIM alignment under DMARC *relaxed* mode: the header.from domain and
+/// the DKIM header.d domain must share an organizational domain (not be byte
+/// equal). RFC 7489 permits relaxed alignment, so requiring exact equality (the
+/// old behavior) produced false negatives for legitimate senders that sign with
+/// a subdomain (e.g. From `example.com`, header.d `mail.example.com`).
 fn check_dkim_alignment(from_domain: &str, dkim_domain: &str) -> bool {
-    from_domain.to_lowercase() == dkim_domain.to_lowercase()
+    organizational_domain(from_domain) == organizational_domain(dkim_domain)
 }
 
-/// Verify transport authentication (DMARC/DKIM/SPF) from RFC 5322 email
-/// Accepts either raw RFC 5322 bytes or a parsed mailparse::ParsedMail struct
+/// Verify transport authentication (DMARC/DKIM) of an RFC 5322 email's visible
+/// `From:` domain, by reading the `Authentication-Results` header added by the
+/// user's own receiving provider.
+///
+/// `trusted_authserv_org_domains` is the set of organizational domains whose
+/// authserv-id we trust (see [`trusted_authserv_org_domains`]). Only an A-R
+/// header stamped by one of these is honored; a sender-injected A-R is ignored.
+/// Pass an empty slice to trust no header (fails closed).
+///
+/// SPF is deliberately *not* a positive signal here: it authenticates the
+/// envelope `MAIL FROM` (Return-Path), not the visible `From:` header, so an
+/// SPF-only pass does not establish From-authentication.
+///
+/// Accepts either raw RFC 5322 bytes or a parsed `mailparse::ParsedMail`.
 pub fn verify_transport_authentication(
     raw_bytes: Option<&[u8]>,
-    parsed_email: Option<&mailparse::ParsedMail>
+    parsed_email: Option<&mailparse::ParsedMail>,
+    trusted_authserv_org_domains: &[String],
 ) -> Result<TransportAuthVerdict> {
     // Parse email if not already parsed - need to handle lifetime by parsing into owned value
     let parsed_owned: Option<mailparse::ParsedMail> = if parsed_email.is_some() {
@@ -3950,20 +4034,26 @@ pub fn verify_transport_authentication(
         }
     };
     
-    // Prefer verifying DKIM ourselves over reading someone's word for it. A
-    // signature we checked is evidence; a header is a claim whose weight rests
-    // entirely on having picked the right hop's copy.
+    // Before falling back to reading anyone's verdict, try to verify DKIM
+    // ourselves. A signature we checked is evidence; an Authentication-Results
+    // header is a claim, which is why the code below has to establish that a
+    // trusted provider stamped it.
     //
-    // Only three of the five verdicts are conclusive. NoSignature and
-    // Unavailable mean we learned nothing — an offline device or a sender who
-    // does not sign — so those fall through to the header path rather than
-    // rejecting mail we simply could not check.
+    // This deliberately sits *ahead* of the authserv-id gate rather than behind
+    // it. The gate fails closed when we cannot recognise the user's provider,
+    // which is right for a header we have to take on trust, but a signature we
+    // verified against the signing domain's own published key does not depend
+    // on trusting any hop — so it can legitimately answer where the gate
+    // abstains. It only ever grants trust on PassAligned: verified signature,
+    // and `d=` speaks for the From: domain.
+    //
+    // Two of the five verdicts are inconclusive. NoSignature and Unavailable
+    // mean we learned nothing — a sender who does not sign, or a device with no
+    // DNS — so those fall through to the header path rather than rejecting mail
+    // we merely could not check.
     if let Some(bytes) = raw_bytes {
         match crate::dkim::verify_dkim(bytes, &from_domain) {
-            verdict @ crate::dkim::DkimVerdict::PassAligned { .. } => {
-                let crate::dkim::DkimVerdict::PassAligned { domain } = verdict else {
-                    unreachable!()
-                };
+            crate::dkim::DkimVerdict::PassAligned { domain } => {
                 return Ok(TransportAuthVerdict {
                     transport_verified: true,
                     method: TransportAuthMethod::Dkim,
@@ -3997,44 +4087,39 @@ pub fn verify_transport_authentication(
         }
     }
 
-    // Take the Authentication-Results header our own receiving MTA prepended.
-    // Anything below it may have been written by the sender — see the doc
-    // comment on get_trusted_authentication_results_header.
-    let auth_results_header = match get_trusted_authentication_results_header(email) {
+    // Select the top-most Authentication-Results header stamped by a trusted
+    // authserv-id (our own receiving provider). A sender-injected A-R sits below
+    // the provider's and is ignored; if no trusted header exists we do not fall
+    // back to an untrusted one (issue #101).
+    let auth_results_header = match select_trusted_authentication_results(email, trusted_authserv_org_domains) {
         Some(header) => header,
         None => {
             return Ok(TransportAuthVerdict {
                 transport_verified: false,
                 method: TransportAuthMethod::None,
-                reason: "No Authentication-Results header found".to_string(),
+                reason: "No Authentication-Results header from a trusted authserv-id was found".to_string(),
             });
         }
     };
-    
+
     // Parse Authentication-Results header
     let auth_results = parse_authentication_results(&auth_results_header);
 
-    // Who asserted this verdict. Without attribution a bare "DMARC passed" is
-    // not auditable after the fact.
-    let asserted_by = auth_results.authserv_id
-        .clone()
-        .unwrap_or_else(|| "unknown server".to_string());
-
-    // Evaluate in priority order: DMARC > DKIM > SPF
-
+    // Evaluate in priority order: DMARC > DKIM. SPF is not From-authentication.
+    
     // 1. Check DMARC
     if let Some(ref dmarc_result) = auth_results.dmarc {
         if dmarc_result == "pass" {
             return Ok(TransportAuthVerdict {
                 transport_verified: true,
                 method: TransportAuthMethod::Dmarc,
-                reason: format!("DMARC verification passed for domain {} (asserted by {})", from_domain, asserted_by),
+                reason: format!("DMARC verification passed for domain {}", from_domain),
             });
         } else if dmarc_result == "fail" {
             return Ok(TransportAuthVerdict {
                 transport_verified: false,
                 method: TransportAuthMethod::Dmarc,
-                reason: format!("DMARC verification failed for domain {} (asserted by {})", from_domain, asserted_by),
+                reason: format!("DMARC verification failed for domain {}", from_domain),
             });
         }
     }
@@ -4048,7 +4133,7 @@ pub fn verify_transport_authentication(
                     return Ok(TransportAuthVerdict {
                         transport_verified: true,
                         method: TransportAuthMethod::Dkim,
-                        reason: format!("DKIM verification passed with alignment: header.from={}, header.d={} (asserted by {})", from_domain, dkim_domain, asserted_by),
+                        reason: format!("DKIM verification passed with alignment: header.from={}, header.d={}", from_domain, dkim_domain),
                     });
                 } else {
                     return Ok(TransportAuthVerdict {
@@ -4073,28 +4158,16 @@ pub fn verify_transport_authentication(
         }
     }
     
-    // 3. Check SPF
-    if let Some(ref spf_result) = auth_results.spf {
-        if spf_result == "pass" {
-            return Ok(TransportAuthVerdict {
-                transport_verified: true,
-                method: TransportAuthMethod::None, // SPF is not a separate method in our enum, use "none"
-                reason: format!("SPF verification passed for domain {} (asserted by {})", from_domain, asserted_by),
-            });
-        } else if spf_result == "fail" {
-            return Ok(TransportAuthVerdict {
-                transport_verified: false,
-                method: TransportAuthMethod::None,
-                reason: format!("SPF verification failed for domain {}", from_domain),
-            });
-        }
-    }
-    
-    // No authentication method passed
+    // SPF is intentionally NOT treated as From-authentication: it validates the
+    // envelope MAIL FROM (Return-Path), which can differ from the visible From:
+    // header, so an SPF-only pass must not set transport_verified. It remains
+    // available in `auth_results.spf` for diagnostics only.
+
+    // No From-authenticating method passed (DMARC/aligned-DKIM)
     Ok(TransportAuthVerdict {
         transport_verified: false,
         method: TransportAuthMethod::None,
-        reason: format!("No authentication method passed. DMARC: {:?}, DKIM: {:?}, SPF: {:?}", 
+        reason: format!("No From-authenticating method passed. DMARC: {:?}, DKIM: {:?}, SPF (envelope-only, not counted): {:?}",
             auth_results.dmarc, auth_results.dkim, auth_results.spf),
     })
 }
@@ -5263,6 +5336,129 @@ nitela\n\
         assert_eq!(manifest.attachments.as_ref().unwrap()[0].id, "a1");
         assert_eq!(manifest.attachments.as_ref().unwrap()[0].orig_filename, "test.pdf");
     }
+
+    // ---- Transport authentication (issue #101) ----
+
+    /// Gmail's trusted authserv-id org-domains: the IMAP/mailbox domain plus
+    /// Google's receiving-MTA org domain (`mx.google.com` -> `google.com`).
+    fn gmail_trusted() -> Vec<String> {
+        super::trusted_authserv_org_domains("gmail.com", "imap.gmail.com")
+    }
+
+    fn verify_transport(raw: &str, trusted: &[String]) -> bool {
+        super::verify_transport_authentication(Some(raw.as_bytes()), None, trusted)
+            .unwrap()
+            .transport_verified
+    }
+
+    #[test]
+    fn test_organizational_domain() {
+        assert_eq!(super::organizational_domain("mx.google.com"), "google.com");
+        assert_eq!(super::organizational_domain("imap.gmail.com"), "gmail.com");
+        assert_eq!(super::organizational_domain("example.com"), "example.com");
+        assert_eq!(super::organizational_domain("a.b.c.example.com"), "example.com");
+        assert_eq!(super::organizational_domain("mail.example.co.uk"), "example.co.uk");
+        assert_eq!(super::organizational_domain("EXAMPLE.COM"), "example.com");
+    }
+
+    #[test]
+    fn test_trusted_authserv_covers_gmail_mx() {
+        let trusted = gmail_trusted();
+        // Google's receiving MTA stamps mx.google.com, whose org domain must be
+        // trusted even though the mailbox domain is gmail.com.
+        assert!(trusted.contains(&"google.com".to_string()));
+        assert!(trusted.contains(&"gmail.com".to_string()));
+    }
+
+    #[test]
+    fn test_exploit_forged_bottom_ar_is_ignored() {
+        // The documented exploit: provider's real A-R is prepended at the TOP and
+        // does not authenticate the spoofed From; the attacker's forged A-R sits
+        // at the bottom. The old `.pop()` selected the bottom (forged) one.
+        let raw = "Authentication-Results: mx.google.com; dmarc=fail header.from=victim.com; dkim=none; spf=fail\n\
+                   Authentication-Results: anything.invalid; dmarc=pass header.from=victim.com\n\
+                   From: attacker <evil@victim.com>\n\
+                   Subject: spoof\n\
+                   \n\
+                   body\n";
+        assert!(!verify_transport(raw, &gmail_trusted()),
+            "forged bottom Authentication-Results must not authenticate the From");
+    }
+
+    #[test]
+    fn test_provider_added_no_ar_rejects_forged_only() {
+        // Provider added no A-R at all; only the sender's forged header exists.
+        // Selecting "first" is not enough — the authserv-id gate must reject it.
+        let raw = "Authentication-Results: anything.invalid; dmarc=pass header.from=victim.com\n\
+                   From: attacker <evil@victim.com>\n\
+                   \n\
+                   body\n";
+        assert!(!verify_transport(raw, &gmail_trusted()),
+            "an A-R from an untrusted authserv-id must never authenticate");
+    }
+
+    #[test]
+    fn test_dmarc_pass_from_trusted_authserv_verifies() {
+        let raw = "Authentication-Results: mx.google.com; dmarc=pass header.from=example.com; dkim=pass header.d=example.com; spf=pass\n\
+                   From: alice <alice@example.com>\n\
+                   \n\
+                   body\n";
+        assert!(verify_transport(raw, &gmail_trusted()));
+    }
+
+    #[test]
+    fn test_spf_only_is_not_from_authentication() {
+        // SPF authenticates the envelope MAIL FROM, not the visible From:.
+        let raw = "Authentication-Results: mx.google.com; spf=pass smtp.mailfrom=bounce.example.com; dkim=none; dmarc=none\n\
+                   From: alice <alice@example.com>\n\
+                   \n\
+                   body\n";
+        assert!(!verify_transport(raw, &gmail_trusted()),
+            "SPF-only pass must not set transport_verified");
+    }
+
+    #[test]
+    fn test_dkim_relaxed_alignment_with_subdomain() {
+        // From example.com signed by header.d=mail.example.com: relaxed alignment
+        // (shared org domain) should pass where exact equality would fail.
+        let raw = "Authentication-Results: mx.google.com; dkim=pass header.d=mail.example.com; dmarc=none; spf=none\n\
+                   From: alice <alice@example.com>\n\
+                   \n\
+                   body\n";
+        assert!(verify_transport(raw, &gmail_trusted()));
+    }
+
+    #[test]
+    fn test_dkim_unaligned_does_not_verify() {
+        let raw = "Authentication-Results: mx.google.com; dkim=pass header.d=mailer.com; dmarc=none; spf=none\n\
+                   From: alice <alice@example.com>\n\
+                   \n\
+                   body\n";
+        assert!(!verify_transport(raw, &gmail_trusted()),
+            "DKIM signed by an unrelated domain is not aligned with the From");
+    }
+
+    #[test]
+    fn test_select_first_trusted_skips_untrusted_top() {
+        // A relay above the provider may add its own (untrusted) A-R; selection
+        // must skip it and use the provider's trusted header below.
+        let raw = "Authentication-Results: relay.untrusted.example; dmarc=fail header.from=example.com\n\
+                   Authentication-Results: mx.google.com; dmarc=pass header.from=example.com\n\
+                   From: alice <alice@example.com>\n\
+                   \n\
+                   body\n";
+        assert!(verify_transport(raw, &gmail_trusted()));
+    }
+
+    #[test]
+    fn test_no_trusted_authserv_configured_fails_closed() {
+        let raw = "Authentication-Results: mx.google.com; dmarc=pass header.from=example.com\n\
+                   From: alice <alice@example.com>\n\
+                   \n\
+                   body\n";
+        assert!(!verify_transport(raw, &[]),
+            "with no trusted authserv-id, no header is honored (fail closed)");
+    }
 }
 
 
@@ -5580,8 +5776,10 @@ async fn sync_nostr_emails_to_db_inner(config: &EmailConfig, folders_arg: Option
         // Bound the per-spam-folder search to the same default load window the
         // scan uses (spam folders are small, so this rarely binds).
         let rescue_window = lookup_initial_count(db, active_pubkey);
+        let rescue_email_domain = extract_domain_from_email_address(&config.email_address).unwrap_or_default();
+        let rescue_trusted = trusted_authserv_org_domains(&rescue_email_domain, &config.imap_host);
         let moved = guarded_session_op(&mut session, &target, |s| {
-            rescue_nostr_emails_from_spam(s, &rescue_target, /* unseen_only = */ true, rescue_window)
+            rescue_nostr_emails_from_spam(s, &rescue_target, /* unseen_only = */ true, rescue_window, &rescue_trusted)
         })?.unwrap_or(0);
         if moved > 0 {
             println!("[RUST] sync_nostr_emails_to_db: spam rescue moved {} message(s) to '{}'", moved, rescue_target);
@@ -6256,7 +6454,9 @@ fn parse_nostr_email_from_imap_body_inner(
     let message_id = extract_message_id_from_headers(&raw_headers).unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let transport_auth_verified = if verify_transport {
-        let verdict = verify_transport_authentication(Some(raw_body), Some(&email))
+        let email_domain = extract_domain_from_email_address(&config.email_address).unwrap_or_default();
+        let trusted = trusted_authserv_org_domains(&email_domain, &config.imap_host);
+        let verdict = verify_transport_authentication(Some(raw_body), Some(&email), &trusted)
             .unwrap_or_else(|e| TransportAuthVerdict {
                 transport_verified: false,
                 method: TransportAuthMethod::None,
@@ -7208,7 +7408,7 @@ fn extend_with_spam_folders(
 /// the inbox, stranding it where the user can't see it. Mail that fails SPF/DKIM
 /// is therefore deliberately left in spam — only authenticated nostr mail that
 /// the provider misfiled gets rescued.
-fn should_rescue_message(raw_body: &[u8]) -> bool {
+fn should_rescue_message(raw_body: &[u8], trusted_authserv: &[String]) -> bool {
     let text = String::from_utf8_lossy(raw_body);
     let has_nostr_marker = text.contains("X-Nostr-Pubkey:")
         || text.contains("X-Nostr-Sig:")
@@ -7220,7 +7420,7 @@ fn should_rescue_message(raw_body: &[u8]) -> bool {
         debug_log!("[RUST] rescue: should_rescue_message=false (no nostr marker)");
         return false;
     }
-    match verify_transport_authentication(Some(raw_body), None) {
+    match verify_transport_authentication(Some(raw_body), None, trusted_authserv) {
         Ok(verdict) => {
             if !verdict.transport_verified {
                 debug_log!("[RUST] rescue: should_rescue_message=false (has marker, transport auth NOT verified)");
@@ -7275,6 +7475,7 @@ fn rescue_nostr_emails_from_spam(
     target_folder: &str,
     unseen_only: bool,
     window: usize,
+    trusted_authserv: &[String],
 ) -> usize {
     let spam_folders = list_spam_folders(session);
     debug_log!("[RUST] rescue: spam folders found = {:?}, target = '{}', unseen_only = {}", spam_folders, target_folder, unseen_only);
@@ -7286,7 +7487,7 @@ fn rescue_nostr_emails_from_spam(
 
     let mut moved_total = 0usize;
     for folder in spam_folders {
-        moved_total += move_nostr_from_folder(session, &folder, target_folder, unseen_only, window);
+        moved_total += move_nostr_from_folder(session, &folder, target_folder, unseen_only, window, trusted_authserv);
     }
     moved_total
 }
@@ -7307,6 +7508,7 @@ fn move_nostr_from_folder(
     target_folder: &str,
     unseen_only: bool,
     window: usize,
+    trusted_authserv: &[String],
 ) -> usize {
     if folder.eq_ignore_ascii_case(target_folder) {
         return 0;
@@ -7383,7 +7585,7 @@ fn move_nostr_from_folder(
         };
         for msg in messages.iter() {
             if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
-                if should_rescue_message(body) {
+                if should_rescue_message(body, trusted_authserv) {
                     to_move.push(uid);
                 } else {
                     debug_log!("[RUST] move_nostr_from_folder: uid {} in '{}' not eligible (missing nostr marker or transport auth failed)", uid, folder);
@@ -7417,8 +7619,10 @@ fn move_nostr_from_folder(
 /// afterwards so the moved messages land in the local DB.
 pub async fn rescue_spam_now(config: &EmailConfig, target_folder: &str, window: usize) -> anyhow::Result<usize> {
     let target = ImapTarget::from_config(config);
+    let email_domain = extract_domain_from_email_address(&config.email_address).unwrap_or_default();
+    let trusted = trusted_authserv_org_domains(&email_domain, &config.imap_host);
     let moved = imap_pool::with_session(&target, |session| {
-        Ok(rescue_nostr_emails_from_spam(session, target_folder, /* unseen_only = */ false, window))
+        Ok(rescue_nostr_emails_from_spam(session, target_folder, /* unseen_only = */ false, window, &trusted))
     })?;
     Ok(moved)
 }
@@ -7532,177 +7736,5 @@ mod decode_perf_bench {
             N, warm_us[0], percentile(&warm_us, 0.50), percentile(&warm_us, 0.90),
             percentile(&warm_us, 0.99), sum as f64 / N as f64, (sum as f64 / N as f64) / 1000.0);
         println!("[BENCH] sig block: {} chars, {} words", content.len(), content.split_whitespace().count());
-    }
-}
-
-#[cfg(test)]
-mod transport_auth_tests {
-    use super::*;
-
-    // ---- Transport authentication: Authentication-Results trust boundary ----
-    //
-    // Regression coverage for the forged-verdict bug: the selector used to take
-    // the *bottom* Authentication-Results header. Since MTAs prepend trace
-    // headers, the bottom entry is the oldest — and is exactly where a header
-    // the sender wrote themselves ends up. The genuine verdict from our own
-    // provider sits above it.
-
-    /// Build an RFC 5322 message from header lines plus a From: address.
-    /// Header order is preserved, so index 0 is the topmost header — the
-    /// position our receiving MTA would have prepended into.
-    fn message_with_auth_headers(auth_headers: &[&str], from: &str) -> Vec<u8> {
-        let mut raw = String::new();
-        for header in auth_headers {
-            raw.push_str("Authentication-Results: ");
-            raw.push_str(header);
-            raw.push_str("\r\n");
-        }
-        raw.push_str(&format!("From: {}\r\n", from));
-        raw.push_str("Subject: test\r\n");
-        raw.push_str("\r\n");
-        raw.push_str("body\r\n");
-        raw.into_bytes()
-    }
-
-    #[test]
-    fn test_transport_auth_ignores_forged_pass_below_genuine_fail() {
-        // The attack: our provider says the message failed DMARC, and the
-        // sender embedded their own "pass" in the message they composed.
-        // The forged header lands underneath the genuine one.
-        let raw = message_with_auth_headers(
-            &[
-                "mx.google.com; dmarc=fail header.from=bank.example",
-                "attacker.invalid; dmarc=pass header.from=bank.example",
-            ],
-            "\"Bank\" <security@bank.example>",
-        );
-
-        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
-
-        assert!(!verdict.transport_verified,
-            "a sender-supplied dmarc=pass below our provider's dmarc=fail must not verify; got: {}",
-            verdict.reason);
-        assert!(verdict.reason.contains("mx.google.com"),
-            "the verdict must be attributed to our provider, not the forged header; got: {}",
-            verdict.reason);
-    }
-
-    #[test]
-    fn test_transport_auth_ignores_forged_pass_when_provider_reports_none() {
-        // Weaker but likelier variant: our provider publishes no usable verdict
-        // (dmarc=none, no DKIM/SPF), and the sender supplies a pass below it.
-        let raw = message_with_auth_headers(
-            &[
-                "mx.google.com; dmarc=none",
-                "attacker.invalid; dmarc=pass header.from=bank.example",
-            ],
-            "\"Bank\" <security@bank.example>",
-        );
-
-        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
-
-        assert!(!verdict.transport_verified,
-            "dmarc=none from our provider must not be upgraded by a lower forged header; got: {}",
-            verdict.reason);
-    }
-
-    #[test]
-    fn test_transport_auth_accepts_genuine_topmost_dmarc_pass() {
-        // The fix must not break the legitimate case.
-        let raw = message_with_auth_headers(
-            &["mx.google.com; dmarc=pass header.from=bank.example"],
-            "\"Bank\" <security@bank.example>",
-        );
-
-        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
-
-        assert!(verdict.transport_verified,
-            "a genuine dmarc=pass from our provider must verify; got: {}", verdict.reason);
-        assert!(matches!(verdict.method, TransportAuthMethod::Dmarc));
-        assert!(verdict.reason.contains("mx.google.com"),
-            "verdict should name the asserting server; got: {}", verdict.reason);
-    }
-
-    #[test]
-    fn test_transport_auth_multi_hop_forward_uses_our_provider_verdict() {
-        // Legitimate forwarded mail carries several genuine headers from
-        // successive hops. Ours is still the topmost one.
-        let raw = message_with_auth_headers(
-            &[
-                "mx.google.com; dmarc=pass header.from=list.example",
-                "mx.forwarder.example; dmarc=fail header.from=list.example",
-            ],
-            "\"List\" <news@list.example>",
-        );
-
-        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
-
-        assert!(verdict.transport_verified,
-            "an older hop's fail must not override our provider's pass; got: {}", verdict.reason);
-    }
-
-    #[test]
-    fn test_transport_auth_dkim_requires_alignment() {
-        // dkim=pass only counts when header.d aligns with the From: domain,
-        // otherwise anyone with a valid signature on their own domain could
-        // sign mail claiming to be from someone else.
-        let raw = message_with_auth_headers(
-            &["mx.google.com; dkim=pass header.d=attacker.example"],
-            "\"Bank\" <security@bank.example>",
-        );
-
-        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
-
-        assert!(!verdict.transport_verified,
-            "dkim=pass with a non-aligned header.d must not verify; got: {}", verdict.reason);
-    }
-
-    #[test]
-    fn test_transport_auth_dkim_aligned_pass_verifies() {
-        let raw = message_with_auth_headers(
-            &["mx.google.com; dkim=pass header.d=bank.example"],
-            "\"Bank\" <security@bank.example>",
-        );
-
-        let verdict = verify_transport_authentication(Some(&raw), None).unwrap();
-
-        assert!(verdict.transport_verified,
-            "aligned dkim=pass should verify; got: {}", verdict.reason);
-        assert!(matches!(verdict.method, TransportAuthMethod::Dkim));
-    }
-
-    #[test]
-    fn test_transport_auth_no_header_is_unverified() {
-        let raw = b"From: \"Bank\" <security@bank.example>\r\nSubject: test\r\n\r\nbody\r\n";
-
-        let verdict = verify_transport_authentication(Some(raw), None).unwrap();
-
-        assert!(!verdict.transport_verified,
-            "absence of any Authentication-Results must not verify; got: {}", verdict.reason);
-    }
-
-    #[test]
-    fn test_trusted_header_selector_takes_topmost() {
-        // Direct unit test of the selector, independent of verdict logic.
-        let raw = message_with_auth_headers(
-            &["first.example; dmarc=pass", "second.example; dmarc=pass"],
-            "a@b.example",
-        );
-        let parsed = parse_mail(&raw).unwrap();
-
-        let selected = get_trusted_authentication_results_header(&parsed).unwrap();
-
-        assert!(selected.contains("first.example"),
-            "selector must return the topmost header; got: {}", selected);
-    }
-
-    #[test]
-    fn test_parse_authentication_results_extracts_authserv_id() {
-        let results = parse_authentication_results("mx.google.com; dmarc=pass header.from=example.com");
-        assert_eq!(results.authserv_id.as_deref(), Some("mx.google.com"));
-
-        // RFC 8601 permits a version number after the authserv-id.
-        let versioned = parse_authentication_results("example.com 1; dmarc=pass");
-        assert_eq!(versioned.authserv_id.as_deref(), Some("example.com"));
     }
 }

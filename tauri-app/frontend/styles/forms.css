@@ -193,9 +193,10 @@ body.dark-mode .settings-section-toggle {
     background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23667eea' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");
 }
 
-/* Dark mode select styling */
+/* Dark mode select styling — match the text-input background/border so selects
+   (To/Cc contact pickers, Algorithm, etc.) look like the other form inputs. */
 body.dark-mode .form-group select {
-    background-color: #232946;
+    background-color: #181a20;
     color: #e0e0e0;
     border-color: #232946;
     background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23e0e0e0' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m1 6 7 7 7-7'/%3e%3c/svg%3e");

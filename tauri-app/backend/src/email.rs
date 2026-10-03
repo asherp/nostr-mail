@@ -396,8 +396,13 @@ pub async fn send_email(
     let mut builder = Message::builder()
         .from(config.email_address.parse()?)
         .reply_to(config.email_address.parse()?)
-        .to(to_address.parse()?)
         .subject(subject);
+
+    // `to_address` may be a comma-separated list (plaintext multi-recipient To).
+    // A single address contains no comma, so this stays correct for 1:1 sends.
+    for addr in to_address.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        builder = builder.to(addr.parse()?);
+    }
 
     // Additional cleartext Cc recipients (plain multi-recipient email).
     for addr in cc {
@@ -692,18 +697,22 @@ pub fn compose_agreement(
     // as an unsigned agreement (spec §6.3, §11.1).
     let to_role = if is_agreement { ROLE_SIGNER } else { ROLE_VIEWER };
     let mut recips: Vec<AgreementRecipientInput> = Vec::with_capacity(to.len() + cc.len());
+    // A recipient may be keyed by pubkey with no email (encrypt-to-pubkey /
+    // signatory we can't SMTP-deliver to): store the email as None so the
+    // RECIPIENTS stanza omits it.
+    let opt_email = |e: &str| if e.trim().is_empty() { None } else { Some(e.to_string()) };
     for p in to {
         recips.push(AgreementRecipientInput {
             role: to_role.to_string(),
             pubkey: p.pubkey.clone(),
-            email: Some(p.email.clone()),
+            email: opt_email(&p.email),
         });
     }
     for p in cc {
         recips.push(AgreementRecipientInput {
             role: ROLE_VIEWER.to_string(),
             pubkey: p.pubkey.clone(),
-            email: Some(p.email.clone()),
+            email: opt_email(&p.email),
         });
     }
     if recips.is_empty() {
@@ -951,10 +960,15 @@ pub async fn send_agreement_email(
         .from(config.email_address.parse()?)
         .reply_to(config.email_address.parse()?)
         .subject(composed.subject);
+    // Keyed recipients with no email get a CEK stanza but no SMTP header line —
+    // they can decrypt/sign wherever they receive the message, but we have no
+    // address to deliver to.
     for p in to {
+        if p.email.trim().is_empty() { continue; }
         builder = builder.to(p.email.parse()?);
     }
     for p in cc {
+        if p.email.trim().is_empty() { continue; }
         builder = builder.cc(p.email.parse()?);
     }
     // Keyless Cc: no Nostr key, so no CEK wrap and no RECIPIENTS stanza — they
@@ -2128,7 +2142,12 @@ fn try_glossia_decode_to_bytes(text: &str) -> Option<Vec<u8>> {
 /// to glossia `(language, wordlist)`. `None`/empty defaults to english/bip39.
 pub(crate) fn glossia_lang_wordlist(encoding: Option<&str>) -> (String, String) {
     match encoding.unwrap_or("").to_lowercase().as_str() {
-        "" | "english" | "english - bip39" | "bip39" => ("english".to_string(), "bip39".to_string()),
+        // Accept every spelling the settings UI has emitted for English/BIP39.
+        // The compose dropdown stores "english bip39" (space, no hyphen) while
+        // older code used "english - bip39"; both must map to english/bip39 or
+        // glossia encode fails with an unknown-language error.
+        "" | "english" | "english - bip39" | "english bip39" | "english-bip39" | "bip39"
+            => ("english".to_string(), "bip39".to_string()),
         "latin" => ("latin".to_string(), "default".to_string()),
         other => (other.to_string(), "default".to_string()),
     }
@@ -5224,6 +5243,19 @@ mod tests {
             use_tls: true,
             private_key: None,
         }
+    }
+
+    #[test]
+    fn test_glossia_lang_wordlist_english_spellings() {
+        // The compose settings dropdown emits "english bip39" (space, no hyphen);
+        // older code used "english - bip39". Both — plus None/"" — must resolve to
+        // english/bip39, or the agreement/envelope glossia encode fails.
+        for e in [None, Some(""), Some("english"), Some("english - bip39"),
+                  Some("english bip39"), Some("english-bip39"), Some("bip39"),
+                  Some("English BIP39")] {
+            assert_eq!(glossia_lang_wordlist(e), ("english".to_string(), "bip39".to_string()), "encoding {:?}", e);
+        }
+        assert_eq!(glossia_lang_wordlist(Some("latin")), ("latin".to_string(), "default".to_string()));
     }
 
     #[test]

@@ -1703,6 +1703,90 @@ impl Database {
         Ok(None)
     }
 
+    /// Most recent received email's raw From header for which we hold a STRONG
+    /// (pubkey, email) binding to `pubkey`:
+    ///   - `sender_pubkey = pubkey`
+    ///   - `transport_auth_verified` (DMARC/DKIM/SPF passed → From domain not spoofed)
+    ///   - `signature_valid` AND `signature_source IN ('header','both')`
+    ///
+    /// The `signature_source` guard is essential: only for `header`/`both` is the
+    /// verified Nostr signature checked against the SAME pubkey stored in
+    /// `sender_pubkey`. A `body`-only signature can validate an armor key that
+    /// differs from an unverified `X-Nostr-Pubkey` header, so it must NOT be
+    /// trusted to bind an email to `sender_pubkey`. This is the safe pubkey→email
+    /// direction (never email→pubkey). Returns the raw From value (caller extracts
+    /// the bare address).
+    pub fn get_verified_email_for_pubkey(&self, pubkey: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT from_address FROM emails
+             WHERE sender_pubkey = ?
+               AND transport_auth_verified = 1
+               AND signature_valid = 1
+               AND signature_source IN ('header', 'both')
+             ORDER BY received_at DESC
+             LIMIT 1"
+        )?;
+        let mut rows = stmt.query(params![pubkey])?;
+        if let Some(row) = rows.next()? {
+            let from_address: String = row.get(0)?;
+            Ok(Some(from_address))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Batch form of `get_verified_email_for_pubkey`: a `pubkey → raw From` map of
+    /// the most-recent strongly-bound (transport + header/both signature) address
+    /// per sender pubkey. Same trust gate as the single-pubkey version. Used to
+    /// pre-fill the compose recipient dropdown so verified addresses show before a
+    /// contact is picked. Rows come newest-first; `or_insert` keeps the newest.
+    pub fn get_verified_emails_map(&self) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT sender_pubkey, from_address FROM emails
+             WHERE sender_pubkey IS NOT NULL
+               AND transport_auth_verified = 1
+               AND signature_valid = 1
+               AND signature_source IN ('header', 'both')
+             ORDER BY received_at DESC"
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut map = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            let pk: String = row.get(0)?;
+            let from: String = row.get(1)?;
+            map.entry(pk).or_insert(from);
+        }
+        Ok(map)
+    }
+
+    /// `recipient_pubkey → to_address` map from our OWN sent mail: the most
+    /// recent address we addressed each keyed recipient at. This is a WEAKER,
+    /// user-asserted binding than `get_verified_emails_map` — it proves only that
+    /// *we chose* to send to that pubkey at that address, not that the pubkey
+    /// holder controls it — so callers must NOT present it as "verified". Still
+    /// the safe pubkey→email direction (anchored on the recipient_pubkey we keyed
+    /// at compose time). Rows newest-first; `or_insert` keeps the newest.
+    pub fn get_sent_email_addresses_map(&self) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT recipient_pubkey, to_address FROM emails
+             WHERE is_draft = 0
+               AND recipient_pubkey IS NOT NULL AND recipient_pubkey != ''
+               AND to_address IS NOT NULL AND to_address != ''
+             ORDER BY received_at DESC"
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut map = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            let pk: String = row.get(0)?;
+            let to: String = row.get(1)?;
+            map.entry(pk).or_insert(to);
+        }
+        Ok(map)
+    }
+
     pub fn get_emails(&self, limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<&str>, user_pubkey: Option<&str>) -> Result<Vec<Email>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.unwrap_or(50);

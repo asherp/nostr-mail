@@ -28,6 +28,20 @@ function sanitizeSettingsForCache(settings) {
     return clean;
 }
 
+// Canonicalize a glossia encoding value to match the settings <option> values.
+// Historically the English-BIP39 option was stored as "english bip39" (space,
+// no hyphen); the canonical value is now "english - bip39". Normalizing on load
+// keeps the <select> in sync with previously-saved settings. Empty string
+// ("Base64/npub, no encoding") and other languages (e.g. "latin") pass through.
+function normalizeGlossiaEncoding(value) {
+    if (value == null) return value;
+    const v = String(value).trim().toLowerCase();
+    if (v === 'english bip39' || v === 'english-bip39' || v === 'english' || v === 'bip39') {
+        return 'english - bip39';
+    }
+    return value;
+}
+
 // Persist the non-secret settings cache to localStorage with secrets stripped.
 function persistSettingsCache(settings) {
     localStorage.setItem('nostr_mail_settings', JSON.stringify(sanitizeSettingsForCache(settings)));
@@ -460,9 +474,12 @@ NostrMailApp.prototype.loadSettingsForPubkey = async function(pubkey) {
                 include_pubkey_header: dbSettings.include_pubkey_header !== 'false', // Default to true if not set
                 include_sig_header: dbSettings.include_sig_header !== 'false', // Default to true if not set
                 include_recipient_header: dbSettings.include_recipient_header !== 'false', // Default to true if not set
-                glossia_encoding_body: dbSettings.glossia_encoding_body ?? dbSettings.glossia_encoding ?? 'latin',
-                glossia_encoding_signature: dbSettings.glossia_encoding_signature ?? dbSettings.glossia_encoding ?? 'latin',
-                glossia_encoding_pubkey: dbSettings.glossia_encoding_pubkey ?? dbSettings.glossia_encoding ?? 'latin'
+                // Normalize legacy encoding spellings to the canonical dropdown value
+                // ("english bip39"/"english-bip39" → "english - bip39") so the <select>
+                // reflects a previously-saved setting instead of falling back to Latin.
+                glossia_encoding_body: normalizeGlossiaEncoding(dbSettings.glossia_encoding_body ?? dbSettings.glossia_encoding ?? 'latin'),
+                glossia_encoding_signature: normalizeGlossiaEncoding(dbSettings.glossia_encoding_signature ?? dbSettings.glossia_encoding ?? 'latin'),
+                glossia_encoding_pubkey: normalizeGlossiaEncoding(dbSettings.glossia_encoding_pubkey ?? dbSettings.glossia_encoding ?? 'latin')
             };
             
             appState.setSettings(settings);
@@ -1193,6 +1210,10 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (saveDraftBtn) {
             saveDraftBtn.addEventListener('click', () => window.emailService?.saveDraft());
         }
+        const newComposeBtn = domManager.get('newComposeBtn');
+        if (newComposeBtn) {
+            newComposeBtn.addEventListener('click', () => window.emailService?.resetComposeForm());
+        }
         const encryptBtn = domManager.get('encryptBtn');
         if (encryptBtn) {
             console.log('[JS] Setting up encrypt button event listener');
@@ -1872,11 +1893,11 @@ NostrMailApp.prototype.setupEventListeners = function() {
         if (createAgreementBtn) {
             createAgreementBtn.addEventListener('click', () => window.emailService?.startNewAgreement());
         }
-        // Wire the optional Cc picker on the (default) compose tab now, since
-        // switchTab may not fire for the initially-active tab.
+        // Wire the To + optional Cc typeaheads on the (default) compose tab now,
+        // since switchTab may not fire for the initially-active tab.
         if (window.emailService) {
-            window.emailService._setupRecipientPicker('composeCc');
-            window.emailService._populateRecipientSelect('composeCc');
+            window.emailService._setupToTypeahead();
+            window.emailService._setupCcTypeahead();
         }
         const refreshAgreements = document.getElementById('refresh-agreements');
         if (refreshAgreements) {

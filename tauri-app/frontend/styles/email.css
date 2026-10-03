@@ -1419,3 +1419,256 @@ body.dark-mode .thread-attachment-indicator {
     padding: 40px;
     color: var(--muted-color, #999);
 }
+
+/* ── Compose Cc typeahead (Tom Select) ──────────────────────────────
+   Single Gmail-style input: type to filter contacts or enter a bare
+   email. The `.cc-typeahead` class is copied from the source <select>
+   onto the TS wrapper, so it scopes these tweaks. */
+/* Inline row: "Cc:" label on the left; to its right a stacked field with the
+   recipient pills ABOVE the typing input (Gmail-style, pills outside the box). */
+.cc-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+.cc-inline-label {
+    flex: 0 0 auto;
+    padding-top: 8px;
+    margin: 0;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.cc-field {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+/* Pill row lives above the input; collapse it entirely when there are none. */
+.cc-pills {
+    margin-bottom: 6px;
+}
+.cc-pills:empty {
+    display: none;
+}
+
+.cc-typeahead {
+    width: 100%;
+    min-height: 38px;
+}
+
+/* Pills are clickable: keyless → add a key; keyed → reveal pubkey + profile. */
+.cc-pills .recipient-chip {
+    cursor: pointer;
+}
+
+/* Verified-address checkmark (email auto-filled from a signed, DMARC-verified
+   message we received from this pubkey). */
+.recipient-chip-verified {
+    color: #2e7d32;
+    font-weight: 700;
+    font-size: 0.9em;
+}
+
+/* "Sent here before" marker — a weaker, user-asserted binding (from our own
+   sent mail). Deliberately muted, NOT green, so it doesn't read as verified. */
+.recipient-chip-usedbefore {
+    color: var(--text-secondary, #999);
+    font-size: 0.9em;
+}
+
+/* Contact avatar shown at the left of a keyed pill (pubkey-anchored). */
+.recipient-chip-avatar {
+    width: 1.3em;
+    height: 1.3em;
+    border-radius: 50%;
+    object-fit: cover;
+    flex: 0 0 auto;
+    margin-left: -2px;
+    background: var(--surface-2, #eef3ee);
+}
+
+/* Inline pubkey reveal shown in place of a keyed pill on click. */
+.cc-pills .recipient-chip.revealing {
+    cursor: default;
+}
+.pill-npub-value {
+    font-family: monospace;
+    font-size: 0.85em;
+    max-width: 22rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: text;
+    user-select: all;
+}
+.pill-profile-link {
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    padding: 0 4px;
+    font-size: 0.8em;
+    color: var(--link-color, #667eea);
+    white-space: nowrap;
+}
+.pill-info-close {
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    padding: 0 2px;
+    font-size: 0.85em;
+    line-height: 1;
+    color: var(--text-secondary, #888);
+}
+.pill-email-value {
+    font-size: 0.8em;
+    color: var(--text-secondary, #888);
+    user-select: all;
+}
+.pill-email-input {
+    width: 12rem;
+    max-width: 45vw;
+    border: 1px solid var(--border-color, #ccc);
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-size: 0.82em;
+}
+.pill-email-confirm {
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    padding: 0 4px;
+    font-size: 0.9em;
+    line-height: 1;
+    color: #2e7d32;
+}
+
+/* Inline "add a key" editor shown in place of a keyless pill on click. */
+.cc-pills .recipient-chip.editing {
+    padding: 2px 4px;
+    gap: 2px;
+}
+.pill-npub-input {
+    width: 16rem;
+    max-width: 55vw;
+    border: 1px solid var(--border-color, #ccc);
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-family: monospace;
+    font-size: 0.85em;
+}
+.pill-npub-confirm,
+.pill-npub-cancel {
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    padding: 0 4px;
+    font-size: 0.9em;
+    line-height: 1;
+}
+.pill-npub-confirm { color: #2e7d32; }
+.pill-npub-cancel { color: #c0392b; }
+
+/* Tom Select renders its own chips inside the control — hide them, we render
+   our own pill row above. Keep the raw text input permanently visible so it
+   always looks and behaves like a plain input (no focus-dependent collapse). */
+.cc-typeahead .ts-control > .item {
+    display: none !important;
+}
+.cc-typeahead .ts-control > input,
+.cc-typeahead.input-hidden .ts-control > input {
+    position: static !important;
+    left: auto !important;
+    opacity: 1 !important;
+    flex: 1 1 auto !important;
+    min-width: 6rem !important;
+}
+
+.cc-typeahead .ts-control {
+    padding: 6px 8px;
+    border-radius: 4px;
+    min-height: 38px;
+}
+
+/* Dropdown option: contact name on top, email muted beside it. */
+.cc-typeahead .ts-dropdown .cc-opt-name {
+    font-weight: 600;
+}
+
+.cc-typeahead .ts-dropdown .cc-opt-email {
+    color: #6b7280;
+    font-size: 0.85em;
+}
+
+/* Keyless pill (typed email with no matching Nostr key): dashed border +
+   muted tone so it's visually distinct from keyed contacts. */
+.cc-typeahead .ts-control .cc-item.keyless {
+    font-style: italic;
+    opacity: 0.85;
+}
+
+body.dark-mode .cc-typeahead .ts-dropdown .cc-opt-email {
+    color: #a0a4b8;
+}
+
+/* ── Dark mode: make the To/Cc typeahead match the settings input fields
+   (#181a20 bg, #e0e0e0 text, #232946 border; focus ring #667eea). ── */
+body.dark-mode .cc-typeahead .ts-control {
+    background-color: #181a20;
+    color: #e0e0e0;
+    border: 2px solid #232946;
+}
+body.dark-mode .cc-typeahead.focus .ts-control,
+body.dark-mode .cc-typeahead .ts-control:focus-within {
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+}
+body.dark-mode .cc-typeahead .ts-control > input {
+    color: #e0e0e0;
+}
+body.dark-mode .cc-typeahead .ts-control > input::placeholder {
+    color: #8a90a6;
+}
+body.dark-mode .cc-typeahead .ts-dropdown {
+    background-color: #181a20;
+    color: #e0e0e0;
+    border-color: #232946;
+}
+body.dark-mode .cc-typeahead .ts-dropdown .active,
+body.dark-mode .cc-typeahead .ts-dropdown .option:hover {
+    background-color: #2d3450;
+    color: #fff;
+}
+body.dark-mode .cc-typeahead .ts-dropdown .cc-opt-name {
+    color: #e0e0e0;
+}
+
+/* Dark mode: the external recipient pills (rendered above the input). */
+body.dark-mode .cc-pills .recipient-chip {
+    background: #232946;
+    color: #e0e0e0;
+    border-color: #3a3f55;
+}
+body.dark-mode .cc-pills .recipient-chip-remove {
+    color: #a0a4b8;
+}
+body.dark-mode .cc-pills .recipient-chip-remove:hover {
+    color: #ff6b6b;
+}
+body.dark-mode .cc-pills .recipient-chip-nokey {
+    color: #a0a4b8;
+}
+body.dark-mode .recipient-chip-avatar {
+    background: #2d3450;
+}
+/* Inline pill editors (add key / add email) in dark mode. */
+body.dark-mode .pill-npub-input,
+body.dark-mode .pill-email-input {
+    background-color: #181a20;
+    color: #e0e0e0;
+    border-color: #3a3f55;
+}
+body.dark-mode .recipient-chip-verified {
+    color: #4caf50;
+}

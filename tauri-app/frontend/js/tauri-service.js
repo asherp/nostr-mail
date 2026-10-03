@@ -288,11 +288,16 @@ const TauriService = {
     },
     // ── Agreements (CC / signatures) ────────────────────────────────
     // `to` / `cc` are arrays of { email, pubkey } (To → signer, Cc → viewer).
-    composeAgreement: async function(emailConfig, subject, body, to, cc, encrypted, originatorConsents, profileName = null, glossiaEncoding = null, subjectEncoding = null) {
+    composeAgreement: async function(emailConfig, subject, body, to, cc, encrypted, originatorConsents, profileName = null, glossiaEncoding = null, subjectEncoding = null, isAgreement = null, encryptSubject = null, sign = null) {
         const args = { emailConfig, subject, body, to, cc, encrypted, originatorConsents };
         if (profileName != null) args.profileName = profileName;
         if (glossiaEncoding != null) args.glossiaEncoding = glossiaEncoding;
         if (subjectEncoding != null) args.subjectEncoding = subjectEncoding;
+        // is_agreement defaults to TRUE in the backend; a plain multi-recipient
+        // email must pass false so it isn't composed as an agreement.
+        if (isAgreement != null) args.isAgreement = isAgreement;
+        if (encryptSubject != null) args.encryptSubject = encryptSubject;
+        if (sign != null) args.sign = sign;
         return await this.invoke('compose_agreement', args);
     },
     // Verify a delivered plaintext attachment against a public message's signed
@@ -360,6 +365,21 @@ const TauriService = {
     },
     getCachedProfileImage: async function(pubkey, pictureUrl) {
         return await this.invoke('get_cached_profile_image', { pubkey, picture_url: pictureUrl || null });
+    },
+    // Most recent verified delivery address we've observed for a pubkey (Nostr
+    // signature verified against this pubkey AND transport-auth passed). Returns
+    // the raw From header string, or null. Safe pubkey→email direction.
+    getVerifiedEmailForPubkey: async function(pubkey) {
+        return await this.invoke('db_get_verified_email_for_pubkey', { pubkey });
+    },
+    // Map of pubkey → raw From for all strongly-bound verified addresses.
+    getVerifiedEmailsMap: async function() {
+        return await this.invoke('db_get_verified_emails_map');
+    },
+    // Map of recipient_pubkey → to_address from our own sent mail (weaker,
+    // user-asserted binding — NOT presented as verified).
+    getSentEmailAddressesMap: async function() {
+        return await this.invoke('db_get_sent_email_addresses_map');
     },
     getContacts: async function() {
         return await this.invoke('get_contacts');

@@ -3070,6 +3070,34 @@ fn db_get_email_by_id(email_id: i64, state: tauri::State<AppState>) -> Result<Op
     db.get_email_by_id(email_id).map_err(|e| e.to_string())
 }
 
+/// Return the raw From header of the most recent received email that carries a
+/// STRONG (pubkey, email) binding to `pubkey` — signature verified against this
+/// pubkey (header/both) AND transport-auth verified. Used to auto-fill a keyed
+/// contact's delivery address (safe pubkey→email direction). `None` if we've
+/// never received such a message.
+#[tauri::command]
+fn db_get_verified_email_for_pubkey(pubkey: String, state: tauri::State<AppState>) -> Result<Option<String>, String> {
+    let db = state.get_database()?;
+    db.get_verified_email_for_pubkey(&pubkey).map_err(|e| e.to_string())
+}
+
+/// `pubkey → raw From` map of strongly-bound verified addresses (see
+/// `get_verified_emails_map`). Used to pre-fill the compose recipient dropdown.
+#[tauri::command]
+fn db_get_verified_emails_map(state: tauri::State<AppState>) -> Result<std::collections::HashMap<String, String>, String> {
+    let db = state.get_database()?;
+    db.get_verified_emails_map().map_err(|e| e.to_string())
+}
+
+/// `recipient_pubkey → to_address` map from our own sent mail (weaker,
+/// user-asserted binding — see `get_sent_email_addresses_map`). Used as a
+/// lower-priority fallback to pre-fill the compose recipient dropdown.
+#[tauri::command]
+fn db_get_sent_email_addresses_map(state: tauri::State<AppState>) -> Result<std::collections::HashMap<String, String>, String> {
+    let db = state.get_database()?;
+    db.get_sent_email_addresses_map().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn db_get_emails(limit: Option<i64>, offset: Option<i64>, nostr_only: Option<bool>, user_email: Option<String>, user_pubkey: Option<String>, state: tauri::State<AppState>) -> Result<Vec<EmailMessage>, String> {
     println!("[RUST] db_get_emails called");
@@ -7695,6 +7723,9 @@ pub fn run() {
         db_save_email,
         db_get_email,
         db_get_email_by_id,
+        db_get_verified_email_for_pubkey,
+        db_get_verified_emails_map,
+        db_get_sent_email_addresses_map,
         db_get_emails,
         db_search_emails,
         db_update_email_sender_pubkey,

@@ -135,35 +135,33 @@
 
                 <div class="compose-form">
                     <div class="form-group" id="compose-to-group">
-                        <label for="to-address">To:</label>
-                        <select id="nostr-contact-select" class="form-control" style="margin-bottom: 8px;">
+                        <div class="cc-row">
+                            <label for="composeTo-select" class="cc-inline-label">To:</label>
+                            <div class="cc-field">
+                                <div id="composeTo-pills" class="recipient-chips cc-pills"></div>
+                                <select id="composeTo-select" class="cc-typeahead" multiple placeholder="Add a contact or type an email…"></select>
+                            </div>
+                        </div>
+                        <!-- Legacy single-To inputs, kept hidden. They mirror the first
+                             To recipient (see _syncToMirror) so draft/preview/DM code that
+                             still reads one To keeps working during the multi-To migration. -->
+                        <select id="nostr-contact-select" style="display:none;">
                             <option value="">Select a Nostr contact with email...</option>
                         </select>
-                        <input type="email" id="to-address" placeholder="recipient@example.com" autocorrect="off" autocapitalize="off" spellcheck="false">
-                        <div id="selected-recipient-pubkey" class="selected-pubkey-display">
-                            <label for="recipient-pubkey-value" style="font-size:0.85em; font-weight:bold; margin-bottom:2px;">Recipient pubkey:</label>
-                            <input type="text" id="recipient-pubkey-value" placeholder="npub1... or hex pubkey (optional)" style="font-family: monospace; font-size: 0.85em;" autocorrect="off" autocapitalize="off" spellcheck="false">
+                        <input type="email" id="to-address" style="display:none;" autocorrect="off" autocapitalize="off" spellcheck="false">
+                        <div id="selected-recipient-pubkey" class="selected-pubkey-display" style="display:none;">
+                            <input type="text" id="recipient-pubkey-value" autocorrect="off" autocapitalize="off" spellcheck="false">
                         </div>
                     </div>
 
                     <div class="form-group" id="compose-cc-group">
-                        <label>Cc (optional):</label>
-                        <div class="recipient-picker">
-                            <select id="composeCc-contact-select" class="form-control">
-                                <option value="">Add a contact…</option>
-                            </select>
-                            <div class="manual-entry">
-                                <input type="email" id="composeCc-manual-email" placeholder="someone@example.com" autocorrect="off" autocapitalize="off" spellcheck="false">
-                                <input type="text" id="composeCc-manual-npub" placeholder="npub1… or hex (optional)" autocorrect="off" autocapitalize="off" spellcheck="false" style="font-family: monospace;">
-                                <button type="button" id="composeCc-add-manual-btn" class="btn btn-secondary">Add</button>
+                        <div class="cc-row">
+                            <label for="composeCc-select" class="cc-inline-label">Cc:</label>
+                            <div class="cc-field">
+                                <div id="composeCc-pills" class="recipient-chips cc-pills"></div>
+                                <select id="composeCc-select" class="cc-typeahead" multiple placeholder="Add a contact or type an email…"></select>
                             </div>
-                            <div id="composeCc-recipients-list" class="recipient-chips"></div>
                         </div>
-                        <label class="agreement-consent-label" style="margin-top:0.5em;">
-                            <input type="checkbox" id="compose-encrypt-subject" checked>
-                            Encrypt the subject (uncheck so a keyless Cc can see it)
-                        </label>
-                        <p class="agreement-hint">When the message is encrypted, the To recipient must have a Nostr key; a Cc without a key still receives it but can't decrypt (it can still verify the signature). When sent in plaintext, no keys are needed.</p>
                     </div>
 
                     <div class="form-group">
@@ -260,6 +258,9 @@
                         </button>
                         <button id="save-draft-btn" class="btn btn-secondary">
                             <i class="fas fa-save"></i> Save Draft
+                        </button>
+                        <button id="new-compose-btn" class="btn btn-secondary" type="button" title="Clear the compose form and start a new message">
+                            <i class="fas fa-file"></i> New
                         </button>
                     </div>
                 </div>
@@ -727,7 +728,7 @@
                                     <label for="glossia-encoding-body" style="font-size:0.85em; font-weight:normal;">Ciphertext</label>
                                     <select id="glossia-encoding-body">
                                         <option value="latin">Latin</option>
-                                        <option value="english bip39">English - BIP39</option>
+                                        <option value="english - bip39">English - BIP39</option>
                                         <option value="">Base64 (no encoding, ⚠ breaks on fwd/reply)</option>
                                     </select>
                                 </div>
@@ -735,7 +736,7 @@
                                     <label for="glossia-encoding-signature" style="font-size:0.85em; font-weight:normal;">Signature</label>
                                     <select id="glossia-encoding-signature">
                                         <option value="latin">Latin</option>
-                                        <option value="english bip39">English - BIP39</option>
+                                        <option value="english - bip39">English - BIP39</option>
                                         <option value="">Base64 (no encoding, ⚠ breaks on fwd/reply)</option>
                                     </select>
                                 </div>
@@ -743,7 +744,7 @@
                                     <label for="glossia-encoding-pubkey" style="font-size:0.85em; font-weight:normal;">Pubkey</label>
                                     <select id="glossia-encoding-pubkey">
                                         <option value="latin">Latin</option>
-                                        <option value="english bip39">English - BIP39</option>
+                                        <option value="english - bip39">English - BIP39</option>
                                         <option value="">npub</option>
                                     </select>
                                 </div>

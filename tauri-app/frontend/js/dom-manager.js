@@ -26,6 +26,7 @@ class DOMManager {
             messageBody: this.getElement('message-body'),
             sendBtn: this.getElement('send-btn'),
             saveDraftBtn: this.getElement('save-draft-btn'),
+            newComposeBtn: this.getElement('new-compose-btn'),
             previewHeadersBtn: this.getElement('preview-headers-btn'),
             nostrContactSelect: this.getElement('nostr-contact-select'),
             encryptBtn: this.getElement('encrypt-btn'),

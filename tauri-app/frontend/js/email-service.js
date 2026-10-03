@@ -12,8 +12,8 @@ class EmailService {
     // Regex patterns for armor block detection (matches both new and legacy formats)
     // New format: BEGIN NOSTR NIP-XX ENCRYPTED BODY, BEGIN NOSTR SIGNED BODY
     // Legacy: BEGIN NOSTR NIP-XX ENCRYPTED MESSAGE, BEGIN NOSTR SIGNED MESSAGE
-    static ARMOR_BEGIN_ENCRYPTED = /(-{3,})\s*BEGIN NOSTR NIP-\d+ ENCRYPTED (?:MESSAGE|BODY)\s*\1/;
-    static ARMOR_BEGIN_ANY = /(-{3,})\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*\1/;
+    static ARMOR_BEGIN_ENCRYPTED = /(-{3,})\s*BEGIN NOSTR (?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY)\s*\1/;
+    static ARMOR_BEGIN_ANY = /(-{3,})\s*BEGIN NOSTR (?:SIGNED (?:MESSAGE|BODY)|(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*\1/;
 
     constructor() {
         this.searchTimeout = null;
@@ -451,6 +451,10 @@ class EmailService {
         dropdown.value = '';
 
         console.log(`[JS] Populated Nostr contact dropdown with ${contactsWithEmail.length} contacts`);
+
+        // Keep the To + Cc typeahead contact options in sync when contacts load.
+        this._populateTypeaheadOptions('composeTo');
+        this._populateTypeaheadOptions('composeCc');
     }
 
     // Attachment Management Methods
@@ -1077,6 +1081,26 @@ class EmailService {
         }).flat(); // Flatten array since legacy hybrid encryption creates 2 attachments per file
     }
 
+    // Map the pending attachments to the plaintext EmailAttachment shape the
+    // multi-recipient send path expects. The Rust side AES-encrypts them into a
+    // capnp manifest (spec §11.2) and emits the encrypted MIME parts — crypto
+    // lives in Rust, not here. Returns null when there are no attachments.
+    plainAttachmentsForEmail() {
+        if (!this.attachments || this.attachments.length === 0) return null;
+        return this.attachments.map(a => ({
+            filename: a.name,
+            content_type: a.type,
+            data: a.data, // base64 plaintext
+            size: a.size,
+            is_encrypted: false,
+            encryption_method: null,
+            algorithm: null,
+            original_filename: null,
+            original_type: null,
+            original_size: null,
+        }));
+    }
+
     // Handle Nostr contact selection
     handleNostrContactSelection() {
         const select = domManager.get('nostrContactSelect');
@@ -1238,6 +1262,38 @@ class EmailService {
         }
     }
     
+    // Reset the compose form to a clean slate (the "New" button). Blanks the
+    // To/Cc typeaheads, subject, body and attachments, and resets the sign/
+    // encrypt/reply/draft state — WITHOUT deleting any draft already saved to the
+    // DB (this only clears the in-progress compose UI). Also drops any agreement
+    // mode so it's a plain new message.
+    resetComposeForm() {
+        // Text fields + legacy mirror inputs.
+        domManager.clear('subject');
+        domManager.clear('messageBody');
+        domManager.clear('toAddress');
+        domManager.setValue('nostrContactSelect', '');
+        const pkInput = document.getElementById('recipient-pubkey-value');
+        if (pkInput) pkInput.value = '';
+
+        // To/Cc typeahead pills + read model.
+        this._recipientLists = this._recipientLists || {};
+        ['composeTo', 'composeCc'].forEach(prefix => {
+            this._recipientLists[prefix] = [];
+            const ts = (this._recipientTs || {})[prefix];
+            if (ts) { ts.clear(true); this._renderTypeaheadPills(prefix); }
+        });
+
+        // Reset the Sign button + cached alt bodies, then the rest of the draft
+        // state (reply metadata, attachments, encrypt button, message id, contact
+        // selection, DM visibility) via the shared draft-clear path.
+        this.clearSignature();
+        this._quotedOriginalArmor = null;
+        this.clearCurrentDraft();
+
+        notificationService.showInfo('Started a new message');
+    }
+
     // Clear signature when body state changes (encrypt/decrypt)
     clearSignature() {
         const signBtn = document.getElementById('sign-btn');
@@ -1695,7 +1751,7 @@ class EmailService {
         if (armorStart < 0) return null;
 
         const lines = normalized.substring(armorStart).split('\n');
-        const isBeginBody = (l) => /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/.test(l.trim());
+        const isBeginBody = (l) => /-{3,}\s*BEGIN NOSTR (?:(?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/.test(l.trim());
         const isBeginSig = (l) => /-{3,}\s*BEGIN NOSTR SIGNATURE\s*-{3,}/.test(l.trim());
         const isBeginSeal = (l) => /-{3,}\s*BEGIN NOSTR SEAL\s*-{3,}/.test(l.trim());
         const isEnd = (l) => /-{3,}\s*END NOSTR (?:(?:NIP-\d+ ENCRYPTED )?MESSAGE|SIGNATURE|SEAL)\s*-{3,}/.test(l.trim());
@@ -2037,12 +2093,36 @@ class EmailService {
     async sendEmail() {
         console.log('[JS] sendEmail function called');
         console.log('[JS] appState.settings:', appState.getSettings());
-        
+
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
         }
-        
+
+        // Agreement mode: route to the multi-recipient / consent send path.
+        if (document.getElementById('agreement-enabled')?.checked) {
+            return this.sendAgreementCompose();
+        }
+
+        // Ensure the To/Cc read models reflect the typeaheads' current selection.
+        // _syncTypeaheadState('composeTo') also mirrors the first To into the
+        // hidden legacy #to-address/#recipient-pubkey-value inputs used below.
+        this._syncTypeaheadState('composeTo');
+        this._syncTypeaheadState('composeCc');
+
+        const toList = this._recipientState('composeTo') || [];
+        const ccList = this._recipientState('composeCc') || [];
+        if (toList.length === 0) {
+            notificationService.showError('Add at least one To recipient');
+            return;
+        }
+        // Multiple To recipients, any Cc, or a keyed To with no email → the group
+        // envelope (like agreements). Only a single To that has an email stays on
+        // the proven 1:1 path, driven by the mirrored legacy inputs below.
+        if (toList.length > 1 || ccList.length > 0 || !toList[0].email) {
+            return this.sendMultiRecipientEmail();
+        }
+
         const toAddress = domManager.getValue('toAddress')?.trim() || '';
         const subject = domManager.getValue('subject')?.trim() || '';
         const body = domManager.getValue('messageBody')?.trim() || '';
@@ -2072,31 +2152,14 @@ class EmailService {
             return;
         }
 
-        // Check if autoencrypt is enabled - if so, require recipient pubkey
+        // Check if autoencrypt is enabled - if so, require recipient pubkey.
+        // The pubkey must come from an explicit contact pick in the To
+        // typeahead (mirrored into recipientPubkey); we do NOT resolve it from
+        // the To email string, since one address can map to many pubkeys.
         const autoEncrypt = settings && settings.automatically_encrypt !== false; // Default to true
         if (autoEncrypt && !recipientPubkey) {
-            // Try to find contact by email address
-            const contacts = appState.getContacts();
-            const contactByEmail = contacts.find(c => c.email && c.email.toLowerCase() === toAddress.toLowerCase());
-
-            if (contactByEmail) {
-                // Found contact by email, set it as selected
-                this.selectedNostrContact = contactByEmail;
-                const dropdown = domManager.get('nostrContactSelect');
-                if (dropdown) {
-                    dropdown.value = contactByEmail.pubkey;
-                }
-                // Fill the recipient pubkey input
-                const pubkeyValue = document.getElementById('recipient-pubkey-value');
-                if (pubkeyValue) {
-                    pubkeyValue.value = contactByEmail.pubkey;
-                }
-                console.log('[JS] Auto-found contact by email for autoencrypt:', contactByEmail.name);
-            } else {
-                // No contact found - block sending when autoencrypt is enabled
-                notificationService.showError('Autoencrypt is enabled but no recipient pubkey found. Please select a Nostr contact, enter a pubkey, or disable autoencrypt to send unencrypted emails.');
-                return;
-            }
+            notificationService.showError('Auto-encrypt is on but this recipient has no Nostr key. Pick them from your contacts, or disable auto-encrypt (Advanced settings) to send unencrypted.');
+            return;
         }
         
         // Warn about attachments not being supported yet
@@ -2243,12 +2306,12 @@ class EmailService {
             domManager.clear('messageBody');
             domManager.setValue('nostrContactSelect', '');
             this.selectedNostrContact = null;
-            
-            // Hide pubkey display
-            const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
-            if (pubkeyDisplay) {
-                // pubkey field is always visible
-            }
+            // Clear the To/Cc typeahead pills too.
+            ['composeTo', 'composeCc'].forEach(prefix => {
+                if (this._recipientLists) this._recipientLists[prefix] = [];
+                const ts = (this._recipientTs || {})[prefix];
+                if (ts) { ts.clear(true); this._renderTypeaheadPills(prefix); }
+            });
             
             // Clear attachments
             this.clearAttachments();
@@ -2271,15 +2334,1061 @@ class EmailService {
         }
     }
 
-    // Preview email headers without sending
-    async previewEmailHeaders() {
-        console.log('[JS] previewEmailHeaders function called');
-        
+    // Compose + send an agreement: To: → signatories, Cc: → viewers (spec §6.3).
+    // Resolves each recipient email to its contact's Nostr pubkey, then sends one
+    // message to all of them via the send_agreement backend command.
+    async sendAgreementCompose() {
         if (!appState.hasSettings()) {
             notificationService.showError('Please configure your email settings first');
             return;
         }
-        
+        if (!appState.hasKeypair()) {
+            notificationService.showError('A Nostr keypair is required to sign an agreement');
+            return;
+        }
+
+        const settings = appState.getSettings();
+        const subject = domManager.getValue('subject')?.trim() || '';
+        const body = domManager.getValue('messageBody')?.trim() || '';
+
+        if (!subject || !body) {
+            notificationService.showError('An agreement needs a subject and a body');
+            return;
+        }
+
+        // To: signatories (keyed) and Cc: viewers come from the pickers. Cc may
+        // include keyless viewers — they go in the Cc header only (cc_plain) and
+        // can't decrypt, but can still verify the signature (escrow/witness).
+        const to = this._recipientState('to').map(r => ({ email: r.email, pubkey: r.pubkey }));
+        const ccAll = this._recipientState('cc');
+        const cc = ccAll.filter(r => r.pubkey).map(r => ({ email: r.email, pubkey: r.pubkey }));
+        const ccPlain = ccAll.filter(r => !r.pubkey).map(r => r.email);
+        if (to.length === 0) {
+            notificationService.showError('Add at least one To: signatory');
+            return;
+        }
+
+        const encrypted = (document.getElementById('agreement-visibility')?.value || 'encrypted') !== 'public';
+        const originatorConsents = !!document.getElementById('agreement-consent')?.checked;
+        const encryptSubject = document.getElementById('agreement-encrypt-subject')?.checked !== false;
+
+        let useTls = settings.use_tls;
+        if (settings.smtp_host === 'smtp.gmail.com' && !useTls) useTls = true;
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+        };
+
+        const keypair = appState.getKeypair();
+        let profileName = '';
+        try { profileName = window.profileManager?.getAccountDisplayName(keypair?.public_key) || ''; } catch (e) { /* best-effort */ }
+        const glossiaEncoding = settings.glossia_encoding_body || null;
+        const includePubkeyHeader = settings.include_pubkey_header !== false;
+        const includeSigHeader = settings.include_sig_header !== false;
+        const messageId = this.generateAndStoreMessageId();
+
+        try {
+            domManager.disable('sendBtn');
+            domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
+            // Pass plaintext body + attachments; Rust builds the capnp manifest
+            // under the CEK for an encrypted agreement (binding each attachment's
+            // hash inside the signed body, §11.2) or sends them in the clear for a
+            // public one.
+            const attachmentData = this.plainAttachmentsForEmail();
+            await TauriService.sendAgreement(
+                emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, true, encryptSubject, true,
+                profileName, messageId, this._replyToMessageId, this._replyReferences,
+                includePubkeyHeader, includeSigHeader, glossiaEncoding, null, attachmentData
+            );
+            let msg = `Agreement sent to ${to.length} signatory(ies)` + (cc.length ? ` and ${cc.length} viewer(s)` : '');
+            if (ccPlain.length) msg += ` (${ccPlain.length} keyless Cc can't read it)`;
+            notificationService.showSuccess(msg);
+
+            // Reset the compose form.
+            domManager.clear('toAddress');
+            domManager.clear('subject');
+            domManager.clear('messageBody');
+            this._recipientLists = {};
+            this._renderRecipientChips('to');
+            this._renderRecipientChips('cc');
+            this.selectedNostrContact = null;
+            try { this.clearAttachments(); } catch (e) {}
+            try { this.clearCurrentDraft(); } catch (e) {}
+
+            setTimeout(() => { this.syncSentEmails().catch(() => {}); }, 100);
+        } catch (error) {
+            console.error('[JS] Error sending agreement:', error);
+            notificationService.showError('Failed to send agreement: ' + error);
+        } finally {
+            domManager.enable('sendBtn');
+            domManager.setHTML('sendBtn', '<i class="fas fa-paper-plane"></i> Send');
+        }
+    }
+
+    // Send a multi-recipient email through the group envelope: To recipients
+    // (all keyed when encrypting) + Cc viewers (keyed → wrapped CEK; keyless →
+    // Cc header only, can't decrypt). Reuses send_agreement with is_agreement =
+    // false (viewer roles, no agreement marker). Also used for the plaintext
+    // multi-recipient case (To + Cc go in the headers, no envelope).
+    async sendMultiRecipientEmail() {
+        if (!appState.hasSettings()) {
+            notificationService.showError('Please configure your email settings first');
+            return;
+        }
+
+        const settings = appState.getSettings();
+        const subject = domManager.getValue('subject')?.trim() || '';
+        const body = domManager.getValue('messageBody')?.trim() || '';
+        const toAll = this._recipientState('composeTo') || [];
+        if (!toAll.length || !subject || !body) {
+            notificationService.showError('Please fill in To, subject, and message');
+            return;
+        }
+
+        const ccAll = this._recipientState('composeCc') || [];
+
+        // Encrypt when requested / auto-encrypt is on. Encryption requires EVERY
+        // To recipient to be keyed (a keyless To couldn't read its own mail);
+        // keyless addresses belong in Cc (receive-but-can't-decrypt).
+        const keylessTo = toAll.filter(r => !r.pubkey);
+        const encryptBtn = domManager.get('encryptBtn');
+        const wantsEncrypt = (encryptBtn && encryptBtn.dataset.encrypted === 'true')
+            || (settings.automatically_encrypt !== false);
+
+        let useTls = settings.use_tls;
+        if (settings.smtp_host === 'smtp.gmail.com' && !useTls) useTls = true;
+        const emailConfig = {
+            email_address: settings.email_address,
+            password: settings.password,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            imap_host: settings.imap_host,
+            imap_port: settings.imap_port,
+            use_tls: useTls,
+        };
+        const includePubkeyHeader = settings.include_pubkey_header !== false;
+        const includeSigHeader = settings.include_sig_header !== false;
+        const includeRecipientHeader = settings.include_recipient_header !== false;
+        const messageId = this.generateAndStoreMessageId();
+
+        const resetForm = () => {
+            domManager.clear('toAddress');
+            domManager.clear('subject');
+            domManager.clear('messageBody');
+            this._recipientLists = this._recipientLists || {};
+            ['composeTo', 'composeCc'].forEach(prefix => {
+                this._recipientLists[prefix] = [];
+                const ts = (this._recipientTs || {})[prefix];
+                if (ts) { ts.clear(true); this._renderTypeaheadPills(prefix); }
+            });
+            this.selectedNostrContact = null;
+            try { this.clearAttachments(); } catch (e) {}
+            try { this.clearCurrentDraft(); } catch (e) {}
+            setTimeout(() => { this.syncSentEmails().catch(() => {}); }, 100);
+        };
+
+        try {
+            domManager.disable('sendBtn');
+            domManager.setHTML('sendBtn', '<span class="loading"></span> Sending...');
+
+            if (wantsEncrypt) {
+                // Encrypted multi-recipient envelope. Every To must be keyed; keyed
+                // Cc get the CEK; keyless Cc go in the Cc header only.
+                if (!appState.hasKeypair()) {
+                    notificationService.showError('A Nostr keypair is required to send encrypted mail');
+                    return;
+                }
+                if (keylessTo.length) {
+                    const who = keylessTo.map(r => r.email).join(', ');
+                    notificationService.showError(`Encrypting requires every To recipient to have a Nostr key. ${who} ${keylessTo.length > 1 ? 'have' : 'has'} none — pick them from contacts, or move them to Cc.`);
+                    return;
+                }
+                const to = toAll.map(r => ({ email: r.email || '', pubkey: r.pubkey }));
+                const cc = ccAll.filter(r => r.pubkey).map(r => ({ email: r.email || '', pubkey: r.pubkey }));
+                const ccPlain = ccAll.filter(r => !r.pubkey).map(r => r.email);
+                // At least one recipient must have an email to actually deliver
+                // to; pubkey-only recipients still get the CEK (encrypt-to-pubkey)
+                // but no SMTP header line.
+                if (![...to, ...cc].some(r => r.email) && ccPlain.length === 0) {
+                    notificationService.showError('No delivery address. Add an email to at least one recipient (click a keyed pill to add one).');
+                    return;
+                }
+                let profileName = '';
+                try { profileName = window.profileManager?.getAccountDisplayName(appState.getKeypair()?.public_key) || ''; } catch (e) {}
+                const glossiaEncoding = settings.glossia_encoding_body || null;
+                // Signing mirrors 1:1: signed by default (auto-sign), unless the
+                // user toggled the Sign button off → unsigned envelope (SEAL).
+                const signBtn = domManager.get('signBtn');
+                const sign = (settings.automatically_sign !== false) || (signBtn && signBtn.dataset.signed === 'true');
+                // Pass plaintext body + attachments; Rust AES-encrypts the files
+                // into a capnp manifest under the CEK and emits the MIME parts
+                // (§11.2). No attachments ⇒ the plain body is encrypted directly.
+                const attachmentData = this.plainAttachmentsForEmail();
+                await TauriService.sendAgreement(
+                    emailConfig, subject, body, to, cc, ccPlain, /* encrypted */ true,
+                    /* originatorConsents */ false, /* isAgreement */ false, /* encryptSubject */ true, sign,
+                    profileName, messageId, this._replyToMessageId, this._replyReferences,
+                    includePubkeyHeader, includeSigHeader, glossiaEncoding, null, attachmentData
+                );
+                let msg = `Encrypted email sent to ${to.length + cc.length} recipient(s)`;
+                if (ccPlain.length) msg += ` (${ccPlain.length} Cc without a key can't read it)`;
+                notificationService.showSuccess(msg);
+                resetForm();
+            } else {
+                // Plaintext multi-recipient: To + Cc go in the headers, no envelope.
+                // Keys are not required; signing still honors the user's settings.
+                // send_email takes a comma-separated To list (Rust splits + loops).
+                // Pubkey-only recipients have no address to deliver plaintext to.
+                const toEmails = toAll.map(r => r.email).filter(Boolean);
+                const ccEmails = ccAll.map(r => r.email).filter(Boolean);
+                if (!toEmails.length) {
+                    notificationService.showError('No email address to send to. Add an email to a To recipient, or enable encryption to send to a pubkey-only contact.');
+                    return;
+                }
+                const plainBody = this._plainBody || body;
+                const attachmentData = this.prepareAttachmentsForEmail();
+                await TauriService.sendEmail(
+                    emailConfig, toEmails.join(', '), subject, plainBody, null, messageId, attachmentData,
+                    this._htmlBody, this._replyToMessageId, this._replyReferences,
+                    includePubkeyHeader, includeSigHeader, null, includeRecipientHeader, ccEmails
+                );
+                notificationService.showSuccess(`Email sent to ${toEmails.length + ccEmails.length} recipient(s)`);
+                resetForm();
+            }
+        } catch (error) {
+            console.error('[JS] Error sending multi-recipient email:', error);
+            notificationService.showError('Failed to send: ' + error);
+        } finally {
+            domManager.enable('sendBtn');
+            domManager.setHTML('sendBtn', '<i class="fas fa-paper-plane"></i> Send');
+        }
+    }
+
+    // ── Agreements tab ──────────────────────────────────────────────
+    // True if a message is an agreement: X-Nostr-Agreement header, or an inline
+    // RECIPIENTS/CONSENT armor block.
+    isAgreementEmail(email) {
+        if (!email) return false;
+        if (/^X-Nostr-Agreement:/im.test(email.raw_headers || '')) return true;
+        const b = email.body || '';
+        return b.includes('BEGIN NOSTR RECIPIENTS') || b.includes('BEGIN NOSTR CONSENT');
+    }
+
+    // Load + render the Agreements tab: inbox AND sent emails filtered to
+    // agreements, deduplicated by thread (newest wins), rendered with the same
+    // rich rows; each routes to its own (inbox/sent) detail view on click.
+    async loadAgreements() {
+        const listEl = document.getElementById('agreements-list');
+        if (!listEl) return;
+        listEl.innerHTML = '<div class="loading-emails">Loading agreements…</div>';
+
+        let inbox = appState.getEmails();
+        if (!inbox || inbox.length === 0) {
+            try { await this.loadEmails(); } catch (e) { /* settings may be missing */ }
+            inbox = appState.getEmails();
+        }
+        let sent = appState.getSentEmails();
+        if (!sent || sent.length === 0) {
+            try { await this.loadSentEmails(); } catch (e) { /* settings may be missing */ }
+            sent = appState.getSentEmails();
+        }
+
+        // Tag source, keep only agreements.
+        const tagged = [
+            ...(inbox || []).map(e => ({ e, source: 'inbox' })),
+            ...(sent || []).map(e => ({ e, source: 'sent' })),
+        ].filter(x => this.isAgreementEmail(x.e));
+
+        // Dedupe by thread (an agreement thread can appear in both stores); keep newest.
+        const byKey = new Map();
+        for (const x of tagged) {
+            const key = x.e.thread_id || x.e.message_id || x.e.id;
+            const prev = byKey.get(key);
+            if (!prev || this._emailDateMs(x.e) > this._emailDateMs(prev.e)) byKey.set(key, x);
+        }
+        const items = [...byKey.values()].sort((a, b) => this._emailDateMs(b.e) - this._emailDateMs(a.e));
+
+        if (!items.length) {
+            listEl.innerHTML = '<div class="empty-state" style="padding:1.5em;color:var(--text-secondary,#888);">No agreements yet. Click “Create agreement” to start one.</div>';
+            return;
+        }
+
+        listEl.innerHTML = '';
+        for (const { e: email, source } of items) {
+            try {
+                const el = source === 'sent'
+                    ? await this.renderSentEmailItem(email)
+                    : await this.renderInboxEmailItem(email);
+                if (!el) continue; // sent renderer returns null when hide_undecryptable is on
+                // Open in the matching (inbox/sent) detail view. Capture phase
+                // pre-empts the row's own handler so it doesn't double-open in a
+                // hidden tab.
+                el.addEventListener('click', (ev) => {
+                    ev.stopImmediatePropagation();
+                    this._openAgreement(email, source);
+                }, true);
+                listEl.appendChild(el);
+            } catch (err) {
+                console.warn('[JS] agreement item render failed:', err);
+            }
+        }
+    }
+
+    _emailDateMs(e) {
+        const d = e && (e.date ?? e.created_at);
+        if (d == null) return 0;
+        const t = typeof d === 'number' ? d : Date.parse(d);
+        return isNaN(t) ? 0 : t;
+    }
+
+    _openAgreement(email, source) {
+        const tab = source === 'sent' ? 'sent' : 'inbox';
+        const open = () => {
+            if (email.message_count > 1) this.showThreadDetail(email.thread_id, tab);
+            else if (source === 'sent') this.showSentDetail(email.id);
+            else this.showEmailDetail(email.id);
+        };
+        const p = window.app && typeof window.app.switchTab === 'function'
+            ? window.app.switchTab(tab) : null;
+        (p && typeof p.then === 'function') ? p.then(open) : open();
+    }
+
+    // Toggle the compose form into / out of agreement mode (used by the
+    // Agreements tab's "Create agreement" button and the "switch to normal" link).
+    setAgreementMode(on) {
+        const cb = document.getElementById('agreement-enabled');
+        if (cb) cb.checked = !!on;
+        const opts = document.getElementById('agreement-options');
+        if (opts) opts.style.display = on ? 'block' : 'none';
+        const banner = document.getElementById('agreement-mode-banner');
+        if (banner) banner.style.display = on ? 'flex' : 'none';
+        const title = document.getElementById('compose-title');
+        if (title) title.textContent = on ? 'Create Agreement' : 'Compose Email';
+        // In agreement mode the To/Cc come from the in-panel pickers; hide the
+        // normal single-recipient To block and the normal Cc picker.
+        const toGroup = document.getElementById('compose-to-group');
+        if (toGroup) toGroup.style.display = on ? 'none' : '';
+        const ccGroup = document.getElementById('compose-cc-group');
+        if (ccGroup) ccGroup.style.display = on ? 'none' : '';
+        if (on) {
+            ['to', 'cc'].forEach(kind => {
+                this._setupRecipientPicker(kind);
+                this._populateRecipientSelect(kind);
+                this._renderRecipientChips(kind);
+            });
+        } else {
+            // Normal compose: wire/populate the To + optional Cc typeaheads.
+            this._setupToTypeahead();
+            this._setupCcTypeahead();
+        }
+    }
+
+    // Open the compose view in agreement mode (from the Agreements tab + button).
+    async startNewAgreement() {
+        this._pendingAgreementCompose = true;
+        this._recipientLists = { to: [], cc: [] };
+        try { await (window.app && window.app.switchTab && window.app.switchTab('compose')); } catch (e) {}
+        this.setAgreementMode(true);
+        this._pendingAgreementCompose = false;
+    }
+
+    // ── Recipient pickers (To signatories, Cc viewers) ──────────────
+    // Add one recipient at a time, from contacts or by manual email + npub.
+    // `kind` is 'to' or 'cc'.
+    _recipientState(kind) {
+        this._recipientLists = this._recipientLists || {};
+        this._recipientLists[kind] = this._recipientLists[kind] || [];
+        return this._recipientLists[kind];
+    }
+
+    // ── Normal-compose Cc: single Gmail-style typeahead ─────────────
+    // One input (#composeCc-select) driven by Tom Select. Typing surfaces a
+    // contacts menu (name — email); picking one keys the recipient with its
+    // pubkey. Typing a bare address adds a keyless Cc. Pills show the contact
+    // name when known, otherwise the raw email. The read model at send time is
+    // still this._recipientLists.composeCc = [{email, pubkey}], kept in sync.
+    // Config for each Gmail-style typeahead. `composeTo` and `composeCc` share
+    // one implementation; only the element IDs and placeholder differ.
+    _typeaheadCfg(prefix) {
+        const cfgs = {
+            composeTo: { selectId: 'composeTo-select', pillsId: 'composeTo-pills', placeholder: 'Add a contact or type an email…' },
+            composeCc: { selectId: 'composeCc-select', pillsId: 'composeCc-pills', placeholder: 'Add a contact or type an email…' },
+        };
+        return cfgs[prefix];
+    }
+
+    // Build (once) the Tom Select typeahead for `prefix` ('composeTo'|'composeCc').
+    // Typing surfaces a contacts menu (name — email); picking one keys the
+    // recipient by its PUBKEY. Typing a bare address adds a keyless recipient —
+    // never resolved to a pubkey (one email can map to many pubkeys; keying is
+    // only ever an explicit contact pick). Pills render in a row above the input
+    // (see _renderTypeaheadPills); Tom Select's own chips are hidden via CSS.
+    _setupTypeahead(prefix) {
+        const cfg = this._typeaheadCfg(prefix);
+        if (!cfg) return;
+        const el = document.getElementById(cfg.selectId);
+        if (!el || typeof window.TomSelect === 'undefined') {
+            // No Tom Select available (e.g. tests): nothing to wire.
+            return;
+        }
+        this._recipientTs = this._recipientTs || {};
+        if (this._recipientTs[prefix]) {
+            this._populateTypeaheadOptions(prefix);
+            return;
+        }
+        const self = this;
+        this._recipientTs[prefix] = new window.TomSelect(el, {
+            persist: false,
+            hideSelected: true,
+            closeAfterSelect: true,
+            // Don't drop the whole contact list on focus — suggestions appear
+            // as you type (Gmail-like), and refocusing after a pick stays quiet.
+            openOnFocus: false,
+            valueField: 'value',
+            labelField: 'name',
+            // Search names/emails only — never the option value (a contact's
+            // value is its pubkey; typed values are emails, matched via `email`).
+            searchField: ['name', 'email'],
+            placeholder: cfg.placeholder,
+            createFilter: (input) => (input || '').includes('@'),
+            create: (input) => {
+                const email = (input || '').trim().toLowerCase();
+                if (!email.includes('@')) return false;
+                return { value: email, email, name: '', pubkey: '' };
+            },
+            render: {
+                option: (data, escape) => {
+                    // Secondary line: the email, marked ✓ (verified from received
+                    // mail) or ↩ (you've sent here before, unverified), or
+                    // "(no email)" for an encrypt-to-pubkey-only contact.
+                    let mark = '';
+                    if (data.email && data.emailVerified) mark = '<span class="recipient-chip-verified" title="Verified address from prior mail">✓</span> ';
+                    else if (data.email && data.emailFromSent) mark = '<span class="recipient-chip-usedbefore" title="You&#39;ve sent here before (unverified)">↩</span> ';
+                    const sub = data.email
+                        ? `${mark}${escape(data.email)}`
+                        : (data.pubkey ? '<em>(no email)</em>' : escape(data.value));
+                    if (data.name) {
+                        return `<div class="cc-opt"><span class="cc-opt-name">${escape(data.name)}</span> <span class="cc-opt-email">${sub}</span></div>`;
+                    }
+                    return `<div class="cc-opt"><span class="cc-opt-email">${sub}</span></div>`;
+                },
+                item: (data, escape) => {
+                    const label = data.name ? data.name : (data.email || data.value);
+                    const keyless = !data.pubkey;
+                    const title = keyless
+                        ? `${data.email || data.value} — no Nostr key, will receive but cannot decrypt`
+                        : (data.email || data.value);
+                    return `<div class="cc-item${keyless ? ' keyless' : ''}" title="${escape(title)}">${escape(label)}</div>`;
+                },
+                create: (input, escape) => `<div class="create">Add <strong>${escape(input)}</strong></div>`,
+            },
+            onChange: () => {
+                self._syncTypeaheadState(prefix);
+                self._renderTypeaheadPills(prefix);
+            },
+            // Keep the caret in the input after a pick, ready for the next one.
+            onItemAdd: () => {
+                setTimeout(() => {
+                    const ts = self._recipientTs[prefix];
+                    if (!ts) return;
+                    ts.setTextboxValue('');
+                    ts.control_input.focus();
+                }, 0);
+            },
+        });
+        this._populateTypeaheadOptions(prefix);
+        this._renderTypeaheadPills(prefix);
+    }
+
+    // Encode a hex pubkey to its npub1… bech32 form for display; falls back to
+    // the raw hex if nostr-tools' nip19 isn't loaded yet.
+    _pubkeyToNpub(hex) {
+        if (!hex) return '';
+        try {
+            const nip19 = window.CryptoService && window.CryptoService._nip19;
+            if (nip19 && nip19.npubEncode) return nip19.npubEncode(hex);
+        } catch (e) { /* fall through to hex */ }
+        return hex;
+    }
+
+    // Abbreviated npub for a pill label when a keyed contact has no name/email.
+    _shortNpub(hex) {
+        const n = this._pubkeyToNpub(hex);
+        return n.length > 16 ? `${n.slice(0, 10)}…${n.slice(-4)}` : n;
+    }
+
+    // Extract the bare address from a raw From header ("Alice <a@x.io>" → "a@x.io").
+    _bareEmail(raw) {
+        if (!raw) return '';
+        const m = String(raw).match(/<([^>]+)>/);
+        return (m ? m[1] : raw).trim().toLowerCase();
+    }
+
+    // Generic person-silhouette avatar (matches the contacts list default).
+    _defaultAvatarDataUrl() {
+        if (!this.__defaultAvatar) {
+            this.__defaultAvatar = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>');
+        }
+        return this.__defaultAvatar;
+    }
+
+    // Avatar <img> for a pill, but ONLY when the pubkey matches a known contact
+    // (avatars are pubkey-anchored — never email-matched). Contacts without a
+    // cached picture get the default silhouette; non-contacts get no avatar.
+    _pillAvatar(pubkey) {
+        if (!pubkey) return '';
+        const contact = (appState.getContacts() || []).find(c => c.pubkey === pubkey);
+        if (!contact) return '';
+        const src = contact.picture_data_url || this._defaultAvatarDataUrl();
+        return `<img class="recipient-chip-avatar" src="${Utils.escapeHtml(src)}" alt="" aria-hidden="true">`;
+    }
+
+    // Lazily fetch avatars for pill contacts that have a picture URL but no
+    // cached data URL yet (same flow as the contacts list). On success the
+    // contact's picture_data_url is filled in and the pills re-render. Each
+    // pubkey is attempted once per session to avoid retry loops on failure.
+    _loadPillAvatars(prefix) {
+        const ts = (this._recipientTs || {})[prefix];
+        if (!ts || !window.TauriService) return;
+        this._pillAvatarTried = this._pillAvatarTried || new Set();
+        const contacts = appState.getContacts() || [];
+        const pending = [];
+        ts.items.forEach(val => {
+            const opt = ts.options[val] || {};
+            if (!opt.pubkey) return;
+            const c = contacts.find(x => x.pubkey === opt.pubkey);
+            if (c && c.picture && !c.picture_data_url && !this._pillAvatarTried.has(c.pubkey)) {
+                this._pillAvatarTried.add(c.pubkey);
+                pending.push(c);
+            }
+        });
+        if (!pending.length) return;
+        Promise.all(pending.map(async (c) => {
+            try {
+                let dataUrl = await window.TauriService.getCachedProfileImage(c.pubkey, c.picture);
+                if (!dataUrl) {
+                    dataUrl = await window.TauriService.fetchImage(c.picture);
+                    if (dataUrl) { try { window.TauriService.cacheProfileImage(c.pubkey, dataUrl); } catch (e) {} }
+                }
+                if (dataUrl) { c.picture_data_url = dataUrl; c.picture_loaded = true; return true; }
+            } catch (e) { /* leave the default avatar in place */ }
+            return false;
+        })).then(results => {
+            if (results.some(Boolean)) this._renderTypeaheadPills(prefix);
+        });
+    }
+
+    // Render a typeahead's recipient pills in their own row above the input.
+    // Removing a pill drives Tom Select via removeItem() so state stays in sync.
+    // Hovering a keyed pill reveals its npub; clicking a keyless pill opens an
+    // inline editor to add a Nostr key manually.
+    _renderTypeaheadPills(prefix) {
+        // Tear down any active "collapse expanded pill on outside click" listener
+        // from a prior _openPillInfo — this render replaces the expanded chip.
+        if (this._pillInfoDocListener) {
+            document.removeEventListener('click', this._pillInfoDocListener, true);
+            this._pillInfoDocListener = null;
+        }
+        const cfg = this._typeaheadCfg(prefix);
+        const ts = (this._recipientTs || {})[prefix];
+        const el = cfg && document.getElementById(cfg.pillsId);
+        if (!el || !ts) return;
+        el.innerHTML = ts.items.map(val => {
+            const opt = ts.options[val] || {};
+            const keyless = !opt.pubkey;
+            const email = keyless ? val : (opt.email || '');
+            const label = opt.name || email || (opt.pubkey ? this._shortNpub(opt.pubkey) : val);
+            let title, tag = '';
+            if (keyless) {
+                title = `${email} — no Nostr key. Click to add one.`;
+                tag = ' <span class="recipient-chip-nokey" title="No Nostr key">(no key)</span>';
+            } else {
+                const npub = this._pubkeyToNpub(opt.pubkey);
+                if (email) {
+                    if (opt.emailVerified) {
+                        // No ✓ badge on the collapsed pill — the verified status
+                        // still shows in the hover tooltip and the expanded view.
+                        title = `${email}\n${npub}\n✓ Verified address — from a signed, transport-authenticated message you received.`;
+                    } else if (opt.emailFromSent) {
+                        title = `${email}\n${npub}\n↩ You've sent to this address before (not verified). Click to change.`;
+                        tag = ' <span class="recipient-chip-usedbefore" title="You&#39;ve sent to this address before (not verified)">↩</span>';
+                    } else {
+                        title = `${email}\n${npub}`;
+                    }
+                } else {
+                    title = `${npub}\nNo email — encrypted to them anyway. Click to add an email.`;
+                    tag = ' <span class="recipient-chip-nokey" title="No email — still encrypted to them">(no email)</span>';
+                }
+            }
+            const avatar = keyless ? '' : this._pillAvatar(opt.pubkey);
+            return `<span class="recipient-chip${keyless ? ' keyless' : ''}" data-value="${Utils.escapeHtml(val)}" title="${Utils.escapeHtml(title)}">${avatar}${Utils.escapeHtml(label)}${tag}<button type="button" class="recipient-chip-remove" data-value="${Utils.escapeHtml(val)}" aria-label="Remove ${Utils.escapeHtml(email || label)}">×</button></span>`;
+        }).join('');
+        el.querySelectorAll('.recipient-chip-remove').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const t = (this._recipientTs || {})[prefix];
+                if (t) t.removeItem(btn.dataset.value);
+            });
+        });
+        // Clicking a keyless pill lets the user add a Nostr key manually;
+        // clicking a keyed pill reveals its pubkey (+ a profile link if known).
+        el.querySelectorAll('.recipient-chip').forEach(chip => {
+            chip.addEventListener('click', (e) => {
+                if (e.target.closest('.recipient-chip-remove')) return;
+                e.stopPropagation();
+                if (chip.classList.contains('keyless')) this._openPillKeyEditor(prefix, chip);
+                else this._openPillInfo(prefix, chip);
+            });
+        });
+        // Fill in any not-yet-cached contact avatars, then re-render.
+        this._loadPillAvatars(prefix);
+    }
+
+    // Expand a keyed pill inline: keep the username (npub in its tooltip), add a
+    // "profile ↗" link when the pubkey matches a known contact, and show the
+    // recipient's email — or, when there is none, an input to add a delivery
+    // address (the message is still encrypted to their pubkey regardless).
+    // Collapses on a click outside the pill (no ✕ — the pill keeps its own
+    // remove × so a close ✕ there would read as "remove contact").
+    _openPillInfo(prefix, chip) {
+        const ts = (this._recipientTs || {})[prefix];
+        if (!ts || !chip || !chip.isConnected) return;
+        const val = chip.dataset.value;
+        const opt = ts.options[val] || {};
+        const pubkey = opt.pubkey;
+        if (!pubkey) return;
+        const contact = (appState.getContacts() || []).find(c => c.pubkey === pubkey) || null;
+        const label = opt.name || opt.email || this._shortNpub(pubkey);
+        const avatar = this._pillAvatar(pubkey);
+        chip.classList.add('revealing');
+        const profileBtn = contact
+            ? `<button type="button" class="pill-profile-link" title="View profile">profile ↗</button>`
+            : '';
+        let emailMark = '', emailTitle = 'Delivery address';
+        if (opt.email && opt.emailVerified) { emailMark = '<span class="recipient-chip-verified">✓</span> '; emailTitle = 'Verified address — from a signed, transport-authenticated message you received'; }
+        else if (opt.email && opt.emailFromSent) { emailMark = '<span class="recipient-chip-usedbefore">↩</span> '; emailTitle = "You've sent to this address before (not verified)"; }
+        const emailSection = opt.email
+            ? `<span class="pill-email-value" title="${Utils.escapeHtml(emailTitle)}">${emailMark}${Utils.escapeHtml(opt.email)}</span>`
+            : `<input type="email" class="pill-email-input" placeholder="add email (optional)" autocorrect="off" autocapitalize="off" spellcheck="false"><button type="button" class="pill-email-confirm" title="Add email" aria-label="Add email">✓</button>`;
+        chip.innerHTML = `${avatar}<span class="pill-name-value" title="${Utils.escapeHtml(this._pubkeyToNpub(pubkey))}">${Utils.escapeHtml(label)}</span>${profileBtn}${emailSection}`;
+        chip.querySelector('.pill-name-value').addEventListener('click', (e) => e.stopPropagation());
+        // Collapse when the next click lands outside this expanded pill. Deferred
+        // so the opening click itself doesn't immediately close it; captured so it
+        // runs before other handlers. _renderTypeaheadPills clears this listener.
+        const onDocClick = (ev) => { if (!chip.contains(ev.target)) this._renderTypeaheadPills(prefix); };
+        this._pillInfoDocListener = onDocClick;
+        setTimeout(() => document.addEventListener('click', onDocClick, true), 0);
+        const pb = chip.querySelector('.pill-profile-link');
+        if (pb) pb.addEventListener('click', (e) => {
+            e.stopPropagation();
+            try { window.contactsService && window.contactsService.selectContact(contact); } catch (err) { console.warn('[JS] open profile failed:', err); }
+        });
+        const emailInput = chip.querySelector('.pill-email-input');
+        if (emailInput) {
+            const applyEmail = () => {
+                const addr = (emailInput.value || '').trim().toLowerCase();
+                if (!addr) { this._renderTypeaheadPills(prefix); return; }
+                if (!addr.includes('@')) { notificationService.showError('Enter a valid email address'); emailInput.focus(); return; }
+                ts.updateOption(val, { ...ts.options[val], email: addr });
+                this._syncTypeaheadState(prefix);
+                this._renderTypeaheadPills(prefix);
+            };
+            emailInput.addEventListener('click', (e) => e.stopPropagation());
+            emailInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); applyEmail(); }
+                else if (e.key === 'Escape') { e.preventDefault(); this._renderTypeaheadPills(prefix); }
+            });
+            chip.querySelector('.pill-email-confirm').addEventListener('click', (e) => { e.stopPropagation(); applyEmail(); });
+            // A keyed pill with no email opens straight into entering one.
+            emailInput.focus();
+        }
+    }
+
+    // Inline "add a key" editor for a keyless pill: replace the pill with a
+    // small npub/hex input + confirm/cancel. On a valid key, re-key the
+    // recipient (drop the keyless entry, add a keyed one with the same email).
+    _openPillKeyEditor(prefix, chip) {
+        const ts = (this._recipientTs || {})[prefix];
+        if (!ts || !chip) return;
+        const keylessValue = chip.dataset.value;
+        const opt = ts.options[keylessValue] || {};
+        const email = opt.email || keylessValue;
+        chip.classList.add('editing');
+        // Keep the email on the left; enter its Nostr key on the right.
+        chip.innerHTML = `<span class="pill-email-value" title="${Utils.escapeHtml(email)}">${Utils.escapeHtml(email)}</span><input type="text" class="pill-npub-input" placeholder="npub1… or hex pubkey" autocorrect="off" autocapitalize="off" spellcheck="false"><button type="button" class="pill-npub-confirm" title="Add key" aria-label="Add key">✓</button><button type="button" class="pill-npub-cancel" title="Cancel" aria-label="Cancel">✕</button>`;
+        const input = chip.querySelector('.pill-npub-input');
+        const apply = () => {
+            const raw = (input.value || '').trim();
+            if (!raw) { this._renderTypeaheadPills(prefix); return; }
+            let hex = null;
+            try { hex = window.CryptoService._npubToHex(raw); } catch (e) { hex = null; }
+            if (!hex || !/^[0-9a-fA-F]{64}$/.test(hex)) {
+                notificationService.showError('Enter a valid npub1… or 64-character hex public key');
+                input.focus();
+                return;
+            }
+            ts.removeItem(keylessValue);
+            // Re-add keyed with the same email; onChange re-renders the pills.
+            this._addTypeaheadRecipient(prefix, email, hex, opt.name || '');
+        };
+        const cancel = () => this._renderTypeaheadPills(prefix);
+        chip.querySelector('.pill-npub-confirm').addEventListener('click', (e) => { e.stopPropagation(); apply(); });
+        chip.querySelector('.pill-npub-cancel').addEventListener('click', (e) => { e.stopPropagation(); cancel(); });
+        input.addEventListener('click', (e) => e.stopPropagation());
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); apply(); }
+            else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+        });
+        input.focus();
+    }
+
+    // A learned (pubkey → email) binding for display: a verified address (from a
+    // signed, transport-authed received message) wins; otherwise an address we've
+    // sent to before (user-asserted, unverified). Returns {email, verified} | null.
+    _learnedEmailFor(pubkey) {
+        const v = this._verifiedEmailMap;
+        if (v && v.has(pubkey)) return { email: v.get(pubkey), verified: true };
+        const s = this._sentEmailMap;
+        if (s && s.has(pubkey)) return { email: s.get(pubkey), verified: false };
+        return null;
+    }
+
+    // Load ALL keyed contacts (public or private, with or without an email) into
+    // a typeahead as selectable options, keyed by PUBKEY so two contacts sharing
+    // an address stay distinct. A contact with no profile email still shows a
+    // learned address when we have one (verified > sent-before), or stays
+    // encrypt-to-pubkey. Selected non-contact/keyless options are preserved.
+    _populateTypeaheadOptions(prefix) {
+        const ts = (this._recipientTs || {})[prefix];
+        if (!ts) return;
+        this._ensureLearnedEmailMaps();
+        const selected = ts.items.slice();
+        const prevOpts = {};
+        selected.forEach(v => { if (ts.options[v]) prevOpts[v] = { ...ts.options[v] }; });
+        ts.clearOptions();
+        const seen = new Set();
+        (appState.getContacts() || []).forEach(c => {
+            if (!c.pubkey || seen.has(c.pubkey)) return;
+            seen.add(c.pubkey);
+            let email = (c.email || '').trim().toLowerCase();
+            let emailVerified = false, emailFromSent = false;
+            if (!email) {
+                const l = this._learnedEmailFor(c.pubkey);
+                if (l) { email = l.email; emailVerified = l.verified; emailFromSent = !l.verified; }
+            }
+            ts.addOption({ value: c.pubkey, email, name: c.name || '', pubkey: c.pubkey, emailVerified, emailFromSent });
+        });
+        // Restore options for selected items the contact loop didn't re-create
+        // (keyed non-contacts, and keyless typed emails), filling learned emails.
+        selected.forEach(v => {
+            if (ts.options[v]) return;
+            const prev = prevOpts[v];
+            if (prev) {
+                if (prev.pubkey && !prev.email) {
+                    const l = this._learnedEmailFor(prev.pubkey);
+                    if (l) { prev.email = l.email; prev.emailVerified = l.verified; prev.emailFromSent = !l.verified; }
+                }
+                ts.addOption(prev);
+            } else {
+                ts.addOption({ value: v, email: v, name: '', pubkey: '' });
+            }
+        });
+        ts.refreshOptions(false);
+        // Newly-filled emails must reach the send model + pills.
+        this._syncTypeaheadState(prefix);
+        this._renderTypeaheadPills(prefix);
+    }
+
+    // Load both learned-email maps once per session (verified received, and
+    // sent-to), then re-populate the typeaheads so dropdown options and pills
+    // reflect the learned addresses.
+    _ensureLearnedEmailMaps() {
+        if (this._learnedEmailMapsLoaded || this._learnedEmailMapsLoading) return;
+        if (!window.TauriService || !window.TauriService.getVerifiedEmailsMap) return;
+        this._learnedEmailMapsLoading = true;
+        const toBareMap = (raw) => {
+            const m = new Map();
+            Object.entries(raw || {}).forEach(([pk, val]) => {
+                const bare = this._bareEmail(String(val).split(',')[0]);
+                if (bare && bare.includes('@')) m.set(pk, bare);
+            });
+            return m;
+        };
+        Promise.all([
+            window.TauriService.getVerifiedEmailsMap().catch(() => ({})),
+            window.TauriService.getSentEmailAddressesMap().catch(() => ({})),
+        ]).then(([verifiedRaw, sentRaw]) => {
+            this._verifiedEmailMap = toBareMap(verifiedRaw);
+            this._sentEmailMap = toBareMap(sentRaw);
+            this._learnedEmailMapsLoaded = true;
+            this._learnedEmailMapsLoading = false;
+            if (this._verifiedEmailMap.size || this._sentEmailMap.size) {
+                ['composeTo', 'composeCc'].forEach(p => this._populateTypeaheadOptions(p));
+            }
+        }).catch(() => {
+            this._verifiedEmailMap = new Map();
+            this._sentEmailMap = new Map();
+            this._learnedEmailMapsLoaded = true;
+            this._learnedEmailMapsLoading = false;
+        });
+    }
+
+    // Mirror a typeahead's selection into the {email, pubkey} read model the
+    // send path consumes. Pubkey comes ONLY from the chosen option (a contact
+    // pick carries it; a typed address does not) — never from the email string.
+    _syncTypeaheadState(prefix) {
+        const ts = (this._recipientTs || {})[prefix];
+        if (!ts) return;
+        this._recipientLists = this._recipientLists || {};
+        this._recipientLists[prefix] = ts.items.map(val => {
+            const opt = ts.options[val] || {};
+            // Keyed recipient: pubkey from the option, email optional ('' when the
+            // contact has none). Keyless: the item value IS the typed email.
+            if (opt.pubkey) return { email: opt.email || '', pubkey: opt.pubkey };
+            return { email: opt.email || val, pubkey: null };
+        });
+        // Keep the legacy single-To inputs mirrored to the first To recipient so
+        // draft/preview/DM read paths that still expect one To keep working.
+        if (prefix === 'composeTo') this._syncToMirror();
+    }
+
+    // Programmatically add a recipient to a typeahead (used by reply/draft/
+    // contact-click prefill). A pubkey (from an allowed anchor — signature,
+    // DM id, draft, or explicit contact) makes a keyed option; otherwise the
+    // address is added keyless. Triggers onChange → state sync + pill render.
+    _addTypeaheadRecipient(prefix, email, pubkey, name) {
+        const ts = (this._recipientTs || {})[prefix];
+        if (!ts) return;
+        email = (email || '').trim().toLowerCase();
+        pubkey = (pubkey || '').trim();
+        if (pubkey) {
+            // Keyed: email optional. Update the option's email if we now have one.
+            if (!ts.options[pubkey]) ts.addOption({ value: pubkey, email, name: name || '', pubkey });
+            else if (email) ts.updateOption(pubkey, { ...ts.options[pubkey], email });
+            ts.addItem(pubkey);
+        } else if (email) {
+            if (!ts.options[email]) ts.addOption({ value: email, email, name: '', pubkey: '' });
+            ts.addItem(email);
+        }
+    }
+
+    // Mirror composeTo[0] into the hidden legacy single-To inputs
+    // (#to-address / #recipient-pubkey-value) and selectedNostrContact, so the
+    // existing draft-save, header-preview and DM-visibility code — which still
+    // reads one To — reflects the primary recipient without a rewrite.
+    _syncToMirror() {
+        const primary = (this._recipientState('composeTo') || [])[0] || null;
+        try { domManager.setValue('toAddress', primary ? primary.email : ''); } catch (e) {}
+        const pkInput = document.getElementById('recipient-pubkey-value');
+        if (pkInput) pkInput.value = primary && primary.pubkey ? primary.pubkey : '';
+        if (primary && primary.pubkey) {
+            this.selectedNostrContact = (appState.getContacts() || []).find(c => c.pubkey === primary.pubkey)
+                || { email: primary.email, pubkey: primary.pubkey, name: '' };
+        } else {
+            this.selectedNostrContact = null;
+        }
+        try { this.updateDmCheckboxVisibility && this.updateDmCheckboxVisibility(); } catch (e) {}
+    }
+
+    // ── Backward-compatible Cc aliases (call sites elsewhere use these) ──
+    _setupCcTypeahead() { this._setupTypeahead('composeCc'); }
+    _renderCcPills() { this._renderTypeaheadPills('composeCc'); }
+    _populateCcOptions() { this._populateTypeaheadOptions('composeCc'); }
+    _syncCcFromTs() { this._syncTypeaheadState('composeCc'); }
+
+    // ── To typeahead: same widget, wired for the To recipient list ──
+    _setupToTypeahead() { this._setupTypeahead('composeTo'); }
+
+    _setupRecipientPicker(kind) {
+        this._pickerWired = this._pickerWired || {};
+        if (this._pickerWired[kind]) return;
+        this._pickerWired[kind] = true;
+        const sel = document.getElementById(`${kind}-contact-select`);
+        if (sel) {
+            sel.addEventListener('change', () => {
+                const pubkey = sel.value;
+                sel.value = '';
+                if (!pubkey) return;
+                const c = (appState.getContacts() || []).find(x => x.pubkey === pubkey);
+                if (c && c.email) this.addRecipient(kind, c.email, c.pubkey);
+            });
+        }
+        const addBtn = document.getElementById(`${kind}-add-manual-btn`);
+        if (addBtn) {
+            addBtn.addEventListener('click', () => {
+                const em = document.getElementById(`${kind}-manual-email`);
+                const pk = document.getElementById(`${kind}-manual-npub`);
+                if (this.addRecipient(kind, em?.value, pk?.value)) {
+                    if (em) em.value = '';
+                    if (pk) pk.value = '';
+                }
+            });
+        }
+    }
+
+    _populateRecipientSelect(kind) {
+        const sel = document.getElementById(`${kind}-contact-select`);
+        if (!sel) return;
+        const contacts = (appState.getContacts() || []).filter(c => c.email && c.pubkey);
+        sel.innerHTML = '<option value="">Add a contact…</option>' + contacts.map(c =>
+            `<option value="${Utils.escapeHtml(c.pubkey)}">${Utils.escapeHtml(c.name || c.email)} — ${Utils.escapeHtml(c.email)}</option>`
+        ).join('');
+    }
+
+    addRecipient(kind, email, pubkey) {
+        email = (email || '').trim().toLowerCase();
+        pubkey = (pubkey || '').trim();
+        if (!email || !email.includes('@')) {
+            notificationService.showError('Enter a valid email address');
+            return false;
+        }
+        // To: signatories must be keyed (encrypted to them). Cc: viewers may be
+        // keyless — they receive the message but can't decrypt it (escrow/witness).
+        if (kind === 'to' && !pubkey) {
+            notificationService.showError('A To: signatory needs a Nostr pubkey');
+            return false;
+        }
+        const list = this._recipientState(kind);
+        if (list.some(r => r.email === email)) {
+            notificationService.showWarning('That recipient is already added');
+            return false;
+        }
+        list.push({ email, pubkey: pubkey || null });
+        this._renderRecipientChips(kind);
+        return true;
+    }
+
+    _renderRecipientChips(kind) {
+        const el = document.getElementById(`${kind}-recipients-list`);
+        if (!el) return;
+        const list = this._recipientState(kind);
+        el.innerHTML = list.map((r, i) => {
+            const keyless = !r.pubkey;
+            const title = keyless ? 'No Nostr key — will receive but cannot decrypt' : Utils.escapeHtml(r.pubkey);
+            const tag = keyless ? ' <span class="recipient-chip-nokey" title="No Nostr key">(no key)</span>' : '';
+            return `<span class="recipient-chip${keyless ? ' keyless' : ''}" title="${title}">${Utils.escapeHtml(r.email)}${tag}<button type="button" class="recipient-chip-remove" data-idx="${i}" aria-label="Remove ${Utils.escapeHtml(r.email)}">×</button></span>`;
+        }).join('');
+        el.querySelectorAll('.recipient-chip-remove').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const idx = parseInt(btn.dataset.idx, 10);
+                if (!isNaN(idx)) {
+                    list.splice(idx, 1);
+                    this._renderRecipientChips(kind);
+                }
+            });
+        });
+    }
+
+    // Render the "M of N signed" agreement status banner at the top of the email
+    // detail view (spec §11.5 / §6.2.6). No-op when the message is not an agreement.
+    async renderAgreementStatus(armorBody) {
+        try {
+            const container = document.getElementById('email-detail-content');
+            if (!container || !armorBody) return;
+            const prior = container.querySelector('.agreement-status');
+            if (prior) prior.remove();
+
+            const status = await TauriService.agreementStatus(armorBody).catch(() => null);
+            if (!status || !status.n) return;
+
+            const contacts = appState.getContacts();
+            const nameFor = (hex) => {
+                const c = contacts.find(c => {
+                    if (!c.pubkey) return false;
+                    if (c.pubkey === hex) return true;
+                    try { return this._npubToHex(c.pubkey) === hex; } catch (e) { return false; }
+                });
+                return c?.name || (hex.substring(0, 8) + '…');
+            };
+
+            const consented = new Set(status.consentedSigners || []);
+            const signersList = (status.requiredSigners || []).map(pk => {
+                const signed = consented.has(pk);
+                return `<li class="${signed ? 'signed' : 'pending'}">${signed ? '✓' : '○'} ${Utils.escapeHtml(nameFor(pk))}</li>`;
+            }).join('');
+
+            // Verified email↔npub bindings provable from this thread (issue #102),
+            // from my perspective as the challenge issuer. Each is a clickable
+            // "Verified identity" badge (explained on click).
+            let bindings = [];
+            try {
+                const myPk = appState.getKeypair()?.public_key;
+                if (myPk) bindings = await TauriService.verifyEmailBinding(armorBody, myPk).catch(() => []);
+            } catch (e) { /* best-effort */ }
+            const bindingHtml = (bindings || []).map(b =>
+                `<div class="binding-indicator trust-badge" title="Click to learn what this means">🔗 Verified identity: ${Utils.escapeHtml(b.email)} ↔ ${Utils.escapeHtml(nameFor(b.pubkey))}</div>`
+            ).join('');
+
+            const complete = !!status.complete;
+            const titleText = complete
+                ? `Agreement complete — ${status.m} of ${status.n} signatories signed`
+                : `${status.m} of ${status.n} signatories signed`;
+            const shortH = status.documentHash ? (status.documentHash.substring(0, 10) + '…') : '';
+
+            const html = `
+                <div class="agreement-status ${complete ? '' : 'incomplete'}">
+                    <div class="agreement-status-title">${complete ? '✓' : '⏳'} ${Utils.escapeHtml(titleText)}</div>
+                    ${shortH ? `<div class="agreement-hash" title="${Utils.escapeHtml(status.documentHash)}">Document ${Utils.escapeHtml(shortH)}</div>` : ''}
+                    ${signersList ? `<ul class="agreement-signers">${signersList}</ul>` : ''}
+                    ${bindingHtml}
+                </div>`;
+            container.insertAdjacentHTML('afterbegin', html);
+        } catch (e) {
+            console.warn('[JS] renderAgreementStatus failed:', e);
+        }
+    }
+
+    // Explain a trust badge in a modal (wired by the capture-phase click handler
+    // registered at the bottom of this file). `key` is the badge type.
+    showTrustBadgeExplanation(key) {
+        const E = {
+            'signed': ['Signed', "This message carries a valid Nostr signature from this contact's key — the content hasn't been altered since they signed it. (It verifies the key, not necessarily the email address.)"],
+            'unsigned': ['Unsigned', "No Nostr signature was found, so the sender's identity and the content's integrity can't be cryptographically verified."],
+            'email-verified': ['Email Verified', "The sending mail server passed transport authentication (DMARC/DKIM/SPF), so the From: domain isn't spoofed. This verifies the email domain — not the Nostr identity."],
+            'email-unverified': ['Email Unverified', "Transport authentication (DMARC/DKIM/SPF) failed or was absent, so the From: address may be spoofed."],
+            'binding-verified': ['Verified identity', "This contact proved control of both their Nostr key and their email address by signing a reply to a challenge (a SecureJoin-style handshake), so the email ↔ key pairing is confirmed — not just self-asserted."],
+        };
+        const [title, body] = E[key] || ['Trust badge', ''];
+        const html = `<p style="margin:0 0 1em;">${Utils.escapeHtml(body)}</p>` +
+            `<div style="text-align:right;"><button class="btn btn-secondary" onclick="window.app.hideModal()">Got it</button></div>`;
+        if (window.app && typeof window.app.showModal === 'function') {
+            window.app.showModal(title, html);
+        } else {
+            notificationService.showSuccess(`${title}: ${body}`);
+        }
+    }
+
+    // Preview email headers without sending
+    async previewEmailHeaders() {
+        console.log('[JS] previewEmailHeaders function called');
+
+        if (!appState.hasSettings()) {
+            notificationService.showError('Please configure your email settings first');
+            return;
+        }
+
+        // Reflect the ACTUAL recipient list (the To/Cc typeaheads), and route the
+        // preview the same way sendEmail does: multiple To, any Cc, or a keyed To
+        // with no email → the group-envelope preview (so it shows every recipient
+        // and the real encrypted RECIPIENTS body). Only a single To that has an
+        // email uses the legacy 1:1 preview below.
+        this._syncTypeaheadState('composeTo');
+        this._syncTypeaheadState('composeCc');
+        const _toAll = this._recipientState('composeTo') || [];
+        const _ccAll = this._recipientState('composeCc') || [];
+        const _subj = domManager.getValue('subject')?.trim() || '';
+        const _body = domManager.getValue('messageBody')?.trim() || '';
+        const _multiPath = _toAll.length > 1 || _ccAll.length > 0 || !(_toAll[0] && _toAll[0].email);
+        if (_toAll.length && _subj && _body && _multiPath) {
+            return this._previewMultiRecipient(_toAll, _ccAll, _subj, _body);
+        }
+
         const toAddress = domManager.getValue('toAddress')?.trim() || '';
         const subject = domManager.getValue('subject')?.trim() || '';
         const body = domManager.getValue('messageBody')?.trim() || '';
@@ -2314,15 +3423,10 @@ class EmailService {
             let previewBody = body;
             let nostrNpub = null;
             
-            // Try to find contact if autoencrypt is enabled
-            let contactForEncryption = this.selectedNostrContact;
-            if (autoEncrypt && !contactForEncryption) {
-                const contacts = appState.getContacts();
-                const contactByEmail = contacts.find(c => c.email && c.email.toLowerCase() === toAddress.toLowerCase());
-                if (contactByEmail) {
-                    contactForEncryption = contactByEmail;
-                }
-            }
+            // Contact for the encrypted preview comes only from the mirrored
+            // To selection (an explicit contact pick), never from an email-string
+            // lookup — one address can map to many pubkeys.
+            const contactForEncryption = this.selectedNostrContact;
             
             // Encrypt in memory if autoencrypt is enabled and contact is found
             // This does NOT modify the DOM fields - only encrypts for preview
@@ -2394,6 +3498,148 @@ class EmailService {
             console.error('[JS] Error in previewEmailHeaders function:', error);
             notificationService.showError('Failed to preview headers: ' + error);
         }
+    }
+
+    // Build the preview for a multi-recipient send — the group envelope (encrypted)
+    // or a plaintext multi-recipient message — so Content lists every To/Cc and Raw
+    // shows the actual bytes that will be transmitted. Mirrors the routing/encryption
+    // decision in sendMultiRecipientEmail.
+    async _previewMultiRecipient(toAll, ccAll, subject, body) {
+        try {
+            const settings = appState.getSettings();
+            const from = settings.email_address || '';
+            const messageId = this.generateAndStoreMessageId();
+            const encryptBtn = domManager.get('encryptBtn');
+            const wantsEncrypt = (encryptBtn && encryptBtn.dataset.encrypted === 'true')
+                || (settings.automatically_encrypt !== false);
+            const allToKeyed = toAll.every(r => r.pubkey);
+
+            // SMTP-visible recipients: only those with an address (pubkey-only get
+            // a CEK stanza but no header line — matches send_agreement_email).
+            const toHeader = toAll.filter(r => r.email).map(r => r.email);
+            const ccHeader = ccAll.filter(r => r.email).map(r => r.email);
+
+            // Mirror sendMultiRecipientEmail's decision so the preview matches what
+            // send would actually do (including its failure cases).
+            if (wantsEncrypt) {
+                if (!appState.hasKeypair()) {
+                    notificationService.showError('A Nostr keypair is required to send encrypted mail');
+                    return;
+                }
+                if (!allToKeyed) {
+                    const who = toAll.filter(r => !r.pubkey).map(r => r.email || '(no address)').join(', ');
+                    notificationService.showError(`Encrypting requires every To recipient to have a Nostr key. ${who} — pick them from contacts, or move them to Cc.`);
+                    return;
+                }
+                let useTls = settings.use_tls;
+                if (settings.smtp_host === 'smtp.gmail.com' && !useTls) useTls = true;
+                const emailConfig = {
+                    email_address: settings.email_address, password: settings.password,
+                    smtp_host: settings.smtp_host, smtp_port: settings.smtp_port,
+                    imap_host: settings.imap_host, imap_port: settings.imap_port, use_tls: useTls,
+                };
+                let profileName = '';
+                try { profileName = window.profileManager?.getAccountDisplayName(appState.getKeypair()?.public_key) || ''; } catch (e) {}
+                const to = toAll.map(r => ({ email: r.email || '', pubkey: r.pubkey }));
+                const cc = ccAll.filter(r => r.pubkey).map(r => ({ email: r.email || '', pubkey: r.pubkey }));
+                const glossiaEncoding = settings.glossia_encoding_body || null;
+                const signBtn = domManager.get('signBtn');
+                const sign = (settings.automatically_sign !== false) || (signBtn && signBtn.dataset.signed === 'true');
+                // Same call the send path makes (is_agreement=false), but compose-only.
+                const composed = await TauriService.composeAgreement(
+                    emailConfig, subject, body, to, cc, /* encrypted */ true, /* originatorConsents */ false,
+                    profileName, glossiaEncoding, null, /* isAgreement */ false, /* encryptSubject */ true, sign
+                );
+                this._showComposedPreviewModal({
+                    from, toAll, ccAll, subject: (composed && composed.subject) || subject,
+                    messageId, bodyText: (composed && composed.armor) || '', isEncrypted: true, toHeader, ccHeader,
+                });
+                return;
+            }
+
+            // Plaintext multi-recipient (no envelope) — headers + cleartext body.
+            if (!toHeader.length) {
+                notificationService.showError('No email address to send to. Add an email to a To recipient, or enable encryption to send to a pubkey-only contact.');
+                return;
+            }
+            this._showComposedPreviewModal({
+                from, toAll, ccAll, subject, messageId,
+                bodyText: (this._plainBody || body), isEncrypted: false, toHeader, ccHeader,
+            });
+        } catch (e) {
+            console.error('[JS] multi-recipient preview failed:', e);
+            notificationService.showError('Failed to preview: ' + e);
+        }
+    }
+
+    // Render the Content/Raw modal for a composed multi-recipient message.
+    _showComposedPreviewModal(o) {
+        const escHtml = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const recipLine = (list) => (list || []).map(r =>
+            r.email ? escHtml(r.email) : `${escHtml(this._shortNpub(r.pubkey))} <em>(no email)</em>`).join(', ');
+        const ccDisplay = (o.ccAll && o.ccAll.length) ? recipLine(o.ccAll) : '';
+        const keyCount = (o.toAll ? o.toAll.filter(r => r.pubkey).length : 0)
+            + (o.ccAll ? o.ccAll.filter(r => r.pubkey).length : 0);
+        const lockNote = o.isEncrypted
+            ? ` <span class="signature-indicator verified"><i class="fas fa-lock"></i> Encrypted · ${keyCount} recipient key(s)</span>`
+            : '';
+        const envelopeHtml = `
+            <div style="margin-bottom:1em;font-size:0.95em;line-height:1.8;">
+                <div><strong>From:</strong> ${escHtml(o.from)}${lockNote}</div>
+                <div><strong>To:</strong> ${recipLine(o.toAll)}</div>
+                ${ccDisplay ? `<div><strong>Cc:</strong> ${ccDisplay}</div>` : ''}
+                <div><strong>Subject:</strong> ${escHtml(o.subject)}</div>
+            </div>
+            <hr style="border:none;border-top:1px solid #ccc;margin:0 0 1em;">`;
+        const bodyBlock = o.isEncrypted
+            ? `<pre style="white-space:pre-wrap;word-break:break-word;font-size:0.8em;">${escHtml(o.bodyText)}</pre>`
+            : `<div style="font-family:sans-serif;line-height:1.6;">${escHtml(o.bodyText).replace(/\n/g, '<br>')}</div>`;
+        const contentHtml = envelopeHtml + bodyBlock;
+
+        // Raw: the SMTP header lines that will actually be emitted (recipients
+        // without an address are omitted, matching the backend) + the body bytes.
+        const headerLines = [`From: ${o.from}`, `To: ${(o.toHeader || []).join(', ')}`];
+        if (o.ccHeader && o.ccHeader.length) headerLines.push(`Cc: ${o.ccHeader.join(', ')}`);
+        headerLines.push(`Subject: ${o.subject}`);
+        if (o.messageId) headerLines.push(`Message-ID: ${o.messageId}`);
+        const rawSource = escHtml(headerLines.join('\n')) + '\n\n' + escHtml(o.bodyText);
+
+        const modalHtml = `
+            <div class="modal-overlay" id="headersModal">
+                <div class="modal-content modal">
+                    <div class="modal-header">
+                        <h3>Preview</h3>
+                        <div class="preview-tabs">
+                            <button class="preview-tab active" data-tab="content">Content</button>
+                            <button class="preview-tab" data-tab="raw">Raw</button>
+                        </div>
+                        <button class="modal-close" onclick="document.getElementById('headersModal').remove()">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="preview-tab-panel active" data-panel="content">${contentHtml}</div>
+                        <div class="preview-tab-panel" data-panel="raw">
+                            <div class="headers-preview"><pre>${rawSource}</pre></div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-primary" onclick="document.getElementById('headersModal').remove(); document.getElementById('send-btn').click();"><i class="fas fa-paper-plane"></i> Send</button>
+                        <button class="btn btn-secondary" onclick="document.getElementById('headersModal').remove()">Close</button>
+                    </div>
+                </div>
+            </div>`;
+
+        const existing = document.getElementById('headersModal');
+        if (existing) existing.remove();
+        document.body.insertAdjacentHTML('beforeend', modalHtml);
+        const modal = document.getElementById('headersModal');
+        modal.querySelectorAll('.preview-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                modal.querySelectorAll('.preview-tab').forEach(t => t.classList.remove('active'));
+                modal.querySelectorAll('.preview-tab-panel').forEach(p => p.classList.remove('active'));
+                tab.classList.add('active');
+                modal.querySelector(`.preview-tab-panel[data-panel="${tab.dataset.tab}"]`).classList.add('active');
+            });
+        });
     }
 
     // Show headers and content preview in a tabbed modal
@@ -3554,8 +4800,8 @@ class EmailService {
             // Batch-decrypt uncached encrypted emails in a single IPC call
             const uncachedEncrypted = filteredEmails.filter(email => {
                 if (this._previewCache.has(`inbox-${email.id}`)) return false;
-                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-                return firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+                return firstBeginMatch && /ENCRYPTED/.test(firstBeginMatch[1]);
             });
 
             if (uncachedEncrypted.length > 0 && appState.getKeypair()) {
@@ -3785,8 +5031,8 @@ class EmailService {
             // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
             // Nested blocks (quoted replies) may be a different type — only the
             // outermost block determines whether this is an encrypted or signed message.
-            const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-            const outerIsEncrypted = firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+            const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+            const outerIsEncrypted = firstBeginMatch && /ENCRYPTED/.test(firstBeginMatch[1]);
 
             if (outerIsEncrypted) {
                 const keypair = appState.getKeypair();
@@ -4037,7 +5283,7 @@ class EmailService {
         // placeholder string; either way it isn't meaningful to display while
         // we wait for decryption. Substitute a clear "Decrypting…" hint for
         // the subject and blank the preview until the full render lands.
-        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
         const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
         const previewText = isEncrypted ? '' : 'Loading...';
 
@@ -4293,7 +5539,9 @@ class EmailService {
                 const senderPubkey = email.sender_pubkey || email.nostr_pubkey; // Fallback for backward compatibility
                 console.log('Sender pubkey for email:', senderPubkey);
                 // Detect encrypted body via armor regex
-                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
+                // Match pairwise (NIP-XX ENCRYPTED BODY) and the generic multi-recipient
+                // envelope (BEGIN NOSTR ENCRYPTED BODY, agreements §10) so both decrypt.
+                const encryptedBodyMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY)\s*-{3,}/);
                 let decryptedSubject = email.subject;
                 let decryptedBody = emailBody;
                 const keypair = appState.getKeypair();
@@ -4362,6 +5610,7 @@ class EmailService {
                             }
 
                             await updateDetail(decryptedSubject, decryptedBody, manifestResult, result.success, sigResults, decryptResults);
+                            this.renderAgreementStatus(emailBody);
                         } catch (err) {
                             console.error('[JS] Backend decrypt_email_body error:', err);
                             await updateDetail('Unable to decrypt', 'Your private key could not decrypt this message. The email may not have been encrypted for your keypair.', null, true);
@@ -4383,6 +5632,7 @@ class EmailService {
                             displayBody = signedMsg.plaintextBody;
                         }
                         await updateDetail(decryptedSubject, displayBody, null, false, sigResults);
+                        this.renderAgreementStatus(emailBody);
                     })();
                 }
                 const updateDetail = async (subject, body, cachedManifestResult, wasDecrypted = false, inlineSigResult = null, decryptResults = null) => {
@@ -4904,85 +6154,35 @@ ${attachmentsHtml}
                     this._replyReferences = refs ? `${refs} ${msgId}` : msgId;
                 }
 
-                domManager.setValue('toAddress', replyTo);
                 domManager.setValue('subject', replySubject);
                 domManager.setValue('messageBody', replyBody);
-                
-                // Get the sender's pubkey (recipient when replying)
-                let senderPubkey = email.sender_pubkey || email.nostr_pubkey;
-                const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
-                const pubkeyValue = document.getElementById('recipient-pubkey-value');
-                
-                // If no pubkey in email, try to look it up by email address
-                if (!senderPubkey && replyTo) {
-                    try {
-                        if (!this._contactsByPubkey) this._buildContactIndex();
-                        const senderContact = this._findContact(null, replyTo);
-                        if (senderContact && senderContact.pubkey) {
-                            senderPubkey = senderContact.pubkey;
-                        }
-                    } catch (e) {
-                        console.log('[JS] Could not look up pubkey by email:', e);
-                    }
-                }
 
+                // Recipient pubkey is anchored ONLY from the message itself
+                // (stored sender pubkey / signature) — never resolved from the
+                // reply-to email string (one email can map to many pubkeys).
+                const senderPubkey = email.sender_pubkey || email.nostr_pubkey || '';
+                let senderName = '';
                 if (senderPubkey) {
-                    // Try to find the contact by pubkey
                     if (!this._contactsByPubkey) this._buildContactIndex();
                     const senderContact = this._findContact(senderPubkey, null);
-                    
-                    if (senderContact) {
-                        // Set as selected Nostr contact
-                        this.selectedNostrContact = senderContact;
-                        domManager.setValue('nostrContactSelect', senderPubkey);
-                        
-                        // Display the recipient pubkey
-                        if (pubkeyDisplay && pubkeyValue) {
-                            pubkeyValue.value = senderPubkey;
-                            // pubkey field is always visible
-                        }
-                        
-                        // Style the toAddress input for Nostr encryption
-                        const toAddressInput = domManager.get('toAddress');
-                        if (toAddressInput) {
-                            toAddressInput.style.borderColor = '#667eea';
-                            toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
-                        }
-                    } else {
-                        // Pubkey exists but contact not found - still display it
-                        this.selectedNostrContact = null;
-                        domManager.setValue('nostrContactSelect', '');
-                        
-                        // Display the recipient pubkey even if contact not found
-                        if (pubkeyDisplay && pubkeyValue) {
-                            pubkeyValue.value = senderPubkey;
-                            // pubkey field is always visible
-                        }
-                        
-                        // Style the toAddress input for Nostr encryption
-                        const toAddressInput = domManager.get('toAddress');
-                        if (toAddressInput) {
-                            toAddressInput.style.borderColor = '#667eea';
-                            toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
-                        }
-                    }
+                    if (senderContact) senderName = senderContact.name || '';
+                }
+
+                // Reset the To typeahead to just this reply recipient. Adding it
+                // fires onChange → _syncToMirror, which updates the legacy inputs
+                // and selectedNostrContact.
+                this._setupToTypeahead();
+                const toTs = (this._recipientTs || {}).composeTo;
+                this._recipientLists = this._recipientLists || {};
+                this._recipientLists.composeTo = [];
+                if (toTs) toTs.clear(true);
+                if (toTs) {
+                    this._addTypeaheadRecipient('composeTo', replyTo, senderPubkey, senderName);
                 } else {
-                    // No pubkey available - clear any selected Nostr contact
-                    domManager.setValue('nostrContactSelect', '');
-                    this.selectedNostrContact = null;
-                    
-                    // Hide the pubkey display
-                    if (pubkeyDisplay) {
-                        // pubkey field is always visible
-                    }
-                    
-                    // Reset the toAddress input styling
-                    const toAddressInput = domManager.get('toAddress');
-                    if (toAddressInput) {
-                        toAddressInput.style.borderColor = '';
-                        toAddressInput.style.backgroundColor = '';
-                        toAddressInput.classList.remove('hidden');
-                    }
+                    // Tom Select unavailable — fall back to the legacy input.
+                    domManager.setValue('toAddress', replyTo);
+                    const pkInput = document.getElementById('recipient-pubkey-value');
+                    if (pkInput) pkInput.value = senderPubkey;
                 }
             }, 100);
         } catch (error) {
@@ -5093,7 +6293,7 @@ ${attachmentsHtml}
             // ciphertext / a placeholder, so start with "Decrypting…" until a
             // per-message task lands a real decrypted subject. Cleartext threads
             // just keep their stored subject as the default.
-            const firstHasArmor = !!(threadEmails[0].body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(threadEmails[0].body));
+            const firstHasArmor = !!(threadEmails[0].body && /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(threadEmails[0].body));
             const decryptingPlaceholder = 'Decrypting…';
             let threadSubjectText = firstHasArmor ? decryptingPlaceholder : threadEmails[0].subject;
             let lastDecryptedSubject = null;
@@ -5161,7 +6361,7 @@ ${attachmentsHtml}
                     const isSent = email._isSentByUser;
                     const emailBody = email.body || '';
                     const bodyBytes = emailBody.length;
-                    const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
+                    const encryptedMatch = emailBody.replace(/\r\n/g, '\n').match(/-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
 
                     let displayBody = emailBody;
                     let displaySubject = email.subject;
@@ -6962,116 +8162,57 @@ ${attachmentsHtml}
             this._subjectCiphertext = null;
 
             if (shouldUseManifest) {
-                // Use manifest-based encryption when attachments are present or body is large
+                // Manifest-based encryption (attachments present or large body).
+                // The capnp manifest + body NIP-encryption are built in Rust
+                // (crypto consolidated there; spec §11.2). Subject NIP-encryption,
+                // glossia encoding, and signing stay here, unchanged.
                 const reason = hasAttachments ? 'has attachments' : 'large body (>64KB)';
-                console.log(`[JS] Using manifest-based encryption (${reason})`);
-                
-                // Create the manifest structure
-                const manifest = {
-                    body: {},
-                    attachments: []
-                };
-                
-                // 1. Encrypt body with AES and store in manifest
-                if (body) {
-                    console.log('[JS] Encrypting body with AES...');
-                    const bodyAesKey = await this.generateSymmetricKey();
-                    // Convert UTF-8 string to base64 properly (handles multi-byte characters)
-                    const bodyBase64 = btoa(unescape(encodeURIComponent(body)));
-                    const encryptedBodyData = await this.encryptWithAES(bodyBase64, bodyAesKey);
-                    const bodySha256 = await this.calculateSHA256(encryptedBodyData);
-                    
-                    manifest.body = {
-                        ciphertext: encryptedBodyData,
-                        cipher_sha256: bodySha256,
-                        cipher_size: encryptedBodyData.length,
-                        key_wrap: bodyAesKey // Unencrypted AES key (manifest will be encrypted)
-                    };
-                    console.log('[JS] Body encrypted with AES, size:', encryptedBodyData.length);
-                }
-                
-                // 2. Encrypt attachments with AES and create manifest entries
-                for (let i = 0; i < this.attachments.length; i++) {
-                    const attachment = this.attachments[i];
-                    const opaqueId = `a${i + 1}`;
-                    
-                    console.log(`[JS] Encrypting attachment ${opaqueId}: ${attachment.name}`);
-                    
-                    // Generate AES key for this attachment
-                    const attachmentAesKey = await this.generateSymmetricKey();
-                    
-                    // Encrypt attachment data with AES (with padding)
-                    const encryptedAttachmentData = await this.encryptWithAES(attachment.data, attachmentAesKey, true);
-                    const attachmentSha256 = await this.calculateSHA256(encryptedAttachmentData);
-                    
-                    // Calculate padded size for display
-                    const originalSize = attachment.size;
-                    const PADDING_SIZE = 64 * 1024; // 64 KiB
-                    const paddedSize = Math.ceil(originalSize / PADDING_SIZE) * PADDING_SIZE;
-                    
-                    // Update attachment with opaque filename and encrypted data
-                    attachment.encryptedData = {
-                        method: 'manifest_aes',
-                        encrypted_file: encryptedAttachmentData,
-                        opaque_id: opaqueId,
-                        aes_key: attachmentAesKey, // Store AES key for decryption
-                        cipher_sha256: attachmentSha256,
-                        original_filename: attachment.name,
-                        original_type: attachment.type,
-                        original_size: originalSize
-                    };
-                    
-                    // Update attachment size to show padded size
-                    attachment.size = paddedSize;
-                    attachment.isEncrypted = true;
-                    
-                    // Add to manifest
-                    manifest.attachments.push({
-                        id: opaqueId,
-                        orig_filename: attachment.name,
-                        orig_mime: attachment.type,
-                        cipher_sha256: attachmentSha256,
-                        cipher_size: encryptedAttachmentData.length,
-                        key_wrap: attachmentAesKey // Unencrypted AES key (manifest will be encrypted)
-                    });
-                    
-                    console.log(`[JS] Attachment ${opaqueId} encrypted, size: ${encryptedAttachmentData.length}`);
-                }
-                
-                // 3. Encrypt subject (direct NIP encryption)
+                console.log(`[JS] Using manifest-based encryption (${reason}) — built in Rust`);
+
+                // 1. Encrypt subject (direct NIP encryption) — unchanged.
                 let encryptedSubject = subject;
                 if (subject) {
-                    console.log('[JS] Encrypting subject with NIP...');
                     encryptedSubject = await TauriService.encryptMessageWithAlgorithm(pubkey, subject, encryptionAlgorithm);
-                    console.log('[JS] Subject encrypted:', encryptedSubject.substring(0, 50) + '...');
                     this._subjectCiphertext = encryptedSubject.trim();
                     domManager.setValue('subject', encryptedSubject.trim());
                 }
 
-                // 4. JSON.stringify(manifest) → encrypt entire manifest with NIP → ASCII armor
-                console.log('[JS] Creating encrypted manifest...');
-                const manifestJson = JSON.stringify(manifest);
-                console.log('[JS] Manifest JSON size:', manifestJson.length);
+                // 2. Body + attachments → Rust builds the capnp manifest, NIP-
+                //    encrypts it to the recipient, and ASCII-armors it.
+                const plainAtts = this.plainAttachmentsForEmail() || [];
+                const result = await TauriService.encryptManifestBody(
+                    pubkey, body || '', plainAtts, encryptionAlgorithm
+                );
+                domManager.setValue('messageBody', result.armoredBody.trim());
+                // Truthy → triggers the _plainBody/_htmlBody rebuild below.
+                rawEncryptedBody = result.armoredBody;
 
-                const encryptedManifest = await TauriService.encryptMessageWithAlgorithm(pubkey, manifestJson, encryptionAlgorithm);
-                console.log('[JS] Manifest encrypted, size:', encryptedManifest.length);
-                rawEncryptedBody = encryptedManifest;
+                // 3. Stamp each pending attachment with its encrypted form so
+                //    prepareAttachmentsForEmail() emits the matching aN.dat MIME
+                //    parts (the encrypted bytes ride outside the armor).
+                (result.attachments || []).forEach((part, i) => {
+                    const att = this.attachments[i];
+                    if (!att) return;
+                    att.encryptedData = {
+                        method: 'manifest_aes',
+                        encrypted_file: part.data,
+                        opaque_id: `a${i + 1}`,
+                        original_filename: att.name,
+                        original_type: att.type,
+                        original_size: att.size,
+                    };
+                    att.isEncrypted = true;
+                });
 
-                // Wrap in ASCII armor
-                const armoredManifest = this.armorCiphertext(encryptedManifest, encryptionAlgorithm);
-                domManager.setValue('messageBody', armoredManifest.trim());
-                
                 // NIP-44 clears any stale signature since body state changed.
                 // NIP-04 signing happens after glossia encoding (below).
                 if (encryptionAlgorithm !== 'nip04') {
                     this.clearSignature();
                 }
 
-                // Update attachment list display
                 this.renderAttachmentList();
-
                 notificationService.showSuccess(`Email encrypted using manifest format (${reason}) with ${encryptionAlgorithm.toUpperCase()}`);
-                
+
             } else {
                 // Use simplified encryption when no attachments
                 console.log('[JS] Using simplified encryption (no attachments)');
@@ -7342,8 +8483,8 @@ ${attachmentsHtml}
             // Batch-decrypt uncached encrypted sent emails, resolving pubkeys from contact index
             const uncachedEncrypted = filteredEmails.filter(email => {
                 if (this._previewCache.has(`sent-${email.id}`)) return false;
-                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-                return firstBeginMatch && /NIP-\d+ ENCRYPTED/.test(firstBeginMatch[1]);
+                const firstBeginMatch = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+                return firstBeginMatch && /ENCRYPTED/.test(firstBeginMatch[1]);
             });
 
             if (uncachedEncrypted.length > 0 && appState.getKeypair()) {
@@ -7530,8 +8671,8 @@ ${attachmentsHtml}
             previewSubject = email.subject;
 
             // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
-            const sentFirstBegin = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-            const sentOuterIsEncrypted = sentFirstBegin && /NIP-\d+ ENCRYPTED/.test(sentFirstBegin[1]);
+            const sentFirstBegin = email.body && email.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+            const sentOuterIsEncrypted = sentFirstBegin && /ENCRYPTED/.test(sentFirstBegin[1]);
 
             if (sentOuterIsEncrypted) {
                 const keypair = appState.getKeypair();
@@ -7776,7 +8917,7 @@ ${attachmentsHtml}
         // placeholder and the body is armor — show "Decrypting…" on the
         // subject and blank the preview until the full render replaces
         // this skeleton. Cleartext sent emails keep their body snippet.
-        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
+        const isEncrypted = !!(email.body && /-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/.test(email.body));
         const subjectText = isEncrypted ? 'Decrypting…' : Utils.escapeHtml(email.subject);
         const previewText = isEncrypted
             ? ''
@@ -8603,7 +9744,7 @@ ${attachmentsHtml}
                 const cleanedBody = email.body.replace(/\r\n/g, '\n').split('\n').filter(line => line.trim() !== '' || line.includes('BEGIN NOSTR')).join('\n').trim();
                 // For sent emails, use recipient_pubkey for decryption
                 const recipientPubkey = email.recipient_pubkey || email.nostr_pubkey;
-                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}/);
 
                 let decryptedSubject = email.subject;
                 let decryptedBody = cleanedBody;
@@ -9204,6 +10345,27 @@ ${attachmentsHtml}
                 );
 
             } else {
+                // If this message binds this attachment via a signed ATTACHMENTS
+                // block (public agreement, §11.2), enforce the hash + signature
+                // before delivering — refuse a swapped/tampered file.
+                if (email.body && email.body.includes('BEGIN NOSTR ATTACHMENTS')) {
+                    try {
+                        const v = await TauriService.verifyPublicAttachment(
+                            email.body, attachment.filename, attachment.data
+                        );
+                        if (v.specFound && !v.verified) {
+                            const why = !v.signatureValid
+                                ? 'the message signature is invalid'
+                                : 'the file does not match the signed hash';
+                            window.notificationService.showError(
+                                `Refusing to open "${attachment.filename}": ${why} (possible tampering).`
+                            );
+                            return;
+                        }
+                    } catch (e) {
+                        console.warn('[JS] public attachment verification error:', e);
+                    }
+                }
                 // Plain attachment - deliver directly (save or share)
                 await this._deliverFile(
                     action,
@@ -9596,8 +10758,8 @@ ${attachmentsHtml}
         let previewSubject = draft.subject;
 
         // Check the FIRST/outermost BEGIN NOSTR block to determine message type.
-        const draftFirstBegin = draft.body && draft.body.match(/-{3,}\s*BEGIN NOSTR ((?:NIP-\d+ ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
-        const draftOuterIsEncrypted = draftFirstBegin && /NIP-\d+ ENCRYPTED/.test(draftFirstBegin[1]);
+        const draftFirstBegin = draft.body && draft.body.match(/-{3,}\s*BEGIN NOSTR ((?:(?:NIP-\d+ )?ENCRYPTED|SIGNED) (?:MESSAGE|BODY))\s*-{3,}/);
+        const draftOuterIsEncrypted = draftFirstBegin && /ENCRYPTED/.test(draftFirstBegin[1]);
 
         if (draftOuterIsEncrypted) {
             const keypair = appState.getKeypair();
@@ -9916,37 +11078,32 @@ ${attachmentsHtml}
             // Wait a moment for the tab to switch
             setTimeout(() => {
                 // Fill in the form fields
-                domManager.setValue('toAddress', draft.to_address || '');
                 domManager.setValue('subject', draft.subject || '');
                 domManager.setValue('messageBody', draft.body || '');
-                
-                // If this was an encrypted draft, restore the Nostr contact selection
-                const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey; // Fallback for backward compatibility
-                if (draft.is_nostr_encrypted && draftRecipientPubkey) {
-                    const contacts = appState.getContacts();
-                    const contact = contacts.find(c => c.pubkey === draftRecipientPubkey);
-                    if (contact) {
-                        this.selectedNostrContact = contact;
-                        // Update the Nostr contact dropdown
-                        const dropdown = domManager.get('nostrContactSelect');
-                        if (dropdown) {
-                            dropdown.value = contact.pubkey;
-                        }
-                        // Display the recipient pubkey
-                        const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
-                        const pubkeyValue = document.getElementById('recipient-pubkey-value');
-                        if (pubkeyDisplay && pubkeyValue) {
-                            pubkeyValue.value = contact.pubkey;
-                            // pubkey field is always visible
-                        }
-                        // Update the UI to show it's an encrypted email
-                        const toAddressInput = domManager.get('toAddress');
-                        if (toAddressInput) {
-                            toAddressInput.style.borderColor = '#667eea';
-                            toAddressInput.style.backgroundColor = this.getNostrContactInputBackgroundColor();
-                            toAddressInput.classList.add('hidden');
-                        }
+
+                // Restore the To recipient into the typeahead. The pubkey comes
+                // from the draft's stored recipient_pubkey (an allowed anchor),
+                // never from the to_address string.
+                const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey || ''; // back-compat
+                let contactName = '';
+                if (draftRecipientPubkey) {
+                    const contact = (appState.getContacts() || []).find(c => c.pubkey === draftRecipientPubkey);
+                    if (contact) contactName = contact.name || '';
+                }
+                this._setupToTypeahead();
+                const toTs = (this._recipientTs || {}).composeTo;
+                this._recipientLists = this._recipientLists || {};
+                this._recipientLists.composeTo = [];
+                if (toTs) {
+                    toTs.clear(true);
+                    if (draft.to_address) {
+                        this._addTypeaheadRecipient('composeTo', draft.to_address,
+                            draft.is_nostr_encrypted ? draftRecipientPubkey : '', contactName);
                     }
+                } else {
+                    domManager.setValue('toAddress', draft.to_address || '');
+                    const pkInput = document.getElementById('recipient-pubkey-value');
+                    if (pkInput && draft.is_nostr_encrypted) pkInput.value = draftRecipientPubkey;
                 }
                 
                 notificationService.showSuccess('Draft loaded successfully!');
@@ -10023,7 +11180,7 @@ ${attachmentsHtml}
                 // For drafts, use recipient_pubkey for decryption (drafts are emails we're preparing to send)
                 const draftRecipientPubkey = draft.recipient_pubkey || draft.nostr_pubkey; // Fallback for backward compatibility
                 const isEncryptedSubject = Utils.isLikelyEncryptedContent(draft.subject);
-                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:NIP-\d+ ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
+                const encryptedBodyMatch = cleanedBody.match(/-{3,}\s*BEGIN NOSTR (?:(?:NIP-\d+ )?ENCRYPTED (?:MESSAGE|BODY))\s*-{3,}\s*([\s\S]+?)\s*-{3,}\s*(?:END NOSTR (?:NIP-\d+ ENCRYPTED )?MESSAGE|BEGIN NOSTR (?:SIGNATURE|SEAL))\s*-{3,}/);
                 let decryptedSubject = draft.subject;
                 let decryptedBody = cleanedBody;
                 const keypair = appState.getKeypair();
@@ -10187,3 +11344,26 @@ ${attachmentsHtml}
 // Create and export a singleton instance
 window.EmailService = EmailService;
 window.emailService = new EmailService();
+
+// Click-to-explain for trust badges. Capture phase so it fires before the
+// email-row open handler and can intercept it; excludes the invalid-signature
+// badge (which keeps its own "recheck" click behavior).
+document.addEventListener('click', (e) => {
+    const el = e.target.closest(
+        '.signature-indicator.verified, .signature-indicator.missing, ' +
+        '.transport-auth-indicator.verified, .transport-auth-indicator.invalid, ' +
+        '.binding-indicator'
+    );
+    if (!el) return;
+    e.stopPropagation();
+    e.preventDefault();
+    let key;
+    if (el.classList.contains('binding-indicator')) {
+        key = 'binding-verified';
+    } else if (el.classList.contains('transport-auth-indicator')) {
+        key = el.classList.contains('verified') ? 'email-verified' : 'email-unverified';
+    } else {
+        key = el.classList.contains('verified') ? 'signed' : 'unsigned';
+    }
+    window.emailService?.showTrustBadgeExplanation(key);
+}, true);

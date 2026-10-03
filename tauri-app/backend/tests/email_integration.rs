@@ -106,6 +106,7 @@ async fn defaults_header_sig_roundtrip() {
         true,            // include_sig_header
         Some(&bob_npub), // recipient_pubkey (default-on anchor for decryption)
         true,            // include_recipient_header
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -231,6 +232,7 @@ async fn glossia_body_latin_roundtrip() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -385,6 +387,7 @@ async fn defaults_full_roundtrip_with_inline_sig() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -488,6 +491,7 @@ async fn nip04_legacy_decrypt() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -568,6 +572,7 @@ async fn nip04_header_sig_fallback_unlocks_decrypt() {
         true, // include X-Nostr-Sig
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -707,6 +712,7 @@ async fn multipart_html_and_text() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -771,6 +777,7 @@ async fn non_ascii_subject_roundtrip() {
         false,
         None,  // no recipient pubkey — this test isn't about encryption
         true,  // default-on, but the None pubkey above makes it a no-op
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -864,6 +871,7 @@ async fn quoted_printable_body_roundtrip() {
         false,
         None,
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -945,6 +953,7 @@ async fn sent_mail_decrypts_via_recipient_header_without_dm() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -1042,6 +1051,7 @@ async fn sent_mail_undecryptable_without_any_counterparty_hint() {
         true,
         None,
         false,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -1151,6 +1161,7 @@ async fn reply_threading_headers_and_encoded_quote() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("alice send_email");
@@ -1189,6 +1200,7 @@ async fn reply_threading_headers_and_encoded_quote() {
         true,
         Some(&alice_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("bob send_email reply");
@@ -1406,6 +1418,7 @@ async fn tampered_body_invalidates_signature() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -1510,6 +1523,7 @@ async fn clearsigned_plaintext_verifies_via_header() {
         true,  // sig header — send_email signs the same canonical bytes
         None,  // no recipient (no encryption context)
         false, // skip recipient header
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -1570,6 +1584,7 @@ async fn inline_valid_header_broken_reports_body() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -1652,6 +1667,7 @@ async fn inline_broken_header_valid_reports_header() {
         true,  // sig header — will sign over the (broken-inline) body bytes correctly
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -1728,6 +1744,7 @@ async fn broken_pubkey_fails_verification() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send_email");
@@ -1859,6 +1876,7 @@ async fn signed_plaintext_reply_preserves_nested_signature() {
         true,  // include_sig_header
         None,  // no recipient (clearsigned, no encryption context)
         false, // skip recipient header
+        &[], // cc
     )
     .await
     .expect("alice send_email");
@@ -1931,6 +1949,7 @@ async fn signed_plaintext_reply_preserves_nested_signature() {
         true,
         None,
         false,
+        &[], // cc
     )
     .await
     .expect("bob send_email reply");
@@ -2166,6 +2185,7 @@ async fn nip44_reply_preserves_nested_encrypted_armor() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("alice send_email");
@@ -2219,6 +2239,7 @@ async fn nip44_reply_preserves_nested_encrypted_armor() {
         true,
         Some(&alice_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("bob send_email reply");
@@ -2435,6 +2456,7 @@ async fn nip44_three_level_reply_chain() {
         true,
         Some(&bob_npub),
         true,
+        &[], // cc
     )
     .await
     .expect("send hop 3");

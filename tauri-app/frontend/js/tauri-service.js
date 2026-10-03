@@ -215,7 +215,7 @@ const TauriService = {
     checkMessageConfirmation: async function(eventId, relays) {
         return await this.invoke('check_message_confirmation', { eventId, relays });
     },
-    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, recipientPubkey = null, includeRecipientHeader = null) {
+    sendEmail: async function(emailConfig, toAddress, subject, body, nostrNpub = null, messageId = null, attachments = null, htmlBody = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, recipientPubkey = null, includeRecipientHeader = null, cc = null) {
         const args = { emailConfig, toAddress, subject, body };
         if (nostrNpub) {
             args.nostrNpub = nostrNpub;
@@ -246,6 +246,9 @@ const TauriService = {
         }
         if (includeRecipientHeader !== null && includeRecipientHeader !== undefined) {
             args.includeRecipientHeader = includeRecipientHeader;
+        }
+        if (cc != null && cc.length) {
+            args.cc = cc;
         }
         return await this.invoke('send_email', args);
     },
@@ -283,6 +286,62 @@ const TauriService = {
         }
         return await this.invoke('construct_email_headers', args);
     },
+    // ── Agreements (CC / signatures) ────────────────────────────────
+    // `to` / `cc` are arrays of { email, pubkey } (To → signer, Cc → viewer).
+    composeAgreement: async function(emailConfig, subject, body, to, cc, encrypted, originatorConsents, profileName = null, glossiaEncoding = null, subjectEncoding = null, isAgreement = null, encryptSubject = null, sign = null) {
+        const args = { emailConfig, subject, body, to, cc, encrypted, originatorConsents };
+        if (profileName != null) args.profileName = profileName;
+        if (glossiaEncoding != null) args.glossiaEncoding = glossiaEncoding;
+        if (subjectEncoding != null) args.subjectEncoding = subjectEncoding;
+        // is_agreement defaults to TRUE in the backend; a plain multi-recipient
+        // email must pass false so it isn't composed as an agreement.
+        if (isAgreement != null) args.isAgreement = isAgreement;
+        if (encryptSubject != null) args.encryptSubject = encryptSubject;
+        if (sign != null) args.sign = sign;
+        return await this.invoke('compose_agreement', args);
+    },
+    // Verify a delivered plaintext attachment against a public message's signed
+    // ATTACHMENTS block (spec §11.2). `dataBase64` is the file's bytes. Returns
+    // { verified, signatureValid, specFound, hashMatch, expectedSha256, actualSha256 }.
+    verifyPublicAttachment: async function(armor, filename, dataBase64) {
+        return await this.invoke('verify_public_attachment', { armor, filename, dataBase64 });
+    },
+    // Build a 1:1 (pairwise) encrypted manifest body in Rust (spec §11.2): AES the
+    // body + plaintext attachments into a capnp manifest, NIP-encrypt it to
+    // `recipientPubkey`, and ASCII-armor it. `attachments` are plaintext
+    // (plainAttachmentsForEmail shape). Returns { armoredBody, attachments } where
+    // attachments are the encrypted aN.dat parts. Uses the active account key.
+    encryptManifestBody: async function(recipientPubkey, body, attachments, algorithm) {
+        return await this.invoke('encrypt_manifest_body', { recipientPubkey, body, attachments, algorithm });
+    },
+    // `ccPlain` are keyless Cc emails (header-only, can't decrypt). `isAgreement`
+    // false → plain multi-recipient encrypted mail (viewer roles, no marker).
+    sendAgreement: async function(emailConfig, subject, body, to, cc, ccPlain, encrypted, originatorConsents, isAgreement, encryptSubject, sign, profileName = null, messageId = null, inReplyTo = null, references = null, includePubkeyHeader = null, includeSigHeader = null, glossiaEncoding = null, subjectEncoding = null, attachments = null) {
+        const args = { emailConfig, subject, body, to, cc, encrypted, originatorConsents };
+        if (ccPlain != null) args.ccPlain = ccPlain;
+        if (isAgreement != null) args.isAgreement = isAgreement;
+        if (encryptSubject != null) args.encryptSubject = encryptSubject;
+        if (sign != null) args.sign = sign;
+        if (profileName != null) args.profileName = profileName;
+        if (messageId != null) args.messageId = messageId;
+        if (inReplyTo != null) args.inReplyTo = inReplyTo;
+        if (references != null) args.references = references;
+        if (includePubkeyHeader != null) args.includePubkeyHeader = includePubkeyHeader;
+        if (includeSigHeader != null) args.includeSigHeader = includeSigHeader;
+        if (glossiaEncoding != null) args.glossiaEncoding = glossiaEncoding;
+        if (subjectEncoding != null) args.subjectEncoding = subjectEncoding;
+        if (attachments != null) args.attachments = attachments;
+        return await this.invoke('send_agreement', args);
+    },
+    // Completion status ("M of N signed") computed from a message/thread armor.
+    // Returns null when the armor is not an agreement.
+    agreementStatus: async function(armor) {
+        return await this.invoke('agreement_status', { armor });
+    },
+    // Stateless (npub, email) binding verification from a thread (issue #102).
+    verifyEmailBinding: async function(armor, myPubkey) {
+        return await this.invoke('verify_email_binding', { armor, myPubkey });
+    },
     testImapConnection: async function(emailConfig) {
         return await this.invoke('test_imap_connection', { emailConfig });
     },
@@ -306,6 +365,21 @@ const TauriService = {
     },
     getCachedProfileImage: async function(pubkey, pictureUrl) {
         return await this.invoke('get_cached_profile_image', { pubkey, picture_url: pictureUrl || null });
+    },
+    // Most recent verified delivery address we've observed for a pubkey (Nostr
+    // signature verified against this pubkey AND transport-auth passed). Returns
+    // the raw From header string, or null. Safe pubkey→email direction.
+    getVerifiedEmailForPubkey: async function(pubkey) {
+        return await this.invoke('db_get_verified_email_for_pubkey', { pubkey });
+    },
+    // Map of pubkey → raw From for all strongly-bound verified addresses.
+    getVerifiedEmailsMap: async function() {
+        return await this.invoke('db_get_verified_emails_map');
+    },
+    // Map of recipient_pubkey → to_address from our own sent mail (weaker,
+    // user-asserted binding — NOT presented as verified).
+    getSentEmailAddressesMap: async function() {
+        return await this.invoke('db_get_sent_email_addresses_map');
     },
     getContacts: async function() {
         return await this.invoke('get_contacts');

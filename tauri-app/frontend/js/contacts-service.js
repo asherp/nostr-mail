@@ -595,7 +595,7 @@ class ContactsService {
                         if (emailButton) {
                             emailButton.addEventListener('click', (e) => {
                                 e.stopPropagation();
-                                this.sendEmailToContact(contact.email);
+                                this.sendEmailToContact(contact.email, contact.pubkey || '');
                             });
                         }
                     }
@@ -972,7 +972,7 @@ class ContactsService {
                         ${privacyToggleHTML}
                         <div class="contact-detail-actions-buttons">
                             ${contact.email ? `
-                            <button class="btn btn-primary" onclick="window.contactsService.sendEmailToContact('${contact.email}')">
+                            <button class="btn btn-primary" onclick="window.contactsService.sendEmailToContact('${contact.email}', '${contact.pubkey || ''}')">
                                 <i class="fas fa-envelope"></i> Send Email
                             </button>
                             ` : ''}
@@ -1940,55 +1940,41 @@ class ContactsService {
         }
     }
 
-    // Send email to contact
-    sendEmailToContact(email) {
+    // Send email to contact. `pubkey` is passed by contact-card callers (an
+    // explicit contact pick → allowed to key the recipient); when absent the
+    // recipient is added keyless. The email string is never resolved to a
+    // pubkey on its own.
+    sendEmailToContact(email, pubkey = '') {
         // Switch to compose tab
         const composeTab = document.querySelector('[data-tab="compose"]');
         if (composeTab) {
             composeTab.click();
         }
-        
-        // Find the contact by email address
-        const contacts = window.appState.getContacts();
-        const contact = contacts.find(c => c.email && c.email.toLowerCase() === email.toLowerCase());
-        
-        // Wait a moment for the tab to switch, then fill in the form
+
+        // Resolve a display name for the pill only when we have an explicit pubkey.
+        let contactName = '';
+        if (pubkey) {
+            const contact = (window.appState.getContacts() || []).find(c => c.pubkey === pubkey);
+            if (contact) contactName = contact.name || '';
+        }
+
+        // Wait a moment for the tab to switch, then add the To recipient.
         setTimeout(() => {
-            // Fill in the email address
+            const es = window.emailService;
+            if (es && es._setupToTypeahead) {
+                es._setupToTypeahead();
+                const toTs = (es._recipientTs || {}).composeTo;
+                if (toTs) {
+                    es._addTypeaheadRecipient('composeTo', email, pubkey, contactName);
+                    window.notificationService.showSuccess(
+                        pubkey ? `Recipient added: ${contactName || email}` : `Email address added: ${email}`);
+                    return;
+                }
+            }
+            // Fallback: legacy input when the typeahead isn't available.
             const toAddressInput = window.domManager.get('toAddress');
-            if (toAddressInput) {
-                toAddressInput.value = email;
-            }
-            
-            // If contact found, set it as selected for encryption
-            if (contact && window.emailService) {
-                window.emailService.selectedNostrContact = contact;
-                
-                // Update the Nostr contact dropdown
-                const dropdown = window.domManager.get('nostrContactSelect');
-                if (dropdown) {
-                    dropdown.value = contact.pubkey;
-                }
-                
-                // Display the recipient pubkey
-                const pubkeyDisplay = document.getElementById('selected-recipient-pubkey');
-                const pubkeyValue = document.getElementById('recipient-pubkey-value');
-                if (pubkeyDisplay && pubkeyValue) {
-                    pubkeyValue.value = contact.pubkey;
-                    pubkeyDisplay.style.display = 'block';
-                }
-                
-                // Update the UI to show it's an encrypted email
-                if (toAddressInput) {
-                    const isDarkMode = document.body.classList.contains('dark-mode');
-                    toAddressInput.style.borderColor = '#667eea';
-                    toAddressInput.style.backgroundColor = isDarkMode ? '#1a1f3a' : '#f8f9ff';
-                }
-                
-                window.notificationService.showSuccess(`Email address and recipient pubkey filled in for ${contact.name}`);
-            } else {
-                window.notificationService.showSuccess(`Email address filled in: ${email}`);
-            }
+            if (toAddressInput) toAddressInput.value = email;
+            window.notificationService.showSuccess(`Email address filled in: ${email}`);
         }, 100);
     }
 

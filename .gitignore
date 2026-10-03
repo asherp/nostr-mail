@@ -31,3 +31,10 @@ target/
 slides/node_modules/
 slides/dist/
 slides/.slidev/
+
+# Built release artifacts (packaged locally / in CI, never committed)
+*.apk
+*.dmg
+_site/
+pr81-builds/
+pr81-builds-staging/
